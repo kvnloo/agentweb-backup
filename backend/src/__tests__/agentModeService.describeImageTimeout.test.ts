@@ -1,11 +1,11 @@
 /**
  * ENG-294: describe_image must bound its vision LLM call so a slow/hung vision
- * model fails fast and falls back, instead of consuming the whole agent-mode
+ * model fails fast instead of consuming the whole agent-mode
  * generation wall-clock budget (default 10 min). A production CSV→CRM sync that
  * OCR'd contact screenshots via describe_image timed out repeatedly (6 failed
  * describe_image calls) because a single un-bounded call could stall for the
  * client's 5-minute per-request timeout — and with callLLM's internal retries
- * plus the fallback model, one image could burn 10+ minutes.
+ * one image could burn the full turn budget.
  */
 
 jest.mock('aws-sdk', () => ({
@@ -71,34 +71,28 @@ describe('describeImage — vision call timeout (ENG-294)', () => {
     }
   });
 
-  it('falls back to the fallback vision model when the primary hangs past the timeout', async () => {
+  it('returns a retryable failure when the one OpenRouter vision request times out', async () => {
     const callLLMSpy = jest
       .spyOn(service, 'callLLM')
-      // primary (opus) hangs forever
-      .mockImplementationOnce(neverResolves)
-      // fallback answers
-      .mockResolvedValueOnce({ choices: [{ message: { content: 'fallback description' } }] } as any);
+      .mockImplementation(neverResolves);
 
     const result = await service.describeImage('anthropic.claude-opus-4-8', 'https://example.com/chart.png');
 
-    expect(result.success).toBe(true);
-    expect(result.description).toBe('fallback description');
-    expect(result.fallbackUsed).toBe(true);
-    expect(result.primaryError).toMatch(/timed out/i);
-    // Both the primary and the fallback model were attempted.
-    expect(callLLMSpy).toHaveBeenCalledTimes(2);
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/temporarily unavailable/i);
+    expect(callLLMSpy).toHaveBeenCalledTimes(1);
   }, 10000);
 
-  it('returns a friendly failure when BOTH the primary and fallback hang', async () => {
+  it('returns a friendly failure when the vision request hangs', async () => {
     jest.spyOn(service, 'callLLM').mockImplementation(neverResolves);
 
     const result = await service.describeImage('anthropic.claude-opus-4-8', 'https://example.com/chart.png');
 
     expect(result.success).toBe(false);
-    expect(result.message).toMatch(/primary and fallback/i);
+    expect(result.message).toMatch(/temporarily unavailable/i);
   }, 10000);
 
-  it('does not time out a fast primary vision call (no fallback used)', async () => {
+  it('does not time out a fast vision call', async () => {
     const callLLMSpy = jest
       .spyOn(service, 'callLLM')
       .mockResolvedValue({ choices: [{ message: { content: 'a chart' } }] } as any);
@@ -107,7 +101,6 @@ describe('describeImage — vision call timeout (ENG-294)', () => {
 
     expect(result.success).toBe(true);
     expect(result.description).toBe('a chart');
-    expect(result.fallbackUsed).toBeUndefined();
     expect(callLLMSpy).toHaveBeenCalledTimes(1);
   });
 
@@ -163,23 +156,21 @@ describe('describeImage — vision call timeout (ENG-294)', () => {
     });
   });
 
-  it('a malformed override still bounds a hung primary and falls back', async () => {
+  it('a malformed override still bounds a hung gateway request', async () => {
     // Regression guard for the fail-open bug: with a garbage override the primary
-    // must still time out (default bound) and route to the fallback model. We shrink
+    // must still time out (default bound). We shrink
     // the default via a spy so the test stays fast while proving the bounded branch runs.
     process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS = 'not-a-number';
     jest.spyOn(AgentModeService, 'resolveDescribeImageTimeoutMs').mockReturnValue(50);
 
     const callLLMSpy = jest
       .spyOn(service, 'callLLM')
-      .mockImplementationOnce(neverResolves)
-      .mockResolvedValueOnce({ choices: [{ message: { content: 'fallback description' } }] } as any);
+      .mockImplementation(neverResolves);
 
     const result = await service.describeImage('anthropic.claude-opus-4-8', 'https://example.com/chart.png');
 
-    expect(result.success).toBe(true);
-    expect(result.fallbackUsed).toBe(true);
-    expect(result.primaryError).toMatch(/timed out/i);
-    expect(callLLMSpy).toHaveBeenCalledTimes(2);
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/temporarily unavailable/i);
+    expect(callLLMSpy).toHaveBeenCalledTimes(1);
   }, 10000);
 });

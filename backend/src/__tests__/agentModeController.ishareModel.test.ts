@@ -364,43 +364,33 @@ describe('AgentModeController - ishare Model Selection', () => {
 
       await agentModeController.generateSharedResponse(req, res);
 
-      // ENG-1211: the stored model is dispatched unchanged. transientFallbackModel
-      // is undefined, which getBackupModel reads as "keep the admin-managed global
-      // backup" — a transient failure retries the way it did before usage caps,
-      // rather than being pinned to a cheap catalog.
+      // The stored model is dispatched unchanged; provider failure handling stays
+      // inside the single OpenRouter request.
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledWith(
         expect.objectContaining({
           llmModel: 'gemini-3-pro-preview',
-          transientFallbackModel: undefined,
         }),
         expect.any(Function),
       );
     });
 
     it('stamps the honored model on an unstamped legacy shared session (ENG-1211)', async () => {
-      const approvedFallback = 'anthropic.claude-haiku-4-5-20251001-v1:0';
       mockChatbotDb.getChatSession.mockResolvedValue(mockSessionWithModel);
       mockAgentModeService.getSupportedModels.mockResolvedValue([
         'gemini-3-pro-preview',
         'gemini-3.1-flash-lite',
-        approvedFallback,
+        'anthropic.claude-haiku-4-5-20251001-v1:0',
         'gpt-5-chat-2',
       ]);
       mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
         billingUserId: 'test-user-123',
         policy: {
           ...optimizedPolicy,
-          optimizedModelIds: ['gemini-3.1-flash-lite', approvedFallback],
+          optimizedModelIds: ['gemini-3.1-flash-lite', 'anthropic.claude-haiku-4-5-20251001-v1:0'],
         },
         costUsedMicroUsd: 30_000_000,
         tokenUsed: 1,
         mode: { usageMode: 'optimized', admissionAllowed: true, reason: 'optimization_threshold_reached' },
-      });
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
-        ...mockResponse,
-        backupModelUsed: true,
-        originalModel: 'gemini-3.1-flash-lite',
-        backupModel: approvedFallback,
       });
 
       const req = {
@@ -413,10 +403,7 @@ describe('AgentModeController - ishare Model Selection', () => {
 
       await agentModeController.generateSharedResponse(req, res);
 
-      // ENG-1211: the policy-owned transient fallback is deleted along with
-      // optimized mode, so the session is stamped with the model policy actually
-      // honored. Writing back a GLOBAL-backup retry is a separate gap and is
-      // ENG-1205 AC1's job, not this ticket's.
+      // The session is stamped with the model policy actually honored.
       expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenLastCalledWith(
         mockSessionId,
         'gemini-3-pro-preview',

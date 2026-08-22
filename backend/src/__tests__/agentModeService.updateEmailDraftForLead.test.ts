@@ -64,6 +64,7 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
     mockReadBrandGuidelines = jest.spyOn(agentModeService as any, 'readBrandGuidelines') as jest.Mock;
     mockReadMarketStrategy = jest.spyOn(agentModeService as any, 'readMarketStrategy') as jest.Mock;
     mockGetSenderForLead = jest.spyOn(agentModeService as any, 'getSenderForLead') as jest.Mock;
+    jest.spyOn(agentModeService, 'getReportGenerationDefaultModel').mockResolvedValue('gpt-5.5');
 
     // Default: allow access (most tests use list owned by userId)
     mockCrmDb.canOrgMemberAccessList.mockResolvedValue(true);
@@ -194,6 +195,7 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       );
 
       expect(result.success).toBe(true);
+      expect(mockCreate).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5.5' }));
       expect(crmDb.getLeadEngagements).toHaveBeenCalledWith(listId, leadId, userId);
       expect(mockReadBrandGuidelines).toHaveBeenCalledWith(userId);
       // ENG-945: this prompt embeds formattedContent wholesale, so it must ask

@@ -285,10 +285,6 @@ async function applyScheduleEditWithConsentNarrowing(
 type EffectiveModelPolicyDecision = PolicyModelDecision & {
   usageMode: 'full_choice' | 'optimized' | 'paused';
   usagePolicyVersion: string | null;
-  // undefined keeps unrestricted requests on the global backup behavior; optimized
-  // requests always carry string|null so provider retries cannot escape the catalog.
-  transientFallbackModel?: string | null;
-  transientFallbackSource?: ModelBackupSource | null;
 };
 
 function toStoredModelPolicyDecision(decision: EffectiveModelPolicyDecision) {
@@ -345,25 +341,10 @@ async function resolveEffectiveModelForUser(input: {
     supportedModelIds,
     policy: usage.policy,
   });
-  // ENG-1211: the policy-owned transient fallback existed only to keep an
-  // optimized-mode retry inside the cheap catalog. With optimized mode deleted
-  // these stay `undefined`, which `getBackupModel` reads as "preserve the
-  // admin-managed global backup" — i.e. a transient provider failure retries the
-  // way it did before usage caps, unconstrained by any catalog.
-  //
-  // Consequence worth knowing: the audit branch that rewrote the session's model
-  // when a policy fallback answered is now unreachable, so a global-backup retry
-  // is not written back to the session. That is pre-existing behavior for the
-  // unrestricted path, not a new gap — recording the model that actually ran on
-  // every path is ENG-1205 AC1.
-  const transientFallbackModel: string | null | undefined = undefined;
-  const transientFallbackSource: ModelBackupSource | null | undefined = undefined;
   return {
     ...decision,
     usageMode: usage.mode.usageMode,
     usagePolicyVersion: usage.policy?.version || null,
-    transientFallbackModel,
-    transientFallbackSource,
   };
 }
 
@@ -1025,8 +1006,6 @@ async function scheduleAutoMediaContinuation(
       undefined, // answeredQuestionMeta
       undefined, // turnStartMs — no whole-turn deadline for this background continuation
       undefined, // publishAuthorizationOverride
-      undefined, // transientFallbackModel
-      undefined, // modelPolicyDecisionForAudit
       undefined, // approvedRevisionImageSources
       'auto-continuation', // ENG-1239: hide this server-authored turn in the chat UI
     ),
@@ -2975,9 +2954,6 @@ export async function runVerifiedChat(
      * required-function list together, so they still cannot disagree.
      */
     refreshPublishAuthorization?: () => Promise<SchedulePublishAuthorization | null>;
-    // Already resolved by the cost policy. Optimized scheduled runs pass string|null
-    // so a transient retry remains inside the approved optimized catalog.
-    transientFallbackModel?: string | null;
     // ENG-936: approval-bound source URLs for `generate_image` revisions in
     // this run. Passed through to the tool dispatcher so confirm=true edits of
     // the wrong source are rejected before execution.
@@ -3425,8 +3401,6 @@ export async function runVerifiedChat(
           undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
           livePublishAuthorization,
-          params.transientFallbackModel,
-          params.modelPolicyDecisionForAudit,
           approvedRevisionImageSources
         );
         if (continuationResponse.content) {
@@ -3558,8 +3532,6 @@ export async function runVerifiedChat(
         undefined, undefined, undefined, undefined, undefined, undefined,
         undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
         livePublishAuthorization,
-        params.transientFallbackModel,
-        params.modelPolicyDecisionForAudit,
         approvedRevisionImageSources
       );
 
@@ -5123,7 +5095,6 @@ export async function runScheduledChat(
       maxAttempts: 20,
       attachments: fileAttachments,
       llmModel: modelToUse,
-      transientFallbackModel: scheduleModelPolicy.transientFallbackModel,
       modelPolicyDecisionForAudit: scheduleModelPolicy,
       // ENG-657: on a resume, count the abandoned portion's tool calls in
       // verification so requiredFunctionCalls isn't falsely missed (empty otherwise).
@@ -6388,13 +6359,6 @@ export async function generateSessionResponse(
   // When absent — the interactive route, or a resumed run entered directly — fall
   // back to reading the schedule for this turn.
   publishAuthorizationOverride?: SchedulePublishAuthorization,
-  // Cost-policy-owned transient retry target. Optimized callers always pass a
-  // string or null; omission preserves the unrestricted global backup behavior.
-  transientFallbackModel?: string | null,
-  // The caller's just-resolved admission decision. This is intentionally not sent
-  // to the worker; it only makes the post-fallback durable audit independent of a
-  // stale pre-admission session read.
-  modelPolicyDecisionForAudit?: EffectiveModelPolicyDecision,
   // ENG-936: approved image-source URLs for this run (currently used by
   // image-revision confirmation preflights). Passed into the worker only.
   approvedRevisionImageSources?: string[],
@@ -6413,9 +6377,6 @@ export async function generateSessionResponse(
   responseMessages: any[];
   workPlan?: any;
   skills?: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[];
-  backupModelUsed?: boolean;
-  originalModel?: string;
-  backupModel?: string;
   // ENG-244: true when the underlying run exhausted its step budget (maxIterations)
   // and was truncated before emitting the final deliverable. The scheduled-run
   // completion gate uses this flag (not response text) to force a synthesis turn.
@@ -6708,7 +6669,6 @@ export async function generateSessionResponse(
       // ENG-907: the caller's whole-turn deadline stamp (undefined when the caller
       // enforces no cap), so the loop wraps itself up against the real deadline.
       turnStartMs,
-      transientFallbackModel,
       approvedRevisionImageSources,
       requireWorkPlanDisposition: enforceWorkPlanDisposition,
     },
@@ -6718,27 +6678,6 @@ export async function generateSessionResponse(
     }
   );
 
-  // The admission decision is stamped before dispatch. If the provider then fails
-  // transiently and the approved optimized fallback actually answers, update the
-  // session to the model that incurred cost so audits never report the failed primary
-  // as the effective model. This is scoped to policy-owned fallbacks; unrestricted
-  // legacy retries retain their existing persistence behavior.
-  if (
-    response.backupModelUsed &&
-    response.backupModel &&
-    transientFallbackModel !== undefined &&
-    modelPolicyDecisionForAudit?.usageMode === 'optimized'
-  ) {
-    await chatbotDb.updateSessionLlmModel(sessionId, response.backupModel, {
-      ...toStoredModelPolicyDecision(modelPolicyDecisionForAudit),
-      effectiveModel: response.backupModel,
-      backupModel: response.backupModel,
-      backupSource: modelPolicyDecisionForAudit.transientFallbackSource || 'system',
-      modelSelection: 'corrected',
-      modelSelectionReason: 'primary_model_transient_failure_using_policy_fallback',
-      recordedAt: new Date().toISOString(),
-    });
-  }
 
   // If the user clicked Stop, drop the FINAL (in-flight) turn — we don't run the batch
   // below, so a page reload shows no ghost final response from the cancelled turn. Any
@@ -7577,8 +7516,6 @@ export const agentModeController = {
         answeredQuestionMeta, // ENG-396: structured click record stamped on the reply
         turnStartMs, // ENG-907: the deadline withGenerationTimeout below enforces
         undefined, // publishAuthorizationOverride — interactive path resolves per turn
-        modelPolicyDecision.transientFallbackModel,
-        modelPolicyDecision,
         undefined, // approvedRevisionImageSources
         undefined, // userMessageKind
         Boolean(questionAnswer || workPlanInputAnswer),
@@ -7794,7 +7731,6 @@ export const agentModeController = {
         skills: response.skills,
         ...(invalidations ? { invalidations } : {}),
         ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
-        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {}),
         ...(modelPolicyDecision ? {
           requestedModel: modelPolicyDecision.requestedModel,
           effectiveModel: modelPolicyDecision.effectiveModel,
@@ -8667,8 +8603,6 @@ export const agentModeController = {
           // for it, exactly as ENG-907 described.
           sharedTurnStartMs,
           undefined, // publishAuthorizationOverride — shared path has no schedule consent
-          modelPolicyDecision.transientFallbackModel,
-          modelPolicyDecision,
           undefined, // approvedRevisionImageSources
           undefined, // userMessageKind
           Boolean(workPlanInputAnswer),
@@ -8686,7 +8620,6 @@ export const agentModeController = {
         workPlan: response.workPlan,
         skills: response.skills,
         ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
-        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
       } finally {
         releaseSessionGeneration(session.sessionId);
@@ -11519,7 +11452,6 @@ export const agentModeController = {
         sources: response.sources,
         workPlan: response.workPlan,
         skills: response.skills,
-        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
     } catch (error) {
       console.error('AgentMode: Generate conversable response error:', error);

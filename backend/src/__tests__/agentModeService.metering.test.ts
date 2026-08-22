@@ -74,15 +74,14 @@ describe('AgentModeService.callLLM cost metering (ENG-200)', () => {
     jest.clearAllMocks();
     svc = new AgentModeService();
     create = jest.fn().mockResolvedValue(fakeResponse);
-    // Inject a fake client so callLLM does not construct a real SDK client.
-    (svc as any).llmModels[MODEL].client = {
+    jest.spyOn(svc, 'getOpenRouterClient').mockResolvedValue({
       chat: { completions: { create } },
-    };
+    } as any);
   });
 
   it('charges the main agent turn to the per-user cap (meterUserUsage), cache tokens included', async () => {
     await svc.callLLM(MODEL, [{ role: 'user', content: 'hi' }], {
-      usageContext: { userId: 'u1', sessionId: 's1', feature: 'agent_task' },
+      usageContext: { userId: 'u1', billingUserId: 'billing-u1', sessionId: 's1', feature: 'agent_task' },
     });
 
     // Routed through meterUserUsage (records AND deducts), NOT a shadow-only recordUsage.
@@ -90,10 +89,14 @@ describe('AgentModeService.callLLM cost metering (ENG-200)', () => {
     expect(mockMeterUser).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: 'u1',
+        billingUserId: 'billing-u1',
         sessionId: 's1',
         feature: 'agent_task',
         model: MODEL,
-        inputTokens: 100,
+        // OpenRouter reports both cache reads and writes inside prompt_tokens,
+        // so report 40 uncached tokens and bill the 50 read / 10 write tokens
+        // independently rather than charging either cache subset twice.
+        inputTokens: 40,
         outputTokens: 20,
         cacheReadTokens: 50, // cache cost is charged, not dropped
         cacheWriteTokens: 10,
@@ -112,13 +115,7 @@ describe('AgentModeService.callLLM cost metering (ENG-200)', () => {
     );
   });
 
-  // ENG-700 AC #5: the vendor recorded matches the client that served the call.
-  // Regression guard: a Bedrock/Vertex client is cached on the registry after
-  // its first call, exactly like an Azure client is pre-populated at
-  // construction time — so "client is already set" must NOT be used as a
-  // proxy for "this is Azure OpenAI", or a cached Bedrock model would
-  // mislabel as azure-openai on its second call onward.
-  it('keeps the "bedrock" label on a second call, after the client is cached', async () => {
+  it('keeps the "openrouter" label on repeated logical Claude calls', async () => {
     await svc.callLLM(MODEL, [{ role: 'user', content: 'hi' }], {
       usageContext: { userId: 'u1', feature: 'agent_task' },
     });
@@ -127,8 +124,8 @@ describe('AgentModeService.callLLM cost metering (ENG-200)', () => {
     });
 
     expect(mockMeterUser).toHaveBeenCalledTimes(2);
-    expect(mockMeterUser.mock.calls[0][0]).toMatchObject({ provider: 'bedrock' });
-    expect(mockMeterUser.mock.calls[1][0]).toMatchObject({ provider: 'bedrock' });
+    expect(mockMeterUser.mock.calls[0][0]).toMatchObject({ provider: 'openrouter' });
+    expect(mockMeterUser.mock.calls[1][0]).toMatchObject({ provider: 'openrouter' });
   });
 });
 
@@ -162,6 +159,9 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     jest.clearAllMocks();
     svc = new AgentModeService();
     create = jest.fn();
+    jest.spyOn(svc, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
     (svc as any).llmModels[OR_MODEL] = { client: null, supportsTemperature: true };
   });
 
@@ -374,16 +374,15 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     );
   });
 
-  it('does not send costUsdOverride for a non-openrouter provider (bedrock unaffected)', async () => {
-    const bedrockCreate = jest.fn().mockResolvedValue(fakeResponse);
-    (svc as any).llmModels[MODEL].client = { chat: { completions: { create: bedrockCreate } } };
+  it('does not send costUsdOverride when a gateway Claude response has no billed cost', async () => {
+    create.mockResolvedValue(fakeResponse);
 
     await svc.callLLM(MODEL, [{ role: 'user', content: 'hi' }], {
       usageContext: { userId: 'u1', feature: 'agent_task' },
     });
 
     expect(mockMeterUser).toHaveBeenCalledWith(
-      expect.objectContaining({ provider: 'bedrock', costUsdOverride: undefined })
+      expect.objectContaining({ provider: 'openrouter', costUsdOverride: undefined })
     );
   });
 

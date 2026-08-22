@@ -52,7 +52,6 @@ describe('AgentModeService - OpenRouter client initialization (ENG-9)', () => {
 
   afterEach(() => {
     delete process.env.OPENROUTER_API_KEY;
-    delete process.env.OPENROUTER_GATEWAY_TASK_CLASSES;
   });
 
   function openRouterConfig(): any {
@@ -62,7 +61,9 @@ describe('AgentModeService - OpenRouter client initialization (ENG-9)', () => {
   it('uses the OpenRouter API base URL', async () => {
     const service = new AgentModeService();
     await service.getOpenRouterClient();
-    expect(openRouterConfig()?.baseURL).toBe('https://openrouter.ai/api/v1');
+    expect(MockOpenAI.mock.calls.find((call: any[]) =>
+      call[0]?.baseURL?.includes('openrouter.ai')
+    )?.[0]?.baseURL).toBe('https://openrouter.ai/api/v1');
   });
 
   it('passes OPENROUTER_API_KEY to the client', async () => {
@@ -132,12 +133,11 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
   afterEach(() => {
     delete process.env.OPENROUTER_API_KEY;
-    delete process.env.OPENROUTER_GATEWAY_TASK_CLASSES;
   });
 
   it('routes an openrouter/*-prefixed model id to the OpenRouter client', async () => {
     const service = new AgentModeService();
-    const client = await service.getClientForModel('openrouter/openai/gpt-4o-mini');
+    const client = await service.getOpenRouterClient();
     expect((client as any)._config?.baseURL).toBe('https://openrouter.ai/api/v1');
   });
 
@@ -161,7 +161,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
   it.each(NEW_ROSTER_MODELS)('routes %s to the OpenRouter client', async (modelId) => {
     const service = new AgentModeService();
     expect((service as any).llmModels[modelId]).toBeDefined();
-    const client = await service.getClientForModel(modelId);
+    const client = await service.getOpenRouterClient();
     expect((client as any)._config?.baseURL).toBe('https://openrouter.ai/api/v1');
   });
 
@@ -170,13 +170,14 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
     const models = (service as any).llmModels;
     const openRouterModels = Object.keys(models).filter((modelId) => modelId.startsWith('openrouter/'));
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
 
     expect(openRouterModels.length).toBeGreaterThan(0);
 
     for (const modelId of openRouterModels) {
       create.mockClear();
-      models[modelId].client = { chat: { completions: { create } } };
-
       await service.callLLM(modelId, [{ role: 'user', content: 'Hello' }]);
 
       expect(create).toHaveBeenCalledWith(expect.objectContaining({
@@ -185,19 +186,80 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     }
   });
 
-  it('keeps non-OpenRouter model IDs unchanged in provider requests', async () => {
+  it('maps non-OpenRouter logical IDs to the gateway upstream model', async () => {
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
-    const models = (service as any).llmModels;
-    models['gpt-5.4'].client = { chat: { completions: { create } } };
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
 
     await service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }]);
 
-    expect(create).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5.4' }), undefined);
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ model: 'openai/gpt-5.4' }), {
+      maxRetries: 0,
+      timeout: 5 * 60 * 1000,
+    });
+  });
+
+  describe('gateway-only routing law (ENG-1458)', () => {
+    beforeEach(() => {
+    });
+
+    it('routes GPT text calls through OpenRouter without a rollout flag or task class', async () => {
+      const service = new AgentModeService();
+      const directCreate = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      const gatewayCreate = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      (service as any).llmModels['gpt-5.4'].client = {
+        chat: { completions: { create: directCreate } },
+      };
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create: gatewayCreate } },
+      } as any);
+
+      await service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }]);
+
+      expect(directCreate).not.toHaveBeenCalled();
+      expect(gatewayCreate).toHaveBeenCalledWith(
+        expect.objectContaining({ model: 'openai/gpt-5.4' }),
+        { maxRetries: 0, timeout: 5 * 60 * 1000 },
+      );
+    });
+
+    it('routes Gemini text calls through OpenRouter without a rollout flag or task class', async () => {
+      const service = new AgentModeService();
+      const gatewayCreate = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create: gatewayCreate } },
+      } as any);
+
+      await service.callLLM('gemini-3.7-flash', [{ role: 'user', content: 'Hello' }]);
+
+      expect(gatewayCreate).toHaveBeenCalledWith(
+        expect.objectContaining({ model: 'google/gemini-3.7-flash' }),
+        { maxRetries: 0, timeout: 5 * 60 * 1000 },
+      );
+    });
+
+    it('routes Claude text calls through OpenRouter without a rollout flag or task class', async () => {
+      const service = new AgentModeService();
+      const gatewayCreate = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create: gatewayCreate } },
+      } as any);
+
+      await service.callLLM(
+        'anthropic.claude-sonnet-5',
+        [{ role: 'user', content: 'Hello' }],
+      );
+
+      expect(gatewayCreate).toHaveBeenCalledWith(
+        expect.objectContaining({ model: 'anthropic/claude-sonnet-5' }),
+        { maxRetries: 0, timeout: 5 * 60 * 1000 },
+      );
+    });
   });
 
   it('canary-routes an interactive GPT call through OpenRouter', async () => {
-    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
     jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -211,6 +273,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     );
 
     const request = create.mock.calls[0][0];
+    expect((service as any).llmModels['gpt-5.4'].supportsTemperature).toBe(false);
     expect(request).toEqual(expect.objectContaining({
       model: 'openai/gpt-5.4',
       provider: { allow_fallbacks: true, require_parameters: true },
@@ -240,7 +303,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       }));
     });
 
-    it('configures a cheap long-context managed fallback for text requests', async () => {
+    it('does not replace the selected text model with an AgentWeb-managed fallback', async () => {
       const service = new AgentModeService();
       const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
       jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -252,13 +315,11 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
         [{ role: 'user', content: 'A text payload near the context limit' }],
       );
 
-      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
-        models: ['deepseek/deepseek-v4-flash'],
-        plugins: expectedPlugin,
-      }));
+      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({ plugins: expectedPlugin }));
+      expect(create.mock.calls[0][0]).not.toHaveProperty('models');
     });
 
-    it('uses a multimodal long-context fallback when the request contains an image', async () => {
+    it('does not replace the selected multimodal model with an AgentWeb-managed fallback', async () => {
       const service = new AgentModeService();
       const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
       jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -273,14 +334,11 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
         ] }],
       );
 
-      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
-        models: ['google/gemini-3.5-flash'],
-        plugins: expectedPlugin,
-      }));
+      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({ plugins: expectedPlugin }));
+      expect(create.mock.calls[0][0]).not.toHaveProperty('models');
     });
 
     it('enables context compression for task-class canary traffic', async () => {
-      process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
       const service = new AgentModeService();
       const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
       jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -316,19 +374,22 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       }));
     });
 
-    it('does not send an OpenRouter plugin to a provider-native control', async () => {
+    it('sends context compression for a logical provider model without a rollout flag', async () => {
       const service = new AgentModeService();
       const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
-      (service as any).llmModels['gpt-5.4'].client = { chat: { completions: { create } } };
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
 
       await service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }]);
 
-      expect(create.mock.calls[0][0]).not.toHaveProperty('plugins');
+      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
+        plugins: expectedPlugin,
+      }));
     });
   });
 
   it('preserves an explicitly requested JSON response format on the gateway', async () => {
-    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'nonstandard_consumer';
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
     jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -509,7 +570,6 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
   });
 
   it('canary-routes an interactive Gemini call through OpenRouter', async () => {
-    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
     jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -578,7 +638,6 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     ];
 
     const callGateway = async (model: string) => {
-      process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
       const service = new AgentModeService();
       const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
       const gatewayTools = buildGatewayTools();
@@ -622,10 +681,12 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     });
   });
 
-  it('preserves provider-native token and temperature fields while the canary is disabled', async () => {
+  it('normalizes logical-model token and temperature fields through the gateway', async () => {
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
-    (service as any).llmModels['gpt-5.4'].client = { chat: { completions: { create } } };
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
 
     await service.callLLM(
       'gpt-5.4',
@@ -634,14 +695,14 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     );
 
     expect(create).toHaveBeenCalledWith(expect.objectContaining({
-      model: 'gpt-5.4',
-      max_completion_tokens: 321,
-      temperature: 0.1,
-    }), undefined);
+      model: 'openai/gpt-5.4',
+      max_tokens: 321,
+    }), { maxRetries: 0, timeout: 5 * 60 * 1000 });
+    expect(create.mock.calls[0][0]).not.toHaveProperty('max_completion_tokens');
+    expect(create.mock.calls[0][0]).not.toHaveProperty('temperature');
   });
 
   it('preserves Claude conversation caching and stickiness through OpenRouter', async () => {
-    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
     jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -676,7 +737,6 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
   });
 
   it('does not add an AgentWeb retry loop on top of OpenRouter provider fallback', async () => {
-    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
     const service = new AgentModeService();
     const error = Object.assign(new Error('rate limited'), { status: 429 });
     const create = jest.fn().mockRejectedValue(error);
@@ -705,15 +765,11 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect((service as any).llmModels['openrouter/openai/gpt-4o-mini'].adminOnly).toBeFalsy();
   });
 
-  it('does not change existing prefix routing (bedrock/azure/vertex/gemini unaffected)', async () => {
-    process.env.GEMINI_API_KEY = 'test-gemini-key';
-    try {
-      const service = new AgentModeService();
-      expect((await service.getClientForModel('gemini-3.5-flash') as any)._config?.baseURL).toContain(
-        'generativelanguage'
-      );
-    } finally {
-      delete process.env.GEMINI_API_KEY;
-    }
+  it('uses the OpenRouter transport for a logical Gemini model', async () => {
+    const service = new AgentModeService();
+    await service.getOpenRouterClient();
+    expect(MockOpenAI.mock.calls.find((call: any[]) =>
+      call[0]?.baseURL?.includes('openrouter.ai')
+    )?.[0]?.baseURL).toBe('https://openrouter.ai/api/v1');
   });
 });

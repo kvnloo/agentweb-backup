@@ -71,11 +71,6 @@ def create_openrouter_llm(model: str):
         "provider": {"allow_fallbacks": True, "require_parameters": True},
         "plugins": [{"id": "context-compression"}],
     }
-    # Agent-engine tasks can include browser screenshots, so its
-    # gateway-managed overflow fallback must remain multimodal.
-    if model != "google/gemini-3.5-flash":
-        extra_body["models"] = ["google/gemini-3.5-flash"]
-
     kwargs = {
         "base_url": OPENROUTER_BASE_URL,
         "model": model,
