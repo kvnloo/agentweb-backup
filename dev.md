@@ -7460,3 +7460,67 @@ was explicitly out of scope for this PR.
 rows with the same latent goal-vs-feature ambiguity as the LinkedIn row. This PR only reworded the
 LinkedIn row's own exception clause (already added in ENG-1484); it did not re-audit those other
 rows for the "before" vs "instead of" framing gap. Flagged for a follow-up, not reproduced per-row.
+
+## ENG-1490 follow-up — audited the other 18 "Page & Feature Tool Reference" rows (2026-08-23)
+
+Full audit of every non-LinkedIn row against the same goal-vs-feature-reference ambiguity, using a
+selection criterion (a row is a candidate only if its primary arrow-target tool CREATES/DRAFTS new
+content or LAUNCHES a new campaign — a "producing a draft"-shaped action per the "When to Ask
+Questions" exemption language, not a read-only/view/list/report row) and a live DynamoDB scan of
+`AW-WorkPlans` for real catalog evidence. Verified via an 8-agent adversarial workflow (7 patches +
+1 independent re-derivation of the "not a candidate" list) before applying — every proposed patch
+came back APPROVE with no edits, exact-text matches confirmed against `origin/main`, zero pinned-test
+collisions found.
+
+**Patched (7 rows), same substitution-framed exception as the LinkedIn row**: paid social/ads
+(strongest catalog evidence — 7+ real ad-campaign plans), landing pages (own trigger keywords already
+include goal phrasing "create/build a landing page"; 3 real matching plans), research/reports/deep
+research (4 real report plans), blog (real "AEO Article Engine" plan, structurally identical to the
+already-production-verified LinkedIn fix), images, videos, and newsletter (last 3 on catalog-agnostic
+reasoning — no exact-title plan confirmed today, but the mechanism no-ops harmlessly when
+`list_predefined_work_plans` returns no match, confirmed live via the "Google reviews" negative-result
+transcript in the original ENG-1490 PR, and the underlying instruction-precedence bug — a specific
+keyword row beating the generic Work Plan Capabilities paragraph — exists independent of today's
+catalog contents).
+
+**Examined and deliberately NOT patched — different bug shape**:
+- **GTM plan row** (`list_gtm_plans`/`read_gtm_plan`) — this row's own tools are read-only; the real
+  gap is that `create_gtm_plan` lives in a separate "GTM Plan Capabilities" section never referenced
+  by this row at all. That's a documentation/cross-reference gap, not the same specific-row-beats-
+  generic-instruction conflict (there's no creation tool on this row to lose the race in the first
+  place). Left as a distinct finding for a possible separate issue, not fixed here.
+- **Tasks/automations row** (`create_task_from_template`) — genuinely creation-capable, but it's
+  already a DIFFERENT templating system (AgentWeb's browser-automation Task Templates, unrelated to
+  predefined Work Plans). Forcing the same exception here would create ambiguity between two
+  competing guided-path systems rather than resolve one. Left unpatched.
+
+**Confirmed correctly excluded (read-only/navigational, no creation tool on the row)**: SEO/GEO, CRM/
+leads, general social-posts view, brand guidelines, website scan (diagnostic on an existing site, not
+a deliverable), market strategy, knowledge base, templates (its own creation tool lives under the
+separate newsletter row instead), books/ebook (row's own tools are read-only despite the word "ebook"
+— possibly a separately stale/incomplete row, different bug class, not investigated further here).
+Google Drive has genuine write tools (`create_folder`, `create_google_doc`) but its trigger phrases
+name a storage location, not a content-creation goal a user would naturally state ("I want to make a
+Google Drive" isn't a real request shape) — excluded on that basis, flagged as the one worth
+rechecking first if this audit's premise is ever found wrong.
+
+New regression test: `agentModeSystemPrompt.goalVsFeatureRowAudit.test.ts` pins all 7 rows' exception
+wording (substitution framing only, never the "before drafting" sequencing that lost to other prompt
+policies in the original bug), confirms the ads spend-confirmation and video CREATE-vs-ANALYZE
+distinctions are preserved, and confirms the excluded read-only rows got no exception added.
+
+**Dev-transcript verification (fresh test-env, real LLM calls, not a click-through)**: ran a
+representative sample of 3 of the 7 patched rows plus a negative control against a freshly launched
+dev environment.
+
+| Phrasing | Tool trace | recommend called? | primary creation tool called? |
+|---|---|---|---|
+| "I want a landing page for my new product launch" | list→search×3→**recommend_predefined_work_plan** | true | `generate_landing_page`: false |
+| "I want to write a blog post about our new feature" | list→read_brand_guidelines→read_market_strategy→search×5→read×7→**recommend_predefined_work_plan** | true | `create_blog_article`: false |
+| "help me launch a Meta ad campaign" | list→search×3→read×5→**recommend_predefined_work_plan** | true | `list_meta_ads_campaigns`: false |
+| "can you write me a haiku about coffee" (negative control) | (no tool calls) | false | n/a |
+
+All three positive cases: Emma checked the plan catalog and proposed a matching plan instead of
+proceeding with the row's primary tool, in the same shape already verified in production for the
+LinkedIn row. Negative control: no spurious recommendation, no spurious tool calls, answered
+directly. Full transcripts in the ENG-1490 follow-up PR.
