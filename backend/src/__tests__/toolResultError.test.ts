@@ -1,3 +1,4 @@
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { toolResultError, extractToolResultMessage } from '../utils/toolResultError';
 
 describe('extractToolResultMessage', () => {
@@ -79,5 +80,30 @@ describe('toolResultError', () => {
   it('a status-only failure is no longer opaque', () => {
     // the run_local "Tool returned success=false" class: now names the status
     expect(toolResultError({ success: false, status: 'rejected_out_of_scope' })!.message).toBe('status: rejected_out_of_scope');
+  });
+
+  it('preserves a tracking-preflight policy block as a typed error for telemetry', () => {
+    const err = toolResultError({
+      success: false,
+      blocked: true,
+      reason: 'tracking_preflight',
+      error: 'Launch blocked: pre-flight tracking check failed.',
+    });
+
+    expect(err!.name).toBe('ToolResultPolicyBlockedError');
+    expect(err).toMatchObject({ reason: 'tracking_preflight' });
+    expect(classifyToolErrorClass(err)).toBe('policy_blocked');
+  });
+
+  it('preserves a scheduled publish-consent refusal as a typed policy block', () => {
+    const err = toolResultError({
+      success: false,
+      blocked: true,
+      reason: 'publish_consent',
+      error: 'post_on_connected_account was not executed: this unattended scheduled run is not authorized to publish.',
+    });
+
+    expect(err!.name).toBe('ToolResultPolicyBlockedError');
+    expect(err).toMatchObject({ reason: 'publish_consent' });
   });
 });
