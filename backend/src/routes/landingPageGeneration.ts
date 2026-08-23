@@ -1794,7 +1794,14 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       } catch (createPrErr: any) {
         // Another publish request can create the same PR after our lookup. GitHub
         // returns 422 for that benign race; prove the PR now exists before reuse.
-        if (createPrErr.response?.status !== 422) throw createPrErr;
+        const createPrMessages = [
+          createPrErr.response?.data?.message,
+          ...(Array.isArray(createPrErr.response?.data?.errors)
+            ? createPrErr.response.data.errors.map((error: { message?: string }) => error.message)
+            : []),
+        ].filter((message): message is string => typeof message === "string");
+        const isDuplicatePr = createPrMessages.some((message) => /pull request already exists/i.test(message));
+        if (createPrErr.response?.status !== 422 || !isDuplicatePr) throw createPrErr;
         const racedPrRes = await findOpenDraftPr();
         if (racedPrRes.data.length === 0) throw createPrErr;
       }

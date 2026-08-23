@@ -1338,6 +1338,27 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     );
   });
 
+  it("FAIL: an unrelated pull-request validation error is not retried as a duplicate", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] });
+    mockAxios.post.mockRejectedValueOnce({
+      response: { status: 422, data: { message: "Validation Failed: head repository is unavailable" } },
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(500);
+    expect(mockAxios.get).toHaveBeenCalledTimes(3);
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
   it("FAIL: consent revoked during the 409 fallback → main is never force-advanced", async () => {
     mockGetLandingPageById.mockResolvedValueOnce(PAGE);
     stub409Fallback();
