@@ -7415,3 +7415,48 @@ Both reported lists need **CRM cleanup, not code** — delete or rename the orph
 `md99qvwnk`, and reconcile the Emma Partner Network page record onto the list its form
 actually writes to (or delete the duplicate, as `LANDERS.md` already says). Both are
 production data mutations behind the same data-plane gate.
+
+## ENG-1490 — recommend_predefined_work_plan lost to the "produce drafts without asking" policy (2026-08-23)
+
+Live DynamoDB trace (production `sessionId b71af8c0-afab-4cff-8417-d5148b05d286`) proved Emma calls
+`list_predefined_work_plans`, searches the result across three turns, finds a genuine match, and
+still calls `create_social_media_posts` directly — `recommend_predefined_work_plan` never fires.
+This is NOT a tool-batching race (the list result WAS seen before drafting); it's a prompt conflict.
+
+Root cause: two CRITICAL, apply-to-every-request policies sit much earlier in
+`agentModeSystemPrompt.ts` than the Work Plan Capabilities section (line 488, ~55% through the
+889-line file) and both tell the model to skip confirmation and just produce the deliverable:
+
+- "Decision Framework" (line 70): CLARIFY → CHECK skills → INSTALL → EXECUTE ("use your tools to
+  complete the request"). Never references the work-plan check at all.
+- "When to Ask Questions" (line 122): explicitly names "producing a draft" as exempt from
+  confirmation, and confirmation is required only for spend/publish/irreversible actions.
+
+Fix (this PR): four targeted edits making the recommendation an explicit substitute for drafting,
+not an extra step alongside it — (1) wired the work-plan check into the Decision Framework's
+EXECUTE step, (2) added a named carve-out in "When to Ask Questions" so a matching-plan proposal is
+not treated as a banned "should I proceed?" pause, (3) strengthened the Work Plan Capabilities
+paragraph to state the recommendation replaces drafting, (4) reworded the LinkedIn reference-table
+row from "before drafting" (sequencing) to "instead of ... in this same turn" (substitution). None
+of the spend/publish/irreversible exemption categories were touched.
+
+Verified via dev-environment before/after transcripts (not a single click-through) across 3
+phrasings against a freshly launched test-env: a clear LinkedIn-goal match now calls
+`recommend_predefined_work_plan` and does NOT also draft; a goal with no matching plan in the
+catalog (Google reviews) answers directly with no spurious recommendation; an ad-hoc draft request
+unrelated to any plan (birthday post) still drafts immediately with no pause. Full transcripts in
+the ENG-1490 PR description.
+
+**Known residual risk, not fixed here**: the agent loop's tool-calling is OpenAI-style batched
+(`agentModeService.ts` `responseMessage.tool_calls` can contain N calls executed concurrently via
+`Promise.all` in `toolDispatch.ts` before the next LLM turn) — nothing at the code level prevents a
+future phrasing from batching `list_predefined_work_plans` together with a drafting tool in one
+turn, which would reintroduce this failure mode even with the reworded prompt. The fix here is
+prompt-level only; a code-level sequencing guard (e.g. forcing `recommend_predefined_work_plan`
+decisions to complete before drafting tools are eligible in the same turn) is a larger change and
+was explicitly out of scope for this PR.
+
+**Also not fixed here**: ENG-1484's dev.md note flagged ~15 other "Page & Feature Tool Reference"
+rows with the same latent goal-vs-feature ambiguity as the LinkedIn row. This PR only reworded the
+LinkedIn row's own exception clause (already added in ENG-1484); it did not re-audit those other
+rows for the "before" vs "instead of" framing gap. Flagged for a follow-up, not reproduced per-row.
