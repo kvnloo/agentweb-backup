@@ -65,6 +65,13 @@ import {
 } from './agentMode/core/askUserQuestion';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
+import {
+  DEFAULT_NEW_CHAT_HERO_GREETING,
+  NEW_CHAT_HERO_GREETING_SETTING,
+  NewChatHeroGreeting,
+  parseNewChatHeroGreetingSetting,
+  validateNewChatHeroGreeting,
+} from '../utils/newChatHeroGreeting';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { createWriteStream, promises as fs, default as fsSync } from 'fs';
@@ -4622,6 +4629,38 @@ export class AgentModeService {
 
     // Fallback to default welcome message
     return "I'm Emma, your team's new CMO 😎. I'll help you research, build, deploy, and measure Meta campaign insights in a blink of an eye.<br><br><strong>To get started, can you share your website URL?</strong>";
+  }
+
+  async getNewChatHeroGreeting(): Promise<NewChatHeroGreeting> {
+    try {
+      const setting = await settingsService.getSetting(NEW_CHAT_HERO_GREETING_SETTING);
+      return parseNewChatHeroGreetingSetting(setting?.settingValue);
+    } catch (error) {
+      console.error('Error getting New Chat hero greeting:', error);
+      return { ...DEFAULT_NEW_CHAT_HERO_GREETING };
+    }
+  }
+
+  async saveNewChatHeroGreeting(
+    value: unknown,
+    updatedBy: string = 'system',
+  ): Promise<NewChatHeroGreeting> {
+    const validationError = validateNewChatHeroGreeting(value);
+    if (validationError) throw new Error(validationError);
+
+    const normalized = parseNewChatHeroGreetingSetting(value);
+    await settingsService.setSetting(
+      NEW_CHAT_HERO_GREETING_SETTING,
+      JSON.stringify(normalized),
+      'Customer Portal New Chat hero greeting presentation copy',
+      updatedBy,
+    );
+    return normalized;
+  }
+
+  async resetNewChatHeroGreeting(): Promise<NewChatHeroGreeting> {
+    await settingsService.deleteSetting(NEW_CHAT_HERO_GREETING_SETTING);
+    return { ...DEFAULT_NEW_CHAT_HERO_GREETING };
   }
 
   async getConversationStarters(): Promise<string[]> {

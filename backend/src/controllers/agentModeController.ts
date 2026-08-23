@@ -78,6 +78,7 @@ import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
+import { validateNewChatHeroGreeting } from '../utils/newChatHeroGreeting';
 import { normalizeEmailList } from '../utils/validation';
 import {
   MAX_ATOMIC_RUN_RESULT_REMOVALS,
@@ -8113,6 +8114,42 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Get welcome message error:', error);
       res.status(500).json({ error: 'Failed to get welcome message' });
+    }
+  },
+
+  // Presentation-only New Chat greeting. It is never included in Emma's prompt
+  // or persisted as a chat message.
+  async getNewChatHeroGreeting(req: Request, res: Response) {
+    try {
+      res.json(await agentModeService.getNewChatHeroGreeting());
+    } catch (error) {
+      console.error('AgentMode: Get New Chat hero greeting error:', error);
+      res.status(500).json({ error: 'Failed to get New Chat hero greeting' });
+    }
+  },
+
+  async updateNewChatHeroGreeting(req: Request, res: Response) {
+    try {
+      const validationError = validateNewChatHeroGreeting(req.body);
+      if (validationError) return res.status(400).json({ error: validationError });
+
+      const greeting = await agentModeService.saveNewChatHeroGreeting(
+        req.body,
+        req.user?.email || 'system',
+      );
+      res.json(greeting);
+    } catch (error) {
+      console.error('AgentMode: Update New Chat hero greeting error:', error);
+      res.status(500).json({ error: 'Failed to update New Chat hero greeting' });
+    }
+  },
+
+  async resetNewChatHeroGreeting(req: Request, res: Response) {
+    try {
+      res.json(await agentModeService.resetNewChatHeroGreeting());
+    } catch (error) {
+      console.error('AgentMode: Reset New Chat hero greeting error:', error);
+      res.status(500).json({ error: 'Failed to reset New Chat hero greeting' });
     }
   },
 
