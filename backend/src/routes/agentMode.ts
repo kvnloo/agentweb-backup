@@ -247,6 +247,10 @@ router.put('/session/:sessionId/task/:taskId/execution/:executionId/status', asy
 // Submit or update message feedback
 router.put('/session/:sessionId/message/:messageIndex/feedback', asyncHandlerAuth(agentModeController.submitMessageFeedback));
 
+// POST /api/agent-mode/session/:sessionId/work-plan-recommendations/:recommendationId/accept
+// Owner-only: instantiate a previously-recommended predefined work plan (ENG-1472)
+router.post('/session/:sessionId/work-plan-recommendations/:recommendationId/accept', asyncHandlerAuth(agentModeController.acceptWorkPlanRecommendation));
+
 // POST /api/agent-mode/share
 // Create shareable link for conversation
 router.post('/share', asyncHandler(agentModeController.createShareLink));

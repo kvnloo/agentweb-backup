@@ -11,6 +11,7 @@ import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
+import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
@@ -9228,6 +9229,108 @@ export const agentModeController = {
     }
   },
 
+  /**
+   * POST /api/agent-mode/session/:sessionId/work-plan-recommendations/:recommendationId/accept
+   *
+   * ENG-1472: the owner-only accept endpoint for a `recommend_predefined_work_plan`
+   * proposal. Only the session owner may call it — this route sits below
+   * `router.use(authenticateToken)` and is deliberately NOT registered under the
+   * `/ishare`/`/share` public routes, so interactive/view-only shares (which
+   * authenticate via a conversable token, not a JWT) cannot reach it at all.
+   *
+   * The plan to instantiate is resolved from the SESSION'S OWN persisted
+   * recommendation record by recommendationId — never from anything in the
+   * request body — and re-resolved for access at click time before being
+   * applied via the existing applyPredefinedWorkPlan path.
+   */
+  async acceptWorkPlanRecommendation(req: AuthenticatedRequest, res: Response) {
+    try {
+      const { sessionId, recommendationId } = req.params;
+      const user = req.user as User;
+      if (!user) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Owner-only — no admin bypass. A delegated session already carries the
+      // target customer's userId as req.user (see the delegation docs in
+      // CLAUDE.md), so this still succeeds correctly for a delegated accept;
+      // a real admin viewing someone else's session without delegating is
+      // refused, same as everywhere else a customer's own plan is mutated.
+      if (session.userId !== user.userId) {
+        return res.status(403).json({ error: 'Only the session owner can accept a work plan recommendation.' });
+      }
+
+      const { findWorkPlanRecommendationToolResult, resolveAccessiblePredefinedWorkPlan } =
+        await import('../services/predefinedWorkPlanResolver');
+
+      const recommendation = findWorkPlanRecommendationToolResult(
+        session.messages,
+        (r) => r.recommendationId === recommendationId,
+      );
+      if (!recommendation || !recommendation.plan?.id) {
+        return res.status(404).json({
+          error: 'WORKPLAN_UNAVAILABLE',
+          code: 'WORKPLAN_UNAVAILABLE',
+          message: 'This work plan recommendation is no longer available.',
+        });
+      }
+      const planId = recommendation.plan.id;
+
+      // Idempotency requires the stable template identity. A legacy work plan
+      // without templatePlanId cannot safely be matched by title: ad-hoc plans
+      // can share a template title, so treating one as applied would silently
+      // suppress the selected recommendation.
+      const existingWorkPlan = session.workPlan;
+      const hasActivePlan = !!existingWorkPlan && Array.isArray(existingWorkPlan.steps) && existingWorkPlan.steps.length > 0;
+      const alreadyApplied = hasActivePlan && (existingWorkPlan as any).templatePlanId === planId;
+      if (alreadyApplied) {
+        return res.status(200).json({ success: true, alreadyApplied: true, workPlan: existingWorkPlan });
+      }
+
+      // A DIFFERENT work plan is already active — conflict, never force-replace here.
+      if (hasActivePlan) {
+        return res.status(409).json({
+          error: 'ACTIVE_WORK_PLAN',
+          code: 'ACTIVE_WORK_PLAN',
+          message: `A work plan "${existingWorkPlan!.title}" is already active in this session.`,
+        });
+      }
+
+      // Re-resolve access at click time — the plan can have been deleted,
+      // unpublished, or had its access changed since it was recommended.
+      const plan = await resolveAccessiblePredefinedWorkPlan({ planId, userId: user.userId });
+      if (!plan) {
+        return res.status(404).json({
+          error: 'WORKPLAN_UNAVAILABLE',
+          code: 'WORKPLAN_UNAVAILABLE',
+          message: 'This work plan is no longer available.',
+        });
+      }
+
+      const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId);
+      if (!result.success) {
+        // Defensive backstop for a race between our pre-check above and this
+        // call (e.g. a concurrent accept/launch landed in between) — never a
+        // silent partial: chat/session state is left exactly as applyPredefinedWorkPlan
+        // left it (unchanged on failure).
+        if (result.requiresConfirmation) {
+          return res.status(409).json({ error: 'ACTIVE_WORK_PLAN', code: 'ACTIVE_WORK_PLAN', message: result.message });
+        }
+        return res.status(404).json({ error: 'WORKPLAN_UNAVAILABLE', code: 'WORKPLAN_UNAVAILABLE', message: result.message });
+      }
+
+      return res.status(200).json({ success: true, alreadyApplied: false, workPlan: result.workPlan });
+    } catch (error) {
+      console.error('AgentMode: Accept work plan recommendation error:', error);
+      res.status(500).json({ error: 'Failed to accept work plan recommendation' });
+    }
+  },
+
   // Submit message feedback for ishare sessions (public with conversable token)
   async submitIShareMessageFeedback(req: Request, res: Response) {
     try {
@@ -11589,7 +11692,11 @@ export const agentModeController = {
         }
       }
 
-      // Map to legacy shape expected by customer portal (uses 'id' not 'planId')
+      // Map to legacy shape expected by customer portal (uses 'id' not 'planId').
+      // `display` carries the new canonical customer-facing projection alongside
+      // the legacy keys above — existing PlanPage/AgentMode consumers keep
+      // working unchanged, and a consumer that wants the safe, deduped
+      // browse/recommendation shape reads `display` instead (ENG-1469).
       const mapPlan = (p: any) => ({
         id: p.planId,
         title: p.title,
@@ -11605,6 +11712,7 @@ export const agentModeController = {
         visibility: p.visibility,
         thumbnail_url: p.thumbnail_url,
         thumbnail_alt_text: p.thumbnail_alt_text,
+        display: projectWorkPlanForCustomer(p),
       });
 
       // Put private plans first, then public — deduplicate by title so user's
@@ -11683,6 +11791,9 @@ export const agentModeController = {
         defaultModel: workPlan.defaultModel,
         steps: workPlan.steps,
         visibility: workPlan.visibility,
+        // Canonical customer-facing projection alongside the legacy keys above
+        // — existing consumers are unaffected (ENG-1469).
+        display: projectWorkPlanForCustomer(workPlan),
       });
     } catch (error) {
       console.error('AgentMode: Get predefined work plan error:', error);
@@ -11785,7 +11896,12 @@ export const agentModeController = {
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
         autocomplete: predefinedPlan.autocomplete || false,
         showLoginSignup: predefinedPlan.showLoginSignup || 'after_plan_completed',
-        requireLogin: predefinedPlan.requireLogin || false
+        requireLogin: predefinedPlan.requireLogin || false,
+        // ENG-1472: stamp which template this session's plan came from — the
+        // same field applyPredefinedWorkPlan stamps on its own instantiation
+        // path — so every predefined-plan session is traceable back to its
+        // template regardless of which route created it.
+        templatePlanId: predefinedPlan.planId,
       };
       await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
       const firstInput = predefinedPlan.steps[0]?.inputRequest;
