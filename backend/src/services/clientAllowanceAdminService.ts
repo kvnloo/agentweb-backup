@@ -44,7 +44,11 @@ type Deps = {
   getUserTokenAllowance(userId: string): Promise<{ allowance: number | null; bonus: number; effectiveAllowance: number | null; costAllowance: number | null }>;
   checkTokenUsage(userId: string): Promise<{ allowed: boolean }>;
   getSubscriptionTypeConfig(subscriptionType: string): Promise<unknown | null>;
-  updateUser(userId: string, updates: { subscriptionType: string }, options: unknown): Promise<User>;
+  // The mutation result is intentionally unused: the post-write inspection is
+  // the source of the returned snapshot. Keep this adapter compatible with
+  // UserDB's DynamoDB AttributeMap | User result without widening business
+  // data through the service boundary.
+  updateUser(userId: string, updates: { subscriptionType: string }, options: unknown): Promise<unknown>;
   grantMonthlyLlmUsageCredit(input: {
     billingUserId: string; grantId: string; source: 'admin'; amountMicroUsd: number; reason: string; grantedBy: string;
   }): Promise<{ granted: boolean; billingUserId: string; ledger: MonthlyLlmUsageCredits }>;
