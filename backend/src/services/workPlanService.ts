@@ -18,6 +18,21 @@ const dynamodb = new AWS.DynamoDB.DocumentClient({
 });
 
 export type WorkPlanVisibility = 'system' | 'private' | 'public' | 'pending_review';
+export type WorkPlanDisplayCategory = 'strategy' | 'paid-ads' | 'founder-led-sales' | 'event-led-sales' | 'content';
+export type WorkPlanDisplayChannel = 'meta' | 'google' | 'linkedin' | 'email' | 'event' | 'content' | 'cross-channel';
+
+/** Customer-facing metadata only. It never changes how a plan executes. */
+export interface WorkPlanDisplayMetadataV1 {
+  version: 1;
+  title?: string;
+  summary?: string;
+  categories?: WorkPlanDisplayCategory[];
+  channel?: WorkPlanDisplayChannel;
+  suite?: { id: string; name: string; position: number };
+  stepLabels?: string[];
+  /** Author-approved optional continuations; users may still start any plan. */
+  nextPlanIds?: string[];
+}
 
 /**
  * Maximum length of a step's userInstructions field. Capped so the
@@ -57,6 +72,7 @@ export interface WorkPlan {
   showInAgentMode?: boolean;
   defaultModel?: string;
   category?: string;
+  display?: WorkPlanDisplayMetadataV1;
   steps: WorkPlanStep[];
   ownerId?: string;
   orgId?: string;
@@ -92,6 +108,7 @@ const THUMBNAIL_FIELDS = ['thumbnail_url', 'thumbnail_source', 'thumbnail_alt_te
 const OPTIONAL_PLAN_FIELDS = [
   'description', 'welcomeMessage', 'autocomplete', 'requireLogin', 'showLoginSignup',
   'showInAgentMode', 'defaultModel', 'category', 'ownerId', 'orgId', 'reviewFeedback',
+  'display',
 ] as const;
 
 /** Always written. */
