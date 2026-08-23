@@ -31,8 +31,10 @@ export type ClientAllowanceSnapshot = {
 
 type User = { userId: string; email: string; subscriptionType?: string; llmUsageCredits?: MonthlyLlmUsageCredits };
 type Deps = {
-  getUserByEmail(email: string): Promise<User | null>;
-  getUserById(userId: string): Promise<User | null>;
+  // DynamoDB's repository returns `undefined` for a missing item.  Accept it
+  // at this boundary and normalize it alongside `null` in the service.
+  getUserByEmail(email: string): Promise<User | null | undefined>;
+  getUserById(userId: string): Promise<User | null | undefined>;
   resolveBillingUserId(userId: string): Promise<string>;
   getUserSubscriptionType(userId: string): Promise<string>;
   getUserTokenUsage(userId: string): Promise<{ month: string; totalTokens: number; totalCost: number; bonus: number }>;
