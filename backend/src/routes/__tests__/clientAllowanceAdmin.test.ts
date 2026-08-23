@@ -77,4 +77,16 @@ describe('client allowance admin routes', () => {
       amountUsd: 2.5, idempotencyKey: 'support-20260823', actor: { userId: 'admin-1', email: 'admin@example.com' },
     }), expect.any(Object));
   });
+
+  it('maps known service failures and redacts unexpected failures', async () => {
+    inspect.mockRejectedValueOnce(Object.assign(new (require('../../services/clientAllowanceAdminService').ClientAllowanceError)('CLIENT_NOT_FOUND', 'missing'), { code: 'CLIENT_NOT_FOUND' }));
+    await request(app).get('/api/admin/client-allowance?email=missing@example.com').expect(404, { message: 'missing', code: 'CLIENT_NOT_FOUND' });
+
+    change.mockRejectedValueOnce(Object.assign(new (require('../../services/clientAllowanceAdminService').ClientAllowanceError)('CLIENT_ALLOWANCE_CONFLICT', 'changed'), { code: 'CLIENT_ALLOWANCE_CONFLICT' }));
+    await request(app).post('/api/admin/client-allowance/subscription').send({ email: 'client@example.com', subscriptionType: 'Pro', reason: 'Support correction', confirmed: true }).expect(409, { message: 'changed', code: 'CLIENT_ALLOWANCE_CONFLICT' });
+
+    inspect.mockRejectedValueOnce(new Error('database password should not leak'));
+    const response = await request(app).get('/api/admin/client-allowance?email=client@example.com').expect(500);
+    expect(response.body).toEqual({ message: 'Client allowance operation failed' });
+  });
 });

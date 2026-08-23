@@ -114,4 +114,36 @@ describe('clientAllowanceAdminService', () => {
     }, deps)).rejects.toMatchObject({ code: 'INVALID_CREDIT_AMOUNT' });
     expect(deps.grantMonthlyLlmUsageCredit).not.toHaveBeenCalled();
   });
+
+  it('rejects zero but accepts the one-cent positive whole-cent boundary', async () => {
+    const zeroDeps = makeDeps();
+    await expect(grantClientCostCredit({
+      email: 'client@example.com', amountUsd: 0, idempotencyKey: 'support-20260823',
+      actor: { userId: 'admin-1' }, reason: 'Support correction',
+    }, zeroDeps)).rejects.toMatchObject({ code: 'INVALID_CREDIT_AMOUNT' });
+    expect(zeroDeps.grantMonthlyLlmUsageCredit).not.toHaveBeenCalled();
+
+    const pennyDeps = makeDeps();
+    await expect(grantClientCostCredit({
+      email: 'client@example.com', amountUsd: 0.01, idempotencyKey: 'support-20260824',
+      actor: { userId: 'admin-1' }, reason: 'Support correction',
+    }, pennyDeps)).resolves.toMatchObject({ granted: true });
+    expect(pennyDeps.grantMonthlyLlmUsageCredit).toHaveBeenCalledWith(expect.objectContaining({ amountMicroUsd: 10_000 }));
+  });
+
+  it('accepts a missing persisted subscription as the normalized Free tier', async () => {
+    const deps = makeDeps({
+      getUserSubscriptionType: jest.fn().mockResolvedValueOnce('Free').mockResolvedValueOnce('Pro'),
+      getUserById: jest.fn()
+        .mockResolvedValueOnce({ ...user, llmUsageCredits: { month: '2026-08', grantIds: [], grants: [] } })
+        .mockResolvedValueOnce({ ...user, subscriptionType: undefined })
+        .mockResolvedValueOnce({ ...user, llmUsageCredits: { month: '2026-08', grantIds: [], grants: [] } }),
+    });
+    await changeClientSubscription({
+      email: 'client@example.com', subscriptionType: 'Pro', actor: { userId: 'admin-1' }, reason: 'Support correction',
+    }, deps);
+    expect(deps.updateUser).toHaveBeenCalledWith('billing-1', { subscriptionType: 'Pro' }, expect.objectContaining({
+      condition: expect.objectContaining({ expression: 'attribute_not_exists(#subscriptionType)' }),
+    }));
+  });
 });

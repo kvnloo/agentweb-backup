@@ -124,7 +124,9 @@ export async function grantClientCostCredit(
   }
   const centsExact = input.amountUsd * 100;
   const cents = Math.round(centsExact);
-  if (!Number.isFinite(input.amountUsd) || input.amountUsd <= 0 || Math.abs(centsExact - cents) > 1e-9) {
+  const amountMicroUsd = cents * 10_000;
+  if (!Number.isFinite(input.amountUsd) || input.amountUsd <= 0 || Math.abs(centsExact - cents) > 1e-9
+    || !Number.isSafeInteger(cents) || !Number.isSafeInteger(amountMicroUsd)) {
     throw new ClientAllowanceError('INVALID_CREDIT_AMOUNT', 'amountUsd must be a positive whole-cent amount');
   }
 
@@ -132,7 +134,7 @@ export async function grantClientCostCredit(
   const result = await deps.grantMonthlyLlmUsageCredit({
     billingUserId: before.billingUserId,
     grantId: `admin:${before.billingUserId}:${input.idempotencyKey}`,
-    source: 'admin', amountMicroUsd: cents * 10_000,
+    source: 'admin', amountMicroUsd,
     reason: input.reason.trim(), grantedBy: input.actor.email || input.actor.userId,
   });
   const after = await inspectClientAllowance(input.email, deps);
@@ -160,13 +162,24 @@ export async function changeClientSubscription(
   }
   if (before.subscriptionType === requested) return { before, after: before, changed: false };
 
+  // The normalized subscription helper treats a missing value as Free. The
+  // conditional write must instead compare against the persisted shape so an
+  // absent legacy value can be changed without silently disabling the guard.
+  const billingUser = await deps.getUserById(before.billingUserId);
+  if (!billingUser) throw new ClientAllowanceError('CLIENT_NOT_FOUND', 'The client billing account no longer exists');
+  const persistedSubscriptionType = typeof billingUser.subscriptionType === 'string'
+    ? billingUser.subscriptionType : undefined;
+  const condition = persistedSubscriptionType === undefined
+    ? { expression: 'attribute_not_exists(#subscriptionType)', names: { '#subscriptionType': 'subscriptionType' } }
+    : {
+      expression: '#subscriptionType = :expectedSubscriptionType',
+      names: { '#subscriptionType': 'subscriptionType' },
+      values: { ':expectedSubscriptionType': persistedSubscriptionType },
+    };
+
   try {
     await deps.updateUser(before.billingUserId, { subscriptionType: requested }, {
-      condition: {
-        expression: '#subscriptionType = :expectedSubscriptionType',
-        names: { '#subscriptionType': 'subscriptionType' },
-        values: { ':expectedSubscriptionType': before.subscriptionType },
-      },
+      condition,
     });
   } catch (error: any) {
     if (error?.code === 'ConditionalCheckFailedException') {
