@@ -1,3 +1,37 @@
+## ENG-1478: a prompt can describe a branch correctly and still never enter it (2026-08-22)
+
+ENG-1472 added `recommend_predefined_work_plan` (an inline, soft-accept proposal card) and the
+system prompt's "Work Plan Capabilities" section already told Emma which tool to call once a
+goal-matching template was known: *"states a concrete current goal that clearly matches exactly one
+template from list_predefined_work_plans, call recommend_predefined_work_plan..."* That sentence
+reads as complete — it names the trigger, the tool, and the guardrails (ask-if-ambiguous, don't
+re-recommend). It is not: it silently assumes the plan list is already sitting in context.
+
+Live-reproduced (Harsha, 2026-08-22): a fresh chat, "I'm interested in making some linkedin posts",
+with a plan literally named `Research_Based_Linkedin_Founder_Post` accessible to the account —
+no recommendation. The prompt has one line just below this section stating the *active* work
+plan's status "is automatically provided in your context." Nothing says the same about the
+*available templates* — because it isn't true; `list_predefined_work_plans` is a tool call, not
+injected context. The branching instruction was written as if discovering a match were free. For
+an ordinary conversational turn where the user never mentioned work plans, calling an extra
+"informational" tool is exactly the kind of speculative call a model will skip unless told to make
+it — and nothing here told it to.
+
+Fix: added one explicit sentence — check for a match before replying; if `list_predefined_work_plans`
+hasn't already been called this session, call it now, even though the user never asked about work
+plans — plus a line stating outright that templates are not auto-injected the way active-plan status
+is. The rest of the branch (single-match → recommend, ambiguous → one clarifying question, no
+re-recommend) was already correct and is unchanged.
+
+Verification is the same convention every other `agentModeSystemPrompt.*` section uses: string
+assertions against the compiled `AGENT_MODE_SYSTEM_PROMPT` constant
+(`agentModeSystemPrompt.workPlanRecommendation.test.ts`) — this repo has 14 sibling files doing
+exactly this for other guardrails (menu selection, capability denial, lead-import resume, etc.), so
+prompt content here is treated as tested code, not prose. A live multi-turn transcript check (does
+the model actually call the tool now) is the residual proof this test shape can't give — flagged in
+the PR as the one thing NOT covered by a unit assertion, same as it is for every other guardrail in
+this file.
+
 ## ENG-1371: deleting a retired gate is easy; the things quietly leaning on it are not (2026-08-19)
 
 Greptile was dropped as a vendor. Its app had already stopped posting — the `Greptile Review`
