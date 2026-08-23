@@ -1759,6 +1759,59 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       return true;
     };
 
+    // A generated branch has no CI of its own: the landing-page repository runs
+    // Tests for pull requests. Open (or reuse) that repository-supported review
+    // path, then inspect the exact draft SHA before any write can advance main.
+    // The route deliberately returns a retryable, non-500 result while GitHub is
+    // still running the check; it never treats a branch-level result as proof for
+    // a different commit.
+    if (await refuseIfConsentWithdrawn()) return;
+
+    const draftRefRes = await axios.get<any>(
+      `${repoBase}/git/ref/heads/${encodeURIComponent(branch)}`,
+      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+    );
+    const draftSha: string = draftRefRes.data.object.sha;
+    const existingPrRes = await axios.get<any[]>(`${repoBase}/pulls`, {
+      headers: ghHeaders,
+      timeout: GITHUB_TIMEOUT_MS,
+      params: { state: "open", head: `${owner}:${branch}`, base: "main" },
+    });
+
+    if (existingPrRes.data.length === 0) {
+      await axios.post(
+        `${repoBase}/pulls`,
+        {
+          title: `Publish landing page changes from ${branch}`,
+          head: branch,
+          base: "main",
+          body: "Automated publish check for the generated landing-page draft.",
+        },
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+    }
+
+    const checksRes = await axios.get<any>(
+      `${repoBase}/commits/${draftSha}/check-runs`,
+      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+    );
+    const testsCheck = (checksRes.data.check_runs || []).find(
+      (check: { name?: string }) => check.name === "Tests"
+    );
+
+    if (!testsCheck || testsCheck.status !== "completed") {
+      const message = !testsCheck
+        ? "Required Tests check has not started for this draft yet. Keep the draft and retry publish after GitHub starts it."
+        : "Required Tests check is still running for this draft. Keep the draft and retry publish when it completes."
+      return res.status(409).json({ error: "required_tests_pending", message });
+    }
+    if (testsCheck.conclusion !== "success") {
+      return res.status(409).json({
+        error: "required_tests_failed",
+        message: "Required Tests check failed for this draft. Fix the draft and retry publish after Tests passes.",
+      });
+    }
+
     if (await refuseIfConsentWithdrawn()) return;
 
     try {

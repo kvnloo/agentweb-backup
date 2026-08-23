@@ -1017,9 +1017,18 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
   afterEach(resetGitHubStubs);
 
   const stubGitHubMergeFlow = () => {
-    // GET pre-merge main ref → POST /merges → DELETE branch ref
-    mockAxios.get.mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } });
-    mockAxios.post.mockResolvedValueOnce({ data: { sha: "merge-sha" } });
+    // GET main ref → consent → GET draft ref → find/create PR → inspect Tests
+    // → consent → POST /merges → DELETE branch ref
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
+      });
+    mockAxios.post
+      .mockResolvedValueOnce({ data: { number: 123 } })
+      .mockResolvedValueOnce({ data: { sha: "merge-sha" } });
     mockAxios.delete.mockResolvedValueOnce({ data: {} });
   };
 
@@ -1180,10 +1189,98 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
   const stub409Fallback = () => {
     mockAxios.get
       .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })  // pre-merge main
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }) // initial draft ref
+      .mockResolvedValueOnce({ data: [] }) // no existing PR
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
+      })
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }); // branch tip
-    mockAxios.post.mockRejectedValueOnce({ response: { status: 409 } });
+    mockAxios.post
+      .mockResolvedValueOnce({ data: { number: 123 } })
+      .mockRejectedValueOnce({ response: { status: 409 } });
     mockAxios.delete.mockResolvedValueOnce({ data: {} });
   };
+
+  const stubDraftCheck = (check: { status: string; conclusion: string | null }) => {
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: { check_runs: [{ name: "Tests", ...check }] } });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+  };
+
+  it("FAIL: missing Tests result preserves the draft and never advances main", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: { check_runs: [] } });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(res.body.message).toMatch(/Tests.*not started/i);
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: pending Tests result preserves the draft and never advances main", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubDraftCheck({ status: "in_progress", conclusion: null });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: failed Tests result preserves the draft and never advances main", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubDraftCheck({ status: "completed", conclusion: "failure" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_failed");
+    expect(res.body.message).toMatch(/Tests.*failed/i);
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: passing Tests for the exact draft SHA permits the existing merge flow", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(mockAxios.get).toHaveBeenCalledWith(
+      expect.stringContaining("/commits/draft-tip-sha/check-runs"), expect.anything()
+    );
+    expect(mockAxios.post).toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
 
   it("FAIL: consent revoked during the 409 fallback → main is never force-advanced", async () => {
     mockGetLandingPageById.mockResolvedValueOnce(PAGE);
