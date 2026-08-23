@@ -19,9 +19,23 @@ describe('manage_client_allowance MCP tool', () => {
     await mcpToolRegistry.execute('manage_client_allowance', { action: 'change_subscription', email: 'a@example.com', subscription_type: 'Pro', reason: 'support', confirmed: true }, context);
     await mcpToolRegistry.execute('manage_client_allowance', { action: 'grant_cost_credit', email: 'a@example.com', amount_usd: 0.01, idempotency_key: 'credit-20260823', reason: 'support', confirmed: true }, context);
     expect(fetchMock.mock.calls.map(([call]) => call)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ method: 'GET', path: '/api/admin/client-allowance?email=a%2Bb%40example.com' }),
-      expect.objectContaining({ method: 'POST', path: '/api/admin/client-allowance/subscription', body: expect.objectContaining({ subscriptionType: 'Pro', confirmed: true }) }),
-      expect.objectContaining({ method: 'POST', path: '/api/admin/client-allowance/cost-credit', body: expect.objectContaining({ amountUsd: 0.01, idempotencyKey: 'credit-20260823', confirmed: true }) }),
+      expect.objectContaining({
+        method: 'GET',
+        path: '/api/admin/client-allowance?email=a%2Bb%40example.com',
+        context: expect.objectContaining({ userId: 'admin-1' }),
+      }),
+      expect.objectContaining({
+        method: 'POST',
+        path: '/api/admin/client-allowance/subscription',
+        context: expect.objectContaining({ userId: 'admin-1' }),
+        body: expect.objectContaining({ email: 'a@example.com', subscriptionType: 'Pro', confirmed: true }),
+      }),
+      expect.objectContaining({
+        method: 'POST',
+        path: '/api/admin/client-allowance/cost-credit',
+        context: expect.objectContaining({ userId: 'admin-1' }),
+        body: expect.objectContaining({ email: 'a@example.com', amountUsd: 0.01, idempotencyKey: 'credit-20260823', confirmed: true }),
+      }),
     ]));
   });
 
