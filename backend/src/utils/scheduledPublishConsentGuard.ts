@@ -33,6 +33,8 @@ import { extractScheduleId } from './schedulePublishApproval';
 
 export interface ScheduledPublishRefusal {
   success: false;
+  blocked: true;
+  reason: 'publish_consent';
   error: string;
 }
 
@@ -163,6 +165,8 @@ export function readAdmittedAuthorization(session: any): SchedulePublishAuthoriz
 function refuse(toolName: string, detail: string): ScheduledPublishRefusal {
   return {
     success: false,
+    blocked: true,
+    reason: 'publish_consent',
     error:
       `${toolName} was not executed: this unattended scheduled run is not authorized to publish. ${detail} ` +
       `Do NOT retry this tool in this run. Save the content as a draft, state plainly that it is ` +
@@ -215,6 +219,8 @@ export async function refuseUnauthorizedScheduledPublish(
     );
     return {
       success: false,
+      blocked: true,
+      reason: 'publish_consent',
       error:
         `${toolName} was not executed: this run's publishing authorization could not be confirmed, ` +
         `and an unconfirmed permission is treated as withheld — a live post cannot be un-made. ` +

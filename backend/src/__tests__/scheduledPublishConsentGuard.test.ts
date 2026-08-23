@@ -70,6 +70,7 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
 
     expect(refusal).not.toBeNull();
     expect(refusal!.success).toBe(false);
+    expect(refusal).toMatchObject({ blocked: true, reason: 'publish_consent' });
     expect(refusal!.error).toContain('not authorized to publish');
     // Must not send the model back into a retry loop — that was the reported burn.
     expect(refusal!.error).toContain('Do NOT retry this tool in this run');
