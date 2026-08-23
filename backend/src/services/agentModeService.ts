@@ -29395,6 +29395,16 @@ ${strippedHtml}`;
 
       const source = options?.source === 'completion_next' ? 'completion_next' as const : undefined;
 
+      // Same source fields ENG-1469's customer projection uses — no new
+      // persisted data, just surfacing what the plan record already has.
+      const thumbnailUrl = typeof (plan as any).thumbnail_url === 'string' ? (plan as any).thumbnail_url.trim() : '';
+      const thumbnail = thumbnailUrl
+        ? {
+            url: thumbnailUrl,
+            alt: typeof (plan as any).thumbnail_alt_text === 'string' ? (plan as any).thumbnail_alt_text.trim() : '',
+          }
+        : undefined;
+
       return {
         success: true,
         type: 'workplan_recommendation' as const,
@@ -29405,6 +29415,7 @@ ${strippedHtml}`;
           title: plan.title,
           summary: typeof plan.description === 'string' ? plan.description : '',
           steps,
+          ...(thumbnail ? { thumbnail } : {}),
         },
         reason: trimmedReason,
         ...(source ? { source } : {}),
