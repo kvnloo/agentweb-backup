@@ -29,7 +29,10 @@ export type ClientAllowanceSnapshot = {
   blocked: boolean;
 };
 
-type User = { userId: string; email: string; subscriptionType?: string; llmUsageCredits?: MonthlyLlmUsageCredits };
+// The DynamoDB repository exposes AttributeMap, whose runtime shape is wider
+// than this service needs. Keep that persistence type at the boundary and
+// validate the required identity fields before using them.
+type User = Record<string, unknown> & { userId?: string; email?: string; subscriptionType?: string; llmUsageCredits?: MonthlyLlmUsageCredits };
 type Deps = {
   // DynamoDB's repository returns `undefined` for a missing item.  Accept it
   // at this boundary and normalize it alongside `null` in the service.
@@ -60,11 +63,21 @@ function normalizeEmail(email: string): string {
   return normalized;
 }
 
+function requireUserIdentity(user: User, field: 'userId' | 'email'): string {
+  const value = user[field];
+  if (typeof value !== 'string' || !value) {
+    throw new ClientAllowanceError('CLIENT_NOT_FOUND', 'The client record is missing required identity data');
+  }
+  return value;
+}
+
 export async function inspectClientAllowance(email: string, deps: Deps): Promise<ClientAllowanceSnapshot> {
   const client = await deps.getUserByEmail(normalizeEmail(email));
   if (!client) throw new ClientAllowanceError('CLIENT_NOT_FOUND', 'No client exists for that exact email');
 
-  const billingUserId = await deps.resolveBillingUserId(client.userId);
+  const clientUserId = requireUserIdentity(client, 'userId');
+  const clientEmail = requireUserIdentity(client, 'email');
+  const billingUserId = await deps.resolveBillingUserId(clientUserId);
   const [subscriptionType, usage, allowance, status, billingUser] = await Promise.all([
     deps.getUserSubscriptionType(billingUserId),
     deps.getUserTokenUsage(billingUserId),
@@ -73,11 +86,11 @@ export async function inspectClientAllowance(email: string, deps: Deps): Promise
     deps.getUserById(billingUserId),
   ]);
   if (!billingUser) throw new ClientAllowanceError('CLIENT_NOT_FOUND', 'The client billing account no longer exists');
-  const adjustment = getLlmUsageCreditAdjustment(billingUser.llmUsageCredits, usage.month);
+  const adjustment = getLlmUsageCreditAdjustment(billingUser.llmUsageCredits as MonthlyLlmUsageCredits | undefined, usage.month);
 
   return {
-    userId: client.userId,
-    email: client.email,
+    userId: clientUserId,
+    email: clientEmail,
     billingUserId,
     subscriptionType,
     currentMonthUsage: { tokens: usage.totalTokens, costUsd: usage.totalCost },
