@@ -1815,9 +1815,11 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       (check: { name?: string }) => check.name === "Tests"
     );
 
-    if (!testsCheck || testsCheck.status !== "completed") {
+    if (!testsCheck || testsCheck.status !== "completed" || testsCheck.conclusion === "cancelled") {
       const message = !testsCheck
         ? "Required Tests check has not started for this draft yet. Keep the draft and retry publish after GitHub starts it."
+        : testsCheck.conclusion === "cancelled"
+          ? "Required Tests check was cancelled for this draft. Keep the draft and retry publish after Tests runs again."
         : "Required Tests check is still running for this draft. Keep the draft and retry publish when it completes."
       return res.status(409).json({ error: "required_tests_pending", message });
     }

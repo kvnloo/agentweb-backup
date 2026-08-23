@@ -1251,6 +1251,22 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     expect(mockAxios.patch).not.toHaveBeenCalled();
   });
 
+  it("FAIL: cancelled Tests result is retryable and preserves the draft", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubDraftCheck({ status: "completed", conclusion: "cancelled" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
   it("FAIL: failed Tests result preserves the draft and never advances main", async () => {
     mockGetLandingPageById.mockResolvedValueOnce(PAGE);
     stubDraftCheck({ status: "completed", conclusion: "failure" });
