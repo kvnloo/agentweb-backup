@@ -2139,12 +2139,12 @@ export class MetaService {
           payload: {
             schema,
             data: chunk,
-            session: {
-              session_id: sessionId,
-              batch_seq: batchSeq,
-              last_batch_flag: isLastBatch,
-              estimated_num_total: rows.length,
-            },
+          },
+          session: {
+            session_id: sessionId,
+            batch_seq: batchSeq,
+            last_batch_flag: isLastBatch,
+            estimated_num_total: rows.length,
           },
         });
         lastResult = result._data || result;
@@ -2195,12 +2195,12 @@ export class MetaService {
           payload: {
             schema,
             data: chunk,
-            session: {
-              session_id: sessionId,
-              batch_seq: batchSeq,
-              last_batch_flag: isLastBatch,
-              estimated_num_total: rows.length,
-            },
+          },
+          session: {
+            session_id: sessionId,
+            batch_seq: batchSeq,
+            last_batch_flag: isLastBatch,
+            estimated_num_total: rows.length,
           },
         });
         lastResult = result._data || result;
@@ -2229,12 +2229,9 @@ export class MetaService {
 
       this.log(`Replacing users in custom audience: ${audienceId}`, { schema, payloadType: typeof payload });
 
-      // Live-test finding: unlike createUser/deleteUsers (session nested
-      // inside `payload`), Meta's /usersreplace edge requires `session` as a
-      // TOP-LEVEL param sibling to `payload`, always — even for a single
-      // batch. Nesting it inside `payload` (mirroring the /users edges)
-      // still produces "(#100) The parameter session is required", confirmed
-      // live against the real Graph API.
+      // Meta's custom-audience user edges require `session` as a top-level
+      // sibling to `payload`. The replace edge requires it even for one batch;
+      // upload and delete omit it for a single batch.
       const rows = payload;
       const sessionId = Math.floor(Math.random() * 1_000_000_000);
       if (!Array.isArray(rows) || rows.length <= MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE) {
