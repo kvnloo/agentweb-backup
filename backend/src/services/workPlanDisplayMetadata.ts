@@ -4,10 +4,12 @@ import type {
   WorkPlanDisplayMetadataV1,
 } from './workPlanService';
 
-const CATEGORIES = new Set<WorkPlanDisplayCategory>(['strategy', 'paid-ads', 'founder-led-sales', 'event-led-sales', 'content']);
-const CHANNELS = new Set<WorkPlanDisplayChannel>(['meta', 'google', 'linkedin', 'email', 'event', 'content', 'cross-channel']);
+// Exported so other consumers (e.g. the customer projection) validate against
+// the exact same closed enums/shape instead of re-declaring and risking drift.
+export const CATEGORIES = new Set<WorkPlanDisplayCategory>(['strategy', 'paid-ads', 'founder-led-sales', 'event-led-sales', 'content']);
+export const CHANNELS = new Set<WorkPlanDisplayChannel>(['meta', 'google', 'linkedin', 'email', 'event', 'content', 'cross-channel']);
 const CONTROL = /[\u0000-\u001F\u007F]/;
-const SUITE_ID = /^[a-z0-9-]{1,64}$/;
+export const SUITE_ID = /^[a-z0-9-]{1,64}$/;
 
 function optionalText(value: unknown, label: string, max: number): string | undefined {
   if (value === undefined || value === null || value === '') return undefined;
