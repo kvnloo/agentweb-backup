@@ -6598,6 +6598,7 @@ emmaToolRegistry.register({
       properties: {
         content: {
           type: 'string',
+          maxLength: 2000,
           description: 'The org-wide fact to remember (max 2000 chars). Be specific and actionable.'
         },
         category: {
