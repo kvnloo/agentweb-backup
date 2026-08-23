@@ -5174,6 +5174,7 @@ export class AgentModeService {
     'save_work_plan',
     'list_predefined_work_plans',
     'launch_predefined_work_plan',
+    'recommend_predefined_work_plan',
 
     // Skill Creation (users can define custom skill bundles)
     'create_skill',
@@ -6162,6 +6163,28 @@ export class AgentModeService {
     // For navigation/connect tools, preserve the full result so the frontend can act on it
     if (toolName === 'navigate_to' || toolName === 'connect_account') {
       return result;
+    }
+
+    // ENG-1472: preserve the full structured workplan_recommendation payload so
+    // the customer portal can detect result.type === 'workplan_recommendation'
+    // && result.version === 1 and render the recommendation card — including on
+    // reload, when this stored ledger entry (not the live tool return) is all
+    // the frontend has. The default `{}` fallback below would otherwise erase
+    // the card the instant the page reloads. A failed/rejected proposal (no
+    // `type`) is minimized to just success/message for diagnostics.
+    if (toolName === 'recommend_predefined_work_plan') {
+      if (result && result.type === 'workplan_recommendation' && result.version === 1) {
+        return {
+          success: true,
+          type: result.type,
+          version: result.version,
+          recommendationId: result.recommendationId,
+          plan: result.plan,
+          reason: result.reason,
+          ...(result.source !== undefined ? { source: result.source } : {}),
+        };
+      }
+      return { success: result?.success ?? false, message: result?.message };
     }
 
     // ENG-736: landing-page deployment tools — preserve the small deployment-outcome
@@ -29126,7 +29149,7 @@ ${strippedHtml}`;
    */
   public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean }): Promise<any> {
     try {
-      const { workPlanService } = await import('./workPlanService');
+      const { getAccessiblePredefinedWorkPlanCandidates } = await import('./predefinedWorkPlanResolver');
 
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -29143,32 +29166,13 @@ ${strippedHtml}`;
         };
       }
 
-      // Resolve candidate plans with private (user/org) taking priority over system/public.
-      const candidates: any[] = [];
-      if (userId && !userId.startsWith('anon_')) {
-        try {
-          const { userDb } = await import('./db');
-          const user = await userDb.getUserById(userId);
-          const [ownPlans, orgPlans] = await Promise.all([
-            workPlanService.getWorkPlansByOwner(userId),
-            user?.orgId ? workPlanService.getWorkPlansByOrg(user.orgId) : Promise.resolve([]),
-          ]);
-          const seen = new Set<string>();
-          for (const p of [...ownPlans, ...orgPlans]) {
-            if (p.visibility === 'private' && !seen.has(p.planId)) {
-              seen.add(p.planId);
-              candidates.push(p);
-            }
-          }
-        } catch (err) {
-          console.warn('[applyPredefinedWorkPlan] Error loading private plans:', (err as Error).message);
-        }
-      }
-      const [systemPlans, publicPlans] = await Promise.all([
-        workPlanService.getWorkPlansByVisibility('system'),
-        workPlanService.getWorkPlansByVisibility('public'),
-      ]);
-      candidates.push(...systemPlans, ...publicPlans);
+      // ENG-1472: the private/org/system/public candidate-building logic that used
+      // to be inlined here now lives in predefinedWorkPlanResolver.ts (shared with
+      // the recommend_predefined_work_plan tool and the accept endpoint). This
+      // method still matches by title OR planId (unlike the resolver's strict
+      // planId-only lookup) to keep launch_predefined_work_plan's existing
+      // behavior — title-based launches from Emma — unchanged.
+      const candidates = await getAccessiblePredefinedWorkPlanCandidates(userId);
 
       const needle = planTitleOrId.toLowerCase();
       const predefinedPlan = candidates.find(
@@ -29201,6 +29205,11 @@ ${strippedHtml}`;
         autocomplete: predefinedPlan.autocomplete || false,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        // ENG-1472: which predefined template this session's plan was launched
+        // from, so a completed run can traceably chain into its author-approved
+        // "next plan" suggestions and so the accept endpoint can idempotently
+        // detect "this recommendation was already applied".
+        templatePlanId: predefinedPlan.planId,
       };
       await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
 
@@ -29246,6 +29255,127 @@ ${strippedHtml}`;
       return {
         success: false,
         message: 'Failed to start work plan',
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
+  /**
+   * Scan a session's persisted assistant messages for an existing
+   * `workplan_recommendation` (v1) result naming `planId`, so a repeated
+   * recommend call returns the SAME proposal instead of adding another
+   * (ENG-1472 closed decision #8: a plan is proposed at most once per session).
+   * Thin wrapper over the shared scan in predefinedWorkPlanResolver.ts, which
+   * the accept endpoint also uses (lookup by recommendationId instead).
+   */
+  private async findPersistedWorkPlanRecommendation(messages: any[] | undefined, planId: string): Promise<any | null> {
+    const { findWorkPlanRecommendationToolResult } = await import('./predefinedWorkPlanResolver');
+    return findWorkPlanRecommendationToolResult(messages, (r) => r.plan?.id === planId);
+  }
+
+  /**
+   * Propose (but never instantiate) an existing, accessible predefined work plan
+   * inline during chat (ENG-1472). The proposal is a persisted structured tool
+   * result — `session.workPlan` is never mutated here; the plan only starts when
+   * the owner explicitly accepts it via the work-plan-recommendation accept
+   * endpoint, which itself calls `applyPredefinedWorkPlan`.
+   *
+   * The backend trusts only `planId` and the model's short `reason` — title,
+   * summary, and steps always come from the canonical server record resolved
+   * through `resolveAccessiblePredefinedWorkPlan`, never from anything the model
+   * supplied. `options.source` is an optional marker ("completion_next") for the
+   * completion-recommendation extension so the UI can distinguish an ordinary
+   * in-chat proposal from one following a just-completed plan's author-approved
+   * "what's next" suggestions; every other rule (dedupe, ownership, access,
+   * boundary validation) is identical for both.
+   */
+  public async recommendPredefinedWorkPlan(
+    planId: string,
+    reason: string,
+    sessionId: string,
+    userId?: string,
+    options?: { source?: string },
+  ): Promise<any> {
+    try {
+      // Boundary validation first — structured, non-customer-sensitive errors
+      // that never touch the database. Empty strings are already rejected by
+      // the tool-gateway's required-argument check upstream; these guards make
+      // the contract hold even when this method is called directly (as the
+      // accept-endpoint's sibling paths and tests do).
+      if (typeof planId !== 'string' || planId.trim() === '') {
+        return { success: false, message: 'recommend_predefined_work_plan requires a non-empty planId.' };
+      }
+      if (planId.length > 128) {
+        return { success: false, message: 'recommend_predefined_work_plan requires planId to be at most 128 characters.' };
+      }
+      if (typeof reason !== 'string' || reason.trim() === '') {
+        return { success: false, message: 'recommend_predefined_work_plan requires a non-empty reason.' };
+      }
+      if (reason.length > 240) {
+        return { success: false, message: 'recommend_predefined_work_plan requires reason to be at most 240 characters.' };
+      }
+      if (!sessionId) {
+        return { success: false, message: 'recommend_predefined_work_plan requires an active session.' };
+      }
+
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return { success: false, message: 'Session not found' };
+      }
+
+      // Dedupe: an already-persisted recommendation for this exact plan wins
+      // outright — including its ORIGINAL reason. A second call (the model
+      // re-proposing, or asking again with different wording) never overwrites
+      // the first proposal the user is looking at.
+      const existing = await this.findPersistedWorkPlanRecommendation(session.messages, planId);
+      if (existing) {
+        return { success: true, ...existing };
+      }
+
+      const { resolveAccessiblePredefinedWorkPlan } = await import('./predefinedWorkPlanResolver');
+      const plan = await resolveAccessiblePredefinedWorkPlan({ planId, userId });
+      if (!plan) {
+        // Deliberately the SAME message for deleted / pending-review / private-
+        // inaccessible / malformed — never leaks WHY a plan can't be recommended.
+        return { success: false, message: `Work plan template "${planId}" is not available.` };
+      }
+
+      const trimmedReason = reason.trim();
+      const rawSteps = Array.isArray(plan.steps) ? plan.steps : [];
+      const steps = rawSteps.slice(0, 4).map((step: any, idx: number) => ({
+        position: typeof step?.stepCount === 'number' ? step.stepCount : idx + 1,
+        // Until ENG-1469's customer-readable display metadata exists, fall back
+        // to the step's raw title (documented fallback per the ENG-1472 spec).
+        label: typeof step?.title === 'string' && step.title.trim() !== '' ? step.title : `Step ${idx + 1}`,
+      }));
+
+      // Deterministic opaque id: the SAME session recommending the SAME plan
+      // twice (with no persisted history to dedupe against yet, e.g. two
+      // concurrent turns) converges on one id instead of two unrelated ones.
+      const recommendationId = createHash('sha256').update(`${sessionId}:${plan.planId}`).digest('hex').slice(0, 32);
+
+      const source = options?.source === 'completion_next' ? 'completion_next' as const : undefined;
+
+      return {
+        success: true,
+        type: 'workplan_recommendation' as const,
+        version: 1 as const,
+        recommendationId,
+        plan: {
+          id: plan.planId,
+          title: plan.title,
+          summary: typeof plan.description === 'string' ? plan.description : '',
+          steps,
+        },
+        reason: trimmedReason,
+        ...(source ? { source } : {}),
+        formattedContent: `Recommended work plan "${plan.title}" — ${trimmedReason}`,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error recommending predefined work plan:', error);
+      return {
+        success: false,
+        message: 'Failed to recommend work plan',
         error: error instanceof Error ? error.message : 'Unknown error',
       };
     }

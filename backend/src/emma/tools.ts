@@ -6176,6 +6176,49 @@ emmaToolRegistry.register({
   }
 });
 
+// ENG-1472: propose (never launch) an existing, accessible predefined work plan
+// inline during an ordinary chat, once the user's current goal is clear enough
+// that one specific template is a good fit. This is intentionally separate from
+// launch_predefined_work_plan — see the tool description below for the contract
+// Emma must follow (never mutate session.workPlan here; only an explicit
+// "Use this workplan" click, via the accept endpoint, starts the plan).
+emmaToolRegistry.register({
+  name: 'recommend_predefined_work_plan',
+  definition: {
+    name: 'recommend_predefined_work_plan',
+    description: 'Propose ONE existing, accessible predefined work plan template inline in chat, once the user\'s current goal clearly matches it. This is a PROPOSAL ONLY — it renders a card the user must explicitly accept ("Use this workplan") before the plan starts; it never changes the session\'s active work plan itself. Use this instead of launch_predefined_work_plan when the user has not yet asked to start a specific plan. Call list_predefined_work_plans first to see what is accessible. If two or more plans could plausibly fit, ask ONE clarifying question instead of guessing which to recommend. Never call this from company/brand context alone — only once the user has stated a concrete current goal. If this exact plan was already recommended earlier in this session, do not call this again unless the user explicitly asks to see it again.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        planId: {
+          type: 'string',
+          maxLength: 128,
+          description: 'The stable id of the work plan template to recommend, exactly as returned by list_predefined_work_plans (that listing may label this field "id" or "planId" depending on how it was called — either way, use that exact value). Never pass a title here.',
+        },
+        reason: {
+          type: 'string',
+          maxLength: 240,
+          description: 'One short sentence (max 240 characters) explaining why this plan fits what the user just said. Shown on the recommendation card.',
+        },
+      },
+      required: ['planId', 'reason'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    // No `source` argument: this tool always produces an ordinary in-chat
+    // proposal. The "completion_next" marker is stamped only by the
+    // completion-recommendation extension's own internal call into
+    // agentModeService.recommendPredefinedWorkPlan, never by the model
+    // through this input schema.
+    return await agentModeService.recommendPredefinedWorkPlan(
+      args.planId,
+      args.reason,
+      context?.sessionId,
+      context?.userId,
+    );
+  },
+});
+
 emmaToolRegistry.register({
   name: 'modify_work_plan',
   definition: {
