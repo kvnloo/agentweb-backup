@@ -10312,6 +10312,17 @@ const AgentModeSettings = () => {
             helperText="Shown when the account has no explicit display name. Plain text only."
             inputProps={{ maxLength: 120 }}
           />
+          <Box mt={2} p={2} sx={{ bgcolor: 'action.hover', borderRadius: 1 }}>
+            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>
+              Preview
+            </Typography>
+            <Typography variant="body2" data-testid="new-chat-greeting-named-preview">
+              Named (e.g. Harsha): {newChatNamedTemplate.split('{firstName}').join('Harsha')}
+            </Typography>
+            <Typography variant="body2" data-testid="new-chat-greeting-anonymous-preview">
+              Anonymous: {newChatAnonymousText}
+            </Typography>
+          </Box>
         </CardContent>
       </Card>
 
