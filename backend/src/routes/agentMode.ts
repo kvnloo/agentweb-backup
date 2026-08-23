@@ -75,6 +75,10 @@ router.post('/ishare/:shareId/upload', upload.single('file'), asyncHandler(agent
 // Get current welcome message (public)
 router.get('/public/welcome-message', asyncHandler(agentModeController.getWelcomeMessage));
 
+// GET /api/agent-mode/public/new-chat-hero-greeting
+// Presentation-only copy for the empty New Chat hero.
+router.get('/public/new-chat-hero-greeting', asyncHandler(agentModeController.getNewChatHeroGreeting));
+
 // GET /api/agent-mode/public/conversation-starters
 // Get current conversation starters (public)
 router.get('/public/conversation-starters', asyncHandler(agentModeController.getConversationStarters));
@@ -219,6 +223,12 @@ router.get('/system-prompt', requireAdmin, asyncHandler(agentModeController.getS
 // GET /api/agent-mode/welcome-message
 // Get current welcome message (admin only)
 router.get('/welcome-message', requireAdmin, asyncHandler(agentModeController.getWelcomeMessage));
+
+// Admin presentation controls. Kept separate from system prompts and the
+// legacy welcome-message setting so prompt/content changes cannot leak here.
+router.get('/new-chat-hero-greeting', requireAdmin, asyncHandler(agentModeController.getNewChatHeroGreeting));
+router.put('/new-chat-hero-greeting', requireAdmin, asyncHandler(agentModeController.updateNewChatHeroGreeting));
+router.delete('/new-chat-hero-greeting', requireAdmin, asyncHandler(agentModeController.resetNewChatHeroGreeting));
 
 // GET /api/agent-mode/conversation-starters
 // Get current conversation starters (admin only)
