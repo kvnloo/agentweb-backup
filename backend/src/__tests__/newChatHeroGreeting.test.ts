@@ -26,6 +26,27 @@ describe('New Chat hero greeting presentation contract', () => {
     expect(validateNewChatHeroGreeting(value)).toMatch(expected as RegExp);
   });
 
+  it('accepts the 120-character boundary for both greeting fields', () => {
+    const namedTemplate = `{firstName}${'a'.repeat(109)}`;
+    const anonymousText = 'a'.repeat(120);
+
+    expect(validateNewChatHeroGreeting({ namedTemplate, anonymousText })).toBeNull();
+  });
+
+  it.each(['\u0085', '\u2028', '\u2029'])('rejects Unicode line separator %j', (separator) => {
+    expect(validateNewChatHeroGreeting({
+      namedTemplate: `Hey${separator}{firstName}`,
+      anonymousText: 'Hey!',
+    })).toMatch(/single line/);
+  });
+
+  it.each([
+    { namedTemplate: `{firstName}${'a'.repeat(110)}`, anonymousText: 'a'.repeat(120) },
+    { namedTemplate: `{firstName}${'a'.repeat(109)}`, anonymousText: 'a'.repeat(121) },
+  ])('rejects a greeting field over the 120-character boundary', (value) => {
+    expect(validateNewChatHeroGreeting(value)).toMatch(/120 characters/);
+  });
+
   it('parses valid stored JSON and trims the two values', () => {
     expect(parseNewChatHeroGreetingSetting(JSON.stringify({
       namedTemplate: ' Welcome back, {firstName} ',

@@ -10300,7 +10300,7 @@ const AgentModeSettings = () => {
             label="Named greeting"
             value={newChatNamedTemplate}
             onChange={(event) => setNewChatNamedTemplate(event.target.value)}
-            helperText="Use {firstName} exactly once. Example: Hey {firstName}! Let's get after it"
+            helperText={`${newChatNamedTemplate.length}/120 characters. Use {firstName} exactly once. Example: Hey {firstName}! Let's get after it`}
             inputProps={{ maxLength: 120 }}
             sx={{ mb: 2 }}
           />
@@ -10309,7 +10309,7 @@ const AgentModeSettings = () => {
             label="Anonymous greeting"
             value={newChatAnonymousText}
             onChange={(event) => setNewChatAnonymousText(event.target.value)}
-            helperText="Shown when the account has no explicit display name. Plain text only."
+            helperText={`${newChatAnonymousText.length}/120 characters. Shown when the account has no explicit display name. Plain text only.`}
             inputProps={{ maxLength: 120 }}
           />
           <Box mt={2} p={2} sx={{ bgcolor: 'action.hover', borderRadius: 1 }}>

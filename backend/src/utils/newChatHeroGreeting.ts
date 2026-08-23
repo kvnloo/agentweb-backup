@@ -11,7 +11,7 @@ export const DEFAULT_NEW_CHAT_HERO_GREETING: Readonly<NewChatHeroGreeting> = Obj
   anonymousText: "Hey! Let's get after it",
 });
 
-const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/;
+const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F\u0085\u2028\u2029]/;
 const RAW_HTML_TAG = /<\/?[a-z][^>]*>/i;
 const TEMPLATE_TOKEN = /\{[^{}]*\}/g;
 
