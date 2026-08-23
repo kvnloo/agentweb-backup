@@ -106,6 +106,36 @@ describe('AgentModeService.recommendPredefinedWorkPlan', () => {
     expect(result.reason).toBe('The user just said they want to onboard a new client.');
   });
 
+  it('includes a thumbnail when the resolved plan has a valid thumbnail_url', async () => {
+    mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+      v === 'system' ? [{ ...systemPlan, thumbnail_url: 'https://cdn.example.com/x.png', thumbnail_alt_text: 'An icon' }] : []
+    );
+
+    const result = await service.recommendPredefinedWorkPlan(
+      'plan-onboard',
+      'reason',
+      sessionId,
+      'user-1',
+    );
+
+    expect(result.plan.thumbnail).toEqual({ url: 'https://cdn.example.com/x.png', alt: 'An icon' });
+  });
+
+  it('omits thumbnail entirely when the resolved plan has no thumbnail_url', async () => {
+    mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+      v === 'system' ? [systemPlan] : []
+    );
+
+    const result = await service.recommendPredefinedWorkPlan(
+      'plan-onboard',
+      'reason',
+      sessionId,
+      'user-1',
+    );
+
+    expect(result.plan).not.toHaveProperty('thumbnail');
+  });
+
   it('produces a deterministic recommendationId from sessionId+planId, distinct across sessions', async () => {
     mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
       v === 'system' ? [systemPlan] : []
