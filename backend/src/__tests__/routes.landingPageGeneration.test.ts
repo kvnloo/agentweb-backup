@@ -1018,14 +1018,16 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
 
   const stubGitHubMergeFlow = () => {
     // GET main ref → consent → GET draft ref → find/create PR → inspect Tests
-    // → consent → POST /merges → DELETE branch ref
+    // → re-read draft tip → consent → POST /merges → re-read before DELETE branch ref
     mockAxios.get
       .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
       .mockResolvedValueOnce({ data: [] })
       .mockResolvedValueOnce({
         data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
-      });
+      })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } });
     mockAxios.post
       .mockResolvedValueOnce({ data: { number: 123 } })
       .mockResolvedValueOnce({ data: { sha: "merge-sha" } });
@@ -1194,7 +1196,8 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
       .mockResolvedValueOnce({
         data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
       })
-      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }); // branch tip
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }) // branch tip after Tests
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }); // branch tip before delete
     mockAxios.post
       .mockResolvedValueOnce({ data: { number: 123 } })
       .mockRejectedValueOnce({ response: { status: 409 } });
@@ -1279,6 +1282,59 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     );
     expect(mockAxios.post).toHaveBeenCalledWith(
       expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
+  it("FAIL: a draft updated after Tests ran is neither merged nor deleted", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "tested-draft-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
+      })
+      .mockResolvedValueOnce({ data: { object: { sha: "newer-draft-sha" } } });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("draft_changed_after_tests");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+    expect(mockAxios.delete).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: a duplicate PR creation response reuses the concurrently created PR", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: [{ number: 456 }] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
+      })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } });
+    mockAxios.post
+      .mockRejectedValueOnce({ response: { status: 422, data: { message: "A pull request already exists" } } })
+      .mockResolvedValueOnce({ data: { sha: "merge-sha" } });
+    mockAxios.delete.mockResolvedValueOnce({ data: {} });
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://everyio.agentwebforms.com");
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(mockAxios.post).toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.objectContaining({ head: "draft-tip-sha" }), expect.anything()
     );
   });
 
