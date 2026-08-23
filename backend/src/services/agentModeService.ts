@@ -29227,9 +29227,6 @@ ${strippedHtml}`;
 
       // Convert template steps -> session work plan (all steps start pending).
       const workPlan = {
-        // Preserve the source template identity. This lets a user-facing
-        // recommendation be accepted idempotently without trusting a title.
-        templatePlanId: predefinedPlan.planId,
         title: predefinedPlan.title,
         steps: (predefinedPlan.steps || []).map((step: any) => ({
           stepCount: step.stepCount,
