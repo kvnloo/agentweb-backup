@@ -3208,6 +3208,49 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'manage_client_allowance',
+  definition: {
+    name: 'manage_client_allowance',
+    description: `Inspect a client's effective monthly allowance and credit-ledger reconciliation by exact email, change their subscription tier, or grant a current-month provider-cost credit. Admin-only.
+
+Use action "inspect" first. A tier change affects the account that is actually billed (the organization billing root when applicable), is conditionally written to detect concurrent changes, and is audit-logged. Mutations require a non-empty reason and confirmed: true. This tool never returns credentials or tokens.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['inspect', 'change_subscription', 'grant_cost_credit'], description: 'Inspect is read-only; mutations require confirmation.' },
+        email: { type: 'string', description: 'Exact client email address.' },
+        subscription_type: { type: 'string', description: 'Existing subscription tier name; required for change_subscription.' },
+        reason: { type: 'string', description: 'Audit reason; required for change_subscription.' },
+        confirmed: { type: 'boolean', description: 'Must be true for change_subscription after the admin has reviewed the inspect result.' },
+        amount_usd: { type: 'number', description: 'Positive whole-cent current-month provider-cost credit; required for grant_cost_credit.' },
+        idempotency_key: { type: 'string', description: '8-100 URL-safe stable key; required for grant_cost_credit and must be reused on a retry.' },
+      },
+      required: ['action', 'email'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    if (args.action === 'inspect') {
+      return jsonResult(await mcpFetch({
+        method: 'GET', path: `/api/admin/client-allowance?email=${encodeURIComponent(args.email)}`, context: ctx(context),
+      }));
+    }
+    if (args.action === 'change_subscription') {
+      return jsonResult(await mcpFetch({
+        method: 'POST', path: '/api/admin/client-allowance/subscription', context: ctx(context),
+        body: { email: args.email, subscriptionType: args.subscription_type, reason: args.reason, confirmed: args.confirmed },
+      }));
+    }
+    if (args.action === 'grant_cost_credit') {
+      return jsonResult(await mcpFetch({
+        method: 'POST', path: '/api/admin/client-allowance/cost-credit', context: ctx(context),
+        body: { email: args.email, amountUsd: args.amount_usd, idempotencyKey: args.idempotency_key, reason: args.reason, confirmed: args.confirmed },
+      }));
+    }
+    return jsonResult({ error: 'Unknown action' });
+  },
+});
+
+mcpToolRegistry.register({
   name: 'manage_user_notes',
   definition: {
     name: 'manage_user_notes',
