@@ -637,6 +637,7 @@ export default function WorkPlans() {
   const inputRequestErrors = steps.flatMap((step) => (
     step.inputRequest ? validateEditableInputRequest(step.inputRequest) : []
   ));
+  const invalidSuiteId = suiteEnabled && suiteId.length > 0 && !SUITE_ID_PATTERN.test(suiteId);
 
   // Compact preview using the exact canonical projection shape — what a
   // customer would actually see for the fields currently in the form,
@@ -1215,7 +1216,7 @@ export default function WorkPlans() {
                         placeholder="meta-launch-suite"
                         size="small"
                         helperText="lowercase letters, numbers, hyphens"
-                        error={suiteId.length > 0 && !SUITE_ID_PATTERN.test(suiteId)}
+                        error={invalidSuiteId}
                       />
                       <TextField
                         label="Suite name"
@@ -1440,8 +1441,8 @@ export default function WorkPlans() {
           <Button
             onClick={() => handleSave()}
             variant="contained"
-            disabled={saving || inputRequestErrors.length > 0}
-            title={inputRequestErrors[0] || undefined}
+            disabled={saving || inputRequestErrors.length > 0 || invalidSuiteId}
+            title={inputRequestErrors[0] || (invalidSuiteId ? "Suite ID must use lowercase letters, numbers, and hyphens" : undefined)}
           >
             {saving ? <CircularProgress size={20} /> : editingPlan ? "Update" : "Create"}
           </Button>

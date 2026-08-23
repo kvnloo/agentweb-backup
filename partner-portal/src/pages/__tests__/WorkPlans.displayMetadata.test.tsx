@@ -135,6 +135,18 @@ describe("WorkPlans editor — customer-facing browse details", () => {
     fireEvent.change(summaryInput, { target: { value: "y".repeat(300) } });
     expect(summaryInput.value.length).toBe(180);
   });
+
+  it("blocks saving an invalid suite ID before it reaches the API", async () => {
+    await renderPage();
+    await openEditor();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /Group this plan into a suite/i }));
+    fireEvent.change(screen.getByLabelText("Suite ID"), { target: { value: "Meta launch" } });
+    fireEvent.change(screen.getByLabelText("Suite name"), { target: { value: "Meta Launch" } });
+
+    expect(saveButton()).toBeDisabled();
+    expect(mockedAxios.put).not.toHaveBeenCalled();
+  });
 });
 
 describe("WorkPlans editor — recommended next workplans", () => {

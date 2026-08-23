@@ -76,10 +76,14 @@ export function projectWorkPlanForCustomer(plan: unknown): CustomerWorkPlanProje
     categories,
     ...(channel && { channel }),
     ...(suite && { suite }),
-    steps: value.steps.filter((step) => step && typeof step.title === 'string').map((step, index) => ({
-      position: index + 1,
-      label: text(display?.stepLabels?.[index], 80) || step.title,
-    })),
+    // flatMap keeps `index` (and therefore `position`) anchored to the
+    // ORIGINAL steps array so a filtered-out malformed step doesn't shift
+    // every subsequent step's position/display-label lookup.
+    steps: value.steps.flatMap((step, index) => (
+      step && typeof step.title === 'string'
+        ? [{ position: index + 1, label: text(display?.stepLabels?.[index], 80) || step.title }]
+        : []
+    )),
     nextPlanIds: validNextPlanIds(display?.nextPlanIds),
     ...(thumbnail && { thumbnail }),
     visibility: value.visibility,

@@ -4,14 +4,33 @@ describe('customer work plan projection', () => {
   const plan = { planId: 'meta', title: 'Meta Ads', description: '<b>Build</b> a campaign', category: 'Paid Ads', visibility: 'public' as const, steps: [{ stepCount: 1, title: 'Create campaign', userInstructions: 'secret' }] };
 
   it('uses safe legacy fallbacks without leaking instructions', () => {
-    expect(projectWorkPlanForCustomer(plan)).toEqual(expect.objectContaining({
+    const result = projectWorkPlanForCustomer({
+      ...plan,
+      userInstructions: 'top-level secret',
+      secret: 'also secret',
+    });
+    expect(result).toEqual(expect.objectContaining({
       title: 'Meta Ads', summary: 'Build a campaign', categories: ['paid-ads'], steps: [{ position: 1, label: 'Create campaign' }], nextPlanIds: [],
     }));
+    expect(JSON.stringify(result)).not.toContain('secret');
+    expect(JSON.stringify(result)).not.toContain('userInstructions');
   });
 
   it('uses display labels and author-approved next plans', () => {
     expect(projectWorkPlanForCustomer({ ...plan, display: { version: 1, title: 'Launch Meta', stepLabels: ['Build ads'], nextPlanIds: ['landing'] } }))
       .toEqual(expect.objectContaining({ title: 'Launch Meta', nextPlanIds: ['landing'], steps: [{ position: 1, label: 'Build ads' }] }));
+  });
+
+  it('keeps original step positions and display labels when malformed steps are omitted', () => {
+    const result = projectWorkPlanForCustomer({
+      ...plan,
+      steps: [
+        { stepCount: 1, title: null },
+        { stepCount: 2, title: 'Create campaign' },
+      ],
+      display: { version: 1, stepLabels: ['Ignored', 'Build ads'] },
+    });
+    expect(result?.steps).toEqual([{ position: 2, label: 'Build ads' }]);
   });
 
   it.each([null, {}, { ...plan, steps: 'wrong' }])('fails closed for malformed records %#', (value) => {
