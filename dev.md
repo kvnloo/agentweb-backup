@@ -1,3 +1,25 @@
+## ENG-1484: two correct instructions can still lose to each other (2026-08-23)
+
+ENG-1478 (same day) fixed the Work Plan Capabilities section to tell Emma to check
+`list_predefined_work_plans` on an unprompted goal statement. Live re-test after that fix deployed:
+"I'm interested in making some linkedin posts" *still* skipped the check and drafted 3 posts
+directly, despite a matching accessible plan ("Research Based Linkedin Founder Post") existing.
+
+Root cause: a separate "Page & Feature Tool Reference" table — framed for "a user refers to a page
+or feature by name" — has `"LinkedIn content", "LinkedIn posts", "LinkedIn page" →
+list_connected_account_posts, create_social_media_posts`, an unconditional keyword→tool arrow. Both
+this row and the Work Plan Capabilities paragraph are individually correct for what they're written
+to cover; neither one references the other, so a request that matches both keyword sets resolves
+to whichever pattern is more concrete and direct — the fixed-arrow table row, not the conditional
+paragraph. ENG-1478's fix never got a chance to run.
+
+Fix: added an explicit exception to that one row — a stated GOAL (not a literal "show me the page"
+request) defers to the Work Plan Capabilities check first. Scoped to the one row Harsha actually
+reproduced; the same table has ~15 other keyword→tool rows with the identical latent shape (a goal
+statement could plausibly match any of them before ever reaching a relevant work-plan check), but
+fixing all of them blind, with no reproduced case for the others, risks unintended behavior change
+across many more real flows than this PR can verify. Flagged as a known follow-up, not fixed here.
+
 ## ENG-1478: a prompt can describe a branch correctly and still never enter it (2026-08-22)
 
 ENG-1472 added `recommend_predefined_work_plan` (an inline, soft-accept proposal card) and the
