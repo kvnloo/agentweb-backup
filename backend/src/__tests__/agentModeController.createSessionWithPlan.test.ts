@@ -388,6 +388,56 @@ describe('AgentModeController - createSessionWithPlan', () => {
       });
     });
 
+    // ENG-1331: this route was the only predefined-plan session-creation path that
+    // dropped expectedAssetCount on the floor — its sibling instantiation path
+    // (agentModeService.ts applyPredefinedWorkPlan) already carried it through. A
+    // template step declaring expectedAssetCount had nothing to enforce once a
+    // session was created via this route, which is confirmed (by pageIdentifier
+    // pattern) to be the exact route the production incident session used.
+    it('carries expectedAssetCount from the template step into the session work plan (ENG-1331)', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) =>
+        Promise.resolve(
+          visibility === 'system'
+            ? [
+                {
+                  ...mockWorkPlans[0],
+                  steps: [
+                    { stepCount: 1, title: 'Step 1', description: 'First step', requiredFunctionCalls: ['function1'] },
+                    { stepCount: 2, title: 'Render Sizes', description: 'Render the matrix', expectedAssetCount: 12 },
+                  ],
+                },
+              ]
+            : []
+        )
+      );
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(mockChatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        'test-session-123',
+        expect.objectContaining({
+          steps: expect.arrayContaining([
+            expect.objectContaining({ stepCount: 2, title: 'Render Sizes', expectedAssetCount: 12 }),
+          ]),
+        })
+      );
+    });
+
+    it('omits expectedAssetCount when the template step does not declare it', async () => {
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      const call = mockChatbotDb.updateSessionWorkPlan.mock.calls.find((c) => c[0] === 'test-session-123');
+      const steps = (call?.[1] as any)?.steps ?? [];
+      for (const step of steps) {
+        expect(step).not.toHaveProperty('expectedAssetCount');
+      }
+    });
+
     // ENG-508/ENG-867: the Founder LinkedIn audit plan carries the "LinkedIn Profile
     // Reader" skill on its profile-extraction step. Creating a session from the plan
     // must auto-install that skill, because tool filtering is computed at the start of
