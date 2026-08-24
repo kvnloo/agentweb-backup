@@ -13410,18 +13410,36 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       // here must never break the underlying write (matches the onboarding
       // backstop's own never-throws contract).
       let autoLogoAsset: { type: string; url: string; filename: string; key: string } | null = null;
+      // Surfaced (not swallowed) when the fetch/rasterise attempt didn't land
+      // an asset — see the failure branch below for why this must not read
+      // as silent success.
+      let logoAutoPinIssue: string | null = null;
       const incomingLogoUrl =
         typeof (brandData as any)?.logoUrl === 'string' ? (brandData as any).logoUrl.trim() : '';
       const callerSuppliedLogoAsset = (
         Array.isArray(brandAssets) ? brandAssets : brandAssets ? [brandAssets] : []
       ).some((a: any) => a?.type === 'logo');
-      const alreadyHasLogoAsset = !!getPersistedBrandLogoAssetUrl({
+      const existingLogoAssetUrl = getPersistedBrandLogoAssetUrl({
         attachments: existingBrand.attachments,
       });
+      const alreadyHasLogoAsset = !!existingLogoAssetUrl;
       if (incomingLogoUrl && !callerSuppliedLogoAsset && !alreadyHasLogoAsset) {
         try {
           const outcome = await downloadBrandLogoToS3(incomingLogoUrl, userId);
-          if (outcome.status === 'uploaded' && outcome.url) {
+          if (outcome.status === 'svg') {
+            // brandData.logoUrl keeps the raw incoming URL, exactly like this
+            // call behaved before this change — never worse than today. But
+            // the write must not silently report full success while no asset
+            // actually landed; the caller (Emma) needs to know so she can
+            // tell the user or retry, instead of believing the Logo & Assets
+            // card is populated when it isn't.
+            logoAutoPinIssue =
+              'The logo URL is an SVG that could not be rasterised — it was not stored as a Logo & Assets attachment. Ask the user to upload a PNG/JPEG/GIF/WEBP version instead.';
+          } else if (outcome.status !== 'uploaded') {
+            const detailSuffix = outcome.detail ? `: ${outcome.detail}` : '';
+            logoAutoPinIssue =
+              `Could not fetch/store the logo from that URL (${outcome.status}${detailSuffix}) — brandData.logoUrl was saved, but no Logo & Assets attachment was created. Retrying later (or asking the user to upload the logo directly) may be needed.`;
+          } else if (outcome.url) {
             const filename = outcome.url.split('/').filter(Boolean).pop() || 'logo.png';
             autoLogoAsset = {
               type: 'logo',
@@ -13434,15 +13452,23 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
             // invents later (ENG-326/ENG-933).
             updatedBrandData.logoUrl = outcome.url;
           }
-          // svg / download-failed / upload-failed: brandData.logoUrl keeps
-          // the raw incoming URL, exactly like this call behaved before this
-          // change — never worse than today.
         } catch (e: any) {
           console.warn('[brandLogo] auto-pin on update_brand_guidelines failed', {
             userId,
             error: e?.message ?? String(e),
           });
+          logoAutoPinIssue =
+            'Could not fetch/store the logo from that URL (unexpected error) — brandData.logoUrl was saved, but no Logo & Assets attachment was created.';
         }
+      } else if (incomingLogoUrl && !callerSuppliedLogoAsset && alreadyHasLogoAsset) {
+        // A real asset already exists and this call isn't replacing it (no
+        // fresh brandAssets entry) — keep brandData.logoUrl in sync with what
+        // is ACTUALLY displayed rather than letting it drift to whatever raw
+        // URL this call happens to carry (e.g. Emma re-sending the original
+        // scraped URL after the asset was already pinned on an earlier call).
+        // Without this, the Logo & Assets card would keep showing the correct
+        // pinned logo while brandData.logoUrl silently pointed somewhere else.
+        updatedBrandData.logoUrl = existingLogoAssetUrl;
       }
 
       // Handle brandAssets update - merge by type to preserve existing assets
@@ -13519,7 +13545,8 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         updatedFields,
         brandData: updatedBrandData,
         attachments: updatedAttachments,
-        updatedAssets: updatedAssets
+        updatedAssets: updatedAssets,
+        ...(logoAutoPinIssue ? { logoAutoPinIssue } : {}),
       });
 
       return {
@@ -13541,6 +13568,11 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
             }
           }
           : {}),
+        // ENG-933 follow-up: the write always succeeds even when the logo
+        // fetch/rasterise attempt didn't land an asset — this field is how
+        // that partial outcome reaches Emma instead of reading as full
+        // success while the Logo & Assets card stays empty.
+        ...(logoAutoPinIssue ? { logoAutoPinIssue } : {}),
         formattedContent
       };
     } catch (error) {
@@ -24168,6 +24200,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           }
         }
       });
+    }
+
+    if (updateResult.logoAutoPinIssue) {
+      formattedSummary += `<br><strong>⚠️ Logo not stored as an asset:</strong> ${updateResult.logoAutoPinIssue}<br>`;
     }
 
     formattedSummary += `<br><em>💡 You can view the latest brand guidelines at the <a href="/brand-guidelines">Brand Guidelines page</a>.</em>`;

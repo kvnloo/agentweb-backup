@@ -504,9 +504,15 @@ describe('AgentModeService - Brand Guidelines Update', () => {
         expect(result.attachments).toEqual([
           expect.objectContaining({ type: 'logo', url: 'https://s3/real-upload.png' }),
         ]);
+        // brandData.logoUrl must track what's actually displayed, not drift
+        // to the stale/raw URL this call happened to carry — otherwise the
+        // Logo & Assets card would keep showing the right logo while
+        // brandData.logoUrl silently pointed somewhere else.
+        expect(result.brandData.logoUrl).toBe('https://s3/real-upload.png');
+        expect(result.logoAutoPinIssue).toBeUndefined();
       });
 
-      it('leaves the write intact when the download/conversion fails', async () => {
+      it('leaves the write intact and surfaces logoAutoPinIssue when the download/conversion fails', async () => {
         const userId = 'test-user-123';
         mockUserDb.getUserById.mockResolvedValue({
           userId,
@@ -531,9 +537,39 @@ describe('AgentModeService - Brand Guidelines Update', () => {
         expect(result.success).toBe(true);
         expect(result.attachments).toEqual([]);
         expect(result.brandData.logoUrl).toBe('https://dead.example.com/logo.ico');
+        // But the caller must be told — never a silent "fully succeeded"
+        // while the Logo & Assets card stays empty.
+        expect(result.logoAutoPinIssue).toEqual(expect.stringContaining('download-failed'));
+        expect(result.logoAutoPinIssue).toEqual(expect.stringContaining('timeout'));
+        expect(result.formattedContent).toEqual(expect.stringContaining('Logo not stored as an asset'));
       });
 
-      it('leaves the write intact when downloadBrandLogoToS3 throws', async () => {
+      it('surfaces a distinct logoAutoPinIssue for an un-rasterisable SVG', async () => {
+        const userId = 'test-user-123';
+        mockUserDb.getUserById.mockResolvedValue({
+          userId,
+          email: 'test@example.com',
+          brandGuidelines: {
+            brandData: { brandName: 'Acme' },
+            attachments: [],
+            createdAt: '2023-01-01T00:00:00.000Z',
+            updatedAt: '2023-01-01T00:00:00.000Z',
+          },
+        });
+        mockUserDb.updateUser.mockResolvedValue({});
+        downloadBrandLogoToS3.mockResolvedValue({ status: 'svg' });
+
+        const result = await (agentModeService as any).updateBrandGuidelines(
+          { brandData: { logoUrl: 'https://acme.com/logo.svg' } },
+          userId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.attachments).toEqual([]);
+        expect(result.logoAutoPinIssue).toEqual(expect.stringContaining('SVG'));
+      });
+
+      it('leaves the write intact and surfaces logoAutoPinIssue when downloadBrandLogoToS3 throws', async () => {
         const userId = 'test-user-123';
         mockUserDb.getUserById.mockResolvedValue({
           userId,
@@ -556,6 +592,7 @@ describe('AgentModeService - Brand Guidelines Update', () => {
         expect(result.success).toBe(true);
         expect(result.attachments).toEqual([]);
         expect(result.brandData.logoUrl).toBe('https://flaky.example.com/logo.ico');
+        expect(result.logoAutoPinIssue).toEqual(expect.stringContaining('unexpected error'));
       });
 
       it('does not throw when brandAssets is explicitly null', async () => {
