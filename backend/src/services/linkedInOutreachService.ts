@@ -1009,8 +1009,12 @@ export class LinkedInOutreachService {
    *
    * Structured ID filters (`company_id`, `location_id`, `industry_id`,
    * `school_id`) are forwarded as top-level body keys per Unipile's classic
-   * people-search schema (arrays of numeric IDs; `industry` is an object with
-   * include/exclude arrays). See https://developer.unipile.com/docs/linkedin-search.
+   * people-search schema — all four as flat arrays of numeric ID strings,
+   * `industry` included (ENG-1299: an earlier `{ include, exclude }` object
+   * shape for industry 400'd every structured search with "Expected union
+   * value", silently degrading to a keyword-only search that drops the
+   * industry/location constraints). See
+   * https://developer.unipile.com/docs/linkedin-search.
    *
    * When the caller passes free-text (e.g. `company: 'Microsoft'`) without the
    * matching `*_id`, this method calls UnipileSearchParamService.resolveTopId()
@@ -1089,7 +1093,7 @@ export class LinkedInOutreachService {
 
         if (resolvedCompanyId) body.company = [resolvedCompanyId];
         if (resolvedLocationId) body.location = [resolvedLocationId];
-        if (resolvedIndustryId) body.industry = { include: [resolvedIndustryId], exclude: [] };
+        if (resolvedIndustryId) body.industry = [resolvedIndustryId];
         if (resolvedSchoolId) body.school = [resolvedSchoolId];
 
         // Free-text fallback for anything that didn't resolve (and for title
