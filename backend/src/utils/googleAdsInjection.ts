@@ -17,6 +17,8 @@
  * been defined, and unblocking one test lander took a hand-written PR from a fork.
  */
 
+import * as ts from 'typescript';
+
 /**
  * Same bail-out rationale as its two siblings: a real Next.js layout.tsx is a few KB.
  * There is no legitimate layout this large; bail out before running any regex against
@@ -213,29 +215,108 @@ function extractGoogleAdsBlocks(content: string): string[] {
  * `conversionId` "" (removal) => zero blocks remain.
  */
 /**
+ * Script elements, split into their attribute text and their inline body.
+ *
+ * Regex rather than an HTML parser on purpose: this reads layout.tsx SOURCE, which is JSX,
+ * and an HTML parser would mangle `{...}` expression containers and self-closing <Script/>.
+ */
+function scriptElements(source: string): Array<{ attrs: string; body: string }> {
+  const out: Array<{ attrs: string; body: string }> = [];
+  const paired = /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = paired.exec(source)) !== null) out.push({ attrs: m[1], body: m[2] });
+  const selfClosing = /<script\b([^>]*)\/>/gi;
+  while ((m = selfClosing.exec(source)) !== null) out.push({ attrs: m[1], body: '' });
+  return out;
+}
+
+/**
+ * Does the browser execute this script element as JavaScript?
+ *
+ * A `type` the browser does not recognise as JS makes the element inert data — the
+ * classic case being `application/json` or `application/ld+json`, whose contents are never
+ * run. Treating those as code is how a config call quoted inside a JSON blob reads as a
+ * live tag.
+ */
+function isExecutableScript(attrs: string): boolean {
+  const type = attrs.match(/\btype\s*=\s*["']([^"']*)["']/i)?.[1]?.trim().toLowerCase();
+  if (!type) return true; // no type attribute = classic JavaScript
+  return ['text/javascript', 'application/javascript', 'text/ecmascript', 'application/ecmascript', 'module']
+    .includes(type);
+}
+
+/**
+ * Is there a real `gtag('config', '<conversionId>')` CALL in this JavaScript?
+ *
+ * Parsed, not string-matched. String matching cannot tell a call from the same characters
+ * sitting in a comment or inside a string literal, and both read as a working tag:
+ *
+ *     // gtag('config', 'AW-99999999') — TODO, ask marketing for the real id
+ *     const example = "gtag('config','AW-99999999')";
+ *
+ * Reporting either as installed makes us skip writing the tag that would actually have
+ * fired. TypeScript is already a runtime dependency, so its parser does this properly and
+ * for free — and it removes the regex built from a variable that the previous version used.
+ *
+ * The parser is error-tolerant, so malformed or non-JS content yields no match rather than
+ * throwing. That is the safe direction here: a false negative means we try to inject, the
+ * wide guard sees the foreign id and refuses, and a human looks.
+ */
+function hasGtagConfigCall(code: string, conversionId: string): boolean {
+  if (!code.trim()) return false;
+  let found = false;
+  const sf = ts.createSourceFile('inline.js', code, ts.ScriptTarget.Latest, false, ts.ScriptKind.JS);
+  const literal = (n: ts.Node | undefined): string | undefined => {
+    if (!n) return undefined;
+    if (ts.isStringLiteral(n)) return n.text;
+    if (ts.isNoSubstitutionTemplateLiteral(n)) return n.text;
+    return undefined;
+  };
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'gtag') {
+      const [first, second] = node.arguments;
+      if (literal(first)?.toLowerCase() === 'config' && literal(second) === conversionId) {
+        found = true;
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sf, visit);
+  return found;
+}
+
+/**
  * Does a hand-written tag actually initialise this conversion id?
  *
  * Two parts have to be present, the same two our own block writes:
  *
- *   - a gtag.js loader. Its id is NOT required to be the Ads id: loading gtag.js once for
- *     GA4 (`gtag/js?id=G-…`) and then adding `gtag('config','AW-…')` is a normal, working
- *     setup, and demanding `gtag/js?id=AW-…` would report those correctly tagged pages as
- *     untagged.
- *   - a `gtag('config', '<this id>')` call. This is the part that actually registers the
- *     id; without it the loader sits there measuring nothing for Ads.
+ *   - a gtag.js loader, taken from a real `src` ATTRIBUTE rather than from anywhere the
+ *     URL happens to appear as text. Its id is NOT required to be the Ads id: loading
+ *     gtag.js once for GA4 (`gtag/js?id=G-…`) and then adding `gtag('config','AW-…')` is a
+ *     normal, working setup, and demanding `gtag/js?id=AW-…` would report those correctly
+ *     tagged pages as untagged.
+ *   - a real `gtag('config', '<this id>')` CALL. This is the part that registers the id;
+ *     without it the loader sits there measuring nothing for Ads.
  *
- * Quoting is deliberately loose (either quote style, optional whitespace) because this
- * reads code a human wrote, not code we generated.
+ * Both are looked for only in scripts the browser will actually execute.
  */
 function handWrittenTagFires(content: string, conversionId: string): boolean {
-  const withoutOurs = stripOurBlock(content);
-  const scripts = (withoutOurs.match(/<script[\s\S]*?(?:\/>|<\/script>)/gi) || []).join('\n');
-  const hasLoader = /googletagmanager\.com\/gtag\/js\?id=/i.test(scripts);
-  const escaped = conversionId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const hasConfig = new RegExp(
-    `gtag\\s*\\(\\s*['"\`]config['"\`]\\s*,\\s*['"\`]${escaped}['"\`]`,
-    'i',
-  ).test(scripts);
+  const elements = scriptElements(stripOurBlock(content)).filter(el => isExecutableScript(el.attrs));
+
+  const hasLoader = elements.some(el =>
+    /\bsrc\s*=\s*[{`"'][^`"'}]*googletagmanager\.com\/gtag\/js\?id=/i.test(el.attrs));
+
+  const hasConfig = elements.some(el => {
+    if (hasGtagConfigCall(el.body, conversionId)) return true;
+    // Next.js writes inline script bodies through dangerouslySetInnerHTML, so the code
+    // lives in the ATTRIBUTES rather than between the tags. Parse that content too, or
+    // every App Router tag reads as loader-only.
+    const html = el.attrs.match(/__html\s*:\s*(`[\s\S]*?`|"[\s\S]*?"|'[\s\S]*?')/)?.[1];
+    return html ? hasGtagConfigCall(html.slice(1, -1), conversionId) : false;
+  });
+
   return hasLoader && hasConfig;
 }
 

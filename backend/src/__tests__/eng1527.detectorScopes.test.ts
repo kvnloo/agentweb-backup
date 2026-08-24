@@ -162,6 +162,66 @@ describe('ENG-1527 a hand-written tag has to actually fire to count as installed
     expect(verifyGoogleAdsInjection(inHead(ga4Loader + CONFIG), 'AW-99999999')).toBe(true);
   });
 
+  /**
+   * Round 2, from CodeRabbit. Requiring the config call was right; matching it as a STRING
+   * was not. The same characters in a comment, in a string literal, or inside a script the
+   * browser never executes are not a call, and treating them as one skips writing the tag
+   * that would actually have fired — the identical failure the string match was added to
+   * close, one level subtler.
+   *
+   * These are parsed now, so the parser decides what is code.
+   */
+  describe('only code counts as a config call', () => {
+    it('ignores a config call inside a non-executable application/json script', () => {
+      const json = `<script type="application/json">{"example":"gtag('config','AW-99999999')"}</script>`;
+      expect(verifyGoogleAdsInjection(inHead(LOADER + json), 'AW-99999999')).toBe(false);
+    });
+
+    it('ignores a config call inside application/ld+json', () => {
+      const ld = `<script type="application/ld+json">{"note":"gtag('config','AW-99999999')"}</script>`;
+      expect(verifyGoogleAdsInjection(inHead(LOADER + ld), 'AW-99999999')).toBe(false);
+    });
+
+    it('ignores a config call that is commented out', () => {
+      const commented = `<script>// gtag('config', 'AW-99999999') — TODO, ask marketing for the real id</script>`;
+      expect(verifyGoogleAdsInjection(inHead(LOADER + commented), 'AW-99999999')).toBe(false);
+    });
+
+    it('ignores a config call inside a block comment', () => {
+      const commented = `<script>/* gtag('config', 'AW-99999999'); */</script>`;
+      expect(verifyGoogleAdsInjection(inHead(LOADER + commented), 'AW-99999999')).toBe(false);
+    });
+
+    it('ignores a config call quoted inside a string literal', () => {
+      const quoted = `<script>var example = "gtag('config','AW-99999999')";</script>`;
+      expect(verifyGoogleAdsInjection(inHead(LOADER + quoted), 'AW-99999999')).toBe(false);
+    });
+
+    it('ignores a loader URL that only appears as text, not as a src attribute', () => {
+      const text = `<script>var doc = "load https://www.googletagmanager.com/gtag/js?id=G-KKJE0Q33LF first";`
+        + `gtag('config', 'AW-99999999');</script>`;
+      expect(verifyGoogleAdsInjection(inHead(text), 'AW-99999999')).toBe(false);
+    });
+
+    it('accepts a real call in a module script', () => {
+      const mod = `<script type="module">gtag('config', 'AW-99999999');</script>`;
+      expect(verifyGoogleAdsInjection(inHead(LOADER + mod), 'AW-99999999')).toBe(true);
+    });
+
+    it('accepts the Next.js dangerouslySetInnerHTML shape', () => {
+      // The App Router way to write an inline body: the code sits in an attribute, so
+      // parsing only what is between the tags would call every such tag loader-only.
+      const next = '<script id="ads" dangerouslySetInnerHTML={{ __html: `'
+        + `gtag('js', new Date()); gtag('config', 'AW-99999999');` + '` }} />';
+      expect(verifyGoogleAdsInjection(inHead(LOADER + next), 'AW-99999999')).toBe(true);
+    });
+
+    it('is not fooled by a config call naming a different id in real code', () => {
+      const other = `<script>gtag('config', 'AW-12312312312');</script>`;
+      expect(verifyGoogleAdsInjection(inHead(LOADER + other), 'AW-99999999')).toBe(false);
+    });
+  });
+
   it.each([
     [`gtag("config", "AW-99999999")`, 'double quotes'],
     [`gtag('config','AW-99999999')`, 'no spaces'],
