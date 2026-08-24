@@ -273,6 +273,38 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(result.analysis).toContain(csv);
   });
 
+  test('surfaces generated CSV data returned as inline_data (snake_case) instead of silently dropping it', async () => {
+    const csv = 'ad_group,impressions,clicks\nBrand Terms,10432,521\nCompetitor Terms,8811,290';
+
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [
+          {
+            content: {
+              parts: [
+                { text: 'Here is the Q3 ad group breakdown.' },
+                {
+                  inline_data: {
+                    data: Buffer.from(csv, 'utf-8').toString('base64'),
+                    mime_type: 'text/csv'
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Break down Q3 performance by ad group.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.codeExecuted).toBe(true);
+    expect(result.analysis).toContain('Brand Terms');
+    expect(result.analysis).toContain('Competitor Terms');
+    expect(result.analysis).toContain(csv);
+  });
+
   test('skips inline_data (snake_case) with non-image mimeType', async () => {
     mockedAxiosPost.mockResolvedValueOnce({
       data: {
