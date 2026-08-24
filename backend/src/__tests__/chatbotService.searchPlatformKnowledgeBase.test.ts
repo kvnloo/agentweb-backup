@@ -151,3 +151,39 @@ describe('searchPlatformKnowledgeBase — content length capping', () => {
     expect(results[1].content).toBe('y'.repeat(5000) + '\n\n[Content truncated]');
   });
 });
+
+describe('searchPlatformKnowledgeBase — ENG-1222 timeout guard', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  // A live Vertex AI Discovery Engine call was directly observed hanging for
+  // several minutes with no error and no result — with no timeout, that stalls
+  // the entire chat turn (every chatbotService.ts message goes through this,
+  // not just skill sessions). It must reject instead of hanging forever.
+  it('rejects with a timeout error instead of hanging indefinitely when Vertex never responds', async () => {
+    jest.useFakeTimers();
+    searchMock.mockImplementation(() => new Promise(() => {})); // never resolves
+
+    const resultPromise = searchPlatformKnowledgeBase('test query', 5, 'user-123');
+    const assertion = expect(resultPromise).rejects.toThrow(/timed out/i);
+
+    await jest.advanceTimersByTimeAsync(10_000);
+    await assertion;
+  });
+
+  it('still returns real results normally when Vertex responds well within the timeout', async () => {
+    searchMock
+      .mockImplementationOnce(async () => [[vertexResult('fast result')]])
+      .mockImplementationOnce(async () => [[]]);
+
+    const results = await searchPlatformKnowledgeBase('test query', 5, 'user-123');
+
+    expect(results).toHaveLength(1);
+    expect(results[0].content).toBe('fast result');
+  });
+});
