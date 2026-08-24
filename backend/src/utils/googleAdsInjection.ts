@@ -64,21 +64,58 @@ const CONVERSION_ID = /^AW-[0-9]{6,}$/;
  * Matches the same shape RULE 7.5's detector looks for, so "a tag the gate would see" and
  * "a tag we consider present" cannot disagree.
  */
-function foreignGoogleAdsIds(content: string): string[] {
-  const withoutOurs = content.replace(
+function stripOurBlock(content: string): string {
+  return content.replace(
     /\{\/\* Google Ads Tag \*\/\}[\s\S]*?\{\/\* End Google Ads Tag \*\/\}/g,
     '',
   );
-  // Scoped to <script> elements, not the whole file. An id in prose is not a tag — v0
-  // writes marketing copy, and a page whose body happens to quote a gtag URL must not
-  // read as tracked, or RULE 7.5 would pass a page that fires nothing. Conversely a
-  // hand-written loader or config call inside a script IS a live tag, whoever wrote it.
+}
+
+/**
+ * ENG-1527. The WIDE half: every AW id anywhere in the source, prose included.
+ *
+ * Used only to REFUSE TO WRITE. The old rule scoped this to <script> elements, reasoning
+ * that an id in prose is not a tag. That reasoning belongs to RULE 7.5's detector, which
+ * reads SERVED HTML, where a text node really is inert. This reads layout.tsx SOURCE,
+ * where the same characters are code:
+ *
+ *     const GA_ADS_ID = "AW-11112222333";
+ *     <Script src={`https://www.googletagmanager.com/gtag/js?id=${GA_ADS_ID}`} />
+ *
+ * an ordinary App Router shape with the id nowhere near a <script> literal. The guard saw
+ * nothing, injection proceeded, and two distinct AW ids shipped on one page — the ENG-910
+ * double-count this guard exists to prevent, walked past a second time.
+ *
+ * Wide is the safe direction HERE and only here: a false positive costs a visible 422
+ * telling a human to clean the layout; a miss costs a silently double-counted conversion.
+ */
+function foreignGoogleAdsIdsAnywhere(content: string): string[] {
+  const ids = new Set<string>();
+  // Case-sensitive: RULE 7.5's detector matches upper case only (a lower-case `gtm-agent`
+  // slug was reading as a container — see the comment on detectTrackingSnippets), so
+  // matching case-insensitively would let the two disagree about the very same page.
+  for (const id of stripOurBlock(content).match(/\bAW-[0-9]{6,}\b/g) || []) ids.add(id);
+  return [...ids];
+}
+
+/**
+ * ENG-1527. The NARROW half: AW ids sitting in an executable position.
+ *
+ * Used only to answer "does a conversion actually fire against this id". Widening this to
+ * match the guard above was a real regression, caught by the marketing-copy test: an AW id
+ * inside <title>We load …gtag/js?id=AW-99999999 for you</title> is copy, and reporting it
+ * as installed would hand RULE 7.5 a pass for a page that fires nothing — the exact failure
+ * the gate exists to prevent, arrived at from the other side.
+ *
+ * So the two are deliberately asymmetric, and the asymmetry is load-bearing. A page whose
+ * id lives in a const reads as NOT installed here, which is the safe answer: we then try to
+ * inject, the wide guard above refuses with a 422, and a human looks at it. Nothing is
+ * double-counted and nothing is silently blessed.
+ */
+function foreignGoogleAdsIdsInCode(content: string): string[] {
+  const withoutOurs = stripOurBlock(content);
   const ids = new Set<string>();
   for (const script of withoutOurs.match(/<script[\s\S]*?(?:\/>|<\/script>)/gi) || []) {
-    // Case-sensitive, to hold the invariant above: RULE 7.5's detector matches upper case
-    // only (a lower-case `gtm-agent` slug was reading as a container — see the comment on
-    // detectTrackingSnippets), so matching case-insensitively here would let the two
-    // disagree about whether the very same page carries a tag.
     for (const id of script.match(/\bAW-[0-9]{6,}\b/g) || []) ids.add(id);
   }
   return [...ids];
@@ -102,7 +139,7 @@ export function injectGoogleAdsIntoLayout(currentContent: string, conversionId: 
   // A tag someone else put here — hand-written, or installed by another tool — is still a
   // tag, and we cannot safely rewrite markup we did not author.
   if (conversionId !== '') {
-    const foreign = foreignGoogleAdsIds(currentContent);
+    const foreign = foreignGoogleAdsIdsAnywhere(currentContent);
     if (foreign.length > 0) {
       if (foreign.length === 1 && foreign[0] === conversionId.toUpperCase()) {
         // Already carrying exactly the id we were asked to install. The page IS
@@ -190,7 +227,7 @@ export function verifyGoogleAdsInjection(content: string, conversionId: string):
   // A hand-written tag carrying this exact id counts as installed: the question this
   // answers is "will a conversion fire against this id", not "did we write it".
   if (blocks.length === 0) {
-    const foreign = foreignGoogleAdsIds(content);
+    const foreign = foreignGoogleAdsIdsInCode(content);
     return foreign.length === 1 && foreign[0] === conversionId.toUpperCase();
   }
 
