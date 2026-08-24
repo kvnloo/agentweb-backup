@@ -2447,6 +2447,42 @@ describe("POST /api/landing-pages/v0/generated/:id/meta-pixel", () => {
     expect(res.body.warnings[0]).not.toMatch(/retry|redeploy/i);
   });
 
+  it("REMOVAL wording: says the pixel was 'removed', not 'updated'", async () => {
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([root]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValueOnce({ committed: false, reason: "no-capture-layer" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings[0]).toMatch(/browser pixel was removed/);
+  });
+
+  it("committed:true is NOT enough — a skipped capture route is still reported", async () => {
+    // The silent-partial `committed` alone cannot see: the commit landed, but the capture
+    // route was deliberately excluded because its deployed map could not be parsed.
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([root]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValueOnce({ committed: true, captureRouteSkipped: true });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings[0]).toMatch(/could not be read/);
+  });
+
   it("FAIL: verification failure on malformed layout → 422, no partial write", async () => {
     const malformedLayout = `export default function RootLayout({ children }) { return <>{children}</>; }`;
     mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);

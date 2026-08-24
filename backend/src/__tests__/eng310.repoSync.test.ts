@@ -368,6 +368,10 @@ describe("syncLeadCaptureFilesToRepo", () => {
     expect(result.committed).toBe(true);
     expect(treePaths()).not.toContain("app/api/capture/route.ts");
     expect(treePaths()).toEqual(expect.arrayContaining(["middleware.ts"]));
+    // ⚠ committed:true here does NOT mean the capture route carries the caller's pixel — it
+    // was deliberately excluded. Callers configuring tracking must be able to see that, or
+    // they report success over a route we never wrote.
+    expect(result.captureRouteSkipped).toBe(true);
   });
 
   it("commits the capture route normally when the deployed map has no extra paths", async () => {
@@ -704,6 +708,21 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
     expect(pixelArg).toBeUndefined();
     expect(accountArg).toBeUndefined();
     await expect(buildListByPath()).resolves.toEqual({ "/pricing": "list_pricing" });
+  });
+
+  it("BESPOKE REPO: DETACHING says 'removed', not 'saved'", async () => {
+    const bespoke = { ...rootPage, githubRepoUrl: "https://github.com/AgentWebPro/agentweb-landing-page", leadListId: "list_home" };
+    mockGetLandingPageById.mockResolvedValue(bespoke);
+    mockGetLandingPagesByOwner.mockResolvedValue([bespoke]);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: false, reason: NO_CAPTURE_LAYER });
+
+    const res = await request(app)
+      .patch("/api/landing-pages/v0/generated/p1/lead-list")
+      .send({ leadListId: null });
+
+    expect(res.status).toBe(200);
+    expect(res.body.captureSyncWarning).toMatch(/^Lead list removed/);
+    expect(res.body.captureSyncWarning).not.toMatch(/Lead list saved/);
   });
 
   it("BESPOKE REPO: the lead-list path may not install a capture layer, and says so accurately", async () => {

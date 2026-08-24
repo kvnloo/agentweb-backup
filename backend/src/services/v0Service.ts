@@ -6618,7 +6618,19 @@ async function readRepoFile(
  */
 export async function syncMiddlewareAndTrackingHelper(
   repoFullName: string,
-): Promise<{ committed: boolean; reason?: string; pushedCommitSha?: string; pushTimestampMs?: number }> {
+): Promise<{
+  committed: boolean;
+  reason?: string;
+  pushedCommitSha?: string;
+  pushTimestampMs?: number;
+  /**
+   * True when the commit deliberately EXCLUDED app/api/capture/route.ts because its deployed
+   * LIST_BY_PATH could not be parsed. `committed: true` alone therefore does not mean the
+   * capture route carries the caller's requested pixel — callers that configure tracking must
+   * check this or they report success over a route they never wrote.
+   */
+  captureRouteSkipped?: boolean;
+}> {
   try {
     const { token: ghToken } = await getGitHubOrgToken();
     const ghHeaders = {
@@ -6805,7 +6817,19 @@ export async function syncLeadCaptureFilesToRepo(
   /** Threaded through to buildCaptureRoute — see its own doc comment. */
   pixelId?: string,
   metaAccountId?: string,
-): Promise<{ committed: boolean; reason?: string; pushedCommitSha?: string; pushTimestampMs?: number }> {
+): Promise<{
+  committed: boolean;
+  reason?: string;
+  pushedCommitSha?: string;
+  pushTimestampMs?: number;
+  /**
+   * True when the commit deliberately EXCLUDED app/api/capture/route.ts because its deployed
+   * LIST_BY_PATH could not be parsed. `committed: true` alone therefore does NOT mean the
+   * capture route carries the caller's requested pixel — a caller configuring tracking must
+   * check this or it reports success over a route it never wrote.
+   */
+  captureRouteSkipped?: boolean;
+}> {
   const MAX_ATTEMPTS = 2;
   let lastErr: any;
 
@@ -6977,7 +7001,12 @@ export async function syncLeadCaptureFilesToRepo(
               : "NO page of this site has a lead list — its forms will fail loudly"
           }`
         );
-        return { committed: true, pushedCommitSha, pushTimestampMs };
+        return {
+          committed: true,
+          pushedCommitSha,
+          pushTimestampMs,
+          ...(captureRouteUnreadable ? { captureRouteSkipped: true } : {}),
+        };
       } catch (err: any) {
         lastErr = err;
         const { retryable, reason } = isRetryableGithubPushError(err);

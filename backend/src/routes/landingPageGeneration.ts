@@ -2739,12 +2739,22 @@ async function saveMetaPixelForPage(
   // `reason: undefined`, and in any suite that mocks v0Service with an object literal the
   // imported NO_CAPTURE_LAYER is ALSO undefined — so a bare equality would fire this warning
   // on every successful pixel install under test.
+  // ⚠ Two distinct silent-partials, and `committed` alone catches neither:
+  //   - the floor refused the repo outright (NO_CAPTURE_LAYER, committed:false)
+  //   - the commit landed but deliberately EXCLUDED the capture route (captureRouteSkipped)
+  // Either way the requested pixel is not in the capture route, so "Meta Pixel injected" on
+  // its own would claim server-side tracking that does not exist.
+  const verb = pixelId ? "updated" : "removed";
   const captureWarning =
     !captureSync.committed && captureSync.reason === NO_CAPTURE_LAYER
-      ? "The browser pixel was updated, but this site does not use the platform's lead-capture " +
+      ? `The browser pixel was ${verb}, but this site does not use the platform's lead-capture ` +
         "code, so server-side conversion tracking was not configured for it. Wire it in the " +
         "site's own repository."
-      : undefined;
+      : captureSync.captureRouteSkipped
+        ? `The browser pixel was ${verb}, but this site's lead-capture route could not be read, ` +
+          "so it was left exactly as deployed and does not carry this change. Fix the route in " +
+          "the site's repository."
+        : undefined;
 
   // 3. Persist metaPixelId/metaAdAccountId on this record.
   await updateLandingPageMetaPixel(page.id, page.userId, pixelId, accountId);
@@ -3090,16 +3100,17 @@ async function syncLeadCaptureForPage(
       rootRecord?.metaAdAccountId,
     );
     if (result.committed || result.reason === "up-to-date") return undefined;
+    // Attaching and DETACHING both come through here; "saved" is wrong for a removal.
+    const lead = leadListId === null ? "Lead list removed" : "Lead list saved";
     // Not transient: no retry or redeploy installs a capture layer we refuse to install, so
     // this must not borrow the "applied on the next deploy" wording below.
     if (result.reason === NO_CAPTURE_LAYER) {
       return (
-        "Lead list saved, but this page's site does not use the platform's lead-capture code, " +
-        "so its form will not start saving leads on its own. Wire the form to this list in the " +
-        "site's own repository."
+        `${lead}, but this page's site does not use the platform's lead-capture code, ` +
+        "so its form was not changed. Wire the form up in the site's own repository."
       );
     }
-    return `Lead list saved, but the live site was not updated (${result.reason}). It will be applied on the next deploy or retry.`;
+    return `${lead}, but the live site was not updated (${result.reason}). It will be applied on the next deploy or retry.`;
   } catch (err: any) {
     // syncLeadCaptureFilesToRepo does not throw, so this is a sibling-fetch failure.
     console.error(`[LP GENERATION] ENG-310: lead-capture sync failed for page ${page.id}:`, err?.message || err);
