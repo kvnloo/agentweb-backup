@@ -5883,13 +5883,28 @@ export class AgentModeService {
     // Google tag is present — not that an Ads conversion can be recorded. The gate
     // already computes this warning and its callers deliberately relay it rather than
     // swallow it; without this branch the minimizer discards it one layer later, which
-    // is the same outcome by a longer route. Merged onto the result rather than replacing
-    // it, because these paths carry a real artifact (resourceName, message) the UI needs.
+    // is the same outcome by a longer route.
+    //
+    // The identifier has to come with it. Two of the four producers return one —
+    // AD CREATE (`adResourceName`) and ASSET_GROUP CREATE (`assetGroupResourceName`) —
+    // and dropping it would leave the persisted toolCalls ledger describing a resource
+    // that was created without saying which, so neither the UI nor any later
+    // reconciliation could find it. Warning the operator while losing the thing the
+    // warning is ABOUT is its own bug.
+    //
+    // Carried by suffix rather than a fixed list so a future producer is covered, and
+    // restricted to top-level strings so this stays a minimizer: no array or nested
+    // object can ride along on the back of a warning.
     if (result && typeof result.trackingWarning === 'string' && result.trackingWarning) {
+      const identifiers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(result)) {
+        if (k.endsWith('ResourceName') && typeof v === 'string') identifiers[k] = v;
+      }
       return {
         success: result.success !== false,
         trackingWarning: result.trackingWarning,
         ...(typeof result.message === 'string' ? { message: result.message } : {}),
+        ...identifiers,
       };
     }
 

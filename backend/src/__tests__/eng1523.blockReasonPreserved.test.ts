@@ -85,6 +85,45 @@ describe('ENG-1523 — the refusal reaches the browser', () => {
     expect(out.message).toBe('Campaign resumed');
   });
 
+  // CodeRabbit caught this on review: the comment claimed the result was merged, the
+  // code returned three fields, and the created resource's id was dropped. Warning the
+  // operator while losing the thing the warning is ABOUT is its own bug — the ledger
+  // would say a resource was created without saying which.
+  it('keeps the created resource id alongside an AD CREATE warning', () => {
+    const out = minimize(
+      { success: true, adResourceName: 'customers/123/adGroupAds/1~2', trackingWarning: 'no AW- tag on the final url' },
+      'call_google_ads_api',
+    );
+    expect(out.adResourceName).toBe('customers/123/adGroupAds/1~2');
+    expect(out.trackingWarning).toMatch(/no AW- tag/);
+  });
+
+  it('keeps the asset group id alongside an ASSET_GROUP CREATE warning', () => {
+    const out = minimize(
+      { success: true, assetGroupResourceName: 'customers/123/assetGroups/9', trackingWarning: 'w' },
+      'call_google_ads_api',
+    );
+    expect(out.assetGroupResourceName).toBe('customers/123/assetGroups/9');
+  });
+
+  // Carried by suffix so a future producer is covered without another edit here...
+  it('carries any *ResourceName a future producer attaches', () => {
+    const out = minimize({ success: true, campaignResourceName: 'customers/1/campaigns/2', trackingWarning: 'w' }, 'call_google_ads_api');
+    expect(out.campaignResourceName).toBe('customers/1/campaigns/2');
+  });
+
+  // ...but this must stay a MINIMIZER. A warning must not become a hole that lets an
+  // arbitrary payload ride along.
+  it('does not let arrays or objects ride along on a warning', () => {
+    const out = minimize(
+      { success: true, trackingWarning: 'w', campaigns: [{ id: '1' }], someObject: { big: true }, count: 42 },
+      'call_google_ads_api',
+    );
+    expect(out.campaigns).toBeUndefined();
+    expect(out.someObject).toBeUndefined();
+    expect(out.count).toBeUndefined();
+  });
+
   // The whole point of the minimizer is to keep stored payloads small. The fix must
   // not become a hole that preserves everything.
   it('still minimizes an ordinary success to nothing', () => {
