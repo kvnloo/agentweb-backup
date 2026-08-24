@@ -109,3 +109,102 @@ describe('the MAXIMIZE_* strategies honour a supplied target', () => {
     expect(lastUpdate().targetRoas).toEqual({ targetRoas: 3 });
   });
 });
+
+/**
+ * Round 2, from CodeRabbit's review of the first fix. The guard above only asked "was a
+ * strategy named at all". That is necessary and not sufficient: naming a strategy that has
+ * nowhere to PUT the supplied target drops it exactly as silently as naming none.
+ *
+ * Every case below was confirmed against the real mutate payload before being fixed — each
+ * one returned `success: true` describing a request that did not contain the number the
+ * caller sent.
+ */
+const CREATE_BASE = {
+  name: 'p',
+  type: 'SEARCH' as const,
+  budgetResourceName: 'customers/1234567890/campaignBudgets/1',
+  locationTargetIds: [] as string[],
+};
+const create = (extra: any) => svc().createCampaign('u', '1234567890', { ...CREATE_BASE, ...extra });
+const update = (extra: any) => svc().updateCampaign('u', '1234567890', CAMPAIGN, extra);
+const lastCreate = () => mutate.mock.calls[0][3][0].create;
+
+describe('a target the named strategy cannot store is refused, not dropped', () => {
+  // Documented as "mutable for portfolio bidding strategies only" — sent on a standard
+  // strategy it is not stored, and the campaign goes on bidding uncapped.
+  it.each(['MAXIMIZE_CONVERSIONS', 'MAXIMIZE_CONVERSION_VALUE', 'TARGET_CPA', 'TARGET_ROAS', 'MANUAL_CPC'])(
+    'refuses a cpc_bid_ceiling on %s and sends nothing',
+    async (biddingStrategy) => {
+      await expect(create({ biddingStrategy, cpcBidCeilingMicros: 2_000_000 }))
+        .rejects.toThrow(/portfolio bidding strategies only/i);
+      await expect(update({ biddingStrategy, cpcBidCeilingMicros: 2_000_000 }))
+        .rejects.toThrow(/portfolio bidding strategies only/i);
+      expect(mutate).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['TARGET_SPEND', 'MANUAL_CPC'])(
+    'refuses a bid target on %s, which has no target field, and sends nothing',
+    async (biddingStrategy) => {
+      await expect(create({ biddingStrategy, biddingStrategyTarget: 50 }))
+        .rejects.toThrow(/is not a field of/i);
+      await expect(update({ biddingStrategy, biddingStrategyTarget: 50, cpcBidCeilingMicros: 1_000_000 }))
+        .rejects.toThrow(/is not a field of/i);
+      expect(mutate).not.toHaveBeenCalled();
+    },
+  );
+
+  // The campaign holds only a REFERENCE to a portfolio strategy, so a target sent here has
+  // no field on the campaign row at all. It belongs on the shared strategy object.
+  it('refuses a target alongside a portfolio strategy and points at the shared object', async () => {
+    const portfolio = { biddingStrategyResourceName: 'customers/1234567890/biddingStrategies/7' };
+    await expect(create({ ...portfolio, biddingStrategyTarget: 50 }))
+      .rejects.toThrow(/only holds a reference to it/i);
+    await expect(update({ ...portfolio, cpcBidCeilingMicros: 2_000_000 }))
+      .rejects.toThrow(/only holds a reference to it/i);
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it('lets an unknown strategy be reported as unknown rather than as a bad target', async () => {
+    // Shadowing the "unsupported bidding_strategy" error with a target complaint would hide
+    // the actual problem — the typo in the strategy name.
+    await expect(update({ biddingStrategy: 'TARGET_CPZ', biddingStrategyTarget: 50 }))
+      .rejects.toThrow(/Unsupported bidding_strategy/i);
+  });
+
+  it('still allows the two strategies that genuinely carry a ceiling', async () => {
+    await update({ biddingStrategy: 'TARGET_SPEND', cpcBidCeilingMicros: 1_000_000 });
+    expect(lastUpdate().targetSpend).toEqual({ cpcBidCeilingMicros: '1000000' });
+    jest.clearAllMocks();
+    await update({ biddingStrategy: 'TARGET_IMPRESSION_SHARE', biddingStrategyTarget: 0.65, cpcBidCeilingMicros: 3_000_000 });
+    expect(lastUpdate().targetImpressionShare.cpcBidCeilingMicros).toBe('3000000');
+  });
+});
+
+describe('createCampaign and updateCampaign apply a bid target identically', () => {
+  /**
+   * The parity this pins is exactly what broke: the MAXIMIZE_* target fix landed in
+   * updateCampaign only, so the same arguments produced a real target on update and an
+   * empty `{}` on create. The strategy branches are duplicated across the two methods, so
+   * nothing but a test comparing them catches a fix applied to one and not the other.
+   */
+  it.each([
+    ['MAXIMIZE_CONVERSIONS', 50, 'maximizeConversions', { targetCpaMicros: '50000000' }],
+    ['MAXIMIZE_CONVERSION_VALUE', 4, 'maximizeConversionValue', { targetRoas: 4 }],
+    ['TARGET_CPA', 50, 'targetCpa', { targetCpaMicros: '50000000' }],
+    ['TARGET_ROAS', 4, 'targetRoas', { targetRoas: 4 }],
+  ])('%s writes the same target on create and on update', async (strategy, target, field, expected) => {
+    await create({ biddingStrategy: strategy, biddingStrategyTarget: target });
+    const created = (lastCreate() as any)[field as string];
+    jest.clearAllMocks();
+    await update({ biddingStrategy: strategy, biddingStrategyTarget: target });
+    const updated = (lastUpdate() as any)[field as string];
+    expect(created).toEqual(expected);
+    expect(updated).toEqual(expected);
+  });
+
+  it('both still fall back to an empty strategy object when no target is supplied', async () => {
+    await create({ biddingStrategy: 'MAXIMIZE_CONVERSIONS' });
+    expect((lastCreate() as any).maximizeConversions).toEqual({});
+  });
+});
