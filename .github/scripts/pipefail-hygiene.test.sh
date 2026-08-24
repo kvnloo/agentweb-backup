@@ -30,9 +30,10 @@
 # (a lost match there means a deploy reports success on an update EB refused —
 # the ENG-734/837 false green), in deploy-failure-alert.sh under `set -e` where
 # a 141 would abort the alerter and lose the Slack notification for a failed
-# production deploy, and — worst — in staging-deploy-gate.test.sh, where the
-# false branch calls `pass_test`, so the assertion would report OK exactly when
-# the condition it guards against was true.
+# production deploy, and — worst — in staging-deploy-gate.test.sh (since
+# removed with the `backend-staging-deploy` job it guarded, ENG-1463), where
+# the false branch called `pass_test`, so the assertion would report OK exactly
+# when the condition it guards against was true.
 #
 # Every one of those reads fine in review. A grep does not, which is why this
 # lives in CI. ENG-1277 fixed one instance of this by hand; it came back.
