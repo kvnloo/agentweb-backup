@@ -764,9 +764,16 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 // their gap is far larger. RELEASE_MS is the tiny grace period after a keyup before we treat the key
 // as truly released (must outlast the auto-repeat keyup→keydown gap).
 const HOLD_MS = 300, REPEAT_GAP = 12, RELEASE_MS = 20, VOICE_LANG = 'en-US';
+// Push-to-talk engine. 'local' = record audio and transcribe with whisper.cpp on the box (via
+// /api/issues/:id/transcribe); 'browser' = the browser's built-in Web Speech API. Set to 'browser'
+// to instantly revert to the old engine. Either way the Haiku polish pass runs on the transcript.
+const VOICE_ENGINE = 'local';
 // `tgt` is the box this press belongs to — the main composer or the /btw modal's textarea. See
 // mainVoiceTarget/btwVoiceTarget below; it is pinned on keydown and cleared when the polish lands.
-const V = { supported: !!SR, denied: false, pressActive: false, recording: false, holdTimer: null, releaseTimer: null, spaceUpTs: -1e9, interveningKey: true, rec: null, before: '', after: '', spaceAt: 0, awaitingFinal: false, finalTimer: null, tgt: null };
+const VOICE_SUPPORTED = VOICE_ENGINE === 'local'
+  ? !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder)
+  : !!SR;
+const V = { supported: VOICE_SUPPORTED, denied: false, pressActive: false, recording: false, holdTimer: null, releaseTimer: null, spaceUpTs: -1e9, interveningKey: true, rec: null, before: '', after: '', spaceAt: 0, awaitingFinal: false, finalTimer: null, tgt: null };
 
 // ---------- sidebar ----------
 let lastIssuesJson = '';
@@ -1984,6 +1991,7 @@ function startVoice(tgt) {
   const caret0 = before.length;
   try { el.setSelectionRange(caret0, caret0); } catch {}
   t.fit();
+  if (VOICE_ENGINE === 'local') { startVoiceLocal(t, el); return; } // record → transcribe on release
   try {
     const rec = new SR();
     V.rec = rec;
@@ -2019,6 +2027,56 @@ function startVoice(tgt) {
     rec.start();
   } catch (e) { voiceNote('⚠ Voice failed to start: ' + (e && e.message || e), t); }
 }
+// ---- local STT (VOICE_ENGINE = 'local'): record with MediaRecorder, transcribe with whisper.cpp on
+// the box, then run the SAME heuristic + Haiku polish as the browser path. No live interim text —
+// the words appear when you release (whisper is batch, not streaming). ----
+function cleanupStream() { try { if (V.stream) V.stream.getTracks().forEach((x) => x.stop()); } catch {} V.stream = null; }
+async function startVoiceLocal(t, el) {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (!V.recording) { stream.getTracks().forEach((x) => x.stop()); return; } // released before the mic opened
+    V.stream = stream; V.chunks = [];
+    const mr = new MediaRecorder(stream); V.mr = mr;
+    mr.ondataavailable = (e) => { if (e.data && e.data.size) V.chunks.push(e.data); };
+    mr.onstop = () => finalizeVoiceLocal(t, el);
+    mr.onerror = () => { voiceNote('⚠ Recording error', t); cleanupStream(); V.recording = false; V.awaitingFinal = false; showVoice(false, t); };
+    mr.start();
+    voiceNote('🎤 Recording… — release space to transcribe', t);
+  } catch (e) {
+    V.recording = false; V.awaitingFinal = false;
+    if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) {
+      V.denied = true; V.pressActive = false; showVoice(false, t);
+      $('hint').innerHTML = '⚠ Microphone blocked — click the address-bar mic/site icon, allow access, then reload.';
+      setTimeout(updateHint, 6000);
+    } else { voiceNote('⚠ Mic failed: ' + ((e && e.message) || e), t); setTimeout(() => showVoice(false, t), 1500); }
+  }
+}
+async function finalizeVoiceLocal(t, el) {
+  if (!V.awaitingFinal) return;   // run once — whichever of onstop / the fallback timer fires first
+  V.awaitingFinal = false;
+  clearTimeout(V.finalTimer);
+  cleanupStream();
+  t = t || V.tgt; el = (t && t.el) || el;
+  if (!voiceLive(t)) { showVoice(false, t); V.tgt = null; return; }
+  const chunks = V.chunks || []; V.chunks = [];
+  const sel = S.sel;
+  if (!chunks.length || !sel) { showVoice(false, t); return; }
+  const blob = new Blob(chunks, { type: (V.mr && V.mr.mimeType) || 'audio/webm' });
+  voiceNote('✨ Transcribing…', t);
+  const before = V.before, after = V.after;
+  let raw = '';
+  try {
+    const r = await fetch(`/api/issues/${sel}/transcribe`, { method: 'POST', headers: { 'content-type': blob.type || 'application/octet-stream' }, body: blob });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && typeof d.text === 'string') raw = d.text.trim();
+  } catch { /* network / transcribe failed → nothing to insert */ }
+  if (!raw) { voiceNote('⚠ Nothing transcribed', t); setTimeout(() => showVoice(false, t), 1500); return; }
+  if (S.sel !== sel || !voiceLive(t)) { showVoice(false, t); return; } // navigated away meanwhile
+  const heur = heuristicClean(raw);
+  el.value = before + heur + after; t.fit();
+  const c = (before + heur).length; try { el.setSelectionRange(c, c); } catch {}
+  voicePolish(raw, before, after, before + heur + after, t); // same Haiku polish as the browser path
+}
 function endVoice() { // release: stop recognition; the transcript stays and then gets polished
   V.pressActive = false;
   if (!V.recording) return;
@@ -2029,6 +2087,13 @@ function endVoice() { // release: stop recognition; the transcript stays and the
     if (voiceLive(t)) t.el.focus();
   }
   V.awaitingFinal = true;
+  if (VOICE_ENGINE === 'local') {
+    clearTimeout(V.finalTimer);
+    V.finalTimer = setTimeout(() => finalizeVoiceLocal(t, t && t.el), 4000); // fallback if onstop never fires
+    if (V.mr && V.mr.state !== 'inactive') { try { V.mr.stop(); } catch {} } // → onstop → finalizeVoiceLocal
+    else finalizeVoiceLocal(t, t && t.el); // mic never opened (instant release)
+    return;
+  }
   if (V.rec) { try { V.rec.stop(); } catch {} } // → final onresult, then onend → finalizeVoice
   clearTimeout(V.finalTimer);
   V.finalTimer = setTimeout(finalizeVoice, 1500); // fallback if onend never fires

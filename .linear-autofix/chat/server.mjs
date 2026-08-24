@@ -13,10 +13,11 @@ import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
-  readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, statSync, unlinkSync, rmSync, createWriteStream, readdirSync,
+  readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, statSync, unlinkSync, rmSync, createWriteStream, readdirSync, mkdtempSync,
 } from 'node:fs';
 import { writeFile as writeFileAsync, rename as renameAsync } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
+import os from 'node:os';
 import path from 'node:path';
 import { config } from '../config.mjs';
 import { resolveIssue } from '../linear.mjs';
@@ -1055,6 +1056,42 @@ function runClaudeCleanup(prompt, timeoutMs) {
 // Clean up a raw speech-to-text transcript: punctuation, casing, and context-aware mishear fixes.
 // Meaning-preserving by instruction; falls back to null (client keeps its instant heuristic) on any
 // failure or if the model goes off-script. `text` is only the dictated segment, never the whole box.
+// Run a child process to completion, capturing stdout. Async (never blocks the event loop for the
+// 2-4s a transcription takes); SIGKILLed after timeoutMs.
+function runProc(cmd, args, { timeoutMs = 30000, env } = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try { child = spawn(cmd, args, { env: env || process.env }); }
+    catch { return resolve({ ok: false, err: 'spawn failed' }); }
+    let out = Buffer.alloc(0), err = '';
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, timeoutMs);
+    child.stdout.on('data', (d) => { out = Buffer.concat([out, d]); });
+    child.stderr.on('data', (d) => { err += String(d); });
+    child.on('error', () => { clearTimeout(timer); resolve({ ok: false, err: 'spawn error' }); });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ ok: code === 0, code, out, err }); });
+  });
+}
+// Local push-to-talk transcription: browser audio -> ffmpeg (16kHz mono wav) -> whisper.cpp -> text.
+// Confined to the configured binary + model on this box; nothing leaves it. { ok, text } | { ok:false, err }.
+async function transcribeAudio(buf) {
+  const stt = CHAT.stt || {};
+  if (!stt.enabled) return { ok: false, err: 'stt disabled' };
+  if (!existsSync(stt.bin) || !existsSync(stt.model)) return { ok: false, err: 'stt not installed' };
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'aw-stt-'));
+  try {
+    const inFile = path.join(dir, 'in'), wav = path.join(dir, 'a.wav');
+    writeFileSync(inFile, buf);
+    const ff = await runProc(stt.ffmpeg || 'ffmpeg',
+      ['-hide_banner', '-loglevel', 'error', '-i', inFile, '-ar', '16000', '-ac', '1', '-f', 'wav', '-y', wav],
+      { timeoutMs: 20000 });
+    if (!ff.ok || !existsSync(wav)) return { ok: false, err: 'ffmpeg: ' + (ff.err || 'failed').slice(0, 200) };
+    const w = await runProc(stt.bin,
+      ['-m', stt.model, '-f', wav, '-np', '-nt', '-t', String(stt.threads || 4)],
+      { timeoutMs: 60000, env: { ...process.env, LD_LIBRARY_PATH: stt.libDir || '' } });
+    if (!w.ok) return { ok: false, err: 'whisper: ' + (w.err || 'failed').slice(0, 200) };
+    return { ok: true, text: w.out.toString('utf8').replace(/\s+/g, ' ').trim() };
+  } finally { try { rmSync(dir, { recursive: true, force: true }); } catch {} }
+}
 async function polishVoice(identifier, body) {
   const text = String(body?.text || '').trim();
   if (!text) return { code: 200, body: { text: null, polished: false } };
@@ -2152,7 +2189,7 @@ async function route(req, res) {
   // merge drive in one call. See createHandoff.
   if (req.method === 'POST' && p === '/api/handoff') { const r = createHandoff(await readBody(req, HANDOFF_MAX_BYTES)); json(res, r.code, r.body || { error: r.error }); return; }
 
-  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/files|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat\/btw|\/chat\/make-editable|\/chat\/rename|\/chat\/owner|\/chat\/close|\/chat|\/preview)?$/);
+  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/files|\/transcribe|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat\/btw|\/chat\/make-editable|\/chat\/rename|\/chat\/owner|\/chat\/close|\/chat|\/preview)?$/);
   if (!m) { json(res, 404, { error: 'not found' }); return; }
   const identifier = m[1].toUpperCase();
   const sub = m[2] || '';
@@ -2196,6 +2233,17 @@ async function route(req, res) {
       accountUsage: usageCache.data?.ok ? usageCache.data.usage : null,
       models: { full: CHAT.full?.model || null, readOnly: CHAT.readOnly?.model || null },
     });
+    return;
+  }
+  if (req.method === 'POST' && sub === '/transcribe') {
+    if (!findEntry(identifier)) { json(res, 404, { error: `no autofix record for ${identifier}` }); return; }
+    try {
+      const buf = await readRawBody(req, 25 * 1024 * 1024); // 25MB audio cap
+      if (!buf.length) { json(res, 400, { error: 'empty audio' }); return; }
+      const r = await transcribeAudio(buf);
+      if (!r.ok) { json(res, 503, { error: r.err || 'transcription unavailable' }); return; }
+      json(res, 200, { text: r.text });
+    } catch (e) { json(res, 413, { error: String(e.message || e) }); }
     return;
   }
   if (req.method === 'POST' && sub === '/attach') {

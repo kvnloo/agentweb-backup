@@ -457,6 +457,17 @@ export const config = {
                                      // the fixer's own Claude session on the first turn for raw native
                                      // memory — costs ~380k tokens of low-signal transcript reloaded every
                                      // turn (the reason /compact felt like a no-op). Reversible A/B knob.
+    // Local speech-to-text for push-to-talk dictation — whisper.cpp (small.en) running on the box, no
+    // external API. REVERT to the browser's Web Speech engine: set enabled:false here AND
+    // VOICE_ENGINE = 'browser' in chat/ui.html. The Haiku polish pass runs on top either way.
+    stt: {
+      enabled: true,
+      bin: '/home/ec2-user/whisper/whisper-bin-ubuntu-x64/whisper-cli',
+      libDir: '/home/ec2-user/whisper/whisper-bin-ubuntu-x64',
+      model: '/home/ec2-user/whisper/models/ggml-small.en.bin',
+      ffmpeg: '/home/ec2-user/bin/ffmpeg',
+      threads: 4,                    // keep CPU polite on the shared box
+    },
     full: {
       model: 'sonnet',
       maxTurns: 150,                  // per-turn agent-loop cap; the 30-min timeout below is the co-limit
