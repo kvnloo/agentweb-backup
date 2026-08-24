@@ -408,6 +408,27 @@ router.get("/site", async (req: Request, res: Response) => {
       vercelProjectId: site.vercelProjectId,
       githubRepoUrl: site.githubRepoUrl,
       gtmContainerId: site.gtmContainerId,
+      /*
+       * ENG-1527. The site's Google Ads conversion tag, alongside the GTM container it
+       * sits next to on the record.
+       *
+       * The record has carried these since the tag work landed; this endpoint projected a
+       * fixed five fields and dropped them, so the only way to see whether a site's
+       * conversion tag exists was to read DynamoDB. That is the same class of gap as a
+       * warning computed and discarded: the data is right there and nobody can see it.
+       *
+       * `googleAdsTrackingInstalled` is the one that matters most and is deliberately
+       * normalised to a boolean rather than passed through as possibly-undefined. Undefined
+       * means "we never recorded an outcome", which a UI would render the same as `false`
+       * anyway; collapsing it here keeps every consumer from having to decide. It carries
+       * more weight than its Meta sibling because Google has no server-side leg until
+       * ENG-1325 — false means the lander shipped with NO Google measurement at all, which
+       * is exactly what RULE 7.5 refuses a launch over.
+       */
+      googleAdsConversionId: site.googleAdsConversionId,
+      googleAdsConversionLabel: site.googleAdsConversionLabel,
+      googleAdsCustomerId: site.googleAdsCustomerId,
+      googleAdsTrackingInstalled: site.googleAdsTrackingInstalled === true,
       deployStatus,
     });
   } catch (err) {
