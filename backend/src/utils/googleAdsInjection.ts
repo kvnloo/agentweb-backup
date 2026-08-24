@@ -222,11 +222,60 @@ function extractGoogleAdsBlocks(content: string): string[] {
  */
 function scriptElements(source: string): Array<{ attrs: string; body: string }> {
   const out: Array<{ attrs: string; body: string }> = [];
-  const paired = /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi;
+  const opens = /<script\b/gi;
   let m: RegExpExecArray | null;
-  while ((m = paired.exec(source)) !== null) out.push({ attrs: m[1], body: m[2] });
-  const selfClosing = /<script\b([^>]*)\/>/gi;
-  while ((m = selfClosing.exec(source)) !== null) out.push({ attrs: m[1], body: '' });
+
+  while ((m = opens.exec(source)) !== null) {
+    const attrsStart = m.index + m[0].length;
+
+    // Walk to the end of the opening tag rather than stopping at the first '>'.
+    // JSX attributes routinely contain one — an arrow function, a comparison, a template
+    // literal — and truncating there loses the rest of the attributes, dangerouslySetInnerHTML
+    // most of all. Quotes and braces are tracked so only a top-level '>' ends the tag.
+    let k = attrsStart;
+    let quote: string | null = null;
+    let depth = 0;
+    let tagEnd = -1;
+    while (k < source.length) {
+      const ch = source[k];
+      if (quote) {
+        if (ch === quote && source[k - 1] !== '\\') quote = null;
+      } else if (ch === '"' || ch === "'" || ch === '`') {
+        quote = ch;
+      } else if (ch === '{') {
+        depth++;
+      } else if (ch === '}') {
+        if (depth > 0) depth--;
+      } else if (ch === '>' && depth === 0) {
+        tagEnd = k;
+        break;
+      }
+      k++;
+    }
+    if (tagEnd === -1) break; // unterminated tag: nothing further is parseable
+
+    const selfClosing = source[tagEnd - 1] === '/';
+    const attrs = source.slice(attrsStart, selfClosing ? tagEnd - 1 : tagEnd);
+
+    if (selfClosing) {
+      // Decided per tag, in one ordered pass. Two independent passes could not tell a
+      // self-closing tag from an opening one, so `<script … />` paired with whatever
+      // </script> came next and swallowed an unrelated element's contents as its body.
+      out.push({ attrs, body: '' });
+      opens.lastIndex = tagEnd + 1;
+      continue;
+    }
+
+    const rest = source.slice(tagEnd + 1);
+    const closeAt = rest.search(/<\/script\s*>/i);
+    if (closeAt === -1) {
+      out.push({ attrs, body: rest });
+      break;
+    }
+    out.push({ attrs, body: rest.slice(0, closeAt) });
+    opens.lastIndex = tagEnd + 1 + closeAt;
+  }
+
   return out;
 }
 
@@ -305,8 +354,14 @@ function hasGtagConfigCall(code: string, conversionId: string): boolean {
 function handWrittenTagFires(content: string, conversionId: string): boolean {
   const elements = scriptElements(stripOurBlock(content)).filter(el => isExecutableScript(el.attrs));
 
-  const hasLoader = elements.some(el =>
-    /\bsrc\s*=\s*[{`"'][^`"'}]*googletagmanager\.com\/gtag\/js\?id=/i.test(el.attrs));
+  // The src VALUE, in any of the forms JSX writes it: a plain quoted string, or a brace
+  // expression wrapping a template literal — `src={`…/gtag/js?id=${ID}`}` is the shape our
+  // own injector emits, and the previous pattern could not cross the backtick, so a
+  // hand-written App Router loader read as no loader at all.
+  const hasLoader = elements.some(el => {
+    const src = el.attrs.match(/\bsrc\s*=\s*(\{[\s\S]*?\}|"[^"]*"|'[^']*'|`[^`]*`)/i)?.[1] ?? '';
+    return /googletagmanager\.com\/gtag\/js\?id=/i.test(src);
+  });
 
   const hasConfig = elements.some(el => {
     if (hasGtagConfigCall(el.body, conversionId)) return true;

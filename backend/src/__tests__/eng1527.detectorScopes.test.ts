@@ -216,6 +216,37 @@ describe('ENG-1527 a hand-written tag has to actually fire to count as installed
       expect(verifyGoogleAdsInjection(inHead(LOADER + next), 'AW-99999999')).toBe(true);
     });
 
+    /**
+     * Round 3, from CodeRabbit. Scanning script elements with two independent regex passes
+     * could not tell a self-closing JSX tag from an opening one, so `<script … />` paired
+     * with whatever `</script>` came next and adopted an unrelated element's contents as
+     * its body. And the attribute capture stopped at the first `>`, which JSX attributes
+     * routinely contain.
+     *
+     * The two loader cases below were confirmed FALSE before the fix: a correctly tagged
+     * App Router page read as untagged, which sends injection at a page that already has a
+     * tag and turns a working site into a 422.
+     */
+    const JSX_LOADER = '<script async src={`https://www.googletagmanager.com/gtag/js?id=AW-99999999`} />';
+
+    it('detects the JSX template-literal loader our own injector writes', () => {
+      expect(verifyGoogleAdsInjection(inHead(JSX_LOADER + CONFIG), 'AW-99999999')).toBe(true);
+    });
+
+    it('does not let a self-closing tag adopt the next element as its body', () => {
+      const inert = `<script type="text/template">gtag('config', 'AW-99999999');</script>`;
+      expect(verifyGoogleAdsInjection(inHead(JSX_LOADER + inert), 'AW-99999999')).toBe(false);
+      expect(verifyGoogleAdsInjection(inHead(LOADER + '<script id="a" defer />' + inert), 'AW-99999999')).toBe(false);
+    });
+
+    it('reads attributes past a > that appears inside a JSX expression', () => {
+      // An arrow function or comparison in an attribute used to truncate the capture
+      // before dangerouslySetInnerHTML closed, losing the config call entirely.
+      const withArrow = '<script id="x" onLoad={() => { if (a > b) go(); }} '
+        + 'dangerouslySetInnerHTML={{ __html: `' + "gtag('config', 'AW-99999999');" + '` }} />';
+      expect(verifyGoogleAdsInjection(inHead(LOADER + withArrow), 'AW-99999999')).toBe(true);
+    });
+
     it('is not fooled by a config call naming a different id in real code', () => {
       const other = `<script>gtag('config', 'AW-12312312312');</script>`;
       expect(verifyGoogleAdsInjection(inHead(LOADER + other), 'AW-99999999')).toBe(false);
