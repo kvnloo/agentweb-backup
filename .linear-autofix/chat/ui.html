@@ -373,8 +373,10 @@
   #atmenu { position: absolute; left: 20px; right: 20px; bottom: 100%; margin-bottom: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.5); overflow-y: auto; max-height: 260px; display: none; z-index: 8; }
   #atmenu .srow { display: flex; gap: 10px; align-items: baseline; justify-content: space-between; padding: 7px 12px; cursor: pointer; }
   #atmenu .srow.sel { background: var(--user); }
-  #atmenu .srow .sn { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #atmenu .srow .sn { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
   #atmenu .srow .sd { color: var(--dim); font-size: 11px; flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #atmenu .srow .rowuse { color: var(--green); font-size: 11px; flex: none; cursor: pointer; padding: 0 2px; }
+  #atmenu .srow .rowuse:hover { text-decoration: underline; }
   #atmenu .atcrumb { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 12px; position: sticky; top: 0; background: var(--panel); }
   #atmenu .atcrumb .atup { cursor: pointer; color: var(--accent); user-select: none; }
   #atmenu .atcrumb .atpath { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
@@ -1852,7 +1854,8 @@ $('input').addEventListener('keydown', (ev) => {
     if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopPropagation(); moveAt(-1); return; }
     if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopPropagation(); moveAt(1); return; }
     if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); hideAt(); return; }
-    if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopPropagation(); runAt(); return; }
+    if (ev.key === 'Enter') { ev.preventDefault(); ev.stopPropagation(); runAt(); return; }        // enter a folder / insert a file
+    if (ev.key === 'Tab') { ev.preventDefault(); ev.stopPropagation(); selectAt(); return; }        // reference the selection as-is (folder or file)
     if (ev.key === 'Backspace' && S.at.prefix) { const c = atContext(); if (c && !c.q) { ev.preventDefault(); ev.stopPropagation(); goUp(); return; } }
   }
   if (ev.key === 'Enter' && ev.altKey) return; // Alt+Enter is the sidebar toggle (handled globally), not a send
@@ -1895,11 +1898,11 @@ function renderInputHighlight() {
   const refs = S.refs || [];
   if (refs.length) {
     const names = [...new Set(refs.map((r) => r.name))].sort((a, b) => b.length - a.length).map(escapeRe);
-    const re = new RegExp(`(^|\\s)@(${names.join('|')})(?![\\w./\\-])`, 'g');
+    const re = new RegExp(`(^|\\s)(${names.join('|')})(?![\\w./\\-])`, 'g');
     for (let mm; (mm = re.exec(v)); ) {
       const at = mm.index + mm[1].length, name = mm[2];
       const path = (refs.find((r) => r.name === name) || {}).path || name;
-      spans.push({ s: at, e: at + 1 + name.length, c: 'ref', t: path });
+      spans.push({ s: at, e: at + name.length, c: 'ref', t: path });
     }
   }
   if (!spans.length) { i.classList.remove('hl'); hl.firstElementChild.innerHTML = ''; return; }
@@ -2207,8 +2210,11 @@ function runSlash() {
 }
 // ---------- @-mention file/folder picker ----------
 // Type @ in the composer to reference a file/folder from THIS chat's worktree. A dropdown suggests
-// paths; selecting a FILE inserts a short @name pill (full path on hover, expanded to the full @path on
-// send), selecting a FOLDER drills into it (browse its contents), and "use folder" references the folder.
+// paths; the @ is only the trigger — selecting a FILE inserts a short NAME pill (no @; full path on
+// hover, expanded to @fullpath on send), selecting a FOLDER (click/Enter) drills into it, and "use" /
+// Tab references a folder as-is. Arrow keys move the selection in place. See renderInputHighlight for
+// how a pill is coloured (each occurrence of a referenced name is shown green — a visible cue for what
+// will expand on send).
 let atTimer = null, atFetchSeq = 0;
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const baseName = (p) => p.slice(p.lastIndexOf('/') + 1);
@@ -2248,19 +2254,34 @@ function renderAt() {
     : '';
   const rows = S.at.items.map((it, k) => {
     const nm = baseName(it.path) + (it.type === 'dir' ? '/' : '');
-    return `<div class="srow${k === S.at.sel ? ' sel' : ''}" data-k="${k}" title="${esc(it.path)}"><span class="sn">${it.type === 'dir' ? '📁' : '📄'} ${esc(nm)}</span><span class="sd">${esc(dirName(it.path) || '·')}</span></div>`;
+    const useBtn = it.type === 'dir' ? `<span class="rowuse" data-k="${k}" title="Reference this folder (Tab)">use</span>` : '';
+    return `<div class="srow${k === S.at.sel ? ' sel' : ''}" data-k="${k}" title="${esc(it.path)}"><span class="sn">${it.type === 'dir' ? '📁' : '📄'} ${esc(nm)}</span><span class="sd">${esc(dirName(it.path) || '·')}</span>${useBtn}</div>`;
   }).join('') || `<div class="atempty">no matches</div>`;
   el.innerHTML = crumb + rows;
   for (const row of el.querySelectorAll('.srow')) {
     row.onmouseenter = () => { S.at.sel = +row.dataset.k; for (const r of el.querySelectorAll('.srow')) r.classList.toggle('sel', r === row); };
-    row.onmousedown = (e) => { e.preventDefault(); S.at.sel = +row.dataset.k; runAt(); };
+    row.onmousedown = (e) => { e.preventDefault(); S.at.sel = +row.dataset.k; runAt(); }; // click a folder to enter it, a file to insert
+  }
+  for (const b of el.querySelectorAll('.rowuse')) {
+    b.onmousedown = (e) => { e.preventDefault(); e.stopPropagation(); S.at.sel = +b.dataset.k; selectAt(); }; // "use" references a folder without entering it
   }
   const up = el.querySelector('.atup'); if (up) up.onmousedown = (e) => { e.preventDefault(); goUp(); };
   const use = el.querySelector('.atuse'); if (use) use.onmousedown = (e) => { e.preventDefault(); insertRef({ path: S.at.prefix, type: 'dir' }); };
   el.style.display = 'block';
   const sel = el.querySelector('.srow.sel'); if (sel) sel.scrollIntoView({ block: 'nearest' });
 }
-function moveAt(d) { if (!S.at || !S.at.items.length) return; const n = S.at.items.length; S.at.sel = (S.at.sel + d + n) % n; renderAt(); }
+// Move the selection IN PLACE (toggle classes on the existing rows). A full renderAt() rebuild here
+// would let a resting mouse fire mouseenter on the fresh element and snap the selection back — which is
+// exactly why arrow keys felt dead when the pointer sat over the menu.
+function setAtSel(k) {
+  if (!S.at || !S.at.items.length) return;
+  S.at.sel = (k + S.at.items.length) % S.at.items.length;
+  const el = $('atmenu'); if (!el) return;
+  const rows = el.querySelectorAll('.srow');
+  rows.forEach((r, i) => r.classList.toggle('sel', i === S.at.sel));
+  if (rows[S.at.sel]) rows[S.at.sel].scrollIntoView({ block: 'nearest' });
+}
+function moveAt(d) { setAtSel((S.at ? S.at.sel : 0) + d); }
 function hideAt() { S.at = null; const el = $('atmenu'); if (el) el.style.display = 'none'; }
 // Reset the typed query back to just "@" (keep everything up to and including the @) — used when drilling.
 function clearAtQuery() {
@@ -2276,29 +2297,31 @@ function goUp() {
   clearAtQuery();
   updateAtMenu();
 }
-function runAt() {
+function runAt() { // Enter / click: enter a folder, or insert a file
   const it = S.at?.items[S.at.sel]; if (!it) return;
-  if (it.type === 'dir') { S.at.prefix = it.path; clearAtQuery(); updateAtMenu(); return; } // drill into the folder
+  if (it.type === 'dir') { S.at.prefix = it.path; clearAtQuery(); updateAtMenu(); return; }
   insertRef(it);
 }
-// Insert a short @name pill for `it`, remembering its full path so hover + send-time expansion resolve it.
+function selectAt() { const it = S.at?.items[S.at.sel]; if (it) insertRef(it); } // Tab / "use": reference the selection as-is (folder or file)
+// Insert a short name pill for `it` — NO leading @ (that was only the trigger). The full path is
+// remembered in S.refs so the pill's hover title and the send-time expansion can resolve it.
 function insertRef(it) {
   const inp = $('input'), ctx = atContext();
   const start = ctx ? ctx.start : (S.at?.start ?? inp.selectionStart);
   const name = baseName(it.path);
   const before = inp.value.slice(0, start), after = inp.value.slice(inp.selectionStart);
-  const insert = `@${name}` + (after.startsWith(' ') ? '' : ' ');
+  const insert = name + (after.startsWith(' ') ? '' : ' ');
   inp.value = before + insert + after;
   inp.selectionStart = inp.selectionEnd = before.length + insert.length;
   (S.refs || (S.refs = [])).push({ name, path: it.path, type: it.type });
   hideAt();
   autosize(); inp.focus();
 }
-// On send, expand each @name pill back to its full @path so the record and the agent are unambiguous.
+// On send, expand each name pill back to its full @path so the record and the agent are unambiguous.
 function expandRefs(text) {
   let out = text;
   for (const r of [...(S.refs || [])].sort((a, b) => b.name.length - a.name.length)) {
-    out = out.replace(new RegExp(`(^|\\s)@${escapeRe(r.name)}(?![\\w./\\-])`, 'g'), (m, pre) => `${pre}@${r.path}${r.type === 'dir' ? '/' : ''}`);
+    out = out.replace(new RegExp(`(^|\\s)${escapeRe(r.name)}(?![\\w./\\-])`, 'g'), (m, pre) => `${pre}@${r.path}${r.type === 'dir' ? '/' : ''}`);
   }
   return out;
 }
