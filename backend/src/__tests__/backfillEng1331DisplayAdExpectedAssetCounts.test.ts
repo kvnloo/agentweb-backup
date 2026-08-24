@@ -31,10 +31,21 @@ describe("backfill-eng1331-display-ad-expected-asset-counts — planExpectedAsse
     expect(updatedSteps.find((s) => s.stepCount === 4)?.expectedAssetCount).toBe(1);
     expect(updatedSteps.find((s) => s.stepCount === 5)?.expectedAssetCount).toBe(12);
 
-    expect(results).toEqual([
-      { stepCount: 3, action: "set", detail: "expectedAssetCount (unset) -> 12" },
-      { stepCount: 4, action: "set", detail: "expectedAssetCount (unset) -> 1" },
-      { stepCount: 5, action: "set", detail: "expectedAssetCount (unset) -> 12" },
+    // Steps 3 and 5 also name the SINGLE tool that counts — unambiguous by construction,
+    // not relying on the gate's max-across-tools heuristic. Step 4's producing tool isn't
+    // evidenced clearly enough in the template to name safely, so it's left unset.
+    expect(updatedSteps.find((s) => s.stepCount === 3)?.expectedAssetCountTools).toEqual([
+      "playwright_browser_take_screenshot",
+    ]);
+    expect(updatedSteps.find((s) => s.stepCount === 4)?.expectedAssetCountTools).toBeUndefined();
+    expect(updatedSteps.find((s) => s.stepCount === 5)?.expectedAssetCountTools).toEqual([
+      "playwright_browser_take_screenshot",
+    ]);
+
+    expect(results.map((r) => ({ stepCount: r.stepCount, action: r.action }))).toEqual([
+      { stepCount: 3, action: "set" },
+      { stepCount: 4, action: "set" },
+      { stepCount: 5, action: "set" },
     ]);
   });
 
@@ -46,14 +57,22 @@ describe("backfill-eng1331-display-ad-expected-asset-counts — planExpectedAsse
     expect(target?.count).toBe(1);
   });
 
-  it("reports already-set for a step that already has the correct value — does not rewrite it", () => {
+  it("reports already-set for a step that already has the correct count AND tools — does not rewrite it", () => {
+    const steps = liveSteps.map((s) =>
+      s.stepCount === 3
+        ? { ...s, expectedAssetCount: 12, expectedAssetCountTools: ["playwright_browser_take_screenshot"] }
+        : s,
+    );
+    const { results } = planExpectedAssetCountUpdates(steps);
+    expect(results.find((r) => r.stepCount === 3)?.action).toBe("already-set");
+  });
+
+  it("still reports 'set' when the count matches but expectedAssetCountTools does not", () => {
+    // The count alone matching isn't enough — an unset (or different) tools list is
+    // still ambiguous relative to the target's explicit declaration.
     const steps = liveSteps.map((s) => (s.stepCount === 3 ? { ...s, expectedAssetCount: 12 } : s));
     const { results } = planExpectedAssetCountUpdates(steps);
-    expect(results.find((r) => r.stepCount === 3)).toEqual({
-      stepCount: 3,
-      action: "already-set",
-      detail: "expectedAssetCount already 12",
-    });
+    expect(results.find((r) => r.stepCount === 3)?.action).toBe("set");
   });
 
   it("flags a title mismatch and leaves that step's expectedAssetCount untouched", () => {

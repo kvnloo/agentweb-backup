@@ -11892,6 +11892,7 @@ export const agentModeController = {
           // the exact route the production incident session was created through
           // (its pageIdentifier `plan-${planTitle}` matches only this path).
           ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
+          ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
         })),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()

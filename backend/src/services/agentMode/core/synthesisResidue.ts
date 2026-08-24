@@ -453,21 +453,35 @@ function sinceLastStepBoundary(toolCalls: ExecutedToolCall[]): ExecutedToolCall[
 }
 
 /**
- * The largest succeeded-call count among the known asset-producing tools in the
- * ledger — NOT a sum across tool names. A step like "Render the Full Size Matrix"
- * (requiredFunctionCalls: create_html_file + playwright_browser_take_screenshot)
- * builds a FEW reusable HTML templates and takes MANY per-size screenshots from
- * them; both tools are legitimately part of "this step's work", but they are not
- * interchangeable units of the same deliverable. Summing them would let, e.g., 5
- * create_html_file calls + 7 screenshots satisfy an expectedAssetCount of 12 while
- * only 7 of the 12 requested sizes were actually rendered — the same
- * "claimed count met by padding across unrelated calls" failure this module exists
- * to catch, just introduced by ITS OWN counting instead of the model's prose. Max
- * still correctly reports 12 when a step genuinely produces 12 of its primary
- * deliverable, whichever single tool that turns out to be.
+ * Without `tools`: the largest succeeded-call count among the known
+ * asset-producing tools in the ledger — NOT a sum across tool names. A step like
+ * "Render the Full Size Matrix" (requiredFunctionCalls: create_html_file +
+ * playwright_browser_take_screenshot) builds a FEW reusable HTML templates and
+ * takes MANY per-size screenshots from them; both tools are legitimately part of
+ * "this step's work", but they are not interchangeable units of the same
+ * deliverable. Summing them would let, e.g., 5 create_html_file calls + 7
+ * screenshots satisfy an expectedAssetCount of 12 while only 7 of the 12 requested
+ * sizes were actually rendered — the same "claimed count met by padding across
+ * unrelated calls" failure this module exists to catch, just introduced by ITS OWN
+ * counting instead of the model's prose. Max still correctly reports 12 when a
+ * step genuinely produces 12 of its primary deliverable, whichever single tool
+ * that turns out to be — the safe default for a step that hasn't said which tool
+ * is "the N things".
+ *
+ * With `tools`: sums successes across exactly those tool names instead. The step
+ * author has already resolved the ambiguity max exists to guard against — e.g. a
+ * step whose N deliverables are genuinely split across two tools (some images,
+ * some videos) — so summing the ones they named is correct, not padding.
  */
-function countProducedAssets(toolCalls: ExecutedToolCall[]): number {
+function countProducedAssets(toolCalls: ExecutedToolCall[], tools?: ReadonlySet<string>): number {
   const counts = tallyExecutedActions(toolCalls);
+  if (tools) {
+    let sum = 0;
+    for (const [name, { ok }] of counts) {
+      if (tools.has(name)) sum += ok;
+    }
+    return sum;
+  }
   let max = 0;
   for (const [name, { ok }] of counts) {
     if (ASSET_PRODUCING_TOOL_NAMES.has(name)) max = Math.max(max, ok);
@@ -505,12 +519,19 @@ interface HistoryMessageLike {
  * assets never satisfy a later step's requirement. Per-message granularity (not
  * per-call) matches `seedMediaCallKeysFromHistory`'s existing precedent for reading
  * this same persisted shape.
+ *
+ * `tools` (ENG-1331), when the caller has one (a work-plan step's
+ * `expectedAssetCountTools`), is forwarded to `countProducedAssets` as-is — sum
+ * those specific tools instead of taking the max across every producing tool.
+ * Omit it to keep the safe max-based default.
  */
 export function extractProducedAssetCount(
   messages: HistoryMessageLike[] | undefined | null,
   sinceIso?: string,
+  tools?: readonly string[],
 ): number {
   if (!Array.isArray(messages)) return 0;
+  const toolSet = tools && tools.length > 0 ? new Set(tools) : undefined;
   let total = 0;
   for (const message of messages) {
     if (!message || message.role !== 'assistant') continue;
@@ -518,7 +539,7 @@ export function extractProducedAssetCount(
     if (!Array.isArray(toolCalls) || toolCalls.length === 0) continue;
     const timestamp = message.timestamp || message.metadata?.timestamp;
     if (sinceIso && timestamp && timestamp < sinceIso) continue;
-    total += countProducedAssets(toolCalls);
+    total += countProducedAssets(toolCalls, toolSet);
   }
   return total;
 }

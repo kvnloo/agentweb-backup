@@ -394,7 +394,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
     // template step declaring expectedAssetCount had nothing to enforce once a
     // session was created via this route, which is confirmed (by pageIdentifier
     // pattern) to be the exact route the production incident session used.
-    it('carries expectedAssetCount from the template step into the session work plan (ENG-1331)', async () => {
+    it('carries expectedAssetCount and expectedAssetCountTools from the template step into the session work plan (ENG-1331)', async () => {
       mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) =>
         Promise.resolve(
           visibility === 'system'
@@ -403,7 +403,13 @@ describe('AgentModeController - createSessionWithPlan', () => {
                   ...mockWorkPlans[0],
                   steps: [
                     { stepCount: 1, title: 'Step 1', description: 'First step', requiredFunctionCalls: ['function1'] },
-                    { stepCount: 2, title: 'Render Sizes', description: 'Render the matrix', expectedAssetCount: 12 },
+                    {
+                      stepCount: 2,
+                      title: 'Render Sizes',
+                      description: 'Render the matrix',
+                      expectedAssetCount: 12,
+                      expectedAssetCountTools: ['playwright_browser_take_screenshot'],
+                    },
                   ],
                 },
               ]
@@ -419,13 +425,18 @@ describe('AgentModeController - createSessionWithPlan', () => {
         'test-session-123',
         expect.objectContaining({
           steps: expect.arrayContaining([
-            expect.objectContaining({ stepCount: 2, title: 'Render Sizes', expectedAssetCount: 12 }),
+            expect.objectContaining({
+              stepCount: 2,
+              title: 'Render Sizes',
+              expectedAssetCount: 12,
+              expectedAssetCountTools: ['playwright_browser_take_screenshot'],
+            }),
           ]),
         })
       );
     });
 
-    it('omits expectedAssetCount when the template step does not declare it', async () => {
+    it('omits expectedAssetCount and expectedAssetCountTools when the template step does not declare them', async () => {
       const req = mockRequest(mockPlanTitle);
       const res = mockResponse();
 
@@ -435,6 +446,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
       const steps = (call?.[1] as any)?.steps ?? [];
       for (const step of steps) {
         expect(step).not.toHaveProperty('expectedAssetCount');
+        expect(step).not.toHaveProperty('expectedAssetCountTools');
       }
     });
 

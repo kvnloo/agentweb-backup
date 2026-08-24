@@ -29145,7 +29145,7 @@ ${strippedHtml}`;
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number }>, sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -29170,7 +29170,8 @@ ${strippedHtml}`;
           notes: undefined,
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds,
-          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount })
+          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
+          ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools })
         })),
         autocomplete: autocomplete || false,
         createdAt: new Date().toISOString(),
@@ -29265,6 +29266,7 @@ ${strippedHtml}`;
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds,
           ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
+          ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
         autocomplete: predefinedPlan.autocomplete || false,
@@ -29457,7 +29459,7 @@ ${strippedHtml}`;
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -29493,8 +29495,10 @@ ${strippedHtml}`;
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
             // Allow scope changes: an explicit expectedAssetCount overrides (including 0
             // to clear the asset gate when the user approves a smaller set); omitting it
-            // preserves the existing value.
-            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount
+            // preserves the existing value. Same override-or-preserve semantics for
+            // expectedAssetCountTools (ENG-1331).
+            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount,
+            expectedAssetCountTools: newStep.expectedAssetCountTools !== undefined ? newStep.expectedAssetCountTools : workPlan.steps[existingIndex].expectedAssetCountTools
           };
         } else {
           // Add new step (stepCount will be fixed by updateSessionWorkPlan)
@@ -29508,7 +29512,8 @@ ${strippedHtml}`;
             notes: undefined,
             requiredFunctionCalls: newStep.requiredFunctionCalls,
             skillIds: newStep.skillIds,
-            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount })
+            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount }),
+            ...(newStep.expectedAssetCountTools !== undefined && { expectedAssetCountTools: newStep.expectedAssetCountTools })
           });
         }
       }
@@ -29724,12 +29729,23 @@ ${strippedHtml}`;
           // own marker, so a step whose deliverable is Playwright-rendered
           // screenshots (no generate_image call at all) would always read 0 there.
           // extractProducedAssetCount reads the same persisted toolCalls ledger for
-          // every known asset-producing tool; take the max of both signals so
-          // neither detection path can pull the count DOWN relative to the other.
-          const producedAssetCount = Math.max(
-            AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
-            extractProducedAssetCount(session.messages, sinceIso),
-          );
+          // every known asset-producing tool.
+          //
+          // When the step names its own expectedAssetCountTools, trust that
+          // explicitly and skip the max-with-legacy-signal blend below: the whole
+          // point of naming the tool(s) is precision, and blending in
+          // extractGeneratedImageFilenames' generate_image count would reopen the
+          // exact ambiguity the author resolved by naming their tool(s) at all (e.g.
+          // an unrelated generate_image call elsewhere in the step inflating a
+          // screenshot-only count). Without a declared list, take the max of both
+          // signals so neither detection path can pull the count DOWN relative to
+          // the other — the safe default for a step that hasn't disambiguated.
+          const producedAssetCount = step.expectedAssetCountTools?.length
+            ? extractProducedAssetCount(session.messages, sinceIso, step.expectedAssetCountTools)
+            : Math.max(
+                AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
+                extractProducedAssetCount(session.messages, sinceIso),
+              );
           if (producedAssetCount < step.expectedAssetCount) {
             insufficientAssets.push({
               stepCount: update.stepCount,

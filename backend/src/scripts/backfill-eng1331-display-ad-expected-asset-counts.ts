@@ -16,7 +16,8 @@
  * since the previous step resolved (ENG-1188) — an earlier step's assets never satisfy
  * a later step's requirement. Given this template's actual step descriptions (read from
  * a live production session, not guessed):
- *   - Step 3 "Render the Full Size Matrix" renders all 12 sizes — expectedAssetCount: 12.
+ *   - Step 3 "Render the Full Size Matrix" renders all 12 sizes — expectedAssetCount: 12,
+ *     expectedAssetCountTools: [playwright_browser_take_screenshot] (see below).
  *   - Step 4 "QA, Contact Sheet & Delivery" VERIFIES the existing 12 renders (no
  *     re-render in the normal case) and produces exactly ONE new asset, the contact
  *     sheet — expectedAssetCount: 12 here (as a since-superseded draft of this fix
@@ -25,7 +26,19 @@
  *     and re-completed once per variant (2, 3, 4, ...), each cycle rendering 12 NEW
  *     sizes. The gate's sinceIso step-boundary logic already handles this reset-and-
  *     recomplete pattern explicitly (see the ENG-1188 CodeRabbit-follow-up comment in
- *     agentModeService.ts's setWorkPlanStatus). expectedAssetCount: 12.
+ *     agentModeService.ts's setWorkPlanStatus). expectedAssetCount: 12,
+ *     expectedAssetCountTools: [playwright_browser_take_screenshot].
+ *
+ * ── Why expectedAssetCountTools on steps 3 and 5 ────────────────────────────────────
+ * Both steps' requiredFunctionCalls list BOTH create_html_file (a handful of reusable
+ * per-archetype templates) AND playwright_browser_take_screenshot (one per requested
+ * size) — real work, not padding, but not interchangeable units of "the 12 sizes"
+ * either. Without naming the counted tool, the gate's safe default (max across every
+ * producing tool) already prevents a false completion, but naming it removes the
+ * ambiguity outright instead of relying on a heuristic. Step 4 is left unset: its
+ * contact-sheet deliverable's producing tool isn't evidenced clearly enough in the
+ * template to name safely, and the max-based default already handles "1 of any
+ * producing tool" correctly.
  *
  * ── NOTE (CLAUDE.md data-plane gate) ───────────────────────────────────────────────
  * This is a production data change (a persistent work-plan template mutation) and needs
@@ -51,12 +64,28 @@ export interface ExpectedAssetCountTarget {
   stepCount: number;
   title: string;
   count: number;
+  /**
+   * ENG-1331 (post-launch hardening): which tool's successes count toward `count`,
+   * when a step calls more than one asset-producing tool that aren't interchangeable
+   * (see synthesisResidue.ts's countProducedAssets). Steps 3 and 5 both declare
+   * create_html_file (a handful of reusable per-archetype templates) AND
+   * playwright_browser_take_screenshot (one per requested size) as
+   * requiredFunctionCalls — only the screenshot count is "the N sizes" per each
+   * step's own description. Without this, the gate's safe default (max across every
+   * producing tool) already prevents the padding failure this fixes for, but leaving
+   * it unset means max, not an explicit, unambiguous "only this tool counts" —
+   * setting it removes the ambiguity entirely rather than relying on a heuristic.
+   * Omitted for step 4: its contact-sheet deliverable's producing tool isn't
+   * evidenced clearly enough in the template to name safely — the max-based default
+   * already handles it correctly (1 succeeded call of any producing tool).
+   */
+  tools?: string[];
 }
 
 export const ENG1331_EXPECTED_ASSET_COUNT_TARGETS: ExpectedAssetCountTarget[] = [
-  { stepCount: 3, title: "Render the Full Size Matrix", count: 12 },
+  { stepCount: 3, title: "Render the Full Size Matrix", count: 12, tools: ["playwright_browser_take_screenshot"] },
   { stepCount: 4, title: "QA, Contact Sheet & Delivery", count: 1 },
-  { stepCount: 5, title: "Optional: Variant Run", count: 12 },
+  { stepCount: 5, title: "Optional: Variant Run", count: 12, tools: ["playwright_browser_take_screenshot"] },
 ];
 
 export type StepChangeAction = "set" | "already-set" | "title-mismatch";
@@ -67,7 +96,13 @@ export interface StepChangeResult {
   detail: string;
 }
 
-type PlanStepLike = Pick<WorkPlanStep, "stepCount" | "title" | "expectedAssetCount">;
+type PlanStepLike = Pick<WorkPlanStep, "stepCount" | "title" | "expectedAssetCount" | "expectedAssetCountTools">;
+
+const sameTools = (a: string[] | undefined, b: string[] | undefined): boolean => {
+  if (a === undefined && b === undefined) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((t, i) => t === b[i]);
+};
 
 /**
  * Pure planning function: given a plan's current steps and the target list, decide what
@@ -99,20 +134,25 @@ export function planExpectedAssetCountUpdates(
       });
       return step;
     }
-    if (step.expectedAssetCount === target.count) {
+    if (step.expectedAssetCount === target.count && sameTools(step.expectedAssetCountTools, target.tools)) {
       results.push({
         stepCount: step.stepCount,
         action: "already-set",
-        detail: `expectedAssetCount already ${target.count}`,
+        detail: `expectedAssetCount already ${target.count}${target.tools ? ` (tools: ${target.tools.join(", ")})` : ""}`,
       });
       return step;
     }
     results.push({
       stepCount: step.stepCount,
       action: "set",
-      detail: `expectedAssetCount ${step.expectedAssetCount ?? "(unset)"} -> ${target.count}`,
+      detail: `expectedAssetCount ${step.expectedAssetCount ?? "(unset)"} -> ${target.count}` +
+        (target.tools ? `, expectedAssetCountTools ${JSON.stringify(step.expectedAssetCountTools ?? null)} -> ${JSON.stringify(target.tools)}` : ""),
     });
-    return { ...step, expectedAssetCount: target.count };
+    return {
+      ...step,
+      expectedAssetCount: target.count,
+      ...(target.tools ? { expectedAssetCountTools: target.tools } : {}),
+    };
   });
   return { updatedSteps, results };
 }

@@ -592,4 +592,48 @@ describe('extractProducedAssetCount', () => {
     expect(extractProducedAssetCount(undefined)).toBe(0);
     expect(extractProducedAssetCount([])).toBe(0);
   });
+
+  // ENG-1331 (post-launch hardening): a step author can name exactly which tool(s)
+  // count, removing the max-vs-sum ambiguity entirely instead of relying on a
+  // heuristic. When named, those tools are SUMMED (the author has already resolved
+  // any padding risk by choosing what to name) — unlike the max-based default.
+  describe('with an explicit tools allowlist', () => {
+    it('sums only the named tool, ignoring a co-occurring unrelated asset-producing tool', () => {
+      const messages = [
+        assistantMessage([
+          { name: 'create_html_file', result: { success: true, s3_url: 'https://s3.example.com/t1.html' } },
+          { name: 'create_html_file', result: { success: true, s3_url: 'https://s3.example.com/t2.html' } },
+          ...fourScreenshotsForFooterTest(),
+        ]),
+      ];
+      expect(extractProducedAssetCount(messages, undefined, ['playwright_browser_take_screenshot'])).toBe(4);
+    });
+
+    it('sums across multiple named tools when the author declares more than one', () => {
+      const messages = [
+        assistantMessage([
+          { name: 'generate_image', result: { success: true, imageUrl: 'https://s3.example.com/a.png' } },
+          { name: 'generate_video', result: { success: true, videoUrl: 'https://s3.example.com/b.mp4' } },
+        ]),
+      ];
+      expect(extractProducedAssetCount(messages, undefined, ['generate_image', 'generate_video'])).toBe(2);
+    });
+
+    it('ignores a tool call whose name is not in the allowlist even if it is asset-producing', () => {
+      const messages = [assistantMessage([
+        { name: 'save_file', result: { success: true, file_url: 'https://s3.example.com/report.pdf' } },
+      ])];
+      expect(extractProducedAssetCount(messages, undefined, ['playwright_browser_take_screenshot'])).toBe(0);
+    });
+
+    it('treats an empty tools array the same as omitting it (falls back to max)', () => {
+      const messages = [
+        assistantMessage([
+          { name: 'create_html_file', result: { success: true, s3_url: 'https://s3.example.com/t1.html' } },
+          ...fourScreenshotsForFooterTest(),
+        ]),
+      ];
+      expect(extractProducedAssetCount(messages, undefined, [])).toBe(4); // max(1, 4), not sum
+    });
+  });
 });
