@@ -84,6 +84,52 @@ describe('httpClient', () => {
         mcpFetch({ method: 'GET', path: '/api/test', context: { userId: 'user-123' } })
       ).rejects.toThrow('API error (403): Forbidden');
     });
+
+    // ENG-1189: a raw network failure (undici's TypeError('fetch failed') on a self-call,
+    // e.g. because the backend process was mid-restart) used to propagate to the LLM as the
+    // bare, unactionable string "fetch failed" with no endpoint/method/cause and no retry —
+    // so a transient connection blip permanently blocked the tool call (manage_scheduled_chat
+    // in production, session 2318c99c-6b45-47ae-95cb-12fe85939c8d, failed 3 times this way).
+    it('should retry a transient network failure and surface method/path/cause once retries are exhausted', async () => {
+      const networkError = () => {
+        const err = new TypeError('fetch failed');
+        (err as any).cause = { code: 'ECONNREFUSED', message: 'connect ECONNREFUSED 127.0.0.1:3001' };
+        return err;
+      };
+      const fetchMock = jest.fn().mockRejectedValue(networkError());
+      global.fetch = fetchMock as any;
+
+      await expect(
+        mcpFetch({ method: 'PUT', path: '/api/agent-mode/scheduled-chats/sched-1', context: { userId: 'user-123' } })
+      ).rejects.toThrow(/PUT.*\/api\/agent-mode\/scheduled-chats\/sched-1.*ECONNREFUSED/s);
+
+      // Bounded retry: more than one attempt, but not unbounded.
+      expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+      expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(5);
+    });
+
+    it('should succeed if a transient network failure resolves on retry', async () => {
+      const networkError = () => {
+        const err = new TypeError('fetch failed');
+        (err as any).cause = { code: 'ECONNRESET', message: 'socket hang up' };
+        return err;
+      };
+      const mockResponse = {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: () => Promise.resolve({ success: true }),
+      };
+      const fetchMock = jest.fn()
+        .mockRejectedValueOnce(networkError())
+        .mockResolvedValueOnce(mockResponse);
+      global.fetch = fetchMock as any;
+
+      const result = await mcpFetch({ method: 'GET', path: '/api/test', context: { userId: 'user-123' } });
+
+      expect(result).toEqual({ success: true });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
   });
 
   // ─── SUCCESS tests ────────────────────────────────────────────────────
