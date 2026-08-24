@@ -81,8 +81,61 @@ describe('GET /api/landing-pages/v0/site', () => {
       rootPageId: 'p1', vercelProjectId: 'vp1',
       githubRepoUrl: 'https://github.com/o/r',
       gtmContainerId: 'GTM-TEST1',
+      // ENG-1527: absent on the record, so absent from the response — except the boolean,
+      // which is always answered rather than left for the consumer to interpret.
+      googleAdsTrackingInstalled: false,
       deployStatus: 'ready',
     });
+  });
+
+  /**
+   * ENG-1527. The record has carried the Google Ads conversion tag since the tag work
+   * landed; this endpoint projected a fixed five fields and dropped it, so the only way to
+   * see whether a site's conversion tag existed was to read DynamoDB directly.
+   */
+  it('returns the Google Ads conversion tag alongside the GTM container', async () => {
+    mockResolveSiteForCaller.mockResolvedValue({
+      id: 'p1', userId: 'u1', status: 'deployed',
+      vercelProjectId: 'vp1', githubRepoUrl: 'https://github.com/o/r',
+      gtmContainerId: 'GTM-TEST1',
+      googleAdsConversionId: 'AW-11112222333',
+      googleAdsConversionLabel: 'abcDEF_ghi',
+      googleAdsCustomerId: '1234567890',
+      googleAdsTrackingInstalled: true,
+    });
+    const res = await request(app).get('/api/landing-pages/v0/site');
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      googleAdsConversionId: 'AW-11112222333',
+      googleAdsConversionLabel: 'abcDEF_ghi',
+      googleAdsCustomerId: '1234567890',
+      googleAdsTrackingInstalled: true,
+    });
+  });
+
+  it('reports googleAdsTrackingInstalled false when the record never recorded an outcome', async () => {
+    // Undefined means "we never recorded an outcome", which a UI renders the same as
+    // false anyway. Collapsing it here keeps every consumer from having to decide, and
+    // stops "no answer" reading as "installed".
+    mockResolveSiteForCaller.mockResolvedValue({
+      id: 'p1', userId: 'u1', status: 'deployed',
+      vercelProjectId: 'vp1', githubRepoUrl: 'https://github.com/o/r',
+      googleAdsConversionId: 'AW-11112222333',
+    });
+    const res = await request(app).get('/api/landing-pages/v0/site');
+    expect(res.body.googleAdsConversionId).toBe('AW-11112222333');
+    expect(res.body.googleAdsTrackingInstalled).toBe(false);
+  });
+
+  it('does not invent a conversion tag for a site that has none', async () => {
+    mockResolveSiteForCaller.mockResolvedValue({
+      id: 'p1', userId: 'u1', status: 'deployed',
+      vercelProjectId: 'vp1', githubRepoUrl: 'https://github.com/o/r',
+    });
+    const res = await request(app).get('/api/landing-pages/v0/site');
+    expect(res.body.googleAdsConversionId).toBeUndefined();
+    expect(res.body.googleAdsConversionLabel).toBeUndefined();
+    expect(res.body.googleAdsTrackingInstalled).toBe(false);
   });
 
   it('returns deploying when site exists but vercelProjectId missing', async () => {
