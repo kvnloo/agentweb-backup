@@ -7,6 +7,7 @@ import { fork, ChildProcess } from 'child_process';
 import path from 'path';
 import { clearTerminalProgress } from '../utils/sseProgress';
 import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
+import type { WorkPlanTurnDisposition } from './agentMode/core/workPlanTurnDisposition';
 
 interface GenerateMarketingResponseParams {
   messageContent: string;
@@ -33,13 +34,11 @@ interface GenerateMarketingResponseParams {
   // cap. Passed through to the loop so its time budget uses the SAME deadline the
   // caller enforces, rather than one that starts after the fork IPC hop.
   turnStartMs?: number;
-  // Explicit cost-policy fallback. `null` survives IPC and means no retry;
-  // omission preserves the global admin fallback for unrestricted requests.
-  transientFallbackModel?: string | null;
   // ENG-936: approved source URLs for confirmed image revisions. When supplied,
   // the tool dispatcher rejects confirm=true generate_image calls that reference
   // any unapproved source image for this run.
   approvedRevisionImageSources?: string[];
+  requireWorkPlanDisposition?: boolean;
 }
 
 interface GenerateMarketingResponseResult {
@@ -49,12 +48,10 @@ interface GenerateMarketingResponseResult {
   sources: string[];
   responseMessages: any[];
   cancelled?: boolean;
-  backupModelUsed?: boolean;
-  originalModel?: string;
-  backupModel?: string;
   // ENG-473: count of responseMessages already persisted incrementally during the
   // run, so the caller's final batch persists only the remaining tail.
   persistedResponseCount?: number;
+  workPlanTurnDisposition?: WorkPlanTurnDisposition;
 }
 
 export class GenerateMarketingResponseWorkerService {

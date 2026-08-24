@@ -3,9 +3,7 @@
 const mockLLM = jest.fn();
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    getClientForModel: jest.fn().mockResolvedValue({
-      chat: { completions: { create: (...a: any[]) => mockLLM(...a) } },
-    }),
+    callLLM: (...a: any[]) => mockLLM(...a),
   },
 }));
 
@@ -25,18 +23,12 @@ jest.mock('../services/crmEnrichmentService', () => ({
   },
 }));
 
-const mockMeterUserUsage = jest.fn();
-jest.mock('../services/usageRecorderService', () => ({
-  meterUserUsage: (...a: any[]) => mockMeterUserUsage(...a),
-}));
-
 import { getOrCreateClustersForFields } from '../services/enrichmentClusterService';
 import { crmDb } from '../services/db';
 const mockDb = crmDb as jest.Mocked<typeof crmDb>;
 
 beforeEach(() => {
   mockLLM.mockReset();
-  mockMeterUserUsage.mockReset();
   mockDb.getLeadListById.mockReset();
   mockDb.updateLeadList.mockReset();
   mockDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'u1' } as any);
@@ -44,7 +36,7 @@ beforeEach(() => {
 });
 
 describe('getOrCreateClustersForFields — per-user metering (ENG-200)', () => {
-  it('charges the clustering LLM call to the caller (userId + tokens) via meterUserUsage', async () => {
+  it('charges the clustering call through the shared gateway usage context', async () => {
     mockLLM.mockResolvedValue({
       choices: [{ message: { content: JSON.stringify([{ fields: ['x', 'y'], searchTemplate: '{{emailDomain}} x y' }]) } }],
       usage: { prompt_tokens: 210, completion_tokens: 35 },
@@ -52,12 +44,14 @@ describe('getOrCreateClustersForFields — per-user metering (ENG-200)', () => {
 
     await getOrCreateClustersForFields('list1', ['x', 'y'], {}, undefined, 'user-9');
 
-    expect(mockMeterUserUsage).toHaveBeenCalledWith(expect.objectContaining({
-      userId: 'user-9',
-      feature: 'crm_enrichment_cluster',
-      inputTokens: 210,
-      outputTokens: 35,
-    }));
+    expect(mockLLM).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Array),
+      expect.objectContaining({
+        usageContext: { userId: 'user-9', feature: 'crm_enrichment_cluster' },
+        taskClass: 'nonstandard_consumer',
+      }),
+    );
   });
 });
 
@@ -122,7 +116,7 @@ describe('getOrCreateClustersForFields — LLM clustering', () => {
 
     expect(mockLLM).toHaveBeenCalledTimes(1);
     // LLM only got the uncovered fields
-    const userMsg = mockLLM.mock.calls[0][0].messages.find((m: any) => m.role === 'user').content;
+    const userMsg = mockLLM.mock.calls[0][1].find((m: any) => m.role === 'user').content;
     expect(userMsg).toContain('novel_a');
     expect(userMsg).toContain('novel_b');
     expect(userMsg).not.toContain('existing');
@@ -146,7 +140,7 @@ describe('getOrCreateClustersForFields — LLM clustering', () => {
       'list1', ['x'], {},
       { company: 'Acme', emailDomain: 'acme.com' },
     );
-    const userMsg = mockLLM.mock.calls[0][0].messages.find((m: any) => m.role === 'user').content;
+    const userMsg = mockLLM.mock.calls[0][1].find((m: any) => m.role === 'user').content;
     expect(userMsg).toContain('Acme');
     expect(userMsg).toContain('acme.com');
   });

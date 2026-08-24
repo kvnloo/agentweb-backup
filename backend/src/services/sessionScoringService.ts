@@ -794,6 +794,7 @@ export async function scoreSession(
       max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
       response_format: { type: "json_object" },
       usageContext: { ...usageContext, feature: usageContext?.feature || "agent_task" },
+      taskClass: 'nonstandard_consumer',
     }
   );
 
@@ -868,6 +869,7 @@ export async function scoreSessionWithJudge(
       temperature: 0,
       max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
       response_format: { type: "json_object" },
+      taskClass: 'nonstandard_consumer',
       usageContext: { ...usageContext, feature: usageContext?.feature || "agent_task" },
     }
   );

@@ -29,6 +29,16 @@ jest.mock('../services/db', () => ({
 }));
 
 const mockGeminiCreate = jest.fn();
+const mockGetClientForModel = jest.fn().mockResolvedValue({
+  chat: { completions: { create: mockGeminiCreate } },
+});
+const mockCallLLM = jest.fn(async (model: string, messages: unknown[], options: Record<string, any> = {}) => {
+  const client = await mockGetClientForModel(model);
+  return client.chat.completions.create(
+    { model, messages, ...options },
+    { timeout: options.timeoutMs },
+  );
+});
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     youSearchWeb: jest.fn(),
@@ -40,18 +50,9 @@ jest.mock('../services/agentModeService', () => ({
         },
       },
     }),
-    getClientForModel: jest.fn().mockResolvedValue({
-      chat: {
-        completions: {
-          create: mockGeminiCreate,
-        },
-      },
-    }),
+    getClientForModel: mockGetClientForModel,
+    callLLM: mockCallLLM,
   },
-}));
-
-jest.mock('../services/usageRecorderService', () => ({
-  meterUserUsage: jest.fn(),
 }));
 
 jest.mock('../services/connectedAccountsDb', () => ({
@@ -93,7 +94,6 @@ import { getAccountsByUserId } from '../services/connectedAccountsDb';
 import { settingsService } from '../services/settingsService';
 import { io } from '../server';
 import { CrmEnrichmentService, EnrichmentJobSpec } from '../services/crmEnrichmentService';
-import { meterUserUsage } from '../services/usageRecorderService';
 import * as apolloServiceModule from '../services/apolloService';
 import type { ApolloService } from '../services/apolloService';
 
@@ -191,7 +191,7 @@ describe('CrmEnrichmentService', () => {
   });
 
   describe('execute - per-user metering (ENG-200)', () => {
-    it('charges the extraction LLM turn to the caller (userId + token counts) via meterUserUsage', async () => {
+    it('charges the extraction LLM turn through the shared gateway usage context', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
       mockCrmDb.getLeadsByListId.mockResolvedValue({
         items: [createLead({ leadId: 'lead1' })],
@@ -220,12 +220,14 @@ describe('CrmEnrichmentService', () => {
 
       await service.execute(spec);
 
-      expect(meterUserUsage).toHaveBeenCalledWith(expect.objectContaining({
-        userId: 'user1',
-        feature: 'crm_enrichment_extract',
-        inputTokens: 300,
-        outputTokens: 50,
-      }));
+      expect(mockCallLLM).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(Array),
+        expect.objectContaining({
+          usageContext: { userId: 'user1', feature: 'crm_enrichment_extract' },
+          taskClass: 'nonstandard_consumer',
+        }),
+      );
     });
   });
 
@@ -1811,84 +1813,15 @@ describe('CrmEnrichmentService template fallback chain', () => {
   });
 });
 
-describe('CrmEnrichmentService cross-provider timeout fallback', () => {
-  const input = {
-    leadContext: { company: 'Acme Corp' },
-    webContext: 'Acme Corp source context',
-    linkedinContext: '',
-    spec: {
-      userId: 'user-fallback',
-      instruction: 'Find company size',
-      outputFields: ['company_size'],
-    },
-    lead: { leadId: 'lead-fallback' },
-    enrichConfig: {
-      enrichmentModel: 'gpt-5-chat-2',
-      dataExtractionModel: 'gpt-5-chat-2',
-    },
-  } as any;
+describe('CrmEnrichmentService gateway boundary', () => {
+  it('propagates a timeout without issuing a second local model call', async () => {
+    const timeout = Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' });
+    const call = jest.fn().mockRejectedValue(timeout);
 
-  beforeEach(() => {
-    jest.clearAllMocks();
-    mockAgentModeService.getClientForModel.mockResolvedValue({
-      chat: { completions: { create: mockGeminiCreate } },
-    } as any);
-  });
-
-  afterEach(() => {
-    mockAgentModeService.getClientForModel.mockResolvedValue({
-      chat: { completions: { create: mockGeminiCreate } },
-    } as any);
-  });
-
-  it('uses the fallback model client after a primary timeout', async () => {
-    const primaryCreate = jest.fn().mockRejectedValue(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }));
-    const fallbackCreate = jest.fn().mockResolvedValue(geminiResponse({ company_size: '51-200' }));
-    const primaryClient = { chat: { completions: { create: primaryCreate } } };
-    const fallbackClient = { chat: { completions: { create: fallbackCreate } } };
-    mockAgentModeService.getClientForModel
-      .mockResolvedValueOnce(primaryClient as any)
-      .mockResolvedValueOnce(fallbackClient as any);
-
-    const result = await (new CrmEnrichmentService() as any).extractFieldsViaLLM(
-      input.leadContext, input.webContext, input.linkedinContext,
-      input.spec, input.lead, input.enrichConfig,
-    );
-
-    expect(result.fields.company_size).toBe('51-200');
-    expect(primaryCreate).toHaveBeenCalledTimes(1);
-    expect(fallbackCreate).toHaveBeenCalledTimes(1);
-    expect(fallbackCreate.mock.calls[0][0].model).toBe('gemini-2.5-flash');
-  });
-
-  it('does not resolve the fallback client when the primary succeeds', async () => {
-    const primaryCreate = jest.fn().mockResolvedValue(geminiResponse({ company_size: '51-200' }));
-    const primaryClient = { chat: { completions: { create: primaryCreate } } };
-    mockAgentModeService.getClientForModel.mockResolvedValue(primaryClient as any);
-
-    const result = await (new CrmEnrichmentService() as any).extractFieldsViaLLM(
-      input.leadContext, input.webContext, input.linkedinContext,
-      input.spec, input.lead, input.enrichConfig,
-    );
-
-    expect(result.fields.company_size).toBe('51-200');
-    expect(mockAgentModeService.getClientForModel).toHaveBeenCalledTimes(1);
-    expect(primaryCreate.mock.calls[0][0].model).toBe('gpt-5-chat-2');
-  });
-
-  it('keeps non-timeout provider errors on the primary path', async () => {
-    const providerError = new Error('provider rejected request');
-    const primaryCreate = jest.fn().mockRejectedValue(providerError);
-    const primaryClient = { chat: { completions: { create: primaryCreate } } };
-    mockAgentModeService.getClientForModel.mockResolvedValue(primaryClient as any);
-
-    await expect((new CrmEnrichmentService() as any).extractFieldsViaLLM(
-      input.leadContext, input.webContext, input.linkedinContext,
-      input.spec, input.lead, input.enrichConfig,
-    )).rejects.toThrow('provider rejected request');
-    expect(mockAgentModeService.getClientForModel).toHaveBeenCalledTimes(2);
-    expect(mockAgentModeService.getClientForModel).toHaveBeenNthCalledWith(1, 'gpt-5-chat-2');
-    expect(mockAgentModeService.getClientForModel).toHaveBeenNthCalledWith(2, 'gpt-5-chat-2');
+    await expect((CrmEnrichmentService as any).llmCallWithTimeout(call, 'gpt-5-chat-2'))
+      .rejects.toBe(timeout);
+    expect(call).toHaveBeenCalledTimes(1);
+    expect(call).toHaveBeenCalledWith('gpt-5-chat-2');
   });
 });
 

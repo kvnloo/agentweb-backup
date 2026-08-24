@@ -17,10 +17,10 @@ export class GatewayContractError extends Error {
 
 const UPSTREAM_MODEL_ID = /^[^/\s]+\/[^/\s]+$/;
 
-// These are the only provider-native logical IDs in AgentModeService's model
-// registry. Keep the non-mechanical Anthropic conversions explicit: Bedrock's
-// dated/inference-profile suffixes are not OpenRouter model IDs, and guessing at
-// them would turn a newly added model into an untested production route.
+// These are the provider-native logical IDs used by migrated consumers. Keep
+// the non-mechanical Anthropic conversions explicit: Bedrock/Vertex identifiers
+// are not OpenRouter model IDs, and guessing at them would turn a newly added
+// model into an untested production route.
 const DIRECT_LOGICAL_MODEL_TO_OPENROUTER_ID: Readonly<Record<string, string>> = {
   'gpt-5.4': 'openai/gpt-5.4',
   'gpt-5.4-nano': 'openai/gpt-5.4-nano',
@@ -37,6 +37,7 @@ const DIRECT_LOGICAL_MODEL_TO_OPENROUTER_ID: Readonly<Record<string, string>> = 
   'anthropic.claude-opus-5': 'anthropic/claude-opus-5',
   'anthropic.claude-sonnet-5': 'anthropic/claude-sonnet-5',
   'anthropic.claude-haiku-4-5-20251001-v1:0': 'anthropic/claude-haiku-4.5',
+  'claude-sonnet-4-6': 'anthropic/claude-sonnet-4.6',
 };
 
 export const GATEWAY_TASK_CLASSES = [
@@ -106,7 +107,7 @@ export function applyOpenRouterCacheBreakpoints(messages: readonly any[], humanP
     if (typeof message.content === 'string' && message.content.length > 0) {
       result[index] = {
         ...message,
-        content: [{ type: 'text', text: message.content, cache_control: cacheControl }],
+        content: [{ type: 'text', text: message.content, cache_control: { ...cacheControl } }],
       };
       return true;
     }
@@ -122,7 +123,7 @@ export function applyOpenRouterCacheBreakpoints(messages: readonly any[], humanP
     }
     if (textIndex < 0) return false;
     const content = [...message.content];
-    content[textIndex] = { ...content[textIndex], cache_control: cacheControl };
+    content[textIndex] = { ...content[textIndex], cache_control: { ...cacheControl } };
     result[index] = { ...message, content };
     return true;
   };
@@ -195,21 +196,4 @@ export function resolveOpenRouterUpstreamModelId(logicalModelId: string): string
   }
 
   return upstreamModelId;
-}
-
-/**
- * Reversible task-class canary. An empty/unset value preserves today's routing;
- * only exact comma-separated task classes move to the gateway.
- */
-export function isOpenRouterGatewayEnabledForTaskClass(
-  taskClass: GatewayTaskClass | undefined,
-  configuredTaskClasses: string | undefined = process.env.OPENROUTER_GATEWAY_TASK_CLASSES,
-): boolean {
-  if (!taskClass || !configuredTaskClasses) return false;
-
-  return configuredTaskClasses
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean)
-    .includes(taskClass);
 }

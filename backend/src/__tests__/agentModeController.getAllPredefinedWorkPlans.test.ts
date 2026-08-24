@@ -80,6 +80,45 @@ describe('AgentModeController - getAllPredefinedWorkPlans', () => {
     expect(res.status).not.toHaveBeenCalled();
   });
 
+  // ENG-1469: the canonical customer projection rides alongside the legacy
+  // keys above — existing consumers reading the legacy shape are unaffected.
+  it('includes the canonical customer-facing display projection alongside legacy keys', async () => {
+    const mockPlans = [
+      {
+        planId: 'plan-1',
+        title: 'Onboarding',
+        description: '<p>Get started</p>',
+        category: 'Strategy',
+        steps: [{ stepCount: 1, title: 'Step 1', userInstructions: 'secret agent-only text' }],
+        showInAgentMode: true,
+        visibility: 'system' as const,
+        isBuiltIn: true,
+        createdAt: '2026-01-01',
+        updatedAt: '2026-01-01',
+      },
+    ];
+    mockWorkPlanService.getPublicPlansForAgentMode.mockResolvedValue(mockPlans);
+
+    const req = mockRequest();
+    const res = mockResponse();
+
+    await agentModeController.getAllPredefinedWorkPlans(req, res);
+
+    const result = (res.json as jest.Mock).mock.calls[0][0];
+    expect(result[0].display).toEqual(
+      expect.objectContaining({
+        id: 'plan-1',
+        title: 'Onboarding',
+        summary: 'Get started',
+        categories: ['strategy'],
+        steps: [{ position: 1, label: 'Step 1' }],
+        nextPlanIds: [],
+      }),
+    );
+    // The projection never leaks agent-only instructions.
+    expect(JSON.stringify(result[0].display)).not.toContain('secret agent-only text');
+  });
+
   it('should return empty array when no work plans exist', async () => {
     mockWorkPlanService.getPublicPlansForAgentMode.mockResolvedValue([]);
 

@@ -147,6 +147,33 @@ describe("WorkPlans turns a step-loss refusal into a decision (ENG-1221)", () =>
     );
   });
 
+  // ENG-1469: confirming a destructive step removal is a separate decision
+  // from customer-facing display metadata — the retried save must carry the
+  // plan's display block through unchanged, not drop it as a side effect of
+  // the confirmation retry.
+  it("carries the plan's existing display metadata through a confirmed step removal, unchanged", async () => {
+    await renderPage([{
+      ...plan,
+      display: { version: 1, title: "Meta Pre-Launch", categories: ["paid-ads"] },
+    }]);
+    await openEditor();
+    mockedAxios.put.mockRejectedValueOnce(removalRefusal).mockResolvedValueOnce({ data: {} });
+
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(saveAnyway()).toBeInTheDocument());
+    fireEvent.click(saveAnyway());
+
+    await waitFor(() => expect(mockedAxios.put).toHaveBeenCalledTimes(2));
+    // Same display block on BOTH the original refused attempt and the
+    // confirmed retry — the confirmation flow re-sends the same body plus the
+    // one added flag, never a display-stripped variant.
+    for (const call of mockedAxios.put.mock.calls) {
+      expect((call[1] as any).display).toEqual(
+        expect.objectContaining({ version: 1, title: "Meta Pre-Launch", categories: ["paid-ads"] }),
+      );
+    }
+  });
+
   it("never confirms on an ordinary save", async () => {
     // The Save button used to read `onClick={handleSave}`, which hands React's
     // MouseEvent to the first parameter. A truthy event would have confirmed

@@ -9,8 +9,10 @@
  * a trust break worth flagging loudly, not logging quietly.
  *
  * This scans active-subscription users whose renewal falls within the
- * lookahead window and raises a deduped oncall alert when no ad platform
- * account is connected, or the only one(s) connected have an expired token.
+ * lookahead window and raises a deduped oncall alert only for customers who
+ * selected paid ads as a goal. A missing ad connection is not evidence that
+ * ads are part of a customer's plan (for example, LinkedIn-outreach-only
+ * customers), so it must not create a renewal-risk alert.
  * Detection is intentionally cheap and synchronous (timestamp-only expiry
  * checks) — no live third-party API calls — so it can run frequently without
  * external dependency risk.
@@ -55,10 +57,19 @@ function hasHealthyAdIntegration(user: any): boolean {
   return accounts.some((acc) => isAdAccount(acc) && acc.config && isTokenNotExpired(acc));
 }
 
+/** A user needs an ad connection only after explicitly choosing paid ads. */
+function hasPaidAdsIntent(user: any): boolean {
+  if (user?.goal === 'paid_ads') return true;
+  if (Array.isArray(user?.emmaHelpInterests) && user.emmaHelpInterests.includes('paid_ads')) return true;
+  return Array.isArray(user?.onboardingEvents) && user.onboardingEvents.some(
+    (event: any) => event?.event === 'goal_selected' && event?.data?.goal === 'paid_ads',
+  );
+}
+
 /**
  * Scan users with an active subscription renewing within `RENEWAL_LOOKAHEAD_DAYS`
- * and flag any whose ad integration is missing or expired. Resilient: a failure
- * sending one user's alert is logged and never aborts the rest of the run.
+ * and flag paid-ads customers whose ad integration is missing or expired. Resilient:
+ * a failure sending one user's alert is logged and never aborts the rest of the run.
  */
 export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegrationHealthSummary> {
   const summary: RenewalIntegrationHealthSummary = {
@@ -85,16 +96,16 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
   for (const user of users) {
     summary.scannedUsers++;
 
-    if (hasHealthyAdIntegration(user)) continue;
+    if (!hasPaidAdsIntent(user) || hasHealthyAdIntegration(user)) continue;
 
     summary.flagged++;
     try {
       await sendAgentModeOncallAlert({
         subject: `Renewal at risk: ${user.email || user.userId} has no healthy ad integration`,
         message:
-          `${user.email || user.userId} renews on ${user.current_period_end} but has no connected, ` +
-          `non-expired ad platform account (Meta/Google Ads/LinkedIn Ads). They will be charged for a ` +
-          `product that isn't functioning. Check the account before the charge fires.`,
+          `${user.email || user.userId} selected paid ads and renews on ${user.current_period_end}, but has no ` +
+          `connected, non-expired ad platform account (Meta/Google Ads/LinkedIn Ads). Check the account ` +
+          `before the charge fires.`,
         dedupeKey: `renewal-integration-health:${user.userId}`,
         dedupeWindowMs: DEDUPE_WINDOW_MS,
         context: {

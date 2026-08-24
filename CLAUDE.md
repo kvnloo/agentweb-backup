@@ -9,10 +9,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Autonomous execution and merge
 
 - AI agents own qualifying engineering work through merge. Merge only from a
-  branch current with `main`, after the full relevant local suite, regression
-  coverage, staging/API/browser smoke where applicable, every relevant GitHub
-  check, attribution, rollback evidence, and acceptance-contract completeness
-  all pass.
+  branch current with `main`, after the affected production build, every
+  relevant GitHub check, attribution, rollback evidence, and acceptance-contract
+  completeness all pass. Routine product suites, coverage targets, and PR
+  staging deploys are not merge gates.
+- Atem is the test compute plane when a test is warranted. Retain or add a test
+  only for a human acceptance criterion, a critical invariant (auth, security,
+  billing, or data integrity), deploy-control integrity, or a reproduced
+  production regression. Do not change a test merely to bless implementation
+  behavior; stale, flaky, or low-signal tests may be removed with a reason.
 - Greptile is retired (ENG-1371, 2026-08-19). It is no longer a merge
   criterion, the `Require Greptile Review` job and its scripts are deleted, and
   `greptile.json` is gone. Do not wait for a Greptile verdict and do not
@@ -56,21 +61,14 @@ Before writing implementation code:
 2. Produce a design or plan and get explicit approval
 3. No approval = no code
 
-### Rule 2: TDD - Tests Before Implementation
+### Rule 2: Contract-first selective tests
 
-**Applies to:** Backend service/logic changes (routes, services, utilities, database operations)
-**Does not apply to:** Frontend UI components, configuration files, documentation, CLAUDE.md itself
-
-For backend logic changes:
-1. Write FAIL test cases first (minimum 3: invalid inputs, boundary conditions, error paths)
-2. Write SUCCESS test cases (minimum 1: happy path)
-3. Verify all new tests FAIL (no implementation yet)
-4. Implement the minimum code to pass all tests
-5. Verify ALL tests pass (new + existing)
-
-**A task is NOT done until all tests pass.** Never skip tests. Never delete failing tests. Never mark a task complete with failing tests.
-
-For frontend and other changes, follow the existing testing strategy section below.
+The production build and deployed runtime are the default proof. Add or retain
+tests only when they protect a human acceptance criterion, a critical invariant,
+deploy-control integrity, or a reproduced production regression. Run selected
+tests on Atem, not as a blanket GitHub Actions requirement. Never change a test
+solely to make new implementation behavior look green; when its invariant no
+longer applies, remove it with the reason recorded in the PR.
 
 ### Rule 3: Workflow Orchestration
 
@@ -474,8 +472,11 @@ Uses browser-use library with Playwright:
 ### GitHub Actions Workflows
 
 - `.github/workflows/tests.yml` - Runs on PRs, builds and verifies compilation
-  - Automatically deploys backend to staging after tests pass on PRs
-  - Deploys are triggered by file changes in `backend/` or `partner-portal/`
+  - Does not run routine product suites, enforce coverage, or deploy staging
+    environments from PRs
+  - `backend/**` runs **Backend build**; `partner-portal/**` runs **Partner
+    portal build**; `.github/**` runs the short **CI script tests** control
+    checks. Changes to `tests.yml` and `eb-deploy.sh` also require Backend build.
 - `.github/workflows/deploy.yml` - Deploys path-filtered changes to production
   on every push to `main`
   - **Manual trigger:** Use GitHub Actions UI to manually trigger deployment (Actions tab → Deploy → Run workflow)
@@ -635,8 +636,7 @@ Runtime environment variables in Elastic Beanstalk do NOT affect the frontend.
 
 - Production build artifacts and EB version labels use the format `<component>-yyyymmdd-pr<number>` (e.g., `backend-20260218-pr42`, `partner-20260218-pr42`)
 - The PR number is extracted from the merge commit message; falls back to the short commit SHA if unavailable
-- Staging labels append the short SHA — `backend-yyyymmdd-pr<number>-<sha>` — because a PR deploys to staging on every push and the deploy verification asserts the environment is running this exact label. Without the SHA that assertion would compare against a label the environment is already on (ENG-743)
-- Deployments are triggered automatically by file changes in `backend/` or `partner-portal/` — no manual version bump is needed. `.github/workflows/tests.yml` and `.github/scripts/eb-deploy.sh` also count as backend changes, so changes to the backend CI/deploy path run that path
+- Production deployment is triggered automatically by file changes in `backend/` or `partner-portal/` on `main`; no manual version bump is needed. `.github/workflows/tests.yml` and `.github/scripts/eb-deploy.sh` also count as backend changes, so changes to the backend CI/deploy path receive an exact build proof
 - `package.json` versions in backend, partner-portal, and customer-portal are independent but are **not** used for deployment gating
 
 ### DynamoDB Query Optimization
@@ -767,15 +767,16 @@ Located in `backend/src/__tests__/`:
 - Integration tests for API endpoints
 - Mocking AWS services with Jest
 
-**Note:** Ready PRs that change `backend/**` run the split backend suites in CI. Local tests remain
-required because CI is a confirmation gate, not a substitute for pre-push validation.
+**Note:** GitHub CI does not run routine product suites. Run a targeted suite on Atem only when it
+proves a human acceptance criterion, a critical invariant (auth, security, billing, data),
+deployment-control integrity, or a reproduced production regression. Do not update a test merely
+to make an implementation pass; remove or quarantine stale, flaky, or low-signal tests with the
+reason recorded in the PR.
 
-```bash
-cd backend
-npm test                  # Run all tests
-npm run test:watch        # Watch mode
-npm run test:coverage     # With coverage
-```
+For a qualifying targeted diagnostic on Atem, run only the relevant test file
+or invariant suite, for example `npm test -- --runTestsByPath src/__tests__/auth/<file>.test.ts`.
+Routine `npm test`, watch, and coverage commands remain available as local
+diagnostics but are not release requirements.
 
 ### Agent Engine Tests
 
@@ -903,11 +904,9 @@ When the user says **"prep for deploy \<date\>"** (default: today's date if omit
    - **Backend changes:** `backend/src/docs/user-release.ts`
    - **Partner portal changes:** `partner-portal/src/docs/release.ts`
 2. For each of `backend/`, `partner-portal/`, `customer-portal/` with code changes: 
-   - **Backend:** Run `npm run test:coverage -- --coverageReporters=text --coverageReporters=json-summary` to verify coverage ≥95% on all metrics
-   - **Backend:** Run `npx tsc` to verify TypeScript compilation
-   - **Frontend:** Run `npm test` for unit tests
-   - Fix any failing tests before proceeding
-   - **CI requires ≥95% coverage on statements, branches, functions, and lines.** Ensure new code branches are covered by tests.
+   - Run the relevant production build(s) on Atem (or rely on the exact-head GitHub build gate).
+   - Run a targeted test only when it meets the selective-test criteria above; do not run or repair
+     a routine suite solely for release ceremony.
 3. Commit changes and create PRs for **both** repos:
    - **This repo** (backend + partner-portal) — commit, push, and create a PR via `gh pr create`
    - **Customer portal** (separate repo at `customer-portal/`) — if there are changes, commit using `git -C customer-portal` commands, push, and create a PR

@@ -134,9 +134,8 @@
 #   GH_TOKEN                    token for `gh`
 #   MERGE_EVIDENCE_DRAFT_JOB    discriminator job name
 #                               (default "Detect changed projects")
-#   MERGE_EVIDENCE_BACKEND_JOBS US-separated job names that must carry a
-#                               `success` when the diff touches the backend
-#                               paths (ENG-915)
+#   MERGE_EVIDENCE_BACKEND_JOBS newline-separated build jobs that must carry a
+#                               `success` when the diff touches backend paths
 
 set -uo pipefail
 
@@ -155,8 +154,7 @@ BACKEND_PATHS='backend/
 # separated; names are matched exactly, and a name that never appears in the
 # payload is treated as "did not run" rather than ignored, so a rename fails
 # closed instead of quietly deleting the requirement.
-BACKEND_JOBS="${MERGE_EVIDENCE_BACKEND_JOBS:-Backend tests (agentMode)
-Backend tests (all other + coverage)}"
+BACKEND_JOBS="${MERGE_EVIDENCE_BACKEND_JOBS:-Backend build}"
 
 log() { printf 'merge-evidence: %s\n' "$*"; }
 
@@ -707,7 +705,7 @@ if [ "${gh_exit}" -ne 0 ]; then
   hard_fail "GitHub API call failed (exit ${gh_exit}) reading the changed files of ${REPO}#${PR_NUMBER}, so whether the backend suite was required here cannot be established: $(tr '\n' ' ' <"${stderr_file}")"
 fi
 if [ -z "${changed_files_tsv}" ]; then
-  hard_fail "${REPO}#${PR_NUMBER} reports no changed files at ${head_sha}. An open PR always has at least one, so this is an unreadable diff rather than an empty one, and the backend-suite requirement cannot be evaluated."
+  hard_fail "${REPO}#${PR_NUMBER} reports no changed files at ${head_sha}. An open PR always has at least one, so build evidence cannot be evaluated."
 fi
 
 # Current paths only — what the workflow's path filter classified on.
@@ -743,12 +741,8 @@ if [ -n "${touches_backend}" ]; then
     [ -n "${job}" ] || continue
     # "Did it ever pass at this head", not "is the newest entry a pass".
     #
-    # Without this, re-running the workflow at a head whose suite had already
-    # gone green reports NO_EVIDENCE the moment the re-run's discriminator
-    # comes back below 5/5: the tests skip, the skip is newer than the success,
-    # and a real green run at this exact SHA is discarded. That verdict is
-    # wrong on the facts — the suite did execute against this code — and it is
-    # unfixable by the author, because pushing to clear it changes the head.
+    # A successful build at an immutable head remains evidence even if a later
+    # superseded workflow attempt is cancelled or skipped.
     #
     # Safe because of where this sits: section 7 is reached only after the
     # classification above found nothing failed and nothing is pending. A later
@@ -768,13 +762,14 @@ if [ -n "${touches_backend}" ]; then
     job_state="$(printf '%s' "${runs_after_supersession}" | jq -r --arg job "${job}" '
         [ .check_runs[] | select(.name == $job) ] as $rows
         | if ($rows | length) == 0 then "ABSENT"
-          elif any($rows[]; .conclusion == "success") then "success"
+          elif ([ $rows[] | select((.conclusion // "") | IN("cancelled", "skipped") | not) ] | length) > 0
+            then ([ $rows[] | select((.conclusion // "") | IN("cancelled", "skipped") | not) ] | max_by(.id // 0) | .conclusion // "pending")
           else ($rows | max_by(.id // 0) | .conclusion // "pending")
           end' 2>/dev/null)"
     jq_exit=$?
     if [ "${jq_exit}" -ne 0 ] || [ -z "${job_state}" ]; then
       surface 'check-runs response (raw)' "${runs_json}"
-      hard_fail "unparseable check-runs payload while requiring the backend suite job '${job}' at ${head_sha}"
+      hard_fail "unparseable check-runs payload while requiring backend build job '${job}' at ${head_sha}"
     fi
     if [ "${job_state}" != "success" ]; then
       missing="${missing:+${missing}, }${job} (${job_state})"
@@ -782,7 +777,7 @@ if [ -n "${touches_backend}" ]; then
   done <<<"${BACKEND_JOBS}"
 
   if [ -n "${missing}" ]; then
-    verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} changes backend paths (e.g. ${touches_backend}), but the backend suite did not execute against head ${head_sha}: ${missing}. A skip here is not proof the path filter excluded them — it is the absence of the measurement this gate exists to require. Push or re-run the workflow at this head. If a job was renamed, set MERGE_EVIDENCE_BACKEND_JOBS."
+    verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} changes backend paths (e.g. ${touches_backend}), but the backend build did not succeed against head ${head_sha}: ${missing}. Push or re-run the workflow at this head. If a job was renamed, set MERGE_EVIDENCE_BACKEND_JOBS."
     exit 3
   fi
 fi

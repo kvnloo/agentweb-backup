@@ -1,6 +1,7 @@
 import { AgentModeService } from '../services/agentModeService';
 import { chatbotDb } from '../services/chatbotService';
 import { workPlanService } from '../services/workPlanService';
+import * as predefinedWorkPlanResolver from '../services/predefinedWorkPlanResolver';
 
 // Mock heavy/external dependencies so the service loads in isolation.
 jest.mock('aws-sdk');
@@ -186,6 +187,49 @@ describe('AgentModeService - predefined work plan templates', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('Session not found');
+    });
+
+    // ENG-1472: extraction characterization — the private/org/system/public
+    // candidate-building duplication now lives in predefinedWorkPlanResolver.ts.
+    // This proves applyPredefinedWorkPlan actually calls through the extracted
+    // resolver (not a re-inlined copy) and that the resulting session work plan
+    // is stamped with templatePlanId so future template runs are traceable
+    // (also exercised via the accept endpoint, which reuses this same method).
+    it('resolves candidates through the extracted predefinedWorkPlanResolver module', async () => {
+      const candidatesSpy = jest.spyOn(predefinedWorkPlanResolver, 'getAccessiblePredefinedWorkPlanCandidates')
+        .mockResolvedValue([systemTemplate]);
+
+      const result = await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+      expect(candidatesSpy).toHaveBeenCalledWith('user-1');
+      expect(result.success).toBe(true);
+      candidatesSpy.mockRestore();
+    });
+
+    it('stamps templatePlanId on the instantiated session work plan', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemTemplate] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ templatePlanId: 'plan-onboard' })
+      );
+    });
+
+    it('stamps templatePlanId even when launched by planId directly (the accept-endpoint path)', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemTemplate] : []
+      );
+
+      await service.applyPredefinedWorkPlan('plan-onboard', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ templatePlanId: 'plan-onboard', title: 'Client Onboarding' })
+      );
     });
   });
 });

@@ -16,6 +16,15 @@ import slackRouter from '../routes/slack';
 // resolve still gets triaged and notified — no over-correction / silent drop; (3) the
 // unresolvable-author branch is logged distinguishably from both the internal-skip and the
 // normal-continue paths, so a repeat is diagnosable from logs.
+//
+// RECURRENCE (2026-08-20, post-#2508): the ID-allowlist-or-email guard above shipped and then
+// misfired again 2h15m later on Fangfang's own message (ftan@agentweb.pro) in #rankai-agentweb —
+// she wasn't on the ID allowlist (Harsha-only by default) and her email failed to resolve even
+// though her display name DID resolve from the same users.info call, which points at the email
+// field specifically being unreliable (missing users:read.email scope or similar), not a fully
+// unresolvable profile. These tests add a third, positive signal: the author's Slack team_id
+// matching the AgentWeb workspace's own team_id — a field users.info returns on any profile that
+// resolves at all, independent of the users:read.email scope that the email path depends on.
 
 // --- Mocks -----------------------------------------------------------------
 
@@ -69,6 +78,8 @@ jest.mock('../services/slackService', () => {
   return {
     ...actual,
     getSlackUserEmail: jest.fn(),
+    getSlackUserTeamId: jest.fn(),
+    getOwnSlackTeamId: jest.fn(),
     getSlackUserDisplayName: jest.fn().mockResolvedValue('Some User'),
     resolveSlackMentionsInText: jest.fn().mockImplementation(async (t: string) => t),
   };
@@ -93,12 +104,19 @@ const slackService = require('../services/slackService');
 const mockTriage = agentModeService.triageSlackMessage as jest.Mock;
 const mockSendSlackTriggeredSessionEmail = emailService.sendSlackTriggeredSessionEmail as jest.Mock;
 const mockGetSlackUserEmail = slackService.getSlackUserEmail as jest.Mock;
+const mockGetSlackUserTeamId = slackService.getSlackUserTeamId as jest.Mock;
+const mockGetOwnSlackTeamId = slackService.getOwnSlackTeamId as jest.Mock;
 
 const flushAsync = () => new Promise((resolve) => setTimeout(resolve, 100));
 
 // Harsha's Slack user ID — the module's default known-internal ID (reference-ids.md), and the
 // exact author whose messages were misclassified on 2026-08-16.
 const HARSHA_SLACK_ID = 'U08TM4QFQ1L';
+
+// The AgentWeb Slack workspace's own team_id and a customer workspace's team_id (Slack Connect) —
+// both fixture-only values, not real IDs.
+const AGENTWEB_TEAM_ID = 'TAGENTWEB01';
+const CUSTOMER_TEAM_ID = 'TCUSTOMER99';
 
 describe('Slack internal-author guard (ENG-1263)', () => {
   let app: express.Application;
@@ -117,6 +135,10 @@ describe('Slack internal-author guard (ENG-1263)', () => {
       email: 'customer@example.com',
       slackChannels: ['C12345'],
     });
+    // Defaults: our own workspace resolves fine; a given author's team_id is unresolved unless a
+    // test says otherwise, so pre-existing email-only test cases are unaffected by this signal.
+    mockGetOwnSlackTeamId.mockResolvedValue(AGENTWEB_TEAM_ID);
+    mockGetSlackUserTeamId.mockResolvedValue(null);
     mockTriage.mockResolvedValue(true);
     chatbotDb.createChatSession.mockResolvedValue({ sessionId: 'session-123', userId: 'user-123', messages: [], llmModel: 'gpt-4o' });
     chatbotDb.updateSessionSlackThread.mockResolvedValue({ sessionId: 'session-123' });
@@ -241,6 +263,49 @@ describe('Slack internal-author guard (ENG-1263)', () => {
     expect(internalSkipLog).toBeDefined();
   });
 
+  it('skips a non-allowlisted internal author whose email fails to resolve but whose team_id matches our workspace (the 2026-08-20 recurrence)', async () => {
+    // This is exactly what happened to Fangfang (ftan@agentweb.pro, not on the ID allowlist) on
+    // 2026-08-20: her display name resolved from users.info but her profile email did not, so the
+    // #2508 fix (ID allowlist OR resolved email) still fell through to triage. team_id is a field
+    // on the same users.info response that does not depend on the users:read.email scope.
+    mockGetSlackUserEmail.mockResolvedValue(null);
+    mockGetSlackUserTeamId.mockResolvedValue(AGENTWEB_TEAM_ID);
+
+    const res = await postMessage('U_FANGFANG_NOT_ALLOWLISTED', 'Thank you! Sorry about the delay here - will take a look.');
+    expect(res.status).toBe(200);
+    await flushAsync();
+
+    expect(mockTriage).not.toHaveBeenCalled();
+    expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
+    expect(mockSendSlackTriggeredSessionEmail).not.toHaveBeenCalled();
+  });
+
+  it('still triages and notifies for an external author whose team_id resolves but does NOT match our workspace, even when email also fails (no over-correction from the team_id signal)', async () => {
+    mockGetSlackUserEmail.mockResolvedValue(null);
+    mockGetSlackUserTeamId.mockResolvedValue(CUSTOMER_TEAM_ID);
+
+    const res = await postMessage('U_CUSTOMER_FOREIGN_TEAM', 'What are the immediate actions you will adjust?');
+    expect(res.status).toBe(200);
+    await flushAsync();
+
+    expect(mockTriage).toHaveBeenCalledWith('What are the immediate actions you will adjust?');
+    expect(mockSendSlackTriggeredSessionEmail).toHaveBeenCalled();
+  });
+
+  it('does NOT log the unresolved-author message when team_id resolves even though email does not (team_id is a real identity signal, not "unresolved")', async () => {
+    mockGetSlackUserEmail.mockResolvedValue(null);
+    mockGetSlackUserTeamId.mockResolvedValue(CUSTOMER_TEAM_ID);
+
+    await postMessage('U_CUSTOMER_FOREIGN_TEAM', 'What are the immediate actions you will adjust?');
+    await flushAsync();
+
+    const logMessages = logSpy.mock.calls.map((call) => call[0]);
+    const unresolvedLog = logMessages.find((m: string) =>
+      typeof m === 'string' && m.includes('could not resolve author identity')
+    );
+    expect(unresolvedLog).toBeUndefined();
+  });
+
   // CodeRabbit (PR #2508): the top-level-message guard above and this monitored triggered-thread
   // reply path independently re-implemented the same "is this internal" check, and only the
   // top-level one was fixed initially — an allowlisted internal user replying in a monitored
@@ -290,6 +355,18 @@ describe('Slack internal-author guard (ENG-1263)', () => {
 
       expect(generateSessionResponse).toHaveBeenCalled();
       expect(mockSendSlackTriggeredSessionEmail).toHaveBeenCalled();
+    });
+
+    it('skips a non-allowlisted internal reply whose email fails to resolve but whose team_id matches our workspace (recurrence, thread-reply path)', async () => {
+      mockGetSlackUserEmail.mockResolvedValue(null);
+      mockGetSlackUserTeamId.mockResolvedValue(AGENTWEB_TEAM_ID);
+
+      const res = await threadReply('U_FANGFANG_NOT_ALLOWLISTED', 'Following up on the numbers');
+      expect(res.status).toBe(200);
+      await flushAsync();
+
+      expect(generateSessionResponse).not.toHaveBeenCalled();
+      expect(mockSendSlackTriggeredSessionEmail).not.toHaveBeenCalled();
     });
   });
 });

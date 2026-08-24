@@ -9,8 +9,9 @@ jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn().mockResolvedValue('test-api-key'),
 }));
 
-jest.mock('../utils/llmClients', () => ({
-  getGeminiClient: jest.fn(),
+const mockCallLLM = jest.fn();
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: { callLLM: (...a: any[]) => mockCallLLM(...a) },
 }));
 
 jest.mock('../config', () => ({
@@ -18,27 +19,22 @@ jest.mock('../config', () => ({
 }));
 
 import { restyleContent } from '../controllers/blog';
-import { getGeminiClient } from '../utils/llmClients';
 
 describe('restyleContent — blog articles are citation-free (ENG-351 scope decision)', () => {
-  let generateContentMock: jest.Mock;
-
   beforeEach(() => {
     jest.clearAllMocks();
-    generateContentMock = jest.fn().mockResolvedValue({
-      text: JSON.stringify({
+    mockCallLLM.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({
         title: 'T',
         description: 'D',
         content: 'C',
         imagePrompt: 'P',
-      }),
-    });
-    (getGeminiClient as jest.Mock).mockResolvedValue({
-      models: { generateContent: generateContentMock },
+      }) } }],
     });
   });
 
-  const getPrompt = (): string => generateContentMock.mock.calls[0][0].contents as string;
+  const getPrompt = (): string => mockCallLLM.mock.calls[0][1]
+    .find((message: any) => message.role === 'user').content as string;
 
   it('instructs the model to remove all citations and references from the blog', async () => {
     await restyleContent('The market grew to $5B (Gartner, 2025).', 'AI market');

@@ -15,6 +15,8 @@ import {
   deleteSlackMessage,
   getSlackUserDisplayName,
   getSlackUserEmail,
+  getSlackUserTeamId,
+  getOwnSlackTeamId,
   resolveSlackMentionsInText,
   downloadSlackFile,
   resolveSlackFileUrl
@@ -27,6 +29,7 @@ import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
 import { getEmmaBotUserId, handleLoopApprovalReaction } from "../services/loopSlackApprovalDispatcher";
 import { renderCitationMarkers } from "../utils/citations";
+import { agentModeService } from '../services/agentModeService';
 
 // ENG-351: resolve Emma's {{cite:N}} markers to Slack-clickable source links. The citation metadata
 // rides on the response's last assistant message; render as markdown links, which postThreadResponse's
@@ -59,14 +62,26 @@ const INTERNAL_SLACK_USER_IDS = new Set(
 
 // Shared by every path that gates on "is this our own team talking, not the customer" — the
 // initial top-level message check and the monitored triggered-thread reply check both need the
-// same two-signal predicate (CodeRabbit flagged the latter still being email-only on PR #2508:
-// an allowlisted internal user replying in a monitored thread with an unresolved email fell
-// through the same fail-open gap this row exists to close). Email comparison is
-// case-insensitive — Slack profile emails aren't guaranteed lowercase.
-function isInternalSlackAuthor(slackUserId: string, senderEmail: string | null): boolean {
+// same predicate (CodeRabbit flagged the latter still being email-only on PR #2508: an
+// allowlisted internal user replying in a monitored thread with an unresolved email fell through
+// the same fail-open gap this row exists to close). Email comparison is case-insensitive — Slack
+// profile emails aren't guaranteed lowercase.
+//
+// ENG-1263 recurrence (2026-08-20): the ID-allowlist-or-email guard above still fell through for
+// Fangfang (ftan@agentweb.pro, not on the ID allowlist) because her profile email specifically
+// failed to resolve even though the rest of her profile did. Third signal: senderTeamId ===
+// ownTeamId. team_id sits on the same users.info response as email but does not depend on the
+// users:read.email scope, so it resolves even when the email field alone does not.
+function isInternalSlackAuthor(
+  slackUserId: string,
+  senderEmail: string | null,
+  senderTeamId: string | null,
+  ownTeamId: string | null
+): boolean {
   return (
     INTERNAL_SLACK_USER_IDS.has(slackUserId) ||
-    (!!senderEmail && senderEmail.toLowerCase().endsWith('@agentweb.pro'))
+    (!!senderEmail && senderEmail.toLowerCase().endsWith('@agentweb.pro')) ||
+    (!!senderTeamId && !!ownTeamId && senderTeamId === ownTeamId)
   );
 }
 
@@ -99,18 +114,6 @@ async function extractAdminMessageIntent(
   rawMessage: string
 ): Promise<{ targetEmail: string; taskMessage: string } | null> {
   try {
-    const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-    const apiKey = process.env.GEMINI_API_KEY || (await getSecret(`${environment}/AgentWeb/GeminiAPIKey`));
-    if (!apiKey?.trim()) {
-      console.warn('⚠️ Gemini API key not available, falling back to regex for admin channel parsing');
-      return null;
-    }
-
-    // Metered factory client (shadow usage metering). System context — admin
-    // channel parsing has no single attributable user, so no userId is passed.
-    const { getGeminiClient } = await import('../utils/llmClients');
-    const ai = await getGeminiClient({ feature: 'other' }, apiKey);
-
     const prompt = `Extract the target user email address and task description from this admin Slack message.
 
 Message: "${rawMessage}"
@@ -124,15 +127,15 @@ Respond with JSON only, no explanation:
 or if no email found:
 {"targetEmail": null, "taskMessage": null}`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.1-flash-lite',
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: {
-        responseMimeType: 'application/json',
-      },
+    const response = await agentModeService.callLLM('gemini-3.1-flash-lite', [
+      { role: 'user', content: prompt },
+    ], {
+      response_format: { type: 'json_object' },
+      usageContext: { feature: 'other' },
+      taskClass: 'mcp_api',
     });
 
-    const text = response.text?.trim();
+    const text = response.choices?.[0]?.message?.content?.trim();
     if (!text) return null;
 
     const parsed = JSON.parse(text);
@@ -176,18 +179,22 @@ async function handleSlackTriggeredSession(params: {
     if (!rawMessage) return;
 
     // Skip messages from AgentWeb team members — no need to suggest replies for our own team's comments.
-    // Two independent signals, either one is sufficient: a resolved @agentweb.pro email, or a known
-    // internal Slack user ID (checked first — it doesn't depend on email resolution succeeding).
+    // Three independent signals, any one is sufficient: a resolved @agentweb.pro email, a known
+    // internal Slack user ID (doesn't depend on email resolution succeeding), or the author's
+    // Slack team_id matching our own workspace (ENG-1263 recurrence — resolves even when the
+    // profile email field specifically fails, e.g. a missing users:read.email scope).
     const senderEmail = await getSlackUserEmail(slackUserId);
+    const senderTeamId = await getSlackUserTeamId(slackUserId);
+    const ownTeamId = await getOwnSlackTeamId();
 
-    if (isInternalSlackAuthor(slackUserId, senderEmail)) {
+    if (isInternalSlackAuthor(slackUserId, senderEmail, senderTeamId, ownTeamId)) {
       console.log(`📨 [slack-triggered] skipping message from AgentWeb team member (${slackUserId}${senderEmail ? `, ${senderEmail}` : ''})`);
       return;
     }
 
-    if (!senderEmail) {
-      // Author identity could not be resolved (rate limit, missing users:read.email scope, or a
-      // cross-workspace profile in a Slack-Connect channel) and the ID isn't on the known-internal
+    if (!senderEmail && !senderTeamId) {
+      // Author identity could not be resolved at all (rate limit, or a cross-workspace stranger
+      // profile users.info can't resolve anything for) and the ID isn't on the known-internal
       // list. Do NOT fail closed here — treating "unresolvable" as "internal" would silently drop
       // genuine customer questions with no signal, which is strictly worse than the noise this row
       // is fixing. Fall through to triage as before, but log distinguishably from both the internal
@@ -985,10 +992,12 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               // Monitored (email-only) session — continue it and send email, do NOT post to Slack
               if (text) {
                 // Skip replies from AgentWeb team members — no suggest needed for our own team's
-                // comments. Same two-signal predicate as the top-level message guard (ENG-1263):
-                // a known-internal ID doesn't depend on email resolution succeeding.
+                // comments. Same three-signal predicate as the top-level message guard (ENG-1263):
+                // ID allowlist and team_id match both don't depend on email resolution succeeding.
                 const replySenderEmail = await getSlackUserEmail(slackUserId);
-                if (isInternalSlackAuthor(slackUserId, replySenderEmail)) {
+                const replySenderTeamId = await getSlackUserTeamId(slackUserId);
+                const replyOwnTeamId = await getOwnSlackTeamId();
+                if (isInternalSlackAuthor(slackUserId, replySenderEmail, replySenderTeamId, replyOwnTeamId)) {
                   console.log(`📨 [slack-triggered] skipping thread reply from AgentWeb team member (${slackUserId}${replySenderEmail ? `, ${replySenderEmail}` : ''})`);
                   return;
                 }

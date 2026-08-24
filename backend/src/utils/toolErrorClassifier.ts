@@ -44,6 +44,7 @@
 const GATEWAY_NAME_CLASSES: Record<string, string> = {
   AgentToolBudgetExceededError: 'repeated_failure',
   AgentToolPolicyBlockedError: 'policy_blocked',
+  ToolResultPolicyBlockedError: 'policy_blocked',
   AgentToolRepeatedFailureError: 'repeated_failure',
   AgentToolContractValidationError: 'invalid_args',
   // A tool returned without throwing but produced no usable output (ENG-105).
