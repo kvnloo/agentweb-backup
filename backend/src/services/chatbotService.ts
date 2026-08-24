@@ -97,6 +97,8 @@ export interface ChatMessage {
     completion_tokens: number;
     total_tokens: number;
     estimated_cost: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
   };
   metadata?: {
     currentUrl?: string;
@@ -4364,6 +4366,12 @@ function logTokenUsage(
     completion_tokens: usage.completion_tokens,
     total_tokens: usage.total_tokens,
     estimated_cost: cost,
+    // ENG-1222: without these, a session's spend has no per-model attribution
+    // basis (apiTools.ts reads msg.usage.cache_*_input_tokens) and reports as
+    // 'selection-only' with cacheTokens/costByModel null even though real spend
+    // happened — the exact telemetry fingerprint that hid the P0 fabrication bug.
+    cache_read_input_tokens: u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
+    cache_creation_input_tokens: u.cache_creation_input_tokens || 0,
   };
 }
 
@@ -5048,6 +5056,18 @@ export async function generateChatResponse(
       console.warn(`[generateChatResponse] Hit MAX_ITERATIONS (${MAX_ITERATIONS})`);
     }
 
+    // ENG-1222: a turn that made zero real tool calls must never present its own
+    // prose as if it were actual/real tool-derived data — this is exactly the P0
+    // fabrication pattern (an invented Google Ads account presented as "the
+    // ACTUAL returned rows"). toolCalls.length === 0 is ground truth for whether
+    // anything really executed; the phrase match only narrows the block to
+    // genuine data-claim language so ordinary toolless conversation is unaffected.
+    const CLAIMS_REAL_TOOL_OUTPUT = /\bactual(?:ly)?\s+(?:returned|return|results?|rows?|data|account\s*(?:names?|ids?)?)\b|\breal\s+(?:api|account|customer)\s+data\b/i;
+    if (toolCalls.length === 0 && CLAIMS_REAL_TOOL_OUTPUT.test(finalAssistantMessage)) {
+      console.error('[generateChatResponse] Blocked a zero-tool-call response claiming real tool-derived data', { sessionId, portalType });
+      finalAssistantMessage = "I wasn't able to actually run the tools needed to get real data for this, so I don't have genuine results to share. Please try again, and let us know if this keeps happening.";
+    }
+
     // Calculate memory usage delta and current state
     const endMemory = process.memoryUsage();
     const endTime = Date.now();
@@ -5080,6 +5100,12 @@ export async function generateChatResponse(
     await chatbotDb.addMessageToSession(sessionId, {
       role: "assistant",
       content: finalAssistantMessage,
+      // ENG-1222: stamp the model that actually generated this turn so
+      // apiTools.ts's per-session attribution (attributionBasis/generationModels/
+      // costByModel) reads 'transcript' instead of falling back to
+      // 'selection-only' — without this, spend/model telemetry for every Emma
+      // turn is invisible to the tool-binding-failure fingerprint the P0 relied on.
+      llm: activeModel,
       usage: finalUsageData,
       metadata: assistantMessageMetadata,
     });
