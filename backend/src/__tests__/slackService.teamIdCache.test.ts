@@ -4,12 +4,12 @@
  * "external" for the rest of the process lifetime.
  */
 
-const mockUsersInfo = jest.fn();
+const mockTeamIdUsersInfo = jest.fn();
 const mockAuthTest = jest.fn();
 
 jest.mock('@slack/web-api', () => ({
   WebClient: jest.fn().mockImplementation(() => ({
-    users: { info: mockUsersInfo },
+    users: { info: mockTeamIdUsersInfo },
     auth: { test: mockAuthTest },
   })),
 }));
@@ -21,7 +21,7 @@ describe('Slack team ID lookup cache (ENG-1263)', () => {
 
   beforeEach(() => {
     jest.resetModules();
-    mockUsersInfo.mockReset();
+    mockTeamIdUsersInfo.mockReset();
     mockAuthTest.mockReset();
     errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
     jest.isolateModules(() => {
@@ -36,23 +36,23 @@ describe('Slack team ID lookup cache (ENG-1263)', () => {
   });
 
   it('retries a user team lookup after a transient users.info failure', async () => {
-    mockUsersInfo
+    mockTeamIdUsersInfo
       .mockRejectedValueOnce(new Error('temporary Slack outage'))
       .mockResolvedValueOnce({ ok: true, user: { team_id: 'TAGENTWEB01' } });
 
     await expect(getSlackUserTeamId('U_FANGFANG')).resolves.toBeNull();
     await expect(getSlackUserTeamId('U_FANGFANG')).resolves.toBe('TAGENTWEB01');
-    expect(mockUsersInfo).toHaveBeenCalledTimes(2);
+    expect(mockTeamIdUsersInfo).toHaveBeenCalledTimes(2);
   });
 
   it('retries a user team lookup after Slack returns no usable team_id', async () => {
-    mockUsersInfo
+    mockTeamIdUsersInfo
       .mockResolvedValueOnce({ ok: true, user: {} })
       .mockResolvedValueOnce({ ok: true, user: { team_id: 'TAGENTWEB01' } });
 
     await expect(getSlackUserTeamId('U_FANGFANG')).resolves.toBeNull();
     await expect(getSlackUserTeamId('U_FANGFANG')).resolves.toBe('TAGENTWEB01');
-    expect(mockUsersInfo).toHaveBeenCalledTimes(2);
+    expect(mockTeamIdUsersInfo).toHaveBeenCalledTimes(2);
   });
 
   it('retries the app workspace lookup after a transient auth.test failure', async () => {
@@ -66,10 +66,10 @@ describe('Slack team ID lookup cache (ENG-1263)', () => {
   });
 
   it('still caches successful team ID lookups', async () => {
-    mockUsersInfo.mockResolvedValue({ ok: true, user: { team_id: 'TAGENTWEB01' } });
+    mockTeamIdUsersInfo.mockResolvedValue({ ok: true, user: { team_id: 'TAGENTWEB01' } });
 
     await expect(getSlackUserTeamId('U_FANGFANG')).resolves.toBe('TAGENTWEB01');
     await expect(getSlackUserTeamId('U_FANGFANG')).resolves.toBe('TAGENTWEB01');
-    expect(mockUsersInfo).toHaveBeenCalledTimes(1);
+    expect(mockTeamIdUsersInfo).toHaveBeenCalledTimes(1);
   });
 });
