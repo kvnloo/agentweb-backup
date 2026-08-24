@@ -462,4 +462,21 @@ describe("attributeCosts — a vendor call is not a model (ENG-1519)", () => {
     ]);
     expect(result.byFeature.map((d) => d.key)).toContain("x-account");
   });
+
+  it("treats a vendor row with no feature as unattributed, like any other unplaceable row", () => {
+    // The vendor branch used to sit BEFORE the missing-dimension guard, so
+    // such a row counted toward `attributed` while appearing in neither
+    // `byFeature` nor `unattributedMicroUsd` — and `reconciles` still claimed
+    // the books balanced while the feature dimension had quietly lost it
+    // (CodeRabbit).
+    const result = attributeCosts([
+      row({ model: "anthropic.claude-opus-5", costMicroUsd: 10 * USD }),
+      row({ model: "twitter:get_user_tweets", feature: "", costMicroUsd: 4 * USD, provider: "twitter", unit: "call" }),
+    ]);
+
+    expect(result.byVendor).toBeNull();
+    expect(result.unattributedMicroUsd).toBe(4 * USD);
+    expect(result.totalCostMicroUsd).toBe(14 * USD);
+    expect(result.reconciles).toBe(true);
+  });
 });

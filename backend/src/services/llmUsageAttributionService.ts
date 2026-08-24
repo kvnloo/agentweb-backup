@@ -233,27 +233,30 @@ export function attributeCosts(rows: AttributionRow[]): CostAttribution {
     const model = (row.model || "").trim();
     const feature = normaliseFeature(row.feature);
 
-    // A per-unit vendor call is real spend on this bill, but it is not a model
-    // and must never be offered as one. It still counts toward the total and
-    // toward every other grouping — dropping it would understate the bill,
-    // which is the opposite failure.
-    const isVendor = row.provider != null && row.unit != null;
-    if (isVendor && model) {
-      const v = byVendor.get(model) || { cost: 0, calls: 0 };
-      byVendor.set(model, { cost: v.cost + cost, calls: v.calls + calls });
-      vendorCost += cost;
-      if (feature) {
-        const f = byFeature.get(feature) || { cost: 0, calls: 0 };
-        byFeature.set(feature, { cost: f.cost + cost, calls: f.calls + calls });
-      }
-      continue;
-    }
 
     // A row missing either dimension cannot be placed. It is added to an explicit
     // remainder so the parts still sum to the whole (AC2) — the failure mode to
     // avoid is a driver list that quietly totals less than the bill.
     if (!model || !feature) {
       unattributed += cost;
+      continue;
+    }
+
+    // A per-unit vendor call is real spend on this bill, but it is not a model
+    // and must never be offered as one. Placed AFTER the missing-dimension
+    // guard deliberately (CodeRabbit): sitting before it, a vendor row with no
+    // feature counted toward `attributed` while appearing in neither
+    // `byFeature` nor `unattributed`, so `reconciles` still claimed the books
+    // balanced while the feature dimension had quietly lost that cost. A
+    // vendor row that cannot be placed is unattributed on exactly the same
+    // terms as a model row that cannot be placed.
+    const isVendor = row.provider != null && row.unit != null;
+    if (isVendor) {
+      const v = byVendor.get(model) || { cost: 0, calls: 0 };
+      byVendor.set(model, { cost: v.cost + cost, calls: v.calls + calls });
+      vendorCost += cost;
+      const vf = byFeature.get(feature) || { cost: 0, calls: 0 };
+      byFeature.set(feature, { cost: vf.cost + cost, calls: vf.calls + calls });
       continue;
     }
 
