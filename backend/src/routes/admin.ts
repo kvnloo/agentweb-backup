@@ -55,7 +55,11 @@ const upload = multer({
  * API call, so the short default costs an admin nothing and caps the damage from
  * a token that leaks. Override only with a deliberate reason.
  */
-const DELEGATE_TOKEN_TTL = process.env.DELEGATE_TOKEN_TTL || "8h";
+// Typed as jwt's own expiresIn rather than string: @types/jsonwebtoken narrows
+// it to a `StringValue` template-literal union, which a plain env-derived
+// string does not satisfy. The old code sidestepped this by inlining a literal.
+const DELEGATE_TOKEN_TTL = (process.env.DELEGATE_TOKEN_TTL ||
+  "8h") as jwt.SignOptions["expiresIn"];
 
 const CRM_SYNC_SOURCES = new Set(["users", "waitlist"]);
 const CRM_SYNC_SETTING_PREFIX = "admin_crm_sync_";
