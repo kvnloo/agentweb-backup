@@ -103,9 +103,42 @@ describe('httpClient', () => {
         mcpFetch({ method: 'PUT', path: '/api/agent-mode/scheduled-chats/sched-1', context: { userId: 'user-123' } })
       ).rejects.toThrow(/PUT.*\/api\/agent-mode\/scheduled-chats\/sched-1.*ECONNREFUSED/s);
 
-      // Bounded retry: more than one attempt, but not unbounded.
-      expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
-      expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(5);
+      // Bounded retry: exactly SELF_CALL_MAX_ATTEMPTS (3), not unbounded.
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    // ENG-1189 code review: retrying blindly risks silently duplicating a
+    // non-idempotent self-call (e.g. POST .../execute) if the network error
+    // occurred after the server already processed the request. Only GET/PUT
+    // are safe to repeat, so a POST must fail after a single attempt.
+    it('should NOT retry a transient network failure for a non-idempotent POST', async () => {
+      const networkError = () => {
+        const err = new TypeError('fetch failed');
+        (err as any).cause = { code: 'ECONNRESET', message: 'socket hang up' };
+        return err;
+      };
+      const fetchMock = jest.fn().mockRejectedValue(networkError());
+      global.fetch = fetchMock as any;
+
+      await expect(
+        mcpFetch({ method: 'POST', path: '/api/tasks/task-1/execute', context: { userId: 'user-123' } })
+      ).rejects.toThrow(/POST.*\/api\/tasks\/task-1\/execute.*ECONNRESET/s);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    // A genuine request timeout aborts with a distinct AbortError, not the
+    // TypeError('fetch failed') this retry targets — must not be retried,
+    // and must fail immediately with no backoff delay.
+    it('should NOT retry an AbortError (real timeout)', async () => {
+      const fetchMock = jest.fn().mockRejectedValue(new DOMException('The operation was aborted', 'AbortError'));
+      global.fetch = fetchMock as any;
+
+      await expect(
+        mcpFetch({ method: 'GET', path: '/api/test', context: { userId: 'user-123' } })
+      ).rejects.toThrow(/GET.*\/api\/test/s);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     it('should succeed if a transient network failure resolves on retry', async () => {
