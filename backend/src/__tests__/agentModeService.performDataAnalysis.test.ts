@@ -234,6 +234,45 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(result.analysis).not.toContain('![Analysis Result]');
   });
 
+  // ─── ENG-1295: generated CSV data returned as inlineData must not be dropped ─
+  // Prod session d789c175 (2026-08-17): Gemini's code-execution sandbox returned a
+  // computed per-ad-group breakdown as inlineData with mimeType text/csv (not via
+  // stdout/codeExecutionResult). The old code discarded ANY non-image inlineData as
+  // presumed Vega-Lite chart JSON, so the caller only ever saw the model's separate
+  // narrative `text` summary — ungrounded by the real computed numbers — which is
+  // exactly how perform_data_analysis reported hallucinated ad-group names/counts.
+  test('surfaces generated CSV data returned as inlineData instead of silently dropping it', async () => {
+    const csv = 'ad_group,impressions,clicks\nBrand Terms,10432,521\nCompetitor Terms,8811,290';
+
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [
+          {
+            content: {
+              parts: [
+                { text: 'Here is the Q3 ad group breakdown.' },
+                {
+                  inlineData: {
+                    data: Buffer.from(csv, 'utf-8').toString('base64'),
+                    mimeType: 'text/csv'
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Break down Q3 performance by ad group.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.codeExecuted).toBe(true);
+    expect(result.analysis).toContain('Brand Terms');
+    expect(result.analysis).toContain('Competitor Terms');
+    expect(result.analysis).toContain(csv);
+  });
+
   test('skips inline_data (snake_case) with non-image mimeType', async () => {
     mockedAxiosPost.mockResolvedValueOnce({
       data: {
