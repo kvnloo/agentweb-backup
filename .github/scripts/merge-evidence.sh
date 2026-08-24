@@ -136,6 +136,9 @@
 #                               (default "Detect changed projects")
 #   MERGE_EVIDENCE_BACKEND_JOBS newline-separated build jobs that must carry a
 #                               `success` when the diff touches backend paths
+#   MERGE_EVIDENCE_RETIRED_CHECKS newline-separated check-run names ignored
+#                               outright, any conclusion (default "Require
+#                               Greptile Review") — see section 3, Pass 3
 
 set -uo pipefail
 
@@ -155,6 +158,29 @@ BACKEND_PATHS='backend/
 # payload is treated as "did not run" rather than ignored, so a rename fails
 # closed instead of quietly deleting the requirement.
 BACKEND_JOBS="${MERGE_EVIDENCE_BACKEND_JOBS:-Backend build}"
+
+# ENG-1453: check-run names ignored outright, regardless of conclusion.
+# GitHub's commits/{sha}/check-runs endpoint retains a check run forever, even
+# after the workflow job that produced it is deleted — a NEW commit cannot
+# overwrite a job that no longer exists to run. ENG-1371 deleted the
+# `Require Greptile Review` job, and live-verified 2026-08-24: two otherwise
+# green, unchanged agentweb PRs (#2417, #2334) still hard-fail this gate
+# solely on that retired job's leftover `failure`.
+#
+# Matched by exact name against an explicit allowlist, not by diffing against
+# `.github/workflows/*.yml` at runtime — this script has no YAML parser
+# (bash+jq+gh only), and every other name-matching decision here already
+# fails closed on a rename rather than trying to infer intent, which an
+# allowlist preserves and dynamic introspection would not.
+#
+# Also not matched by GitHub App identity, which reads as the more principled
+# axis until checked against the actual payload: `Require Greptile Review`
+# was a first-party Actions job (app "github-actions", the same app as every
+# other job in this workflow), not the third-party Greptile integration
+# itself (`Greptile Review`, app "greptile-apps", which passes and was never
+# the blocker). An app-identity rule would be unable to tell this job apart
+# from any other Actions job, active or not.
+RETIRED_CHECKS="${MERGE_EVIDENCE_RETIRED_CHECKS:-Require Greptile Review}"
 
 log() { printf 'merge-evidence: %s\n' "$*"; }
 
@@ -453,6 +479,40 @@ if [ "${jq_exit}" -ne 0 ] || [ -z "${runs_json}" ]; then
   hard_fail "unparseable check-runs payload while selecting the latest result for each check context at ${head_sha}"
 fi
 
+# Pass 3 — DROP CHECK-RUNS NAMED ON THE RETIRED-CHECK ALLOWLIST (ENG-1453).
+# Unlike passes 1-2, this is not about currency — a retired check-run is not
+# superseded by anything newer, because nothing runs under that name anymore.
+# It is simply not evidence of anything a merge decision needs: neither a
+# `failure` nor a `success` from a job that no longer exists describes the
+# code at this head. Dropped before classification, so it cannot count as
+# `bad` OR as the `success` section 6 requires — a PR whose only success was a
+# leftover from a deleted job is correctly NO_EVIDENCE, not a pass.
+if [ -n "${RETIRED_CHECKS}" ]; then
+  retired_names="$(printf '%s' "${runs_json}" | jq -r --arg retired "${RETIRED_CHECKS}" '
+      ($retired | split("\n") | map(select(length > 0))) as $r
+      | [ .check_runs[] | select(.name as $n | $r | index($n) != null)
+          | "\(.name) (\(.conclusion // .status))" ] | join(", ")' 2>/dev/null)"
+  jq_exit=$?
+
+  if [ "${jq_exit}" -ne 0 ]; then
+    surface 'check-runs response (raw)' "${runs_json}"
+    hard_fail "failed to identify retired-allowlisted check-runs in the payload at ${head_sha}"
+  fi
+
+  if [ -n "${retired_names}" ]; then
+    runs_json="$(printf '%s' "${runs_json}" | jq -c --arg retired "${RETIRED_CHECKS}" '
+        ($retired | split("\n") | map(select(length > 0))) as $r
+        | .check_runs |= map(select(.name as $n | $r | index($n) == null))' 2>/dev/null)"
+    jq_exit=$?
+
+    if [ "${jq_exit}" -ne 0 ] || [ -z "${runs_json}" ]; then
+      hard_fail "failed to exclude retired-allowlisted check-runs from the check-runs payload at ${head_sha}"
+    fi
+
+    log "ignored check-run(s) named on MERGE_EVIDENCE_RETIRED_CHECKS, any conclusion: ${retired_names}"
+  fi
+fi
+
 effective_count="$(printf '%s' "${runs_json}" | jq -r '.check_runs | length' 2>/dev/null)"
 if ! grep -qE '^[0-9]+$' <<<"${effective_count}"; then
   hard_fail "check-runs payload became unreadable after narrowing to effective runs at ${head_sha}"
@@ -464,12 +524,12 @@ superseded_count=$((returned_count - effective_count))
 returned_count="${effective_count}"
 
 if [ "${superseded_count}" -gt 0 ]; then
-  log "ignored ${superseded_count} superseded check-run(s): suites proven cancelled-and-re-run ${superseded_suites}, then the latest run per check context"
+  log "ignored ${superseded_count} superseded and/or retired-allowlisted check-run(s): suites proven cancelled-and-re-run ${superseded_suites}, then the latest run per check context, then the retired-check allowlist"
 fi
 
-# Every surviving row was dropped as superseded — nothing executed here.
+# Every surviving row was dropped as superseded and/or retired-allowlisted.
 if [ "${returned_count}" -eq 0 ]; then
-  verdict 'NO_EVIDENCE' "every check-run at head ${head_sha} of ${REPO}#${PR_NUMBER} belonged to a superseded workflow run. Nothing was actually measured against this head."
+  verdict 'NO_EVIDENCE' "every check-run at head ${head_sha} of ${REPO}#${PR_NUMBER} belonged to a superseded workflow run or matched MERGE_EVIDENCE_RETIRED_CHECKS. Nothing was actually measured against this head."
   exit 3
 fi
 
