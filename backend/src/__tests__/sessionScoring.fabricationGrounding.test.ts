@@ -56,9 +56,14 @@ jest.mock('../services/settingsService', () => ({
 
 const mockCallLLM = agentModeService.callLLM as jest.MockedFunction<typeof agentModeService.callLLM>;
 
-function makeLLMResponse(score: number, dimensions: Record<string, unknown>, reason = 'r') {
+function makeLLMResponse(
+  score: number,
+  dimensions: Record<string, unknown>,
+  reason = 'r',
+  extra: Record<string, unknown> = {}
+) {
   return {
-    choices: [{ message: { content: JSON.stringify({ score, reason, dimensions }) } }],
+    choices: [{ message: { content: JSON.stringify({ score, reason, dimensions, ...extra }) } }],
   } as any;
 }
 
@@ -293,5 +298,104 @@ describe('SessionScoring - fabrication grounding (ENG-1223)', () => {
     expect(result.score).toBe(5);
     expect(result.dimensions?.dataAccuracy).toBe(5);
     expect(result.dimensions?.goalCompletion).toBe(5);
+  });
+
+  it('FABRICATION_GROUNDING_CLAUSE requires the structural "assertsToolDerivedData" field', () => {
+    expect(FABRICATION_GROUNDING_CLAUSE).toContain('assertsToolDerivedData');
+  });
+
+  it('STRUCTURAL CAP: forces the cap on a zero-tool-call fabrication even when the judge reason never uses "simulat" language, via assertsToolDerivedData: true', async () => {
+    // Same fabrication as the regression fixture, but the judge's reason text
+    // this time never says "simulat" anywhere — the old regex-only guard
+    // would have missed this and let dataAccuracy 5 through untouched.
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(
+        4,
+        { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 },
+        'The assistant accurately provided the connected account details and the exact GAQL query results for the conversion actions as requested.',
+        { assertsToolDerivedData: true }
+      )
+    );
+
+    const result = await scoreSessionWithJudge(
+      fabricatedSimulationMessages,
+      fabricatedSimulationMessages.length,
+      judge
+    );
+
+    expect(result.score).toBeLessThanOrEqual(2);
+    expect(result.dimensions?.dataAccuracy).toBe(1);
+    expect(result.dimensions?.goalCompletion).toBeLessThanOrEqual(2);
+  });
+
+  it('does NOT cap when the judge explicitly reports assertsToolDerivedData: false and the reason has no "simulat" language', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(
+        4,
+        { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 },
+        'The assistant accurately provided the connected account details and the exact GAQL query results for the conversion actions as requested.',
+        { assertsToolDerivedData: false }
+      )
+    );
+
+    const result = await scoreSessionWithJudge(
+      fabricatedSimulationMessages,
+      fabricatedSimulationMessages.length,
+      judge
+    );
+
+    expect(result.score).toBe(4);
+    expect(result.dimensions?.dataAccuracy).toBe(5);
+  });
+
+  it('falls back to the pre-existing regex-only check (no forced cap) when assertsToolDerivedData is omitted entirely, e.g. a judge/prompt that predates the field', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(
+        4,
+        { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 },
+        'The assistant accurately provided the connected account details and the exact GAQL query results for the conversion actions as requested.'
+      )
+    );
+
+    const result = await scoreSessionWithJudge(
+      fabricatedSimulationMessages,
+      fabricatedSimulationMessages.length,
+      judge
+    );
+
+    expect(result.score).toBe(4);
+    expect(result.dimensions?.dataAccuracy).toBe(5);
+  });
+
+  it('does NOT override when tool calls actually occurred, even if assertsToolDerivedData is (correctly) true — real tool-derived data is not fabrication', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(
+        5,
+        { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 },
+        'The assistant retrieved and accurately reported the connected account data.',
+        { assertsToolDerivedData: true }
+      )
+    );
+
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Pull my account data.' },
+      {
+        role: 'assistant',
+        content: '',
+        metadata: { toolCalls: [{ id: 'tc1', name: 'get_connected_accounts' }] },
+      } as any,
+      {
+        role: 'tool',
+        name: 'get_connected_accounts',
+        tool_call_id: 'tc1',
+        content: JSON.stringify({ success: true, accounts: [{ name: 'Acme Widgets Main' }] }),
+      } as any,
+      { role: 'assistant', content: 'Your connected account is Acme Widgets Main.' },
+    ];
+
+    const result = await scoreSession(messages, messages.length);
+
+    expect(result.score).toBe(5);
+    expect(result.dimensions?.dataAccuracy).toBe(5);
   });
 });

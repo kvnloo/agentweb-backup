@@ -140,20 +140,44 @@ const CREDITS_SIMULATION_AS_SUCCESS_RE =
  * "reason" said "successfully simulated/executed" — is overridden rather than
  * trusted.
  *
- * Scoped narrowly on purpose: it only fires when the session made ZERO tool
- * calls AND the judge's own reason text credits the simulation as
- * completed/successful (see CREDITS_SIMULATION_AS_SUCCESS_RE). A normal,
- * accurate, tool-free chat reply (where dataAccuracy 5 is correct and
- * "simulat" never appears), AND a genuine tool-free simulation/roleplay
- * request the judge scored correctly, are both left untouched.
+ * Two independent triggers, either is sufficient, both require ZERO tool
+ * calls in the session:
+ *   1. `assertsToolDerivedData === true` — the judge's own structured factual
+ *      field (see FABRICATION_GROUNDING_CLAUSE) saying the response presented
+ *      data as if tool-retrieved. With zero tool calls in the session, that
+ *      claim is fabricated by definition, regardless of what words the
+ *      judge's free-text "reason" happens to use. This closes the gap the
+ *      original (reason-text-only) version of this guard had: a judge that
+ *      fabricates a high score WITHOUT ever writing "simulat" anywhere.
+ *   2. CREDITS_SIMULATION_AS_SUCCESS_RE on the reason text — kept as a
+ *      fallback for a judge/prompt that predates `assertsToolDerivedData`
+ *      (field omitted, so trigger 1 doesn't fire) but still confesses to
+ *      crediting a simulation in prose, exactly Fangfang's original wording.
+ *
+ * `assertsToolDerivedData` is deliberately NOT defaulted to `true` when
+ * missing/malformed (unlike NO_TASK_JUDGMENT_CLAUSE's taskRequested, which
+ * fails open toward the rare case). The base rates are opposite: the vast
+ * majority of zero-tool-call sessions are ordinary, correct, tool-free chat
+ * replies, so defaulting a missing field to `true` here would systematically
+ * cap dataAccuracy on normal good sessions any time a judge simply omits the
+ * field — the same "never fake a default that would masquerade as a real
+ * judge answer" reasoning parseDimensions already applies to the ENG-1312
+ * fields. A missing field just falls back to trigger 2 above.
+ *
+ * A normal, accurate, tool-free chat reply (dataAccuracy 5 is correct,
+ * assertsToolDerivedData false/omitted, "simulat" never appears), AND a
+ * genuine tool-free simulation/roleplay request the judge scored correctly,
+ * are both left untouched.
  */
 function applyFabricationGuard(
   toolCallCount: number,
   reason: string,
   score: number,
-  dimensions: ScoringResult["dimensions"]
+  dimensions: ScoringResult["dimensions"],
+  assertsToolDerivedData?: boolean
 ): { score: number; dimensions: ScoringResult["dimensions"] } {
-  if (toolCallCount > 0 || !CREDITS_SIMULATION_AS_SUCCESS_RE.test(reason)) {
+  const credited = assertsToolDerivedData === true || CREDITS_SIMULATION_AS_SUCCESS_RE.test(reason);
+  if (toolCallCount > 0 || !credited) {
     return { score, dimensions };
   }
 
@@ -370,7 +394,15 @@ CRITICAL — ground dataAccuracy and goalCompletion in the TOOL CALL MANIFEST, n
 - If the assistant's response presents specific data as if it came from a tool or external system — account names, IDs, numbers, query rows, connected-account details, search results, etc. — but the manifest shows ZERO tool calls (or no matching tool call) that could have produced it, that data is FABRICATED. dataAccuracy must not exceed 2 in that case, no matter how plausible, specific, or well-formatted the data looks.
 - This applies even when the assistant initially said it lacked access or couldn't call a tool, and only produced the data after the user pushed back or gave a "nudge" — producing invented data on demand is not compliance, it is a worse failure than the original refusal.
 - Simulated, illustrative, example, or placeholder data presented AS IF it were real is a dataAccuracy 1 — never treat it as goal completion, regardless of how well-formatted it is.
-- Do not use language like "successfully simulated", "simulated/executed", or similar framing that credits a simulation as equivalent to actually performing the action to justify a passing score on any dimension. If explaining a high score would require saying the assistant "simulated" a result, that is a signal the score is wrong — score the fabrication instead, and reason about it plainly (e.g. "the assistant fabricated data with no tool call to back it").`;
+- Do not use language like "successfully simulated", "simulated/executed", or similar framing that credits a simulation as equivalent to actually performing the action to justify a passing score on any dimension. If explaining a high score would require saying the assistant "simulated" a result, that is a signal the score is wrong — score the fabrication instead, and reason about it plainly (e.g. "the assistant fabricated data with no tool call to back it").
+
+ADDITIONAL REQUIRED FIELD — "assertsToolDerivedData":
+- Set "assertsToolDerivedData": true if the assistant's response presents ANY specific data (account names/IDs, numbers, query rows, search results, statuses, dates, etc.) AS IF it were retrieved, queried, fetched, or executed via a tool or external system — regardless of whether you believe that data is accurate or fabricated. This is a factual question about what the response claims, not a quality judgment.
+- Set "assertsToolDerivedData": false when the response contains no such tool-attributed data — general knowledge, reasoning, a plain conversational reply, or content the assistant clearly marked as illustrative/example/placeholder rather than real.
+- This field is checked by code against the tool call manifest above: if you set it true but the manifest shows zero matching tool calls, the response's dataAccuracy score will be treated as fabricated regardless of what "reason" text you write, so answer honestly.
+
+Include it in the SAME JSON object as the other fields, e.g.:
+{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "assertsToolDerivedData": <true|false>}`;
 
 /**
  * Read the judge's zero-task verdict, failing OPEN.
@@ -382,6 +414,20 @@ CRITICAL — ground dataAccuracy and goalCompletion in the TOOL CALL MANIFEST, n
  */
 function parseTaskRequested(parsed: any): boolean | undefined {
   return parsed?.taskRequested === false ? false : undefined;
+}
+
+/**
+ * Read the judge's "did the response assert tool-derived data" verdict for
+ * applyFabricationGuard. Unlike parseTaskRequested, this does NOT fail open
+ * to a fixed default on a missing/malformed field — see applyFabricationGuard's
+ * docstring for why the base rate makes that unsafe here. Only a literal
+ * `true` or `false` is read; anything else returns undefined and the guard
+ * falls back to its reason-text-only trigger.
+ */
+function parseAssertsToolDerivedData(parsed: any): boolean | undefined {
+  if (parsed?.assertsToolDerivedData === true) return true;
+  if (parsed?.assertsToolDerivedData === false) return false;
+  return undefined;
 }
 
 /**
@@ -952,7 +998,13 @@ export async function scoreSession(
   const parsed = JSON.parse(raw);
   const score = Math.max(1, Math.min(5, Math.round(parsed.score)));
   const reason = parsed.reason || "No reason provided";
-  const guarded = applyFabricationGuard(manifest.count, reason, score, parseDimensions(parsed));
+  const guarded = applyFabricationGuard(
+    manifest.count,
+    reason,
+    score,
+    parseDimensions(parsed),
+    parseAssertsToolDerivedData(parsed)
+  );
 
   return {
     score: guarded.score,
@@ -1036,7 +1088,13 @@ export async function scoreSessionWithJudge(
   const parsed = JSON.parse(raw);
   const score = Math.max(1, Math.min(5, Math.round(parsed.score)));
   const reason = parsed.reason || "No reason provided";
-  const guarded = applyFabricationGuard(manifest.count, reason, score, parseDimensions(parsed));
+  const guarded = applyFabricationGuard(
+    manifest.count,
+    reason,
+    score,
+    parseDimensions(parsed),
+    parseAssertsToolDerivedData(parsed)
+  );
 
   return {
     score: guarded.score,
