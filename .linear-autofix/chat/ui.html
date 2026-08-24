@@ -375,8 +375,10 @@
   #atmenu .srow.sel { background: var(--user); }
   #atmenu .srow .sn { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
   #atmenu .srow .sd { color: var(--dim); font-size: 11px; flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #atmenu .srow .rowuse { color: var(--green); font-size: 11px; flex: none; cursor: pointer; padding: 0 2px; }
-  #atmenu .srow .rowuse:hover { text-decoration: underline; }
+  #atmenu .srow .rowsel, #atmenu .srow .rowopen { font-size: 11px; flex: none; cursor: pointer; padding: 0 3px; white-space: nowrap; }
+  #atmenu .srow .rowsel { color: var(--green); }
+  #atmenu .srow .rowopen { color: var(--accent); }
+  #atmenu .srow .rowsel:hover, #atmenu .srow .rowopen:hover { text-decoration: underline; }
   #atmenu .atcrumb { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 12px; position: sticky; top: 0; background: var(--panel); }
   #atmenu .atcrumb .atup { cursor: pointer; color: var(--accent); user-select: none; }
   #atmenu .atcrumb .atpath { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
@@ -1854,8 +1856,9 @@ $('input').addEventListener('keydown', (ev) => {
     if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopPropagation(); moveAt(-1); return; }
     if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopPropagation(); moveAt(1); return; }
     if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); hideAt(); return; }
-    if (ev.key === 'Enter') { ev.preventDefault(); ev.stopPropagation(); runAt(); return; }        // enter a folder / insert a file
-    if (ev.key === 'Tab') { ev.preventDefault(); ev.stopPropagation(); selectAt(); return; }        // reference the selection as-is (folder or file)
+    if (ev.key === 'Enter' && ev.shiftKey) { ev.preventDefault(); ev.stopPropagation(); selectAt(); return; } // Shift+Enter: reference the selection as-is (folder or file)
+    if (ev.key === 'Enter') { ev.preventDefault(); ev.stopPropagation(); runAt(); return; }        // Enter: enter a folder / insert a file
+    if (ev.key === 'Tab') { ev.preventDefault(); ev.stopPropagation(); selectAt(); return; }        // Tab: same as Shift+Enter
     if (ev.key === 'Backspace' && S.at.prefix) { const c = atContext(); if (c && !c.q) { ev.preventDefault(); ev.stopPropagation(); goUp(); return; } }
   }
   if (ev.key === 'Enter' && ev.altKey) return; // Alt+Enter is the sidebar toggle (handled globally), not a send
@@ -2250,20 +2253,23 @@ function renderAt() {
   let el = $('atmenu');
   if (!el) { el = document.createElement('div'); el.id = 'atmenu'; $('composer').appendChild(el); }
   const crumb = S.at.prefix
-    ? `<div class="atcrumb"><span class="atup" title="Up a level (Backspace)">⬅</span><span class="atpath" title="${esc(S.at.prefix)}">${esc(S.at.prefix)}/</span><span class="atuse" title="Reference this folder">use folder</span></div>`
+    ? `<div class="atcrumb"><span class="atup" title="Up a level (Backspace)">⬅</span><span class="atpath" title="${esc(S.at.prefix)}">${esc(S.at.prefix)}/</span><span class="atuse" title="Reference this folder">select folder</span></div>`
     : '';
   const rows = S.at.items.map((it, k) => {
     const nm = baseName(it.path) + (it.type === 'dir' ? '/' : '');
-    const useBtn = it.type === 'dir' ? `<span class="rowuse" data-k="${k}" title="Reference this folder (Tab)">use</span>` : '';
-    return `<div class="srow${k === S.at.sel ? ' sel' : ''}" data-k="${k}" title="${esc(it.path)}"><span class="sn">${it.type === 'dir' ? '📁' : '📄'} ${esc(nm)}</span><span class="sd">${esc(dirName(it.path) || '·')}</span>${useBtn}</div>`;
+    const dirBtns = it.type === 'dir' ? `<span class="rowsel" data-k="${k}" title="Reference this folder (Shift+Enter / Tab)">select</span><span class="rowopen" data-k="${k}" title="Open this folder (Enter)">open ›</span>` : '';
+    return `<div class="srow${k === S.at.sel ? ' sel' : ''}" data-k="${k}" title="${esc(it.path)}"><span class="sn">${it.type === 'dir' ? '📁' : '📄'} ${esc(nm)}</span><span class="sd">${esc(dirName(it.path) || '·')}</span>${dirBtns}</div>`;
   }).join('') || `<div class="atempty">no matches</div>`;
   el.innerHTML = crumb + rows;
   for (const row of el.querySelectorAll('.srow')) {
     row.onmouseenter = () => { S.at.sel = +row.dataset.k; for (const r of el.querySelectorAll('.srow')) r.classList.toggle('sel', r === row); };
     row.onmousedown = (e) => { e.preventDefault(); S.at.sel = +row.dataset.k; runAt(); }; // click a folder to enter it, a file to insert
   }
-  for (const b of el.querySelectorAll('.rowuse')) {
-    b.onmousedown = (e) => { e.preventDefault(); e.stopPropagation(); S.at.sel = +b.dataset.k; selectAt(); }; // "use" references a folder without entering it
+  for (const b of el.querySelectorAll('.rowsel')) {
+    b.onmousedown = (e) => { e.preventDefault(); e.stopPropagation(); S.at.sel = +b.dataset.k; selectAt(); }; // "select" references a folder without entering it
+  }
+  for (const b of el.querySelectorAll('.rowopen')) {
+    b.onmousedown = (e) => { e.preventDefault(); e.stopPropagation(); S.at.sel = +b.dataset.k; runAt(); }; // "open" enters the folder to browse
   }
   const up = el.querySelector('.atup'); if (up) up.onmousedown = (e) => { e.preventDefault(); goUp(); };
   const use = el.querySelector('.atuse'); if (use) use.onmousedown = (e) => { e.preventDefault(); insertRef({ path: S.at.prefix, type: 'dir' }); };
