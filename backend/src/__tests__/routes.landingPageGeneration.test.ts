@@ -137,6 +137,9 @@ jest.mock("../services/v0Service", () => ({
   updateLandingPageMetaPixel: (...args: any[]) => mockUpdateLandingPageMetaPixel(...args),
   updateLandingPageMetaTrackingInstalled: (...args: any[]) => mockUpdateLandingPageMetaTrackingInstalled(...args),
   syncLeadCaptureFilesToRepo: (...args: any[]) => mockSyncLeadCaptureFilesToRepo(...args),
+  // Re-export the real constant: the route compares against it, and an object-literal mock
+  // would leave it undefined so the comparison could never match.
+  NO_CAPTURE_LAYER: "no-capture-layer",
   updateLandingPageContext: (...args: any[]) => mockUpdateLandingPageContext(...args),
   resolveVercelProjectId: (...args: any[]) => mockResolveVercelProjectId(...args),
   triggerVercelDeployment: (...args: any[]) => mockTriggerVercelDeployment(...args),
@@ -2420,6 +2423,64 @@ describe("POST /api/landing-pages/v0/generated/:id/meta-pixel", () => {
     expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledWith("sub-a", true);
     expect(mockUpdateLandingPageMetaTrackingInstalled).not.toHaveBeenCalledWith("other-1", expect.anything());
     expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledTimes(2);
+  });
+
+  it("BESPOKE REPO: reports that server-side tracking was NOT configured instead of a clean success", async () => {
+    // The base pixel snippet still goes into the layout, but the CAPI half lives in the
+    // capture route — which the install floor refuses to write on a repo we do not own.
+    // Answering "Meta Pixel injected" here would claim tracking that does not exist.
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([root]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValueOnce({ committed: false, reason: "no-capture-layer" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings).toEqual([expect.stringContaining("server-side conversion tracking was not configured")]);
+    // ⚠ Not transient — it must not promise a retry or a redeploy.
+    expect(res.body.warnings[0]).not.toMatch(/retry|redeploy/i);
+  });
+
+  it("REMOVAL wording: says the pixel was 'removed', not 'updated'", async () => {
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([root]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValueOnce({ committed: false, reason: "no-capture-layer" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings[0]).toMatch(/browser pixel was removed/);
+  });
+
+  it("committed:true is NOT enough — a skipped capture route is still reported", async () => {
+    // The silent-partial `committed` alone cannot see: the commit landed, but the capture
+    // route was deliberately excluded because its deployed map could not be parsed.
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([root]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValueOnce({ committed: true, captureRouteSkipped: true });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings[0]).toMatch(/could not be read/);
   });
 
   it("FAIL: verification failure on malformed layout → 422, no partial write", async () => {
