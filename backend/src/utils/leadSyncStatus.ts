@@ -1,5 +1,5 @@
 /**
- * Per-lead external-CRM (HubSpot) sync status helpers.
+ * Per-lead external-CRM (HubSpot, Attio) sync status helpers.
  *
  * This is a LEAF module: it must not import from services/ or adapters/ so the
  * adapter (which imports these builders) doesn't create a require cycle.
@@ -7,10 +7,13 @@
 
 export type LeadSyncStatus = 'synced' | 'sync_pending' | 'update_pending' | 'sync_failed';
 
-export interface HubspotConnection {
+export interface ExternalCrmConnection {
   connected: boolean;
   autoSyncEnabled: boolean;
-  /** The raw stored ExternalCrmSyncConfig for the hubspot provider, or null. */
+  /** Which provider the list is connected to — a list is only ever connected
+   *  to one at a time (enforced in externalCrmSyncService.saveConfig). */
+  provider: 'hubspot' | 'attio' | null;
+  /** The raw stored ExternalCrmSyncConfig for that provider, or null. */
   config: any | null;
 }
 
@@ -22,20 +25,31 @@ const DEFAULT_MAPPED_FIELDS = [
   'linkedin', 'notes', 'status', 'dealValue', 'dealCurrency',
 ];
 
-/** Read the HubSpot connection state off a lead-list record. */
-export function getHubspotConnection(list: any): HubspotConnection {
-  const config = list?.externalCrmSyncConfigs?.hubspot ?? null;
+/**
+ * Read the connected-CRM state off a lead-list record. A list can only ever
+ * be connected to one provider at a time (saveConfig throws if a second
+ * provider is configured on an already-connected list), so checking both
+ * keys and using whichever is present is safe and unambiguous.
+ */
+export function getExternalCrmConnection(list: any): ExternalCrmConnection {
+  const configs = list?.externalCrmSyncConfigs ?? {};
+  const provider: 'hubspot' | 'attio' | null =
+    configs.hubspot ? 'hubspot' : configs.attio ? 'attio' : null;
+  const config = provider ? configs[provider] : null;
   const connected = !!config && (!!config.accountId || !!config.apiKeyEncrypted);
-  return { connected, autoSyncEnabled: !!config?.autoSyncEnabled, config };
+  return { connected, autoSyncEnabled: !!config?.autoSyncEnabled, provider: connected ? provider : null, config };
 }
 
 /**
  * Resolve a lead's sync status for display/filtering. Authoritative when the
  * persisted field is present; otherwise derives a value for legacy leads:
- *   any HubSpot id (contact OR deal) present -> 'synced', else 'sync_pending'.
+ *   any known CRM id (HubSpot contact/deal, or Attio person record) present
+ *   -> 'synced', else 'sync_pending'.
  * The deal-id fallback matters for leads synced before contact-id writeback was
  * reliable (e.g. the old deal-writeback clobber) — they're in HubSpot, so they
- * must not read as 'sync_pending'.
+ * must not read as 'sync_pending'. The Attio fallback is defense-in-depth only
+ * — going forward every successful Attio push stamps `syncStatus` directly
+ * (see buildSyncedMetadataBase), so this branch should rarely be hit.
  * Returns null when the list isn't connected (no chip / no filter).
  */
 export function resolveSyncStatus(lead: any, connected: boolean): LeadSyncStatus | null {
@@ -43,7 +57,7 @@ export function resolveSyncStatus(lead: any, connected: boolean): LeadSyncStatus
   const sm = lead?.syncMetadata;
   const persisted = sm?.syncStatus as LeadSyncStatus | undefined;
   if (persisted) return persisted;
-  return sm?.hubspot_contact_id || sm?.hubspot_deal_id ? 'synced' : 'sync_pending';
+  return sm?.hubspot_contact_id || sm?.hubspot_deal_id || sm?.attio_record_id ? 'synced' : 'sync_pending';
 }
 
 /** Set of agentwebField names that are pushed to HubSpot (enabled, not pull-only). */
@@ -89,22 +103,34 @@ export function mappedFieldChanged(existing: any, updates: any, mappedFields: Se
 }
 
 /**
- * Merge for a successful per-lead push: stamp contact id + synced + lastSyncedAt,
- * preserve any other ids (e.g. hubspot_deal_id), and CLEAR a prior syncError.
+ * Merge for a successful per-lead push: stamp synced + lastSyncedAt, preserve
+ * any existing ids, and CLEAR a prior syncError. Provider-agnostic — writes
+ * no id field, so it's safe for any adapter to call directly (e.g. Attio,
+ * which stamps its own attio_record_id/attio_list_entry_id separately).
+ */
+export function buildSyncedMetadataBase(
+  existing: Record<string, any> | undefined,
+  nowIso: string,
+): Record<string, any> {
+  const merged: Record<string, any> = {
+    ...(existing || {}),
+    syncStatus: 'synced',
+    lastSyncedAt: nowIso,
+  };
+  delete merged.syncError; // omit (not undefined) so DynamoDB drops it cleanly
+  return merged;
+}
+
+/**
+ * HubSpot-specific: buildSyncedMetadataBase plus the HubSpot contact id.
+ * Preserves any other existing ids (e.g. hubspot_deal_id).
  */
 export function buildSyncedMetadata(
   existing: Record<string, any> | undefined,
   contactId: string,
   nowIso: string,
 ): Record<string, any> {
-  const merged: Record<string, any> = {
-    ...(existing || {}),
-    hubspot_contact_id: contactId,
-    syncStatus: 'synced',
-    lastSyncedAt: nowIso,
-  };
-  delete merged.syncError; // omit (not undefined) so DynamoDB drops it cleanly
-  return merged;
+  return { ...buildSyncedMetadataBase(existing, nowIso), hubspot_contact_id: contactId };
 }
 
 /** Merge for a failed per-lead push: stamp sync_failed + error, preserve ids. */

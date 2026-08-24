@@ -2,6 +2,7 @@ import { CrmAdapter, CrmAuth } from './crmAdapterTypes';
 import { ExternalCrmSyncConfig, FieldMapping, SyncResult } from '../externalCrmSyncService';
 import { AttioService } from '../attioService';
 import { crmDb } from '../db';
+import { buildSyncedMetadataBase, buildFailedMetadata } from '../../utils/leadSyncStatus';
 
 /**
  * Attio CRM Adapter
@@ -232,11 +233,21 @@ export class AttioAdapter implements CrmAdapter {
                     }
                 }
 
+                // Stamp the provider-agnostic sync status (Gap 1: without this,
+                // the CRM leads page's synced badge/filter never recognizes an
+                // Attio-only sync, since it primarily reads syncMetadata.syncStatus).
+                await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+                    syncMetadata: buildSyncedMetadataBase(lead.syncMetadata, new Date().toISOString()),
+                }).catch((err: any) => { });
+
                 result.successCount++;
             } catch (err: any) {
                 result.errorCount++;
                 const msg = err.response?.data?.message || err.response?.data || err.message || 'Unknown error';
                 result.errors.push(`${lead.email || lead.leadId}: ${msg}`);
+                await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+                    syncMetadata: buildFailedMetadata(lead.syncMetadata, msg),
+                }).catch((updateErr: any) => { });
             }
         }
 

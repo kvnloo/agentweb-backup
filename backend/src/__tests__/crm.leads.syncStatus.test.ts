@@ -108,6 +108,11 @@ const HS_UNCONNECTED_LIST = {
   listId: 'list1',
   userId: 'test-user-id',
 };
+const ATTIO_CONNECTED_LIST = {
+  listId: 'list1',
+  userId: 'test-user-id',
+  externalCrmSyncConfigs: { attio: { accountId: 'acc1', autoSyncEnabled: false } },
+};
 
 // ─── Task 4: POST create → sync_pending ──────────────────────────────────────
 
@@ -149,6 +154,18 @@ describe('POST /lists/:listId/leads — sync_pending stamping', () => {
     expect(res.status).toHaveBeenCalledWith(201);
     const arg = asMock(crmDb.createLead).mock.calls[0][1];
     expect(arg.syncMetadata?.syncStatus).toBeUndefined();
+  });
+
+  it('stamps syncStatus sync_pending in syncMetadata when the list is Attio-connected (Gap 1 closure)', async () => {
+    asMock(crmDb.getLeadListById).mockResolvedValue(ATTIO_CONNECTED_LIST);
+
+    const req = { params: { listId: 'list1' }, body: { email: 'a@x.com' }, user: { userId: 'test-user-id' } };
+    const res = makeRes();
+    await handler!(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(201);
+    const arg = asMock(crmDb.createLead).mock.calls[0][1];
+    expect(arg.syncMetadata.syncStatus).toBe('sync_pending');
   });
 });
 
@@ -275,7 +292,7 @@ describe('GET /lists/:listId/leads — sync status filter + flags', () => {
     expect(handler).toBeTruthy();
   });
 
-  it('returns hubspotConnected:true and a resolved syncStatus per lead when connected', async () => {
+  it('returns crmConnected:true and a resolved syncStatus per lead when connected', async () => {
     asMock(crmDb.getLeadListById).mockResolvedValue(HS_CONNECTED_LIST);
     asMock(crmDb.getLeadsByListId).mockResolvedValue({ items: CANDIDATES, lastEvaluatedKey: undefined });
 
@@ -284,7 +301,28 @@ describe('GET /lists/:listId/leads — sync status filter + flags', () => {
     await handler!(req, res);
 
     const body = asMock(res.json).mock.calls.at(-1)?.[0];
-    expect(body.hubspotConnected).toBe(true);
+    expect(body.crmConnected).toBe(true);
+    const byId = Object.fromEntries(body.leads.map((l: any) => [l.leadId, l.syncStatus]));
+    expect(byId.A).toBe('synced');
+    expect(byId.B).toBe('synced');
+    expect(byId.C).toBe('sync_pending');
+  });
+
+  it('returns crmConnected:true when the list is Attio-connected instead of HubSpot (Gap 1 closure)', async () => {
+    asMock(crmDb.getLeadListById).mockResolvedValue(ATTIO_CONNECTED_LIST);
+    const attioCandidates = [
+      { leadId: 'A', syncMetadata: { syncStatus: 'synced' } },
+      { leadId: 'B', syncMetadata: { attio_record_id: 'p1' } }, // legacy fallback -> synced
+      { leadId: 'C', syncMetadata: {} }, // -> sync_pending
+    ];
+    asMock(crmDb.getLeadsByListId).mockResolvedValue({ items: attioCandidates, lastEvaluatedKey: undefined });
+
+    const req = { params: { listId: 'list1' }, query: {}, user: { userId: 'test-user-id' } };
+    const res = makeRes();
+    await handler!(req, res);
+
+    const body = asMock(res.json).mock.calls.at(-1)?.[0];
+    expect(body.crmConnected).toBe(true);
     const byId = Object.fromEntries(body.leads.map((l: any) => [l.leadId, l.syncStatus]));
     expect(byId.A).toBe('synced');
     expect(byId.B).toBe('synced');
@@ -303,7 +341,7 @@ describe('GET /lists/:listId/leads — sync status filter + flags', () => {
     expect(body.leads.map((l: any) => l.leadId)).toEqual(['C']);
   });
 
-  it('returns hubspotConnected:false and no syncStatus filtering when not connected', async () => {
+  it('returns crmConnected:false and no syncStatus filtering when not connected', async () => {
     asMock(crmDb.getLeadListById).mockResolvedValue(HS_UNCONNECTED_LIST);
     asMock(crmDb.getLeadsByListId).mockResolvedValue({ items: CANDIDATES, lastEvaluatedKey: undefined });
 
@@ -312,7 +350,7 @@ describe('GET /lists/:listId/leads — sync status filter + flags', () => {
     await handler!(req, res);
 
     const body = asMock(res.json).mock.calls.at(-1)?.[0];
-    expect(body.hubspotConnected).toBe(false);
+    expect(body.crmConnected).toBe(false);
     // syncStatus param ignored when not connected — all leads returned.
     expect(body.leads.map((l: any) => l.leadId)).toEqual(['A', 'B', 'C']);
   });

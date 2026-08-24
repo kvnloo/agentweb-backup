@@ -209,6 +209,28 @@ describe('AttioAdapter.pushLeads — deal list sync', () => {
     );
   });
 
+  it('stamps syncStatus=synced + lastSyncedAt on a successful push (Gap 1 closure)', async () => {
+    await adapter.pushLeads(auth, [makeLead()], makeConfig({ dealFieldMapping: [] }));
+
+    const calls = (crmDb.updateLead as jest.Mock).mock.calls;
+    const syncStatusCall = calls.find(c => c[2]?.syncMetadata?.syncStatus === 'synced');
+    expect(syncStatusCall).toBeTruthy();
+    expect(syncStatusCall![2].syncMetadata.lastSyncedAt).toEqual(expect.any(String));
+    expect(syncStatusCall![2].syncMetadata.attio_record_id).toBe('person_1');
+  });
+
+  it('stamps syncStatus=sync_failed + syncError when the push throws (Gap 1 closure)', async () => {
+    mockUpsertPersonByValues.mockRejectedValue(new Error('boom'));
+
+    const result = await adapter.pushLeads(auth, [makeLead()], makeConfig({ dealFieldMapping: [] }));
+
+    expect(result.errorCount).toBe(1);
+    const calls = (crmDb.updateLead as jest.Mock).mock.calls;
+    const failedCall = calls.find(c => c[2]?.syncMetadata?.syncStatus === 'sync_failed');
+    expect(failedCall).toBeTruthy();
+    expect(failedCall![2].syncMetadata.syncError).toMatch(/boom/);
+  });
+
   it('resolves and ensures the deal list only once across multiple leads in one call', async () => {
     const leads = [makeLead({ leadId: 'l1', email: 'a@acme.com' }), makeLead({ leadId: 'l2', email: 'b@acme.com' })];
     mockUpsertPersonByValues
