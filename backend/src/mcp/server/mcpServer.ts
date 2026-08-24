@@ -18,6 +18,7 @@ import {
   createMcpSessionStore,
 } from './mcpSessionStore';
 import { rehydrateAndServe } from './mcpSessionRehydration';
+import { anonymousUserIdForSession, isAnonymousDiscoveryEnabled, isAnonymouslyPermitted } from "./anonymousTransport";
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
 const mcpRateLimiter = new RateLimiter();
@@ -47,12 +48,25 @@ interface SessionEntry {
  * 2. MCP_ACCESS_TOKEN (static env token) — for internal backend-to-backend clients
  * 3. OAuth 2.1 access tokens — for OAuth-authenticated clients
  */
-async function validateMcpAccessToken(req: Request, res: Response, next: NextFunction) {
+export async function validateMcpAccessToken(req: Request, res: Response, next: NextFunction) {
   const baseUrl = `${req.protocol}://${req.get("host")}`;
   const authHeader = req.headers.authorization;
 
   // No token provided at all
   if (!authHeader) {
+    // ENG-984 lazy auth: a stranger may discover the surface before signing up.
+    // Only discovery methods (and, once one ships, an explicitly allowlisted
+    // demo tool) get through — everything else falls to the 401 below, which
+    // carries the WWW-Authenticate challenge a client turns into a Connect card.
+    if (isAnonymousDiscoveryEnabled() && isAnonymouslyPermitted(req.body)) {
+      // Stable per session, not per request — see anonymousUserIdForSession.
+      (req as any)._agentApiUserId = anonymousUserIdForSession(req.headers['mcp-session-id']);
+      (req as any)._mcpIsInternal = false;
+      (req as any)._mcpAuthMethod = 'anonymous';
+      (req as any)._mcpClientType = classifyMcpClient({ userAgent: req.get('user-agent') });
+      return next();
+    }
+
     console.error("[MCP] Access denied: Missing Authorization header");
     setMcpAuthChallenge(res, baseUrl);
     return res.status(401).json({
@@ -392,10 +406,22 @@ export function setupMcpServer(
         // internal caller; external sessions require a matching authenticated user.
         const reqUserId = (req as any)._agentApiUserId as string | undefined;
         const reqIsInternal = (req as any)._mcpIsInternal === true;
+        // Anonymous discovery sessions (ENG-984) are owned by a per-request
+        // `anon_` id, so an exact-match check can never succeed once a follow-up
+        // request lands on a different instance (each request mints a fresh id).
+        // An anon-owned session may be rehydrated by any anonymous-permitted
+        // request: the middleware has already confined it to discovery methods,
+        // which grant nothing a brand-new anonymous session wouldn't. Real user
+        // sessions still require an exact principal match (IDOR guard).
+        const reqIsAnonymous = (req as any)._mcpAuthMethod === 'anonymous';
+        const rehydratedIsAnonymous =
+          !!rehydrated?.agentUserId && rehydrated.agentUserId.startsWith('anon_');
         const samePrincipal = rehydrated
           ? rehydrated.isInternal
             ? reqIsInternal
-            : !!rehydrated.agentUserId && rehydrated.agentUserId === reqUserId
+            : rehydratedIsAnonymous
+              ? reqIsAnonymous
+              : !!rehydrated.agentUserId && rehydrated.agentUserId === reqUserId
           : false;
 
         if (rehydrated && samePrincipal) {

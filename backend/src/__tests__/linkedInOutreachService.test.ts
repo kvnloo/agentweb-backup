@@ -1712,6 +1712,59 @@ describe('LinkedInOutreachService', () => {
     });
   });
 
+  describe('resolveAccountIdWithSource (ENG-1198)', () => {
+    const mockGetAccountsByUserId = jest.fn();
+    const mockGetSetting = jest.fn();
+
+    beforeEach(() => {
+      jest.resetModules();
+      jest.doMock('../services/connectedAccountsDb', () => ({
+        getAccountsByUserId: mockGetAccountsByUserId,
+      }));
+      jest.doMock('../services/settingsService', () => ({
+        settingsService: { getSetting: mockGetSetting },
+      }));
+    });
+
+    it('reports usedSharedAccount: false when the user\'s own live account is used', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'user-acct-123' },
+      ]);
+      const liveSpy = jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(true);
+
+      const result = await linkedInOutreachService.resolveAccountIdWithSource('user-1');
+
+      expect(result).toEqual({ accountId: 'user-acct-123', usedSharedAccount: false });
+      liveSpy.mockRestore();
+    });
+
+    it('reports usedSharedAccount: true when every own account is dead and a site-wide account is used', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'own-dead' },
+      ]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([{ account_id: 'site-live', enabled: true }]),
+      });
+      const liveSpy = jest
+        .spyOn(linkedInOutreachService, 'isAccountConnected')
+        .mockImplementation(async (id: string) => id === 'site-live');
+
+      const result = await linkedInOutreachService.resolveAccountIdWithSource('user-1');
+
+      expect(result).toEqual({ accountId: 'site-live', usedSharedAccount: true });
+      liveSpy.mockRestore();
+    });
+
+    it('reports usedSharedAccount: false when nothing can be resolved', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockGetSetting.mockResolvedValue(null);
+
+      const result = await linkedInOutreachService.resolveAccountIdWithSource('user-3');
+
+      expect(result).toEqual({ accountId: null, usedSharedAccount: false });
+    });
+  });
+
   describe('resolveUserOwnedAccountId', () => {
     const mockGetAccountsByUserId = jest.fn();
     const mockGetSetting = jest.fn();

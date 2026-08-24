@@ -807,6 +807,117 @@ describe("v0Service - generateLandingPage", () => {
     expect(result.id).toBe("test-uuid-1234");
   });
 
+  describe("ENG-1141: metaPixelOverride at chat-creation time", () => {
+    it("uses an explicit override directly, without ever calling resolveMetaPixelForUser", async () => {
+      const resolveSpy = jest.spyOn(metaService, "resolveMetaPixelForUser");
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_override" });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create page",
+        "Overridden",
+        {},
+        undefined,
+        undefined,
+        { metaPixelOverride: { pixelId: "px-override", accountId: "acc-override" } }
+      );
+
+      expect(resolveSpy).not.toHaveBeenCalled();
+      expect(result.metaPixelId).toBe("px-override");
+      expect(result.metaAdAccountId).toBe("acc-override");
+      resolveSpy.mockRestore();
+    });
+
+    it("falls through to resolveMetaPixelForUser when no override is given (unchanged behavior)", async () => {
+      const resolveSpy = jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValueOnce({
+        pixelId: "px-auto",
+        accountId: "acc-auto",
+      });
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_auto" });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create page",
+        "Auto-resolved",
+        {}
+      );
+
+      expect(resolveSpy).toHaveBeenCalledTimes(1);
+      expect(result.metaPixelId).toBe("px-auto");
+      expect(result.metaAdAccountId).toBe("acc-auto");
+      resolveSpy.mockRestore();
+    });
+
+    // Negative/boundary coverage (CLAUDE.md Rule 2, Greptile P2 on #2384). The route
+    // validates shape + ownership before calling this service, so these pin what the
+    // service itself does if a malformed value ever reaches it another way (an internal
+    // caller, a future endpoint): treat it as "no override" and auto-resolve, never
+    // half-apply a pixel without its account.
+    it("ignores an override missing accountId and falls back to auto-resolution", async () => {
+      const resolveSpy = jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValueOnce({
+        pixelId: "px-auto",
+        accountId: "acc-auto",
+      });
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_partial" });
+
+      const result = await generateLandingPage(
+        "user-1", "Create page", "Partial override", {}, undefined, undefined,
+        { metaPixelOverride: { pixelId: "px-orphan" } as any }
+      );
+
+      expect(resolveSpy).toHaveBeenCalledTimes(1);
+      expect(result.metaPixelId).toBe("px-auto");
+      expect(result.metaAdAccountId).toBe("acc-auto");
+      resolveSpy.mockRestore();
+    });
+
+    it("ignores an override missing pixelId and falls back to auto-resolution", async () => {
+      const resolveSpy = jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValueOnce({
+        pixelId: "px-auto",
+        accountId: "acc-auto",
+      });
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_partial_2" });
+
+      const result = await generateLandingPage(
+        "user-1", "Create page", "Partial override 2", {}, undefined, undefined,
+        { metaPixelOverride: { accountId: "acc-orphan" } as any }
+      );
+
+      expect(resolveSpy).toHaveBeenCalledTimes(1);
+      expect(result.metaPixelId).toBe("px-auto");
+      expect(result.metaAdAccountId).toBe("acc-auto");
+      resolveSpy.mockRestore();
+    });
+
+    it("still deploys with no pixel when an override is absent AND auto-resolution is unresolved", async () => {
+      const resolveSpy = jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValueOnce({
+        unresolved: true,
+        reason: "2 ad accounts connected — ambiguous",
+      } as any);
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_unresolved" });
+
+      const result = await generateLandingPage("user-1", "Create page", "Unresolved", {});
+
+      expect(resolveSpy).toHaveBeenCalledTimes(1);
+      expect(result.metaPixelId).toBeUndefined();
+      expect(result.metaAdAccountId).toBeUndefined();
+      resolveSpy.mockRestore();
+    });
+
+    it("does not let a resolver throw abort the whole generation", async () => {
+      const resolveSpy = jest
+        .spyOn(metaService, "resolveMetaPixelForUser")
+        .mockRejectedValueOnce(new Error("graph exploded"));
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_throw" });
+
+      const result = await generateLandingPage("user-1", "Create page", "Resolver threw", {});
+
+      expect(result.id).toBe("test-uuid-1234");
+      expect(result.metaPixelId).toBeUndefined();
+      resolveSpy.mockRestore();
+    });
+  });
+
   it("SUCCESS: recycles a prior failed record (no v0 chat) instead of orphaning it", async () => {
     // Query #1 (findUserSiteRecord) → no site repo exists.
     // Query #2 (listLandingPages) → one prior failed first-page record with no v0ChatId.
@@ -4860,6 +4971,268 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     expect(result.status).toBe("deployed");
     expect(result.deployedUrl).toContain("https://my-brand.agentwebforms.com/");
     expect(result.deployedUrl).not.toContain("vercel.app");
+  });
+
+  // ENG-1141 (Greptile P1 on #2384): a creation-form pixel choice reaching an EXISTING site.
+  // The rule is fill-a-gap, never diverge — a pixel is site-wide by construction here (one
+  // shared layout snippet, one PIXEL_ID constant in the capture route), so a site that already
+  // has one keeps it, and a site with none gets the chosen one installed site-wide.
+  describe("ENG-1141: metaPixelOverride on the sub-page path", () => {
+    const committedBlobs = (): string[] =>
+      mockAxiosPost.mock.calls
+        .filter((c) => typeof c[0] === "string" && c[0].includes("/git/blobs"))
+        .map((c) => Buffer.from(c[1].content, "base64").toString("utf8"));
+
+    // Same shape as the ENG-483 block's helper below (which is scoped to that describe):
+    // the post-deploy capture-route sync reads 4 files, then commits the changed ones.
+    const setupSyncMocks = (existingCaptureRouteContent: string) => {
+      mockAxiosGet.mockResolvedValueOnce({ data: { content: Buffer.from("stale middleware").toString("base64") } });
+      mockAxiosGet.mockResolvedValueOnce({ data: { content: Buffer.from(existingCaptureRouteContent).toString("base64") } });
+      mockAxiosGet.mockResolvedValueOnce({ data: { content: Buffer.from("{}").toString("base64") } });
+      mockAxiosGet.mockResolvedValueOnce({ data: { content: Buffer.from(buildTrackingHelper()).toString("base64") } });
+      mockAxiosGet.mockResolvedValueOnce({ data: { object: { sha: "sync_base_sha" } } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_sync_middleware" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_sync_capture_route" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_sync_tracking_helper" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "sync_tree_sha" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "sync_commit_sha" } });
+      mockAxiosPatch.mockResolvedValueOnce({ data: {} });
+    };
+
+    // With a pixel in play, addPageToExistingRepo validates that the generated form really
+    // carries the Lead event (ENG-482) — the shared createTestZip has no fbq call, so these
+    // tests need a page that satisfies validatePixelLeadEvent or the build retries and fails.
+    const createTrackedZip = async () => {
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from(
+          "export default function Page() {\n" +
+          "  const submit = async () => {\n" +
+          "    const eventId = crypto.randomUUID();\n" +
+          "    await fetch('/api/capture', { method: 'POST', body: JSON.stringify({ eventId }) });\n" +
+          "    window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });\n" +
+          "  };\n" +
+          "  return <form onSubmit={submit} />;\n" +
+          "}"
+        )
+      );
+      return zip.toBuffer();
+    };
+
+    const setupTrackedV0Mocks = async () => {
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "version_new" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(await createTrackedZip());
+    };
+
+    // Greptile (round 4) on #2384: addSubPage handed the override to the coding-agent engine,
+    // which has no way to install it — silently discarding a selection the customer was just
+    // forced to make. Installing a pixel is exactly what the v0 path does, so route there.
+    describe("CODING_AGENT_SUBPAGES interaction", () => {
+      // CODING_AGENT_SUBPAGES is only consulted on the multi-site path (addSubPage). The
+      // legacy path this describe otherwise runs calls addPageToExistingRepo directly and
+      // never sees the flag, so DURABLE_LANDING_GENERATION has to be on for these to mean
+      // anything — without it the "routes to the agent" case silently tests nothing.
+      const ORIGINAL_AGENT = process.env.CODING_AGENT_SUBPAGES;
+      const ORIGINAL_DURABLE = process.env.DURABLE_LANDING_GENERATION;
+      afterEach(() => {
+        if (ORIGINAL_AGENT === undefined) delete process.env.CODING_AGENT_SUBPAGES;
+        else process.env.CODING_AGENT_SUBPAGES = ORIGINAL_AGENT;
+        if (ORIGINAL_DURABLE === undefined) delete process.env.DURABLE_LANDING_GENERATION;
+        else process.env.DURABLE_LANDING_GENERATION = ORIGINAL_DURABLE;
+      });
+
+      it("uses the v0 path (not the agent) when an override has to be installed on a pixel-less site", async () => {
+        process.env.CODING_AGENT_SUBPAGES = "true";
+        setupSiteRecordMock();
+        await setupTrackedV0Mocks();
+
+        mockAxiosGet.mockResolvedValueOnce({ data: { tree: [] } });
+        mockAxiosGet.mockResolvedValueOnce({
+          data: { content: Buffer.from("<html><head></head><body>{children}</body></html>").toString("base64") },
+        });
+        mockAxiosGet.mockResolvedValueOnce({ data: { object: { sha: "abc123" } } });
+        mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_page" } });
+        mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_track" } });
+        mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_layout" } });
+        mockAxiosPost.mockResolvedValueOnce({ data: { sha: "tree_sha" } });
+        mockAxiosPost.mockResolvedValueOnce({ data: { sha: "commit_sha" } });
+        mockAxiosPatch.mockResolvedValueOnce({ data: {} });
+        setupVercelDeploySuccessMock();
+        mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: existingSiteRecord }) });
+        mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+        mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+        setupSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+
+        const result = await generateLandingPage(
+          "user-1", "Create pricing page", "Pricing", {}, "list_pricing", undefined,
+          { metaPixelOverride: { pixelId: "override-pixel", accountId: "override-acct" } }
+        );
+
+        // Built by v0 (a chat was created) and the pixel really was installed.
+        expect(mockChatsCreate).toHaveBeenCalled();
+        expect(result.status).toBe("deployed");
+        const layoutBlob = committedBlobs().find((c) => c.includes("Meta Pixel Code"));
+        expect(layoutBlob).toContain("fbq('init', 'override-pixel')");
+      });
+
+      it("still uses the agent when the site already has a pixel — nothing to install, so the cheap engine wins", async () => {
+        process.env.CODING_AGENT_SUBPAGES = "true";
+        process.env.DURABLE_LANDING_GENERATION = "true";
+        const siteWithPixel = { ...existingSiteRecord, metaPixelId: "site-pixel", metaAdAccountId: "site-acct" };
+        mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [siteWithPixel] }) });
+        mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: siteWithPixel }) });
+        mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+
+        // Measure the delta: this mock's call count is not reset between cases in this file,
+        // so an absolute assertion here would read the previous test's v0 build as this one's.
+        const v0ChatsBefore = mockChatsCreate.mock.calls.length;
+
+        await generateLandingPage(
+          "user-1", "Create pricing page", "Pricing", {}, "list_pricing", undefined,
+          { metaPixelOverride: { pixelId: "override-pixel", accountId: "override-acct" } }
+        ).catch(() => { /* the agent module is not mocked here; routing is what's asserted */ });
+
+        // No NEW v0 chat: the build went to the coding agent, as the flag intends.
+        expect(mockChatsCreate.mock.calls.length).toBe(v0ChatsBefore);
+      });
+    });
+
+    it("ignores the override and inherits the site's own pixel when the site already has one", async () => {
+      const siteWithPixel = { ...existingSiteRecord, metaPixelId: "site-pixel", metaAdAccountId: "site-acct" };
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [siteWithPixel] }) });
+      mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: siteWithPixel }) });
+      await setupTrackedV0Mocks();
+      // extraBlobs=1: lib/agentweb-track.ts rides along (leadListId && a pixel is in play).
+      // No layout blob — the site already has its snippet, so nothing re-pushes layout.tsx.
+      setupGitHubMocks(1);
+      setupVercelDeploySuccessMock();
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [siteWithPixel] }) });
+      setupSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+
+      const result = await generateLandingPage(
+        "user-1", "Create pricing page", "Pricing", {}, "list_pricing", undefined,
+        { metaPixelOverride: { pixelId: "override-pixel", accountId: "override-acct" } }
+      );
+
+      expect(result.status).toBe("deployed");
+      const captureRoute = committedBlobs().find((c) => c.includes("LIST_BY_PATH"));
+      expect(captureRoute).toContain('const PIXEL_ID = "site-pixel"');
+      expect(captureRoute).not.toContain("override-pixel");
+      // Nothing touched the shared layout, and the root record was not rewritten.
+      expect(committedBlobs().some((c) => c.includes("Meta Pixel Code"))).toBe(false);
+      expect(mockUpdate).not.toHaveBeenCalledWith(
+        expect.objectContaining({ ExpressionAttributeValues: expect.objectContaining({ ":px": "override-pixel" }) })
+      );
+    });
+
+    // The record and the repo are separate sources of truth and can drift (a record that lost
+    // its pixel while the repo was wired by hand — the drift §13 hit on Every.io).
+    // injectPixelIntoLayout always strips the existing block first, so proceeding would
+    // silently repoint a LIVE site's conversions at a different pixel.
+    it("refuses to replace a different pixel already in the layout, and abandons the override entirely", async () => {
+      setupSiteRecordMock();
+      await setupTrackedV0Mocks();
+
+      mockAxiosGet.mockResolvedValueOnce({ data: { tree: [] } }); // repair scan
+      mockAxiosGet.mockResolvedValueOnce({                        // layout ALREADY has another pixel
+        data: {
+          content: Buffer.from(
+            "<html><head>{/* Meta Pixel Code */}fbq('init', '999999999999999');{/* End Meta Pixel Code */}</head><body>{children}</body></html>"
+          ).toString("base64"),
+        },
+      });
+      mockAxiosGet.mockResolvedValueOnce({ data: { object: { sha: "abc123" } } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_page" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_track" } });
+      // Exactly two blobs are expected (page + tracking helper). Without the guard a third —
+      // the rewritten layout — rides along, which both trips the assertions below and shifts
+      // this sequential mock queue; either way the test goes red, and the assertions say why.
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "tree_sha" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "commit_sha" } });
+      mockAxiosPatch.mockResolvedValueOnce({ data: {} });
+
+      setupVercelDeploySuccessMock();
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+      setupSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+
+      const result = await generateLandingPage(
+        "user-1", "Create pricing page", "Pricing", {}, "list_pricing", undefined,
+        { metaPixelOverride: { pixelId: "override-pixel", accountId: "override-acct" } }
+      );
+
+      // The page still ships — this is a tracking decision, not a build failure.
+      expect(result.status).toBe("deployed");
+      // The foreign pixel is untouched: no layout blob committed at all.
+      expect(committedBlobs().some((c) => c.includes("Meta Pixel Code"))).toBe(false);
+      // And the override is abandoned wholesale rather than half-applied: the capture route
+      // must not point CAPI at our pixel while the browser fires theirs.
+      const captureRoute = committedBlobs().find((c) => c.includes("LIST_BY_PATH"));
+      expect(captureRoute).not.toContain("override-pixel");
+      // The root record is not rewritten either.
+      expect(mockUpdate).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          ExpressionAttributeValues: expect.objectContaining({ ":px": "override-pixel" }),
+        })
+      );
+    });
+
+    it("installs the chosen pixel site-wide when the site has none, and records it on the root", async () => {
+      // The ENG-1141 case: 2+ ad accounts, so resolveMetaPixelForUser refused at generation
+      // time and the root record carries no pixel — every later page inherited that nothing.
+      setupSiteRecordMock();
+      await setupTrackedV0Mocks();
+
+      // GitHub call order for this path, in sequence:
+      mockAxiosGet.mockResolvedValueOnce({ data: { tree: [] } }); // repair scan
+      mockAxiosGet.mockResolvedValueOnce({                        // readRepoFile(app/layout.tsx)
+        data: { content: Buffer.from("<html><head></head><body>{children}</body></html>").toString("base64") },
+      });
+      mockAxiosGet.mockResolvedValueOnce({ data: { object: { sha: "abc123" } } }); // ref/heads/main
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_page" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_track" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_layout" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "tree_sha" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "commit_sha" } });
+      mockAxiosPatch.mockResolvedValueOnce({ data: {} });
+
+      setupVercelDeploySuccessMock();
+      // updateLandingPageMetaPixel reads the root record before writing it.
+      mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: existingSiteRecord }) });
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+      setupSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+
+      const result = await generateLandingPage(
+        "user-1", "Create pricing page", "Pricing", {}, "list_pricing", undefined,
+        { metaPixelOverride: { pixelId: "override-pixel", accountId: "override-acct" } }
+      );
+
+      expect(result.status).toBe("deployed");
+
+      // 1. The base snippet rides the SAME commit as the page — without it window.fbq never
+      //    exists and the form's Lead call queues forever against nothing.
+      const layoutBlob = committedBlobs().find((c) => c.includes("Meta Pixel Code"));
+      expect(layoutBlob).toBeDefined();
+      expect(layoutBlob).toContain("fbq('init', 'override-pixel')");
+
+      // 2. The server-side leg carries it too.
+      const captureRoute = committedBlobs().find((c) => c.includes("LIST_BY_PATH"));
+      expect(captureRoute).toContain('const PIXEL_ID = "override-pixel"');
+      expect(captureRoute).toContain('const META_ACCOUNT_ID = "override-acct"');
+
+      // 3. The site root now owns the pixel, so later pages inherit instead of asking again.
+      expect(mockUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Key: { id: "existing-site-id" },
+          ExpressionAttributeValues: expect.objectContaining({ ":px": "override-pixel", ":acc": "override-acct" }),
+        })
+      );
+    });
   });
 
   // ENG-483: addPageToExistingRepo used to push only the new page's own files, never

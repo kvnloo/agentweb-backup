@@ -21,7 +21,13 @@ jest.mock('../services/db', () => ({
     getLeadEngagements: jest.fn(),
     addLeadEngagement: jest.fn(),
     canOrgMemberAccessList: jest.fn(),
-  }
+  },
+  userDb: {
+    getUserById: jest.fn(),
+  },
+  orgDb: {
+    getOrgById: jest.fn(),
+  },
 }));
 
 jest.mock('../services/resendService', () => ({
@@ -37,11 +43,14 @@ jest.mock('../services/gmailService', () => ({
 }));
 
 import { AgentModeService } from '../services/agentModeService';
-import { crmDb } from '../services/db';
+import { crmDb, userDb, orgDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import { gmailService } from '../services/gmailService';
+import { LEAD_IMPORT_WRITE_BUDGET_MS } from '../utils/leadImportLedger';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
+const mockUserDb = userDb as jest.Mocked<typeof userDb>;
+const mockOrgDb = orgDb as jest.Mocked<typeof orgDb>;
 const mockResend = resendService as jest.Mocked<typeof resendService>;
 const mockGmail = gmailService as jest.Mocked<typeof gmailService>;
 
@@ -82,6 +91,25 @@ describe('AgentModeService - CRM Tools', () => {
     createdAt: '2026-01-15T00:00:00.000Z',
     updatedAt: '2026-02-01T00:00:00.000Z',
   };
+
+  // Fixtures for canDestructiveCrmList (ENG-1049) — same-org users plus an org
+  // fixture with a configurable `crm.editors` list and `ownerUserId`.
+  const listOwnerId = 'list-owner-id';
+  const orgMemberId = 'org-member-id';
+  const orgId = 'org-A';
+  function setSameOrgUsers() {
+    mockUserDb.getUserById.mockImplementation((id: string) =>
+      Promise.resolve(id === listOwnerId ? ({ userId: listOwnerId, orgId } as any) : ({ userId: id, orgId } as any))
+    );
+  }
+  function orgWithCrm(overrides: Record<string, any> = {}) {
+    return {
+      orgId,
+      ownerUserId: 'org-owner-id',
+      shareSettings: { crm: { enabled: true, editors: [] as string[] } },
+      ...overrides,
+    };
+  }
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -1114,12 +1142,10 @@ describe('AgentModeService - CRM Tools', () => {
 
     it('allows the list owner to add leads through the shared access helper', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
-      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
 
       const result = await service.addLeadsToList(listId, [newLead], userId);
 
       expect(result.success).toBe(true);
-      expect(mockCrmDb.canOrgMemberAccessList).toHaveBeenCalledWith(userId, mockList);
       expect(mockCrmDb.batchCreateLeads).toHaveBeenCalledWith(listId, [
         {
           email: 'kyle@example.com',
@@ -1128,34 +1154,44 @@ describe('AgentModeService - CRM Tools', () => {
           company: 'Acme',
           customFields: { dinnerSeat: 'confirmed' },
         },
-      ]);
+      ], expect.objectContaining({ dedupeByNameCompany: true }));
     });
 
-    it('allows a same-org member with write access to add leads to an org-shared list', async () => {
-      const listOwnerId = 'list-owner-id';
-      const orgMemberId = 'org-member-id';
+    it('allows a listed crm.editor to add leads to another member\'s list (ENG-1049)', async () => {
       const orgSharedList = { ...mockList, userId: listOwnerId };
       mockCrmDb.getLeadListById.mockResolvedValue(orgSharedList as any);
-      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+      setSameOrgUsers();
+      mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: true, editors: [orgMemberId] } } }) as any);
 
       const result = await service.addLeadsToList(listId, [newLead], orgMemberId);
 
       expect(result.success).toBe(true);
-      expect(result.newCount).toBe(1);
-      expect(mockCrmDb.canOrgMemberAccessList).toHaveBeenCalledWith(orgMemberId, orgSharedList);
+      expect(result.reconciliation.created).toBe(1);
       expect(mockCrmDb.batchCreateLeads).toHaveBeenCalledTimes(1);
+    });
+
+    it('denies a same-org member who is not the owner and not a CRM editor (ENG-1049)', async () => {
+      const orgSharedList = { ...mockList, userId: listOwnerId };
+      mockCrmDb.getLeadListById.mockResolvedValue(orgSharedList as any);
+      setSameOrgUsers();
+      mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm() as any);
+
+      const result = await service.addLeadsToList(listId, [newLead], orgMemberId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Access denied');
+      expect(result.error).toMatch(/CRM editor/i);
+      expect(mockCrmDb.batchCreateLeads).not.toHaveBeenCalled();
     });
 
     it('denies users who fail the org-aware list access check', async () => {
       const outsiderList = { ...mockList, userId: 'other-user' };
       mockCrmDb.getLeadListById.mockResolvedValue(outsiderList as any);
-      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
 
       const result = await service.addLeadsToList(listId, [newLead], userId);
 
       expect(result.success).toBe(false);
       expect(result.message).toBe('Access denied');
-      expect(mockCrmDb.canOrgMemberAccessList).toHaveBeenCalledWith(userId, outsiderList);
       expect(mockCrmDb.batchCreateLeads).not.toHaveBeenCalled();
     });
 
@@ -1168,6 +1204,380 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.message).toBe('Lead list not found');
       expect(mockCrmDb.canOrgMemberAccessList).not.toHaveBeenCalled();
       expect(mockCrmDb.batchCreateLeads).not.toHaveBeenCalled();
+    });
+
+    // ENG-1133: a 97-row CSV imported in three 25-row calls stopped at 75 when
+    // the whole-turn cap fired. Each call had reported only "25 new lead(s)
+    // created", so the next turn could not tell which 75 of the 97 had landed
+    // and told the user to retry the whole request instead of resuming.
+    describe('resumable import reporting (ENG-1133)', () => {
+      beforeEach(() => {
+        mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      });
+
+      it('names the rows it persisted so the next turn can resume from the remainder', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 2,
+          newCount: 1,
+          mergedCount: 1,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['created', 'merged'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [
+            { email: 'one@example.com', firstName: 'One' },
+            { linkedin: 'https://www.linkedin.com/in/two', firstName: 'Two', lastName: 'Person' },
+          ],
+          userId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.complete).toBe(true);
+        expect(result.attempted).toBe(2);
+        expect(result.importedIdentifiers).toEqual([
+          'one@example.com',
+          'https://www.linkedin.com/in/two',
+        ]);
+        expect(result.unimportedRows).toBeUndefined();
+      });
+
+      it('returns an explicit resumable partial naming the rows that did not land', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 1,
+          newCount: 1,
+          mergedCount: 0,
+          errorCount: 1,
+          errors: ['Row 2: b@example.com - ProvisionedThroughputExceeded'],
+          rowOutcomes: ['created', 'failed', 'unprocessed'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [
+            { email: 'a@example.com' },
+            { email: 'b@example.com' },
+            { email: 'c@example.com' },
+          ],
+          userId,
+        );
+
+        // NOT success:false — the dispatch boundary turns a success:false result
+        // into a structured tool error, which strips `unimportedRows` before the
+        // model ever sees it and appends a "do NOT retry" verdict. Rows landed,
+        // so the call succeeded; `complete: false` carries the incompleteness.
+        expect(result.success).toBe(true);
+        expect(result.complete).toBe(false);
+        expect(result.resumable).toBe(true);
+        expect(result.unimportedRows).toEqual([
+          { row: 2, identifier: 'b@example.com', reason: 'failed' },
+          { row: 3, identifier: 'c@example.com', reason: 'unprocessed' },
+        ]);
+        expect(result.message).toMatch(/1 of 3/);
+        // The agent must be told to resume with the named rows, not to hand a
+        // whole-request retry back to the user.
+        expect(result.message).toMatch(/add_leads_to_list/);
+      });
+
+      it('still reports failure when the import landed nothing at all', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          errorCount: 2,
+          errors: ['Row 1: a@example.com - ProvisionedThroughputExceeded'],
+          rowOutcomes: ['failed', 'failed'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          userId,
+        );
+
+        // Nothing is in the list and every row was attempted, so this IS a tool
+        // failure — the dispatcher should downgrade it and the CRM page has
+        // nothing to refresh for. No resume is offered with it: the dispatcher
+        // strips the payload and appends "do NOT retry", so a `resumable: true`
+        // beside it would be an instruction the agent is simultaneously told to
+        // ignore, and resending rows that all failed on write repeats the
+        // failure anyway.
+        expect(result.success).toBe(false);
+        expect(result.complete).toBe(false);
+        expect(result.resumable).toBeUndefined();
+        expect(result.message).toMatch(/none of the 2 row\(s\) could be written/);
+      });
+
+      it('stays resumable when the budget expired before any row was reached', async () => {
+        // Zero rows landed, but two were never attempted — resending THOSE makes
+        // progress, so the call has to succeed or the dispatcher strips the
+        // resume list and stops the agent on an import that is merely unstarted.
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          errorCount: 1,
+          errors: ['Row 1: a@example.com - ProvisionedThroughputExceeded'],
+          rowOutcomes: ['failed', 'unprocessed', 'unprocessed'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }, { email: 'c@example.com' }],
+          userId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.complete).toBe(false);
+        expect(result.resumable).toBe(true);
+        expect(result.unimportedRows).toEqual([
+          { row: 1, identifier: 'a@example.com', reason: 'failed' },
+          { row: 2, identifier: 'b@example.com', reason: 'unprocessed' },
+          { row: 3, identifier: 'c@example.com', reason: 'unprocessed' },
+        ]);
+        expect(result.message).toMatch(/add_leads_to_list/);
+      });
+
+      it('clamps the write budget to the turn deadline it was handed', async () => {
+        // A full-length write budget started late in a turn outlives the turn,
+        // and the ledger it exists to produce never comes back.
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 1,
+          newCount: 1,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['created'],
+        } as any);
+
+        await service.addLeadsToList(listId, [{ email: 'a@example.com' }], userId, {
+          turnDeadlineMs: Date.now() + 30_000,
+        });
+
+        const options = mockCrmDb.batchCreateLeads.mock.calls[0][2] as any;
+        expect(options.deadlineMs).toBeGreaterThan(0);
+        expect(options.deadlineMs).toBeLessThanOrEqual(25_000);
+      });
+
+      it('keeps the full write budget when the caller imposes no turn cap', async () => {
+        // Scheduled/Slack/email runs have no wall-clock cap, so there is no turn
+        // for the import to outlive — clamping them would truncate work that
+        // completes today.
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 1,
+          newCount: 1,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['created'],
+        } as any);
+
+        await service.addLeadsToList(listId, [{ email: 'a@example.com' }], userId, {});
+
+        const options = mockCrmDb.batchCreateLeads.mock.calls[0][2] as any;
+        expect(options.deadlineMs).toBe(LEAD_IMPORT_WRITE_BUDGET_MS);
+      });
+
+      // The resume list is capped so a huge partial cannot blow the tool result
+      // past the size at which the agent layer swaps it for a preview. Left
+      // unsaid, that cap is silent data loss: the agent imports the 100 rows it
+      // was named, gets a clean `complete: true`, and reports the import
+      // finished while the rest are still missing.
+      it('says so when the resume list is truncated, and that finishing it is not finishing the import', async () => {
+        const rows = Array.from({ length: 250 }, (_, i) => ({ email: `row${i}@example.com` }));
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 50,
+          newCount: 50,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: rows.map((_, i) => (i < 50 ? 'created' : 'unprocessed')),
+        } as any);
+
+        const result = await service.addLeadsToList(listId, rows, userId);
+
+        expect(result.complete).toBe(false);
+        // 200 ledger entries are ~14KB — inside the budget, so the resume list
+        // names every missing row rather than a 100-row slice of them.
+        expect(result.unimportedRows).toHaveLength(200);
+        expect(result.unimportedRowsTruncated).toBeUndefined();
+        expect(result.unimportedRowRanges).toBe('51-250');
+        expect(result.message).not.toMatch(/FIRST/);
+      });
+
+      // The budget can still be exceeded by rows carrying long identifiers. A
+      // trimmed resume list that does not say it is trimmed is silent data
+      // loss: the agent imports the slice, reads `complete: true` and stops.
+      it('says so when the resume list does not fit, and points at the untrimmed ranges', async () => {
+        const rows = Array.from({ length: 400 }, (_, i) => ({
+          email: `row${i}.${'x'.repeat(120)}@example.com`,
+        }));
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: rows.map((_, i) => (i < 1 ? 'created' : 'unprocessed')),
+        } as any);
+
+        const result = await service.addLeadsToList(listId, rows, userId);
+
+        expect(result.unimportedRowsTruncated).toBeDefined();
+        expect(result.unimportedRowsTruncated.total).toBe(399);
+        expect(result.unimportedRows.length).toBe(result.unimportedRowsTruncated.shown);
+        expect(result.unimportedRows.length).toBeLessThan(399);
+        // The backstop still accounts for every missing row.
+        expect(result.unimportedRowRanges).toBe('2-400');
+        expect(result.message).toMatch(/FIRST \d+ of 399 missing rows/);
+        expect(result.message).toMatch(/unimportedRowRanges \(2-400\) lists EVERY missing position/);
+        expect(result.message).toMatch(/not done until a result comes back with complete: true/);
+      });
+
+      // A resume that only ever sees a slice of the missing rows imports it,
+      // gets `complete: true` for that call, and stops — stranding the rest.
+      // The ranges are what make the resume deterministic regardless.
+      it('names every missing row position, including any past the detail budget', async () => {
+        const rows = Array.from({ length: 250 }, (_, i) => ({ email: `row${i}@example.com` }));
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 50,
+          newCount: 50,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: rows.map((_, i) => (i < 50 ? 'created' : 'unprocessed')),
+        } as any);
+
+        const result = await service.addLeadsToList(listId, rows, userId);
+
+        const missing = new Set<number>();
+        for (const part of (result.unimportedRowRanges as string).split(',')) {
+          const [start, end] = part.split('-').map(Number);
+          for (let row = start; row <= (end ?? start); row++) missing.add(row);
+        }
+        expect(missing.size).toBe(200);
+        expect(missing.has(51)).toBe(true);
+        expect(missing.has(250)).toBe(true);
+        expect(missing.has(50)).toBe(false);
+      });
+
+      it('does not claim truncation when the whole resume list fits', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 1,
+          newCount: 1,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['created', 'unprocessed'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          userId,
+        );
+
+        expect(result.unimportedRowsTruncated).toBeUndefined();
+        expect(result.message).not.toMatch(/FIRST/);
+      });
+
+      // When the list could not be read at all, resending the same rows hits
+      // the same wall. This is the one incomplete import that must NOT be
+      // offered as a resume, or the agent loops on it for the rest of the turn.
+      it('reports an unreadable list as a blocker rather than a resume', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: ['Could not read the existing leads in this list within 120000ms, so no rows were imported.'],
+          rowOutcomes: ['unprocessed', 'unprocessed'],
+          dedupeIncomplete: true,
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          userId,
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.complete).toBe(false);
+        expect(result.resumable).toBeUndefined();
+        expect(result.message).toMatch(/Import not attempted/);
+        expect(result.message).toMatch(/would duplicate rows already in the list/);
+        expect(result.message).toMatch(/Do NOT retry the same call/);
+        expect(result.message).not.toMatch(/RESUME by calling/);
+      });
+
+      it('reconciles attempted rows across created, merged, duplicate, skipped and failed', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 2,
+          newCount: 1,
+          mergedCount: 1,
+          alreadyPresentCount: 1,
+          anonymizedSkipped: 1,
+          errorCount: 1,
+          errors: ['Row 4: Duplicate email "d@example.com" found in upload data'],
+          rowOutcomes: ['created', 'merged', 'already_present', 'duplicate_in_request', 'anonymized_skipped'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [
+            { email: 'a@example.com' },
+            { email: 'b@example.com' },
+            { email: 'c@example.com' },
+            { email: 'c@example.com' },
+            { firstName: 'LinkedIn', lastName: 'Member' },
+          ],
+          userId,
+        );
+
+        expect(result.attempted).toBe(5);
+        const { created, merged, alreadyPresent, duplicateInRequest, anonymizedSkipped, failed, unprocessed } =
+          result.reconciliation;
+        // Pin each bucket to the row it came from — the sum alone is a
+        // tautology (every outcome tallies into exactly one bucket), so it
+        // would still hold if two buckets were mislabelled.
+        expect(created).toBe(1);
+        expect(merged).toBe(1);
+        expect(alreadyPresent).toBe(1);
+        expect(duplicateInRequest).toBe(1);
+        expect(anonymizedSkipped).toBe(1);
+        expect(failed).toBe(0);
+        expect(unprocessed).toBe(0);
+        expect(created + merged + alreadyPresent + duplicateInRequest + anonymizedSkipped + failed + unprocessed)
+          .toBe(result.attempted);
+        expect(result.complete).toBe(true);
+      });
+
+      // Re-sending the full CSV after a partial import is the retry the user
+      // was told to do. Every row already being present is a SUCCESSFUL
+      // reconciliation, not "No leads were processed".
+      it('reports success when every re-submitted row is already in the list', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          alreadyPresentCount: 2,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['already_present', 'already_present'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          userId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.complete).toBe(true);
+        expect(result.message).toMatch(/already/i);
+      });
     });
   });
 
@@ -1741,12 +2151,11 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.message).toBe('Access denied');
     });
 
-    it('should use list owner senders when org member sends email', async () => {
-      const orgMemberUserId = 'org-member-id';
-      const listOwnerId = 'list-owner-id';
+    it('should use list owner senders when a listed crm.editor sends email (ENG-1049)', async () => {
       const orgMemberList = { ...mockList, userId: listOwnerId };
       mockCrmDb.getLeadListById.mockResolvedValue(orgMemberList as any);
-      (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+      setSameOrgUsers();
+      mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: true, editors: [orgMemberId] } } }) as any);
       mockCrmDb.getLeadById.mockResolvedValue(leadWithDraft as any);
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       const getCrmSendersSpy = jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
@@ -1756,11 +2165,24 @@ describe('AgentModeService - CRM Tools', () => {
       });
       mockResend.sendEmail.mockResolvedValue({ id: 'email-789' } as any);
 
-      const result = await service.sendEmailToLead(listId, leadId, orgMemberUserId);
+      const result = await service.sendEmailToLead(listId, leadId, orgMemberId);
 
       expect(result.success).toBe(true);
       // Should fetch senders using the list owner's userId, not the caller's
       expect(getCrmSendersSpy).toHaveBeenCalledWith(listOwnerId);
+    });
+
+    it('denies a same-org member who is not the owner and not a CRM editor from sending (ENG-1049)', async () => {
+      const orgMemberList = { ...mockList, userId: listOwnerId };
+      mockCrmDb.getLeadListById.mockResolvedValue(orgMemberList as any);
+      setSameOrgUsers();
+      mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm() as any);
+
+      const result = await service.sendEmailToLead(listId, leadId, orgMemberId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Access denied');
+      expect(result.error).toMatch(/CRM editor/i);
     });
   });
 
@@ -2512,74 +2934,103 @@ describe('AgentModeService - CRM Tools', () => {
     });
   });
 
-  // ─── org-shared access: non-owner org member (PR #1895 follow-up) ──────────
-  // Every CRM list method must gate on the org-aware canOrgMemberAccessList, not
-  // a raw `list.userId !== userId` owner check. A same-org member who is NOT the
-  // list owner must be allowed to operate on a shared list; an outsider must be
-  // denied. Covers the 9 methods migrated alongside addLeadsToList.
-  describe('org-shared access — non-owner org member (PR #1895)', () => {
-    const listOwnerId = 'list-owner-id';
-    const orgMemberId = 'org-member-id';
+  // ─── org-shared access: non-owner org member (PR #1895, tightened ENG-1049) ─
+  // PR #1895 first made these methods org-aware, but gated destructive writes on
+  // the READ-level canOrgMemberAccessList — any same-org member (not just the
+  // owner/org-owner/crm.editors) could mutate another member's list or leads.
+  // ENG-1049 moved the 7 write methods below onto canDestructiveCrmList. The 2
+  // read methods (getLeadListStatuses, getLeadEngagements) are unchanged and
+  // still allow any same-org member.
+  describe('org-shared access — non-owner org member (PR #1895 / ENG-1049)', () => {
     const sharedList = { ...mockList, userId: listOwnerId, statusConfig: undefined };
 
     type AccessCase = {
       name: string;
       run: (svc: AgentModeService, caller: string) => Promise<any>;
-      denyError?: string;
       writeMock?: jest.Mock;
     };
 
-    const cases: AccessCase[] = [
+    const destructiveCases: AccessCase[] = [
       { name: 'setLeadContactStatus',
         run: (s, u) => s.setLeadContactStatus(listId, [leadId], 'do-not-contact', undefined, undefined, u),
         writeMock: mockCrmDb.updateLead as jest.Mock },
       { name: 'deleteLeads',
         run: (s, u) => s.deleteLeads(listId, [leadId], u),
-        denyError: 'You do not have permission to delete leads from this list',
         writeMock: mockCrmDb.deleteLead as jest.Mock },
       { name: 'deleteLeadsByFilter',
         run: (s, u) => s.deleteLeadsByFilter(listId, [{ field: 'status', operator: 'equals', value: 'lost' }], u, true),
-        denyError: 'You do not have permission to delete leads from this list',
         writeMock: mockCrmDb.deleteLead as jest.Mock },
       { name: 'updateLeadList',
         run: (s, u) => s.updateLeadList(listId, { description: 'updated by org member' }, u),
-        denyError: 'You do not have permission to modify this list',
         writeMock: mockCrmDb.updateLeadList as jest.Mock },
-      { name: 'getLeadListStatuses',
-        run: (s, u) => s.getLeadListStatuses(listId, u),
-        denyError: 'You do not have permission to view this list' },
       { name: 'configureLeadStatuses',
         run: (s, u) => s.configureLeadStatuses(listId, [{ value: 'new', label: 'New', color: 'gray', type: 'active' }], u),
-        denyError: 'You do not have permission to modify this list',
         writeMock: mockCrmDb.updateLeadList as jest.Mock },
       { name: 'deleteLeadList',
         run: (s, u) => s.deleteLeadList(listId, u),
-        denyError: 'You do not have permission to delete this list',
         writeMock: mockCrmDb.deleteLeadList as jest.Mock },
-      { name: 'getLeadEngagements',
-        run: (s, u) => s.getLeadEngagements(listId, leadId, u),
-        denyError: 'You do not have permission to access this list' },
       { name: 'addLeadEngagement',
         run: (s, u) => s.addLeadEngagement(listId, leadId, 'custom.call', u),
-        denyError: 'You do not have permission to modify leads in this list',
         writeMock: mockCrmDb.addLeadEngagement as jest.Mock },
     ];
 
-    cases.forEach(({ name, run, denyError, writeMock }) => {
-      it(`${name} allows a same-org member who is not the list owner`, async () => {
+    const readCases: AccessCase[] = [
+      { name: 'getLeadListStatuses', run: (s, u) => s.getLeadListStatuses(listId, u) },
+      { name: 'getLeadEngagements', run: (s, u) => s.getLeadEngagements(listId, leadId, u) },
+    ];
+
+    function setDownstreamMocks() {
+      mockCrmDb.getLeadById.mockResolvedValue({ ...mockLead } as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: undefined } as any);
+      (mockCrmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue(0);
+      mockCrmDb.getLeadEngagements.mockResolvedValue([] as any);
+    }
+
+    destructiveCases.forEach(({ name, run, writeMock }) => {
+      it(`${name} denies a same-org member who is not the owner and not a CRM editor`, async () => {
         mockCrmDb.getLeadListById.mockResolvedValue({ ...sharedList } as any);
-        (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
-        // Downstream mocks so each method can proceed past the access gate.
-        mockCrmDb.getLeadById.mockResolvedValue({ ...mockLead } as any);
-        mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: undefined } as any);
-        (mockCrmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue(0);
-        mockCrmDb.getLeadEngagements.mockResolvedValue([] as any);
+        setSameOrgUsers();
+        mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm() as any);
 
         const result = await run(service, orgMemberId);
 
-        // The bug returned a hard 'Access denied' for non-owner members. The
-        // downstream outcome may vary, but it must NOT be the permission denial,
-        // and the org-aware check must have been consulted with the caller + list.
+        expect(result.success).toBe(false);
+        expect(result.message).toBe('Access denied');
+        expect(result.error).toMatch(/CRM editor/i);
+        if (writeMock) expect(writeMock).not.toHaveBeenCalled();
+      });
+
+      it(`${name} allows a listed crm.editor`, async () => {
+        mockCrmDb.getLeadListById.mockResolvedValue({ ...sharedList } as any);
+        setSameOrgUsers();
+        mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: true, editors: [orgMemberId] } } }) as any);
+        setDownstreamMocks();
+
+        const result = await run(service, orgMemberId);
+
+        expect(result.message).not.toBe('Access denied');
+      });
+
+      it(`${name} allows the org owner`, async () => {
+        mockCrmDb.getLeadListById.mockResolvedValue({ ...sharedList } as any);
+        setSameOrgUsers();
+        mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm({ ownerUserId: orgMemberId }) as any);
+        setDownstreamMocks();
+
+        const result = await run(service, orgMemberId);
+
+        expect(result.message).not.toBe('Access denied');
+      });
+    });
+
+    readCases.forEach(({ name, run }) => {
+      it(`${name} allows a same-org member who is not the list owner (read-level, unchanged)`, async () => {
+        mockCrmDb.getLeadListById.mockResolvedValue({ ...sharedList } as any);
+        (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+        setDownstreamMocks();
+
+        const result = await run(service, orgMemberId);
+
         expect(result.message).not.toBe('Access denied');
         expect(mockCrmDb.canOrgMemberAccessList).toHaveBeenCalledWith(
           orgMemberId, expect.objectContaining({ userId: listOwnerId })
@@ -2594,8 +3045,6 @@ describe('AgentModeService - CRM Tools', () => {
 
         expect(result.success).toBe(false);
         expect(result.message).toBe('Access denied');
-        if (denyError) expect(result.error).toBe(denyError);
-        if (writeMock) expect(writeMock).not.toHaveBeenCalled();
       });
     });
   });

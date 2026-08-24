@@ -21,18 +21,10 @@
  *   3. Call CompleteLifecycleAction(CONTINUE) so the instance terminates immediately
  *      once drained, rather than sitting out the hook's full heartbeat timeout.
  *
- * STATUS: the hook itself is NOT deployed yet. Creating it requires an IAM grant on
- * the EB instance role, and the CI deploy user (github-actions-deploy-backend) has no
- * IAM write access — the staging attempt rolled back with "not authorized to perform:
- * iam:GetRolePolicy" (the hook resource itself created fine). The hook must NOT ship
- * before that grant exists: EB waits for old-instance removal before reporting the
- * update complete (prod 2026-07-29: "Removed instance" 10:22:06 → "Environment update
- * completed" 10:23:37), so a hook nobody can answer would add its full heartbeat to
- * every deploy and blow EB's own 900s command timeout.
- *
- * Until then this module is still a net win and is safe on its own: with no hook, the
- * `Terminated` signal simply starts the drain a few seconds EARLIER than the SIGTERM
- * would have, and the completion call fails harmlessly into the logged catch below.
+ * DEPLOYMENT: the backend deploy script idempotently ensures the hook before each EB
+ * update. The application's AWS identity has the narrow CompleteLifecycleAction,
+ * RecordLifecycleActionHeartbeat, and DescribeAutoScalingInstances grants needed to
+ * answer it. A 900-second heartbeat with DefaultResult=CONTINUE remains the fallback.
  *
  * Fail-safe by construction — every failure mode degrades to today's behavior or
  * better, never worse:
@@ -71,6 +63,14 @@ export const LIFECYCLE_POLL_INTERVAL_MS = 5000;
  */
 export const CONFIRMING_READS_REQUIRED = 2;
 
+/**
+ * AWS may expose `Terminating` through IMDS just before its lifecycle action becomes
+ * queryable by CompleteLifecycleAction. Retry only that exact propagation race for
+ * at most 14 seconds; every other error still takes the normal fail-safe path.
+ */
+export const COMPLETION_MAX_ATTEMPTS = 15;
+export const COMPLETION_RETRY_DELAY_MS = 1000;
+
 export interface AsgLifecycleGuardDeps {
   /** Injected in tests; defaults to global fetch. */
   fetchImpl?: typeof fetch;
@@ -79,6 +79,8 @@ export interface AsgLifecycleGuardDeps {
   clearIntervalImpl?: typeof clearInterval;
   /** Resolves the ASG name for an instance and completes its lifecycle action. */
   completeAction?: (instanceId: string) => Promise<void>;
+  /** Injected in tests; defaults to a one-shot timer. */
+  sleepImpl?: (delayMs: number) => Promise<void>;
   logger?: Pick<Console, 'log' | 'warn' | 'error'>;
 }
 
@@ -180,6 +182,18 @@ export async function completeTerminationLifecycleAction(instanceId: string): Pr
     .promise();
 }
 
+function isLifecycleActionPropagationRace(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const awsError = error as { code?: unknown; name?: unknown; message?: unknown };
+  const isValidationError =
+    awsError.code === 'ValidationError' || awsError.name === 'ValidationError';
+  return (
+    isValidationError &&
+    typeof awsError.message === 'string' &&
+    awsError.message.includes('No active Lifecycle Action found')
+  );
+}
+
 /**
  * Start watching for an ASG-initiated termination of THIS instance.
  *
@@ -195,6 +209,8 @@ export function startAsgTerminationGuard(
   const setIntervalFn = deps.setIntervalImpl ?? setInterval;
   const clearIntervalFn = deps.clearIntervalImpl ?? clearInterval;
   const completeAction = deps.completeAction ?? completeTerminationLifecycleAction;
+  const sleepImpl =
+    deps.sleepImpl ?? ((delayMs: number) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
   const log = deps.logger ?? console;
 
   let confirmingReads = 0;
@@ -240,7 +256,23 @@ export function startAsgTerminationGuard(
     try {
       const instanceId = await readInstanceId(fetchImpl);
       if (!instanceId) throw new Error('could not read instance-id from IMDS');
-      await completeAction(instanceId);
+      for (let attempt = 1; attempt <= COMPLETION_MAX_ATTEMPTS; attempt += 1) {
+        try {
+          await completeAction(instanceId);
+          break;
+        } catch (completeError) {
+          if (
+            !isLifecycleActionPropagationRace(completeError) ||
+            attempt === COMPLETION_MAX_ATTEMPTS
+          ) {
+            throw completeError;
+          }
+          log.warn(
+            `[asgLifecycleGuard] lifecycle action is not active yet (attempt ${attempt}/${COMPLETION_MAX_ATTEMPTS}); retrying in ${COMPLETION_RETRY_DELAY_MS}ms`
+          );
+          await sleepImpl(COMPLETION_RETRY_DELAY_MS);
+        }
+      }
       log.log('[asgLifecycleGuard] drained — lifecycle action completed, instance may terminate');
     } catch (completeError) {
       // The hook's HeartbeatTimeout + DefaultResult=CONTINUE covers us here.

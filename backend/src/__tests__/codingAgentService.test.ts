@@ -1,5 +1,18 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream, _rollbackEditedFiles } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _setOpenRouterClientForTest, _setDeploymentSleepForTest, _rollbackEditedFiles } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
+import Anthropic from '@anthropic-ai/sdk';
+import { getSecret } from '../utils/secretsManager';
+import { recordUsage } from '../services/usageRecorderService';
+
+jest.mock('@anthropic-ai/sdk', () => ({
+  __esModule: true,
+  default: jest.fn(() => ({ messages: { create: jest.fn() } })),
+}));
+
+jest.mock('../services/usageRecorderService', () => ({
+  ...jest.requireActual('../services/usageRecorderService'),
+  recordUsage: jest.fn(async () => undefined),
+}));
 
 // Mock mcpFetch
 jest.mock('../mcp/server/httpClient', () => ({
@@ -30,7 +43,12 @@ const mockedAxios = axios as jest.Mocked<typeof axios>;
 jest.mock('../utils/secretsManager', () => ({
   ...jest.requireActual('../utils/secretsManager'),
   getGitHubOrgToken: jest.fn(async () => ({ token: 'gh-test-token', org: 'AgentWebPro' })),
+  getSecret: jest.fn(async () => 'or-test-key'),
 }));
+
+const mockedGetSecret = getSecret as jest.MockedFunction<typeof getSecret>;
+const mockedRecordUsage = recordUsage as jest.MockedFunction<typeof recordUsage>;
+const MockAnthropic = Anthropic as unknown as jest.Mock;
 
 // Build an axios-style error carrying a GitHub response body.
 const githubAxiosError = (status: number, data: any): any => {
@@ -55,11 +73,12 @@ jest.mock('../services/v0Service', () => ({
 import { mcpFetch } from '../mcp/server/httpClient';
 const mockedMcpFetch = mcpFetch as jest.MockedFunction<typeof mcpFetch>;
 
-// Mock the AnthropicBedrock client
+// Mock OpenRouter's Anthropic-compatible Messages client.
 const mockCreate = jest.fn();
 const mockClient = {
   messages: { create: mockCreate }
 } as any;
+_setDeploymentSleepForTest(async () => {});
 
 describe('applySearchReplace', () => {
   // --- FAIL CASES ---
@@ -174,13 +193,11 @@ describe('runCodingAgent', () => {
     jest.clearAllMocks();
     mockedMcpFetch.mockReset();
     mockCreate.mockReset();
-    _setBedrockClientForTest(mockClient);
-    // Skip real sleep delays in all tests
-    _setSleepFnForTest(async () => {});
+    _setOpenRouterClientForTest(mockClient);
   });
 
   afterAll(() => {
-    _setBedrockClientForTest(null);
+    _setOpenRouterClientForTest(null);
   });
 
   // --- FAIL CASES ---
@@ -907,6 +924,9 @@ describe('runCodingAgent', () => {
     const imageBlock = trBlock.content.find((b: any) => b.type === 'image');
     expect(imageBlock).toBeDefined();
     expect(imageBlock.source).toMatchObject({ type: 'base64', media_type: 'image/jpeg', data: 'BASE64IMAGEDATA' });
+    expect(mockCreate.mock.calls[1][0].fallbacks).toEqual([
+      { model: 'google/gemini-3.5-flash' },
+    ]);
   });
 
   test('take_screenshot returns a text error (no image block) when browser tools are unavailable', async () => {
@@ -1612,289 +1632,202 @@ describe('applySearchReplace — new file creation', () => {
   });
 });
 
-// ─── Model → provider routing ─────────────────────────────────────────────────
-// Routing must send each model id to the client that can actually serve it:
-// - anthropic.claude-opus-4-8 → Bedrock bearer-token client (separate AWS account)
-// - other bare claude-* → Vertex
-// - anthropic.* → Bedrock (default IAM credentials)
-describe('runCodingAgent — model provider routing', () => {
-  const mockContext: CodingAgentContext = {
+describe('ENG-1451 — coding-agent OpenRouter gateway contract', () => {
+  const context: CodingAgentContext = {
     pageId: 'test-page-123',
     userId: 'user-456',
     sessionId: 'session-789',
-    llmModel: 'anthropic.claude-opus-4-8',
+    llmModel: 'anthropic.claude-sonnet-4-6',
   };
 
-  const bedrockCreate = jest.fn();
-  const vertexCreate = jest.fn();
-  const bearerCreate = jest.fn();
+  const gatewayCreate = jest.fn();
   let modelSpy: jest.SpyInstance;
 
   beforeEach(() => {
     jest.clearAllMocks();
     mockedMcpFetch.mockReset();
-    bedrockCreate.mockReset();
-    vertexCreate.mockReset();
-    bearerCreate.mockReset();
-    _setBedrockClientForTest({ messages: { create: bedrockCreate } } as any);
-    _setVertexClientForTest({ messages: { create: vertexCreate } } as any);
-    _setBedrockBearerClientForTest({ messages: { create: bearerCreate } } as any);
-    _setSleepFnForTest(async () => {});
-    // Pre-flight list_files succeeds so the loop reaches the LLM call.
+    gatewayCreate.mockReset();
+    _setOpenRouterClientForTest({ messages: { create: gatewayCreate } } as any);
     mockedMcpFetch.mockResolvedValue({ files: [{ path: 'app/page.tsx', size: 100 }] });
     modelSpy = jest.spyOn(agentModeService, 'getCodingAgentDefaultModel');
+    mockedGetSecret.mockResolvedValue('or-test-key');
   });
 
-  afterEach(() => {
-    modelSpy.mockRestore();
-  });
+  afterEach(() => modelSpy.mockRestore());
 
   afterAll(() => {
-    _setBedrockClientForTest(null);
-    _setVertexClientForTest(null);
-    _setBedrockBearerClientForTest(null);
+    _setOpenRouterClientForTest(null);
   });
 
-  test('routes Opus 4.8 (anthropic.claude-opus-4-8) to the Bedrock bearer client, not Vertex or default Bedrock', async () => {
-    modelSpy.mockResolvedValue('anthropic.claude-opus-4-8');
-    bearerCreate.mockResolvedValueOnce({
-      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
-      stop_reason: 'tool_use',
-    });
-
-    const result = await runCodingAgent('change the heading', mockContext);
-
-    expect(result.success).toBe(true);
-    expect(bearerCreate).toHaveBeenCalledTimes(1);
-    expect(vertexCreate).not.toHaveBeenCalled();
-    expect(bedrockCreate).not.toHaveBeenCalled();
-    // The bare model id must be passed through to the bearer client unchanged;
-    // the client maps it to the inference profile internally.
-    expect(bearerCreate.mock.calls[0][0].model).toBe('anthropic.claude-opus-4-8');
+  const successfulTurn = () => ({
+    content: [{
+      type: 'tool_use',
+      id: 'tu_1',
+      name: 'report_to_user',
+      input: { message: 'Done.', status: 'success' },
+    }],
+    stop_reason: 'tool_use',
   });
 
-  test('routes a Vertex model (claude-sonnet-*) to the Vertex client, not Bedrock', async () => {
-    modelSpy.mockResolvedValue('claude-sonnet-4-6');
-    vertexCreate.mockResolvedValueOnce({
-      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
-      stop_reason: 'tool_use',
-    });
-
-    const result = await runCodingAgent('change the heading', mockContext);
-
-    expect(result.success).toBe(true);
-    expect(vertexCreate).toHaveBeenCalledTimes(1);
-    expect(bedrockCreate).not.toHaveBeenCalled();
-    expect(bearerCreate).not.toHaveBeenCalled();
-    expect(vertexCreate.mock.calls[0][0].model).toBe('claude-sonnet-4-6');
-  });
-
-  test('routes a Bedrock model (anthropic.*) to the Bedrock client, not Vertex', async () => {
+  test('maps the logical coding model to the OpenRouter upstream model id', async () => {
     modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
-    bedrockCreate.mockResolvedValueOnce({
-      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
-      stop_reason: 'tool_use',
+    gatewayCreate.mockResolvedValueOnce(successfulTurn());
+
+    await runCodingAgent('change the heading', context);
+
+    expect(gatewayCreate.mock.calls[0][0].model).toBe('anthropic/claude-sonnet-4.6');
+  });
+
+  test('delegates fallback and context overflow handling to OpenRouter', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    gatewayCreate.mockResolvedValueOnce(successfulTurn());
+
+    await runCodingAgent('change the heading', context);
+
+    expect(gatewayCreate.mock.calls[0][0]).toEqual(expect.objectContaining({
+      provider: { allow_fallbacks: true, require_parameters: true },
+      plugins: [{ id: 'context-compression' }],
+      fallbacks: [{ model: 'deepseek/deepseek-v4-flash' }],
+      session_id: context.sessionId,
+    }));
+  });
+
+  test('normalizes the legacy Vertex logical id through the same gateway', async () => {
+    modelSpy.mockResolvedValue('claude-sonnet-4-6');
+    gatewayCreate.mockResolvedValueOnce(successfulTurn());
+
+    await runCodingAgent('change the heading', context);
+
+    expect(gatewayCreate.mock.calls[0][0].model).toBe('anthropic/claude-sonnet-4.6');
+  });
+
+  test('preserves the Anthropic-native tool loop response contract', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    gatewayCreate.mockResolvedValueOnce(successfulTurn());
+
+    const result = await runCodingAgent('change the heading', context);
+
+    expect(result).toEqual(expect.objectContaining({ success: true, message: 'Done.' }));
+  });
+
+  test('attributes fallback usage to the model OpenRouter actually served', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    gatewayCreate.mockResolvedValueOnce({
+      ...successfulTurn(),
+      model: 'deepseek/deepseek-v4-flash',
+      usage: { input_tokens: 1_000, output_tokens: 1_000 },
     });
 
-    const result = await runCodingAgent('change the heading', mockContext);
+    await runCodingAgent('change the heading', context);
 
-    expect(result.success).toBe(true);
-    expect(bedrockCreate).toHaveBeenCalledTimes(1);
-    expect(vertexCreate).not.toHaveBeenCalled();
-    expect(bearerCreate).not.toHaveBeenCalled();
+    expect(mockedRecordUsage).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'deepseek/deepseek-v4-flash',
+      provider: 'openrouter',
+    }));
   });
 
-  test('retries a transient 5xx from the Opus 4.8 bearer client, then succeeds', async () => {
-    modelSpy.mockResolvedValue('anthropic.claude-opus-4-8');
-    const transient: any = new Error('Bedrock (Opus 4.8) error 503: overloaded');
-    transient.status = 503;
-    bearerCreate
-      .mockRejectedValueOnce(transient)
-      .mockResolvedValueOnce({
-        content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
-        stop_reason: 'tool_use',
-      });
+  test('prices usage totals from the model OpenRouter actually served', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    gatewayCreate.mockResolvedValueOnce({
+      ...successfulTurn(),
+      model: 'deepseek/deepseek-v4-flash',
+      usage: { input_tokens: 1_000, output_tokens: 1_000 },
+    });
 
-    const result = await runCodingAgent('change the heading', mockContext);
+    const result = await runCodingAgent('change the heading', context);
 
-    expect(result.success).toBe(true);
-    expect(bearerCreate).toHaveBeenCalledTimes(2);
-  });
-});
-
-// ─── Bedrock streaming: frame parser + accumulator ────────────────────────────
-// The bearer-token Opus path streams `application/vnd.amazon.eventstream` frames.
-// These tests build real frames (matching AWS framing) and verify we reconstruct
-// the exact non-streaming Anthropic.Message shape the agent loop consumes.
-
-/** Encode one eventstream frame. Layout: [totalLen][headersLen][preludeCRC][headers][payload][msgCRC].
- * The parser does not validate CRCs, so we zero them. Headers are string-typed (type 7). */
-function encodeFrame(headers: Record<string, string>, payload: Buffer): Buffer {
-  const headerParts: Buffer[] = [];
-  for (const [name, value] of Object.entries(headers)) {
-    const nameBuf = Buffer.from(name, 'utf8');
-    const valBuf = Buffer.from(value, 'utf8');
-    const h = Buffer.alloc(1 + nameBuf.length + 1 + 2 + valBuf.length);
-    let o = 0;
-    h.writeUInt8(nameBuf.length, o); o += 1;
-    nameBuf.copy(h, o); o += nameBuf.length;
-    h.writeUInt8(7, o); o += 1; // string type
-    h.writeUInt16BE(valBuf.length, o); o += 2;
-    valBuf.copy(h, o);
-    headerParts.push(h);
-  }
-  const headerBuf = Buffer.concat(headerParts);
-  const totalLen = 4 + 4 + 4 + headerBuf.length + payload.length + 4;
-  const frame = Buffer.alloc(totalLen);
-  let o = 0;
-  frame.writeUInt32BE(totalLen, o); o += 4;
-  frame.writeUInt32BE(headerBuf.length, o); o += 4;
-  frame.writeUInt32BE(0, o); o += 4; // prelude CRC (unchecked)
-  headerBuf.copy(frame, o); o += headerBuf.length;
-  payload.copy(frame, o); o += payload.length;
-  frame.writeUInt32BE(0, o); // message CRC (unchecked)
-  return frame;
-}
-
-/** Wrap a native Anthropic streaming event into a Bedrock "event/chunk" frame
- * (payload is JSON with a base64 `bytes` field), exactly as the live endpoint does. */
-function chunkFrame(event: any): Buffer {
-  const payload = Buffer.from(JSON.stringify({ bytes: Buffer.from(JSON.stringify(event), 'utf8').toString('base64') }), 'utf8');
-  return encodeFrame({ ':message-type': 'event', ':event-type': 'chunk', ':content-type': 'application/json' }, payload);
-}
-
-function streamFromBuffers(buffers: Buffer[]): ReadableStream<Uint8Array> {
-  let i = 0;
-  return new ReadableStream<Uint8Array>({
-    pull(controller) {
-      if (i < buffers.length) controller.enqueue(new Uint8Array(buffers[i++]));
-      else controller.close();
-    },
-  });
-}
-
-// A canonical text + tool_use event sequence, mirroring what the probe captured live.
-const TEXT_AND_TOOL_EVENTS = [
-  { type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', model: 'claude-opus-4-8', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } },
-  { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
-  { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: "I'll edit " } },
-  { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'the file.' } },
-  { type: 'content_block_stop', index: 0 },
-  { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_1', name: 'edit_file', input: {} } },
-  { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"file_path":"app/' } },
-  { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: 'page.tsx"}' } },
-  { type: 'content_block_stop', index: 1 },
-  { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 42 } },
-  { type: 'message_stop', 'amazon-bedrock-invocationMetrics': { inputTokenCount: 10, outputTokenCount: 42 } },
-];
-
-describe('_parseEventStreamFrames', () => {
-  test('parses a single complete frame and exposes its headers and payload', () => {
-    const payload = Buffer.from('{"hello":"world"}', 'utf8');
-    const frame = encodeFrame({ ':message-type': 'event', ':event-type': 'chunk' }, payload);
-    const state = { buf: Buffer.alloc(0) };
-    const frames = [..._parseEventStreamFrames(state, new Uint8Array(frame))];
-    expect(frames).toHaveLength(1);
-    expect(frames[0].headers[':message-type']).toBe('event');
-    expect(frames[0].headers[':event-type']).toBe('chunk');
-    expect(frames[0].payload.toString('utf8')).toBe('{"hello":"world"}');
-    expect(state.buf.length).toBe(0);
+    // DeepSeek V4 Flash: $0.068/M input + $0.168/M output.
+    expect(result.usageTotals?.costUsd).toBeCloseTo(0.000236, 9);
+    expect(mockedRecordUsage).toHaveBeenCalledWith(expect.objectContaining({
+      costUsdOverride: 0.000236,
+    }));
   });
 
-  test('buffers a partial frame split across chunks until complete', () => {
-    const payload = Buffer.from('{"a":1}', 'utf8');
-    const frame = encodeFrame({ ':message-type': 'event' }, payload);
-    const state = { buf: Buffer.alloc(0) };
-    const mid = Math.floor(frame.length / 2);
-    // First half yields nothing (incomplete)
-    expect([..._parseEventStreamFrames(state, new Uint8Array(frame.subarray(0, mid)))]).toHaveLength(0);
-    // Second half completes it
-    const frames = [..._parseEventStreamFrames(state, new Uint8Array(frame.subarray(mid)))];
-    expect(frames).toHaveLength(1);
-    expect(frames[0].payload.toString('utf8')).toBe('{"a":1}');
+  test('uses one SDK retry for transient gateway transport failures', async () => {
+    const originalEnvKey = process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    _setOpenRouterClientForTest(null);
+    MockAnthropic.mockImplementationOnce(() => ({ messages: { create: gatewayCreate } }));
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    gatewayCreate.mockResolvedValueOnce(successfulTurn());
+
+    try {
+      await runCodingAgent('change the heading', context);
+      expect(MockAnthropic).toHaveBeenCalledWith(expect.objectContaining({
+        maxRetries: 1,
+        defaultHeaders: expect.objectContaining({ 'X-OpenRouter-Metadata': 'enabled' }),
+      }));
+    } finally {
+      if (originalEnvKey === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = originalEnvKey;
+      _setOpenRouterClientForTest({ messages: { create: gatewayCreate } } as any);
+    }
   });
 
-  test('parses two frames delivered in one chunk', () => {
-    const f1 = encodeFrame({ ':message-type': 'event' }, Buffer.from('first', 'utf8'));
-    const f2 = encodeFrame({ ':message-type': 'event' }, Buffer.from('second', 'utf8'));
-    const state = { buf: Buffer.alloc(0) };
-    const frames = [..._parseEventStreamFrames(state, new Uint8Array(Buffer.concat([f1, f2])))];
-    expect(frames.map(f => f.payload.toString('utf8'))).toEqual(['first', 'second']);
-  });
-});
+  test('uses upstream inference cost when a BYOK provider bills outside OpenRouter', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    gatewayCreate.mockResolvedValueOnce({
+      ...successfulTurn(),
+      model: 'openai/gpt-5.6-terra',
+      openrouter_metadata: { is_byok: true },
+      usage: {
+        input_tokens: 1_000,
+        output_tokens: 1_000,
+        cost: 0,
+        cost_details: { upstream_inference_cost: 0.0042 },
+      },
+    });
 
-describe('_accumulateBedrockStream', () => {
-  test('reconstructs a text + tool_use message from a streamed event sequence', async () => {
-    const frames = TEXT_AND_TOOL_EVENTS.map(chunkFrame);
-    const activity = jest.fn();
-    const msg = await _accumulateBedrockStream(streamFromBuffers(frames), 'us.anthropic.claude-opus-4-8', activity);
+    const result = await runCodingAgent('change the heading', context);
 
-    expect(msg.stop_reason).toBe('tool_use');
-    expect(msg.content).toHaveLength(2);
-    expect(msg.content[0]).toEqual({ type: 'text', text: "I'll edit the file." });
-    expect(msg.content[1]).toMatchObject({ type: 'tool_use', id: 'toolu_1', name: 'edit_file', input: { file_path: 'app/page.tsx' } });
-    // usage from message_start should be merged with message_delta's output_tokens
-    expect(msg.usage.output_tokens).toBe(42);
-    // onActivity fires at least once per chunk read
-    expect(activity).toHaveBeenCalled();
+    expect(result.usageTotals?.costUsd).toBeCloseTo(0.0042, 9);
+    expect(mockedRecordUsage).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'openai/gpt-5.6-terra',
+      costUsdOverride: 0.0042,
+    }));
   });
 
-  test('splitting frames mid-stream still reconstructs correctly (chunk boundaries are irrelevant)', async () => {
-    const all = Buffer.concat(TEXT_AND_TOOL_EVENTS.map(chunkFrame));
-    // Deliver the whole byte stream in 7-byte slices to stress the buffering path.
-    const slices: Buffer[] = [];
-    for (let i = 0; i < all.length; i += 7) slices.push(all.subarray(i, i + 7));
-    const msg = await _accumulateBedrockStream(streamFromBuffers(slices), 'p', () => {});
-    expect(msg.content[1]).toMatchObject({ name: 'edit_file', input: { file_path: 'app/page.tsx' } });
+  test('omits session_id when the local session id exceeds OpenRouter limits', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    gatewayCreate.mockResolvedValueOnce(successfulTurn());
+
+    await runCodingAgent('change the heading', { ...context, sessionId: 's'.repeat(257) });
+
+    expect(gatewayCreate.mock.calls[0][0]).not.toHaveProperty('session_id');
   });
 
-  test('throws a retryable (5xx) error when the stream ends without message_start', async () => {
-    await expect(
-      _accumulateBedrockStream(streamFromBuffers([]), 'p', () => {})
-    ).rejects.toMatchObject({ status: 500 });
+  test('fails closed before the gateway call for an unmapped logical model', async () => {
+    modelSpy.mockResolvedValue('unmapped-model');
+
+    const result = await runCodingAgent('change the heading', context);
+
+    expect(result).toEqual(expect.objectContaining({
+      success: false,
+      message: expect.stringMatching(/no verified OpenRouter upstream mapping/i),
+    }));
+    expect(gatewayCreate).not.toHaveBeenCalled();
   });
 
-  test('surfaces a Bedrock throttling exception frame as a retryable 429', async () => {
-    const start = chunkFrame(TEXT_AND_TOOL_EVENTS[0]);
-    const exceptionFrame = encodeFrame(
-      { ':message-type': 'exception', ':exception-type': 'ThrottlingException' },
-      Buffer.from('{"message":"Too many requests"}', 'utf8')
-    );
-    await expect(
-      _accumulateBedrockStream(streamFromBuffers([start, exceptionFrame]), 'p', () => {})
-    ).rejects.toMatchObject({ status: 429 });
-  });
-});
+  test('an empty OpenRouter key fails before any model call or edit', async () => {
+    const originalEnvKey = process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    _setOpenRouterClientForTest(null);
+    mockedGetSecret.mockResolvedValueOnce('   ');
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
 
-// ─── Bearer client: abort surfaces as an honest timeout, not a generic error ──
-describe('runCodingAgent — bearer-token request timeout surfacing', () => {
-  const mockContext: CodingAgentContext = {
-    pageId: 'p', userId: 'u', sessionId: 's', llmModel: 'anthropic.claude-opus-4-8',
-  };
-  let modelSpy: jest.SpyInstance;
-
-  beforeEach(() => {
-    jest.clearAllMocks();
-    mockedMcpFetch.mockReset();
-    mockedMcpFetch.mockResolvedValue({ files: [{ path: 'app/page.tsx', size: 100 }] });
-    _setSleepFnForTest(async () => {});
-    modelSpy = jest.spyOn(agentModeService, 'getCodingAgentDefaultModel').mockResolvedValue('anthropic.claude-opus-4-8');
-  });
-  afterEach(() => { modelSpy.mockRestore(); _setBedrockBearerClientForTest(null); });
-
-  test('a 408 timeout error from the client is reported (not retried into oblivion)', async () => {
-    const timeoutErr: any = new Error('Bedrock (us.anthropic.claude-opus-4-8) request timed out after 120s of inactivity');
-    timeoutErr.status = 408;
-    timeoutErr.isTimeout = true;
-    const bearerCreate = jest.fn().mockRejectedValue(timeoutErr);
-    _setBedrockBearerClientForTest({ messages: { create: bearerCreate } } as any);
-
-    const result = await runCodingAgent('edit the page', mockContext);
-
-    expect(result.success).toBe(false);
-    expect(result.message).toMatch(/timed out|inactivity/i);
-    // 408 is not in callWithRetry's retry set (only 429/5xx), so exactly one attempt.
-    expect(bearerCreate).toHaveBeenCalledTimes(1);
+    try {
+      const result = await runCodingAgent('change the heading', context);
+      expect(result).toEqual(expect.objectContaining({
+        success: false,
+        message: expect.stringMatching(/OpenRouter API key is empty/i),
+      }));
+      expect(gatewayCreate).not.toHaveBeenCalled();
+      expect(mockedMcpFetch.mock.calls.some(([path]) => String(path).includes('github-edit'))).toBe(false);
+    } finally {
+      if (originalEnvKey === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = originalEnvKey;
+      _setOpenRouterClientForTest({ messages: { create: gatewayCreate } } as any);
+    }
   });
 });
 
@@ -2012,8 +1945,7 @@ describe('runCodingAgent — scope enforcement', () => {
     mockCreate.mockReset();
     mockGetLandingPageById.mockReset();
     mockGetLandingPagesByOwner.mockReset();
-    _setBedrockClientForTest(mockClient);
-    _setSleepFnForTest(async () => {});
+    _setOpenRouterClientForTest(mockClient);
     // The page under edit is one route of a multi-route project; a sibling route
     // shares the SAME repo, so it is in-scope and editable.
     const repo = 'https://github.com/acme/lp-every-io';
@@ -2025,7 +1957,7 @@ describe('runCodingAgent — scope enforcement', () => {
   });
 
   afterAll(() => {
-    _setBedrockClientForTest(null);
+    _setOpenRouterClientForTest(null);
   });
 
   test('allows an edit to a SIBLING route in the same multi-route project', async () => {
@@ -2269,8 +2201,7 @@ describe('runCodingAgent — preview-branch reset resilience', () => {
     jest.clearAllMocks();
     mockedMcpFetch.mockReset();
     mockCreate.mockReset();
-    _setBedrockClientForTest(mockClient);
-    _setSleepFnForTest(async () => {});
+    _setOpenRouterClientForTest(mockClient);
     // Page exists and is editable by the caller so we reach the reset path.
     mockGetLandingPageById.mockResolvedValue(editablePage);
     mockGetLandingPagesByOwner.mockResolvedValue([]);
@@ -2281,7 +2212,7 @@ describe('runCodingAgent — preview-branch reset resilience', () => {
   });
 
   afterAll(() => {
-    _setBedrockClientForTest(null);
+    _setOpenRouterClientForTest(null);
   });
 
   test('creates the branch when GitHub returns 422 "Reference does not exist" (was: every edit 422s)', async () => {
@@ -2362,6 +2293,84 @@ describe('runCodingAgent — preview-branch reset resilience', () => {
   });
 });
 
+// ─── Unknown page id must not be reported as a missing repository (ENG-1192) ───
+
+describe('runCodingAgent — an unresolvable page id says so (ENG-1192)', () => {
+  const previewContext: CodingAgentContext = {
+    pageId: 'not-a-real-page-id',
+    userId: 'user-456',
+    sessionId: 'session-789',
+    llmModel: 'anthropic.claude-sonnet-4-6',
+    draftBranch: LANDING_PAGE_PREVIEW_BRANCH,
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+    mockCreate.mockReset();
+    _setOpenRouterClientForTest(mockClient);
+    mockGetLandingPagesByOwner.mockResolvedValue([]);
+    mockCanUserEditLandingPage.mockResolvedValue(true);
+    mockedAxios.get.mockReset();
+    mockedAxios.patch.mockReset();
+    mockedAxios.post.mockReset();
+  });
+
+  afterAll(() => {
+    _setOpenRouterClientForTest(null);
+  });
+
+  // Live-caught on env1: a truncated page id produced "landing page has no GitHub
+  // repository" for a page that has one. Emma relayed it verbatim and told the user to
+  // deploy the page first — wrong advice generated from a wrong error.
+  test('reports the page as not found rather than blaming the repository', async () => {
+    mockGetLandingPageById.mockResolvedValue(undefined);
+
+    const result = await runCodingAgent('install a tracking snippet', previewContext);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('not-a-real-page-id');
+    expect(result.message).not.toContain('no GitHub repository');
+  });
+
+  test('does not claim a missing repository when the page itself is null', async () => {
+    mockGetLandingPageById.mockResolvedValue(null as any);
+
+    const result = await runCodingAgent('install a tracking snippet', previewContext);
+
+    expect(result.success).toBe(false);
+    expect(result.message).not.toContain('no GitHub repository');
+  });
+
+  // The original message is correct for this case and must survive.
+  test('still reports a missing repository when the page exists without one', async () => {
+    mockGetLandingPageById.mockResolvedValue({ id: 'not-a-real-page-id' } as any);
+
+    const result = await runCodingAgent('install a tracking snippet', previewContext);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('no GitHub repository');
+  });
+
+  test('proceeds normally when the page resolves and has a repository', async () => {
+    mockGetLandingPageById.mockResolvedValue({
+      id: 'not-a-real-page-id',
+      githubRepoUrl: 'https://github.com/AgentWebPro/lp-free-ai-seo-geo-audit-37343865',
+    } as any);
+    mockedAxios.get.mockResolvedValueOnce({ data: { object: { sha: 'main-sha-abc' } } } as any);
+    mockedAxios.patch.mockResolvedValueOnce({ data: {} } as any);
+    mockCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
+      stop_reason: 'tool_use',
+    });
+
+    const result = await runCodingAgent('install a tracking snippet', previewContext);
+
+    expect(result.success).toBe(true);
+    expect(result.message).not.toContain('no GitHub repository');
+  });
+});
+
 // ─── Preview-branch reset: preserve unpublished sequential edits (ENG-176) ─────
 
 describe('runCodingAgent — sequential edits do not clobber (ENG-176)', () => {
@@ -2388,8 +2397,7 @@ describe('runCodingAgent — sequential edits do not clobber (ENG-176)', () => {
     jest.clearAllMocks();
     mockedMcpFetch.mockReset();
     mockCreate.mockReset();
-    _setBedrockClientForTest(mockClient);
-    _setSleepFnForTest(async () => {});
+    _setOpenRouterClientForTest(mockClient);
     mockGetLandingPageById.mockResolvedValue(editablePage);
     mockGetLandingPagesByOwner.mockResolvedValue([]);
     mockCanUserEditLandingPage.mockResolvedValue(true);
@@ -2399,7 +2407,7 @@ describe('runCodingAgent — sequential edits do not clobber (ENG-176)', () => {
   });
 
   afterAll(() => {
-    _setBedrockClientForTest(null);
+    _setOpenRouterClientForTest(null);
   });
 
   test('does NOT reset the preview branch when it has unpublished commits ahead of main', async () => {

@@ -2,20 +2,20 @@
  * Coding Agent Service
  *
  * A sub-agent that Emma delegates to for code editing tasks.
- * Uses the Anthropic SDK with AWS Bedrock for the agentic loop.
+ * Uses the Anthropic SDK through OpenRouter's native Messages endpoint.
  * Runs with diff-based editing tools, reads files before editing,
  * checks deployment after changes, and iterates on build errors.
  */
 
-import AnthropicBedrock from '@anthropic-ai/bedrock-sdk';
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
 import { getGitHubOrgToken, getSecret } from '../utils/secretsManager';
-import { BEDROCK_BEARER_TOKEN_MODELS, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import { recordUsage, computeCostMicroUsd } from './usageRecorderService';
+import { getModelPrice, MODEL_PRICING } from '../utils/llmPricing';
 import { normalizeAnthropicCacheCreation } from '../utils/llmClients';
+import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
 import { getLandingPageById, getLandingPagesByOwner, canUserEditLandingPage, GeneratedLandingPage } from './v0Service';
 import { AcceptanceCheck, AcceptanceStatus, AcceptanceVerificationResult, verifyAcceptanceChecks } from './codingAgentAcceptance';
 import {
@@ -115,6 +115,8 @@ interface CodingAgentUsageAccumulator {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
+  /** Sum of each turn priced from OpenRouter's served model (or reported cost). */
+  costMicroUsd: number;
   /** ENG-893: cache-write tokens by the TTL the response reported, for pricing. */
   cacheWriteByTtl: Record<string, number>;
 }
@@ -171,6 +173,12 @@ function throwIfAborted(signal?: AbortSignal): void {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && (error.name === 'AbortError' || /cancelled|aborted/i.test(error.message));
+}
+
+// Injectable only so deployment-polling tests do not wait on Vercel's real interval.
+let deploymentSleep: (ms: number) => Promise<void> = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+export function _setDeploymentSleepForTest(fn: (ms: number) => Promise<void>): void {
+  deploymentSleep = fn;
 }
 
 function isBuildOrDeploymentFailure(result: CodingAgentResult): boolean {
@@ -295,7 +303,14 @@ async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Pr
   if (context.draftBranch !== LANDING_PAGE_PREVIEW_BRANCH) return;
 
   const page = await getLandingPageById(context.pageId);
-  if (!page?.githubRepoUrl) {
+  // ENG-1192: keep "no such page" and "page without a repo" apart. They were collapsed into
+  // the repo message, so an id that resolved to nothing was reported as a repository problem
+  // on a page that was never found — caught live when a truncated id produced that error for
+  // a page that does have a repo, and the agent relayed it as "deploy the page first".
+  if (!page) {
+    throw new Error(`Cannot prepare preview branch: no landing page found with id ${context.pageId}`);
+  }
+  if (!page.githubRepoUrl) {
     throw new Error('Cannot prepare preview branch: landing page has no GitHub repository');
   }
 
@@ -494,7 +509,6 @@ const DEFAULT_CODING_AGENT_MODEL = 'anthropic.claude-sonnet-4-6'; // Fallback if
 // tight budget here is what silently killed broad edits before they could finish.
 const AGENT_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes max for the entire agent run
 const MAX_TOOL_RESULT_CHARS = 30000; // Truncate tool results to prevent context bloat
-const MAX_RETRIES = 2;
 
 // Shared message for an authorization denial. Used by the upfront preflight and
 // the mid-run 403 catch so the user sees one consistent, actionable instruction.
@@ -1420,7 +1434,7 @@ async function executeTool(
           if (attempt < MAX_POLL_ATTEMPTS) {
             console.log(`[CODING AGENT] check_deployment: branch="${branch}" status="${lastData.buildStatus}" (attempt ${attempt}/${MAX_POLL_ATTEMPTS}), retrying in ${POLL_INTERVAL_MS / 1000}s...`);
             throwIfAborted(context.abortSignal);
-            await _sleepFn(POLL_INTERVAL_MS);
+            await deploymentSleep(POLL_INTERVAL_MS);
             throwIfAborted(context.abortSignal);
           }
         }
@@ -1533,434 +1547,99 @@ function trimMessageHistory(messages: Anthropic.MessageParam[]): void {
   }
 }
 
-// ─── Bedrock Client ─────────────────────────────────────────────────────────
+// ─── OpenRouter Messages client ──────────────────────────────────────────────
 
-let bedrockClient: AnthropicBedrock | null = null;
-
-function getBedrockClient(): AnthropicBedrock {
-  if (!bedrockClient) {
-    bedrockClient = new AnthropicBedrock({
-      awsRegion: 'us-west-2',
-    });
-  }
-  return bedrockClient;
-}
-
-// Exported for testing (allows mock injection)
-export function _setBedrockClientForTest(client: AnthropicBedrock | null): void {
-  bedrockClient = client;
-}
-
-// ─── Vertex Client (native Anthropic format) ──────────────────────────────────
-// Claude models on Google Vertex AI (e.g. "claude-sonnet-4-6") are addressed by a
-// bare model id with NO "anthropic." prefix. We hit the rawPredict endpoint
-// directly, which speaks the native Anthropic Messages format — the exact shape
-// the coding agent already builds — so no request/response conversion is needed
-// (unlike agentModeService, which adapts to/from OpenAI format).
-
-/** Minimal client surface the agent loop relies on — satisfied by both AnthropicBedrock and the Vertex wrapper. */
 interface AnthropicLikeClient {
   messages: {
     create: (params: Anthropic.MessageCreateParamsNonStreaming) => Promise<Anthropic.Message>;
   };
 }
 
-const VERTEX_REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per request
+let openRouterClient: AnthropicLikeClient | null = null;
+let openRouterClientPromise: Promise<AnthropicLikeClient> | null = null;
 
-let vertexClient: AnthropicLikeClient | null = null;
-let vertexClientPromise: Promise<AnthropicLikeClient> | null = null;
+async function getOpenRouterClient(): Promise<AnthropicLikeClient> {
+  if (openRouterClient) return openRouterClient;
+  if (openRouterClientPromise) return openRouterClientPromise;
 
-async function getVertexClient(): Promise<AnthropicLikeClient> {
-  if (vertexClient) return vertexClient;
-  if (vertexClientPromise) return vertexClientPromise;
-
-  vertexClientPromise = (async () => {
-    const { GoogleAuth } = await import('google-auth-library');
+  openRouterClientPromise = (async () => {
     const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-    const secretString = await getSecret(`${environment}/AgentWeb/Google/Vertex`);
-    const credentials = JSON.parse(secretString);
-    const auth = new GoogleAuth({
-      credentials,
-      scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-    });
-    const projectId = credentials.project_id;
+    const apiKey = (
+      process.env.OPENROUTER_API_KEY ||
+      await getSecret(`${environment}/AgentWeb/OpenRouter`)
+    ).trim();
+    if (!apiKey) throw new Error('OpenRouter API key is empty or not found in env/secrets');
 
-    const client: AnthropicLikeClient = {
-      messages: {
-        create: async (params) => {
-          const token = await auth.getAccessToken();
-          // The model id goes in the URL for Vertex; everything else is the
-          // native Anthropic request body (system, tools, messages, max_tokens).
-          const { model, ...rest } = params as any;
-          delete (rest as any).model;
-          const url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/global/publishers/anthropic/models/${model}:rawPredict`;
-          const body = { anthropic_version: 'vertex-2023-10-16', ...rest };
-
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), VERTEX_REQUEST_TIMEOUT_MS);
-          let response: Response;
-          try {
-            response = await fetch(url, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify(body),
-              signal: controller.signal,
-            });
-          } catch (err: any) {
-            // Surface a per-request timeout honestly rather than letting the bare
-            // AbortError bubble up as a generic (and unretried) failure.
-            if (err?.name === 'AbortError') {
-              const timeoutErr: any = new Error(
-                `Vertex AI request timed out after ${VERTEX_REQUEST_TIMEOUT_MS / 1000}s`
-              );
-              timeoutErr.status = 408;
-              timeoutErr.isTimeout = true;
-              throw timeoutErr;
-            }
-            throw err;
-          } finally {
-            clearTimeout(timeout);
-          }
-
-          if (!response.ok) {
-            const errText = await response.text();
-            const err: any = new Error(`Vertex AI error ${response.status}: ${errText}`);
-            err.status = response.status; // lets callWithRetry decide whether to retry
-            throw err;
-          }
-
-          // rawPredict returns a native Anthropic Message — consumed as-is.
-          return (await response.json()) as Anthropic.Message;
-        },
+    const client = new Anthropic({
+      apiKey,
+      baseURL: 'https://openrouter.ai/api',
+      maxRetries: 1,
+      timeout: 5 * 60 * 1000,
+      defaultHeaders: {
+        'HTTP-Referer': 'https://app.agentweb.pro',
+        'X-Title': 'AgentWeb',
+        // Exposes the selected provider and BYOK flag on both OpenRouter's
+        // OpenAI and Anthropic-compatible response shapes.
+        'X-OpenRouter-Metadata': 'enabled',
       },
-    };
-
-    vertexClient = client;
+    });
+    openRouterClient = client;
     return client;
   })();
-
-  return vertexClientPromise;
-}
-
-// Exported for testing (allows mock injection)
-export function _setVertexClientForTest(client: AnthropicLikeClient | null): void {
-  vertexClient = client;
-  vertexClientPromise = null;
-}
-
-// ─── Bedrock bearer-token client (Opus 4.8, native Anthropic format) ──────────
-// Opus 4.8 lives in a separate AWS account (231030591963) the app's default IAM
-// credentials can't reach, so it can't use the AnthropicBedrock SDK (SigV4). We
-// authenticate with a long-term Bedrock API key (bearer token) and hit the
-// invoke endpoint directly — it speaks native Anthropic Messages format, exactly
-// what the coding agent already builds.
-// Which models live in that account, and the invoke-endpoint profile id each
-// maps to, both come from utils/bedrockInferenceProfiles.ts.
-
-// Idle (inter-chunk) timeout for the streaming bearer path. Because we stream,
-// we don't need a hard cap on total request duration — a long-but-progressing
-// generation is healthy. We only abort if the model goes silent for this long,
-// which is the real signature of a hung request. This is what makes the overall
-// AGENT_TIMEOUT_MS budget usable: slow turns finish instead of being guillotined.
-const BEARER_STREAM_IDLE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes of no stream activity
-
-/**
- * Parse AWS `application/vnd.amazon.eventstream` framing out of a growing byte
- * buffer. Each frame is: [totalLen:4][headersLen:4][preludeCRC:4][headers][payload][msgCRC:4],
- * all big-endian. We only need string-valued headers (`:message-type`,
- * `:event-type`, `:exception-type`), so header parsing handles the string type (7).
- * Mutates `state.buf`, yielding one `{ headers, payload }` per complete frame.
- * Exported for unit testing the binary parser without a live socket.
- */
-export function* _parseEventStreamFrames(
-  state: { buf: Buffer },
-  chunk: Uint8Array
-): Generator<{ headers: Record<string, string>; payload: Buffer }> {
-  state.buf = state.buf.length ? Buffer.concat([state.buf, chunk]) : Buffer.from(chunk);
-  while (state.buf.length >= 12) {
-    const totalLen = state.buf.readUInt32BE(0);
-    if (totalLen < 16 || state.buf.length < totalLen) break; // incomplete frame — wait for more
-    const headersLen = state.buf.readUInt32BE(4);
-    const headers: Record<string, string> = {};
-    let o = 12;
-    const headersEnd = 12 + headersLen;
-    while (o < headersEnd) {
-      const nameLen = state.buf.readUInt8(o); o += 1;
-      const name = state.buf.toString('utf8', o, o + nameLen); o += nameLen;
-      const type = state.buf.readUInt8(o); o += 1;
-      if (type === 7) { // string header — the only type Bedrock emits for these events
-        const vl = state.buf.readUInt16BE(o); o += 2;
-        headers[name] = state.buf.toString('utf8', o, o + vl); o += vl;
-      } else {
-        break; // unexpected header type — stop parsing this frame's headers defensively
-      }
-    }
-    const payload = state.buf.subarray(headersEnd, totalLen - 4);
-    state.buf = state.buf.subarray(totalLen);
-    yield { headers, payload: Buffer.from(payload) };
-  }
-}
-
-/**
- * Reconstruct a complete `Anthropic.Message` from a Bedrock streaming response
- * body. Bedrock wraps each native Anthropic streaming event in an eventstream
- * frame whose JSON payload has a base64 `bytes` field. We decode those into the
- * standard event sequence (message_start → content_block_* → message_delta →
- * message_stop) and fold them back into the same non-streaming Message shape the
- * agent loop already consumes — so callers can't tell streaming was used.
- *
- * Resets `onActivity()` on every chunk so the caller can implement an idle timeout.
- * Exported for unit testing the accumulator against synthetic frames.
- */
-export async function _accumulateBedrockStream(
-  body: ReadableStream<Uint8Array>,
-  profileId: string,
-  onActivity: () => void
-): Promise<Anthropic.Message> {
-  const reader = body.getReader();
-  const state = { buf: Buffer.alloc(0) };
-  let message: any = null;
-  const jsonBufs: Record<number, string> = {};
 
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      onActivity();
-      if (!value) continue;
-      for (const frame of _parseEventStreamFrames(state, value)) {
-        const messageType = frame.headers[':message-type'];
-        let payload: any;
-        try {
-          payload = JSON.parse(frame.payload.toString('utf8'));
-        } catch {
-          continue; // non-JSON frame — ignore
-        }
-        // Error frames from Bedrock arrive as exceptions, not event chunks.
-        if (messageType === 'exception' || messageType === 'error' || frame.headers[':exception-type']) {
-          const err: any = new Error(
-            `Bedrock (${profileId}) stream error: ${frame.headers[':exception-type'] || ''} ${JSON.stringify(payload)}`.trim()
-          );
-          // Bedrock surfaces throttling as a stream exception; treat it as retryable.
-          err.status = /throttl|TooManyRequests|ServiceUnavailable/i.test(JSON.stringify(frame.headers) + JSON.stringify(payload)) ? 429 : 500;
-          throw err;
-        }
-        if (!payload.bytes) continue;
-        const event = JSON.parse(Buffer.from(payload.bytes, 'base64').toString('utf8'));
-        switch (event.type) {
-          case 'message_start':
-            message = { ...event.message, content: [] };
-            break;
-          case 'content_block_start':
-            if (message) { message.content[event.index] = { ...event.content_block }; jsonBufs[event.index] = ''; }
-            break;
-          case 'content_block_delta':
-            if (!message) break;
-            if (event.delta?.type === 'text_delta') {
-              message.content[event.index].text = (message.content[event.index].text || '') + event.delta.text;
-            } else if (event.delta?.type === 'input_json_delta') {
-              jsonBufs[event.index] = (jsonBufs[event.index] || '') + event.delta.partial_json;
-            }
-            break;
-          case 'content_block_stop':
-            if (message?.content[event.index]?.type === 'tool_use') {
-              const raw = jsonBufs[event.index];
-              message.content[event.index].input = raw ? JSON.parse(raw) : {};
-            }
-            break;
-          case 'message_delta':
-            if (!message) break;
-            if (event.delta?.stop_reason) message.stop_reason = event.delta.stop_reason;
-            if (event.delta?.stop_sequence !== undefined) message.stop_sequence = event.delta.stop_sequence;
-            if (event.usage) message.usage = { ...message.usage, ...event.usage };
-            break;
-          // message_stop carries only Bedrock metrics — nothing to fold in.
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock?.();
+    return await openRouterClientPromise;
+  } catch (error) {
+    openRouterClientPromise = null;
+    throw error;
   }
+}
 
-  if (!message) {
-    const err: any = new Error(`Bedrock (${profileId}) stream ended without a message_start event`);
-    err.status = 500; // treat an empty/garbled stream as a retryable server error
-    throw err;
+export function _setOpenRouterClientForTest(client: AnthropicLikeClient | null): void {
+  openRouterClient = client;
+  openRouterClientPromise = null;
+}
+
+function containsImageInput(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsImageInput);
+  if (!value || typeof value !== 'object') return false;
+  const block = value as Record<string, unknown>;
+  if (block.type === 'image' || block.type === 'image_url' || block.type === 'input_image') {
+    return true;
   }
-  // Drop any holes left by sparse indexing so downstream sees a dense content array.
-  message.content = (message.content as any[]).filter(Boolean);
-  return message as Anthropic.Message;
+  return containsImageInput(block.content);
 }
 
-let bedrockBearerClient: AnthropicLikeClient | null = null;
-let bedrockBearerClientPromise: Promise<AnthropicLikeClient> | null = null;
-
-async function getBedrockBearerClient(): Promise<AnthropicLikeClient> {
-  if (bedrockBearerClient) return bedrockBearerClient;
-  if (bedrockBearerClientPromise) return bedrockBearerClientPromise;
-
-  bedrockBearerClientPromise = (async () => {
-    const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-    const bearerToken = (await getSecret(`${environment}/AgentWeb/Bedrock/ApiKey`)).trim();
-    const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
-
-    const client: AnthropicLikeClient = {
-      messages: {
-        create: async (params) => {
-          // The model id goes in the URL for the Bedrock invoke endpoint; the rest
-          // is the native Anthropic request body, with the required version field.
-          // We stream (invoke-with-response-stream) rather than block on a single
-          // /invoke call: a long generation no longer ties up the whole turn, and a
-          // genuinely stuck request is caught by the idle timeout below.
-          const { model, ...rest } = params as any;
-          delete (rest as any).model;
-          const profileId = resolveBedrockModelId(model);
-          const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${profileId}/invoke-with-response-stream`;
-          const body = { anthropic_version: 'bedrock-2023-05-31', ...rest };
-
-          // Idle timeout: abort only if the stream goes silent. Reset on every chunk.
-          const controller = new AbortController();
-          let idleTimer: NodeJS.Timeout | undefined;
-          const armIdleTimer = () => {
-            if (idleTimer) clearTimeout(idleTimer);
-            idleTimer = setTimeout(() => controller.abort(), BEARER_STREAM_IDLE_TIMEOUT_MS);
-          };
-          const clearIdleTimer = () => { if (idleTimer) clearTimeout(idleTimer); };
-          armIdleTimer();
-
-          let response: Response;
-          try {
-            response = await fetch(url, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${bearerToken}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/vnd.amazon.eventstream',
-              },
-              body: JSON.stringify(body),
-              signal: controller.signal,
-            });
-          } catch (err: any) {
-            clearIdleTimer();
-            // Distinguish an idle-timeout abort from other network errors so it's
-            // reported honestly instead of being swallowed as a generic failure.
-            if (err?.name === 'AbortError') {
-              const timeoutErr: any = new Error(
-                `Bedrock (${profileId}) request timed out after ${BEARER_STREAM_IDLE_TIMEOUT_MS / 1000}s of inactivity`
-              );
-              timeoutErr.status = 408; // request timeout — not auto-retried by callWithRetry
-              timeoutErr.isTimeout = true;
-              throw timeoutErr;
-            }
-            throw err;
-          }
-
-          if (!response.ok) {
-            clearIdleTimer();
-            const errText = await response.text();
-            const err: any = new Error(`Bedrock (${profileId}) error ${response.status}: ${errText}`);
-            err.status = response.status; // lets callWithRetry decide whether to retry
-            throw err;
-          }
-          if (!response.body) {
-            clearIdleTimer();
-            const err: any = new Error(`Bedrock (${profileId}) returned no response body`);
-            err.status = 500;
-            throw err;
-          }
-
-          try {
-            return await _accumulateBedrockStream(response.body, profileId, armIdleTimer);
-          } catch (err: any) {
-            if (err?.name === 'AbortError') {
-              const timeoutErr: any = new Error(
-                `Bedrock (${profileId}) stream stalled after ${BEARER_STREAM_IDLE_TIMEOUT_MS / 1000}s of inactivity`
-              );
-              timeoutErr.status = 408;
-              timeoutErr.isTimeout = true;
-              throw timeoutErr;
-            }
-            throw err;
-          } finally {
-            clearIdleTimer();
-          }
-        },
-      },
-    };
-
-    bedrockBearerClient = client;
-    return client;
-  })();
-
-  return bedrockBearerClientPromise;
-}
-
-// Exported for testing (allows mock injection)
-export function _setBedrockBearerClientForTest(client: AnthropicLikeClient | null): void {
-  bedrockBearerClient = client;
-  bedrockBearerClientPromise = null;
-}
-
-/**
- * Pick the right LLM client for a given model id.
- * - "anthropic.claude-opus-4-8" is on AWS Bedrock in a separate account (bearer-token auth).
- * - Bare "claude-*" ids (e.g. claude-sonnet-*) are Google Vertex AI models.
- * - Other "anthropic.*" ids are AWS Bedrock models (default IAM credentials).
- */
-async function getClientForModel(model: string): Promise<AnthropicLikeClient> {
-  if (BEDROCK_BEARER_TOKEN_MODELS.has(model)) {
-    return getBedrockBearerClient();
-  }
-  if (model.startsWith('claude-')) {
-    return getVertexClient();
-  }
-  return getBedrockClient() as unknown as AnthropicLikeClient;
-}
-
-// Sleep helper — injectable for tests to skip real delays
-let _sleepFn: (ms: number) => Promise<void> = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-export function _setSleepFnForTest(fn: (ms: number) => Promise<void>): void {
-  _sleepFn = fn;
-}
-
-/**
- * Call the Anthropic Messages API with retry logic for transient errors.
- * Maps model IDs to inference profile ARNs when needed.
- */
-async function callWithRetry(
+async function callOpenRouter(
   client: AnthropicLikeClient,
-  params: Anthropic.MessageCreateParamsNonStreaming
+  params: Anthropic.MessageCreateParamsNonStreaming,
+  sessionId: string,
 ): Promise<Anthropic.Message> {
-  // Map Bedrock model IDs to inference profile ARNs for models that require them.
-  // Vertex models (bare "claude-*") are not in the map and pass through unchanged —
-  // the Vertex client puts the model id in the request URL.
-  // Bearer-account models are deliberately NOT resolved here: getBedrockBearerClient()
-  // owns its own invoke-URL construction and expects the app-level model id.
-  const actualModel = BEDROCK_BEARER_TOKEN_MODELS.has(params.model)
-    ? params.model
-    : resolveBedrockModelId(params.model);
-  const updatedParams = { ...params, model: actualModel };
+  const upstreamModel = resolveOpenRouterUpstreamModelId(params.model);
+  const managedFallback = containsImageInput(params.messages)
+    ? 'google/gemini-3.5-flash'
+    : 'deepseek/deepseek-v4-flash';
+  const request = {
+    ...params,
+    model: upstreamModel,
+    provider: { allow_fallbacks: true, require_parameters: true },
+    plugins: [{ id: 'context-compression' }],
+    ...(upstreamModel !== managedFallback ? { fallbacks: [{ model: managedFallback }] } : {}),
+    ...(sessionId.length <= 256 ? { session_id: sessionId } : {}),
+  };
 
-  let lastError: Error | undefined;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      return await client.messages.create(updatedParams);
-    } catch (error) {
-      // Retry transient errors (rate limits / server errors) from either provider.
-      const status = (error as any)?.status;
-      if (typeof status === 'number' && (status === 429 || status >= 500)) {
-        lastError = error as Error;
-        // Exponential backoff: 1s, 2s
-        await _sleepFn(1000 * Math.pow(2, attempt));
-        continue;
-      }
-      throw error; // Non-retryable error
-    }
-  }
-  throw lastError!;
+  // OpenRouter owns provider retry/fallback. The SDK gets one bounded retry for
+  // transient network/gateway failures; AgentWeb has no custom retry loop.
+  return client.messages.create(request as Anthropic.MessageCreateParamsNonStreaming);
+}
+
+function resolveOpenRouterUsagePricingModel(servedModel: string, requestedModel: string): string | null {
+  const openRouterLogicalModel = servedModel.includes('/') && !servedModel.startsWith('openrouter/')
+    ? `openrouter/${servedModel}`
+    : servedModel;
+  if (MODEL_PRICING[openRouterLogicalModel]) return openRouterLogicalModel;
+  if (MODEL_PRICING[servedModel]) return servedModel;
+  return getModelPrice(requestedModel) ? requestedModel : null;
 }
 
 // ─── Failure Summary ─────────────────────────────────────────────────────────
@@ -2084,8 +1763,18 @@ async function runCodingAgentInternal(
   model: string,
   usageAcc: CodingAgentUsageAccumulator
 ): Promise<CodingAgentResult> {
-
-  const client = await getClientForModel(model);
+  let client: AnthropicLikeClient;
+  try {
+    client = await getOpenRouterClient();
+  } catch (error) {
+    return {
+      success: false,
+      message: `Coding agent encountered an error: ${error instanceof Error ? error.message : String(error)}`,
+      iterations: 0,
+      branch: context.draftBranch,
+      editedFiles: [],
+    };
+  }
   const tools = getToolDefinitions();
 
   // Resolve this run's editable boundary so a single-page task can't bleed edits
@@ -2143,14 +1832,15 @@ async function runCodingAgentInternal(
         });
       }
 
-      // Call Anthropic Messages API
-      const response = await callWithRetry(client, {
+      // Preserve the native Anthropic message/tool loop while OpenRouter owns
+      // upstream provider selection, fallback, throttling, and overflow handling.
+      const response = await callOpenRouter(client, {
         model,
         max_tokens: 16384,
         system: systemPrompt,
         tools,
         messages,
-      });
+      }, context.sessionId);
       throwIfAborted(context.abortSignal);
 
       // Report this turn's token usage if a consumer is listening (eval harness).
@@ -2159,17 +1849,24 @@ async function runCodingAgentInternal(
       }
 
       // Shadow-meter every turn's spend. The coding loop can run many high-cost
-      // Bedrock/Claude iterations, so leaving it unmetered was the biggest hole in
+      // coding-agent iterations, so leaving it unmetered was the biggest hole in
       // per-user cost data. Fire-and-forget + fail-open: never blocks/slows the run.
       try {
         const u: any = response.usage;
         if (u) {
+          const inputTokens = u.input_tokens || 0;
+          const outputTokens = u.output_tokens || 0;
+          const cacheReadTokens = u.cache_read_input_tokens || 0;
+          const cacheWriteTokens = u.cache_creation_input_tokens || 0;
+          const servedModel = typeof response.model === 'string' && response.model
+            ? response.model
+            : model;
           // Accumulate for the per-user cap (charged once by the caller from
           // result.usageTotals). Same numbers the shadow meter records below.
-          usageAcc.inputTokens += u.input_tokens || 0;
-          usageAcc.outputTokens += u.output_tokens || 0;
-          usageAcc.cacheReadTokens += u.cache_read_input_tokens || 0;
-          usageAcc.cacheWriteTokens += u.cache_creation_input_tokens || 0;
+          usageAcc.inputTokens += inputTokens;
+          usageAcc.outputTokens += outputTokens;
+          usageAcc.cacheReadTokens += cacheReadTokens;
+          usageAcc.cacheWriteTokens += cacheWriteTokens;
           // ENG-893: this loop never requests a 1-hour TTL, so its writes are
           // 5-minute writes even on a model agent-mode asks 1h for. Carry the
           // response's own breakdown so cost follows the TTL actually applied.
@@ -2179,17 +1876,53 @@ async function runCodingAgentInternal(
               usageAcc.cacheWriteByTtl[ttl] = (usageAcc.cacheWriteByTtl[ttl] || 0) + tokens;
             }
           }
+          const reportedGatewayCostUsd = typeof u.cost === 'number' && Number.isFinite(u.cost) && u.cost >= 0
+            ? u.cost
+            : undefined;
+          const upstreamInferenceCostUsd =
+            typeof u.cost_details?.upstream_inference_cost === 'number' &&
+            Number.isFinite(u.cost_details.upstream_inference_cost) &&
+            u.cost_details.upstream_inference_cost >= 0
+              ? u.cost_details.upstream_inference_cost
+              : undefined;
+          const routerMetadata = (response as any).openrouter_metadata;
+          const isByok = routerMetadata?.is_byok === true || (
+            reportedGatewayCostUsd === 0 &&
+            upstreamInferenceCostUsd !== undefined &&
+            upstreamInferenceCostUsd > 0
+          );
+          // OpenRouter's own `usage.cost` is the account charge for normal
+          // routing. BYOK can report zero there while Azure/Bedrock still bills
+          // us, so use the upstream inference cost for that case.
+          const billedCostUsd = isByok ? upstreamInferenceCostUsd : reportedGatewayCostUsd;
+          const pricingModel = resolveOpenRouterUsagePricingModel(servedModel, model);
+          const turnCostMicroUsd = billedCostUsd !== undefined
+            ? Math.round(billedCostUsd * 1e6)
+            : pricingModel
+              ? computeCostMicroUsd(
+                  pricingModel,
+                  inputTokens,
+                  outputTokens,
+                  cacheReadTokens,
+                  cacheWriteTokens,
+                  turnCacheByTtl,
+                )
+              : 0;
+          usageAcc.costMicroUsd += turnCostMicroUsd;
           void recordUsage({
             userId: context.userId,
             sessionId: context.sessionId,
-            model,
-            provider: model.startsWith('claude-') ? 'vertex' : 'bedrock',
+            model: servedModel,
+            provider: 'openrouter',
             feature: 'coding_agent',
-            inputTokens: u.input_tokens || 0,
-            outputTokens: u.output_tokens || 0,
-            cacheReadTokens: u.cache_read_input_tokens || 0,
-            cacheWriteTokens: u.cache_creation_input_tokens || 0,
+            inputTokens,
+            outputTokens,
+            cacheReadTokens,
+            cacheWriteTokens,
             cacheWriteByTtl: turnCacheByTtl,
+            ...(billedCostUsd !== undefined || pricingModel
+              ? { costUsdOverride: turnCostMicroUsd / 1e6 }
+              : {}),
           });
         }
       } catch {
@@ -2355,16 +2088,13 @@ export async function runCodingAgent(
     outputTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
+    costMicroUsd: 0,
     cacheWriteByTtl: {} as Record<string, number>,
   };
 
   const withRun = (result: CodingAgentResult, state?: CodingAgentRunState): CodingAgentResult => {
     const totalTokens =
       usageAcc.inputTokens + usageAcc.outputTokens + usageAcc.cacheReadTokens + usageAcc.cacheWriteTokens;
-    // `model` is only accessed here (in the totalTokens > 0 branch), which cannot
-    // be reached until the loop has run — i.e. after model resolution below — so
-    // there is no temporal-dead-zone hazard on the early-return paths (auth denial,
-    // preview-branch reset failure) where no LLM call was made.
     const usageTotals =
       totalTokens > 0
         ? {
@@ -2373,17 +2103,7 @@ export async function runCodingAgent(
             cacheReadTokens: usageAcc.cacheReadTokens,
             cacheWriteTokens: usageAcc.cacheWriteTokens,
             totalTokens,
-            costUsd:
-              computeCostMicroUsd(
-                model,
-                usageAcc.inputTokens,
-                usageAcc.outputTokens,
-                usageAcc.cacheReadTokens,
-                usageAcc.cacheWriteTokens,
-                Object.keys(usageAcc.cacheWriteByTtl).length > 0
-                  ? usageAcc.cacheWriteByTtl
-                  : undefined
-              ) / 1e6,
+            costUsd: usageAcc.costMicroUsd / 1e6,
           }
         : undefined;
     return {

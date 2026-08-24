@@ -5,10 +5,13 @@
 
 // ── Mocks ──────────────────────────────────────────────────────────────────
 
-const mockGetAccountById = jest.fn();
+// Resolution reads every account the caller can reach (own + org-shared), not
+// just their own record — see ENG-943 and emailProviderService.orgShared.test.ts.
+const mockGetAccountsWithOwnerIncludingOrgShared = jest.fn();
 
 jest.mock('../services/connectedAccountsDb', () => ({
-  getAccountById: (...args: any[]) => mockGetAccountById(...args),
+  getAccountsWithOwnerIncludingOrgShared: (...args: any[]) =>
+    mockGetAccountsWithOwnerIncludingOrgShared(...args),
 }));
 
 // Prevent gmailService from importing googleapis at module load
@@ -95,7 +98,7 @@ describe('emailProviderService', () => {
     });
 
     it('resolves a valid gmail account', async () => {
-      mockGetAccountById.mockResolvedValue(makeAccount('gmail', 'user@gmail.com'));
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([makeAccount('gmail', 'user@gmail.com')]);
 
       const result = await resolveEmailAccount('user-123', 'user@gmail.com');
       expect(result.platform).toBe('gmail');
@@ -103,7 +106,7 @@ describe('emailProviderService', () => {
     });
 
     it('throws when account is not found', async () => {
-      mockGetAccountById.mockResolvedValue(null);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([]);
 
       await expect(resolveEmailAccount('user-123', 'missing-acc')).rejects.toThrow(
         /not found/
@@ -111,7 +114,7 @@ describe('emailProviderService', () => {
     });
 
     it('throws when account platform is not an email platform', async () => {
-      mockGetAccountById.mockResolvedValue(makeAccount('linkedin', 'li-acc'));
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([makeAccount('linkedin', 'li-acc')]);
 
       await expect(resolveEmailAccount('user-123', 'li-acc')).rejects.toThrow(
         /not an email account/
@@ -119,7 +122,7 @@ describe('emailProviderService', () => {
     });
 
     it('error for non-email platform mentions the platform name', async () => {
-      mockGetAccountById.mockResolvedValue(makeAccount('meta', 'meta-acc'));
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([makeAccount('meta', 'meta-acc')]);
 
       await expect(resolveEmailAccount('user-123', 'meta-acc')).rejects.toThrow(/meta/);
     });

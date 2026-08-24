@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { skillService } from "../services/skillService";
 import { userDb } from "../services/db";
 import { findTiersAllowingSkill } from "../services/subscriptionService";
+import { validateWelcomeMessage } from "../utils/welcomeMessageValidation";
 
 // ENG-173: a published skill that is in no subscription tier's allowedSkills is
 // invisible to every non-wildcard user (list_available_skills filters it out), so the
@@ -18,19 +19,17 @@ async function entitlementWarnings(skill: any): Promise<string[] | undefined> {
 
 export const createSkill = async (req: Request, res: Response) => {
   try {
-    const { name, description, toolNames, systemPrompt, isPublished } = req.body;
-    
+    const { name, description, toolNames, systemPrompt, isPublished, welcomeMessage } = req.body;
+
     if (!name || !description) {
       return res.status(400).json({ message: "Name and description are required" });
     }
+    const validationError = validateWelcomeMessage(welcomeMessage);
+    if (validationError) return res.status(400).json({ message: validationError });
 
-    const skill = await skillService.createSkill(
-          name,
-          description,
-          toolNames || [],
-          systemPrompt,
-          isPublished
-    );
+    const args: Parameters<typeof skillService.createSkill> = [name, description, toolNames || [], systemPrompt, isPublished];
+    if (welcomeMessage !== undefined) args.push(welcomeMessage);
+    const skill = await skillService.createSkill(...args);
 
     const warnings = await entitlementWarnings(skill);
     res.status(201).json(warnings ? { ...skill, warnings } : skill);
@@ -86,7 +85,10 @@ export const getSkill = async (req: Request, res: Response) => {
 export const updateSkill = async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;
-    const { name, description, toolNames, systemPrompt, isPublished } = req.body;
+    const { name, description, toolNames, systemPrompt, isPublished, welcomeMessage } = req.body;
+
+    const validationError = validateWelcomeMessage(welcomeMessage);
+    if (validationError) return res.status(400).json({ message: validationError });
 
     const existingSkill = await skillService.getSkill(skillId);
     if (!existingSkill) {
@@ -100,6 +102,7 @@ export const updateSkill = async (req: Request, res: Response) => {
       ...(toolNames !== undefined && { toolNames }),
       ...(systemPrompt !== undefined && { systemPrompt }),
       ...(isPublished !== undefined && { isPublished }),
+      ...(welcomeMessage !== undefined && { welcomeMessage }),
       skillId,
     };
     await skillService.updateSkill(updatedSkill);

@@ -89,9 +89,17 @@ describe('addMessagesToMessagesTable oversized message truncation', () => {
 
     const storedContent = writeRequests[0].PutRequest.Item.message.content as string;
 
-    // Content should be truncated to 350,000 chars + notice
-    expect(storedContent.startsWith('x'.repeat(350_000))).toBe(true);
+    // ENG-946: the budget is the WHOLE ITEM in UTF-8 bytes, not the content string in
+    // characters. The old guard sliced content to exactly 350,000 chars and ignored the
+    // rest of the item, so the result could still exceed DynamoDB's 400KB limit and be
+    // rejected — that is the defect, not the contract. Assert what actually matters:
+    // the content is truncated, it keeps its leading data, and the ITEM fits.
+    expect(storedContent.startsWith('xxx')).toBe(true);
+    expect(storedContent.length).toBeLessThan(400_000);
     expect(storedContent).toContain('[Truncated — original size:');
+    expect(
+      Buffer.byteLength(JSON.stringify(writeRequests[0].PutRequest.Item.message), 'utf8'),
+    ).toBeLessThanOrEqual(350_000);
 
     // Should have logged a warning
     expect(warnSpy).toHaveBeenCalledWith(
@@ -130,5 +138,111 @@ describe('addMessagesToMessagesTable oversized message truncation', () => {
     );
 
     warnSpy.mockRestore();
+  });
+});
+
+/**
+ * ENG-1048: ENG-946 bounded ONLY addMessagesToMessagesTable. Three other paths
+ * write a message item to AW-ChatMessages — the session→table migration, the
+ * repair pass, and the single-message update — and each wrote the message raw,
+ * so an oversized item still threw `ValidationException: Item size has exceeded
+ * the maximum allowed size` there. Same table, same 400KB ceiling, same guard.
+ */
+describe('every AW-ChatMessages write path is size-bounded', () => {
+  const tableName = (chatbotDb as any).messagesTableName;
+  // Comfortably over the 350,000-byte budget.
+  const huge = () => ({ role: 'assistant', content: 'z'.repeat(500_000) });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    lastBatchWriteParams = null;
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  const fits = (message: any) =>
+    Buffer.byteLength(JSON.stringify(message) ?? '', 'utf8') <= 350_000;
+
+  // FAIL: the migration path wrote the raw message
+  it('bounds messages migrated from the session record', async () => {
+    batchWriteMock.mockResolvedValueOnce({ UnprocessedItems: {} });
+
+    await (chatbotDb as any).migrateMessagesToMessagesTable('sess-migrate', [huge()]);
+
+    const written = lastBatchWriteParams.RequestItems[tableName][0].PutRequest.Item.message;
+    expect(fits(written)).toBe(true);
+    expect(written.content).toContain('[Truncated — original size:');
+  });
+
+  // FAIL: the repair pass wrote the raw message
+  it('bounds messages rewritten by the repair pass', async () => {
+    batchWriteMock.mockResolvedValueOnce({ UnprocessedItems: {} });
+
+    await (chatbotDb as any).updateMessagesInDatabase('sess-repair', [
+      { messageIndex: 4, message: huge() },
+    ]);
+
+    const request = lastBatchWriteParams.RequestItems[tableName][0].PutRequest.Item;
+    expect(request.messageIndex).toBe(4);
+    expect(fits(request.message)).toBe(true);
+  });
+
+  // The guard is a ceiling, so the interesting inputs are the two messages either
+  // side of it: exactly at budget must survive intact, one byte over must be shrunk.
+  const atExactly = (bytes: number) => {
+    const overhead = Buffer.byteLength(JSON.stringify({ role: 'assistant', content: '' }), 'utf8');
+    return { role: 'assistant', content: 'z'.repeat(bytes - overhead) };
+  };
+
+  // BOUNDARY: a message sized exactly to the budget is not oversized — leave it whole
+  it('writes a message that is exactly at the budget through untouched', async () => {
+    const exact = atExactly(350_000);
+    expect(Buffer.byteLength(JSON.stringify(exact), 'utf8')).toBe(350_000);
+
+    batchWriteMock.mockResolvedValueOnce({ UnprocessedItems: {} });
+    await (chatbotDb as any).migrateMessagesToMessagesTable('sess-exact', [exact]);
+
+    expect(lastBatchWriteParams.RequestItems[tableName][0].PutRequest.Item.message).toBe(exact);
+  });
+
+  // BOUNDARY: one byte past the budget is oversized, on the repair path too
+  it('shrinks a message that is one byte over the budget', async () => {
+    const over = atExactly(350_001);
+
+    batchWriteMock.mockResolvedValueOnce({ UnprocessedItems: {} });
+    await (chatbotDb as any).updateMessagesInDatabase('sess-over', [{ messageIndex: 2, message: over }]);
+
+    const written = lastBatchWriteParams.RequestItems[tableName][0].PutRequest.Item.message;
+    expect(written).not.toBe(over);
+    expect(fits(written)).toBe(true);
+  });
+
+  // ERROR PATH: the guard runs before the write, so a rejected batch still surfaces
+  it('surfaces a write failure rather than reporting an oversized message as stored', async () => {
+    batchWriteMock.mockRejectedValueOnce(Object.assign(new Error('throttled'), {
+      code: 'ProvisionedThroughputExceededException',
+    }));
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(
+      (chatbotDb as any).migrateMessagesToMessagesTable('sess-fail', [huge()]),
+    ).rejects.toThrow('throttled');
+  });
+
+  // SUCCESS: a message that already fits is written through untouched
+  it('leaves a normal message alone on both paths', async () => {
+    const small = { role: 'assistant', content: 'short answer' };
+
+    batchWriteMock.mockResolvedValueOnce({ UnprocessedItems: {} });
+    await (chatbotDb as any).migrateMessagesToMessagesTable('sess-ok', [small]);
+    expect(lastBatchWriteParams.RequestItems[tableName][0].PutRequest.Item.message).toBe(small);
+
+    batchWriteMock.mockResolvedValueOnce({ UnprocessedItems: {} });
+    await (chatbotDb as any).updateMessagesInDatabase('sess-ok', [{ messageIndex: 0, message: small }]);
+    expect(lastBatchWriteParams.RequestItems[tableName][0].PutRequest.Item.message).toBe(small);
   });
 });

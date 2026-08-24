@@ -1,4 +1,3 @@
-import { google } from 'googleapis';
 import { getSecret } from '../utils/secretsManager';
 import {
   normalizeSearchCount,
@@ -32,6 +31,10 @@ export class GoogleSearchProvider implements SearchProvider {
       throw new Error('Google Search API is not configured');
     }
 
+    // ENG-1277: lazy load. `googleapis` pulls in ~990 transitive modules
+    // (~613ms cold) that every jest worker paid on `require()` of this file
+    // even though this is the only call site and it never runs at module load.
+    const { google } = await import('googleapis');
     const customsearch = google.customsearch('v1');
     const response = await customsearch.cse.list({
       auth: credentials.apiKey,

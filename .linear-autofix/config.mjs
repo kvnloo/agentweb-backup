@@ -14,6 +14,9 @@ export const config = {
   inProgressState: 'In Progress',  // moved here on pickup (guards against re-processing)
   reviewState: 'In Review',        // moved here ONLY when triage is green (see triageLabels)
   gcDoneStateTypes: ['completed', 'canceled'], // gc.mjs removes a kept worktree once its issue reaches one of these state types
+  gcUnresolvedMaxAgeDays: 14,      // gc.mjs removes a worktree whose identifier doesn't resolve in Linear
+                                   // (scratch dirs like `tsc-heap`) once it's untouched longer than this;
+                                   // resolvable issues are governed by state/PR-merge, never by age
 
   // Triage labels set on the issue after each run, so the board answers "what do I do with
   // this?" at a glance. Only `green` advances the issue to In Review.

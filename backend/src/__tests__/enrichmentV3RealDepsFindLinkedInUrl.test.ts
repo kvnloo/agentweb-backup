@@ -251,3 +251,29 @@ describe('findLinkedInUrlImpl — LLM context disambiguation among same-name can
     expect(mockGenerateJSONContent).not.toHaveBeenCalled();
   });
 });
+
+describe('findLinkedInUrlImpl — the anonymized sentinel is not a URL', () => {
+  // LinkedIn returns out-of-network profiles with `public_identifier` set to the
+  // literal string "undefined", which is truthy. A bare presence check therefore
+  // resolved it to https://www.linkedin.com/in/undefined and returned that as the
+  // lead's LinkedIn URL — a link belonging to nobody, written back onto the lead.
+  it('returns null instead of resolving an anonymized hit', async () => {
+    svc.searchPeople.mockResolvedValue({
+      items: [{ name: 'Jane Doe', public_identifier: 'undefined' }],
+    });
+
+    const result = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', 'Acme');
+
+    expect(result).toBeNull();
+  });
+
+  it('still resolves a real hit', async () => {
+    svc.searchPeople.mockResolvedValue({
+      items: [{ name: 'Jane Doe', public_identifier: 'jane-doe-123' }],
+    });
+
+    const result = await findLinkedInUrlImpl('user-1', 'Jane', 'Doe', 'Acme');
+
+    expect(result).toBe('https://www.linkedin.com/in/jane-doe-123');
+  });
+});

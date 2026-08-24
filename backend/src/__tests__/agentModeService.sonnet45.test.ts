@@ -160,27 +160,30 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       });
 
       /*
-       * SUPERSEDED by ENG-759 (approved by Harsha 2026-07-30: "opus 5 as default
-       * is fine"). ENG-744's AC #5 was "merely ADDING the Claude 5 family must not
-       * re-route the default" — that guard was correct for ENG-744 and is still
-       * the intent here: the default only moves by an explicit, approved decision.
-       * ENG-759 is that decision, so the expected value changes from 'gpt-5.5' to
-       * Opus 5 while the guard itself is kept (it would still catch an accidental
-       * re-route caused by a future catalog addition).
+       * SUPERSEDED again 2026-08-19 (Harsha, live picker review: default moved
+       * off Opus, through GLM 5.2 and GPT-5.6 Luna, to Gemini 3.7 Flash — see
+       * the comment above the default_model field and
+       * agentModeService.defaultModelGemini37Flash.test.ts). ENG-744's AC #5
+       * was "merely ADDING the Claude 5 family must not re-route the default"
+       * — that guard is still the intent here: the default only moves by an
+       * explicit, approved decision. This is that decision, so the expected
+       * value changes to Gemini 3.7 Flash while the guard itself is kept (it
+       * would still catch an accidental re-route caused by a future catalog
+       * addition).
        */
-      it('AC #5 — default model only moves by explicit decision (now Opus 5, ENG-759)', async () => {
+      it('AC #5 — default model only moves by explicit decision (now Gemini 3.7 Flash, 2026-08-19)', async () => {
         // `default_model` is a field initializer and
         // AZURE_OPENAI_DEPLOYMENT_AGENT_MODE takes precedence over the literal,
         // so any runner exporting a deployment override (backend/.env sets one)
         // silently defeated this guard — it asserted the environment rather than
         // the code. Establish the no-override state and construct AFTER clearing,
-        // or the field is already resolved. Same reasoning as the ENG-759 suite
-        // in agentModeService.defaultModelOpus5.test.ts.
+        // or the field is already resolved. Same reasoning as the suite in
+        // agentModeService.defaultModelGemini37Flash.test.ts.
         const envOverride = 'AZURE_OPENAI_DEPLOYMENT_AGENT_MODE';
         const savedOverride = process.env[envOverride];
         delete process.env[envOverride];
         try {
-          expect(new AgentModeService().default_model).toBe('anthropic.claude-opus-5');
+          expect(new AgentModeService().default_model).toBe('gemini-3.7-flash');
         } finally {
           if (savedOverride === undefined) {
             delete process.env[envOverride];
@@ -213,6 +216,348 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * listing: this model still appears in Google's ListModels while 404ing on
      * the actual call, so a discovery-endpoint check proves nothing.
      */
+    /*
+     * 2026-08-19 picker cleanup — the founder flagged the picker as cluttered
+     * with redundant same-family versions (Opus 4.6/4.8 alongside Opus 5,
+     * Sonnet 4.5/4.6 alongside Sonnet 5, four near-identical GPT-5.x rows)
+     * and separately asked where OpenAI's GPT-5.6 family (Sol/Terra/Luna,
+     * launched 2026-07-09) was. This block covers both: the superseded
+     * versions get `legacy: true` (picker-grouping only — see
+     * LLMModelConfig.legacy; resolveGenerationModel/resolveFallbackModel are
+     * untouched, so no existing session or schedule pinned to one of these
+     * ids changes behavior), and the new GPT-5.6 tiers are added via
+     * OpenRouter. Originally adminOnly per the existing unverified-in-our-
+     * stack convention for new OpenRouter entries; opened to all users
+     * 2026-08-19 (Harsha: "i'm fine to include open source / open router
+     * stuff for all users not just isadmin") — see the "opened to everyone"
+     * describe block below.
+     */
+    describe('2026-08-19 — legacy flag + GPT-5.6 (Sol/Terra/Luna) addition', () => {
+      const LEGACY_IDS = [
+        'gpt-5.4',
+        'anthropic.claude-sonnet-4-5-20250929-v1:0',
+        'anthropic.claude-sonnet-4-6',
+        'anthropic.claude-opus-4-6-v1',
+        'anthropic.claude-opus-4-8',
+      ];
+      const CURRENT_IDS = ['gpt-5.5', 'anthropic.claude-opus-5', 'anthropic.claude-sonnet-5'];
+
+      it.each(LEGACY_IDS)('marks %s as legacy', (id) => {
+        expect((agentModeService as any).llmModels[id].legacy).toBe(true);
+      });
+
+      it.each(CURRENT_IDS)('does NOT mark the current frontier pick %s as legacy', (id) => {
+        expect((agentModeService as any).llmModels[id].legacy).toBeUndefined();
+      });
+
+      it.each(LEGACY_IDS)('still offers the legacy model %s to whichever caller could already see it (no access change)', async (id) => {
+        const wasAdminOnly = (agentModeService as any).llmModels[id].adminOnly === true;
+        const models = await agentModeService.getSupportedModels(wasAdminOnly);
+        expect(models).toContain(id);
+      });
+
+      const GPT_5_6 = [
+        'openrouter/openai/gpt-5.6-sol',
+        'openrouter/openai/gpt-5.6-terra',
+        'openrouter/openai/gpt-5.6-luna',
+      ];
+
+      it.each(GPT_5_6)('offers %s to admins', async (id) => {
+        const models = await agentModeService.getSupportedModels(true);
+        expect(models).toContain(id);
+      });
+
+      // 2026-08-19: Harsha opened every OpenRouter entry (including this
+      // GPT-5.6 family) to all users, not just admins — see the dedicated
+      // "opened to everyone" block below for the full OpenRouter list.
+      it.each(GPT_5_6)('also offers %s to non-admins', async (id) => {
+        const models = await agentModeService.getSupportedModels(false);
+        expect(models).toContain(id);
+      });
+
+      // 2026-08-19: tier is now derived live from costScore (see
+      // "cost-band tier derivation" below), not read off this static field —
+      // these three still carry the pre-derivation literal so a model with
+      // no MODEL_PRICING entry has a sane fallback, but it is no longer what
+      // the picker actually shows. The real, cost-derived tiers are
+      // ultra_premium, pro, and ultra_cheap respectively (see the
+      // derivation test).
+      it('carries a static tier as a no-price fallback, distinct from its real cost-derived tier', () => {
+        const llmModels = (agentModeService as any).llmModels;
+        expect(llmModels['openrouter/openai/gpt-5.6-sol'].tier).toBe('pro');
+        expect(llmModels['openrouter/openai/gpt-5.6-terra'].tier).toBe('medium');
+        expect(llmModels['openrouter/openai/gpt-5.6-luna'].tier).toBe('ultra_cheap');
+      });
+
+      it.each(GPT_5_6)('gives %s a clean display name and the openai provider', (id) => {
+        const config = (agentModeService as any).llmModels[id];
+        expect(config.provider).toBe('openai');
+        expect(config.name).toMatch(/^GPT-5\.6 (Sol|Terra|Luna)$/);
+      });
+    });
+
+    /*
+     * 2026-08-19 — every OpenRouter entry opened to everyone. Harsha: "i'm
+     * fine to include open source / open router stuff for all users not
+     * just isadmin." Was `adminOnly: true` on each (gated as
+     * unproven-in-our-stack); removed. Does NOT touch adminOnly gates
+     * elsewhere in the registry that exist for unrelated reasons (e.g.
+     * anthropic.claude-opus-4-6-v1, still Bedrock-Claude-tier-gated).
+     */
+    describe('2026-08-19 — OpenRouter models opened to everyone (no longer adminOnly)', () => {
+      const OPENROUTER_IDS = [
+        'openrouter/x-ai/grok-4.6',
+        'openrouter/deepseek/deepseek-v4-pro',
+        'openrouter/deepseek/deepseek-v4-flash',
+        'openrouter/qwen/qwen3.8-max',
+        'openrouter/mistralai/mistral-small-2603',
+        'openrouter/moonshotai/kimi-k3',
+        'openrouter/moonshotai/kimi-k2.7-code',
+        'openrouter/z-ai/glm-5.2',
+        'openrouter/z-ai/glm-4.7-flash',
+        'openrouter/openai/gpt-5.6-sol',
+        'openrouter/openai/gpt-5.6-terra',
+        'openrouter/openai/gpt-5.6-luna',
+      ];
+
+      it.each(OPENROUTER_IDS)('%s carries no adminOnly flag', (id) => {
+        expect((agentModeService as any).llmModels[id].adminOnly).toBeUndefined();
+      });
+
+      it.each(OPENROUTER_IDS)('%s is offered to a non-admin caller', async (id) => {
+        const models = await agentModeService.getSupportedModels(false);
+        expect(models).toContain(id);
+      });
+
+      it('does NOT touch an adminOnly gate that exists for a non-OpenRouter reason', () => {
+        expect((agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'].adminOnly).toBe(true);
+      });
+    });
+
+    /*
+     * 2026-08-19 — real quality/cost scores for the picker's meters.
+     * qualityScore is sourced live from Artificial Analysis (Intelligence
+     * Index), a hand-typed literal per model — never estimated. costScore is
+     * NOT hand-typed: it's computed live from MODEL_PRICING via
+     * costScoreFromPrice (see llmPricing.test.ts for the formula's own
+     * tests), so it can never independently drift from what we actually
+     * bill — 11 of 29 hand-typed costScores had already gone stale relative
+     * to MODEL_PRICING before this was caught and fixed. Read through
+     * getSupportedModelsWithMetadata(), the real path the picker uses, not
+     * off the private config object (costScore/costScoreSource no longer
+     * live there at all).
+     */
+    describe('2026-08-19 — quality/cost meter scores', () => {
+      const SCORED_IDS = [
+        'anthropic.claude-opus-5', 'anthropic.claude-opus-4-8', 'anthropic.claude-opus-4-6-v1',
+        'anthropic.claude-sonnet-5', 'anthropic.claude-sonnet-4-6', 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+        'anthropic.claude-haiku-4-5-20251001-v1:0',
+        'gpt-5.5', 'gpt-5.4', 'gpt-5.4-nano',
+        'gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.5-flash', 'gemini-3.7-flash', 'gemini-3.1-flash-lite',
+        'openrouter/openai/gpt-4o-mini', 'openrouter/x-ai/grok-4.6',
+        'openrouter/deepseek/deepseek-v4-pro', 'openrouter/deepseek/deepseek-v4-flash',
+        'openrouter/qwen/qwen3.8-max', 'openrouter/mistralai/mistral-small-2603',
+        'openrouter/moonshotai/kimi-k3', 'openrouter/moonshotai/kimi-k2.7-code',
+        'openrouter/z-ai/glm-5.2', 'openrouter/z-ai/glm-4.7-flash',
+        'openrouter/openai/gpt-5.6-sol', 'openrouter/openai/gpt-5.6-terra', 'openrouter/openai/gpt-5.6-luna',
+      ];
+
+      it.each(SCORED_IDS)('%s has an in-range (0-100) qualityScore and costScore, each with a source note', async (id) => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const info = models.find((m) => m.id === id);
+        expect(info).toBeDefined();
+        expect(info!.qualityScore).toBeGreaterThanOrEqual(0);
+        expect(info!.qualityScore).toBeLessThanOrEqual(100);
+        expect(Number.isInteger(info!.qualityScore)).toBe(true);
+        expect(info!.qualityScoreSource).toEqual(expect.any(String));
+        expect(info!.costScore).toBeGreaterThanOrEqual(0);
+        expect(info!.costScore).toBeLessThanOrEqual(100);
+        expect(Number.isInteger(info!.costScore)).toBe(true);
+        expect(info!.costScoreSource).toEqual(expect.any(String));
+      });
+
+      // Regression pins on a few real, hand-verified values — catches an
+      // accidental reshuffle without re-deriving the whole table in the
+      // assertion. qualityScore is AA Intelligence Index v4.1.1
+      // (live-fetched 2026-08-19); costScore is computed from MODEL_PRICING.
+      it('pins Claude Opus 5 at the real AA-sourced quality / MODEL_PRICING-derived cost values', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(false);
+        const info = models.find((m) => m.id === 'anthropic.claude-opus-5')!;
+        expect(info.qualityScore).toBe(63);
+        expect(info.costScore).toBe(70); // $5/$25 blended 75:25 -> $10.00/1M, log-normalized
+        expect(info.tier).toBe('pro'); // 70 falls in the 51-70 "pro" cost band
+      });
+
+      it('pins GPT-4o Mini (the cheapest, weakest scored model) at the real values', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(false);
+        const info = models.find((m) => m.id === 'openrouter/openai/gpt-4o-mini')!;
+        expect(info.qualityScore).toBe(7);
+        expect(info.costScore).toBe(22);
+        expect(info.tier).toBe('ultra_cheap'); // 22 falls in the <=30 "ultra_cheap" cost band
+      });
+
+      it('does not lower a legacy model\'s quality score merely for being legacy', () => {
+        // Claude Opus 4.8 (legacy: true) scores lower than Opus 5 because it
+        // IS a weaker model per AA, not because `legacy` itself penalizes it —
+        // Opus 4.6 (also legacy) is correctly lower still, tracking real
+        // capability, not recency/legacy-ness.
+        const opus5 = (agentModeService as any).llmModels['anthropic.claude-opus-5'];
+        const opus48 = (agentModeService as any).llmModels['anthropic.claude-opus-4-8'];
+        const opus46 = (agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'];
+        expect(opus48.qualityScore).toBe(57);
+        expect(opus46.qualityScore).toBe(45);
+        expect(opus5.qualityScore).toBeGreaterThan(opus48.qualityScore);
+        expect(opus48.qualityScore).toBeGreaterThan(opus46.qualityScore);
+      });
+    });
+
+    /*
+     * 2026-08-19 — same-family dominance auto-legacy. Harsha: "anything that
+     * is band for band worse in the same model family should be put into
+     * legacy — GPT-5.6 Luna is strictly better than GPT-5.4 Nano." A model
+     * gets legacy: true when a same-`family`, originally-non-legacy sibling
+     * is at least as cheap (cost band) AND at least as good (quality score),
+     * strictly so in one dimension — see deriveDominanceLegacyIds and each
+     * model's `family` tag in the registry.
+     *
+     * `family` is deliberately narrower than `provider`: an earlier
+     * provider-wide version of this check falsely flagged Claude Sonnet 5
+     * as dominated by Claude Opus 5, and Gemini 3.1 Pro as dominated by
+     * Gemini 3.5 Flash — different product tiers serving different jobs,
+     * not generations of the same model. The tests below pin both the real
+     * positive case and that specific false-positive class as a regression
+     * guard.
+     */
+    describe('2026-08-19 — same-family dominance auto-legacy', () => {
+      // Originally this asserted Luna dominates Nano (same cost band, higher
+      // quality) — that used OpenRouter's own marketplace price for Luna.
+      // Luna is BYOK-routed to our Azure resource (agentweb-openrouter-byok,
+      // confirmed live), so we're actually billed Azure's list rate
+      // ($1.00/$6.00), not OpenRouter's. At that real price Luna's cost band
+      // moves up from 'ultra_cheap' to 'cheap' — no longer the same band as
+      // Nano, so dominance correctly no longer fires. Higher quality alone
+      // doesn't dominate; it has to be same-or-cheaper too.
+      it('does NOT flag GPT-5.4 Nano as legacy — GPT-5.6 Luna is pricier at Azure BYOK rates, not the same cost band', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const nano = models.find((m) => m.id === 'gpt-5.4-nano')!;
+        const luna = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-luna')!;
+        expect(nano.tier).not.toBe(luna.tier);
+        expect(luna.qualityScore).toBeGreaterThan(nano.qualityScore!);
+        expect(nano.legacy).toBeUndefined();
+      });
+
+      it('flags the far-weaker, same-band GPT-4o Mini as legacy too (dominated by GPT-5.4 Nano)', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const mini = models.find((m) => m.id === 'openrouter/openai/gpt-4o-mini')!;
+        expect(mini.legacy).toBe(true);
+      });
+
+      it('does NOT flag Claude Sonnet 5 as legacy just because Claude Opus 5 exists — different product tier, not a generation', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(false);
+        const sonnet5 = models.find((m) => m.id === 'anthropic.claude-sonnet-5')!;
+        const opus5 = models.find((m) => m.id === 'anthropic.claude-opus-5')!;
+        expect(opus5.qualityScore).toBeGreaterThan(sonnet5.qualityScore!);
+        expect(sonnet5.legacy).toBeUndefined();
+      });
+
+      // Gemini 3.1 Flash Lite is deliberately kept out of the `gemini-flash`
+      // family (3.5/3.7 Flash) — it's a distinct "lightest/fastest"
+      // positioning, same reasoning as gpt5-chat vs gpt5-nano — so it must
+      // never be auto-dominated no matter what lands in the same cost band.
+      it('does NOT flag Gemini 3.1 Flash Lite as legacy — no `family` tag, so never auto-dominated', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(false);
+        const flashLite = models.find((m) => m.id === 'gemini-3.1-flash-lite')!;
+        expect(flashLite.legacy).toBeUndefined();
+      });
+
+      it('still marks the pre-existing manually-legacy models legacy regardless of dominance', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        for (const id of ['gpt-5.4', 'anthropic.claude-opus-4-6-v1', 'anthropic.claude-opus-4-8']) {
+          expect(models.find((m) => m.id === id)!.legacy).toBe(true);
+        }
+      });
+
+      // Harsha: "the preview gemini models should be moved to legacy asap."
+      // Static legacy: true — "preview" status isn't a cost/quality-dominance
+      // fact, so this couldn't be (and isn't) derived automatically.
+      it('marks both Gemini preview models legacy', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(false);
+        for (const id of ['gemini-3-flash-preview', 'gemini-3.1-pro-preview']) {
+          expect(models.find((m) => m.id === id)!.legacy).toBe(true);
+        }
+      });
+
+      it('does NOT mark the non-preview, non-dominated Gemini models legacy', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(false);
+        // gemini-3.5-flash is deliberately excluded here — it's now correctly
+        // legacy, dominated band-for-band by gemini-3.7-flash (see above).
+        for (const id of ['gemini-3.1-flash-lite', 'gemini-3.7-flash']) {
+          expect(models.find((m) => m.id === id)!.legacy).toBeUndefined();
+        }
+      });
+
+      // Harsha caught this live: GPT-5.6 Terra showed as legacy and that
+      // looked wrong. Root cause — GPT-5.6 Sol ("Frontier coding and
+      // agentic work") was wrongly placed in the same `family` as Terra
+      // ("Balanced general-purpose model"). Sol's OpenRouter price is
+      // currently on a promotional discount that happens to land it in the
+      // same cost band as Terra, so dominance concluded Terra was
+      // redundant — an artifact of a volatile promo price coinciding with
+      // a genuinely different product positioning, not a real supersession.
+      // Fix: Sol carries no `family` at all (same treatment as Kimi K3,
+      // which is likewise excluded from a family with its coding-specialized
+      // sibling Kimi K2.7-Code) — it can neither dominate nor be dominated.
+      it('does NOT flag GPT-5.6 Terra as legacy because of GPT-5.6 Sol — different positioning, not a generation', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const terra = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-terra')!;
+        expect(terra.legacy).toBeUndefined();
+      });
+
+      it('GPT-5.6 Sol itself is never auto-flagged legacy (carries no family)', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const sol = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!;
+        expect(sol.legacy).toBeUndefined();
+      });
+
+      it('GPT-5.5 is still correctly legacy — GPT-5.6 Terra alone (same "balanced" family) is cheaper AND better', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const gpt55 = models.find((m) => m.id === 'gpt-5.5')!;
+        const terra = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-terra')!;
+        expect(terra.qualityScore).toBeGreaterThanOrEqual(gpt55.qualityScore!);
+        expect(terra.costScore!).toBeLessThanOrEqual(gpt55.costScore!);
+        expect(gpt55.legacy).toBe(true);
+      });
+
+      // Harsha: "did you add Gemini 3.7 Flash, and then make legacy what it
+      // beats band for band?" — Gemini 3.5 Flash is exactly that case: same
+      // `gemini-flash` family, Gemini 3.7 Flash is both cheaper (cost tier
+      // 'cheap' vs 3.5's 'medium') and higher quality (56 vs 52).
+      it('flags Gemini 3.5 Flash as legacy — Gemini 3.7 Flash beats it band for band', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const flash35 = models.find((m) => m.id === 'gemini-3.5-flash')!;
+        const flash37 = models.find((m) => m.id === 'gemini-3.7-flash')!;
+        expect(flash37.qualityScore).toBeGreaterThan(flash35.qualityScore!);
+        expect(flash37.tier).not.toBe(flash35.tier);
+        expect(flash35.legacy).toBe(true);
+      });
+
+      it('Gemini 3.7 Flash itself is never auto-flagged legacy — it is the dominator, not the dominated', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const flash37 = models.find((m) => m.id === 'gemini-3.7-flash')!;
+        expect(flash37.legacy).toBeUndefined();
+      });
+
+      // Gemini 3.1 Flash Lite is a distinct "lightest/fastest" positioning
+      // (same reasoning as gpt5-chat vs gpt5-nano), so it deliberately does
+      // NOT share a family with Flash/Flash Lite — it must not get swept into
+      // legacy just because it happens to share Gemini 3.7 Flash's cost band.
+      it('does NOT flag Gemini 3.1 Flash Lite as legacy from Gemini 3.7 Flash — different positioning, no shared family', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const flashLite = models.find((m) => m.id === 'gemini-3.1-flash-lite')!;
+        expect(flashLite.legacy).toBeUndefined();
+      });
+    });
+
     describe('ENG-744 — withdrawn model removal', () => {
       it('no longer offers the shut-down gemini-3-pro-preview to anyone', async () => {
         for (const isAdmin of [true, false]) {
@@ -263,14 +608,14 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(models).toContain('gpt-5.4');
     });
 
-    it('should have temperature support enabled for gpt-5.4', () => {
+    it('does not advertise unsupported temperature for gpt-5.4 through OpenRouter', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5.4'].supportsTemperature).toBe(true);
+      expect(llmModels['gpt-5.4'].supportsTemperature).toBe(false);
     });
 
-    it('should have a non-null client for gpt-5.4 (Azure client created eagerly)', () => {
+    it('does not construct an Azure client for gpt-5.4 at startup', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5.4'].client).not.toBeNull();
+      expect(llmModels['gpt-5.4'].client).toBeNull();
     });
 
     it('should include gpt-5.4-nano in the supported models', async () => {
@@ -278,14 +623,14 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(models).toContain('gpt-5.4-nano');
     });
 
-    it('should have temperature support enabled for gpt-5.4-nano', () => {
+    it('does not advertise unsupported temperature for gpt-5.4-nano through OpenRouter', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5.4-nano'].supportsTemperature).toBe(true);
+      expect(llmModels['gpt-5.4-nano'].supportsTemperature).toBe(false);
     });
 
-    it('should have a non-null client for gpt-5.4-nano (Azure client created eagerly)', () => {
+    it('does not construct an Azure client for gpt-5.4-nano at startup', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5.4-nano'].client).not.toBeNull();
+      expect(llmModels['gpt-5.4-nano'].client).toBeNull();
     });
 
     it('should include gpt-5.5 in the supported models', async () => {
@@ -298,23 +643,25 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gpt-5.5'].supportsTemperature).toBe(false);
     });
 
-    it('should have a non-null client for gpt-5.5 (Azure client created eagerly)', () => {
+    it('does not construct an Azure client for gpt-5.5 at startup', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5.5'].client).not.toBeNull();
+      expect(llmModels['gpt-5.5'].client).toBeNull();
     });
 
     it('should have maxTools: 128 for all Azure OpenAI gpt-5.x models', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5-chat-2'].maxTools).toBe(128);
-      expect(llmModels['gpt-5.2-chat'].maxTools).toBe(128);
       expect(llmModels['gpt-5.4'].maxTools).toBe(128);
       expect(llmModels['gpt-5.4-nano'].maxTools).toBe(128);
       expect(llmModels['gpt-5.5'].maxTools).toBe(128);
     });
 
-    it('should NOT set maxTools on Gemini or Bedrock models', () => {
+    it('should enforce Google\'s 128-function limit on Gemini but not Bedrock models', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.1-pro-preview'].maxTools).toBeUndefined();
+      expect(llmModels['gemini-3.1-pro-preview'].maxTools).toBe(128);
+      expect(llmModels['gemini-3.1-flash-lite'].maxTools).toBe(128);
+      expect(llmModels['gemini-3.5-flash'].maxTools).toBe(128);
+      expect(llmModels['gemini-3.7-flash'].maxTools).toBe(128);
+      expect(llmModels['gemini-3-flash-preview'].maxTools).toBe(128);
       expect(llmModels['anthropic.claude-sonnet-4-6'].maxTools).toBeUndefined();
     });
 
@@ -363,9 +710,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gemini-3.5-flash'].client).toBeNull();
     });
 
-    it('should NOT set maxTools on Gemini 3.5 Flash', () => {
+    it('should set maxTools on Gemini 3.5 Flash', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.5-flash'].maxTools).toBeUndefined();
+      expect(llmModels['gemini-3.5-flash'].maxTools).toBe(128);
     });
 
     it('should return only anthropic non-opus models from getReportsModelOptions for non-admins', async () => {
@@ -407,7 +754,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     it('should place the configured default model first in the list', async () => {
       const { settingsService } = require('../services/settingsService');
       const llmModels = (agentModeService as any).llmModels;
-      const allModels = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
+      const allModels = Object.keys(llmModels).filter((m: string) =>
+        !llmModels[m].adminOnly && !llmModels[m].internalOnly);
       // Configure a model that is NOT first in the natural object-key order
       const nonFirstModel = allModels[allModels.length - 1];
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
@@ -423,7 +771,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
     it('should place the configured default model first in the list for admins (including opus)', async () => {
       const { settingsService } = require('../services/settingsService');
-      const allModels = Object.keys((agentModeService as any).llmModels);
+      const llmModels = (agentModeService as any).llmModels;
+      const allModels = Object.keys(llmModels).filter((m: string) => !llmModels[m].internalOnly);
       const nonFirstModel = allModels[allModels.length - 1];
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
         settingValue: nonFirstModel,
@@ -476,273 +825,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       const llmModels = (agentModeService as any).llmModels;
       const models = await agentModeService.getSupportedModels();
-      const naturalOrder = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
+      const naturalOrder = Object.keys(llmModels).filter((m: string) =>
+        !llmModels[m].adminOnly && !llmModels[m].internalOnly);
       // Falls back to env/hardcoded default which is likely first anyway
       expect(models.length).toBe(naturalOrder.length);
     });
-  });
-
-  describe('Bedrock client lazy-loading', () => {
-    beforeEach(() => {
-      // Mock ConverseCommand response format (Bedrock native, not LangChain)
-      mockBedrockSend.mockResolvedValue({
-        output: { message: { role: 'assistant', content: [{ text: 'test response' }] } },
-        usage: { inputTokens: 10, outputTokens: 5 },
-        stopReason: 'end_turn',
-      });
-    });
-
-    it('should lazy-load Bedrock client for Sonnet 4.5 on first callLLM', async () => {
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-sonnet-4-5-20250929-v1:0',
-        messages
-      );
-
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['anthropic.claude-sonnet-4-5-20250929-v1:0'].client).not.toBeNull();
-    });
-
-    it('should lazy-load Bedrock client for Sonnet 4.6 on first callLLM', async () => {
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-sonnet-4-6',
-        messages
-      );
-
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['anthropic.claude-sonnet-4-6'].client).not.toBeNull();
-    });
-
-    it('should lazy-load Bedrock client for Opus 4.6 on first callLLM', async () => {
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-opus-4-6-v1',
-        messages
-      );
-
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['anthropic.claude-opus-4-6-v1'].client).not.toBeNull();
-    });
-
-  });
-
-  describe('Gemini client lazy-loading', () => {
-    // ENG-737: gemini calls always resolve via getGeminiNativeClient (the only
-    // transport — no compat fallback, no kill-switch) instead of caching on
-    // llmModels[model].client — that cache was removed deliberately so nothing
-    // stale can survive a settings change. getGeminiNativeClient is synchronous.
-
-    it('should lazy-load the native Gemini client for gemini-3.1-pro-preview on first callLLM', async () => {
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { content: 'test response' } }],
-        usage: { prompt_tokens: 10, completion_tokens: 5 },
-      });
-      const mockGeminiClient = { chat: { completions: { create: mockCreate } } };
-
-      jest.spyOn(agentModeService as any, 'getGeminiNativeClient').mockReturnValue(mockGeminiClient);
-
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM('gemini-3.1-pro-preview', messages);
-
-      expect((agentModeService as any).getGeminiNativeClient).toHaveBeenCalled();
-      expect(mockCreate).toHaveBeenCalled();
-    });
-
-    it('should lazy-load the native Gemini client for gemini-3.1-flash-lite on first callLLM', async () => {
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { content: 'test response' } }],
-        usage: { prompt_tokens: 10, completion_tokens: 5 },
-      });
-      const mockGeminiClient = { chat: { completions: { create: mockCreate } } };
-
-      jest.spyOn(agentModeService as any, 'getGeminiNativeClient').mockReturnValue(mockGeminiClient);
-
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM('gemini-3.1-flash-lite', messages);
-
-      expect((agentModeService as any).getGeminiNativeClient).toHaveBeenCalled();
-      expect(mockCreate).toHaveBeenCalled();
-    });
-
-    it('should lazy-load the native Gemini client for gemini-3.5-flash on first callLLM', async () => {
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { content: 'test response' } }],
-        usage: { prompt_tokens: 10, completion_tokens: 5 },
-      });
-      const mockGeminiClient = { chat: { completions: { create: mockCreate } } };
-
-      jest.spyOn(agentModeService as any, 'getGeminiNativeClient').mockReturnValue(mockGeminiClient);
-
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM('gemini-3.5-flash', messages);
-
-      expect((agentModeService as any).getGeminiNativeClient).toHaveBeenCalled();
-      expect(mockCreate).toHaveBeenCalled();
-    });
-  });
-
-  describe('Bedrock client lazy-loading (Opus 4.8)', () => {
-    it('should lazy-load the Bedrock client for anthropic.claude-opus-4-8 on first callLLM', async () => {
-      // Opus 4.8 runs on Bedrock (separate account, bearer-token auth) despite its
-      // bare "claude-" id, so it must route to getBedrockClient, not Vertex.
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { role: 'assistant', content: 'Hi!', tool_calls: undefined }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 9, completion_tokens: 13, total_tokens: 22 },
-      });
-      const mockBedrockClient = { chat: { completions: { create: mockCreate } } };
-
-      jest.spyOn(agentModeService as any, 'getBedrockClient').mockResolvedValue(mockBedrockClient);
-      const vertexSpy = jest.spyOn(agentModeService as any, 'getVertexClient');
-
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM('anthropic.claude-opus-4-8', messages);
-
-      expect((agentModeService as any).getBedrockClient).toHaveBeenCalledWith('anthropic.claude-opus-4-8');
-      expect(vertexSpy).not.toHaveBeenCalled();
-
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['anthropic.claude-opus-4-8'].client).toBe(mockBedrockClient);
-    });
-  });
-
-  describe('Legacy model id normalization (Opus 4.8 rename)', () => {
-    // Sessions created before commit c86c8ec1 persisted the bare "claude-opus-4-8"
-    // id (Vertex era). After the rename to "anthropic.claude-opus-4-8" (Bedrock),
-    // those legacy ids must be transparently mapped so old sessions keep working
-    // instead of throwing "Invalid model 'claude-opus-4-8'".
-    it('should NOT throw "Invalid model" for the legacy claude-opus-4-8 id', async () => {
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { role: 'assistant', content: 'Hi!', tool_calls: undefined }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 9, completion_tokens: 13, total_tokens: 22 },
-      });
-      const mockBedrockClient = { chat: { completions: { create: mockCreate } } };
-      jest.spyOn(agentModeService as any, 'getBedrockClient').mockResolvedValue(mockBedrockClient);
-
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await expect(
-        (agentModeService as any).callLLM('claude-opus-4-8', messages)
-      ).resolves.toBeDefined();
-    });
-
-    it('should route the legacy claude-opus-4-8 id to the Bedrock client, not Vertex', async () => {
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { role: 'assistant', content: 'Hi!', tool_calls: undefined }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 9, completion_tokens: 13, total_tokens: 22 },
-      });
-      const mockBedrockClient = { chat: { completions: { create: mockCreate } } };
-      jest.spyOn(agentModeService as any, 'getBedrockClient').mockResolvedValue(mockBedrockClient);
-      const vertexSpy = jest.spyOn(agentModeService as any, 'getVertexClient');
-
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM('claude-opus-4-8', messages);
-
-      // Must resolve to the canonical Bedrock id, never the Vertex client.
-      expect((agentModeService as any).getBedrockClient).toHaveBeenCalledWith('anthropic.claude-opus-4-8');
-      expect(vertexSpy).not.toHaveBeenCalled();
-    });
-
-    it('normalizeModelId maps the legacy id to the canonical Bedrock id', () => {
-      expect((agentModeService as any).normalizeModelId('claude-opus-4-8')).toBe('anthropic.claude-opus-4-8');
-    });
-
-    it('normalizeModelId leaves canonical and unknown ids unchanged', () => {
-      expect((agentModeService as any).normalizeModelId('anthropic.claude-opus-4-8')).toBe('anthropic.claude-opus-4-8');
-      expect((agentModeService as any).normalizeModelId('gpt-5.5')).toBe('gpt-5.5');
-      expect((agentModeService as any).normalizeModelId(undefined)).toBeUndefined();
-    });
-  });
-
-  describe('Inference profile ARN mapping', () => {
-    beforeEach(() => {
-      mockBedrockSend.mockResolvedValue({
-        output: { message: { role: 'assistant', content: [{ text: 'test response' }] } },
-        usage: { inputTokens: 10, outputTokens: 5 },
-        stopReason: 'end_turn',
-      });
-    });
-
-    it('should map Sonnet 4.5 to its inference profile ARN', async () => {
-      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-sonnet-4-5-20250929-v1:0',
-        [{ role: 'system', content: 'Test' }, { role: 'user', content: 'Hello' }]
-      );
-
-      expect(ConverseCommand).toHaveBeenCalledWith(
-        expect.objectContaining({
-          modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
-        })
-      );
-    });
-
-    it('should map Sonnet 4.6 to its inference profile ARN', async () => {
-      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-sonnet-4-6',
-        [{ role: 'system', content: 'Test' }, { role: 'user', content: 'Hello' }]
-      );
-
-      expect(ConverseCommand).toHaveBeenCalledWith(
-        expect.objectContaining({
-          modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
-        })
-      );
-    });
-
-    it('should map Opus 4.6 to its inference profile ARN', async () => {
-      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-opus-4-6-v1',
-        [{ role: 'system', content: 'Test' }, { role: 'user', content: 'Hello' }]
-      );
-
-      expect(ConverseCommand).toHaveBeenCalledWith(
-        expect.objectContaining({
-          modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
-        })
-      );
-    });
-
   });
 
   describe('callLLM rejects unknown models', () => {
@@ -755,14 +842,15 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     });
   });
 
-  describe('callLLM maxTools truncation (Azure OpenAI 128-tool limit)', () => {
+  describe('callLLM maxTools truncation (provider 128-tool limits)', () => {
     it('should truncate tools to maxTools limit for gpt-5.4', async () => {
       const mockCreate = jest.fn().mockResolvedValue({
         choices: [{ message: { content: 'response', tool_calls: null } }],
         usage: { prompt_tokens: 10, completion_tokens: 5 },
       });
-      const llmModels = (agentModeService as any).llmModels;
-      llmModels['gpt-5.4'].client = { chat: { completions: { create: mockCreate } } };
+      jest.spyOn(agentModeService as any, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create: mockCreate } },
+      });
 
       const tools = Array.from({ length: 143 }, (_, i) => ({
         type: 'function',
@@ -782,8 +870,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         choices: [{ message: { content: 'response', tool_calls: null } }],
         usage: { prompt_tokens: 10, completion_tokens: 5 },
       });
-      const llmModels = (agentModeService as any).llmModels;
-      llmModels['gpt-5.4'].client = { chat: { completions: { create: mockCreate } } };
+      jest.spyOn(agentModeService as any, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create: mockCreate } },
+      });
 
       const tools = Array.from({ length: 128 }, (_, i) => ({
         type: 'function',
@@ -794,6 +883,28 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       const calledParams = mockCreate.mock.calls[0][0];
       expect(calledParams.tools).toHaveLength(128);
+    });
+
+    it('should truncate Gemini tools to Google\'s 128-function limit', async () => {
+      const mockCreate = jest.fn().mockResolvedValue({
+        choices: [{ message: { content: 'response', tool_calls: null } }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+      jest.spyOn(agentModeService as any, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create: mockCreate } },
+      });
+      const tools = Array.from({ length: 207 }, (_, i) => ({
+        type: 'function',
+        function: { name: `tool_${i}`, description: `Tool ${i}`, parameters: { type: 'object', properties: {} } }
+      }));
+
+      await (agentModeService as any).callLLM(
+        'gemini-3.1-flash-lite',
+        [{ role: 'user', content: 'test' }],
+        { tools },
+      );
+
+      expect(mockCreate.mock.calls[0][0].tools).toHaveLength(128);
     });
   });
 

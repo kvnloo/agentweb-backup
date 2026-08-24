@@ -12,7 +12,6 @@
  * requires the calendar.events write scope.
  */
 
-import { google } from 'googleapis';
 import { emmaToolRegistry } from './registry';
 import {
   getAccountByPlatform,
@@ -35,6 +34,8 @@ const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // refresh 5 min before expiry
  *   `{ error: 'write_scope_not_granted' }` so the caller can prompt a reconnect.
  */
 async function getCalendarClient(userId: string, requireWrite = false) {
+  // ENG-1277: lazy load — see googleSearchProvider.ts for why.
+  const { google } = await import('googleapis');
   const account = await getAccountByPlatform(userId, 'gmail');
   if (!account) return null;
 

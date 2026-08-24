@@ -18,7 +18,8 @@
 
 import express, { Request, Response, Router } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth';
-import { crmDb, userDb } from '../services/db';
+import { crmDb } from '../services/db';
+import { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } from '../services/crmAccessControl';
 import { getApolloService, isApolloServiceReady } from '../services/apolloService';
 import { ApolloQuotaExceededError } from '../services/apolloQuota';
 import { applyApolloMatchToLead } from '../services/applyApolloMatchToLead';
@@ -65,18 +66,6 @@ const router: Router = express.Router();
 const bulkEnrichInFlight = new Set<string>();
 function bulkLockKey(userId: string, listId: string): string { return `${userId}:${listId}`; }
 export function __resetBulkEnrichLockForTesting(): void { bulkEnrichInFlight.clear(); }
-
-async function canAccessCrmList(
-  userId: string,
-  list: { userId: string } | Record<string, any>,
-): Promise<boolean> {
-  if (list.userId === userId) return true;
-  const [user, owner] = await Promise.all([
-    userDb.getUserById(userId),
-    userDb.getUserById(list.userId),
-  ]);
-  return !!(user?.orgId && owner?.orgId && user.orgId === owner.orgId);
-}
 
 function ensureApolloReadyOr503(res: Response): boolean {
   if (!isApolloServiceReady()) {
@@ -266,9 +255,9 @@ router.post('/lists/:listId/leads/enrich-with-apollo', async (req: Request, res:
       bulkEnrichInFlight.delete(lockKey);
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (!(await canAccessCrmList(userId, list as any))) {
+    if (!(await canDestructiveCrmList(userId, list as any))) {
       bulkEnrichInFlight.delete(lockKey);
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const opts: ApolloBulkOptions = {

@@ -12,16 +12,15 @@ import browser_use
 from browser_use import Agent, Controller
 from browser_use.browser.browser import Browser, BrowserConfig
 from browser_use.browser.context import BrowserContextConfig, BrowserContext
-from langchain_aws import ChatBedrock
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
-from pydantic import SecretStr, BaseModel
+from pydantic import BaseModel
 from botocore.config import Config
 from dotenv import load_dotenv
 import logging
+import secrets_manager
 from pathlib import Path
 from browser_use.agent.views import ActionResult
 from cookie_sync import CookieSync
-from aws_utils import get_dynamodb_resource, get_bedrock_client
+from aws_utils import get_dynamodb_resource, get_s3_client
 import time
 import asyncio
 import random
@@ -30,6 +29,7 @@ import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
 from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs, parse_json, convert_svg_to_png
+from openrouter_gateway import browser_tool_calling_method
 from knowledge_base_utils import get_knowledge_base_manager
 from partial_extraction import collect_partial_extraction, build_incomplete_run_message
 from datetime import datetime, timezone
@@ -52,8 +52,8 @@ TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 # Azure AI Services credentials used for image generation/editing (gpt-image-*, FLUX.*).
 # Sourced from the environment so the resource can be rotated without a code change.
 #
-# These are deliberately SEPARATE from the AZURE_OPENAI_*2 pair used by the chat client in
-# task_utils.get_azure_openai_llm2(). Image generation and chat historically shared
+# These are deliberately SEPARATE from the retired AZURE_OPENAI_*2 chat pair.
+# Image generation and chat historically shared
 # AZURE_OPENAI_API_KEY2 while pointing at different resources, so repointing the image
 # endpoint alone would authenticate the new endpoint with the old resource's key (401).
 # Endpoint and key move together as a pair.
@@ -65,14 +65,19 @@ AZURE_IMAGE_API_KEY_ENV = 'AZURE_IMAGE_API_KEY'
 
 
 def get_azure_image_endpoint() -> Optional[str]:
-    """Return the configured Azure image endpoint (no trailing slash), or None if unset."""
-    endpoint = (os.getenv(AZURE_IMAGE_ENDPOINT_ENV) or '').strip()
+    """Return the configured Azure image endpoint (no trailing slash), or None if unset.
+
+    Routed through secrets_manager (env var first, GCP Secret Manager
+    fallback in prod) rather than a bare os.getenv - found via ENG-389 live
+    testing that a bare env-var read here would silently break in
+    production, same class of gap ENG-816 fixed for OPENAI_API_KEY."""
+    endpoint = (secrets_manager.get_azure_image_endpoint() or '').strip()
     return endpoint.rstrip('/') or None
 
 
 def get_azure_image_api_key() -> Optional[str]:
     """Return the configured Azure image API key, or None if unset."""
-    return (os.getenv(AZURE_IMAGE_API_KEY_ENV) or '').strip() or None
+    return (secrets_manager.get_azure_image_api_key() or '').strip() or None
 
 # Initialize DynamoDB client
 dynamodb = get_dynamodb_resource()
@@ -82,7 +87,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 global_use_vision = True
-global_tool_calling_method_for_azure: Optional[str] = "function_calling"
 
 controller = Controller()
 
@@ -119,6 +123,27 @@ class GenerateVideoParams(BaseModel):
     output_file_name: str
     image_file_name: Optional[str] = None  # Optional input image for image-to-video generation
     negative_prompt: Optional[str] = None  # Optional negative prompt to avoid certain elements
+
+# Single source of truth for the Veo model ID, so a future Google retirement
+# (ENG-1070: the prior preview ID 404'd) only needs updating in one place
+# instead of two duplicated literals across the image-to-video and
+# text-to-video branches.
+VEO_MODEL_ID = "veo-3.1-generate-preview"
+
+
+def build_veo_config_params(negative_prompt: Optional[str] = None) -> dict:
+    """Build the kwargs for types.GenerateVideosConfig() used by both Veo generation branches.
+
+    Pure and dependency-free (no google.genai import needed) so it's directly
+    unit-testable without the full browser-use/langchain import chain.
+    """
+    config_params = {
+        "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
+        "number_of_videos": 1,  # 1 video generated per request
+    }
+    if negative_prompt:
+        config_params["negative_prompt"] = negative_prompt
+    return config_params
 
 class LogFilterThread(threading.Thread):
     """Thread that continuously filters the log file in real-time"""
@@ -246,7 +271,7 @@ class WebAgent:
         self.current_task_id = None
         self.controller = Controller()
         self.question_count = 0  # Track number of questions asked
-        self.s3_client = boto3.client('s3')
+        self.s3_client = get_s3_client()
         self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
         self._log_handlers = []  # Store log handlers for cleanup
         self.generate_gif = None
@@ -617,7 +642,7 @@ class WebAgent:
                 if not query or not isinstance(query, str):
                     return ActionResult(error="Please provide a non-empty search query")
 
-                api_key = os.getenv('GOOGLE_SEARCH_API_KEY')
+                api_key = secrets_manager.get_google_search_api_key()
                 search_engine_id = os.getenv('GOOGLE_SEARCH_ENGINE_ID')
 
                 if not api_key or not search_engine_id:
@@ -967,7 +992,7 @@ class WebAgent:
                         return ActionResult(error="OpenAI package not installed. Install with: pip install openai")
 
                     # Get API key
-                    api_key = os.getenv('OPENAI_API_KEY')
+                    api_key = secrets_manager.get_openai_api_key()
                     if not api_key:
                         return ActionResult(error="OPENAI_API_KEY environment variable is not set")
 
@@ -1752,7 +1777,7 @@ class WebAgent:
                 The generated video is saved to the downloads folder.
                 
                 Supported models:
-                - veo-3.0-generate-preview (Google): 8-second videos with audio supported, 16:9 aspect ratio
+                - veo-3.1-generate-preview (Google): 8-second videos with audio supported, 16:9 aspect ratio
                 - gen4_turbo (Runway AI): 5-second videos without audio, 1280:720 ratio
                 - kling-v2.1-std (ReelMind): 5-second image-to-video generation, 16:9 aspect ratio (Kling V1.6 Std used for text-to-video)
                 
@@ -1768,7 +1793,7 @@ class WebAgent:
                 """
                 try:
                     # Get the video model to use (default to Google VEO if not specified)
-                    video_model = self.video_model or "veo-3.0-generate-preview"
+                    video_model = self.video_model or VEO_MODEL_ID
                     logger.info(f"Using video model: {video_model}")
                     
                     # Validate output file extension (must end with .mp4)
@@ -1832,7 +1857,7 @@ class WebAgent:
                             return ActionResult(error="Runway ML package not installed. Install with: pip install runwayml")
                         
                         # Get API key
-                        api_key = os.getenv('RUNWAY_API_KEY')
+                        api_key = secrets_manager.get_runway_api_key()
                         if not api_key:
                             return ActionResult(error="RUNWAY_API_KEY environment variable is not set")
                         
@@ -1870,7 +1895,6 @@ class WebAgent:
                                 
                                 if task and hasattr(task, 'output') and task.output:
                                     # Download the video
-                                    import requests
                                     response = requests.get(task.output[0])
                                     with open(output_path, 'wb') as f:
                                         f.write(response.content)
@@ -1890,13 +1914,15 @@ class WebAgent:
                             return ActionResult(error="Runway AI gen4_turbo only supports image-to-video generation. Please provide an input image.")
                     
                     elif video_model == "kling-v2.1-std":
-                        # Use ReelMind API for Kling V2.1 Std
-                        import requests
-                        import json
-                        import time
-                        
+                        # Use ReelMind API for Kling V2.1 Std.
+                        # requests/json/time/uuid are already imported at module level (ENG-1122:
+                        # redundant local imports here silently made those names LOCAL for this
+                        # entire closure -- including the Veo branch's time.sleep() polling loop
+                        # below, which raised UnboundLocalError since that local import statement
+                        # never executes on the Veo path).
+
                         # Get API key
-                        api_key = os.getenv('REELMIND_API_KEY')
+                        api_key = secrets_manager.get_reelmind_api_key()
                         if not api_key:
                             return ActionResult(error="REELMIND_API_KEY environment variable is not set (Do not retry - this is a permanent failure)")
                         
@@ -1917,7 +1943,6 @@ class WebAgent:
                                 return ActionResult(error="AWS_S3_BUCKET environment variable is not set (Do not retry - this is a permanent failure)")
                             
                             # Generate unique S3 key for the image
-                            import uuid
                             image_ext = Path(params.image_file_name).suffix.lower()
                             unique_filename = f"kling_input_{uuid.uuid4()}{image_ext}"
                             s3_key = f"video_inputs/{unique_filename}"
@@ -2110,7 +2135,7 @@ class WebAgent:
                             return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-genai")
                         
                         # Get API key
-                        api_key = os.getenv('GOOGLE_VEO_API_KEY')
+                        api_key = secrets_manager.get_google_veo_api_key()
                         if not api_key:
                             return ActionResult(error="GOOGLE_VEO_API_KEY environment variable is not set")
                         
@@ -2145,15 +2170,10 @@ class WebAgent:
                         if image_object:
                             # Image-to-video generation
                             logger.info("Generating video from input image using Google VEO")
-                            config_params = {
-                                "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
-                                "number_of_videos": 1,  # 1 video generated per request
-                            }
-                            if params.negative_prompt:
-                                config_params["negative_prompt"] = params.negative_prompt
-                            
+                            config_params = build_veo_config_params(params.negative_prompt)
+
                             operation = client.models.generate_videos(
-                                model="veo-3.0-generate-preview",
+                                model=VEO_MODEL_ID,
                                 prompt=params.prompt,
                                 image=image_object,
                                 config=types.GenerateVideosConfig(**config_params)
@@ -2161,15 +2181,10 @@ class WebAgent:
                         else:
                             # Text-to-video generation
                             logger.info("Generating video from text prompt using Google VEO")
-                            config_params = {
-                                "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
-                                "number_of_videos": 1,  # 1 video generated per request
-                            }
-                            if params.negative_prompt:
-                                config_params["negative_prompt"] = params.negative_prompt
-                            
+                            config_params = build_veo_config_params(params.negative_prompt)
+
                             operation = client.models.generate_videos(
-                                model="veo-3.0-generate-preview",
+                                model=VEO_MODEL_ID,
                                 prompt=params.prompt,
                                 config=types.GenerateVideosConfig(**config_params)
                             )
@@ -2508,7 +2523,7 @@ class WebAgent:
                     return ActionResult(error="Google Gemini SDK not installed. Install with: pip install google-genai")
 
                 # Get API key
-                api_key = os.getenv('GEMINI_API_KEY')
+                api_key = secrets_manager.get_gemini_api_key()
                 if not api_key:
                     return ActionResult(error="GEMINI_API_KEY environment variable is not set")
 
@@ -2691,7 +2706,8 @@ class WebAgent:
                 # Combine all results
                 analysis_result = "\n\n".join(result_parts)
                 
-                return ActionResult(extracted_content=f"{analysis_result}{'\n\nNo code execution was performed.' if not code_executed else ''}")
+                no_code_execution_note = "\n\nNo code execution was performed." if not code_executed else ""
+                return ActionResult(extracted_content=f"{analysis_result}{no_code_execution_note}")
 
             except Exception as e:
                 logger.error(f"Error performing data analysis: {e}")
@@ -2722,7 +2738,7 @@ class WebAgent:
                     return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-genai")
 
                 # Get API key
-                api_key = os.getenv('GEMINI_API_KEY')
+                api_key = secrets_manager.get_gemini_api_key()
                 if not api_key:
                     return ActionResult(error="GEMINI_API_KEY environment variable is not set")
 
@@ -3240,7 +3256,7 @@ class WebAgent:
                     logger.info(f"Azure AI Services FLUX model configured: {azure_model_name}")
                 elif model_to_use == "gemini-2.5-flash-image":
                     # Use Google Gemini Nano Banana image model
-                    api_key = os.getenv('GOOGLE_IMAGE_API_KEY')
+                    api_key = secrets_manager.get_google_image_api_key()
                     if not api_key:
                         return ActionResult(error="GOOGLE_IMAGE_API_KEY environment variable is not set for Google Nano Banana model")
                     try:
@@ -3268,7 +3284,7 @@ class WebAgent:
                     azure_model_name = "gpt-image-1"
                 else:
                     # Use OpenAI for other models
-                    api_key = os.getenv('OPENAI_IMAGE_API_KEY')
+                    api_key = secrets_manager.get_openai_image_api_key()
                     if not api_key:
                         return ActionResult(error="OPENAI_IMAGE_API_KEY environment variable is not set")
                     
@@ -4092,15 +4108,12 @@ class WebAgent:
             "max_failures": 5,
             "retry_delay": 60,
             "generate_gif": self.generate_gif,
-            "validate_output": validate_output
+            "validate_output": validate_output,
+            "tool_calling_method": browser_tool_calling_method(
+                getattr(self.llm, "model_name", "")
+            ),
         }
 
-        # Conditionally add tool_calling_method for Azure OpenAI LLMs
-        # self.llm_name is available from __init__ (e.g., "azure->openai->gpt-4o")
-        if self.llm_name and "azure->openai" in self.llm_name.lower() and global_tool_calling_method_for_azure:
-            agent_kwargs["tool_calling_method"] = global_tool_calling_method_for_azure
-            logger.info(f"Using tool_calling_method '{global_tool_calling_method_for_azure}' for Azure OpenAI LLM.")
-        
         self.agent = Agent(**agent_kwargs)
         logger.info("Agent initialized successfully.")
 
@@ -4171,7 +4184,7 @@ async def main():
     parser.add_argument('--lead-list-identifier', help='Identifier field name for lead list records')
     parser.add_argument('--has-attachments', action='store_true', help='Task has attachments')
     parser.add_argument('--create-video', action='store_true', help='Create video recording of task execution')
-    parser.add_argument('--video-model', help='Video model to use for video generation (veo-3.0-generate-preview, gen4_turbo, or kling-v2.1-std)')
+    parser.add_argument('--video-model', help='Video model to use for video generation (veo-3.1-generate-preview, gen4_turbo, or kling-v2.1-std)')
     parser.add_argument('--image-model', help='Image model to use for image generation (openai-image-1 or FLUX.1-Kontext-pro)')
     args = parser.parse_args()
 

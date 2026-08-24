@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { PublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 import {
   LinkedInProfile,
   LinkedInPost,
@@ -632,7 +633,20 @@ export class LinkedInService {
     return { title: this.titleFromUrl(url) };
   }
 
-  async createPost(accessToken: string, authorUrn: string, text: string, imageUrns?: string[]): Promise<string> {
+  /**
+   * ENG-827: `assertStillAuthorized` is the scheduled-run publish-consent re-check.
+   * A post whose text carries a URL and no image goes through OG-metadata discovery
+   * first — which can fall back to launching a headless browser with a 15s navigation
+   * timeout, then upload a thumbnail. That is many seconds of work standing between
+   * the caller's check and the write, so the check is repeated at the request itself.
+   */
+  async createPost(
+    accessToken: string,
+    authorUrn: string,
+    text: string,
+    imageUrns?: string[],
+    assertStillAuthorized?: () => Promise<{ success: false; error: string } | null>
+  ): Promise<string> {
     return this.safeRequest(async () => {
       console.log('[LinkedIn] createPost called for author:', authorUrn);
 
@@ -701,6 +715,15 @@ export class LinkedInService {
       }
 
 
+
+      // ENG-827: the true last moment — the next statement is the irreversible write,
+      // and everything above it (OG discovery, thumbnail upload) may have taken many
+      // seconds on a consent decision read before any of it started.
+      const withdrawn = await assertStillAuthorized?.();
+      if (withdrawn) {
+        console.warn('[LinkedIn] ENG-827: abandoning post — publish consent was withdrawn while the preview was being built.');
+        throw new PublishConsentWithdrawn(withdrawn.error);
+      }
 
       console.log('[LinkedIn] Sending post to LinkedIn API - commentary length:', payload.commentary?.length, ', hasArticle:', !!payload.content?.article);
       const response = await this.client.post('/rest/posts', payload, {

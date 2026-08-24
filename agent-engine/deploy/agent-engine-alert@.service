@@ -1,0 +1,20 @@
+[Unit]
+Description=Alert oncall that %i failed
+
+[Service]
+# Runs as agentengine-alert — a dedicated OS user distinct from agentengine
+# (not root — avoids privilege escalation if this unit is ever triggered
+# maliciously). Script/interpreter/venv live under /opt/agent-engine-alert,
+# root-owned and read/execute-only for both agentengine and
+# agentengine-alert. The one thing agentengine-alert can read that
+# agentengine cannot is alerter-sa-key.json (mode 0400, owned by
+# agentengine-alert) — that's what actually isolates this unit's GCP
+# identity from the monitored workload's. Deliberately NOT the
+# agentengine-writable checkout — the thing that reports agent-engine's
+# failure must not be modifiable, or impersonable, by agent-engine itself
+# if it's ever compromised.
+Type=oneshot
+User=agentengine-alert
+Group=agentengine-alert
+WorkingDirectory=/opt/agent-engine-alert
+ExecStart=/opt/agent-engine-alert/venv/bin/python /opt/agent-engine-alert/alert_oncall.py %i

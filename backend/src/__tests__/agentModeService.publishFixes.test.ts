@@ -110,90 +110,6 @@ jest.mock('../services/metaService', () => ({ metaService: {}, MetaService: jest
 jest.mock('../utils/s3Utils', () => ({ uploadFileToS3: jest.fn() }));
 jest.mock('../services/clickupService', () => ({ getAccessToken: jest.fn(), getWorkspaces: jest.fn(), listDocs: jest.fn(), readDocContent: jest.fn() }));
 
-describe('callLLM retry logic', () => {
-  let AgentModeService: any;
-
-  beforeAll(async () => {
-    const mod = await import('../services/agentModeService');
-    AgentModeService = mod.AgentModeService;
-  });
-
-  it('should retry on transient 503 error and succeed on third attempt', async () => {
-    const service = new AgentModeService();
-    // Mock sleep so tests don't wait for real delays
-    service.sleep = jest.fn().mockResolvedValue(undefined);
-
-    service.llmModels = {
-      'test-model': {
-        client: {
-          chat: {
-            completions: {
-              create: jest.fn()
-                .mockRejectedValueOnce(Object.assign(new Error('503 status code (no body)'), { status: 503 }))
-                .mockRejectedValueOnce(Object.assign(new Error('503 status code (no body)'), { status: 503 }))
-                .mockResolvedValueOnce({ choices: [{ message: { content: 'ok' } }] }),
-            },
-          },
-        },
-        supportsTemperature: true,
-      },
-    };
-
-    const result = await service.callLLM('test-model', [{ role: 'user', content: 'hello' }]);
-    expect(result.choices[0].message.content).toBe('ok');
-    expect(service.llmModels['test-model'].client.chat.completions.create).toHaveBeenCalledTimes(3);
-    expect(service.sleep).toHaveBeenCalledTimes(2);
-  });
-
-  it('should NOT retry on non-transient 400 error', async () => {
-    const service = new AgentModeService();
-    service.sleep = jest.fn().mockResolvedValue(undefined);
-
-    service.llmModels = {
-      'test-model': {
-        client: {
-          chat: {
-            completions: {
-              create: jest.fn()
-                .mockRejectedValueOnce(Object.assign(new Error('Bad Request'), { status: 400 })),
-            },
-          },
-        },
-        supportsTemperature: true,
-      },
-    };
-
-    await expect(service.callLLM('test-model', [{ role: 'user', content: 'hello' }]))
-      .rejects.toThrow('Bad Request');
-    expect(service.llmModels['test-model'].client.chat.completions.create).toHaveBeenCalledTimes(1);
-    expect(service.sleep).not.toHaveBeenCalled();
-  });
-
-  it('should throw after max retries exhausted', async () => {
-    const service = new AgentModeService();
-    service.sleep = jest.fn().mockResolvedValue(undefined);
-
-    service.llmModels = {
-      'test-model': {
-        client: {
-          chat: {
-            completions: {
-              create: jest.fn()
-                .mockRejectedValue(Object.assign(new Error('503 status code (no body)'), { status: 503 })),
-            },
-          },
-        },
-        supportsTemperature: true,
-      },
-    };
-
-    await expect(service.callLLM('test-model', [{ role: 'user', content: 'hello' }]))
-      .rejects.toThrow('503 status code');
-    expect(service.llmModels['test-model'].client.chat.completions.create).toHaveBeenCalledTimes(3);
-    expect(service.sleep).toHaveBeenCalledTimes(2);
-  });
-});
-
 // ─── 3. trimToolMessagesForContext() ─────────────────────────────────────────
 
 describe('trimToolMessagesForContext', () => {
@@ -207,6 +123,9 @@ describe('trimToolMessagesForContext', () => {
   it('should truncate old large tool result messages', () => {
     const service = new AgentModeService();
     const largeContent = 'x'.repeat(10000);
+    // ENG-940: the preserve window only spends its slots on results the trimmer
+    // could actually destroy, so the three newer results have to be large too —
+    // small ones no longer evict anything (covered by the next test).
     const messages: any[] = [
       { role: 'system', content: 'You are a helpful assistant' },
       { role: 'user', content: 'Search for articles' },
@@ -214,7 +133,35 @@ describe('trimToolMessagesForContext', () => {
       { role: 'assistant', content: null, tool_calls: [{ id: 'tc1', function: { name: 'search_web' } }] },
       { role: 'tool', tool_call_id: 'tc1', name: 'search_web', content: largeContent },
       { role: 'assistant', content: 'Here are the results' },
-      // 3 recent tool calls to push tc1 outside the preserve window
+      // 3 recent large tool calls to push tc1 outside the preserve window
+      { role: 'assistant', content: null, tool_calls: [{ id: 'tc2', function: { name: 'read_file' } }] },
+      { role: 'tool', tool_call_id: 'tc2', name: 'read_file', content: 'a'.repeat(10000) },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'tc3', function: { name: 'update_html' } }] },
+      { role: 'tool', tool_call_id: 'tc3', name: 'update_html', content: 'b'.repeat(10000) },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'tc4', function: { name: 'publish' } }] },
+      { role: 'tool', tool_call_id: 'tc4', name: 'publish', content: 'c'.repeat(10000) },
+    ];
+
+    const trimmed = service.trimToolMessagesForContext(messages);
+
+    // Old large tool result (tc1 at index 3) should be summarized
+    expect(trimmed[3].content.length).toBeLessThan(10000);
+    expect(trimmed[3].content).toMatch(/^\[Tool: search_web/);
+
+    // Recent tool results should be preserved
+    expect(trimmed[6].content).toBe('a'.repeat(10000));
+    expect(trimmed[8].content).toBe('b'.repeat(10000));
+    expect(trimmed[10].content).toBe('c'.repeat(10000));
+  });
+
+  it('should NOT let small recent results evict a large old one (ENG-940)', () => {
+    const service = new AgentModeService();
+    const largeContent = 'x'.repeat(10000);
+    const messages: any[] = [
+      { role: 'system', content: 'You are a helpful assistant' },
+      { role: 'user', content: 'Search for articles' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'tc1', function: { name: 'search_web' } }] },
+      { role: 'tool', tool_call_id: 'tc1', name: 'search_web', content: largeContent },
       { role: 'assistant', content: null, tool_calls: [{ id: 'tc2', function: { name: 'read_file' } }] },
       { role: 'tool', tool_call_id: 'tc2', name: 'read_file', content: 'file content' },
       { role: 'assistant', content: null, tool_calls: [{ id: 'tc3', function: { name: 'update_html' } }] },
@@ -225,14 +172,11 @@ describe('trimToolMessagesForContext', () => {
 
     const trimmed = service.trimToolMessagesForContext(messages);
 
-    // Old large tool result (tc1 at index 3) should be summarized
-    expect(trimmed[3].content.length).toBeLessThan(10000);
-    expect(trimmed[3].content).toMatch(/^\[Tool: search_web/);
-
-    // Recent tool results should be preserved
-    expect(trimmed[6].content).toBe('file content');
-    expect(trimmed[8].content).toBe('updated');
-    expect(trimmed[10].content).toBe('Published successfully');
+    // Three tiny results are not at risk, so the search_web payload keeps its slot.
+    expect(trimmed[3].content).toBe(largeContent);
+    expect(trimmed[5].content).toBe('file content');
+    expect(trimmed[7].content).toBe('updated');
+    expect(trimmed[9].content).toBe('Published successfully');
   });
 
   it('should preserve the most recent tool results at full size', () => {

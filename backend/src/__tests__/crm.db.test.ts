@@ -95,6 +95,55 @@ describe('CRM Database Service', () => {
       expect(mockDocumentClientMethods.put).toHaveBeenCalled();
       expect(result.name).toBe(name);
     });
+
+    // Idempotent-create support (ENG-524): a caller that needs a deterministic,
+    // race-safe "create if absent" (e.g. one auto-created list per user, safe
+    // across multiple backend instances) can pass an explicit listId. This
+    // must NOT change behavior for the many existing callers that omit it.
+    it('uses the explicit listId verbatim when provided, instead of generating a random one', async () => {
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+
+      const result = await crmDb.createLeadList(
+        'user1', 'Test List', undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+        'list_deterministic_id',
+      );
+
+      expect(result.listId).toBe('list_deterministic_id');
+    });
+
+    it('adds a ConditionExpression guarding against overwriting an existing item when an explicit listId is given', async () => {
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+
+      await crmDb.createLeadList(
+        'user1', 'Test List', undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+        'list_deterministic_id',
+      );
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.ConditionExpression).toBe('attribute_not_exists(listId)');
+    });
+
+    it('does not add a ConditionExpression when no explicit listId is given (existing random-ID behavior unchanged)', async () => {
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+
+      await crmDb.createLeadList('user1', 'Test List');
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.ConditionExpression).toBeUndefined();
+    });
+
+    it('propagates a ConditionalCheckFailedException when the explicit listId already exists (lost the create race)', async () => {
+      const conditionalError: any = new Error('The conditional request failed');
+      conditionalError.code = 'ConditionalCheckFailedException';
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockRejectedValue(conditionalError) });
+
+      await expect(
+        crmDb.createLeadList(
+          'user1', 'Test List', undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+          'list_deterministic_id',
+        ),
+      ).rejects.toMatchObject({ code: 'ConditionalCheckFailedException' });
+    });
   });
 
   describe('getLeadListById', () => {
@@ -788,6 +837,54 @@ describe('CRM Database Service', () => {
       mergeSpy.mockRestore();
     });
 
+    // Greptile P1 on #2291: internal per-booking idempotency markers (e.g. Calendly
+    // webhook completion flags) must never show up in CSV exports or the Configure
+    // Display Fields UI the way customFields does — `system` is the existing sidecar
+    // map for exactly this (see updateLead's `system` param), but setLeadFields only
+    // supported atomic writes to customFields/enrichmentMetadata, not system, forcing
+    // callers needing atomicity to (mis)use customFields instead.
+    it('writes system sub-keys atomically, bootstraps the system map, and never triggers the customFields fieldNames sync', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        system: { 'hubspotSynced::https://api.calendly.com/x/invitees/y': true },
+      });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      const bootstrap = mockDocumentClientMethods.update.mock.calls[0][0];
+      // `system` is a DynamoDB reserved keyword — must be a #system placeholder, not
+      // the literal attribute name (confirmed live against a real table: unescaped,
+      // this throws ValidationException, invisible to a mocked-DynamoDB unit test).
+      expect(bootstrap.UpdateExpression).toContain('#system = if_not_exists(#system, :emptyMap)');
+      expect(bootstrap.ExpressionAttributeNames['#system']).toBe('system');
+      const main = mockDocumentClientMethods.update.mock.calls[1][0];
+      expect(main.UpdateExpression).toContain('#system.#sys0 = :sys0');
+      expect(main.ExpressionAttributeNames['#system']).toBe('system');
+      expect(main.ExpressionAttributeValues[':sys0']).toBe(true);
+      // system keys are internal bookkeeping, not customer-visible custom fields —
+      // must never register on the list's fieldNames.
+      expect(mergeSpy).not.toHaveBeenCalled();
+
+      mergeSpy.mockRestore();
+    });
+
+    it('removes system sub-keys via removeSystemKeys', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        removeSystemKeys: ['stale_marker'],
+      });
+
+      const main = mockDocumentClientMethods.update.mock.calls[1][0];
+      expect(main.UpdateExpression).toContain('REMOVE');
+      expect(main.UpdateExpression).toContain('system.#rmsys0');
+    });
+
     it('uses if_not_exists in all SET clauses when ifNotExists=true', async () => {
       mockDocumentClientMethods.update.mockReturnValue({
         promise: jest.fn().mockResolvedValue({}),
@@ -925,6 +1022,81 @@ describe('CRM Database Service', () => {
     });
   });
 
+  // Greptile P1 on #2291 (round 15): a stale-reclamation race in the async job
+  // queue can, in the worst case, let two processor instances both start
+  // processing the SAME booking concurrently. Per-step completion markers alone
+  // stop a THIRD run from repeating a step, but two instances racing to the same
+  // not-yet-done step would both pass that check. claimLeadStepOnce is the actual
+  // mutex — a DynamoDB conditional write, not a probability reduction — so at most
+  // one instance ever wins the claim and performs the real side effect.
+  describe('claimLeadStepOnce', () => {
+    it('returns true and SETs the key (with a claimedAt timestamp) when nobody else holds it', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      const result = await crmDb.claimLeadStepOnce('list_123', 'lead_123', 'hubspotSynced::uri-1');
+
+      expect(result).toBe(true);
+      // 1: bootstrap the system map, 2: the conditional claim SET.
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      const claimCall = mockDocumentClientMethods.update.mock.calls[1][0];
+      // `system` is a DynamoDB reserved keyword — must be a #system placeholder, not
+      // the literal attribute name (confirmed live against a real table).
+      expect(claimCall.UpdateExpression).toContain('#system.#k = :claim');
+      expect(claimCall.ExpressionAttributeNames['#system']).toBe('system');
+      expect(claimCall.ExpressionAttributeValues[':claim']).toEqual({
+        status: 'in_progress',
+        claimedAt: expect.any(String),
+      });
+      // Greptile P1 on #2291 (round 17): the release-on-failure write is itself
+      // best-effort — if it also fails, a claim with no timestamp would stay
+      // 'in_progress' forever with no way to ever recover it. The condition must
+      // allow reclaiming, not just claiming fresh.
+      expect(claimCall.ConditionExpression).toBe(
+        'attribute_not_exists(#system.#k) OR (#system.#k.#status = :inProgress AND #system.#k.#claimedAt < :staleThreshold)',
+      );
+    });
+
+    it('returns false without throwing when the key is claimed by a NOT-yet-stale concurrent run', async () => {
+      mockDocumentClientMethods.update
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) }) // bootstrap succeeds
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }) }); // claim loses — real DynamoDB evaluates the OR condition itself; the mock just simulates "condition failed"
+
+      const result = await crmDb.claimLeadStepOnce('list_123', 'lead_123', 'hubspotSynced::uri-1');
+
+      expect(result).toBe(false);
+    });
+
+    it('returns false without throwing when the lead itself does not exist (bootstrap condition fails)', async () => {
+      mockDocumentClientMethods.update.mockReturnValueOnce({
+        promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }),
+      });
+
+      const result = await crmDb.claimLeadStepOnce('list_123', 'missing-lead', 'hubspotSynced::uri-1');
+
+      expect(result).toBe(false);
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('sets the stale threshold to CLAIM_STALE_MS (5 minutes) in the past', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      const before = Date.now();
+
+      await crmDb.claimLeadStepOnce('list_123', 'lead_123', 'hubspotSynced::uri-1');
+
+      const claimCall = mockDocumentClientMethods.update.mock.calls[1][0];
+      const staleThreshold = new Date(claimCall.ExpressionAttributeValues[':staleThreshold']).getTime();
+      const claimedAt = new Date(claimCall.ExpressionAttributeValues[':claim'].claimedAt).getTime();
+      // staleThreshold ~5 minutes before claimedAt (allow a little test-run slack).
+      expect(claimedAt - staleThreshold).toBeGreaterThan(4.9 * 60 * 1000);
+      expect(claimedAt - staleThreshold).toBeLessThan(5.1 * 60 * 1000);
+      expect(claimedAt).toBeGreaterThanOrEqual(before);
+    });
+  });
+
   describe('mergeFieldNames', () => {
     it('atomically appends via list_append without a read-modify-write', async () => {
       // The previous implementation read-then-set, which loses concurrent writes.
@@ -1024,6 +1196,42 @@ describe('CRM Database Service', () => {
 
       expect(result.successCount).toBe(2);
       expect(result.errorCount).toBe(0);
+    });
+
+    // ENG-1002: callers that preview "what was imported" need to map each
+    // created leadId back to the input row it came from. Without sourceIndex
+    // there is no join key for rows that carry no email (LinkedIn-sourced
+    // leads), so previews get built from the wrong records.
+    it('reports the input-array index each created lead came from', async () => {
+      const listId = 'list_123';
+      const leads = [
+        { linkedin: 'https://www.linkedin.com/in/already-there', firstName: 'Dup', lastName: 'Licate' },
+        { linkedin: 'https://www.linkedin.com/in/brand-new', firstName: 'Brand', lastName: 'New' },
+      ];
+
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [
+            { leadId: 'lead-existing', listId, linkedin: 'https://www.linkedin.com/in/already-there', firstName: 'Dup' },
+          ],
+        }),
+      });
+      mockDocumentClientMethods.batchWrite.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      const result = await crmDb.batchCreateLeads(listId, leads);
+
+      expect(result.newCount).toBe(1);
+      expect(result.created).toHaveLength(1);
+      // Index 0 merged into the existing lead; only index 1 was written.
+      expect(result.created[0].sourceIndex).toBe(1);
     });
 
     it('should merge leads with existing emails', async () => {
@@ -2116,4 +2324,416 @@ describe('CRM Database Service', () => {
       expect(params.ExpressionAttributeValues).not.toHaveProperty(':linkedin');
     });
   });
+
+  // ENG-1002 follow-up: `batchCreateLeads` is the single choke point every CRM
+  // write goes through — CSV import, bulk import, outreach save,
+  // import_leads_from_search AND add_leads_to_list. Filtering anonymized hits
+  // only in the import path left `add_leads_to_list` as an open bypass: an
+  // agent that pipes `linkedin_outreach search-people` results straight into it
+  // re-creates the exact nameless, un-dedupable rows ENG-1002 fixed.
+  //
+  // The rule here is deliberately NARROWER than isAnonymizedSearchLead: it
+  // rejects ONLY the explicit LinkedIn placeholder name. The search-boundary
+  // rule also drops rows with no name and no profile URL, which at this
+  // boundary would silently destroy legitimate email-only leads (newsletter
+  // signups, form fills, a CSV of bare addresses).
+  describe('anonymized LinkedIn placeholder guard (write choke point)', () => {
+    const listId = 'list_guard';
+
+    const primeMocks = () => {
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [] }),
+      });
+      mockDocumentClientMethods.batchWrite.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+    };
+
+    beforeEach(primeMocks);
+
+    it('refuses the English placeholder, whatever the caller', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'LinkedIn', lastName: 'Member' },
+      ]);
+
+      expect(result.newCount).toBe(0);
+      expect(result.created).toHaveLength(0);
+      expect(result.anonymizedSkipped).toBe(1);
+    });
+
+    it('refuses the localized and variant spellings', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'LinkedIn', lastName: 'User' },
+        { firstName: 'Anonymous', lastName: 'LinkedIn Member' },
+        { firstName: 'Miembro de', lastName: 'LinkedIn' },
+        { firstName: '\u9886\u82f1\u4f1a\u5458' },
+      ]);
+
+      expect(result.newCount).toBe(0);
+      expect(result.anonymizedSkipped).toBe(4);
+    });
+
+    it('does NOT drop an email-only lead that has no name at all', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { email: 'nobody@example.com' },
+      ]);
+
+      expect(result.anonymizedSkipped).toBe(0);
+      expect(result.newCount).toBe(1);
+    });
+
+    it('does NOT drop a real person whose name carries a LinkedIn badge', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'Jane', lastName: 'Doe | LinkedIn Top Voice', linkedin: 'https://www.linkedin.com/in/janedoe' },
+      ]);
+
+      expect(result.anonymizedSkipped).toBe(0);
+      expect(result.newCount).toBe(1);
+    });
+
+    it('keeps sourceIndex aligned to the ORIGINAL rows when it skips one', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'LinkedIn', lastName: 'Member' },
+        { firstName: 'Real', lastName: 'Person', linkedin: 'https://www.linkedin.com/in/realperson' },
+      ]);
+
+      expect(result.anonymizedSkipped).toBe(1);
+      expect(result.created).toHaveLength(1);
+      // Row 1 was skipped, so the surviving write must still report index 1 —
+      // re-indexing here would mis-attribute every downstream preview.
+      expect(result.created[0].sourceIndex).toBe(1);
+    });
+
+    // Greptile P1 on #2362: a refused row is neither a success nor an error,
+    // so every caller that reports totals must be able to account for it —
+    // otherwise a 100-row CSV reports 97 and the other 3 just vanish.
+    it('leaves every input row accounted for across the reported counts', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'LinkedIn', lastName: 'Member' },
+        { firstName: 'Dana', lastName: 'Reeves', linkedin: 'https://www.linkedin.com/in/danareeves-acct' },
+        { firstName: 'LinkedIn', lastName: 'User' },
+      ]);
+
+      const accountedFor = result.successCount + result.errorCount + result.anonymizedSkipped;
+      expect(accountedFor).toBe(3);
+      expect(result.anonymizedSkipped).toBe(2);
+    });
+
+    // Greptile P1 on #2362 (second round) flagged the catch path for zeroing
+    // anonymizedSkipped. The shape there is corrected, but it is NOT asserted
+    // here on purpose: handleDynamoDbError always rethrows, so batchCreateLeads
+    // propagates the failure instead of returning that object, and a test
+    // pretending to reach it would only be pinning dead code.
+    // ENG-1133: incrementLeadCount / updateFieldNames run AFTER the rows are
+    // written. Letting either unwind into the outer catch threw away the ledger
+    // for an import that had already persisted — the caller was told the whole
+    // thing failed and would re-send rows that are in the list. Denormalized
+    // bookkeeping is recoverable; the ledger is not.
+    it('keeps the import and its ledger when post-write bookkeeping fails', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('DynamoDB unavailable')),
+      });
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'LinkedIn', lastName: 'Member' },
+        { firstName: 'Dana', lastName: 'Reeves', linkedin: 'https://www.linkedin.com/in/danareeves-fail' },
+      ]);
+
+      expect(result.rowOutcomes).toEqual(['anonymized_skipped', 'created']);
+      expect(result.created).toHaveLength(1);
+      expect(result.anonymizedSkipped).toBe(1);
+    });
+
+    it('propagates a failure that lands before any row is written', async () => {
+      // The pre-read of the list's existing leads is the surviving way into the
+      // outer catch: nothing has been written, so there is no ledger to lose.
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('DynamoDB unavailable')),
+      });
+
+      await expect(
+        crmDb.batchCreateLeads(listId, [
+          { firstName: 'Dana', lastName: 'Reeves', linkedin: 'https://www.linkedin.com/in/danareeves-fail' },
+        ]),
+      ).rejects.toThrow('DynamoDB unavailable');
+    });
+
+    it('imports a clean batch untouched', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'Dana', lastName: 'Reeves', linkedin: 'https://www.linkedin.com/in/danareeves' },
+        { firstName: 'Omar', lastName: 'Haddad', email: 'omar@example.com' },
+      ]);
+
+      expect(result.anonymizedSkipped).toBe(0);
+      expect(result.newCount).toBe(2);
+      expect(result.created).toHaveLength(2);
+    });
+  });
+
+  // ENG-1133: a large import that dies part-way (agent-mode whole-turn cap)
+  // can only be resumed if the caller can tell, row by row, what landed and
+  // what did not. Aggregate counts alone ("25 new lead(s) created") make a
+  // resume indistinguishable from a restart.
+  describe('per-row import ledger (resumable partial imports)', () => {
+    const listId = 'list_ledger';
+
+    const primeWrites = () => {
+      mockDocumentClientMethods.batchWrite.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+    };
+
+    const primeExisting = (items: any[]) => {
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: items }),
+      });
+    };
+
+    beforeEach(primeWrites);
+
+    it('classifies every input row in rowOutcomes, aligned to input order', async () => {
+      primeExisting([
+        { leadId: 'lead_merge', listId, email: 'merge@example.com', firstName: 'Old' },
+        { leadId: 'lead_same', listId, email: 'same@example.com', firstName: 'Same', lastName: 'Person' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { email: 'brand-new@example.com', firstName: 'Brand', lastName: 'New' },
+        { email: 'merge@example.com', firstName: 'Updated' },
+        { email: 'same@example.com', firstName: 'Same', lastName: 'Person' },
+        { firstName: 'LinkedIn', lastName: 'Member' },
+        { email: 'brand-new@example.com', firstName: 'Dup', lastName: 'Row' },
+      ]);
+
+      expect(result.rowOutcomes).toEqual([
+        'created',
+        'merged',
+        'already_present',
+        'anonymized_skipped',
+        'duplicate_in_request',
+      ]);
+      // A row that was already in the list, unchanged, used to vanish from
+      // every counter — the resume path read that as "nothing happened".
+      expect(result.alreadyPresentCount).toBe(1);
+      expect(result.rowOutcomes).toHaveLength(5);
+    });
+
+    it('marks rows as failed — never unprocessed — when their batch write fails', async () => {
+      primeExisting([]);
+      mockDocumentClientMethods.batchWrite.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('ProvisionedThroughputExceeded')),
+      });
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { email: 'a@example.com' },
+        { email: 'b@example.com' },
+      ]);
+
+      expect(result.rowOutcomes).toEqual(['failed', 'failed']);
+      expect(result.errorCount).toBe(2);
+    });
+
+    // The customer report calls this one out directly: "rows without email may
+    // not dedupe safely". Without an identity axis for them, re-submitting a
+    // partially-imported CSV duplicates every email-less row it already wrote.
+    it('dedupes an email-less, linkedin-less row against the list by name + company', async () => {
+      primeExisting([
+        { leadId: 'lead_ann', listId, firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'Ann', lastName: 'Lee', company: 'Acme', title: 'CTO' },
+      ], { dedupeByNameCompany: true });
+
+      expect(result.newCount).toBe(0);
+      expect(result.rowOutcomes).toEqual(['merged']);
+    });
+
+    it('still creates an email-less row when no existing lead shares its name + company', async () => {
+      primeExisting([
+        { leadId: 'lead_ann', listId, firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'Ann', lastName: 'Lee', company: 'Globex' },
+      ], { dedupeByNameCompany: true });
+
+      expect(result.newCount).toBe(1);
+      expect(result.rowOutcomes).toEqual(['created']);
+    });
+
+    // Narrow by design: a row that carries its own identity (email or
+    // LinkedIn URL) must keep the existing behaviour, or two genuinely
+    // different people who share a name at one company get silently merged.
+    it('does not name-match a row that carries its own email identity', async () => {
+      primeExisting([
+        { leadId: 'lead_ann', listId, firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { email: 'ann.lee.2@example.com', firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ], { dedupeByNameCompany: true });
+
+      expect(result.newCount).toBe(1);
+      expect(result.rowOutcomes).toEqual(['created']);
+    });
+
+    // ENG-1133 acceptance criterion 1: an import that cannot finish must RETURN
+    // a partial naming the rows it never reached, rather than run until a
+    // caller-level timeout kills the turn with no tool result at all. Without a
+    // budget `unprocessed` was unreachable — every path assigned a terminal
+    // outcome — so the resumable contract could never actually fire.
+    describe('write budget', () => {
+      /** Push the clock past the deadline once the first unit of work is done. */
+      const expireAfterFirstUnit = (budgetMs: number) => {
+        const start = Date.now();
+        let calls = 0;
+        jest.spyOn(Date, 'now').mockImplementation(() => {
+          calls++;
+          // Two reads happen before any row is written and must see budget
+          // left: the one that sets the deadline, and the one that bounds the
+          // first existing-lead page. Everything after them reads as expired.
+          return calls <= 2 ? start : start + budgetMs + 1;
+        });
+      };
+
+      afterEach(() => {
+        (Date.now as any).mockRestore?.();
+      });
+
+      it('stops on the budget and leaves the rows it never reached unprocessed', async () => {
+        // 30 rows = two write chunks (25 + 5). The first is unconditional, the
+        // second is past the deadline.
+        const rows = Array.from({ length: 30 }, (_, i) => ({ email: `budget${i}@example.com` }));
+        expireAfterFirstUnit(1000);
+
+        const result = await crmDb.batchCreateLeads(listId, rows, { deadlineMs: 1000 });
+
+        expect(result.newCount).toBe(25);
+        expect(result.rowOutcomes.filter((o: string) => o === 'created')).toHaveLength(25);
+        expect(result.rowOutcomes.filter((o: string) => o === 'unprocessed')).toHaveLength(5);
+        // Not billed as failures — those rows were never attempted, and a
+        // resume must retry them rather than treat them as rejected.
+        expect(result.errorCount).toBe(0);
+      });
+
+      it('stops the merge loop on the budget too', async () => {
+        // Merges are one sequential round-trip per row, so a file re-sent after
+        // a partial run — every row already present — is the slowest shape here
+        // and the one a resume produces. The budget has to bound it, not just
+        // the batched creates.
+        primeExisting([
+          { leadId: 'lead_m1', listId, email: 'm1@example.com', title: 'Old' },
+          { leadId: 'lead_m2', listId, email: 'm2@example.com', title: 'Old' },
+          { leadId: 'lead_m3', listId, email: 'm3@example.com', title: 'Old' },
+        ]);
+        expireAfterFirstUnit(1000);
+
+        const result = await crmDb.batchCreateLeads(listId, [
+          { email: 'm1@example.com', title: 'New' },
+          { email: 'm2@example.com', title: 'New' },
+          { email: 'm3@example.com', title: 'New' },
+        ], { deadlineMs: 1000 });
+
+        expect(result.rowOutcomes).toEqual(['merged', 'unprocessed', 'unprocessed']);
+      });
+
+      // The pre-read is O(list size) and runs before any row is written, so on
+      // a huge or throttled list it can burn the whole budget and let the
+      // caller's own timeout kill the turn with no ledger at all — the exact
+      // failure this ticket is about.
+      it('stops when the existing-lead pre-read cannot finish inside the budget', async () => {
+        // Every page reports another page behind it, so the pre-read would never
+        // end on its own. The budget has to end it.
+        mockDocumentClientMethods.query.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { leadId: 'next' } }),
+        });
+        expireAfterFirstUnit(1000);
+
+        const result = await crmDb.batchCreateLeads(
+          listId,
+          [{ email: 'preread@example.com' }],
+          { deadlineMs: 1000 },
+        );
+
+        expect(result.dedupeIncomplete).toBe(true);
+        // Nothing written: the dedupe maps are missing rows, so every unmatched
+        // row would be inserted a second time.
+        expect(result.newCount).toBe(0);
+        expect(result.mergedCount).toBe(0);
+        expect(result.rowOutcomes).toEqual(['unprocessed']);
+        expect(result.errors[0]).toMatch(/Could not read the existing leads/);
+      });
+
+      // Checking the clock between pages does not help if one page never comes
+      // back: the await holds and the check is never reached.
+      it('stops when a single existing-lead page stalls past the budget', async () => {
+        mockDocumentClientMethods.query.mockReturnValue({
+          promise: jest.fn().mockReturnValue(new Promise(() => {})),
+        });
+
+        const result = await crmDb.batchCreateLeads(
+          listId,
+          [{ email: 'stall@example.com' }],
+          { deadlineMs: 50 },
+        );
+
+        expect(result.dedupeIncomplete).toBe(true);
+        expect(result.newCount).toBe(0);
+        expect(result.rowOutcomes).toEqual(['unprocessed']);
+      });
+
+      it('does not flag an incomplete pre-read when the list reads cleanly', async () => {
+        primeExisting([{ leadId: 'lead_a', listId, email: 'a@example.com' }]);
+
+        const result = await crmDb.batchCreateLeads(
+          listId,
+          [{ email: 'b@example.com' }],
+          { deadlineMs: 1000 },
+        );
+
+        expect(result.dedupeIncomplete).toBe(false);
+        expect(result.newCount).toBe(1);
+      });
+
+      it('imports everything when no budget is given', async () => {
+        const rows = Array.from({ length: 30 }, (_, i) => ({ email: `nobudget${i}@example.com` }));
+
+        const result = await crmDb.batchCreateLeads(listId, rows);
+
+        expect(result.newCount).toBe(30);
+        expect(result.rowOutcomes.filter((o: string) => o === 'unprocessed')).toHaveLength(0);
+      });
+    });
+
+    // The name+company fallback is a GUESS — two different people with the same
+    // name at one company collapse into one. Callers that sync from a system
+    // with its own stable record ids (HubSpot, Attio) must never get it, so it
+    // is opt-in and OFF by default.
+    it('does not name-match at all unless the caller opts in', async () => {
+      primeExisting([
+        { leadId: 'lead_ann', listId, firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'Ann', lastName: 'Lee', company: 'Acme', title: 'CTO' },
+      ]);
+
+      expect(result.newCount).toBe(1);
+      expect(result.rowOutcomes).toEqual(['created']);
+    });
+  });
+
 });

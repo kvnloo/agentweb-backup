@@ -16,6 +16,8 @@ import {
   getPublicAllowedSkills,
   resolveSkillsToToolNames,
   findTiersAllowingSkill,
+  getAllowedFeatures,
+  isSubscriptionFeatureEnabled,
 } from '../services/subscriptionService';
 
 jest.mock('../services/settingsService', () => ({
@@ -92,6 +94,37 @@ describe('subscriptionService', () => {
     expect(t2).toBe('Free');
   });
 
+  it('uses an explicit feature entitlement without relying on the tier name', async () => {
+    mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Community' } as any);
+    mockedSettingsService.getSetting.mockResolvedValue({
+      settingValue: JSON.stringify([{
+        name: 'Community', allowedPages: ['/'], allowedSkills: [], allowedFeatures: ['scheduled_chats'],
+      }]),
+    } as any);
+
+    expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats']);
+  });
+
+  it('denies a feature when an admin explicitly omits it', async () => {
+    mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Community' } as any);
+    mockedSettingsService.getSetting.mockResolvedValue({
+      settingValue: JSON.stringify([{
+        name: 'Community', allowedPages: ['/'], allowedSkills: [], allowedFeatures: [],
+      }]),
+    } as any);
+
+    expect(await getAllowedFeatures('u1')).toEqual([]);
+  });
+
+  it('keeps legacy subscription rows permissive until an admin saves feature settings', async () => {
+    mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Legacy' } as any);
+    mockedSettingsService.getSetting.mockResolvedValue({
+      settingValue: JSON.stringify([{ name: 'Legacy', allowedPages: ['/'], allowedSkills: [] }]),
+    } as any);
+
+    expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats']);
+  });
+
   it('getUserSubscriptionType resolves an org member to the owner tier dynamically (ENG-288)', async () => {
     const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
     // Member record itself carries no paid tier — it must resolve from the owner.
@@ -129,6 +162,17 @@ describe('subscriptionService', () => {
 
     const tier = await getUserSubscriptionType('member-1');
     expect(tier).toBe('Pro');
+  });
+
+  it('keeps a transient org lookup distinct from an explicit feature denial', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockResolvedValueOnce({
+      userId: 'member-1', orgId: 'org-1', orgRole: 'member', subscriptionType: 'Free',
+    } as any);
+    mockedOrgDb.getOrgById.mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'));
+
+    expect(await isSubscriptionFeatureEnabled('member-1', 'scheduled_chats')).toBeNull();
+    expect(mockedSettingsService.getSetting).not.toHaveBeenCalled();
   });
 
   it('getUserSubscriptionType lets a member own ACTIVE subscription govern instead of the owner (regression: pvandervalk@xcures.com)', async () => {

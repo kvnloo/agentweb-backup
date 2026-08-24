@@ -1,4 +1,5 @@
 import { orgDb, userDb } from "./db";
+import { can } from "./orgAuthz";
 
 export interface ResolvedAnalyticsConfig {
   properties: Array<{ propertyId: string; label: string }>;
@@ -80,7 +81,7 @@ export async function resolveAnalyticsConfig(user: any): Promise<ResolvedAnalyti
   const org = await orgDb.getOrgById(user.orgId);
   if (!org) return buildBundle(user, "self"); // orgId set but no Org record → treat as solo
 
-  const isOwner = org.ownerUserId === user.userId;
+  const isOwner = can({ userId: user.userId, orgId: user.orgId, orgRole: (user as any).orgRole }, org, "org:configure");
   const isEditor =
     Array.isArray(org.shareSettings?.analytics?.editors) &&
     org.shareSettings!.analytics!.editors.includes(user.userId);
@@ -111,7 +112,7 @@ export async function resolveConfigTarget(user: any): Promise<ConfigTarget> {
   const org = await orgDb.getOrgById(user.orgId);
   if (!org) return { kind: "user", id: user.userId, canEdit: true, canView: true };
 
-  const isOwner = org.ownerUserId === user.userId;
+  const isOwner = can({ userId: user.userId, orgId: user.orgId, orgRole: (user as any).orgRole }, org, "org:configure");
   const isEditor =
     Array.isArray(org.shareSettings?.analytics?.editors) &&
     org.shareSettings!.analytics!.editors.includes(user.userId);

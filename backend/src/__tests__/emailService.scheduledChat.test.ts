@@ -171,6 +171,27 @@ describe('emailService.sendScheduledChatResultEmail', () => {
     expect(htmlContent).not.toContain('🔧');
   });
 
+  // CodeRabbit (PR #2383, pre-existing gap surfaced by this PR's own edits to
+  // the surrounding lines): scheduleName was interpolated raw into the HTML
+  // body/header — a schedule name containing markup renders unescaped in the
+  // recipient's email client. sendScheduleSourcingBlockTransitionEmail (added
+  // in the same PR) already escapes it; this brings the sibling function in
+  // line with that pattern.
+  it('HTML-escapes the schedule name so markup cannot alter the email or inject links', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(
+      'test@example.com',
+      '<script>alert(1)</script>Evil Schedule',
+      baseResult,
+      'schedule-123'
+    );
+
+    const [, , , htmlContent] = spy.mock.calls[0];
+    expect(htmlContent).not.toContain('<script>alert(1)</script>');
+    expect(htmlContent).toContain('&lt;script&gt;');
+  });
+
   it('shows correct success/failure indicators for function calls', async () => {
     const resultWithMixedFunctionDetails = {
       ...baseResult,

@@ -12,6 +12,17 @@ on:
         type: choice
         options:
           - prod
+      probe_dryrun:
+        # ENG-878: the lagging-rollup health probe only runs when EB's health
+        # rollup is still Grey/Red past the settle window, which has not
+        # happened since it shipped — so its four extra IAM actions have never
+        # executed for real. Setting this exercises the probe on an ordinary
+        # healthy deploy and logs what it saw. It cannot change the deploy's
+        # verdict; the deploy is already confirmed before it runs.
+        description: 'Exercise the EB health probe (observation only, cannot fail the deploy)'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: deploy-production
@@ -26,13 +37,15 @@ env:
 jobs:
   detect-changes:
     name: Detect changed projects
-    runs-on: ubuntu-latest
+    # ENG-1277: ubuntu-slim ($0.002/min vs $0.006) — a checkout + paths-filter
+    # read (or a two-line manual-trigger step), no docker, no build.
+    runs-on: ubuntu-slim
     outputs:
       backend: ${{ steps.filter.outputs.backend || steps.manual.outputs.backend }}
       partner: ${{ steps.filter.outputs.partner || steps.manual.outputs.partner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -62,12 +75,12 @@ jobs:
     environment: prod
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
@@ -146,6 +159,8 @@ jobs:
           EB_SOURCE_BUNDLE_S3_BUCKET: elasticbeanstalk-${{ env.AWS_REGION }}-992382574572
           EB_SOURCE_BUNDLE_S3_KEY: builds/${{ steps.version.outputs.version_label }}.zip
           EB_TOTAL_TIMEOUT_SECONDS: '2700'
+          # '1' only on a manual run that asked for it (ENG-878).
+          EB_HEALTH_PROBE_DRYRUN: ${{ inputs.probe_dryrun && '1' || '0' }}
         run: bash .github/scripts/eb-deploy.sh
 
       - name: Backend Deployment Status
@@ -166,12 +181,12 @@ jobs:
     environment: prod
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: 'npm'
           cache-dependency-path: partner-portal/package-lock.json
@@ -335,7 +350,7 @@ jobs:
       checks: read
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3

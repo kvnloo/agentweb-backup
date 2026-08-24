@@ -80,7 +80,7 @@ export function getPersistedBrandLogoUrl(
  */
 export async function resolveBrandGuidelinesForLoadedUser(
   user:
-    | { orgId?: string; brandGuidelines?: BrandGuidelinesLike | null }
+    | { userId?: string; orgId?: string; brandGuidelines?: BrandGuidelinesLike | null }
     | null
     | undefined,
 ): Promise<BrandGuidelinesLike | null> {
@@ -89,7 +89,13 @@ export async function resolveBrandGuidelinesForLoadedUser(
   if (user.orgId) {
     const { orgDb } = await import('../db');
     const org: any = await orgDb.getOrgById(user.orgId);
-    if (org?.brandGuidelines) brand = org.brandGuidelines;
+    if (org) {
+      // Org record first, then the org OWNER's record for an org that was never
+      // populated — otherwise a member of such an org generates creatives with
+      // no logo while the settings page shows one (ENG-927).
+      const { resolveOrgProfileField } = await import('../orgProfileResolver');
+      brand = (await resolveOrgProfileField(user, org, 'brandGuidelines')) ?? null;
+    }
   }
   return brand;
 }

@@ -231,6 +231,21 @@ function deriveDomainFromWebsite(website: string): string | null {
   }
 }
 
+// A domain is usable as a company-domain signal only when it could actually
+// be a real employer — CrmEnrichmentService.isPersonalDomain() already folds
+// in reserved/placeholder domains (ENG-968: example.com, company.com, ...)
+// alongside free-mail and institutional ones, so this single check is the
+// same bar `rawEmailDomain`/`hasBusinessEmailDomain` already apply. Every
+// domain that reaches Apollo, enrich.so, the broker chain, pattern-matching,
+// or gets persisted onto the lead's emailDomain field must go through this —
+// whether it came from the lead record directly or was derived from a
+// website/web-search result (CodeRabbit review on PR #2302).
+function sanitizeBusinessDomain(domain: string | null | undefined): string | undefined {
+  const d = typeof domain === 'string' ? domain.trim() : '';
+  if (!d || CrmEnrichmentService.isPersonalDomain(d)) return undefined;
+  return d;
+}
+
 export async function resolveIdentity(
   input: ResolveIdentityInput,
   deps: IdentityResolverDeps,
@@ -245,6 +260,32 @@ export async function resolveIdentity(
   // Email is normalized (trim+lowercase) once at entry so every downstream
   // dep sees the same cache key.
   let email = typeof lead.email === 'string' ? lead.email.trim().toLowerCase() : '';
+  // ENG-968: a reserved/filler address (queue-verify@example.com,
+  // test2@company.com) identifies nobody, yet as an anchor it still reaches
+  // every provider — sibling lookup pools other tenants' junk rows onto it, and
+  // the web-search tiers turn its domain into a plausible-looking company with
+  // an invented funding round and revenue. Drop it as an identity signal so the
+  // lead is resolvable only through a real one (linkedin / name+company) and
+  // otherwise trips the completeness gate below: a not-found the caller can see,
+  // instead of a fabrication indistinguishable from real data. The address stays
+  // on the lead — it is just never used to identify anyone.
+  const emailIsPlaceholder =
+    !!email && CrmEnrichmentService.isPlaceholderDomain(email.split('@')[1] || '');
+  if (emailIsPlaceholder) {
+    console.log(`${logTag} placeholder/test email domain — ignoring email as an identity signal`);
+    email = '';
+  }
+  // A lead enriched before this guard existed (or imported with the field set
+  // directly) can carry a placeholder OR personal emailDomain independently of
+  // email — Tier 0.5 and step 3.6 below persist `resolved.emailDomain` back
+  // onto the lead whenever they resolve a domain with no email to derive it
+  // from. Every downstream read of `lead.emailDomain` must go through this
+  // sanitized value instead of the raw field, or a stale `emailDomain` reaches
+  // Apollo's org match, enrich.so, the broker chain and pattern-matching on
+  // every later run even after email itself is dropped above. This is a
+  // company-domain SIGNAL, same as rawEmailDomain below, not an identity
+  // anchor — held to the same isPersonalDomain bar, not just placeholder.
+  const leadEmailDomain = sanitizeBusinessDomain(lead.emailDomain);
   const linkedinUrl = typeof lead.linkedin === 'string' ? lead.linkedin.trim() : '';
   const hasName =
     typeof lead.firstName === 'string' && lead.firstName.trim() !== '' &&
@@ -374,11 +415,21 @@ export async function resolveIdentity(
             websiteAccepted = false;
           }
         }
+        // A "resolved" website is not real when it isn't even a plausible
+        // business domain — a hallucinated https://example.com is exactly
+        // how ENG-968's original fabrication started. Reject it outright
+        // (website, company and emailDomain all gated on the same accept)
+        // rather than only filtering the derived emailDomain, so a bad
+        // result can't still poison `resolved.website`/`resolved.company`.
+        if (websiteAccepted && !sanitizeBusinessDomain(deriveDomainFromWebsite(domainResult.website))) {
+          console.warn(`${logTag} tier 0.5 resolved website is not a business domain — rejecting`);
+          websiteAccepted = false;
+        }
         if (websiteAccepted) {
           resolved.website = domainResult.website;
           meta.website = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
           const derivedDomain = deriveDomainFromWebsite(domainResult.website);
-          if (derivedDomain && !lead.emailDomain && !resolved.emailDomain) {
+          if (derivedDomain && !leadEmailDomain && !resolved.emailDomain) {
             resolved.emailDomain = derivedDomain;
             meta.emailDomain = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
           }
@@ -474,9 +525,9 @@ export async function resolveIdentity(
   const firstNameEff = lead.firstName || resolved.firstName;
   const lastNameEff = lead.lastName || resolved.lastName;
   const domainForApollo =
-    lead.emailDomain || resolved.emailDomain ||
+    leadEmailDomain || resolved.emailDomain ||
     (rawEmailDomain && !CrmEnrichmentService.isPersonalDomain(rawEmailDomain) ? rawEmailDomain : undefined) ||
-    deriveDomainFromWebsite(lead.website || resolved.website || '') ||
+    sanitizeBusinessDomain(deriveDomainFromWebsite(lead.website || resolved.website || '')) ||
     undefined;
   const companyForApollo = lead.company || resolved.company;
   const hasNameOrg = !!(firstNameEff && lastNameEff && (domainForApollo || companyForApollo));
@@ -632,9 +683,9 @@ export async function resolveIdentity(
   // it the domain is only discovered later in the waterfall, so email
   // resolution would otherwise need a second enrichment run.
   const domainKnown = !!(
-    lead.emailDomain || resolved.emailDomain ||
+    leadEmailDomain || resolved.emailDomain ||
     (rawEmailDomain && hasBusinessEmailDomain) ||
-    lead.website || resolved.website
+    sanitizeBusinessDomain(deriveDomainFromWebsite(lead.website || resolved.website || ''))
   );
   if (!email && needsPersonFields && resolved.company && !lead.company && !domainKnown) {
     try {
@@ -646,7 +697,10 @@ export async function resolveIdentity(
         lastName: lead.lastName || resolved.lastName || undefined,
       });
       if (dr?.website) {
-        const derived = deriveDomainFromWebsite(dr.website);
+        // Same standard as Tier 0.5: a resolved website that isn't even a
+        // plausible business domain (a hallucinated example.com) must not
+        // be stored as website OR derived into emailDomain.
+        const derived = sanitizeBusinessDomain(deriveDomainFromWebsite(dr.website));
         if (derived) {
           if (!lead.website && !resolved.website) {
             resolved.website = dr.website;
@@ -655,6 +709,8 @@ export async function resolveIdentity(
           resolved.emailDomain = derived;
           meta.emailDomain = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
           console.log(`${logTag} step 3.6 domain-from-company website=${dr.website} emailDomain=${derived}`);
+        } else {
+          console.warn(`${logTag} step 3.6 resolved website is not a business domain — rejecting`);
         }
       }
     } catch (err) {
@@ -663,11 +719,11 @@ export async function resolveIdentity(
   }
 
   // 4. Derive emailDomain from email if present. Pure local op, no API call.
-  if (email && !lead.emailDomain) {
-    const derived = extractDomainFromEmail(email);
+  if (email && !leadEmailDomain) {
+    const derived = sanitizeBusinessDomain(extractDomainFromEmail(email));
     if (derived) resolved.emailDomain = derived;
   }
-  const emailDomain = lead.emailDomain || resolved.emailDomain;
+  const emailDomain = leadEmailDomain || resolved.emailDomain;
 
   // (Tier 5 merged into unified Apollo call above.)
 
@@ -705,7 +761,7 @@ export async function resolveIdentity(
   // (emailDomain or company). Respects the same emailStatus gate as the
   // unified Apollo Tier 3: weak signal (no linkedin) → only verified/unverified/
   // extrapolated accepted; strong signal (has linkedin) → anything except guessed.
-  const emailDomainForBroker = lead.emailDomain || resolved.emailDomain;
+  const emailDomainForBroker = leadEmailDomain || resolved.emailDomain;
   const firstNameForBroker = lead.firstName || resolved.firstName;
   const lastNameForBroker = lead.lastName || resolved.lastName;
   const companyForBroker = lead.company || resolved.company;
@@ -744,7 +800,7 @@ export async function resolveIdentity(
   // firstName + lastName are known. Does NOT require leadHint. Quality is
   // inherent (enrich.so deliverability check); no emailStatus gate needed.
   let emailPattern: string | undefined;
-  const emailDomainForPatterns = lead.emailDomain || resolved.emailDomain;
+  const emailDomainForPatterns = leadEmailDomain || resolved.emailDomain;
   const firstNameForPatterns = lead.firstName || resolved.firstName;
   const lastNameForPatterns = lead.lastName || resolved.lastName;
   if (!email && emailDomainForPatterns && firstNameForPatterns && lastNameForPatterns) {
@@ -773,8 +829,8 @@ export async function resolveIdentity(
 
   // After Tier 6.5 / 7: re-derive emailDomain from the newly-found email
   // when neither the lead nor the resolved object already has one.
-  if (email && !lead.emailDomain && !resolved.emailDomain) {
-    const derived = extractDomainFromEmail(email);
+  if (email && !leadEmailDomain && !resolved.emailDomain) {
+    const derived = sanitizeBusinessDomain(extractDomainFromEmail(email));
     if (derived) resolved.emailDomain = derived;
   }
 
@@ -843,6 +899,10 @@ export async function resolveIdentity(
     // otherwise "LinkedIn only" would still write the company discovered
     // while resolving the LinkedIn URL.
     if (input.excludePersistFields?.has(key)) continue;
+    // The lead's own address was dropped as an anchor above, so the usual
+    // "only fill an empty field" guard no longer protects it — an email found
+    // via another signal must not silently replace what the user imported.
+    if (key === 'email' && emailIsPlaceholder) continue;
     if (typeof value === 'string' && value.length > 0) {
       writableFields[key] = value;
     }

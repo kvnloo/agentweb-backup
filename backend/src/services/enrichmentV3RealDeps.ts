@@ -13,8 +13,9 @@ import { getEnrichSoService } from './enrichSoService';
 import type { MappedPerson, MappedOrganization } from './apolloFieldMapper';
 import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
+import { usablePublicIdentifier } from '../utils/linkedInAnonymizedProfile';
 import { sanitizePhone } from '../utils/phoneValidation';
-import { nameTokensMatch, normalizeNameToken } from '../utils/nameMatch';
+import { nameTokensMatch, unipileNameMatches } from '../utils/nameMatch';
 import type { IdentityResolverDeps } from './enrichmentIdentityResolver';
 import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityResolver';
 import { runWaterfall as pureRunWaterfall, type LLMFilledValue, type EnrichSoFetchResult } from './enrichmentGroupWaterfall';
@@ -36,8 +37,8 @@ import { extractJson } from './util/extractJson';
 import { getUnipileCompanyService } from './unipileCompanyServiceFactory';
 import { getUnipileProfileService } from './unipileProfileServiceFactory';
 
-// Models — match what v2 enrichment uses (gpt-5-chat-2 via Azure OpenAI; see
-// `crmEnrichmentService.ts:260-261`). Overridable via env for cost tuning.
+// Logical model defaults preserve existing settings while callLLM normalizes
+// retired IDs and owns OpenRouter transport, fallback, and metering.
 const EXTRACT_MODEL      = process.env.CRM_ENRICH_V3_EXTRACT_MODEL      || 'gpt-5-chat-2';
 const CRITIC_MODEL       = process.env.CRM_ENRICH_V3_CRITIC_MODEL       || 'gpt-5-chat-2';
 // The default deployment (gpt-5-chat-2) rejects ANY non-default temperature with
@@ -51,9 +52,8 @@ const CRITIC_TEMPERATURE: number | null =
   process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE !== ''
     ? Number(process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE)
     : null;
-// Model used for Tier 4 web extraction — must support web search tool.
-// Set to a Gemini model (e.g. "gemini-2.0-flash") for Google Search grounding,
-// or an Azure deployment of gpt-4o-search-preview for OpenAI web_search_preview.
+// Model used for Tier 4 extraction. OpenRouter executes the provider-independent
+// web-search server tool, so no model-specific search adapter or secret is needed.
 const WEB_SEARCH_MODEL   = process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL   || EXTRACT_MODEL;
 
 // ─── Identity resolver deps ───────────────────────────────────────────────────
@@ -956,9 +956,12 @@ export async function findLinkedInUrlImpl(
       chosen = nameMatched[0];
     }
 
-    if (!chosen?.public_identifier) return null;
-    console.log(`[v3 linkedin-search] HIT url=https://www.linkedin.com/in/${chosen.public_identifier}`);
-    return `https://www.linkedin.com/in/${chosen.public_identifier}`;
+    // The sentinel is truthy, so a bare presence check let an anonymized result
+    // resolve to /in/undefined and be returned as this lead's LinkedIn URL.
+    const chosenSlug = usablePublicIdentifier(chosen?.public_identifier);
+    if (!chosenSlug) return null;
+    console.log(`[v3 linkedin-search] HIT url=https://www.linkedin.com/in/${chosenSlug}`);
+    return `https://www.linkedin.com/in/${chosenSlug}`;
   } catch (err) {
     // Any failure after accountId was resolved — purge both caches so next call
     // re-resolves to a live account (covers NOT_FOUND + newly-connected replacements).
@@ -1151,38 +1154,10 @@ export async function pickCandidateByContextLLM(
  * fall back to splitting `name` on whitespace when those split fields are
  * absent.
  */
-export function unipileNameMatches(
-  item: any,
-  leadFirst: string | undefined,
-  leadLast: string | undefined,
-): boolean {
-  let itemFirst = typeof item.first_name === 'string' ? item.first_name.trim().toLowerCase() : null;
-  let itemLast  = typeof item.last_name  === 'string' ? item.last_name.trim().toLowerCase()  : null;
-
-  // Fallback: derive first/last from the combined `name` field. Split on
-  // whitespace — first token → first name, last token → last name. Handles
-  // middle names by ignoring everything between.
-  //
-  // Drop tokens that normalize to empty (emoji, symbols, decorative marks)
-  // BEFORE choosing first/last. Without this, a display name like
-  // "💡 Paul Graham" would take "💡" as the first name; normalization later
-  // turns it into "" → "no constraint" → a WRONG first name would slip
-  // through the gate (verified live). Filtering here keeps the first/last
-  // anchored on real name tokens.
-  if (itemFirst === null && itemLast === null && typeof item.name === 'string') {
-    const tokens = item.name.trim().toLowerCase().split(/\s+/)
-      .filter(Boolean)
-      .filter((t: string) => normalizeNameToken(t) !== '');
-    if (tokens.length >= 1) itemFirst = tokens[0];
-    if (tokens.length >= 2) itemLast = tokens[tokens.length - 1];
-  }
-
-  // Can't verify without at least one name field — reject for correctness.
-  if (itemFirst === null && itemLast === null) return false;
-
-  // Bidirectional-prefix token comparison shared with the Apollo identity gate.
-  return nameTokensMatch(itemFirst, itemLast, leadFirst, leadLast);
-}
+// ENG-1026: the algorithm moved to ../utils/nameMatch so the pre-send identity
+// check can reuse it without importing this dep-heavy module. Re-exported here
+// so existing importers are unchanged.
+export { unipileNameMatches };
 
 export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
   const identityDeps = buildIdentityDeps(userId);
@@ -1339,7 +1314,10 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
               const result = {
                 first_name:   profileFirst,
                 last_name:    profileLast,
-                linkedin_url: raw.public_identifier ? `https://www.linkedin.com/in/${raw.public_identifier}` : undefined,
+                // Same sentinel guard as the search path above.
+                linkedin_url: usablePublicIdentifier(raw.public_identifier)
+                  ? `https://www.linkedin.com/in/${usablePublicIdentifier(raw.public_identifier)}`
+                  : undefined,
                 title:        trimStr(current?.position),
                 fromCache:    profileResult.fromCache,
               };

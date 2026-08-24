@@ -1,7 +1,9 @@
 import type { Organization } from "./db";
+import type { OrgRole } from "./orgAuthz";
+import { can } from "./orgAuthz";
 
 export type ToggleableFeature =
-  | "knowledgeBase" | "htmlTemplates" | "landingPages" | "workPlans" | "skills" | "analytics";
+  | "knowledgeBase" | "htmlTemplates" | "landingPages" | "workPlans" | "skills" | "analytics" | "crm";
 export type AlwaysOnFeature = "brandGuidelines" | "marketingStrategy";
 export type Feature = ToggleableFeature | AlwaysOnFeature;
 
@@ -49,6 +51,7 @@ const DEFAULT_ENABLED: Readonly<Record<ToggleableFeature, boolean>> = {
   workPlans: true,
   skills: true,
   analytics: true,
+  crm: true,
 };
 
 // The effective `enabled` default for a feature when no explicit value exists.
@@ -66,6 +69,7 @@ export function defaultShareSettings(): {
   workPlans: { enabled: boolean; editors: string[] };
   skills: { enabled: boolean; editors: string[] };
   analytics: { enabled: boolean; editors: string[] };
+  crm: { enabled: boolean; editors: string[] };
   brandGuidelines: { editors: string[] };
   marketingStrategy: { editors: string[] };
 } {
@@ -76,13 +80,18 @@ export function defaultShareSettings(): {
     workPlans:         { enabled: DEFAULT_ENABLED.workPlans,     editors: [] },
     skills:            { enabled: DEFAULT_ENABLED.skills,        editors: [] },
     analytics:         { enabled: DEFAULT_ENABLED.analytics,     editors: [] },
+    crm:               { enabled: DEFAULT_ENABLED.crm,           editors: [] },
     brandGuidelines:   { editors: [] },
     marketingStrategy: { editors: [] },
   };
 }
 
 export interface ItemLike { userId?: string }
-export interface UserLike { userId: string; orgId?: string; orgRole?: "owner" | "member" }
+// orgRole is widened to the full OrgRole union (owner | admin | member). The 36
+// `as "owner" | "member"` casts scattered across the call sites existed only to
+// satisfy the old narrow type here; they are now redundant and can be deleted
+// opportunistically rather than in one sweep.
+export interface UserLike { userId: string; orgId?: string; orgRole?: OrgRole }
 export type OrgLike = Pick<Organization, "orgId" | "ownerUserId" | "shareSettings">;
 
 function configFor(org: OrgLike | null, f: Feature) {
@@ -108,12 +117,31 @@ function enabledForMembers(org: OrgLike | null, f: Feature): boolean {
 // and manage org items regardless of `enabled`. Always-on features (BG/MS)
 // ignore `enabled` entirely.
 
-function isEditorOrAdmin(user: UserLike, org: OrgLike | null, feature: Feature): boolean {
-  if (!user.orgId || !org) return false;
-  if (org.ownerUserId === user.userId) return true;
-  if (user.orgRole === "owner") return true;
+// Read and write authority are split into two predicates rather than one shared
+// `isEditorOrAdmin`. They resolve identically today — org authority plus the
+// feature's editor list — but keeping them separate is what lets a read-only
+// oversight role be added later by changing one of them, without decomposing any
+// of the ~46 downstream call sites.
+//
+// The org-authority half delegates to orgAuthz.can(), which unions
+// `org.ownerUserId` with `user.orgRole`. The previous inline form checked
+// `orgRole === "owner"` only in some places, which is what locked a drifted owner
+// out of their own org's items.
+function isListedEditor(user: UserLike, org: OrgLike, feature: Feature): boolean {
   const cfg = configFor(org, feature);
   return Array.isArray(cfg?.editors) && cfg!.editors.includes(user.userId);
+}
+
+function canViewAsEditorOrAdmin(user: UserLike, org: OrgLike | null, feature: Feature): boolean {
+  if (!user.orgId || !org) return false;
+  if (can(user, org, "org:content:manage")) return true;
+  return isListedEditor(user, org, feature);
+}
+
+function canEditAsEditorOrAdmin(user: UserLike, org: OrgLike | null, feature: Feature): boolean {
+  if (!user.orgId || !org) return false;
+  if (can(user, org, "org:content:manage")) return true;
+  return isListedEditor(user, org, feature);
 }
 
 export function canViewItem(
@@ -126,7 +154,7 @@ export function canViewItem(
   // Member-owned features: visibility is purely the `enabled` toggle. When off,
   // every member (owner included) sees only their own items.
   if (isMemberOwnedFeature(feature)) return enabledForMembers(org, feature);
-  if (isEditorOrAdmin(user, org, feature)) return true;       // editors/admin always see
+  if (canViewAsEditorOrAdmin(user, org, feature)) return true; // editors/admin always see
   return enabledForMembers(org, feature);                      // plain members: when shared (explicit or default)
 }
 
@@ -138,8 +166,8 @@ export function canEditItem(
   if (ownerOrgId !== user.orgId) return false;
   // Member-owned features (skills/workPlans): edited by the item owner (handled
   // above) or the org owner as an admin override — but NOT listed editors.
-  if (isMemberOwnedFeature(feature)) return user.orgRole === "owner";
-  return isEditorOrAdmin(user, org, feature);
+  if (isMemberOwnedFeature(feature)) return can(user, org, "org:content:manage");
+  return canEditAsEditorOrAdmin(user, org, feature);
 }
 
 // Whether `user` may create new items of `feature` in `org`.
@@ -152,7 +180,7 @@ export function canManageOrgFeature(user: UserLike, org: OrgLike | null, feature
   // own items. Sharing/visibility is governed separately by the `enabled` toggle.
   if (isMemberOwnedFeature(feature)) return true;
   if (!org) return false;
-  return isEditorOrAdmin(user, org, feature);
+  return canEditAsEditorOrAdmin(user, org, feature);
 }
 
 // Whether `user` should receive the org-wide fanout for `feature`. Editors and
@@ -169,7 +197,7 @@ export function isFeatureEffectivelyEnabled(
   // Member-owned features: fanout is governed purely by the `enabled` toggle —
   // no owner/editor override, so when off each member sees only their own items.
   if (isMemberOwnedFeature(feature)) return enabledForMembers(org, feature);
-  if (isEditorOrAdmin(user, org, feature)) return true;
+  if (canViewAsEditorOrAdmin(user, org, feature)) return true;
   return enabledForMembers(org, feature);
 }
 
@@ -180,7 +208,7 @@ export const ORG_ITEMS_CAP     = 2000;
 export const RESPONSE_CAP      = 1000;
 
 export const TOGGLEABLE_FEATURES: ReadonlyArray<ToggleableFeature> = [
-  "knowledgeBase", "htmlTemplates", "landingPages", "workPlans", "skills", "analytics",
+  "knowledgeBase", "htmlTemplates", "landingPages", "workPlans", "skills", "analytics", "crm",
 ];
 export const ALWAYS_ON_FEATURES: ReadonlyArray<AlwaysOnFeature> = [
   "brandGuidelines", "marketingStrategy",

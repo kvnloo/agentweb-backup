@@ -167,7 +167,7 @@ describe('DELETE /lists/:listId/leads/bulk-delete', () => {
     await handler!(mockReq, mockRes);
     expect(mockRes.status).toHaveBeenCalledWith(403);
     expect(mockRes.json).toHaveBeenCalledWith(
-      expect.objectContaining({ message: 'Access denied' })
+      expect.objectContaining({ message: expect.stringContaining('CRM editor') })
     );
   });
 

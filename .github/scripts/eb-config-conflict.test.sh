@@ -100,7 +100,13 @@ check() {
     TESTS_FAILED=$(( TESTS_FAILED + 1 ))
     return
   fi
-  if [ -n "${needle}" ] && ! printf '%s' "${LAST_OUTPUT}" | grep -qF "${needle}"; then
+  # ENG-1277: a here-string, not a pipe. Under `set -o pipefail`, `grep -q`
+  # exiting early on the first match can SIGPIPE the upstream printf, and
+  # pipefail then reports THAT nonzero for the whole pipeline even though grep
+  # genuinely matched — a race that passes locally and fails intermittently in
+  # CI (see trunk-deploy-state.test.sh for the live incident). A here-string
+  # has no live producer process for grep to SIGPIPE.
+  if [ -n "${needle}" ] && ! grep -qF "${needle}" <<<"${LAST_OUTPUT}"; then
     printf '  FAIL %s\n       output did not contain: %s\n       output:\n%s\n' \
       "${desc}" "${needle}" "${LAST_OUTPUT}"
     TESTS_FAILED=$(( TESTS_FAILED + 1 ))
@@ -377,6 +383,23 @@ check 'ENG-836: an unrecoverable config counts as both sides, not neither' 1 \
 run_check "$(cd "${SCRIPT_DIR}/../.." && pwd)" \
   backend/.ebextensions/timeout.config
 check 'ENG-836: the live repo timeout.config alone is not a conflict' 0 ''
+
+# ENG-1412's structural assertion used to live here. It now lives in
+# .github/scripts/pipefail-hygiene.test.sh, which is where a rule about every
+# script in the directory belongs — this file's subject is EB resource/instance
+# config conflicts, and it was only the host because that is where the bug was
+# first caught.
+#
+# The move is also a widening. Measured head-to-head on a 12-shape corpus, the
+# pattern here caught 4 and the replacement catches 12, with no false positives
+# either side. It matched only pipelines that BEGIN with printf and END in grep,
+# so `jq ... | head -n 1` — which aborts deploy-failure-alert.sh outright under
+# set -e — was invisible to it, along with every other `head` case,
+# `grep --silent`, `grep -e X -q`, and any writer that is not printf.
+#
+# What it did better, and what the replacement now also handles: it regexed the
+# whole file, so it spanned a blank or comment line between `|` and the reader.
+# The line-joining replacement missed that until this comparison surfaced it.
 
 printf '\n%s checks run, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ] || exit 1

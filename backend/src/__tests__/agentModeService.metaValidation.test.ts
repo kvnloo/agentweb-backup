@@ -65,6 +65,7 @@ import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { userDb } from '../services/db';
 import { chatbotDb } from '../services/chatbotService';
+import { toolResultError } from '../utils/toolResultError';
 
 const mockUser = {
   id: 'user123',
@@ -127,8 +128,36 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(result.message).toContain('"name"');
+      expect(metaService.createCampaign).not.toHaveBeenCalled();
+    });
+
+    it('tells the model WHICH param was rejected, not just the error code (ENG-1018)', async () => {
+      // A rejection is only better than a silent drop if the caller learns what to fix.
+      // success:false results never reach the model as JSON — the dispatch boundary
+      // (utils/toolResultError) collapses them to ONE reason string read from `error`
+      // before `message`, so a bare 'PARAM_VALIDATION_ERROR' told the model nothing and
+      // the retryability guidance then says "change your approach".
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+        { role: 'user', content: 'set up a traffic campaign' },
+      ]);
+      const result = await callApi(service, 'CAMPAIGN', 'CREATE', {
+        sessionId: 'session-1',
+        params: {
+          name: 'Budget Drop Test',
+          objective: 'OUTCOME_TRAFFIC',
+          objective_quote: 'traffic campaign',
+          special_ad_categories: ['NONE'],
+          daily_budget: 5000, // an ad-set field the campaign create path would drop
+        },
+      });
+
+      const modelVisibleReason = toolResultError(result)?.message ?? '';
+      expect(modelVisibleReason).toContain('PARAM_VALIDATION_ERROR');
+      expect(modelVisibleReason).toContain('daily_budget');
+      expect(modelVisibleReason).toContain('advantage_campaign_budget');
+      expect(modelVisibleReason).toMatch(/AD_SET CREATE/);
       expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
 
@@ -156,15 +185,29 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(result.message).toContain('campaign_id');
+    });
+
+    it('rejects a malformed spend_cap on CAMPAIGN UPDATE before writing to Meta', async () => {
+      // UPDATE forwards params verbatim, so without this guard a fractional cap reaches
+      // Meta and comes back as an opaque "Invalid parameter".
+      const result = await callApi(service, 'CAMPAIGN', 'UPDATE', {
+        campaign_id: 'camp_1',
+        params: { spend_cap: 1000.5 },
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
+      expect(result.message).toMatch(/positive whole number of cents/i);
+      expect(metaService.updateCampaign).not.toHaveBeenCalled();
     });
 
     it('returns PARAM_VALIDATION_ERROR for CAMPAIGN DELETE without campaign_id', async () => {
       const result = await callApi(service, 'CAMPAIGN', 'DELETE', {});
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(result.message).toContain('campaign_id');
     });
 
@@ -175,7 +218,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(result.message).toContain('campaign_id');
     });
 
@@ -186,7 +229,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(result.message).toContain('ad_set_id');
     });
 
@@ -196,7 +239,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(result.message).toContain('ad_id');
     });
 
@@ -206,7 +249,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(result.message).toContain('"params.q"');
     });
 
@@ -216,7 +259,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(result.message).toContain('"params.type"');
     });
 

@@ -88,7 +88,7 @@ describe("PATCH /api/admin/orgs/:orgId/analytics-sharing", () => {
       orgId: "org-1", ownerUserId: "o-1",
       shareSettings: { analytics: { enabled: false, editors: [] } },
     } as any);
-    mockOrgDb.updateShareSettings.mockResolvedValue(undefined);
+    mockOrgDb.updateShareSettings.mockResolvedValue("2026-08-10T15:00:00.001Z");
     const res = await request(app)
       .patch("/api/admin/orgs/org-1/analytics-sharing")
       .set("Authorization", `Bearer ${adminToken}`)
@@ -115,7 +115,7 @@ describe("PATCH /api/admin/orgs/:orgId/analytics-sharing", () => {
       orgId: "org-1", ownerUserId: "o-1",
       shareSettings: { analytics: { enabled: false } },
     } as any);
-    mockOrgDb.updateShareSettings.mockResolvedValue(undefined);
+    mockOrgDb.updateShareSettings.mockResolvedValue("2026-08-10T15:00:00.001Z");
     const res = await request(app)
       .patch("/api/admin/orgs/org-1/analytics-sharing")
       .set("Authorization", `Bearer ${adminToken}`)
@@ -131,7 +131,7 @@ describe("PATCH /api/admin/orgs/:orgId/analytics-sharing", () => {
       orgId: "org-1", ownerUserId: "o-1",
       shareSettings: {},
     } as any);
-    mockOrgDb.updateShareSettings.mockResolvedValue(undefined);
+    mockOrgDb.updateShareSettings.mockResolvedValue("2026-08-10T15:00:00.001Z");
     const res = await request(app)
       .patch("/api/admin/orgs/org-1/analytics-sharing")
       .set("Authorization", `Bearer ${adminToken}`)
@@ -146,7 +146,7 @@ describe("PATCH /api/admin/orgs/:orgId/analytics-sharing", () => {
       orgId: "org-1", ownerUserId: "o-1",
       shareSettings: { analytics: { enabled: false, editors: ["user-123"] } },
     } as any);
-    mockOrgDb.updateShareSettings.mockResolvedValue(undefined);
+    mockOrgDb.updateShareSettings.mockResolvedValue("2026-08-10T15:00:00.001Z");
     const res = await request(app)
       .patch("/api/admin/orgs/org-1/analytics-sharing")
       .set("Authorization", `Bearer ${adminToken}`)

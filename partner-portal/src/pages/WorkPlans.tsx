@@ -30,6 +30,8 @@ import {
   FormControl,
   InputLabel,
   Autocomplete,
+  Checkbox,
+  FormGroup,
 } from "@mui/material";
 import {
   Edit as EditIcon,
@@ -40,10 +42,45 @@ import {
   Close as CloseIcon,
   Visibility as VisibilityIcon,
   VisibilityOff as VisibilityOffIcon,
+  ArrowUpward as ArrowUpwardIcon,
+  ArrowDownward as ArrowDownwardIcon,
 } from "@mui/icons-material";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
+import WorkPlanInputEditor from "../components/WorkPlanInputEditor";
+import {
+  type EditableWorkPlanInputRequest,
+  validateEditableInputRequest,
+} from "../components/workPlanInputSchema";
+import {
+  type WorkPlanDisplayCategory,
+  type WorkPlanDisplayChannel,
+  type WorkPlanDisplayMetadata,
+  computeWorkPlanPreview,
+} from "../utils/workPlanPreview";
+
+/** Closed enums rendered as checkboxes/selects — never free-text tags (ENG-1469). */
+const DISPLAY_CATEGORIES: { value: WorkPlanDisplayCategory; label: string }[] = [
+  { value: "strategy", label: "Strategy" },
+  { value: "paid-ads", label: "Paid Ads" },
+  { value: "founder-led-sales", label: "Founder-Led Sales" },
+  { value: "event-led-sales", label: "Event-Led Sales" },
+  { value: "content", label: "Content" },
+];
+const DISPLAY_CHANNELS: { value: WorkPlanDisplayChannel; label: string }[] = [
+  { value: "meta", label: "Meta" },
+  { value: "google", label: "Google" },
+  { value: "linkedin", label: "LinkedIn" },
+  { value: "email", label: "Email" },
+  { value: "event", label: "Event" },
+  { value: "content", label: "Content" },
+  { value: "cross-channel", label: "Cross-Channel" },
+];
+const DISPLAY_TITLE_MAX = 80;
+const DISPLAY_SUMMARY_MAX = 180;
+const NEXT_PLAN_IDS_MAX = 3;
+const SUITE_ID_PATTERN = /^[a-z0-9-]{1,64}$/;
 
 /** Backend-enforced cap. Keep in sync with USER_INSTRUCTIONS_MAX_LENGTH in
  *  backend/src/services/workPlanService.ts. */
@@ -61,6 +98,7 @@ interface WorkPlanStep {
   /** Media assets this step must actually produce before it can be marked
    *  completed. Enforced at run time by the session work plan's asset gate. */
   expectedAssetCount?: number;
+  inputRequest?: EditableWorkPlanInputRequest;
 }
 
 const PLAN_CATEGORIES = ["Paid Ads", "Strategy", "Content", "Other"];
@@ -80,6 +118,10 @@ interface WorkPlan {
   showLoginSignup?: string;
   defaultModel?: string;
   category?: string;
+  /** Optional customer-readable browse/recommendation metadata (ENG-1469).
+   *  Never changes execution — the fallback rules in the canonical projection
+   *  cover any plan that has none. */
+  display?: WorkPlanDisplayMetadata;
   reviewFeedback?: string;
   createdAt: string;
   updatedAt: string;
@@ -101,6 +143,20 @@ const visibilityColor = (v: string) => {
     default: return "default";
   }
 };
+
+/**
+ * What `PUT /api/admin/work-plans/:id` returns when it refuses a destructive
+ * replace (ENG-1221). `blanked` is a step that came back with a field emptied;
+ * `unpaired` is one the payload could not account for at all — most often a
+ * step renamed while its content was edited, which is indistinguishable from a
+ * different step taking its number.
+ */
+interface StepLossRefusal {
+  message?: string;
+  stepsWouldBeRemoved?: number;
+  removedStepTitles?: string[];
+  stepContentLoss?: { stepCount?: number; title?: string; fields?: string[]; kind?: "blanked" | "unpaired" }[];
+}
 
 export default function WorkPlans() {
   const { token } = useAuth();
@@ -128,6 +184,20 @@ export default function WorkPlans() {
   const [category, setCategory] = useState("");
   const [supportedModels, setSupportedModels] = useState<string[]>([]);
 
+  // Customer-facing browse metadata (ENG-1469) — optional, never affects execution.
+  const [displayTitle, setDisplayTitle] = useState("");
+  const [displaySummary, setDisplaySummary] = useState("");
+  const [displayCategories, setDisplayCategories] = useState<WorkPlanDisplayCategory[]>([]);
+  const [displayChannel, setDisplayChannel] = useState<WorkPlanDisplayChannel | "">("");
+  const [suiteEnabled, setSuiteEnabled] = useState(false);
+  const [suiteId, setSuiteId] = useState("");
+  const [suiteName, setSuiteName] = useState("");
+  const [suitePosition, setSuitePosition] = useState<number | "">(1);
+  /** Index-aligned with `steps`. A blank entry falls back to that step's own title. */
+  const [stepLabels, setStepLabels] = useState<string[]>([]);
+  /** Author-ordered, max 3. Relationship metadata, never a prerequisite. */
+  const [nextPlanIds, setNextPlanIds] = useState<string[]>([]);
+
   // Reject dialog
   const [rejectDialogOpen, setRejectDialogOpen] = useState(false);
   const [rejectTarget, setRejectTarget] = useState<WorkPlan | null>(null);
@@ -139,6 +209,9 @@ export default function WorkPlans() {
 
   // Delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<WorkPlan | null>(null);
+
+  /** The endpoint's step-loss refusal, held so the admin can confirm it (ENG-1221). */
+  const [stepLoss, setStepLoss] = useState<StepLossRefusal | null>(null);
 
   // Available function calls for autocomplete
   const [availableFunctionCalls, setAvailableFunctionCalls] = useState<string[]>([]);
@@ -202,7 +275,8 @@ export default function WorkPlans() {
     setTitle("");
     setDescription("");
     setWelcomeMessage("");
-    setSteps([{ stepCount: 1, title: "" }]);
+    const initialSteps = [{ stepCount: 1, title: "" }];
+    setSteps(initialSteps);
     setShowInAgentMode(true);
     setAutocomplete(false);
     setRequireLogin(false);
@@ -212,6 +286,16 @@ export default function WorkPlans() {
     setThumbnailUrl(undefined);
     setThumbnailSource("none");
     setThumbnailError("");
+    setDisplayTitle("");
+    setDisplaySummary("");
+    setDisplayCategories([]);
+    setDisplayChannel("");
+    setSuiteEnabled(false);
+    setSuiteId("");
+    setSuiteName("");
+    setSuitePosition(1);
+    setStepLabels(initialSteps.map(() => ""));
+    setNextPlanIds([]);
     setDialogOpen(true);
   };
 
@@ -220,7 +304,8 @@ export default function WorkPlans() {
     setTitle(plan.title);
     setDescription(plan.description || "");
     setWelcomeMessage(plan.welcomeMessage || "");
-    setSteps(plan.steps.length > 0 ? plan.steps : [{ stepCount: 1, title: "" }]);
+    const initialSteps = plan.steps.length > 0 ? plan.steps : [{ stepCount: 1, title: "" }];
+    setSteps(initialSteps);
     setShowInAgentMode(plan.showInAgentMode !== false);
     setAutocomplete(plan.autocomplete || false);
     setRequireLogin(plan.requireLogin || false);
@@ -230,6 +315,17 @@ export default function WorkPlans() {
     setThumbnailUrl(plan.thumbnail_url);
     setThumbnailSource(plan.thumbnail_source || "none");
     setThumbnailError("");
+    const d = plan.display;
+    setDisplayTitle(d?.title || "");
+    setDisplaySummary(d?.summary || "");
+    setDisplayCategories(d?.categories || []);
+    setDisplayChannel(d?.channel || "");
+    setSuiteEnabled(!!d?.suite);
+    setSuiteId(d?.suite?.id || "");
+    setSuiteName(d?.suite?.name || "");
+    setSuitePosition(d?.suite?.position ?? 1);
+    setStepLabels(initialSteps.map((_, i) => d?.stepLabels?.[i] || ""));
+    setNextPlanIds(d?.nextPlanIds || []);
     setDialogOpen(true);
   };
 
@@ -303,12 +399,72 @@ export default function WorkPlans() {
     }
   };
 
-  const handleSave = async () => {
+  /**
+   * Build the complete `display` block to send with a save.
+   *
+   * A blank step-label field falls back to that step's own current title —
+   * matching what the customer would see anyway via the backend's fallback —
+   * so an admin can label only the first few steps without needing to retype
+   * every later title just to keep the array valid (the schema requires every
+   * entry actually present in `stepLabels` to be non-empty text; trailing
+   * unlabeled steps are simply left out of the array instead).
+   */
+  const buildDisplayPayload = (
+    validEntries: { step: WorkPlanStep; label: string }[],
+  ): WorkPlanDisplayMetadata => {
+    let lastLabeled = -1;
+    validEntries.forEach(({ label }, i) => {
+      if (label.trim()) lastLabeled = i;
+    });
+    const stepLabelsPayload = lastLabeled === -1
+      ? undefined
+      : validEntries.slice(0, lastLabeled + 1).map(({ step, label }) => label.trim() || step.title);
+
+    const trimmedTitle = displayTitle.trim();
+    const trimmedSummary = displaySummary.trim();
+    const suite = suiteEnabled && suiteId.trim() && suiteName.trim()
+      ? { id: suiteId.trim(), name: suiteName.trim(), position: Number(suitePosition) || 1 }
+      : undefined;
+
+    return {
+      version: 1,
+      ...(trimmedTitle && { title: trimmedTitle }),
+      ...(trimmedSummary && { summary: trimmedSummary }),
+      ...(displayCategories.length > 0 && { categories: displayCategories }),
+      ...(displayChannel && { channel: displayChannel }),
+      ...(suite && { suite }),
+      ...(stepLabelsPayload && { stepLabels: stepLabelsPayload }),
+      ...(nextPlanIds.length > 0 && { nextPlanIds }),
+    };
+  };
+
+  /**
+   * Save, optionally confirming a step-loss refusal (ENG-1221).
+   *
+   * The endpoint refuses a replace that would drop steps or blank fields on the
+   * ones it keeps, unless `confirm_step_removal` is set. This editor always
+   * sends the WHOLE steps array, so two ordinary actions land on that refusal:
+   * renaming a step while editing its content, and removing a step. Before this
+   * the admin got the server's message verbatim — which ends by telling them to
+   * retry with an API flag the portal cannot send — and no way forward.
+   *
+   * `confirmStepRemoval` MUST be passed explicitly. The Save button previously
+   * read `onClick={handleSave}`, which hands React's MouseEvent to the first
+   * parameter; a truthy event would confirm every destructive save silently.
+   */
+  const handleSave = async (confirmStepRemoval: boolean = false) => {
     if (!title.trim()) {
       setError("Title is required");
       return;
     }
-    const validSteps = steps.filter(s => s.title.trim());
+    // Keep each step's preview label aligned with the step it belongs to
+    // through the same title-based filter used for the real steps array —
+    // otherwise a step dropped for having no title would leave every label
+    // after it one position out of sync with what it actually describes.
+    const validEntries = steps
+      .map((step, i) => ({ step, label: stepLabels[i] || "" }))
+      .filter(({ step }) => step.title.trim());
+    const validSteps = validEntries.map(({ step }, i) => ({ ...step, stepCount: i + 1 }));
     if (validSteps.length === 0) {
       setError("At least one step with a title is required");
       return;
@@ -318,10 +474,15 @@ export default function WorkPlans() {
     try {
       const body = {
         title, description, welcomeMessage,
-        steps: validSteps.map((s, i) => ({ ...s, stepCount: i + 1 })),
+        steps: validSteps,
         showInAgentMode, autocomplete, requireLogin, visibility,
         ...(defaultModel && { defaultModel }),
         ...(category && { category }),
+        ...(confirmStepRemoval && { confirm_step_removal: true }),
+        // Always the complete normalized block — the editor never sends a
+        // partial diff of `display`, so an admin's edit can never be silently
+        // merged with stale fields the dialog did not show them (ENG-1469).
+        display: buildDisplayPayload(validEntries),
       };
       if (editingPlan) {
         // This save replaces the whole steps array with what the dialog loaded,
@@ -339,18 +500,35 @@ export default function WorkPlans() {
         });
         setSuccess("Work plan created");
       }
+      setStepLoss(null);
       setDialogOpen(false);
       fetchPlans();
     } catch (err: any) {
+      const data = err.response?.data as StepLossRefusal | undefined;
+      // The guard's refusal carries exactly what would be lost. Show it as
+      // something the admin can decide on rather than an error they cannot act
+      // on. Anything else is still a plain error.
+      const describesLoss = (data?.stepsWouldBeRemoved ?? 0) > 0
+        || (data?.stepContentLoss?.length ?? 0) > 0;
+      if (err.response?.status === 400 && describesLoss) {
+        setStepLoss(data ?? null);
+        return;
+      }
+      // Every other failure closes the confirmation first. A retry that comes
+      // back a stale-write conflict — or anything else — would otherwise leave
+      // the modal sitting over the error that explains it, offering a "Save
+      // anyway" that cannot work: the admin clicks it, fails the same way, and
+      // never sees why.
+      setStepLoss(null);
       if (err.response?.status === 409) {
-        // Keep the dialog open — their edits are still in it, and closing would
+        // Keep the EDITOR open — their edits are still in it, and closing would
         // throw away the work while the plan on screen is the outdated one.
         setError(
           "This plan changed while you were editing it — nothing was saved. Copy any changes you want to keep, then close and reopen the plan to start from the current version.",
         );
         return;
       }
-      setError(err.response?.data?.message || "Failed to save work plan");
+      setError(data?.message || "Failed to save work plan");
     } finally {
       setSaving(false);
     }
@@ -400,17 +578,39 @@ export default function WorkPlans() {
 
   const addStep = () => {
     setSteps([...steps, { stepCount: steps.length + 1, title: "" }]);
+    setStepLabels([...stepLabels, ""]);
   };
 
   const removeStep = (index: number) => {
     if (steps.length <= 1) return;
     setSteps(steps.filter((_, i) => i !== index).map((s, i) => ({ ...s, stepCount: i + 1 })));
+    setStepLabels(stepLabels.filter((_, i) => i !== index));
   };
 
-  const updateStep = (index: number, field: string, value: string | string[] | number | undefined) => {
+  const updateStep = (index: number, field: string, value: string | string[] | number | boolean | WorkPlanStep['inputRequest'] | undefined) => {
     const updated = [...steps];
     updated[index] = { ...updated[index], [field]: value };
     setSteps(updated);
+  };
+
+  const updateStepLabel = (index: number, value: string) => {
+    const next = [...stepLabels];
+    next[index] = value.slice(0, DISPLAY_TITLE_MAX);
+    setStepLabels(next);
+  };
+
+  const toggleDisplayCategory = (value: WorkPlanDisplayCategory) => {
+    setDisplayCategories((prev) =>
+      prev.includes(value) ? prev.filter((c) => c !== value) : [...prev, value],
+    );
+  };
+
+  const moveNextPlan = (index: number, delta: -1 | 1) => {
+    const target = index + delta;
+    if (target < 0 || target >= nextPlanIds.length) return;
+    const next = [...nextPlanIds];
+    [next[index], next[target]] = [next[target], next[index]];
+    setNextPlanIds(next);
   };
 
   const toggleVisibility = async (plan: WorkPlan) => {
@@ -433,6 +633,39 @@ export default function WorkPlans() {
       setError("Failed to update visibility");
     }
   };
+
+  const inputRequestErrors = steps.flatMap((step) => (
+    step.inputRequest ? validateEditableInputRequest(step.inputRequest) : []
+  ));
+  const invalidSuiteId = suiteEnabled && suiteId.length > 0 && !SUITE_ID_PATTERN.test(suiteId);
+
+  // Compact preview using the exact canonical projection shape — what a
+  // customer would actually see for the fields currently in the form,
+  // computed client-side so it updates as the admin types (ENG-1469).
+  const preview = computeWorkPlanPreview({
+    planId: editingPlan?.planId,
+    title: title || "(untitled plan)",
+    description,
+    legacyCategory: category,
+    visibility,
+    steps,
+    display: {
+      title: displayTitle,
+      summary: displaySummary,
+      categories: displayCategories,
+      channel: displayChannel || undefined,
+      suite: suiteEnabled && suiteId.trim() && suiteName.trim()
+        ? { id: suiteId.trim(), name: suiteName.trim(), position: Number(suitePosition) || 1 }
+        : undefined,
+      stepLabels,
+      nextPlanIds,
+    },
+    knownPlansById: new Map(plans.map((p) => [p.planId, { title: p.title }])),
+  });
+
+  const nextPlanCandidates = plans.filter(
+    (p) => p.planId !== editingPlan?.planId && !nextPlanIds.includes(p.planId),
+  );
 
   if (loading) {
     return (
@@ -749,7 +982,10 @@ export default function WorkPlans() {
 
             <Box>
               <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 1 }}>
-                <Typography variant="subtitle2">Steps</Typography>
+                <Box>
+                  <Typography variant="subtitle2">Customer journey</Typography>
+                  <Typography variant="caption" color="text.secondary">Write what the customer sees first. Keep agent-only instructions tucked away.</Typography>
+                </Box>
                 <Button size="small" startIcon={<AddIcon />} onClick={addStep}>Add Step</Button>
               </Box>
               {steps.map((step, i) => (
@@ -759,15 +995,8 @@ export default function WorkPlans() {
                     <TextField
                       value={step.title}
                       onChange={(e) => updateStep(i, "title", e.target.value)}
-                      placeholder={`Step ${i + 1} title`}
-                      size="small"
-                      fullWidth
-                      sx={{ mb: 0.5 }}
-                    />
-                    <TextField
-                      value={step.description || ""}
-                      onChange={(e) => updateStep(i, "description", e.target.value)}
-                      placeholder="LLM prompt for this step (not shown to users)"
+                      label="Step name"
+                      placeholder={`e.g., Share your event guest list`}
                       size="small"
                       fullWidth
                       sx={{ mb: 0.5 }}
@@ -778,7 +1007,8 @@ export default function WorkPlans() {
                         const next = e.target.value.slice(0, USER_INSTRUCTIONS_MAX_LENGTH);
                         updateStep(i, "userInstructions", next);
                       }}
-                      placeholder="User Instructions: what should the user do at this step? What should they expect? (Shown to users when they expand this step.)"
+                      label="What should the customer do?"
+                      placeholder="e.g., Paste the guest-list link. Emma will pull in recent registrations."
                       size="small"
                       fullWidth
                       multiline
@@ -798,6 +1028,51 @@ export default function WorkPlans() {
                       }}
                       sx={{ mb: 0.5 }}
                     />
+                    <TextField
+                      value={stepLabels[i] || ""}
+                      onChange={(e) => updateStepLabel(i, e.target.value)}
+                      label="Browse preview label (optional)"
+                      placeholder={step.title || `Step ${i + 1}`}
+                      helperText="Shown to customers browsing plans. Leave blank to use the step name above."
+                      size="small"
+                      fullWidth
+                      inputProps={{ maxLength: DISPLAY_TITLE_MAX }}
+                      sx={{ mb: 1 }}
+                    />
+                    <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, px: 1.5, py: 1, mb: 1 }}>
+                      <FormControlLabel
+                        control={<Switch checked={Boolean(step.inputRequest)} onChange={(e) => updateStep(i, 'inputRequest', e.target.checked ? {
+                          title: step.title || `Details for step ${i + 1}`,
+                          prompt: 'Share the details Emma needs to continue.',
+                          fields: [{ id: 'details', label: 'Details', type: 'text', required: true }],
+                        } : undefined)} />}
+                        label="Collect details from the customer before this step"
+                      />
+                      {step.inputRequest && (
+                        <Box sx={{ mt: 1 }}>
+                          <WorkPlanInputEditor
+                            value={step.inputRequest}
+                            onChange={(inputRequest) => updateStep(i, 'inputRequest', inputRequest)}
+                          />
+                        </Box>
+                      )}
+                    </Box>
+                    <Box component="details" sx={{ mb: 1 }}>
+                      <Box component="summary" sx={{ cursor: "pointer", color: "text.secondary", fontSize: "0.8rem", mb: 1 }}>
+                        Advanced agent instructions
+                      </Box>
+                      <TextField
+                        value={step.description || ""}
+                        onChange={(e) => updateStep(i, "description", e.target.value)}
+                        label="Instructions for Emma only"
+                        placeholder="Optional context, rules, or constraints for the agent"
+                        size="small"
+                        fullWidth
+                        multiline
+                        minRows={2}
+                        helperText="Customers never see this text."
+                      />
+                    </Box>
                     <Autocomplete
                       multiple
                       freeSolo
@@ -856,6 +1131,203 @@ export default function WorkPlans() {
                   )}
                 </Box>
               ))}
+            </Box>
+
+            {/* ── Customer-facing browse details (ENG-1469) ──────────────── */}
+            <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 2 }}>
+              <Typography variant="subtitle2">Customer-facing browse details</Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
+                Optional. Controls how this plan appears when customers browse and search — never
+                changes what the plan actually does. Leave any field blank to fall back to the
+                plan's own title, description, and category.
+              </Typography>
+              <Stack spacing={1.5}>
+                <TextField
+                  label="Display title (optional)"
+                  value={displayTitle}
+                  onChange={(e) => setDisplayTitle(e.target.value.slice(0, DISPLAY_TITLE_MAX))}
+                  placeholder={title || "Uses the plan title above"}
+                  size="small"
+                  fullWidth
+                  inputProps={{ maxLength: DISPLAY_TITLE_MAX }}
+                  helperText={`${displayTitle.length} / ${DISPLAY_TITLE_MAX}`}
+                />
+                <TextField
+                  label="Outcome summary (optional)"
+                  value={displaySummary}
+                  onChange={(e) => setDisplaySummary(e.target.value.slice(0, DISPLAY_SUMMARY_MAX))}
+                  placeholder="A one-sentence outcome customers can scan while browsing"
+                  size="small"
+                  fullWidth
+                  multiline
+                  minRows={2}
+                  maxRows={3}
+                  inputProps={{ maxLength: DISPLAY_SUMMARY_MAX }}
+                  helperText={`${displaySummary.length} / ${DISPLAY_SUMMARY_MAX}`}
+                />
+
+                <Box>
+                  <Typography variant="caption" color="text.secondary">Categories (optional — a plan may belong to more than one)</Typography>
+                  <FormGroup row>
+                    {DISPLAY_CATEGORIES.map((c) => (
+                      <FormControlLabel
+                        key={c.value}
+                        control={
+                          <Checkbox
+                            size="small"
+                            checked={displayCategories.includes(c.value)}
+                            onChange={() => toggleDisplayCategory(c.value)}
+                          />
+                        }
+                        label={c.label}
+                      />
+                    ))}
+                  </FormGroup>
+                </Box>
+
+                <FormControl size="small" sx={{ maxWidth: 260 }}>
+                  <InputLabel>Channel (optional)</InputLabel>
+                  <Select
+                    value={displayChannel}
+                    label="Channel (optional)"
+                    onChange={(e) => setDisplayChannel(e.target.value as WorkPlanDisplayChannel | "")}
+                  >
+                    <MenuItem value=""><em>None</em></MenuItem>
+                    {DISPLAY_CHANNELS.map((c) => (
+                      <MenuItem key={c.value} value={c.value}>{c.label}</MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+
+                <Box>
+                  <FormControlLabel
+                    control={<Switch checked={suiteEnabled} onChange={(e) => setSuiteEnabled(e.target.checked)} />}
+                    label="Group this plan into a suite"
+                  />
+                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: suiteEnabled ? 1 : 0 }}>
+                    Suites are display grouping only — they do not change how any plan runs.
+                  </Typography>
+                  {suiteEnabled && (
+                    <Box sx={{ display: "flex", gap: 1.5, flexWrap: "wrap" }}>
+                      <TextField
+                        label="Suite ID"
+                        value={suiteId}
+                        onChange={(e) => setSuiteId(e.target.value.toLowerCase().slice(0, 64))}
+                        placeholder="meta-launch-suite"
+                        size="small"
+                        helperText="lowercase letters, numbers, hyphens"
+                        error={invalidSuiteId}
+                      />
+                      <TextField
+                        label="Suite name"
+                        value={suiteName}
+                        onChange={(e) => setSuiteName(e.target.value.slice(0, 80))}
+                        placeholder="Meta Launch Suite"
+                        size="small"
+                      />
+                      <TextField
+                        label="Position"
+                        type="number"
+                        value={suitePosition}
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          setSuitePosition(raw === "" ? "" : Math.min(99, Math.max(1, parseInt(raw, 10) || 1)));
+                        }}
+                        size="small"
+                        inputProps={{ min: 1, max: 99 }}
+                        sx={{ maxWidth: 110 }}
+                      />
+                    </Box>
+                  )}
+                </Box>
+              </Stack>
+            </Box>
+
+            {/* ── Recommended next workplans (relationship-authoring extension, ENG-1469) ── */}
+            <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 2 }}>
+              <Typography variant="subtitle2">Recommended next workplans</Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
+                Optional recommendations shown after this plan finishes — not a prerequisite or a
+                required sequence. Customers can start any plan directly at any time. Up to three,
+                shown in the order below.
+              </Typography>
+              <Autocomplete
+                size="small"
+                options={nextPlanCandidates}
+                getOptionLabel={(p) => p.title}
+                value={null}
+                disabled={nextPlanIds.length >= NEXT_PLAN_IDS_MAX}
+                onChange={(_e, selected) => {
+                  if (selected) setNextPlanIds([...nextPlanIds, selected.planId]);
+                }}
+                renderInput={(params) => (
+                  <TextField
+                    {...params}
+                    label="Add a recommendation"
+                    placeholder={
+                      nextPlanIds.length >= NEXT_PLAN_IDS_MAX
+                        ? `Maximum of ${NEXT_PLAN_IDS_MAX} reached`
+                        : "Search workplans..."
+                    }
+                  />
+                )}
+              />
+              {nextPlanIds.length > 0 && (
+                <Stack spacing={0.5} sx={{ mt: 1.5 }}>
+                  {nextPlanIds.map((id, idx) => {
+                    const match = plans.find((p) => p.planId === id);
+                    return (
+                      <Box key={id} sx={{ display: "flex", alignItems: "center", gap: 0.5, bgcolor: "grey.50", borderRadius: 1, px: 1, py: 0.5 }}>
+                        <Chip label={idx + 1} size="small" />
+                        <Typography variant="body2" sx={{ flex: 1 }}>
+                          {match ? match.title : `${id} (not found — may have been deleted)`}
+                        </Typography>
+                        <IconButton size="small" disabled={idx === 0} onClick={() => moveNextPlan(idx, -1)} title="Move up">
+                          <ArrowUpwardIcon fontSize="small" />
+                        </IconButton>
+                        <IconButton size="small" disabled={idx === nextPlanIds.length - 1} onClick={() => moveNextPlan(idx, 1)} title="Move down">
+                          <ArrowDownwardIcon fontSize="small" />
+                        </IconButton>
+                        <IconButton size="small" onClick={() => setNextPlanIds(nextPlanIds.filter((_, i) => i !== idx))} title="Remove">
+                          <CloseIcon fontSize="small" />
+                        </IconButton>
+                      </Box>
+                    );
+                  })}
+                </Stack>
+              )}
+            </Box>
+
+            {/* ── Compact customer-facing preview (canonical projection shape) ── */}
+            <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 2, bgcolor: "grey.50" }}>
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>Customer preview</Typography>
+              <Typography variant="body1" sx={{ fontWeight: 600 }}>{preview.title}</Typography>
+              {preview.summary && (
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>{preview.summary}</Typography>
+              )}
+              <Stack direction="row" spacing={0.5} sx={{ flexWrap: "wrap", mb: 1 }}>
+                {preview.categories.map((c) => (
+                  <Chip key={c} label={DISPLAY_CATEGORIES.find((d) => d.value === c)?.label || c} size="small" />
+                ))}
+                {preview.channel && (
+                  <Chip label={DISPLAY_CHANNELS.find((d) => d.value === preview.channel)?.label || preview.channel} size="small" variant="outlined" />
+                )}
+                {preview.suite && (
+                  <Chip label={`Suite: ${preview.suite.name} (#${preview.suite.position})`} size="small" variant="outlined" />
+                )}
+              </Stack>
+              <Stack spacing={0.25} sx={{ mb: preview.nextPlans.length > 0 ? 1 : 0 }}>
+                {preview.steps.map((s) => (
+                  <Typography key={s.position} variant="caption" color="text.secondary">
+                    {s.position}. {s.label}
+                  </Typography>
+                ))}
+              </Stack>
+              {preview.nextPlans.length > 0 && (
+                <Typography variant="caption" color="text.secondary">
+                  Then consider: {preview.nextPlans.map((p) => p.title).join(" → ")}
+                </Typography>
+              )}
             </Box>
           </Stack>
 
@@ -966,7 +1438,12 @@ export default function WorkPlans() {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setDialogOpen(false)}>Cancel</Button>
-          <Button onClick={handleSave} variant="contained" disabled={saving}>
+          <Button
+            onClick={() => handleSave()}
+            variant="contained"
+            disabled={saving || inputRequestErrors.length > 0 || invalidSuiteId}
+            title={inputRequestErrors[0] || (invalidSuiteId ? "Suite ID must use lowercase letters, numbers, and hyphens" : undefined)}
+          >
             {saving ? <CircularProgress size={20} /> : editingPlan ? "Update" : "Create"}
           </Button>
         </DialogActions>
@@ -988,6 +1465,57 @@ export default function WorkPlans() {
         <DialogActions>
           <Button onClick={() => { setRejectDialogOpen(false); setRejectTarget(null); setRejectFeedback(""); }}>Cancel</Button>
           <Button onClick={handleReject} variant="contained" color="error" disabled={!rejectFeedback.trim()}>Reject</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Step-loss confirmation (ENG-1221) — the endpoint refuses a destructive
+          replace; this turns that refusal into a decision the admin can make. */}
+      <Dialog open={!!stepLoss} onClose={() => setStepLoss(null)} maxWidth="sm" fullWidth>
+        <DialogTitle>Saving this would lose step content</DialogTitle>
+        <DialogContent>
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            Nothing has been saved yet. Review what would be lost, then choose.
+          </Alert>
+          {(stepLoss?.removedStepTitles?.length ?? 0) > 0 && (
+            <>
+              <Typography variant="subtitle2" sx={{ mt: 1 }}>
+                Steps that would be removed ({stepLoss?.stepsWouldBeRemoved})
+              </Typography>
+              <ul style={{ marginTop: 4 }}>
+                {stepLoss?.removedStepTitles?.map((t, i) => (
+                  <li key={`removed-${i}`}><Typography variant="body2">{t}</Typography></li>
+                ))}
+              </ul>
+            </>
+          )}
+          {(stepLoss?.stepContentLoss?.length ?? 0) > 0 && (
+            <>
+              <Typography variant="subtitle2" sx={{ mt: 1 }}>
+                Steps that would lose content ({stepLoss?.stepContentLoss?.length})
+              </Typography>
+              <ul style={{ marginTop: 4 }}>
+                {stepLoss?.stepContentLoss?.map((l, i) => (
+                  <li key={`loss-${i}`}>
+                    <Typography variant="body2">
+                      <strong>{l.title || `Step ${l.stepCount}`}</strong>
+                      {l.kind === "unpaired"
+                        ? " — this step is not recognisable in what you are saving. Renaming a step while editing it looks the same as replacing it with a different one, so it is reported either way."
+                        : (l.fields?.length ? ` — would clear: ${l.fields.join(", ")}` : "")}
+                    </Typography>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          <Typography variant="body2" sx={{ mt: 2, color: "text.secondary" }}>
+            If this is what you meant, save anyway. If not, go back — your edits are still open.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setStepLoss(null)}>Go back</Button>
+          <Button onClick={() => handleSave(true)} variant="contained" color="warning" disabled={saving}>
+            Save anyway
+          </Button>
         </DialogActions>
       </Dialog>
 

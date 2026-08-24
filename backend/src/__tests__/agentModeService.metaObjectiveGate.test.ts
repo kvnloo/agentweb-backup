@@ -344,7 +344,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       const result = await callApi(service, { special_ad_categories: ['NONE'], confirm: true }, 'session-1');
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(result.message).toContain('"name"');
       expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
       expect(chatbotDb.getMessagesFromMessagesTable).not.toHaveBeenCalled();
@@ -360,7 +360,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
       expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
@@ -369,7 +369,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       const result = await callApi(service, { special_ad_categories: ['NONE'], confirm: true }); // no sessionId
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
     });
   });

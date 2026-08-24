@@ -340,3 +340,43 @@ describe("listOrgVisibleItems", () => {
     expect(result.truncated).toBe(true);
   });
 });
+
+// ENG-954 — regression guards for the two authority defects consolidated away.
+describe("org authority is unioned from ownerUserId and orgRole", () => {
+  // orgShareService.ts:141 checked `user.orgRole === "owner"` with no
+  // ownerUserId fallback, unlike its sibling twelve lines above. An org whose
+  // ownerUserId is correct but whose owner's user-row orgRole drifted (cleared
+  // by a membership write) was locked out of admin override on skills and
+  // workPlans. Production shipped two "stale role" repairs for this class.
+  const driftedOwner = { userId: "u-admin", orgId: "org-A", orgRole: "member" as const };
+  const memberItem = { userId: "u-member" };
+
+  it("a drifted canonical owner can still edit a member's skill", () => {
+    expect(canEditItem(memberItem, driftedOwner, orgA, "org-A", "skills")).toBe(true);
+  });
+
+  it("a drifted canonical owner can still edit a member's work plan", () => {
+    expect(canEditItem(memberItem, driftedOwner, orgA, "org-A", "workPlans")).toBe(true);
+  });
+
+  it("an ADMIN gets the same content override an owner has", () => {
+    const adminUser = { userId: "u-new-admin", orgId: "org-A", orgRole: "admin" as const };
+    expect(canEditItem(memberItem, adminUser, orgA, "org-A", "skills")).toBe(true);
+    expect(canEditItem(memberItem, adminUser, orgA, "org-A", "knowledgeBase")).toBe(true);
+    expect(canViewItem(memberItem, adminUser, orgA, "org-A", "knowledgeBase")).toBe(true);
+  });
+
+  it("a plain member still gets no override on ANOTHER member's items", () => {
+    // Deliberately a different user from memberItem.userId — the item-owner
+    // short-circuit on the first line of canEditItem would otherwise mask this.
+    const otherMember = { userId: "u-someone-else", orgId: "org-A", orgRole: "member" as const };
+    expect(canEditItem(memberItem, otherMember, orgA, "org-A", "skills")).toBe(false);
+    expect(canEditItem(memberItem, otherMember, orgA, "org-A", "knowledgeBase")).toBe(false);
+  });
+
+  it("an admin in a DIFFERENT org gets nothing", () => {
+    const foreignAdmin = { userId: "u-foreign", orgId: "org-B", orgRole: "admin" as const };
+    expect(canEditItem(memberItem, foreignAdmin, orgA, "org-A", "knowledgeBase")).toBe(false);
+    expect(canViewItem(memberItem, foreignAdmin, orgA, "org-A", "knowledgeBase")).toBe(false);
+  });
+});

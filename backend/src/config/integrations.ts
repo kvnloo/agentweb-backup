@@ -1,4 +1,4 @@
-import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getOutlookCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials, getHubSpotCredentials, getAttioCredentials, getGoogleAdsCredentials, getTwitterCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getOutlookCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials, getHubSpotCredentials, getAttioCredentials, getGoogleAdsCredentials, getTwitterCredentials, getCalendlyCredentials } from '../utils/secretsManager';
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
@@ -99,6 +99,24 @@ export const INTEGRATION_CONFIG = {
       'https://graph.microsoft.com/Mail.Read',
       'https://graph.microsoft.com/User.Read',
       'offline_access',
+    ],
+  },
+
+  calendly: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/calendly/callback`,
+    // Calendly requires PKCE (S256) on every OAuth app, web or native, IN ADDITION to
+    // scoped permissions (developer.calendly.com/scopes) — new OAuth apps get no API
+    // access at all until scopes are explicitly requested and granted.
+    authorizationUrl: 'https://auth.calendly.com/oauth/authorize',
+    tokenUrl: 'https://auth.calendly.com/oauth/token',
+    meUrl: 'https://api.calendly.com/users/me',
+    webhookSubscriptionsUrl: 'https://api.calendly.com/webhook_subscriptions',
+    scopes: [
+      'users:read',            // GET /users/me — resolves user_uri/organization_uri
+      'webhooks:write',        // POST /webhook_subscriptions — provisions the booking webhook
+      'webhooks:read',         // Calendly's dashboard force-selects this alongside webhooks:write; we don't call it, but it will be granted regardless
+      'scheduled_events:read', // required alongside webhooks:write for invitee.created events
+      'event_types:read',      // GET /event_types — used to resolve a connected user's scheduling link (ENG-524 webhook-receiver verification spike)
     ],
   },
 
@@ -428,6 +446,47 @@ export async function getOutlookConfig(): Promise<OutlookOAuthConfig> {
   };
   outlookConfigCacheExpiresAt = Date.now() + OUTLOOK_CONFIG_CACHE_TTL_MS;
   return cachedOutlookConfig;
+}
+
+// Calendly OAuth configuration
+export interface CalendlyOAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  scopes: string[];
+  authorizationUrl: string;
+  tokenUrl: string;
+  meUrl: string;
+  webhookSubscriptionsUrl: string;
+}
+
+// Module-level cache — avoids hitting Secrets Manager on every request
+let cachedCalendlyConfig: CalendlyOAuthConfig | null = null;
+let calendlyConfigCacheExpiresAt = 0;
+const CALENDLY_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Returns Calendly OAuth configuration.
+ * Credentials come from AWS Secrets Manager (dev/AgentWeb/Calendly or prod/...).
+ * Result is cached for 5 minutes to avoid per-request Secrets Manager calls.
+ */
+export async function getCalendlyConfig(): Promise<CalendlyOAuthConfig> {
+  if (cachedCalendlyConfig && Date.now() < calendlyConfigCacheExpiresAt) {
+    return cachedCalendlyConfig;
+  }
+  const credentials = await getCalendlyCredentials();
+  cachedCalendlyConfig = {
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: INTEGRATION_CONFIG.calendly.redirectUri,
+    scopes: INTEGRATION_CONFIG.calendly.scopes,
+    authorizationUrl: INTEGRATION_CONFIG.calendly.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.calendly.tokenUrl,
+    meUrl: INTEGRATION_CONFIG.calendly.meUrl,
+    webhookSubscriptionsUrl: INTEGRATION_CONFIG.calendly.webhookSubscriptionsUrl,
+  };
+  calendlyConfigCacheExpiresAt = Date.now() + CALENDLY_CONFIG_CACHE_TTL_MS;
+  return cachedCalendlyConfig;
 }
 
 // Google Drive OAuth configuration

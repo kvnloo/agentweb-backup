@@ -14,6 +14,7 @@
 
 jest.mock('../services/subscriptionService', () => ({
   getAllowedFunctionCalls: jest.fn(async () => []),
+  isSubscriptionFeatureEnabled: jest.fn(async () => true),
 }));
 
 jest.mock('../services/chatbotService', () => ({
@@ -24,6 +25,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    updateSessionPublishAdmission: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
   },
 }));
@@ -45,7 +47,7 @@ jest.mock('../services/agentModeService', () => ({
 }));
 
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
-  generateMarketingResponseWorkerService: { runInWorker: jest.fn() },
+  generateMarketingResponseWorkerService: { runInWorker: jest.fn(), releaseSessionClients: jest.fn() },
 }));
 
 jest.mock('../services/db', () => ({
@@ -421,5 +423,60 @@ describe('runScheduledChat — deterministic completion gate', () => {
     const calls = mockWorker.runInWorker.mock.calls.length;
     expect(calls).toBeGreaterThanOrEqual(2);
     expect(calls).toBeLessThanOrEqual(3);
+  });
+
+  // ENG-827 (Greptile P1, security): the completion-gate CONTINUATION turn builds its
+  // own message and calls the model on a separate code path from the main turn. It did
+  // not carry the mid-run publish-withdrawal notice, so a run that was admitted
+  // authorized and then had consent revoked reached the model with the persisted
+  // "you are authorized to publish" system prompt intact — the gate stopped nudging,
+  // but nothing told the model to stop publishing.
+  describe('mid-run publish revocation reaches the CONTINUATION turn too (ENG-827)', () => {
+    const publishSchedule = {
+      ...leadEngSchedule,
+      scheduleId: 'sched-publish',
+      requiredFunctionCalls: ['post_on_connected_account'],
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
+    };
+
+    beforeEach(async () => {
+      // This schedule requires a non-foundation tool, so the subscription pre-check
+      // would abort the run before it ever starts.
+      const { getAllowedFunctionCalls } = await import('../services/subscriptionService');
+      (getAllowedFunctionCalls as jest.Mock).mockResolvedValue(['*']);
+      // The owner revoked after admission: every mid-run re-read comes back withheld.
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...publishSchedule,
+        autopublishAuthorized: false,
+        autopublishAuthorizedTools: [],
+      } as any);
+    });
+
+    it('prepends the withdrawal notice to EVERY turn, including the gate continuation', async () => {
+      // Every turn admits unfinished work, so the gate keeps issuing continuation
+      // turns — the exact path that bypassed the notice.
+      mockWorker.runInWorker.mockResolvedValue(
+        workerResult('Draft is ready. I did not complete Step 3 for the remaining items.')
+      );
+
+      await runScheduledChat(publishSchedule as any, 'test-user-123', true);
+
+      const messages = mockWorker.runInWorker.mock.calls.map(
+        (c: any[]) => c[0].messageContent as string
+      );
+      // The gate fired, so at least one of these is a continuation turn.
+      expect(messages.length).toBeGreaterThanOrEqual(2);
+      const continuationTurns = messages.filter((m) =>
+        /remaining|not finished|complete all/i.test(m)
+      );
+      expect(continuationTurns.length).toBeGreaterThan(0);
+      // Assert the OUTCOME — what the model was actually told — on every turn sent
+      // after the revocation, not merely that the checker stopped asking.
+      for (const message of messages) {
+        expect(message).toContain('[PUBLISH AUTHORIZATION WITHDRAWN]');
+        expect(message).toContain('no longer authorized to publish with any tool');
+      }
+    });
   });
 });

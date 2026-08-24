@@ -7,11 +7,23 @@ instructions narrow and operational.
 
 - AI agents own execution through merge for qualifying engineering work. A PR
   merges without routine human approval only when it is current with `main`,
-  all relevant local tests/build/typecheck/lint and regression coverage pass,
-  staging/API/browser smoke is complete where applicable, every relevant
-  GitHub check is green, latest-head Greptile is 5/5 with no unresolved
-  actionable P1/P2, attribution is valid, rollback/post-deploy verification is
-  defined, and the PR is complete against its acceptance contract.
+  the affected production build passes, every relevant GitHub check is green,
+  attribution is valid, rollback/post-deploy verification is defined, and the
+  PR is complete against its acceptance contract. Routine product-test suites,
+  coverage targets, and PR staging deploys are not merge gates.
+- Atem is the test compute plane when a test is warranted. Retain or add a test
+  only for a human acceptance criterion, a critical invariant (auth, security,
+  billing, or data integrity), deploy-control integrity, or a reproduced
+  production regression. Do not update tests merely to bless an implementation;
+  stale, flaky, or low-signal tests may be removed with a recorded reason.
+- Greptile is retired (ENG-1371, 2026-08-19). It is no longer a merge
+  criterion, and the `Require Greptile Review` job, its scripts and
+  `greptile.json` are deleted from both repos. Do not wait for a Greptile
+  verdict — none will arrive. CodeRabbit still comments on every PR and is
+  advisory only: it has never been a required check and reports `pass`
+  regardless of its own rate-limit state, so read its findings, but nothing
+  mechanical gates on it. This mirrors the same change in CLAUDE.md; the two
+  files must not disagree about what gates a merge.
 - Prove "every relevant GitHub check is green" with
   `REPO=AgentWebPro/agentweb PR_NUMBER=<n> bash .github/scripts/merge-evidence.sh`
   (exit 0), not with `gh pr checks` alone. That command answers "did anything

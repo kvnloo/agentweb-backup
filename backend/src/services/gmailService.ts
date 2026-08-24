@@ -1,4 +1,3 @@
-import { google } from 'googleapis';
 import { getAccountById, updateAccountTokens, GmailConfig } from './connectedAccountsDb';
 import { getGmailConfig } from '../config/integrations';
 import { EmailProviderError } from './emailProviderService';
@@ -109,6 +108,8 @@ export class GmailService implements IEmailService {
       throw new GmailTokenRevokedError('No refresh token available. Please reconnect your Gmail account.');
     }
 
+    // ENG-1277: lazy load — see googleSearchProvider.ts for why.
+    const { google } = await import('googleapis');
     const gmailConfig = await getGmailConfig();
     const oauth2Client = new google.auth.OAuth2(
       gmailConfig.clientId,
@@ -148,6 +149,8 @@ export class GmailService implements IEmailService {
   // ── Gmail client builder ──────────────────────────────────────────────────
 
   private async getGmailClient(userId: string, accountId: string) {
+    // ENG-1277: lazy load — see googleSearchProvider.ts for why.
+    const { google } = await import('googleapis');
     const token = await this.getValidAccessToken(userId, accountId);
     const gmailConfig = await getGmailConfig();
     const oauth2Client = new google.auth.OAuth2(

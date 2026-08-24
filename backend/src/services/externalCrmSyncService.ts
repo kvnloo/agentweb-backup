@@ -120,6 +120,10 @@ export interface SyncResult {
   errors: string[];
   removedCount?: number;        // leads marked as CRM-removed (deleteOnPull)
   seenExternalIds?: string[];   // populated by adapters during pull, consumed by service for delete sweep
+  /** ENG-1002: rows the CRM refused as anonymized LinkedIn placeholders. They
+   *  are neither a success nor an error, so without their own field they
+   *  vanish from the sync totals and the counts stop adding up. */
+  anonymizedSkipped?: number;
 }
 
 export interface CrmProperty {

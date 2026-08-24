@@ -1,11 +1,18 @@
 import express from 'express';
+import axios from 'axios';
 import { authenticateToken } from '../middleware/auth';
-import { getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, updateAccountConfig, FathomConfig } from '../services/connectedAccountsDb';
+import { getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, getAccountById, updateAccountConfig, FathomConfig, CalendlyConfig } from '../services/connectedAccountsDb';
+import { refreshCalendlyAccessToken } from './calendlyAuth';
+import { registerProcessor, updateJobPayload } from '../services/asyncJobQueue';
+import { CALENDLY_WEBHOOK_CLEANUP_SOURCE, CalendlyWebhookCleanupPayload, queueCalendlyWebhookCleanup, getOrphanedCalendlyWebhook, recordOrphanedCalendlyWebhook } from '../services/calendlyWebhookCleanupQueue';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
+import { describeMetaAdsCapability } from '../utils/metaAdsScope';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
 import { getAllowedConnectedAccounts } from '../services/subscriptionService';
-import { userDb, orgDb } from '../services/db';
+import { userDb, orgDb, crmDb } from '../services/db';
+import { can } from "../services/orgAuthz";
+import { assertOwnedMetaPixel } from '../services/metaAccountCredentials';
 
 const router = express.Router();
 
@@ -26,7 +33,7 @@ async function canCallerDisconnectAccount(userId: string, platform: string, acco
   }
 
   const org = await orgDb.getOrgById(user.orgId);
-  const isOrgOwner = org?.ownerUserId === userId || user.orgRole === 'owner';
+  const isOrgOwner = can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, 'org:accounts:read');
   if (isOrgOwner) {
     return { allowed: true };
   }
@@ -35,6 +42,166 @@ async function canCallerDisconnectAccount(userId: string, platform: string, acco
     allowed: false,
     error: 'Only the org owner can disconnect an org-shared connected account. Unshare it from the organization first.',
   };
+}
+
+/**
+ * Durable retry for a webhook subscription that couldn't be deleted inline during
+ * disconnect (Calendly outage, or a token that a refresh at enqueue-time couldn't
+ * fix but a LATER refresh might). Refreshes on every attempt rather than reusing
+ * a stored access token, since by the time the poller retries this, whatever
+ * token was current at enqueue-time is almost certainly stale again.
+ */
+export async function processCalendlyWebhookCleanupJob(payload: CalendlyWebhookCleanupPayload): Promise<void> {
+  // Greptile P1 on #2291 (round 22): the orphan-webhook table (round 16) is a
+  // genuinely independent durable store from this job's own queue row — if an
+  // EARLIER attempt's rotation made it there but not here (its updateJobPayload
+  // write failed), this is the one place a fresher token could still be
+  // recovered from before giving up on the one this attempt was enqueued with.
+  let effectiveRefreshToken = payload.refreshToken;
+  if (payload.userId && payload.userUri) {
+    const orphaned = await getOrphanedCalendlyWebhook(payload.userId, payload.userUri);
+    if (orphaned?.refreshToken) effectiveRefreshToken = orphaned.refreshToken;
+  }
+
+  if (!effectiveRefreshToken) {
+    throw new Error(`No refresh token available to clean up orphaned webhook ${payload.webhookId}`);
+  }
+  const refreshed = await refreshCalendlyAccessToken(effectiveRefreshToken);
+  if (!refreshed) {
+    throw new Error(`Could not refresh token to clean up orphaned webhook ${payload.webhookId}`);
+  }
+
+  try {
+    await axios.delete(payload.webhookId, { headers: { Authorization: `Bearer ${refreshed.access_token}` } });
+    console.log(`[Calendly] Cleaned up orphaned webhook ${payload.webhookId} via queued retry`);
+  } catch (deleteError: any) {
+    // Greptile P1 on #2291 (round 20/22): Calendly may rotate the refresh token
+    // on every use. Persisting the rotation is only NEEDED if this attempt is
+    // about to fail anyway — this attempt already has a valid access_token in
+    // hand and doesn't need the persisted value at all if the delete above just
+    // succeeds, so only pay for the persist (and its own failure risk) when
+    // there's actually a future retry to prepare for. On that future retry,
+    // rely on TWO independent durable writes rather than one fallible write
+    // with one retry: the queue's own payload (updateJobPayload, fast path for
+    // this exact job) AND the orphan-webhook table (a different table, checked
+    // above, so the two failure domains are genuinely separate) — the compound
+    // "both writes to both stores failed" tail is meaningfully rarer than
+    // "one write failed twice."
+    if (refreshed.refresh_token && refreshed.refresh_token !== effectiveRefreshToken) {
+      const persistedToQueue = await updateJobPayload(CALENDLY_WEBHOOK_CLEANUP_SOURCE, payload.webhookId, { ...payload, refreshToken: refreshed.refresh_token });
+      const persistedToOrphanTable = payload.userId && payload.userUri
+        ? await recordOrphanedCalendlyWebhook(payload.userId, payload.userUri, payload.webhookId, refreshed.refresh_token)
+        : false;
+      // Greptile P1 on #2291 (third pass): both persistence writes are best-effort by
+      // design (retry-then-log, never throw) — but previously nothing here checked
+      // whether EITHER actually landed before re-throwing the unrelated deleteError.
+      // Calendly has already consumed the OLD refresh token by rotating it, so if
+      // BOTH writes failed, the new one exists nowhere durable — every future retry
+      // of this job will keep reloading the now-permanently-invalid old token,
+      // fail refreshCalendlyAccessToken every time, and exhaust its retry budget
+      // without ever having a real chance to succeed. Throwing a distinct error here
+      // makes that diagnosable in logs instead of looking identical to an ordinary
+      // transient delete failure that a later retry might still resolve.
+      if (!persistedToQueue && !persistedToOrphanTable) {
+        throw new Error(
+          `Calendly rotated the refresh token for webhook ${payload.webhookId}, but persisting the new token failed in both the queue payload and the orphan-webhook fallback table — every future retry of this cleanup job will use the now-invalid old token and can never succeed. Original delete error: ${deleteError?.message ?? deleteError}`,
+        );
+      }
+    }
+    throw deleteError;
+  }
+}
+
+// Greptile P1 on #2291 (round 9, issue 3): this job carries the ONLY remaining
+// durable copy of a webhook_id once the local account record (its other copy)
+// is deleted by disconnect. The default 5-attempt cap let it go terminally
+// 'failed' and never be retried again — permanently stranding the orphaned
+// Calendly-side subscription with no way left to recover its id and clean it
+// up, which then blocks a later reconnect with Calendly's "Already Exists".
+// A generous 20-attempt cap (~10 minutes at the 30s poll interval, round 25's
+// heartbeat/interval numbers) rides out a real Calendly outage or an
+// initially-unrefreshable token exactly like unlimited retries would.
+//
+// ENG-992 (live-tested round, #2291): unlimited retries used to be the
+// design here, but a real disconnect that hit a permanent (not transient)
+// 403 from Calendly showed the actual cost of that choice — the job retried
+// every 30s forever with zero escalation, indistinguishable in logs from a
+// healthy job. Bounding it lets processClaimedJob's terminal-'failed' log
+// (asyncJobQueue.ts) actually surface a permanently-stuck cleanup instead of
+// it scrolling silently forever. Safe to bound now specifically because
+// round 16's orphan-webhook table + reconnect self-heal (getOrphanedCalendlyWebhook
+// in calendlyAuth.ts) is an independent second recovery path that doesn't
+// depend on this job's retry state at all — the webhook_id is never actually
+// unrecoverable just because this job gives up.
+registerProcessor(CALENDLY_WEBHOOK_CLEANUP_SOURCE, processCalendlyWebhookCleanupJob, { maxAttempts: 20 });
+
+/**
+ * Best-effort cleanup of the remote Calendly webhook subscription on disconnect,
+ * symmetric with how /connect creates it. Non-fatal: disconnect must always
+ * succeed locally even if this fails (expired token, Calendly outage, etc).
+ *
+ * Greptile P1 on #2291 (round 1): without this at all, disconnect deleted the
+ * local account record (including webhook_id) but left the actual Calendly-side
+ * subscription alive, permanently stranding a later reconnect.
+ *
+ * Greptile P1 on #2291 (round 4): the refresh-and-retry added for that fixed the
+ * common "expired token" case, but disconnect still deleted the local account
+ * (and its webhook_id) on ANY remaining failure — a revoked refresh token or a
+ * Calendly outage at that exact moment — losing the only recorded identifier
+ * forever with no way to ever clean it up. Enqueueing a durable retry job here,
+ * BEFORE the account (and its webhook_id) is deleted, means that identifier
+ * survives independently of the account's lifecycle: the queue's own poller
+ * keeps retrying (refreshing the token fresh on each attempt) until it succeeds
+ * or exhausts its attempts, at which point it's durably 'failed' in the queue
+ * table rather than silently gone from everywhere.
+ */
+async function cleanupCalendlyWebhook(userId: string, account: { config: unknown } | null): Promise<void> {
+  if (!account) return;
+  const config = account.config as CalendlyConfig;
+  if (!config.webhook_id || !config.access_token) return;
+
+  const attemptDelete = (accessToken: string) =>
+    axios.delete(config.webhook_id!, { headers: { Authorization: `Bearer ${accessToken}` } });
+
+  try {
+    await attemptDelete(config.access_token);
+    console.log(`[Calendly] Deleted webhook ${config.webhook_id} on disconnect`);
+    return;
+  } catch (err: any) {
+    const isAuthError = err?.response?.status === 401 || err?.response?.status === 403;
+    if (!isAuthError || !config.refresh_token) {
+      await queueCalendlyWebhookCleanup(userId, config);
+      console.warn(`[Calendly] Failed to delete webhook ${config.webhook_id} on disconnect:`, err?.response?.data || err?.message);
+      return;
+    }
+  }
+
+  // The stored access token is short-lived and this cleanup often runs long after
+  // last activity — an auth failure here is expected, not exceptional. Refresh once
+  // and retry before falling back to the durable queue.
+  const refreshed = await refreshCalendlyAccessToken(config.refresh_token!);
+  if (!refreshed) {
+    await queueCalendlyWebhookCleanup(userId, config);
+    console.warn(`[Calendly] Could not refresh token to clean up webhook ${config.webhook_id} on disconnect — queued for retry`);
+    return;
+  }
+
+  try {
+    await attemptDelete(refreshed.access_token);
+    console.log(`[Calendly] Deleted webhook ${config.webhook_id} on disconnect (after token refresh)`);
+  } catch (retryErr: any) {
+    // Greptile P1 on #2291 (round 20): the same rotation-loss bug as
+    // processCalendlyWebhookCleanupJob, one call site earlier — refreshed
+    // successfully refreshes the token above, but queuing the ORIGINAL
+    // (pre-refresh) `config` here would enqueue the durable retry job with a
+    // refresh_token Calendly may have already rotated and invalidated by this
+    // very refresh call, guaranteeing that job's own first refresh attempt
+    // fails too. refreshed.refresh_token is always the current valid one
+    // (refreshCalendlyAccessToken falls back to the input token if Calendly
+    // didn't rotate it) — use it, not the stale value still on `config`.
+    await queueCalendlyWebhookCleanup(userId, { ...config, refresh_token: refreshed.refresh_token });
+    console.warn(`[Calendly] Failed to delete webhook ${config.webhook_id} on disconnect even after token refresh:`, retryErr?.response?.data || retryErr?.message);
+  }
 }
 
 // ============================================
@@ -74,6 +241,11 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
       let status: string;
       let expiryMessage: string;
 
+      // Meta ad accounts only, and only when we can prove the answer — the same
+      // annotation the agent's list_connected_accounts tool reports, so the model
+      // and the account owner can never be told two different things (ENG-1158).
+      const adsCapability = describeMetaAdsCapability(acc as any);
+
       if (acc.platform === 'unipile') {
         // Unipile manages credentials; use the real status from their API
         const unipileStatus = unipileStatusMap.get(acc.account_id) || 'OK';
@@ -93,6 +265,14 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // reconnect prompt instead of a misleading "Connected" badge.
         status = 'disconnected';
         expiryMessage = 'Reconnect required — X revoked the token';
+      } else if (adsCapability.ads_capable === false) {
+        // The token is valid and unexpired, but the Meta account never granted (or
+        // has since lost) ads_read/ads_management, so this ad account cannot serve
+        // the only thing it exists for. Reporting it as "Connected" is what let a
+        // multi-day zero-data reporting outage go unnoticed (ENG-1158) — surface it
+        // as needing reconnection so the row shows the Reconnect action.
+        status = 'disconnected';
+        expiryMessage = 'Reconnect required — Meta Ads permission not granted';
       } else {
         // Accounts with a refresh token (e.g. Gmail) auto-renew — don't show the
         // short-lived access token expiry; just show them as permanently connected.
@@ -124,6 +304,25 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         owned: acc.userId === userId,
         // LinkedIn Outreach (unipile) only: Premium accounts allow 300-char invites.
         is_premium: acc.platform === 'unipile' ? ((acc.config as any).is_premium === true) : undefined,
+        // Calendly only: false when the connecting account's plan doesn't support
+        // webhooks (Free tier) — OAuth succeeded but no booking events will arrive (ENG-524).
+        booking_tracking_active: acc.platform === 'calendly' ? ((acc.config as any).booking_tracking_active === true) : undefined,
+        // Calendly only: which lead list bookings land in — explicitly chosen or
+        // auto-resolved server-side on first booking (ENG-524 CRM-forward).
+        booking_lead_list_id: acc.platform === 'calendly' ? (acc.config as any).booking_lead_list_id : undefined,
+        // Meta ad accounts only: whether this connection can actually read ads
+        // data, plus the actionable reason when it cannot. Absent entirely for
+        // every other account, and for Meta records whose grant we cannot prove.
+        ...adsCapability,
+        // Calendly only (ENG-1141): which Meta pixel/ad account bookings attribute to —
+        // explicitly chosen, or undefined until the customer picks one (the frontend
+        // defaults the picker's display to the first connected account/pixel, matching
+        // resolveMetaPixelWithDefault's own fallback, but nothing is persisted until set).
+        attribution_pixel_id: acc.platform === 'calendly' ? (acc.config as any).attributionPixelId : undefined,
+        attribution_account_id: acc.platform === 'calendly' ? (acc.config as any).attributionAccountId : undefined,
+        // ENG-1141: the explicit "don't track in Meta" opt-out, distinct from the pair simply
+        // being unset (which auto-resolves) — the picker needs to render the difference.
+        attribution_disabled: acc.platform === 'calendly' ? (acc.config as any).attributionDisabled === true : undefined,
         // Status fields
         status,
         expires_at: acc.config.token_expires_at,
@@ -181,6 +380,16 @@ router.delete('/connected-accounts/:platform', authenticateToken, async (req: an
       return res.status(403).json({ error: disconnectGuard.error });
     }
 
+    if (platform === 'calendly') {
+      // Greptile P1 on #2291: getAccountByPlatform only returns the FIRST matching
+      // account, but a user can have more than one Calendly connection, and
+      // deleteAccount below removes ALL of them — clean up every one, not just one,
+      // or the rest are orphaned with no local record left to identify them.
+      const allAccounts = await getAccountsByUserId(userId);
+      const calendlyAccounts = allAccounts.filter((acc) => acc.platform === 'calendly');
+      await Promise.all(calendlyAccounts.map((acc) => cleanupCalendlyWebhook(userId, acc)));
+    }
+
     await deleteAccount(userId, platform);
     res.json({ success: true, message: `${platform} account(s) disconnected` });
   } catch (error) {
@@ -212,6 +421,10 @@ router.delete('/connected-accounts/:platform/:accountId', authenticateToken, asy
       }
     }
 
+    if (platform === 'calendly') {
+      await cleanupCalendlyWebhook(userId, await getAccountById(accountId, userId, 'calendly'));
+    }
+
     await deleteAccountById(userId, platform, accountId);
     res.json({ success: true, message: `${platform} account ${accountId} disconnected` });
   } catch (error) {
@@ -241,6 +454,187 @@ router.patch('/connected-accounts/unipile/:accountId/premium', authenticateToken
     }
     console.error('Update LinkedIn Premium flag error:', error);
     res.status(500).json({ error: 'Failed to update LinkedIn Premium status' });
+  }
+});
+
+// Choose which of the customer's own lead lists a Calendly booking gets created/updated
+// in (CRM-forward, ENG-524). Ownership is checked explicitly — getLeadListById has no
+// caller-scoping of its own, so a customer could otherwise point their bookings at a
+// list they don't own.
+router.patch('/connected-accounts/calendly/:accountId/booking-list', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { accountId } = req.params;
+  const { listId } = req.body;
+
+  if (typeof listId !== 'string' || !listId) {
+    return res.status(400).json({ error: 'listId is required' });
+  }
+
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ error: `No lead list with id "${listId}"` });
+    }
+    if (list.userId !== userId) {
+      return res.status(403).json({ error: 'You do not own this lead list' });
+    }
+
+    await updateAccountConfig(userId, 'calendly', accountId, { booking_lead_list_id: listId });
+    res.json({ success: true, accountId, booking_lead_list_id: listId });
+  } catch (error: any) {
+    // updateAccountConfig throws when the account isn't connected to this user
+    if (typeof error?.message === 'string' && error.message.includes('No calendly account')) {
+      return res.status(404).json({ error: error.message });
+    }
+    console.error('Update Calendly booking-list error:', error);
+    res.status(500).json({ error: 'Failed to update Calendly booking list' });
+  }
+});
+
+// ENG-1141: which Meta pixel/ad account this Calendly connection's bookings attribute
+// to — a booking webhook is unattended, so unlike landing pages this needs a settable,
+// persisted choice rather than a per-creation prompt (resolveMetaPixelWithDefault falls
+// back to the caller's first connected account/pixel when unset). Never trusts the
+// client to submit a valid pair — assertOwnedMetaPixel re-validates against the
+// caller's own connected Meta accounts before persisting, same as the landing-page
+// generation-time override.
+router.patch('/connected-accounts/calendly/:accountId/attribution', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { accountId } = req.params;
+  const { pixelId, accountId: metaAccountId, disabled } = req.body;
+
+  // ENG-1141: two valid shapes — a real pixel/account pair, or `disabled: true` meaning
+  // "don't wire Meta up for this connection at all". The opt-out is NOT the same as leaving
+  // the pair unset: unset means "auto-resolve to my first account/pixel", so a customer who
+  // uses Calendly purely for scheduling had no way to decline CAPI events entirely.
+  const isOptOut = disabled === true;
+  if (!isOptOut && (typeof pixelId !== 'string' || !pixelId || typeof metaAccountId !== 'string' || !metaAccountId)) {
+    return res.status(400).json({ error: 'pixelId and accountId are required, or pass disabled: true to turn attribution off' });
+  }
+
+  try {
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (isOptOut) {
+      // Clear any previously-stored pair alongside the flag, so re-enabling later is an
+      // explicit choice rather than silently resurrecting a months-old selection.
+      await updateAccountConfig(userId, 'calendly', accountId, {
+        attributionPixelId: undefined,
+        attributionAccountId: undefined,
+        attributionDisabled: true,
+      });
+      return res.json({ success: true, accountId, attributionDisabled: true });
+    }
+
+    const { accountId: resolvedAccountId } = await assertOwnedMetaPixel(user, userId, pixelId, metaAccountId);
+
+    await updateAccountConfig(userId, 'calendly', accountId, {
+      attributionPixelId: pixelId,
+      attributionAccountId: resolvedAccountId,
+      attributionDisabled: false,
+    });
+    res.json({ success: true, accountId, attributionPixelId: pixelId, attributionAccountId: resolvedAccountId });
+  } catch (error: any) {
+    if (typeof error?.message === 'string' && error.message.includes('No calendly account')) {
+      return res.status(404).json({ error: error.message });
+    }
+    if (typeof error?.message === 'string' && (
+      error.message.includes('not one of your connected accounts') || error.message.includes('was not found on ad account')
+    )) {
+      return res.status(400).json({ error: error.message });
+    }
+    console.error('Update Calendly attribution error:', error);
+    res.status(500).json({ error: 'Failed to update Calendly attribution' });
+  }
+});
+
+/**
+ * ENG-926 §C follow-up — the CRM → Meta conversion relay's per-ad-account settings.
+ *
+ * Two things live here, both previously unreachable without a hand-written DynamoDB row:
+ *
+ *   `enabled` — the relay's opt-in. §C shipped default-OFF deliberately (turning it on for
+ *   everyone would start writing deal values into the same event stream their campaign
+ *   optimisation reads, with nobody having asked), but shipped with no way to turn it ON
+ *   either. Editing a customer's production record by hand to activate a feature is not a
+ *   mechanism, it is a hazard.
+ *
+ *   `eventNames` — which Meta event each conversion is emitted as. A customer whose store
+ *   pixel already uses `Purchase` needs CRM deals under a different name, or the two are
+ *   blended with no way to separate them afterwards.
+ *
+ * Per ad account, not per user: a customer may run a store pixel on one account and CRM
+ * conversions on another, and the relay reads these from the account its pixel resolved to.
+ */
+router.patch('/connected-accounts/meta/:accountId/conversion-relay', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { accountId } = req.params;
+  const { enabled, eventNames } = req.body ?? {};
+
+  if (enabled === undefined && eventNames === undefined) {
+    return res.status(400).json({ error: 'nothing to update: pass enabled and/or eventNames' });
+  }
+  if (enabled !== undefined && typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+
+  const { validateEventNameOverrides } = await import('../services/metaConversionRelay');
+  const validation = validateEventNameOverrides(eventNames);
+  if (!validation.valid) {
+    // Refused here rather than at send time. A name Meta rejects becomes a lost conversion
+    // recorded only in a log, which is the silent failure this whole card exists to end.
+    return res.status(400).json({ error: validation.error });
+  }
+
+  try {
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Resolve against the caller's OWN connections, so this can never touch an account
+    // they do not hold, and so the stored `platform` value is used verbatim rather than
+    // assumed — production carries only 'meta' today, but three other modules still accept
+    // a legacy 'facebook', and updateAccountConfig matches on platform AND id.
+    const accounts = Array.isArray((user as any).connected_accounts) ? (user as any).connected_accounts : [];
+    const account = accounts.find(
+      (acc: any) =>
+        (acc?.platform === 'meta' || acc?.platform === 'facebook') &&
+        acc?.config?.account_type === 'ad_account' &&
+        String(acc?.account_id) === String(accountId),
+    );
+    if (!account) {
+      return res.status(404).json({ error: `No Meta ad account with id "${accountId}" connected` });
+    }
+
+    const patch: Record<string, any> = {};
+    if (enabled !== undefined) patch.crmConversionRelayEnabled = enabled;
+    // `null` clears the override back to §C's defaults, which is why it is an unset rather
+    // than a stored null. An object replaces the previous one wholesale, so a slot omitted
+    // from the new object genuinely returns to its default instead of lingering.
+    if (eventNames !== undefined && eventNames !== null) {
+      patch.crmConversionEventNames = eventNames;
+    }
+
+    await updateAccountConfig(
+      userId,
+      account.platform,
+      accountId,
+      patch,
+      eventNames === null ? { unset: ['crmConversionEventNames'] } : undefined,
+    );
+
+    return res.json({
+      success: true,
+      accountId,
+      ...(enabled !== undefined ? { crmConversionRelayEnabled: enabled } : {}),
+      ...(eventNames !== undefined ? { crmConversionEventNames: eventNames } : {}),
+    });
+  } catch (error: any) {
+    if (typeof error?.message === 'string' && error.message.includes('No meta account')) {
+      return res.status(404).json({ error: error.message });
+    }
+    console.error('Update Meta conversion relay settings error:', error);
+    return res.status(500).json({ error: 'Failed to update conversion relay settings' });
   }
 });
 

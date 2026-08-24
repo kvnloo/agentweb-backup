@@ -75,6 +75,10 @@ router.post('/ishare/:shareId/upload', upload.single('file'), asyncHandler(agent
 // Get current welcome message (public)
 router.get('/public/welcome-message', asyncHandler(agentModeController.getWelcomeMessage));
 
+// GET /api/agent-mode/public/new-chat-hero-greeting
+// Presentation-only copy for the empty New Chat hero.
+router.get('/public/new-chat-hero-greeting', asyncHandler(agentModeController.getNewChatHeroGreeting));
+
 // GET /api/agent-mode/public/conversation-starters
 // Get current conversation starters (public)
 router.get('/public/conversation-starters', asyncHandler(agentModeController.getConversationStarters));
@@ -135,6 +139,9 @@ router.post('/ishare/:shareId/email-report', asyncHandler(agentModeController.em
 // All other routes require authentication
 router.use(authenticateToken);
 
+// Create an authorized Skill-backed session with its existing static welcome brief.
+router.post('/skill/:skillId/session', asyncHandler(agentModeController.createSession));
+
 // PUT /api/agent-mode/session/:sessionId/transfer
 // Transfer anonymous session to authenticated user (requires authentication)
 router.put('/session/:sessionId/transfer', asyncHandlerAuth(agentModeController.transferSession));
@@ -144,6 +151,9 @@ router.put('/session/:sessionId/transfer', asyncHandlerAuth(agentModeController.
 // GET /api/agent-mode/sessions
 // Get user's agent chat sessions
 router.get('/sessions', asyncHandler(agentModeController.getSessions));
+
+// Current user model choices after applying the admin-managed cost policy.
+router.get('/model-options', asyncHandler(agentModeController.getModelOptions));
 
 // POST /api/agent-mode/sessions
 // Create new agent chat session
@@ -214,6 +224,12 @@ router.get('/system-prompt', requireAdmin, asyncHandler(agentModeController.getS
 // Get current welcome message (admin only)
 router.get('/welcome-message', requireAdmin, asyncHandler(agentModeController.getWelcomeMessage));
 
+// Admin presentation controls. Kept separate from system prompts and the
+// legacy welcome-message setting so prompt/content changes cannot leak here.
+router.get('/new-chat-hero-greeting', requireAdmin, asyncHandler(agentModeController.getNewChatHeroGreeting));
+router.put('/new-chat-hero-greeting', requireAdmin, asyncHandler(agentModeController.updateNewChatHeroGreeting));
+router.delete('/new-chat-hero-greeting', requireAdmin, asyncHandler(agentModeController.resetNewChatHeroGreeting));
+
 // GET /api/agent-mode/conversation-starters
 // Get current conversation starters (admin only)
 router.get('/conversation-starters', requireAdmin, asyncHandler(agentModeController.getConversationStarters));
@@ -230,6 +246,10 @@ router.put('/session/:sessionId/task/:taskId/execution/:executionId/status', asy
 // PUT /api/agent-mode/session/:sessionId/message/:messageIndex/feedback
 // Submit or update message feedback
 router.put('/session/:sessionId/message/:messageIndex/feedback', asyncHandlerAuth(agentModeController.submitMessageFeedback));
+
+// POST /api/agent-mode/session/:sessionId/work-plan-recommendations/:recommendationId/accept
+// Owner-only: instantiate a previously-recommended predefined work plan (ENG-1472)
+router.post('/session/:sessionId/work-plan-recommendations/:recommendationId/accept', asyncHandlerAuth(agentModeController.acceptWorkPlanRecommendation));
 
 // POST /api/agent-mode/share
 // Create shareable link for conversation
@@ -272,6 +292,19 @@ router.post('/scheduled-chats/:scheduleId/variables', asyncHandler(agentModeCont
 // Test scheduled chat
 router.post('/scheduled-chats/:scheduleId/test', asyncHandler(agentModeController.testScheduledChat));
 
+// POST /api/agent-mode/scheduled-chats/:scheduleId/publish-consent
+// ENG-827: REVOKE-ONLY. Accepts { authorized: false } and nothing else — the grant
+// direction is deliberately unreachable from the API (see the controller).
+//
+// No portal control calls this yet, and that is deliberate rather than an oversight.
+// The default was NOT flipped to opt-in, so `autopublishAuthorized` is written only by
+// scripts/grant-schedule-autopublish.ts against a recorded owner confirmation. This is
+// how an owner takes such a grant back — needed the moment that migration runs, and the
+// reason the endpoint is not removed as unreachable. The visible control today is
+// ENG-803's `requirePublishApproval` hold, which works on granted and never-asked
+// schedules alike.
+router.post('/scheduled-chats/:scheduleId/publish-consent', asyncHandler(agentModeController.revokeScheduledChatPublishConsent));
+
 // PATCH /api/agent-mode/scheduled-chats/:scheduleId/toggle
 // Toggle scheduled chat status (enable/disable)
 router.patch('/scheduled-chats/:scheduleId/toggle', asyncHandler(agentModeController.toggleScheduledChatStatus));
@@ -283,6 +316,12 @@ router.delete('/scheduled-chats/:scheduleId', asyncHandler(agentModeController.d
 // GET /api/agent-mode/scheduled-chats/:scheduleId/test-history
 // Get test history for a scheduled chat
 router.get('/scheduled-chats/:scheduleId/test-history', asyncHandler(agentModeController.getScheduledChatTestHistory));
+
+// GET /api/agent-mode/scheduled-chats/:scheduleId/storage-diagnostics
+// ENG-1071: read-only byte-usage breakdown (current prompt / prompt revisions / run
+// results) against DynamoDB's per-item limit, plus a corrective action when the
+// schedule is under storage pressure. Never returns field content, never writes.
+router.get('/scheduled-chats/:scheduleId/storage-diagnostics', asyncHandler(agentModeController.getScheduledChatStorageDiagnostics));
 
 // POST /api/agent-mode/scheduled-chats/:scheduleId/test-history/:runId/send-email
 // Send test notification email for a specific test history record

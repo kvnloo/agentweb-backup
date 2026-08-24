@@ -637,6 +637,54 @@ describe('SessionScoring - surfacing silent dead runs (ENG-473)', () => {
     expect(mockUpdateError.mock.calls[0][1]).toMatch(/crashed or timed out|failed run/i);
   });
 
+  // ENG-971. This note ends in "please send your message again to retry", and a
+  // turn-less death does NOT mean nothing happened — the module's own docs cite a
+  // run whose enrich_leads_execute landed before an EB deploy killed it. If the run
+  // published to production first, blanket retry advice invites a duplicate deploy,
+  // so the note must name what the ledger confirms.
+  it('names a confirmed publish in the retry note so the user does not re-run it', async () => {
+    const session = {
+      sessionId: 'dead-after-publish',
+      userId: 'u1',
+      sessionType: 'regular',
+      pageIdentifier: 'agent-mode',
+      messages: [...regularTurnless],
+      messageCount: regularTurnless.length,
+      calledFunctions: { publish_landing_page_changes: 1, get_deployment_status: 2 },
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    await scoreSessionIfNeeded(session);
+
+    expect(mockAddMessage).toHaveBeenCalledTimes(1);
+    const [, msg] = mockAddMessage.mock.calls[0];
+    expect(msg.content).toMatch(/didn't finish|send your message again|retry/i);
+    expect(msg.content).toContain('published your landing-page changes');
+    expect(msg.content).toContain('do NOT re-run it');
+    // The marker the idempotency check keys off must survive the append.
+    expect(msg.metadata.isRunFailureNotice).toBe(true);
+  });
+
+  it('leaves the retry note bare when the dead run published nothing', async () => {
+    const session = {
+      sessionId: 'dead-no-publish',
+      userId: 'u1',
+      sessionType: 'regular',
+      pageIdentifier: 'agent-mode',
+      messages: [...regularTurnless],
+      messageCount: regularTurnless.length,
+      calledFunctions: { get_leads: 3 },
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    await scoreSessionIfNeeded(session);
+
+    const [, msg] = mockAddMessage.mock.calls[0];
+    expect(msg.content).not.toContain('Correction');
+  });
+
   it('does NOT surface a note while the turn-less run is still in-flight (recent)', async () => {
     const session = {
       sessionId: 'inflight-regular-1',

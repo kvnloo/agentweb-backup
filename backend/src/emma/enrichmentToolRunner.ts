@@ -6,7 +6,7 @@ import { processEnrichmentConfig } from '../services/enrichmentConfigService';
 import { buildConfigProcessingDeps } from '../services/enrichmentConfigDeps';
 import { runEnrichment, type RunEnrichmentResult } from '../services/crmEnrichmentServiceV3';
 import { buildOrchestratorDeps } from '../services/enrichmentV3RealDeps';
-import type { SocketEmitFn } from '../services/crmEnrichmentService';
+import { CrmEnrichmentService, type SocketEmitFn } from '../services/crmEnrichmentService';
 import { buildRawEnrichmentConfig, type EmmaEnrichmentOutputField } from './enrichmentToolConfig';
 import { normalizeOutputFields, type FieldRemap } from './enrichmentFieldNormalizer';
 import { fieldVerificationStatus, fieldProvenanceBadge } from '../utils/enrichedFieldValue';
@@ -71,6 +71,31 @@ export interface RunEmmaEnrichmentParams {
 export async function runEmmaEnrichment(
   params: RunEmmaEnrichmentParams,
 ): Promise<EmmaEnrichmentSummary> {
+  // Access check (ENG-1049): this was previously missing entirely — not even a
+  // same-org check — so any authenticated user who could get a list_id in front
+  // of Emma could trigger enrichment writes on it. 'preview' doesn't persist, so
+  // it's gated by the read-level guard (still honours crm.enabled); 'enrich'
+  // writes field values, so it requires owner/org-owner/crm.editor.
+  const { crmDb } = await import('../services/db');
+  let accessList: any;
+  try {
+    accessList = await crmDb.getLeadListById(params.listId);
+  } catch (err) {
+    // Fail closed — unlike the field-normalization lookup below, an access-check
+    // failure must never silently allow the write to proceed.
+    throw new Error('Failed to verify list access');
+  }
+  if (!accessList) {
+    throw new Error('Lead list not found');
+  }
+  const { canAccessCrmList, canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('../services/crmAccessControl');
+  const hasAccess = params.mode === 'preview'
+    ? await canAccessCrmList(params.userId, accessList)
+    : await canDestructiveCrmList(params.userId, accessList);
+  if (!hasAccess) {
+    throw new Error(CRM_EDITOR_REQUIRED_MESSAGE);
+  }
+
   // Normalize field names: map synonyms onto existing standard/custom columns to
   // avoid creating duplicates. Fail soft — if the list lookup throws, proceed
   // with the original output_fields unchanged (enrichment must never be blocked).
@@ -78,13 +103,11 @@ export async function runEmmaEnrichment(
   let remaps: FieldRemap[] = [];
   let listContext: string | undefined;
   try {
-    const { crmDb } = await import('../services/db');
-    const list = await crmDb.getLeadListById(params.listId);
-    const existingFieldNames: string[] = Array.isArray(list?.fieldNames) ? list.fieldNames : [];
+    const existingFieldNames: string[] = Array.isArray(accessList?.fieldNames) ? accessList.fieldNames : [];
     const normalized = normalizeOutputFields(params.outputFields, existingFieldNames);
     effectiveOutputFields = normalized.fields;
     remaps = normalized.remaps;
-    listContext = buildListContext(list);
+    listContext = buildListContext(accessList);
   } catch (err) {
     console.warn(
       `[emma-enrich] Failed to fetch list fieldNames for normalization (listId=${params.listId}); ` +
@@ -161,7 +184,11 @@ export async function runEmmaEnrichment(
 
 /** Select 2 representative sample leads for a preview run. Prefers leads
  *  with identity data (email or linkedin) so the preview shows useful
- *  results. Throws when the list has no leads to sample. */
+ *  results. A placeholder/test address (queue-verify@example.com) is not
+ *  identity data — such a row can never be enriched (ENG-968), and sampling
+ *  two of them makes an otherwise-enrichable list look unenrichable. Falls
+ *  back to the raw pool when no better leads exist. Throws when the list has
+ *  no leads to sample. */
 export async function pickPreviewLeadIds(
   listId: string,
   explicitLeadIds: string[] | undefined,
@@ -175,8 +202,13 @@ export async function pickPreviewLeadIds(
   if (pool.length === 0) {
     throw new Error('This list has no leads to preview enrichment on.');
   }
+  const hasRealEmail = (l: any) => {
+    const email = typeof l.email === 'string' ? l.email.trim() : '';
+    if (!email) return false;
+    return !CrmEnrichmentService.isPlaceholderDomain(email.split('@')[1] || '');
+  };
   const hasIdentity = (l: any) =>
-    (typeof l.email === 'string' && l.email.trim()) ||
+    hasRealEmail(l) ||
     (typeof l.linkedin === 'string' && l.linkedin.trim());
   const withIdentity = pool.filter(hasIdentity);
   const chosen = (withIdentity.length >= 2 ? withIdentity : pool).slice(0, 2);

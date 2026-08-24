@@ -23,6 +23,19 @@
  * The golden reference below is a faithful copy of the algorithm as it stood
  * before the fix. DO NOT "simplify" it to match the new implementation — its
  * entire purpose is to be an independent oracle of the prior behavior.
+ *
+ * TWO deliberate divergences have been folded into the oracle since:
+ *  - ENG-940's follow-up changed which results the tool-content preserve window
+ *    protects (the N most recent AT-RISK results, not the N most recent results
+ *    outright).
+ *  - ENG-1310 changed the compressed-preview TEXT itself: the placeholder now
+ *    explicitly tells the model the preview is not a verified source and names
+ *    the recovery path (re-read via read_tool_response/search_tool_response, or
+ *    re-run the source tool), instead of a bare "[Tool: name — preview...]" that
+ *    silently disappeared a few turns later with nothing pointing back at it.
+ * Both are intended behavior changes, not drift, so the oracle encodes them too —
+ * each is marked at the point of use. Everything else must still match byte for
+ * byte, and the performance and splice/reorder guarantees are unaffected.
  */
 
 // ─── Golden reference: the ORIGINAL trimToolMessagesForContext algorithm ──────
@@ -54,6 +67,18 @@ function goldenTrim(
 
   const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
 
+  // ENG-940 follow-up: the tool-content window preserves the N most recent
+  // AT-RISK results (those over their trim limit) rather than the N most recent
+  // results outright, so a result the trimmer would never touch cannot evict one
+  // it would destroy. The recency-based `preserveSet` above still drives the
+  // assistant-argument logic, which is unchanged.
+  const atRiskIndices = toolIndices.filter(
+    (i) =>
+      typeof messages[i].content === 'string' &&
+      messages[i].content.length > (REF_LARGE_TOOL_RESULT_LIMIT[messages[i].name] || maxToolContentLength),
+  );
+  const atRiskPreserveSet = new Set(atRiskIndices.slice(-recentToPreserve));
+
   const oldAssistantIndices = new Set<number>();
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -73,11 +98,19 @@ function goldenTrim(
   }
 
   return messages.map((msg, idx) => {
-    if (msg.role === 'tool' && !preserveSet.has(idx) && typeof msg.content === 'string') {
+    if (msg.role === 'tool' && !atRiskPreserveSet.has(idx) && typeof msg.content === 'string') {
       const limit = REF_LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
       if (msg.content.length > limit) {
+        // ENG-1310 divergence: none of buildSyntheticSession's fixtures carry a
+        // "[Full response stored at S3 key: …]" header, so the S3-ref branch of the
+        // real function is never exercised here — this mirrors production's
+        // no-ref path exactly (see agentModeService.ts's trimToolMessagesForContext).
         const preview = msg.content.slice(0, 200).replace(/\n/g, ' ').trim();
-        return { ...msg, content: `[Tool: ${msg.name} — ${preview}...]` };
+        const recoveryHint = `re-run ${msg.name} if you need the full result`;
+        return {
+          ...msg,
+          content: `[Tool: ${msg.name} — compressed for context; this preview is NOT a verified source — do not restate any number or figure from it, or from your own earlier reply, as confirmed; ${recoveryHint}. preview: ${preview}...]`,
+        };
       }
     }
     if (msg.role === 'assistant' && oldAssistantIndices.has(idx) && msg.tool_calls?.length) {
