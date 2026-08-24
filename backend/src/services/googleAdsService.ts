@@ -175,7 +175,7 @@ function assertBidTargetIsAddressable(params: {
 
   if (sentCeiling && !support.ceiling) {
     throw new Error(
-      `cpc_bid_ceiling_micros cannot be set on ${params.biddingStrategy} at campaign level: Google makes the bid ceiling mutable for PORTFOLIO bidding strategies only, so a ceiling sent here is not stored and the campaign keeps bidding uncapped. Either move the campaign onto a portfolio strategy that carries the ceiling, or drop cpc_bid_ceiling_micros${support.target ? ` and control cost with bidding_strategy_target (${support.targetMeans})` : ''}. Nothing was sent to Google Ads.`,
+      `cpc_bid_ceiling_micros is not a campaign-level field of ${params.biddingStrategy}: Google makes the ceiling on this strategy mutable only through a PORTFOLIO bidding strategy, so a ceiling sent here is not stored and the campaign keeps bidding uncapped. Either move the campaign onto a portfolio strategy that carries the ceiling, or drop cpc_bid_ceiling_micros${support.target ? ` and control cost with bidding_strategy_target (${support.targetMeans})` : ''}. Nothing was sent to Google Ads.`,
     );
   }
 }
@@ -810,7 +810,6 @@ export class GoogleAdsService {
     brandBusinessName?: string;
     brandLogoAssetResourceName?: string;
   }): Promise<{ resourceName: string }> {
-    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
     // DISPLAY campaigns cannot use MAXIMIZE_CONVERSIONS with a shared budget
     if (params.type === 'DISPLAY' && params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') {
@@ -856,6 +855,13 @@ export class GoogleAdsService {
         : {};
     }
     else throw new Error(`Unsupported bidding_strategy '${params.biddingStrategy}' for CAMPAIGN CREATE. Supported values: MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, TARGET_CPA, TARGET_ROAS, TARGET_IMPRESSION_SHARE, TARGET_SPEND, MANUAL_CPC.`);
+
+    // Credentials are loaded only AFTER every local validation above, matching
+    // updateCampaign. Loading them first meant an invalid request could trigger a token
+    // refresh and rewrite the stored tokens on its way to being rejected, and a caller
+    // with an expired connection got an authentication error instead of the validation
+    // error that actually described their mistake.
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
     const campaignCreate = {
       name: params.name,

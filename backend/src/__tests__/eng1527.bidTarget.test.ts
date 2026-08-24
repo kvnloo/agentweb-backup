@@ -136,9 +136,9 @@ describe('a target the named strategy cannot store is refused, not dropped', () 
     'refuses a cpc_bid_ceiling on %s and sends nothing',
     async (biddingStrategy) => {
       await expect(create({ biddingStrategy, cpcBidCeilingMicros: 2_000_000 }))
-        .rejects.toThrow(/portfolio bidding strategies only/i);
+        .rejects.toThrow(/not a campaign-level field of/i);
       await expect(update({ biddingStrategy, cpcBidCeilingMicros: 2_000_000 }))
-        .rejects.toThrow(/portfolio bidding strategies only/i);
+        .rejects.toThrow(/not a campaign-level field of/i);
       expect(mutate).not.toHaveBeenCalled();
     },
   );
@@ -163,6 +163,22 @@ describe('a target the named strategy cannot store is refused, not dropped', () 
     await expect(update({ ...portfolio, cpcBidCeilingMicros: 2_000_000 }))
       .rejects.toThrow(/only holds a reference to it/i);
     expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unaddressable target BEFORE loading credentials', async () => {
+    /*
+     * createCampaign used to fetch credentials first. An invalid request could therefore
+     * trigger a token refresh and rewrite the stored tokens on its way to being rejected,
+     * and a caller whose connection had expired got an authentication error instead of the
+     * validation error that actually described their mistake. updateCampaign already
+     * validated first; this pins the two the same way.
+     */
+    const s = svc();
+    s.getAccountCredentials = jest.fn().mockRejectedValue(new Error('OAuth token expired'));
+    await expect(
+      s.createCampaign('u', '1234567890', { ...CREATE_BASE, biddingStrategy: 'MANUAL_CPC', biddingStrategyTarget: 50 }),
+    ).rejects.toThrow(/is not a field of MANUAL_CPC/i);
+    expect(s.getAccountCredentials).not.toHaveBeenCalled();
   });
 
   it('lets an unknown strategy be reported as unknown rather than as a bad target', async () => {
