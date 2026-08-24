@@ -88,7 +88,12 @@ export async function findDuplicate(input: DedupInput, candidates: DedupCandidat
         { role: 'system', content: system },
         { role: 'user', content: user },
       ],
-      { temperature: 0, max_completion_tokens: 120, response_format: { type: 'json_object' } },
+      {
+        temperature: 0,
+        max_completion_tokens: 120,
+        response_format: { type: 'json_object' },
+        taskClass: 'nonstandard_consumer',
+      },
     );
     let timer: NodeJS.Timeout | undefined;
     const timeoutPromise = new Promise<never>((_, reject) => {

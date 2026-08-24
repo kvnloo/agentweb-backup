@@ -171,6 +171,48 @@ describe("recommendation telemetry (ENG-1210 AC12)", () => {
     });
   });
 
+  it("ENG-1436: carries the ACTUAL onTrack, so the funnel can exclude what was never shown", async () => {
+    // Not just "the field exists" — the VALUE has to track the real forecast, because the
+    // panel renders recommendations only when onTrack === false. In 48h of production, 31
+    // of 60 shown events went to accounts that could not see them.
+    //
+    // Both resolvers derive onTrack from the same readBilledLedgerRows(billingUserId,
+    // cycleStart, today) and the same policy, so the value emitted here is the one the UI
+    // gates on. These two cases pin that it moves with the forecast rather than being a
+    // constant nobody noticed.
+    const cheap = Array.from({ length: 10 }, (_, i) => ({
+      userId: "billing-root",
+      sk: `2026-08-${String(i + 1).padStart(2, "0")}#${OPUS}#agent_task`,
+      date: `2026-08-${String(i + 1).padStart(2, "0")}`,
+      model: OPUS,
+      feature: "agent_task",
+      inputTokens: 500,
+      outputTokens: 100,
+      costMicroUsd: 0.01 * USD,
+      callCount: 1,
+    }));
+    mockQuery.mockResolvedValue(cheap);
+    mockPolicy.mockResolvedValue(policyFor({ costUsedMicroUsd: 1 * USD }));
+    await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const onTrackShown = emitted
+      .filter((e) => e.event === "runway_recommendation_shown")
+      .map((e) => e.dimensions.onTrack);
+    // A trivial burn against a $150 ceiling comfortably outlives the cycle.
+    expect(onTrackShown.length).toBeGreaterThan(0);
+    expect(new Set(onTrackShown)).toEqual(new Set([true]));
+
+    // Now the opposite: heavy burn, nearly all of the ceiling already spent.
+    emitted.length = 0;
+    mockQuery.mockResolvedValue(opusLedger());
+    mockPolicy.mockResolvedValue(policyFor({ costUsedMicroUsd: 140 * USD }));
+    await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const offTrackShown = emitted
+      .filter((e) => e.event === "runway_recommendation_shown")
+      .map((e) => e.dimensions.onTrack);
+    expect(offTrackShown.length).toBeGreaterThan(0);
+    expect(new Set(offTrackShown)).toEqual(new Set([false]));
+  });
+
   it("puts no internal dollar figure into any emitted dimension", async () => {
     await resolveUsageDrivers("u1", { today: "2026-08-11" });
     const blob = JSON.stringify(emitted);
@@ -391,6 +433,23 @@ describe("resolveUsageDrivers", () => {
     expect(scheduleDrivers).toHaveLength(1);
     expect(scheduleDrivers[0].scheduleId).toBe("ghost");
     expect(scheduleDrivers[0].title).toBeNull();
+    // ENG-1438: null title alone cannot say WHICH state this is. Found in production —
+    // a real deleted schedule was rendering as "Untitled scheduled task", a task that
+    // does not exist described as one that does.
+    expect(scheduleDrivers[0].scheduleExists).toBe(false);
+  });
+
+  it("ENG-1438: an EXISTING but unnamed schedule is not reported as deleted", async () => {
+    // The other half of the distinction. Both used to produce `title: null`, so the UI
+    // had one sentence for two different truths.
+    mockQuery.mockResolvedValue([
+      { date: "2026-08-02", model: OPUS, feature: "agent_task:scheduled:sched-a", costMicroUsd: 50 * USD, callCount: 5 },
+    ]);
+    mockSchedules.mockResolvedValue([{ scheduleId: "sched-a", frequency: "daily" }]);
+
+    const { scheduleDrivers } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(scheduleDrivers[0].title).toBeNull();
+    expect(scheduleDrivers[0].scheduleExists).toBe(true);
   });
 
   it("looks up schedules across every pooled member, not only the root", async () => {
@@ -689,6 +748,23 @@ describe("toCustomerDrivers — AC4 exposure boundary", () => {
     expect(customer.drivers!.byModel[0].shareOfTotal).toBeCloseTo(1, 5);
     expect(customer.drivers!.byModel[0].key).toBe(OPUS);
     expect(customer.recommendations[0].estimatedDaysRecovered!).toBeGreaterThan(0);
+  });
+
+  it("ENG-1438: `scheduleExists` CROSSES the boundary — the UI cannot name a deleted task without it", async () => {
+    // Found by mutation testing this very PR: deleting the field from
+    // toCustomerDrivers failed no test, so nothing proved the portal fix would ever
+    // receive the value it depends on. That is the shape of a fix that ships inert.
+    mockQuery.mockResolvedValue([
+      { date: "2026-08-02", model: OPUS, feature: "agent_task:scheduled:ghost", costMicroUsd: 50 * USD, callCount: 5 },
+    ]);
+    mockSchedules.mockResolvedValue([]);
+
+    const customer = toCustomerDrivers(await resolveUsageDrivers("u1", { today: "2026-08-11" }));
+
+    expect(customer.scheduleDrivers).toHaveLength(1);
+    expect(customer.scheduleDrivers[0]).toHaveProperty("scheduleExists", false);
+    // And it stays customer-safe: a boolean about existence, no economics.
+    expect(JSON.stringify(customer.scheduleDrivers)).not.toMatch(/MicroUsd/i);
   });
 });
 

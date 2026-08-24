@@ -40,6 +40,7 @@ export async function summarizeSession(
       temperature: 0,
       max_completion_tokens: 200,
       response_format: { type: "json_object" },
+      taskClass: 'nonstandard_consumer',
     }
   );
 

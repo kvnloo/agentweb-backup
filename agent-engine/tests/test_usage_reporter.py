@@ -33,15 +33,17 @@ def _fake_llm_result(usage_metadata=None, llm_output=None):
 class TestParseFullLlmName(unittest.TestCase):
     def test_valid_triplet(self):
         self.assertEqual(
-            parse_full_llm_name("azure->openai->gpt-4o"), ("openai", "gpt-4o")
+            parse_full_llm_name("azure->openai->gpt-4o"), ("openrouter", "gpt-4o")
         )
         self.assertEqual(
             parse_full_llm_name("aws->Anthropic->anthropic.claude-sonnet-4-6"),
-            ("anthropic", "anthropic.claude-sonnet-4-6"),
+            ("openrouter", "anthropic.claude-sonnet-4-6"),
         )
 
     def test_malformed_names_fall_back(self):
         self.assertEqual(parse_full_llm_name("gpt-4o"), ("unknown", "gpt-4o"))
+        self.assertEqual(parse_full_llm_name("->openai->gpt-4o"), ("unknown", "->openai->gpt-4o"))
+        self.assertEqual(parse_full_llm_name("azure-> ->gpt-4o"), ("unknown", "azure-> ->gpt-4o"))
         self.assertEqual(parse_full_llm_name(""), ("unknown", "unknown"))
         self.assertEqual(parse_full_llm_name(None), ("unknown", "unknown"))
 
@@ -89,6 +91,42 @@ class TestExtractUsage(unittest.TestCase):
         self.assertIsNone(extract_usage_from_llm_result(None))
         self.assertIsNone(extract_usage_from_llm_result(object()))
 
+    def test_malformed_truthy_metadata_does_not_hide_valid_usage(self):
+        malformed = SimpleNamespace(message=SimpleNamespace(usage_metadata="wrong-type"))
+        valid = SimpleNamespace(
+            message=SimpleNamespace(
+                usage_metadata={"input_tokens": 7, "output_tokens": 3},
+                response_metadata="wrong-type",
+            )
+        )
+        result = SimpleNamespace(generations=[[malformed, valid]], llm_output="wrong-type")
+
+        usage = extract_usage_from_llm_result(result)
+
+        self.assertEqual(usage["input_tokens"], 7)
+        self.assertEqual(usage["output_tokens"], 3)
+
+    def test_openrouter_response_includes_actual_model_and_upstream_cost(self):
+        message = SimpleNamespace(
+            usage_metadata={"input_tokens": 91, "output_tokens": 13},
+            response_metadata={
+                "model_name": "openai/gpt-4.1",
+                "token_usage": {
+                    "cost": 0,
+                    "is_byok": True,
+                    "cost_details": {"upstream_inference_cost": 0.000286},
+                },
+            },
+        )
+        result = SimpleNamespace(
+            generations=[[SimpleNamespace(message=message)]], llm_output={}
+        )
+
+        usage = extract_usage_from_llm_result(result)
+
+        self.assertEqual(usage["model"], "openai/gpt-4.1")
+        self.assertEqual(usage["cost_usd_override"], 0.000286)
+
 
 class TestUsageReporterBuffering(unittest.TestCase):
     def setUp(self):
@@ -106,7 +144,7 @@ class TestUsageReporterBuffering(unittest.TestCase):
         self.assertEqual(record["userId"], "user-1")
         self.assertEqual(record["taskId"], "task-9")
         self.assertEqual(record["model"], "anthropic.claude-sonnet-4-6")
-        self.assertEqual(record["provider"], "anthropic")
+        self.assertEqual(record["provider"], "openrouter")
         self.assertEqual(record["feature"], "agent_task")
         self.assertEqual(record["inputTokens"], 150)
         self.assertEqual(record["outputTokens"], 30)
@@ -221,6 +259,25 @@ class TestCallbackHandler(unittest.TestCase):
         records = reporter.build_records("user-1")
         self.assertEqual(records[0]["inputTokens"], 42)
         self.assertEqual(records[0]["outputTokens"], 8)
+
+    def test_on_llm_end_attributes_the_served_model_and_exact_cost(self):
+        reporter = UsageReporter("azure->openai->gpt-4o", token_factory=lambda uid: "t")
+        handler = UsageCallbackHandler(reporter)
+        message = SimpleNamespace(
+            usage_metadata={"input_tokens": 42, "output_tokens": 8},
+            response_metadata={
+                "model_name": "openai/gpt-4.1",
+                "token_usage": {"cost": 0.00012, "is_byok": False},
+            },
+        )
+
+        handler.on_llm_end(
+            SimpleNamespace(generations=[[SimpleNamespace(message=message)]], llm_output={})
+        )
+
+        record = reporter.build_records("user-1")[0]
+        self.assertEqual(record["model"], "openai/gpt-4.1")
+        self.assertEqual(record["costUsdOverride"], 0.00012)
 
     def test_on_llm_end_never_raises(self):
         reporter = UsageReporter("google->google->gemini-3.5-flash", token_factory=lambda uid: "t")

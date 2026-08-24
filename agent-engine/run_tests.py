@@ -34,7 +34,6 @@ def run_all_tests():
         "tests/test_validate_content_format_standalone.py",
         "tests/test_browser_use_integration.py",
         "tests/test_memory_fix_comprehensive.py",
-        "tests/test_azure_openai_with_memory_fix.py",
     ]
     
     success_count = 0
