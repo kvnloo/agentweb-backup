@@ -462,6 +462,54 @@ function countProducedAssets(toolCalls: ExecutedToolCall[]): number {
   return total;
 }
 
+/** Minimal shape of a persisted assistant message this reads — mirrors the
+ * identical local interface `seedMediaCallKeysFromHistory` (toolDispatch.ts) already
+ * uses to reconstruct tool calls from `session.messages`. */
+interface HistoryMessageLike {
+  role?: string;
+  timestamp?: string;
+  metadata?: {
+    timestamp?: string;
+    toolCalls?: ExecutedToolCall[];
+  } | null;
+}
+
+/**
+ * ENG-1331: the work-plan step completion gate's asset counter
+ * (`AgentModeService.extractGeneratedImageFilenames`) only recognizes the
+ * system-message marker `generate_image` emits — a step whose deliverable is
+ * Playwright-rendered screenshots (`create_html_file` +
+ * `playwright_browser_take_screenshot`, no `generate_image` call at all) can never
+ * satisfy it, so the ENG-1188 xCures completion gate stays silently blind to
+ * exactly the failure mode production hit here (4 of 12 screenshots rendered, the
+ * step still marked completed). This counts every `ASSET_PRODUCING_TOOL_NAMES`
+ * success across `session.messages` instead of one tool's marker — the same ledger
+ * this module already reads for the synthesis-claim check above, so both
+ * mechanisms agree on what "an asset was produced" means.
+ *
+ * Scoped by `sinceIso` exactly like `extractGeneratedImageFilenames`: only calls
+ * from a message timestamped at or after the cutoff count, so an earlier step's
+ * assets never satisfy a later step's requirement. Per-message granularity (not
+ * per-call) matches `seedMediaCallKeysFromHistory`'s existing precedent for reading
+ * this same persisted shape.
+ */
+export function extractProducedAssetCount(
+  messages: HistoryMessageLike[] | undefined | null,
+  sinceIso?: string,
+): number {
+  if (!Array.isArray(messages)) return 0;
+  let total = 0;
+  for (const message of messages) {
+    if (!message || message.role !== 'assistant') continue;
+    const toolCalls = message.metadata?.toolCalls;
+    if (!Array.isArray(toolCalls) || toolCalls.length === 0) continue;
+    const timestamp = message.timestamp || message.metadata?.timestamp;
+    if (sinceIso && timestamp && timestamp < sinceIso) continue;
+    total += countProducedAssets(toolCalls);
+  }
+  return total;
+}
+
 export interface FalseCompletionClaim {
   /** The largest numeric completion claim found in the content. */
   claimed: number;

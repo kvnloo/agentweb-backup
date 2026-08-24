@@ -30,7 +30,7 @@ import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
@@ -29720,7 +29720,16 @@ ${strippedHtml}`;
               if (live?.resolvedAt) { sinceIso = live.resolvedAt; break; }
             }
           }
-          const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length;
+          // ENG-1331: extractGeneratedImageFilenames only recognizes generate_image's
+          // own marker, so a step whose deliverable is Playwright-rendered
+          // screenshots (no generate_image call at all) would always read 0 there.
+          // extractProducedAssetCount reads the same persisted toolCalls ledger for
+          // every known asset-producing tool; take the max of both signals so
+          // neither detection path can pull the count DOWN relative to the other.
+          const producedAssetCount = Math.max(
+            AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
+            extractProducedAssetCount(session.messages, sinceIso),
+          );
           if (producedAssetCount < step.expectedAssetCount) {
             insufficientAssets.push({
               stepCount: update.stepCount,

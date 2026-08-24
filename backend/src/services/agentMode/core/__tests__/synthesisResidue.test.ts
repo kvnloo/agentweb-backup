@@ -12,6 +12,7 @@ import {
   buildExecutedActionsFooter,
   detectFalseCompletionClaim,
   buildFalseClaimCorrectionFooter,
+  extractProducedAssetCount,
 } from '../synthesisResidue';
 import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from '../termination';
 import { buildTurnTimeBudgetNudge, type TurnTimeBudgetState } from '../../../../utils/turnTimeBudget';
@@ -493,3 +494,75 @@ function fourScreenshotsForFooterTest() {
     result: { success: true, screenshotUrl: `https://s3.example.com/${i + 1}.png` },
   }));
 }
+
+// ENG-1331: the work-plan step completion gate's own asset counter
+// (extractGeneratedImageFilenames) only recognizes generate_image's marker, so a
+// Playwright-screenshot-rendered step could never satisfy expectedAssetCount even
+// when it was set. extractProducedAssetCount reads the same persisted
+// session.messages toolCalls ledger for every ASSET_PRODUCING_TOOL_NAMES tool.
+describe('extractProducedAssetCount', () => {
+  function assistantMessage(toolCalls: any[], timestamp?: string) {
+    return { role: 'assistant', timestamp, metadata: { timestamp, toolCalls } };
+  }
+
+  it('counts successful playwright_browser_take_screenshot calls — the production gap', () => {
+    const messages = [
+      assistantMessage([
+        { name: 'create_html_file', result: { success: true, s3_url: 'https://s3.example.com/template.html' } },
+        ...fourScreenshotsForFooterTest(),
+      ]),
+    ];
+    expect(extractProducedAssetCount(messages)).toBe(5); // 1 html file + 4 screenshots
+  });
+
+  it('counts generate_image successes too', () => {
+    const messages = [
+      assistantMessage([
+        { name: 'generate_image', result: { success: true, imageUrl: 'https://s3.example.com/hero.png' } },
+      ]),
+    ];
+    expect(extractProducedAssetCount(messages)).toBe(1);
+  });
+
+  it('ignores non-asset-producing tools', () => {
+    const messages = [
+      assistantMessage([
+        { name: 'search_user_assets', result: { success: true, results: [] } },
+        { name: 'set_work_plan_status', result: { success: true } },
+      ]),
+    ];
+    expect(extractProducedAssetCount(messages)).toBe(0);
+  });
+
+  it('ignores errored, deferred, and reported-failure calls', () => {
+    const messages = [
+      assistantMessage([
+        { name: 'playwright_browser_take_screenshot', error: 'timeout' },
+        { name: 'playwright_browser_take_screenshot', result: { deferred: true } },
+        { name: 'playwright_browser_take_screenshot', result: { success: false } },
+      ]),
+    ];
+    expect(extractProducedAssetCount(messages)).toBe(0);
+  });
+
+  it('ignores non-assistant messages', () => {
+    const messages = [
+      { role: 'user', metadata: { toolCalls: fourScreenshotsForFooterTest() } },
+      { role: 'system', metadata: { toolCalls: fourScreenshotsForFooterTest() } },
+    ];
+    expect(extractProducedAssetCount(messages as any)).toBe(0);
+  });
+
+  it('excludes calls before sinceIso — an earlier step\'s assets do not satisfy a later step', () => {
+    const messages = [
+      assistantMessage(fourScreenshotsForFooterTest(), '2026-08-18T09:12:00.000Z'),
+      assistantMessage(fourScreenshotsForFooterTest(), '2026-08-18T09:20:00.000Z'),
+    ];
+    expect(extractProducedAssetCount(messages, '2026-08-18T09:15:00.000Z')).toBe(4);
+  });
+
+  it('returns 0 for missing or empty message history', () => {
+    expect(extractProducedAssetCount(undefined)).toBe(0);
+    expect(extractProducedAssetCount([])).toBe(0);
+  });
+});
