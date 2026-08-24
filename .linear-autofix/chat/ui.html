@@ -771,7 +771,7 @@ const VOICE_ENGINE = 'local';
 // `tgt` is the box this press belongs to — the main composer or the /btw modal's textarea. See
 // mainVoiceTarget/btwVoiceTarget below; it is pinned on keydown and cleared when the polish lands.
 const VOICE_SUPPORTED = VOICE_ENGINE === 'local'
-  ? !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder)
+  ? !!(SR && navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder) // live SR + audio capture
   : !!SR;
 const V = { supported: VOICE_SUPPORTED, denied: false, pressActive: false, recording: false, holdTimer: null, releaseTimer: null, spaceUpTs: -1e9, interveningKey: true, rec: null, before: '', after: '', spaceAt: 0, awaitingFinal: false, finalTimer: null, tgt: null };
 
@@ -1991,7 +1991,7 @@ function startVoice(tgt) {
   const caret0 = before.length;
   try { el.setSelectionRange(caret0, caret0); } catch {}
   t.fit();
-  if (VOICE_ENGINE === 'local') { startVoiceLocal(t, el); return; } // record → transcribe on release
+  if (VOICE_ENGINE === 'local') { V.mr = null; V.chunks = []; V.recStopped = null; } // parallel audio capture starts after rec.start()
   try {
     const rec = new SR();
     V.rec = rec;
@@ -2025,57 +2025,50 @@ function startVoice(tgt) {
       else finalizeVoice(); // released (or auto-ended) → clean up the transcript
     };
     rec.start();
+    if (VOICE_ENGINE === 'local') startRecorder(t); // capture audio in parallel for the whisper pass on release
   } catch (e) { voiceNote('⚠ Voice failed to start: ' + (e && e.message || e), t); }
 }
-// ---- local STT (VOICE_ENGINE = 'local'): record with MediaRecorder, transcribe with whisper.cpp on
-// the box, then run the SAME heuristic + Haiku polish as the browser path. No live interim text —
-// the words appear when you release (whisper is batch, not streaming). ----
+// ---- local STT (VOICE_ENGINE = 'local'), HYBRID: the browser's live transcript streams word-by-word
+// as before; in PARALLEL we record the audio, and on release whisper.cpp re-transcribes the whole clip
+// (more accurate, on-box) and replaces the live text, then the Haiku polish runs. The live preview is a
+// throwaway — the text you keep is whisper's. ----
 function cleanupStream() { try { if (V.stream) V.stream.getTracks().forEach((x) => x.stop()); } catch {} V.stream = null; }
-async function startVoiceLocal(t, el) {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+function startRecorder(t) {
+  navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
     if (!V.recording) { stream.getTracks().forEach((x) => x.stop()); return; } // released before the mic opened
     V.stream = stream; V.chunks = [];
+    V.recStopped = new Promise((res) => { V.recResolve = res; });
     const mr = new MediaRecorder(stream); V.mr = mr;
     mr.ondataavailable = (e) => { if (e.data && e.data.size) V.chunks.push(e.data); };
-    mr.onstop = () => finalizeVoiceLocal(t, el);
-    mr.onerror = () => { voiceNote('⚠ Recording error', t); cleanupStream(); V.recording = false; V.awaitingFinal = false; showVoice(false, t); };
+    mr.onstop = () => { if (V.recResolve) V.recResolve(); };
     mr.start();
-    voiceNote('🎤 Recording… — release space to transcribe', t);
-  } catch (e) {
-    V.recording = false; V.awaitingFinal = false;
-    if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) {
-      V.denied = true; V.pressActive = false; showVoice(false, t);
-      $('hint').innerHTML = '⚠ Microphone blocked — click the address-bar mic/site icon, allow access, then reload.';
-      setTimeout(updateHint, 6000);
-    } else { voiceNote('⚠ Mic failed: ' + ((e && e.message) || e), t); setTimeout(() => showVoice(false, t), 1500); }
-  }
+  }).catch(() => { V.mr = null; }); // no parallel capture → live SR still works, just no whisper upgrade
 }
-async function finalizeVoiceLocal(t, el) {
-  if (!V.awaitingFinal) return;   // run once — whichever of onstop / the fallback timer fires first
-  V.awaitingFinal = false;
-  clearTimeout(V.finalTimer);
+// Replace the live (SR) transcript with whisper's reading of the same audio, then Haiku-polish. Any
+// whisper failure (model down, no audio) keeps the SR text — dictation still works regardless.
+async function voiceFinalizeLocal(srText, before, after, baseline, t) {
+  let raw = srText, base = baseline;
+  if (VOICE_ENGINE === 'local' && V.mr) {
+    voiceNote('✨ Transcribing…', t);
+    try { await Promise.race([V.recStopped || Promise.resolve(), new Promise((r) => setTimeout(r, 3000))]); } catch {}
+    const chunks = V.chunks || []; V.chunks = [];
+    const sel = S.sel;
+    if (chunks.length && sel) {
+      const blob = new Blob(chunks, { type: (V.mr && V.mr.mimeType) || 'audio/webm' });
+      try {
+        const r = await fetch(`/api/issues/${sel}/transcribe`, { method: 'POST', headers: { 'content-type': blob.type || 'application/octet-stream' }, body: blob });
+        const d = await r.json().catch(() => ({}));
+        const wtext = (r.ok && typeof d.text === 'string') ? d.text.trim() : '';
+        if (wtext && S.sel === sel && voiceLive(t)) {
+          const el = t.el, heur = heuristicClean(wtext), nb = before + heur + after;
+          if (el.value === base) { el.value = nb; t.fit(); const c = (before + heur).length; try { el.setSelectionRange(c, c); } catch {} } // only if you haven't edited meanwhile
+          raw = wtext; base = nb;
+        }
+      } catch { /* whisper failed → keep the live SR text */ }
+    }
+  }
   cleanupStream();
-  t = t || V.tgt; el = (t && t.el) || el;
-  if (!voiceLive(t)) { showVoice(false, t); V.tgt = null; return; }
-  const chunks = V.chunks || []; V.chunks = [];
-  const sel = S.sel;
-  if (!chunks.length || !sel) { showVoice(false, t); return; }
-  const blob = new Blob(chunks, { type: (V.mr && V.mr.mimeType) || 'audio/webm' });
-  voiceNote('✨ Transcribing…', t);
-  const before = V.before, after = V.after;
-  let raw = '';
-  try {
-    const r = await fetch(`/api/issues/${sel}/transcribe`, { method: 'POST', headers: { 'content-type': blob.type || 'application/octet-stream' }, body: blob });
-    const d = await r.json().catch(() => ({}));
-    if (r.ok && typeof d.text === 'string') raw = d.text.trim();
-  } catch { /* network / transcribe failed → nothing to insert */ }
-  if (!raw) { voiceNote('⚠ Nothing transcribed', t); setTimeout(() => showVoice(false, t), 1500); return; }
-  if (S.sel !== sel || !voiceLive(t)) { showVoice(false, t); return; } // navigated away meanwhile
-  const heur = heuristicClean(raw);
-  el.value = before + heur + after; t.fit();
-  const c = (before + heur).length; try { el.setSelectionRange(c, c); } catch {}
-  voicePolish(raw, before, after, before + heur + after, t); // same Haiku polish as the browser path
+  voicePolish(raw, before, after, base, t);
 }
 function endVoice() { // release: stop recognition; the transcript stays and then gets polished
   V.pressActive = false;
@@ -2087,13 +2080,7 @@ function endVoice() { // release: stop recognition; the transcript stays and the
     if (voiceLive(t)) t.el.focus();
   }
   V.awaitingFinal = true;
-  if (VOICE_ENGINE === 'local') {
-    clearTimeout(V.finalTimer);
-    V.finalTimer = setTimeout(() => finalizeVoiceLocal(t, t && t.el), 4000); // fallback if onstop never fires
-    if (V.mr && V.mr.state !== 'inactive') { try { V.mr.stop(); } catch {} } // → onstop → finalizeVoiceLocal
-    else finalizeVoiceLocal(t, t && t.el); // mic never opened (instant release)
-    return;
-  }
+  if (VOICE_ENGINE === 'local' && V.mr && V.mr.state !== 'inactive') { try { V.mr.stop(); } catch {} } // stop the parallel recording (→ resolves recStopped)
   if (V.rec) { try { V.rec.stop(); } catch {} } // → final onresult, then onend → finalizeVoice
   clearTimeout(V.finalTimer);
   V.finalTimer = setTimeout(finalizeVoice, 1500); // fallback if onend never fires
@@ -2127,7 +2114,7 @@ function finalizeVoice() {
   const heurVal = before + heur + after;
   el.value = heurVal; t.fit();
   const c = (before + heur).length; try { el.setSelectionRange(c, c); } catch {}
-  voicePolish(raw, before, after, heurVal, t);
+  voiceFinalizeLocal(raw, before, after, heurVal, t); // whisper upgrade (if local), then Haiku polish
 }
 async function voicePolish(raw, before, after, baseline, tgt) {
   const t = tgt || V.tgt;
