@@ -208,7 +208,7 @@ describe('Organization routes', () => {
       expect(mockUsers['user-1'].orgId).toBeUndefined();
     });
 
-    it.each(['Starter', 'Pro', 'Partner', 'Super Premium', 'Managed'])('allows a %s user to create an organization', async (subscriptionType) => {
+    it.each(['Starter', 'Basic', 'Pro', 'Complete', 'Enterprise', 'Partner', 'Super Premium', 'Managed'])('allows a %s user to create an organization', async (subscriptionType) => {
       mockSubscriptionType = subscriptionType;
 
       const res = await request(app).post('/api/org').send({ name: 'My Org' });

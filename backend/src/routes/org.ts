@@ -12,7 +12,12 @@ const router = Router();
 
 const ORGANIZATION_CREATION_TIERS = new Set([
   "starter",
+  // Basic is the persisted label for the Starter checkout plan.
+  "basic",
   "pro",
+  // Complete is the legacy paid label for the Pro checkout plan.
+  "complete",
+  "enterprise",
   "partner",
   "super premium",
   "managed",
