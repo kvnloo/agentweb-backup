@@ -133,7 +133,7 @@ describe('AttioAdapter.pullContacts — deal entry pull', () => {
       entries: [{
         entryId: 'entry_1',
         personRecordId: 'person_1',
-        values: { deal_value: [{ number_value: 5000 }], deal_status: [{ status: { title: 'open' } }] },
+        values: { deal_value: [{ value: 5000 }], deal_status: [{ status: { title: 'open' } }] },
       }],
       nextCursor: undefined,
     });

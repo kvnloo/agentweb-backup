@@ -514,8 +514,8 @@ export class AttioAdapter implements CrmAdapter {
         const cleanType = type.replace(/-/g, '_');
         switch (cleanType) {
             case 'status': return { status: str };
-            case 'select': return { select: { target: str } };
-            case 'number': return { number_value: Number(str) };
+            case 'select': return { option: str };
+            case 'number': return { value: Number(str) };
             case 'currency': return { currency_value: Number(String(value).replace(/[^0-9.]/g, '')) };
             case 'checkbox': return { value: str === 'true' || str === '1' };
             case 'personal_name': {
@@ -540,9 +540,9 @@ export class AttioAdapter implements CrmAdapter {
         const cleanType = type.replace(/-/g, '_');
         switch (cleanType) {
             case 'status': return entry.status?.title ?? entry.status?.target;
-            case 'select': return entry.select?.title ?? entry.select?.target;
+            case 'select': return entry.option?.title ?? entry.option?.target;
             case 'currency': return entry.currency_value;
-            case 'number': return entry.number_value;
+            case 'number': return entry.value;
             case 'email_address': return entry.email_address;
             case 'phone_number': return entry.original_phone_number;
             case 'personal_name':
