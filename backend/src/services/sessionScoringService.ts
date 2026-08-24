@@ -83,6 +83,45 @@ function describeToolOutcome(content: unknown): "success" | "failed" | "unknown"
 }
 
 /**
+ * A tool call as persisted on an assistant message shows up in one of two
+ * shapes depending on which write path produced it — normalize both to
+ * `{id, name}`.
+ *
+ * `metadata.toolCalls` (agent-mode's own bookkeeping, `{id, name, arguments,
+ * result?, error?}`) and top-level `tool_calls` (raw OpenAI/Anthropic wire
+ * format, `{id, type, function: {name, arguments}}`) are NOT duplicates of
+ * each other in practice — verified against real production data (session
+ * 368a96ac-c8ca-46db-af04-d4f629856e3e): every genuine tool call on that
+ * session is stored as top-level `tool_calls` with metadata.toolCalls absent
+ * entirely (CodeRabbit review, ENG-1223 PR #2548). A manifest that only read
+ * metadata.toolCalls would report "0 tool calls" for a session that made
+ * several real ones — actively misleading the judge in the wrong direction,
+ * and, combined with applyFabricationGuard's assertsToolDerivedData trigger,
+ * capable of forcing dataAccuracy to 1 on a legitimate, accurate, tool-backed
+ * response.
+ */
+function normalizeToolCallEntries(m: ChatMessage): Array<{ id?: string; name: string }> {
+  const metaCalls: Array<{ id?: string; name: string }> = (m as any).metadata?.toolCalls || [];
+  const topCalls: Array<{ id?: string; name?: string; function?: { name?: string } }> =
+    (m as any).tool_calls || [];
+  const normalizedTop = topCalls
+    .map((tc) => ({ id: tc.id, name: tc.function?.name || tc.name || "" }))
+    .filter((tc) => tc.name);
+
+  // A single call could in principle be represented in both fields on the same
+  // message — de-dupe by id so it is never double-counted.
+  const seen = new Set<string>();
+  const combined: Array<{ id?: string; name: string }> = [];
+  for (const tc of [...metaCalls, ...normalizedTop]) {
+    const key = tc.id || `${tc.name}:${combined.length}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    combined.push(tc);
+  }
+  return combined;
+}
+
+/**
  * Ground-truth tool-call manifest for a session: the real count of tool calls
  * the assistant actually made, their names, and (best-effort) outcomes.
  *
@@ -99,7 +138,7 @@ function buildToolCallManifest(messages: ChatMessage[]): { count: number; text: 
 
   for (const m of messages) {
     if (m.role !== "assistant" || isRunFailurePlaceholder(m)) continue;
-    const toolCalls: Array<{ id?: string; name: string }> = (m as any).metadata?.toolCalls || [];
+    const toolCalls = normalizeToolCallEntries(m);
     for (const tc of toolCalls) {
       const resultMsg = tc.id
         ? messages.find((mm: any) => mm.role === "tool" && mm.tool_call_id === tc.id)

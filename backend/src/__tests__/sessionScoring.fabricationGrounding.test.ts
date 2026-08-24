@@ -398,4 +398,44 @@ describe('SessionScoring - fabrication grounding (ENG-1223)', () => {
     expect(result.score).toBe(5);
     expect(result.dimensions?.dataAccuracy).toBe(5);
   });
+
+  it('CODERABBIT FINDING: counts real tool calls stored as top-level tool_calls (agent-mode\'s actual persisted shape for a resolved call), not just metadata.toolCalls', async () => {
+    // Mirrors the real shape found in production for agent-mode sessions with
+    // genuine tool calls (verified against session 368a96ac-c8ca-46db-af04-d4f629856e3e):
+    // the assistant message carries top-level tool_calls (OpenAI/Anthropic wire
+    // format), NOT metadata.toolCalls. Before this fix, buildToolCallManifest only
+    // read metadata.toolCalls, so a session exactly like this would be reported as
+    // "0 tool calls made anywhere in this session" — actively misleading the judge
+    // about a session that made a real, successful tool call — and, combined with
+    // applyFabricationGuard's assertsToolDerivedData trigger, could wrongly force
+    // dataAccuracy to 1 on a legitimate, accurate, tool-backed response.
+    mockCallLLM.mockResolvedValue(makeLLMResponse(5, { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 }));
+
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Load the chat history from the last 24 hours.' },
+      {
+        role: 'assistant',
+        content: "I'll pull the last 24 hours of chat history.",
+        tool_calls: [
+          {
+            id: 'tooluse_abc123',
+            type: 'function',
+            function: { name: 'get_chat_history', arguments: '{"start_time":"...","end_time":"..."}' },
+          },
+        ],
+      } as any,
+      {
+        role: 'tool',
+        tool_call_id: 'tooluse_abc123',
+        name: 'get_chat_history',
+        content: JSON.stringify({ success: true, sessions: [] }),
+      } as any,
+      { role: 'assistant', content: 'Here is the summary of the last 24 hours.' },
+    ];
+
+    await scoreSession(messages, messages.length);
+
+    expect(getUserMessage()).not.toContain('[TOOL CALL MANIFEST: 0 tool calls were made anywhere in this session');
+    expect(getUserMessage()).toContain('get_chat_history');
+  });
 });
