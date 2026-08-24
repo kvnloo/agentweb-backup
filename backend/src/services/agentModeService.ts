@@ -5855,6 +5855,45 @@ export class AgentModeService {
       return base;
     }
 
+    // ENG-1523. Preserve a REFUSED launch for ANY tool, for the same reason the
+    // confirmation gate above is preserved: the per-tool minimizers below drop unknown
+    // fields and everything unrecognised falls through to `return {}`. There is no
+    // `call_google_ads_api` branch, so a RULE 7.5 block arrived at the browser as an
+    // empty object — and a block is a RETURNED value, not a throw, so `toolCall.error`
+    // stays unset and the frontend's status ternary resolves it to 'completed'. The
+    // user was shown a green success tick on a launch the backend had just refused.
+    //
+    // Tool-agnostic on purpose: metaLaunchGate returns this exact shape in five places,
+    // so the same erasure was happening to Meta launch blocks. Keyed on the payload,
+    // not the tool name, so a future gate is covered without another branch here.
+    //
+    // A refusal the operator never sees is indistinguishable from one that never
+    // happened, which is the failure the gate exists to prevent.
+    if (result && result.blocked === true) {
+      return {
+        success: false,
+        blocked: true,
+        reason: result.reason,
+        error: result.error,
+        ...(result.trackingCheck ? { trackingCheck: result.trackingCheck } : {}),
+      };
+    }
+
+    // ENG-1523 / ENG-1358. The launch was PERMITTED, but the page proves only that some
+    // Google tag is present — not that an Ads conversion can be recorded. The gate
+    // already computes this warning and its callers deliberately relay it rather than
+    // swallow it; without this branch the minimizer discards it one layer later, which
+    // is the same outcome by a longer route. Merged onto the result rather than replacing
+    // it, because these paths carry a real artifact (resourceName, message) the UI needs.
+    if (result && typeof result.trackingWarning === 'string' && result.trackingWarning) {
+      return {
+        success: result.success !== false,
+        trackingWarning: result.trackingWarning,
+        ...(typeof result.message === 'string' ? { message: result.message } : {}),
+      };
+    }
+
+
     // ENG-1131: preserve the ENG-975 people-search-outage marker. Both tools that
     // can raise it (`linkedin_outreach` search-people/search-parameters and the
     // `find_leads` top-up loop) fall through to the `{}` default at the bottom of
