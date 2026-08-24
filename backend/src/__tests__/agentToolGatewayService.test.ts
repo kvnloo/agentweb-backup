@@ -1878,6 +1878,69 @@ describe('agentToolGatewayService', () => {
       expect(execute).not.toHaveBeenCalled();
     });
 
+    it('ENG-969: three not-found get_lead_details for different leads do not block a corrected, valid call', async () => {
+      const runId = 'run-eng969';
+      // Three different (list_id, lead_id) pairs each return a structured
+      // not-found failure — a normal per-entity outcome, not a spiral.
+      for (let i = 0; i < 3; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_lead_details',
+          args: { list_id: `wrong-list-${i}`, lead_id: `lead-${i}` },
+          runId,
+          execute: () => Promise.resolve({
+            success: false,
+            message: 'Lead not found',
+            error: 'The specified lead does not exist in this list',
+          }),
+        });
+        expect(outcome.status).toBe('success'); // structured failure, not a thrown error
+      }
+
+      // A later call with corrected, valid list_id + lead_id must still execute.
+      const execute = jest.fn().mockResolvedValue({ success: true, lead: { id: 'lead-real' } });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_lead_details',
+        args: { list_id: 'correct-list', lead_id: 'lead-real' },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('ENG-969: still trips when the SAME get_lead_details lead fails repeatedly', async () => {
+      const runId = 'run-eng969-same';
+      const args = { list_id: 'list-a', lead_id: 'lead-a' };
+      for (let i = 0; i < 3; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_lead_details',
+          args,
+          runId,
+          execute: () => Promise.resolve({
+            success: false,
+            message: 'Lead not found',
+            error: 'The specified lead does not exist in this list',
+          }),
+        });
+        expect(outcome.status).toBe('success');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_lead_details',
+        args,
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
     // ENG-291: the Daily Satisfaction Score Report calls get_chat_history over a
     // 24h window with sync=true (on-the-fly score generation). That heavy request
     // timed out twice, tripping the SESSION-scoped timeout aggregate at threshold
