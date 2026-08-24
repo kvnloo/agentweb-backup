@@ -27,6 +27,7 @@ import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
+  getPersistedBrandLogoAssetUrl,
   getPersistedBrandLogoUrlForUser,
   missingBrandLogoToolResult,
   promptCreatesLogo,
@@ -14463,41 +14464,84 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         return asset;
       };
 
+      // ENG-933 follow-up: this method is the ONE place every brand write
+      // funnels through — Emma's `update_brand_guidelines` chat tool included,
+      // not just the onboarding backstop (ensureBrandLogoPersisted) that only
+      // guards the one-time onboarding flow. Emma has a documented history
+      // (ENG-792, ENG-933) of calling this tool with only brandData.logoUrl
+      // and no brandAssets entry, which leaves `attachments` empty — the
+      // Brand Guidelines "Logo & Assets" card renders `attachments`, so the
+      // account shows "No logos uploaded" even though Emma "found" a logo.
+      // Auto-pin it here so that gap can't reopen through this call
+      // regardless of when or how it's invoked. Best-effort: any failure
+      // here must never break the underlying write (matches the onboarding
+      // backstop's own never-throws contract).
+      let autoLogoAsset: { type: string; url: string; filename: string; key: string } | null = null;
+      const incomingLogoUrl =
+        typeof (brandData as any)?.logoUrl === 'string' ? (brandData as any).logoUrl.trim() : '';
+      const callerSuppliedLogoAsset = (
+        Array.isArray(brandAssets) ? brandAssets : brandAssets ? [brandAssets] : []
+      ).some((a: any) => a?.type === 'logo');
+      const alreadyHasLogoAsset = !!getPersistedBrandLogoAssetUrl({
+        attachments: existingBrand.attachments,
+      });
+      if (incomingLogoUrl && !callerSuppliedLogoAsset && !alreadyHasLogoAsset) {
+        try {
+          const outcome = await downloadBrandLogoToS3(incomingLogoUrl, userId);
+          if (outcome.status === 'uploaded' && outcome.url) {
+            const filename = outcome.url.split('/').filter(Boolean).pop() || 'logo.png';
+            autoLogoAsset = {
+              type: 'logo',
+              url: outcome.url,
+              filename,
+              key: `auto-logo-${Date.now()}`,
+            };
+            // Point brandData.logoUrl at the pinned S3 copy too — never
+            // something an external host can take down or an image model
+            // invents later (ENG-326/ENG-933).
+            updatedBrandData.logoUrl = outcome.url;
+          }
+          // svg / download-failed / upload-failed: brandData.logoUrl keeps
+          // the raw incoming URL, exactly like this call behaved before this
+          // change — never worse than today.
+        } catch (e: any) {
+          console.warn('[brandLogo] auto-pin on update_brand_guidelines failed', {
+            userId,
+            error: e?.message ?? String(e),
+          });
+        }
+      }
+
       // Handle brandAssets update - merge by type to preserve existing assets
       let updatedAttachments = [...(existingBrand.attachments || [])];
       const updatedAssets: any[] = []; // Track which assets were actually updated
 
-      if (brandAssets !== undefined) {
-        if (Array.isArray(brandAssets)) {
-          // Merge by type: replace assets of the same type, keep others
-          brandAssets.forEach(rawAsset => {
-            const newAsset = normalizeBrandGuideAsset(rawAsset);
-            const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
-            if (existingIndex >= 0) {
-              // Replace existing asset of the same type
-              updatedAttachments[existingIndex] = newAsset;
-              updatedAssets.push(newAsset); // Track as updated
-            } else {
-              // Add new asset type
-              updatedAttachments.push(newAsset);
-              updatedAssets.push(newAsset); // Track as added
-            }
-          });
-        } else if (typeof brandAssets === 'object' && brandAssets !== null) {
-          // Single asset - merge by type
-          const newAsset = normalizeBrandGuideAsset(brandAssets);
-          const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
-          if (existingIndex >= 0) {
-            // Replace existing asset of the same type
-            updatedAttachments[existingIndex] = newAsset;
-            updatedAssets.push(newAsset); // Track as updated
-          } else {
-            // Add new asset type
-            updatedAttachments.push(newAsset);
-            updatedAssets.push(newAsset); // Track as added
-          }
-        }
+      const assetsToMerge: any[] = [];
+      if (Array.isArray(brandAssets)) {
+        assetsToMerge.push(...brandAssets);
+      } else if (brandAssets !== undefined && typeof brandAssets === 'object' && brandAssets !== null) {
+        // Same guard the original single-asset branch used — a malformed
+        // `brandAssets` (null / string / number) is silently ignored here,
+        // not merged as a bogus attachment entry.
+        assetsToMerge.push(brandAssets);
       }
+      if (autoLogoAsset) {
+        assetsToMerge.push(autoLogoAsset);
+      }
+
+      assetsToMerge.forEach(rawAsset => {
+        const newAsset = normalizeBrandGuideAsset(rawAsset);
+        const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
+        if (existingIndex >= 0) {
+          // Replace existing asset of the same type
+          updatedAttachments[existingIndex] = newAsset;
+          updatedAssets.push(newAsset); // Track as updated
+        } else {
+          // Add new asset type
+          updatedAttachments.push(newAsset);
+          updatedAssets.push(newAsset); // Track as added
+        }
+      });
 
       // Update org-level or personal brand guidelines
       const updatedGuidelines = {
@@ -14532,7 +14576,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
 
       const updatedFields = [];
       if (brandData) updatedFields.push(...Object.keys(brandData));
-      if (brandAssets !== undefined) updatedFields.push('brandAssets');
+      if (assetsToMerge.length > 0) updatedFields.push('brandAssets');
       updatedFields.push(...Object.keys(otherFields));
 
       // Format the update result for LLM consumption

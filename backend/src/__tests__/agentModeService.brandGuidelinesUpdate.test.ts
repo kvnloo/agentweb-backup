@@ -8,6 +8,14 @@ jest.mock('../services/db', () => ({
   },
 }));
 
+// downloadBrandLogoToS3 is the only piece that reaches the network — mocked
+// so these tests never make a real HTTP call. getPersistedBrandLogoAssetUrl
+// (a pure function) keeps its real implementation.
+jest.mock('../services/agentMode/brandLogo', () => ({
+  ...jest.requireActual('../services/agentMode/brandLogo'),
+  downloadBrandLogoToS3: jest.fn(),
+}));
+
 describe('AgentModeService - Brand Guidelines Update', () => {
   let agentModeService: AgentModeService;
   const mockUserDb = require('../services/db').userDb;
@@ -384,6 +392,198 @@ describe('AgentModeService - Brand Guidelines Update', () => {
       expect(fixedBrandGuidelinesData.brandData.brandValues).toEqual(["Accuracy", "Transparency"]); // ✅ Preserved
       expect(fixedBrandGuidelinesData.brandData.targetAudience).toBe("CXOs and executives"); // ✅ Preserved (not provided)
       expect(fixedBrandGuidelinesData.brandData.brandPersonality).toBe("Analytical, trustworthy"); // ✅ Preserved (not provided)
+    });
+
+    // ENG-933 follow-up: `update_brand_guidelines` is Emma's chat tool, callable
+    // in any session — not just the one-time onboarding backstop
+    // (ensureBrandLogoPersisted) ENG-933 already fixed. Emma has a documented
+    // history of calling this tool with only brandData.logoUrl and no
+    // brandAssets entry, which used to leave `attachments` empty forever — the
+    // exact "No logos uploaded" bug ENG-933 exists to fix, just reachable
+    // through a second door. These tests cover the auto-pin that closes it.
+    describe('auto-pinning a bare brandData.logoUrl as a logo attachment (ENG-933 follow-up)', () => {
+      const { downloadBrandLogoToS3 } = require('../services/agentMode/brandLogo');
+
+      it('pins a bare logoUrl as a logo attachment when none exists yet', async () => {
+        const userId = 'test-user-123';
+        mockUserDb.getUserById.mockResolvedValue({
+          userId,
+          email: 'test@example.com',
+          brandGuidelines: {
+            brandData: { brandName: 'Acme' },
+            attachments: [],
+            createdAt: '2023-01-01T00:00:00.000Z',
+            updatedAt: '2023-01-01T00:00:00.000Z',
+          },
+        });
+        mockUserDb.updateUser.mockResolvedValue({});
+        downloadBrandLogoToS3.mockResolvedValue({
+          status: 'uploaded',
+          url: 'https://s3/brand/logo.png',
+        });
+
+        const result = await (agentModeService as any).updateBrandGuidelines(
+          { brandData: { logoUrl: 'https://acme.com/favicon.ico' } },
+          userId,
+        );
+
+        expect(downloadBrandLogoToS3).toHaveBeenCalledWith(
+          'https://acme.com/favicon.ico',
+          userId,
+        );
+        expect(result.success).toBe(true);
+        expect(result.attachments).toEqual([
+          expect.objectContaining({ type: 'logo', url: 'https://s3/brand/logo.png' }),
+        ]);
+        // Points at the pinned S3 copy, not the raw external URL — same
+        // contract as the onboarding backstop (ENG-326/ENG-933).
+        expect(result.brandData.logoUrl).toBe('https://s3/brand/logo.png');
+
+        const persistedGuidelines = mockUserDb.updateUser.mock.calls[0][1].brandGuidelines;
+        expect(persistedGuidelines.attachments).toEqual([
+          expect.objectContaining({ type: 'logo', url: 'https://s3/brand/logo.png' }),
+        ]);
+      });
+
+      it('does not re-fetch when the caller already supplies a logo asset alongside logoUrl', async () => {
+        // This is exactly how the onboarding backstop's own persist call is
+        // shaped (brandLogo.ts defaultPersistBrandLogo) — it must not trigger
+        // a second, redundant download.
+        const userId = 'test-user-123';
+        mockUserDb.getUserById.mockResolvedValue({
+          userId,
+          email: 'test@example.com',
+          brandGuidelines: {
+            brandData: { brandName: 'Acme' },
+            attachments: [],
+            createdAt: '2023-01-01T00:00:00.000Z',
+            updatedAt: '2023-01-01T00:00:00.000Z',
+          },
+        });
+        mockUserDb.updateUser.mockResolvedValue({});
+
+        const result = await (agentModeService as any).updateBrandGuidelines(
+          {
+            brandData: { logoUrl: 'https://s3/brand/logo.png' },
+            brandAssets: { type: 'logo', url: 'https://s3/brand/logo.png', filename: 'logo.png' },
+          },
+          userId,
+        );
+
+        expect(downloadBrandLogoToS3).not.toHaveBeenCalled();
+        expect(result.attachments).toEqual([
+          expect.objectContaining({ type: 'logo', url: 'https://s3/brand/logo.png' }),
+        ]);
+      });
+
+      it('does not touch an already-persisted logo asset (manual/prior upload protection)', async () => {
+        const userId = 'test-user-123';
+        mockUserDb.getUserById.mockResolvedValue({
+          userId,
+          email: 'test@example.com',
+          brandGuidelines: {
+            brandData: { brandName: 'Acme' },
+            attachments: [
+              { type: 'logo', url: 'https://s3/real-upload.png', filename: 'mylogo.png', key: 'k1' },
+            ],
+            createdAt: '2023-01-01T00:00:00.000Z',
+            updatedAt: '2023-01-01T00:00:00.000Z',
+          },
+        });
+        mockUserDb.updateUser.mockResolvedValue({});
+
+        // Emma re-scrapes and writes a DIFFERENT (scraped) URL to brandData
+        // only — the real uploaded asset must survive untouched, and no
+        // network fetch should fire for it.
+        const result = await (agentModeService as any).updateBrandGuidelines(
+          { brandData: { logoUrl: 'https://acme.com/rescraped-logo.ico' } },
+          userId,
+        );
+
+        expect(downloadBrandLogoToS3).not.toHaveBeenCalled();
+        expect(result.attachments).toEqual([
+          expect.objectContaining({ type: 'logo', url: 'https://s3/real-upload.png' }),
+        ]);
+      });
+
+      it('leaves the write intact when the download/conversion fails', async () => {
+        const userId = 'test-user-123';
+        mockUserDb.getUserById.mockResolvedValue({
+          userId,
+          email: 'test@example.com',
+          brandGuidelines: {
+            brandData: { brandName: 'Acme' },
+            attachments: [],
+            createdAt: '2023-01-01T00:00:00.000Z',
+            updatedAt: '2023-01-01T00:00:00.000Z',
+          },
+        });
+        mockUserDb.updateUser.mockResolvedValue({});
+        downloadBrandLogoToS3.mockResolvedValue({ status: 'download-failed', detail: 'timeout' });
+
+        const result = await (agentModeService as any).updateBrandGuidelines(
+          { brandData: { logoUrl: 'https://dead.example.com/logo.ico' } },
+          userId,
+        );
+
+        // Never worse than before this change: the write still succeeds, the
+        // raw URL still lands on brandData, just no attachment gets created.
+        expect(result.success).toBe(true);
+        expect(result.attachments).toEqual([]);
+        expect(result.brandData.logoUrl).toBe('https://dead.example.com/logo.ico');
+      });
+
+      it('leaves the write intact when downloadBrandLogoToS3 throws', async () => {
+        const userId = 'test-user-123';
+        mockUserDb.getUserById.mockResolvedValue({
+          userId,
+          email: 'test@example.com',
+          brandGuidelines: {
+            brandData: { brandName: 'Acme' },
+            attachments: [],
+            createdAt: '2023-01-01T00:00:00.000Z',
+            updatedAt: '2023-01-01T00:00:00.000Z',
+          },
+        });
+        mockUserDb.updateUser.mockResolvedValue({});
+        downloadBrandLogoToS3.mockRejectedValue(new Error('ECONNRESET'));
+
+        const result = await (agentModeService as any).updateBrandGuidelines(
+          { brandData: { logoUrl: 'https://flaky.example.com/logo.ico' } },
+          userId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.attachments).toEqual([]);
+        expect(result.brandData.logoUrl).toBe('https://flaky.example.com/logo.ico');
+      });
+
+      it('does not throw when brandAssets is explicitly null', async () => {
+        // Regression guard: the original two-branch merge silently ignored a
+        // null brandAssets; collapsing those branches to fold in the
+        // auto-pinned asset must preserve that exact no-op.
+        const userId = 'test-user-123';
+        mockUserDb.getUserById.mockResolvedValue({
+          userId,
+          email: 'test@example.com',
+          brandGuidelines: {
+            brandData: { brandName: 'Acme' },
+            attachments: [],
+            createdAt: '2023-01-01T00:00:00.000Z',
+            updatedAt: '2023-01-01T00:00:00.000Z',
+          },
+        });
+        mockUserDb.updateUser.mockResolvedValue({});
+
+        const result = await (agentModeService as any).updateBrandGuidelines(
+          { brandData: { brandName: 'Updated Acme' }, brandAssets: null },
+          userId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.attachments).toEqual([]);
+        expect(downloadBrandLogoToS3).not.toHaveBeenCalled();
+      });
     });
   });
 });
