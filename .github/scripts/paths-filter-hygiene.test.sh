@@ -80,24 +80,67 @@ import sys
 def steps_of(lines):
     """Split a workflow into its step blocks.
 
-    Steps are the 6-space `      - ` entries; their bodies sit at 8+ spaces, so
-    any shallower non-blank line closes the block.
+    Indentation is DERIVED from each `steps:` key rather than assumed. The
+    version this was recovered from hardcoded the 6-space entries that
+    tests.yml happens to use, which is a fail-open in a fail-open detector: a
+    workflow indented any other way is not parsed into steps at all, so it is
+    silently never audited and the suite reports clean. YAML permits any width,
+    and it permits a list whose items sit at the SAME indent as their key —
+    both shapes are handled here. (CodeRabbit on #2594.)
     """
     steps = []
     cur = None
+    steps_indent = None
+    step_indent = None
+
+    def close():
+        nonlocal cur
+        if cur is not None:
+            steps.append(cur)
+            cur = None
+
     for line in lines:
-        if re.match(r"^      - \S", line):
+        stripped = line.strip()
+
+        m_steps = re.match(r"^(\s*)steps:\s*$", line)
+        if m_steps:
+            close()
+            steps_indent = len(m_steps.group(1))
+            step_indent = None
+            continue
+
+        if steps_indent is None:
+            continue
+
+        # Blank lines belong to whatever step is open; they do not end it.
+        if not stripped:
             if cur is not None:
-                steps.append(cur)
-            cur = [line]
-        elif cur is not None:
-            if line.strip() and (len(line) - len(line.lstrip())) <= 5:
-                steps.append(cur)
-                cur = None
-            else:
                 cur.append(line)
-    if cur is not None:
-        steps.append(cur)
+            continue
+
+        indent = len(line) - len(line.lstrip())
+        is_item = re.match(r"^\s*-\s+\S", line) is not None
+
+        # The steps block ends at a key shallower than `steps:`, or at a
+        # non-item sibling sitting at the same depth (the next job key).
+        if indent < steps_indent or (indent == steps_indent and not is_item):
+            close()
+            steps_indent = None
+            step_indent = None
+            continue
+
+        # The first item under `steps:` fixes the step depth; items deeper than
+        # that are nested data (filter patterns), not new steps.
+        if is_item and (step_indent is None or indent == step_indent):
+            step_indent = indent
+            close()
+            cur = [line]
+            continue
+
+        if cur is not None:
+            cur.append(line)
+
+    close()
     return steps
 
 
@@ -110,10 +153,12 @@ def step_id(step_lines):
     one step it was actually scanning — harmless when the suite name told you
     the file, useless now that the offender could be any workflow.
     """
+    if step_lines:
+        m = re.match(r"^\s*-\s+id:\s*(\S+)\s*$", step_lines[0])
+        if m:
+            return m.group(1)
     for line in step_lines:
-        m = re.match(r"^      - id:\s*(\S+)\s*$", line) or re.match(
-            r"^        id:\s*(\S+)\s*$", line
-        )
+        m = re.match(r"^\s+id:\s*(\S+)\s*$", line)
         if m:
             return m.group(1)
     return "<no id>"
@@ -182,21 +227,26 @@ fi
 # auditor and a clean repo are indistinguishable without these.
 
 mk_workflow() {
-  # $1 destination, $2 quantifier line (may be empty), $3 pattern line
-  local dest="$1" quant="$2" pattern="$3"
+  # $1 destination, $2 quantifier line (may be empty), $3 pattern line,
+  # $4 indent of the step's `-` (default 6). `steps:` always sits at 4, so 4
+  # exercises the same-indent-as-its-key list form that YAML also allows.
+  local dest="$1" quant="$2" pattern="$3" si="${4:-6}"
+  local dash body
+  dash="$(printf '%*s' "${si}" '')"
+  body="$(printf '%*s' "$((si + 2))" '')"
   {
     printf 'jobs:\n'
     printf '  detect:\n'
     printf '    runs-on: ubuntu-slim\n'
     printf '    steps:\n'
-    printf '      - id: filter\n'
-    printf '        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3\n'
-    printf '        with:\n'
-    [ -n "${quant}" ] && printf '          %s\n' "${quant}"
-    printf '          filters: |\n'
-    printf '            backend_src:\n'
-    printf "              - 'backend/**'\n"
-    printf '              %s\n' "${pattern}"
+    printf '%s- id: filter\n' "${dash}"
+    printf '%suses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3\n' "${body}"
+    printf '%swith:\n' "${body}"
+    [ -n "${quant}" ] && printf '%s  %s\n' "${body}" "${quant}"
+    printf '%s  filters: |\n' "${body}"
+    printf '%s    backend_src:\n' "${body}"
+    printf "%s      - 'backend/**'\n" "${body}"
+    printf '%s      %s\n' "${body}" "${pattern}"
   } >"${dest}"
 }
 
@@ -229,6 +279,29 @@ if [ -z "$(python3 "${AUDITOR}" "${WORKDIR}/none.yml")" ]; then
 else
   fail "self-check: a filter with no negation is left alone" \
     "the auditor flagged a step that negates nothing"
+fi
+
+# Indentation must not be a way out. The recovered version hardcoded the
+# 6-space entries tests.yml uses, so a workflow indented any other way parsed
+# to zero steps and was reported clean without ever being audited — the same
+# silent fail-open this suite exists to catch, one level up. (CodeRabbit on
+# #2594.) Both alternatives below are valid YAML.
+mk_workflow "${WORKDIR}/deep.yml" "" "- '!backend/**/__tests__/**'" 8
+if [ -n "$(python3 "${AUDITOR}" "${WORKDIR}/deep.yml")" ]; then
+  pass "self-check: a hazard in a deeper-indented step list is still found"
+else
+  fail "self-check: a hazard in a deeper-indented step list is still found" \
+    "step parsing is pinned to one indent width, so a workflow written any" \
+    "other way is never audited and reports clean"
+fi
+
+# List items may sit at the same indent as the key that owns them.
+mk_workflow "${WORKDIR}/flush.yml" "" "- '!backend/**/__tests__/**'" 4
+if [ -n "$(python3 "${AUDITOR}" "${WORKDIR}/flush.yml")" ]; then
+  pass "self-check: a hazard in a steps list flush with its key is still found"
+else
+  fail "self-check: a hazard in a steps list flush with its key is still found" \
+    "a list indented level with 'steps:' is valid YAML and must still be audited"
 fi
 
 # Prose must not satisfy the rule. The deleted version called this out
