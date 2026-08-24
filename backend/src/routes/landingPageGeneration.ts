@@ -2613,7 +2613,11 @@ router.post("/generated/:id/google-ads", editRateLimiter, async (req, res: Respo
       ? "Base tag installed, but no conversion label was provided — conversions cannot be attributed until one is set."
       : undefined;
 
-    await saveGoogleAdsForPage(page, conversionId, label, googleAdsCustomerId?.trim() || undefined);
+    // ENG-1525: `|| undefined` collapsed an explicit `""` (clear this) into "not
+    // mentioned", which is the distinction updateLandingPageGoogleAds now relies on.
+    // Same shape as `label` two lines up.
+    const customerId = typeof googleAdsCustomerId === "string" ? googleAdsCustomerId.trim() : undefined;
+    await saveGoogleAdsForPage(page, conversionId, label, customerId);
 
     res.json({
       success: true,

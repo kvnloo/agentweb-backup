@@ -1989,6 +1989,60 @@ async function addPageToExistingRepo(
           }
         }
 
+        // ENG-1524. Sibling of the deployLandingPage check, and it has to exist in BOTH
+        // places for the same reason the pixel check does: a sub-page has its own form
+        // component, and `subPageGoogleAds` above inherits the site's conversion pair, so
+        // the generated handler is expected to fire it. Adding this on one branch only is
+        // how the original gap happened.
+        //
+        // Post-remap file set (ENG-482), like the pixel check: previewFiles is v0's raw
+        // zip, and its scaffold layout.tsx can carry a gtag conversion that never ships —
+        // which would satisfy the inline-pattern arm against code the site never sees.
+        if (subPageGoogleAds) {
+          const adsCheck = validateGoogleAdsConversion(remapFilesForSubPage(previewFiles, slug, name));
+          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call missing for /${slug} (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
+
+            await guardedV0CorrectionMessage({
+              userId,
+              scopeId: existingPage.siteId ?? existingPage.id,
+              chatId: chatId!,
+              attempt: validationAttempt,
+              send: () => withRetry(
+                () => v0.chats.sendMessage({
+                  chatId: chatId!,
+                  message:
+                    "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
+                    "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
+                    "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
+                    "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
+                    "shared root layout. " +
+                    `Issue: ${adsCheck.reason}`,
+                }),
+                "v0 correction message (google ads conversion, sub-page)",
+                undefined, undefined, undefined,
+                { retryOnTimeout: false }
+              ),
+            });
+
+            versionId = await waitForCompletedV0Version(
+              v0,
+              chatId!,
+              "v0 correction (google ads conversion, sub-page)",
+              {
+                heartbeat: () => touchLandingPageRecord(id),
+                deadline: buildDeadline,
+                afterVersionId: versionId,
+              }
+            );
+
+            continue;
+          }
+          if (!adsCheck.ok) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call still missing for /${slug} after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
+          }
+        }
+
         if (leadListId && bridgeOutUrl) {
           // Same post-remap file set rationale as the pixel check above (ENG-482).
           const bridgeCheck = validateBridgeOutRedirect(remapFilesForSubPage(previewFiles, slug, name), bridgeOutUrl);
@@ -3081,6 +3135,58 @@ export async function deployLandingPage(
           }
         }
 
+        // ENG-1524. Same contract as the pixel check above, for the platform that had none.
+        // Gated on the conversion PAIR, not just the id: without a label the helper cannot
+        // fire anyway (ENG-1328), so demanding the call would be asking v0 to write
+        // something that does nothing.
+        if (record.googleAdsConversionId && record.googleAdsConversionLabel) {
+          const adsCheck = validateGoogleAdsConversion(previewFiles);
+          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call missing (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
+
+            await guardedV0CorrectionMessage({
+              userId,
+              scopeId: record.siteId ?? record.id,
+              chatId: record.v0ChatId!,
+              attempt: validationAttempt,
+              send: () => withRetry(
+                () => v0.chats.sendMessage({
+                  chatId: record.v0ChatId!,
+                  message:
+                    "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
+                    "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
+                    "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
+                    "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
+                    "root layout. " +
+                    `Issue: ${adsCheck.reason}`,
+                }),
+                "v0 correction message (google ads conversion)",
+                undefined, undefined, undefined,
+                { retryOnTimeout: false }
+              ),
+            });
+
+            versionId = await waitForCompletedV0Version(
+              v0,
+              record.v0ChatId!,
+              "v0 correction (google ads conversion)",
+              {
+                heartbeat: () => touchLandingPageRecord(id),
+                deadline: buildDeadline,
+                afterVersionId: versionId,
+              }
+            );
+
+            continue;
+          }
+          if (!adsCheck.ok) {
+            // Never fails generation, same as the pixel path: a lander that captures leads
+            // is worth more than one that refuses to exist. But this is the line that turns
+            // an invisible miss into a visible one.
+            console.warn(`[V0 SERVICE] Google Ads conversion call still missing after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
+          }
+        }
+
         if (record.leadListId && record.bridgeOutUrl) {
           const bridgeCheck = validateBridgeOutRedirect(previewFiles, record.bridgeOutUrl);
           if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
@@ -4055,6 +4161,62 @@ export function validatePixelLeadEvent(files: Array<{ path: string; content: Buf
 
   if (!hasOldPattern && !hasNewPattern) {
     return { ok: false, reason: "No fbq('track', 'Lead') call (or fireLeadTracking({ pixelId }) call) found in the generated form component" };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * ENG-1524. Does the generated form actually ask for the Google Ads conversion?
+ *
+ * The base gtag is injected deterministically into layout.tsx, so RULE 7.5 sees an `AW-`
+ * id and passes. What no check covered is whether anything ever FIRES a conversion: v0
+ * authors the submit handler, and `fireLeadTracking` takes `googleAds` as an argument it
+ * can simply omit.
+ *
+ * The failure that motivated this is silent in every indicator: v0 emits
+ * `fireLeadTracking({ email, eventId, pixelId })`, validatePixelLeadEvent passes because
+ * pixelId IS there, generation succeeds, googleAdsTrackingInstalled is set true, the
+ * pre-flight gate passes cleanly with no warning because the page genuinely carries the
+ * tag — and the campaign reports zero conversions for as long as it runs.
+ *
+ * v0Service's own comment argued no net was needed here because "v0 does not author the
+ * conversion call, it only passes two values into the platform-owned helper". It does not
+ * author the gtag call; it does author whether the helper is called and with which
+ * arguments, which is the part that breaks.
+ *
+ * Deliberately mirrors validatePixelLeadEvent rather than being stricter: presence of the
+ * argument, not placement. Whether the call sits on the success branch is a separate
+ * question this cannot answer from source (see ENG-1527).
+ */
+export function validateGoogleAdsConversion(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
+  const tsxSource = files
+    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    .map((f) => f.content.toString("utf-8"))
+    .join("\n");
+
+  // Two accepted shapes, checked with OR for the same reason the pixel validator does it:
+  // an existing page must keep validating true under whichever pattern it shipped with.
+  //   - the helper carrying the googleAds argument (what buildBrandEnrichedPrompt asks for)
+  //   - a hand-authored gtag conversion with a send_to (older pages, and pages the coding
+  //     agent wrote before the helper existed)
+  // Bounded [\s\S] window rather than the pixel validator's `[^}]*`: the argument the
+  // prompt asks for is `googleAds: { conversionId, conversionLabel }`, a NESTED object, so
+  // `[^}]*` stops at the first inner brace the moment any other object precedes it. The
+  // window also accepts property shorthand (`{ ..., googleAds }`), which is a legitimate
+  // shape if v0 hoists the pair to a const, and is bounded so a `googleAds` mention
+  // elsewhere in the file cannot satisfy the check.
+  const hasHelperPattern = /fireLeadTracking\([\s\S]{0,400}?\bgoogleAds\b/.test(tsxSource);
+  const hasInlinePattern = /gtag\(\s*['"]event['"]\s*,\s*['"]conversion['"]/.test(tsxSource);
+
+  if (!hasHelperPattern && !hasInlinePattern) {
+    return {
+      ok: false,
+      reason:
+        "No Google Ads conversion call found in the generated form component — " +
+        "expected fireLeadTracking({ googleAds }) (or a gtag('event','conversion') call). " +
+        "The base tag is installed, so the page will look tracked and report nothing.",
+    };
   }
 
   return { ok: true };
@@ -6129,10 +6291,26 @@ export async function updateLandingPageGoogleAds(
     const sets = ["googleAdsConversionId = :cid", "updatedAt = :now"];
     const values: Record<string, any> = { ":cid": conversionId, ":now": new Date().toISOString() };
     const removes: string[] = [];
-    if (conversionLabel) { sets.push("googleAdsConversionLabel = :lbl"); values[":lbl"] = conversionLabel; }
-    else removes.push("googleAdsConversionLabel");
-    if (customerId) { sets.push("googleAdsCustomerId = :cust"); values[":cust"] = customerId; }
-    else removes.push("googleAdsCustomerId");
+    // ENG-1525. `undefined` means the caller did not mention the field; `""` means they
+    // asked to clear it. Those are different requests and used to produce the same write.
+    //
+    // Re-posting just the conversion id — the natural "re-apply my tag" call, and what the
+    // route explicitly permits with only a warning — took the falsy branch and REMOVEd the
+    // label and customer id from this record and every sibling. The base tag survived, so
+    // RULE 7.5 still passed and the page still looked configured, while buildTrackingHelper
+    // (which fires only when id AND label are both present) went silent. A conversion pair
+    // destroyed behind a 200.
+    //
+    // The hazard was already known one branch away: the route rejects a NON-STRING label
+    // with a 400 because "a malformed request would strip a working conversion pair and
+    // leave an id that attributes nothing". An omitted label did exactly that, unguarded.
+    if (conversionLabel === undefined) { /* not mentioned — leave whatever is stored */ }
+    else if (conversionLabel === "") { removes.push("googleAdsConversionLabel"); }
+    else { sets.push("googleAdsConversionLabel = :lbl"); values[":lbl"] = conversionLabel; }
+
+    if (customerId === undefined) { /* not mentioned — leave whatever is stored */ }
+    else if (customerId === "") { removes.push("googleAdsCustomerId"); }
+    else { sets.push("googleAdsCustomerId = :cust"); values[":cust"] = customerId; }
     await dynamodb
       .update({
         TableName: TABLE_NAME,
