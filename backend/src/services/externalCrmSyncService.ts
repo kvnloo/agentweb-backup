@@ -79,6 +79,11 @@ export interface ExternalCrmSyncConfig {
   // Cached external IDs to skip redundant lookups
   externalPipelineId?: string;      // HubSpot deal pipeline ID
   hubspotDealStageMap?: Record<string, string>; // AgentWeb status value -> HubSpot stage ID
+  // Attio has no native Deal object — a Deal is represented as an entry in a
+  // dedicated Attio List (see attioAdapter.ts pushLeads). This is that List's ID,
+  // lazily resolved/created on first push and cached here (locked post-sync, same
+  // as externalPipelineId above).
+  attioDealListId?: string;
   // Sync state
   lastPushSyncAt?: string;
   lastPullSyncAt?: string;
@@ -147,6 +152,20 @@ export const DEFAULT_HUBSPOT_CONTACT_MAPPING: FieldMapping[] = [
   { agentwebField: 'linkedin', crmProperty: 'hs_linkedin_url', direction: 'push', enabled: true },
 ];
 
+// UTM/campaign attribution fields, surfaced as a default mapping for both
+// providers so Meta/Google/LinkedIn ad attribution survives the CRM handoff
+// without the user hand-configuring it. Leaf fields only — never the parent
+// `firstTouch`/`utm` object: mapping the object directly either pushes the
+// literal string "[object Object]" (HubSpot) or is silently skipped (Attio).
+// One-way ('push'): AgentWeb is attribution's source of truth, not the CRM.
+export const ATTRIBUTION_FIELD_MAPPING: FieldMapping[] = [
+  { agentwebField: 'utmSource', crmProperty: 'utm_source', direction: 'push', enabled: true },
+  { agentwebField: 'utmMedium', crmProperty: 'utm_medium', direction: 'push', enabled: true },
+  { agentwebField: 'firstTouch.utm.campaign', crmProperty: 'utm_campaign', direction: 'push', enabled: true },
+  { agentwebField: 'firstTouch.referrer', crmProperty: 'referrer', direction: 'push', enabled: true },
+  { agentwebField: 'firstTouch.landingUrl', crmProperty: 'landing_url', direction: 'push', enabled: true },
+];
+
 // 'notes' has no standard HubSpot contact property — pushed as a custom property
 // so ensureContactProperty runs before the push and creates it if absent.
 // HUBSPOT_LIST_IDENTITY_MAPPING (listName/listId) is defined in hubspotAdapter to
@@ -155,6 +174,7 @@ export const DEFAULT_HUBSPOT_CONTACT_MAPPING: FieldMapping[] = [
 export const DEFAULT_HUBSPOT_CUSTOM_MAPPING: FieldMapping[] = [
   { agentwebField: 'notes', crmProperty: 'notes', direction: 'both', enabled: true },
   ...HUBSPOT_LIST_IDENTITY_MAPPING,
+  ...ATTRIBUTION_FIELD_MAPPING,
 ];
 
 export const DEFAULT_HUBSPOT_DEAL_MAPPING: FieldMapping[] = [
@@ -179,6 +199,7 @@ export const DEFAULT_ATTIO_DEAL_MAPPING: FieldMapping[] = [];
 
 export const DEFAULT_ATTIO_CUSTOM_MAPPING: FieldMapping[] = [
   { agentwebField: 'notes', crmProperty: 'notes', direction: 'both', enabled: true },
+  ...ATTRIBUTION_FIELD_MAPPING,
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -265,19 +286,10 @@ export class ExternalCrmSyncService {
     const now = new Date().toISOString();
     const isHubspot = provider === 'hubspot';
 
-    let nextDealFieldMapping = updates.dealFieldMapping ?? existing?.dealFieldMapping
+    const nextDealFieldMapping = updates.dealFieldMapping ?? existing?.dealFieldMapping
       ?? (isHubspot ? DEFAULT_HUBSPOT_DEAL_MAPPING : DEFAULT_ATTIO_DEAL_MAPPING);
-    let nextCustomFieldMapping = updates.customFieldMapping ?? existing?.customFieldMapping
+    const nextCustomFieldMapping = updates.customFieldMapping ?? existing?.customFieldMapping
       ?? (isHubspot ? DEFAULT_HUBSPOT_CUSTOM_MAPPING : DEFAULT_ATTIO_CUSTOM_MAPPING);
-
-    // Attio has no separate "deal" object — deal mappings are stored as list-entry (custom) attrs.
-    // When saving for Attio, merge any deal mappings into customFieldMapping and clear dealFieldMapping.
-    if (!isHubspot && nextDealFieldMapping.length > 0) {
-      const existingCustomKeys = new Set(nextCustomFieldMapping.map((m: FieldMapping) => m.agentwebField));
-      const dealEntries = nextDealFieldMapping.filter((m: FieldMapping) => !existingCustomKeys.has(m.agentwebField));
-      nextCustomFieldMapping = [...nextCustomFieldMapping, ...dealEntries];
-      nextDealFieldMapping = [];
-    }
 
     // HubSpot per-contact push constant. A non-CRM provider never carries it.
     // `null` is an explicit clear (→ undefined); `undefined` (key absent) preserves
@@ -309,6 +321,13 @@ export class ExternalCrmSyncService {
       ? existing?.externalPipelineId
       : (isHubspot ? (updates.externalPipelineId ?? existing?.externalPipelineId) : undefined);
 
+    // Attio deal-list ID — resolved/cached by attioAdapter.pushLeads on first push,
+    // not settable via saveConfig updates. Once a sync has happened, preserve it
+    // unconditionally (same lock as the HubSpot pipeline above); before that,
+    // carry forward whatever was already cached (there's nothing else to source it
+    // from here — saveConfig never creates the Attio list itself).
+    const resolvedAttioDealListId = existing?.attioDealListId;
+
     const config: ExternalCrmSyncConfig = {
       provider: provider as 'hubspot' | 'attio',
       listId,
@@ -331,6 +350,7 @@ export class ExternalCrmSyncService {
       hubspotMarkAsNonMarketing: resolveMarkAsNonMarketing(),
       externalPipelineId: resolvedExternalPipelineId,
       hubspotDealStageMap: existing?.hubspotDealStageMap,
+      attioDealListId: resolvedAttioDealListId,
       lastPushSyncAt: existing?.lastPushSyncAt,
       lastPullSyncAt: existing?.lastPullSyncAt,
       lastSyncStatus: existing?.lastSyncStatus,

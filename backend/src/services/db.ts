@@ -6095,7 +6095,7 @@ export const crmDb = {
 
       // Extract field names from lead data
       const fieldNames: string[] = [];
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'companyLinkedin', 'status', 'dealValue', 'dealCurrency'];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'companyLinkedin', 'status', 'dealValue', 'dealCurrency', 'utmSource', 'utmMedium'];
       standardFields.forEach(field => {
         if (leadData[field as keyof typeof leadData] && String(leadData[field as keyof typeof leadData]).trim()) {
           fieldNames.push(field);

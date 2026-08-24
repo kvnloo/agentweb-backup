@@ -449,26 +449,42 @@ describe('ExternalCrmSyncService', () => {
       expect(saved.customFieldMapping).toEqual(customMapping);
     });
 
-    it('merges Attio deal mappings into custom mappings', async () => {
+    it('persists Attio deal mappings without merging into custom mappings', async () => {
       mockNoConfig();
       mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
 
+      const dealMapping: FieldMapping[] = [
+        { agentwebField: 'status', crmProperty: 'deal_status', direction: 'both', enabled: true },
+      ];
+      const customMapping: FieldMapping[] = [
+        { agentwebField: 'company', crmProperty: 'company_name', direction: 'push', enabled: true },
+      ];
+
       await service.saveConfig('user1', 'list1', 'attio', {
-        dealFieldMapping: [
-          { agentwebField: 'status', crmProperty: 'deal_status', direction: 'both', enabled: true },
-        ],
-        customFieldMapping: [
-          { agentwebField: 'company', crmProperty: 'company_name', direction: 'push', enabled: true },
-        ],
+        dealFieldMapping: dealMapping,
+        customFieldMapping: customMapping,
       });
 
       const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
       const saved = call[2] as Record<string, any>;
-      expect(saved.dealFieldMapping).toEqual([]);
-      expect(saved.customFieldMapping).toEqual(expect.arrayContaining([
-        expect.objectContaining({ agentwebField: 'status', crmProperty: 'deal_status' }),
-        expect.objectContaining({ agentwebField: 'company', crmProperty: 'company_name' }),
-      ]));
+      expect(saved.dealFieldMapping).toEqual(dealMapping);
+      expect(saved.customFieldMapping).toEqual(customMapping);
+    });
+
+    it('keeps the Attio deal list ID locked after first sync', async () => {
+      const existing = makeConfig({
+        provider: 'attio',
+        attioDealListId: 'list-locked-123',
+        lastPushSyncAt: '2024-02-01T00:00:00.000Z',
+      });
+      mockListWithConfig(existing, 'attio');
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'attio', {});
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.attioDealListId).toBe('list-locked-123');
     });
 
     it('keeps the pipeline ID locked after first sync', async () => {
@@ -751,6 +767,33 @@ describe('ExternalCrmSyncService', () => {
       const fields = defaults.customFieldMapping.map(m => m.agentwebField);
       expect(fields).not.toContain('listName');
       expect(fields).not.toContain('listId');
+    });
+
+    it('includes UTM/attribution fields in the HubSpot custom mapping defaults', async () => {
+      const defaults = await service.getDefaultMappings('hubspot');
+      expect(defaults.customFieldMapping).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentwebField: 'utmSource', crmProperty: 'utm_source', direction: 'push', enabled: true }),
+        expect.objectContaining({ agentwebField: 'utmMedium', crmProperty: 'utm_medium', direction: 'push', enabled: true }),
+        expect.objectContaining({ agentwebField: 'firstTouch.utm.campaign', crmProperty: 'utm_campaign', direction: 'push', enabled: true }),
+      ]));
+    });
+
+    it('includes UTM/attribution fields in the Attio custom mapping defaults', async () => {
+      const defaults = await service.getDefaultMappings('attio');
+      expect(defaults.customFieldMapping).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentwebField: 'utmSource', crmProperty: 'utm_source', direction: 'push', enabled: true }),
+        expect.objectContaining({ agentwebField: 'utmMedium', crmProperty: 'utm_medium', direction: 'push', enabled: true }),
+        expect.objectContaining({ agentwebField: 'firstTouch.utm.campaign', crmProperty: 'utm_campaign', direction: 'push', enabled: true }),
+      ]));
+    });
+
+    it('never maps the parent firstTouch/utm object directly (leaf fields only)', async () => {
+      const hubspotFields = (await service.getDefaultMappings('hubspot')).customFieldMapping.map(m => m.agentwebField);
+      const attioFields = (await service.getDefaultMappings('attio')).customFieldMapping.map(m => m.agentwebField);
+      for (const fields of [hubspotFields, attioFields]) {
+        expect(fields).not.toContain('firstTouch');
+        expect(fields).not.toContain('firstTouch.utm');
+      }
     });
   });
 

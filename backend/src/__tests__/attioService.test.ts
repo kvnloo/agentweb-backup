@@ -404,5 +404,23 @@ describe('AttioService', () => {
         expect.any(Object)
       );
     });
+
+    it('returns undefined when the response has no entry id', async () => {
+      mockAxiosPost.mockResolvedValue({ data: {} });
+
+      const entryId = await service.addPersonToList('list-abc', 'rec-person-1');
+
+      expect(entryId).toBeUndefined();
+    });
+
+    it('returns the new entry id extracted from the response', async () => {
+      mockAxiosPost.mockResolvedValue({ data: { data: { id: { entry_id: 'entry-1' } } } });
+
+      const entryId = await service.addPersonToList('list-abc', 'rec-person-1', {
+        industry: [{ value: 'SaaS' }],
+      });
+
+      expect(entryId).toBe('entry-1');
+    });
   });
 });

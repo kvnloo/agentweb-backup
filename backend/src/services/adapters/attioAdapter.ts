@@ -79,6 +79,41 @@ export class AttioAdapter implements CrmAdapter {
         }
         console.log(`[AttioAdapter] Ensured person-level slugs:`, Array.from(ensuredSlugs));
 
+        // ── 2. Resolve the deal list (Attio's Deal/Opportunity analog) ───────────
+        // Attio has no native Deal object. AgentWeb represents "a deal" as an entry
+        // in a dedicated Attio List, with deal-shaped fields (value, stage, etc.)
+        // stored as per-entry attributes and linked to the synced Person record.
+        // Resolved once per push run, not per lead. A failure here is non-critical
+        // — it degrades to person-only sync for the rest of the run rather than
+        // failing every lead, since list/attribute setup is best-effort.
+        const dealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'pull');
+        let dealListId: string | undefined;
+        const dealSlugs = new Map<string, string>();  // mapped crmProperty -> resolved Attio list-attribute slug
+        const dealTypes = new Map<string, string>();  // resolved slug -> Attio attribute type
+        if (dealMappings.length > 0) {
+            try {
+                dealListId = config.attioDealListId;
+                if (!dealListId) {
+                    dealListId = await svc.findOrCreateList(config.listName || 'AgentWeb Deals', 'people');
+                    config.attioDealListId = dealListId;
+                }
+                for (const m of dealMappings) {
+                    const rawSlug = m.crmProperty;
+                    const type = (rawSlug.includes('value') || rawSlug.includes('amount')) ? 'number' : 'text';
+                    try {
+                        const finalSlug = await svc.ensureListAttribute(dealListId, rawSlug, rawSlug.replace(/_/g, ' '), type);
+                        dealSlugs.set(rawSlug, finalSlug);
+                        dealTypes.set(finalSlug, type);
+                    } catch (e: any) {
+                        console.error(`[AttioAdapter] Failed to ensure deal-list attribute "${rawSlug}":`, e.response?.data?.message || e.message);
+                    }
+                }
+            } catch (e: any) {
+                console.error('[AttioAdapter] Failed to resolve deal list — degrading to person-only sync:', e.response?.data?.message || e.message);
+                dealListId = undefined;
+            }
+        }
+
         // ── 4. Sync each lead ───────────────────────────────────────────────────
         for (const lead of leads) {
             try {
@@ -166,6 +201,36 @@ export class AttioAdapter implements CrmAdapter {
                     lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_record_id: personId };
                 }
 
+                // Deal-list entry sync (non-critical — a failure here doesn't fail
+                // the lead, since its Person record already synced successfully).
+                if (dealListId) {
+                    try {
+                        const entryValues = this.buildDealEntryValues(lead, dealMappings, dealSlugs, dealTypes);
+                        const existingEntryId = lead.syncMetadata?.attio_list_entry_id;
+                        let entryId: string | undefined = existingEntryId;
+
+                        if (existingEntryId) {
+                            await svc.updateListEntry(dealListId, existingEntryId, entryValues);
+                        } else {
+                            const foundEntryId = await svc.findListEntry(dealListId, personId);
+                            if (foundEntryId) {
+                                await svc.updateListEntry(dealListId, foundEntryId, entryValues);
+                                entryId = foundEntryId;
+                            } else {
+                                entryId = await svc.addPersonToList(dealListId, personId, entryValues);
+                            }
+                        }
+
+                        if (entryId && entryId !== existingEntryId) {
+                            await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+                                syncMetadata: { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId },
+                            }).catch((err: any) => { });
+                            lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId };
+                        }
+                    } catch (e: any) {
+                        console.error(`[AttioAdapter] Deal-list sync failed for lead ${lead.leadId} (non-critical):`, e.response?.data?.message || e.message);
+                    }
+                }
 
                 result.successCount++;
             } catch (err: any) {
@@ -365,6 +430,30 @@ export class AttioAdapter implements CrmAdapter {
         }
 
         return values;
+    }
+
+    private buildDealEntryValues(
+        lead: any,
+        dealMappings: FieldMapping[],
+        dealSlugs: Map<string, string>,
+        dealTypes: Map<string, string>
+    ): Record<string, any[]> {
+        const entryValues: Record<string, any> = {};
+
+        for (const m of dealMappings) {
+            const finalSlug = dealSlugs.get(m.crmProperty);
+            if (!finalSlug) continue; // attribute-ensure failed for this field — skip it
+
+            const value = this.getNestedValue(lead, m.agentwebField) ?? lead.customFields?.[m.agentwebField];
+            if (value == null || typeof value === 'object') continue;
+            const strValue = String(value).trim();
+            if (!strValue) continue;
+
+            const type = dealTypes.get(finalSlug) || 'text';
+            entryValues[finalSlug] = [this.formatAttioValue(strValue, type)];
+        }
+
+        return entryValues;
     }
 
     private formatAttioValue(value: any, type: string): any {

@@ -398,8 +398,8 @@ export class AttioService {
     listId: string,
     recordId: string,
     entryValues?: Record<string, any[]>
-  ): Promise<void> {
-    await axiosInstance.post(
+  ): Promise<string | undefined> {
+    const res = await axiosInstance.post(
       `${this.baseUrl}/lists/${listId}/entries`,
       {
         data: {
@@ -410,6 +410,7 @@ export class AttioService {
       },
       { headers: this.headers() }
     );
+    return (res.data as any)?.data?.id?.entry_id;
   }
 
   // ─── List entry attributes ────────────────────────────────────────────────
