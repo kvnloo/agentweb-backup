@@ -35,6 +35,8 @@ import {
   updateLandingPageContext,
   updateLandingPageLeadList,
   syncLeadCaptureFilesToRepo,
+  isPlatformGeneratedRepo,
+  NO_CAPTURE_LAYER,
   recordLandingPagePublish,
   markLandingPagePublishReverted,
   INTEGRATIONS,
@@ -2725,7 +2727,11 @@ async function saveMetaPixelForPage(
     }
     return listByPath;
   };
-  await syncLeadCaptureFilesToRepo(repoFullName, buildListByPath, pixelId || undefined, pixelId ? accountId : undefined);
+  // Installing Meta tracking regenerates the capture layer by design — this route is one
+  // of the two callers allowed to CREATE it.
+  await syncLeadCaptureFilesToRepo(repoFullName, buildListByPath, pixelId || undefined, pixelId ? accountId : undefined, {
+    allowInstall: true,
+  });
 
   // 3. Persist metaPixelId/metaAdAccountId on this record.
   await updateLandingPageMetaPixel(page.id, page.userId, pixelId, accountId);
@@ -3066,8 +3072,25 @@ async function syncLeadCaptureForPage(
       buildListByPath,
       rootRecord?.metaPixelId,
       rootRecord?.metaAdAccountId,
+      {
+        // ⚠ Changing a page's lead list must NEVER install a capture layer into a repo that
+        // has none — on a bespoke site that means creating a root middleware.ts and a
+        // colliding capture route on `main`, with an immediate redeploy. Platform-generated
+        // repos may still be repaired this way (a page generated before ENG-309 can legitimately
+        // have no capture files yet); everything else gets a warning instead.
+        allowInstall: isPlatformGeneratedRepo(repoFullName),
+      },
     );
     if (result.committed || result.reason === "up-to-date") return undefined;
+    // Not transient: no retry or redeploy installs a capture layer we refuse to install, so
+    // this must not borrow the "applied on the next deploy" wording below.
+    if (result.reason === NO_CAPTURE_LAYER) {
+      return (
+        "Lead list saved, but this page's site does not use the platform's lead-capture code, " +
+        "so its form will not start saving leads on its own. Wire the form to this list in the " +
+        "site's own repository."
+      );
+    }
     return `Lead list saved, but the live site was not updated (${result.reason}). It will be applied on the next deploy or retry.`;
   } catch (err: any) {
     // syncLeadCaptureFilesToRepo does not throw, so this is a sibling-fetch failure.

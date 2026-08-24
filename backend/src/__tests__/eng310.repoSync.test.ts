@@ -126,6 +126,8 @@ import { findOrphanedCaptureEntries } from "../services/v0Service";
 // so reach past it here). Its axios / aws-sdk / secrets deps are still mocked.
 const {
   syncLeadCaptureFilesToRepo,
+  isPlatformGeneratedRepo,
+  NO_CAPTURE_LAYER,
   buildLandingPageMiddleware,
   buildCaptureRoute,
   buildDomainMapFile,
@@ -494,7 +496,12 @@ describe("syncLeadCaptureFilesToRepo", () => {
         : { "/a": "list_a", "/b": "list_b" };     // retry: fresh, includes the sibling that landed
     };
 
-    const result = await syncLeadCaptureFilesToRepo(REPO, buildListByPath);
+    // allowInstall: this fixture makes every file read 404 on purpose (see above) so each
+    // attempt reaches a real commit. That is the install case, and the subject here is
+    // retry mechanics, not install policy — so opt in rather than let the guard short-circuit.
+    const result = await syncLeadCaptureFilesToRepo(REPO, buildListByPath, undefined, undefined, {
+      allowInstall: true,
+    });
 
     expect(result.committed).toBe(true);
     // Re-derived fresh on EACH attempt, not computed once and reused across retries.
@@ -515,6 +522,80 @@ describe("syncLeadCaptureFilesToRepo", () => {
 });
 
 // =============================================================================
+// =============================================================================
+// The install guard: never CREATE a capture layer in a repo that never had one
+// =============================================================================
+describe("syncLeadCaptureFilesToRepo — install guard", () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  /** A bespoke / v0-era site: none of the platform capture files exist. */
+  const BESPOKE: Record<string, string> = {};
+
+  it("REFUSES to install into a repo with no capture layer when the caller may not install", async () => {
+    // middleware.ts and lib/agentweb-track.ts are written UNCONDITIONALLY, so on a repo with
+    // neither this is not a sync — it CREATES a root middleware, which in Next.js changes
+    // request handling for the whole site, and pushes it to main with an immediate redeploy.
+    mockGitHub(BESPOKE);
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }));
+
+    expect(result.committed).toBe(false);
+    expect(result.reason).toBe(NO_CAPTURE_LAYER);
+    // Nothing was pushed at all — not a blob, not a tree, not a ref update.
+    expect(mockAxiosPatch).not.toHaveBeenCalled();
+    expect(treePaths()).toEqual([]);
+  });
+
+  it("the guard defaults CLOSED — a caller that passes no options cannot install", async () => {
+    mockGitHub(BESPOKE);
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }), undefined, undefined);
+    expect(result.reason).toBe(NO_CAPTURE_LAYER);
+  });
+
+  it("ALLOWS the install when the caller owns the capture layer (generation, pixel install)", async () => {
+    mockGitHub(BESPOKE);
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }), undefined, undefined, {
+      allowInstall: true,
+    });
+
+    expect(result.committed).toBe(true);
+    expect(treePaths()).toEqual(expect.arrayContaining(["middleware.ts", "app/api/capture/route.ts"]));
+  });
+
+  it("does NOT change an ordinary sync — a repo that already has the layer still syncs without opting in", async () => {
+    mockGitHub({
+      "middleware.ts": "// stale middleware\n",
+      "app/api/capture/route.ts": "// stale route\n",
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }));
+
+    expect(result.committed).toBe(true);
+    expect(blobForPath("middleware.ts")).toBe(buildLandingPageMiddleware());
+  });
+});
+
+describe("isPlatformGeneratedRepo", () => {
+  it("recognises platform-generated repos", () => {
+    expect(isPlatformGeneratedRepo("AgentWebPro/lp-taskflow-test-page-249d7f67")).toBe(true);
+    expect(isPlatformGeneratedRepo("lp-demystifying-ai-agentweb-lead-180f2e2b")).toBe(true);
+  });
+
+  it("rejects the bespoke and v0-era customer sites, which is the whole point", () => {
+    // Real production repos: 34 landing-page records point at these four.
+    for (const r of [
+      "AgentWebPro/agentweb-landing-page",
+      "AgentWebPro/v0-xc-ures-landing-page",
+      "AgentWebPro/v0-waldium-lander",
+      "AgentWebPro/v0-haven-ai-landing-page",
+    ]) {
+      expect(isPlatformGeneratedRepo(r)).toBe(false);
+    }
+  });
+});
+
 // Route: PATCH /generated/:id/lead-list
 // =============================================================================
 const app: Application = express();
@@ -595,6 +676,9 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
       expect.any(Function), // ENG-485: now a callback, re-derived fresh on every retry
       "1012387921717047",
       "act_555",
+      // REPO is an lp-* repo, so the lead-list path MAY repair a platform site that has no
+      // capture layer yet. On a bespoke repo this argument is false and the sync is skipped.
+      { allowInstall: true },
     );
   });
 
@@ -617,6 +701,32 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
     expect(pixelArg).toBeUndefined();
     expect(accountArg).toBeUndefined();
     await expect(buildListByPath()).resolves.toEqual({ "/pricing": "list_pricing" });
+  });
+
+  it("BESPOKE REPO: the lead-list path may not install a capture layer, and says so accurately", async () => {
+    // hireemma.ai. 34 production records point at four repos like this one. Committing here
+    // would CREATE a root middleware.ts on AgentWeb's own marketing site.
+    const bespoke = { ...rootPage, githubRepoUrl: "https://github.com/AgentWebPro/agentweb-landing-page" };
+    mockGetLandingPageById.mockResolvedValue(bespoke);
+    mockGetLandingPagesByOwner.mockResolvedValue([bespoke]);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: false, reason: NO_CAPTURE_LAYER });
+
+    const res = await request(app)
+      .patch("/api/landing-pages/v0/generated/p1/lead-list")
+      .send({ leadListId: "list_home" });
+
+    expect(res.status).toBe(200);
+    // The guard is decided by the caller, not left to the service to infer.
+    expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(
+      "AgentWebPro/agentweb-landing-page",
+      expect.any(Function),
+      undefined,
+      undefined,
+      { allowInstall: false },
+    );
+    // ⚠ Wording matters: this is NOT transient, so it must not promise a later retry.
+    expect(res.body.captureSyncWarning).toMatch(/does not use the platform's lead-capture code/);
+    expect(res.body.captureSyncWarning).not.toMatch(/next deploy or retry/);
   });
 
   it("a GitHub failure does not lose the DB write — 200 with captureSyncWarning", async () => {

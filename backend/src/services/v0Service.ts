@@ -2436,6 +2436,8 @@ async function addPageToExistingRepo(
         // had, so the capture route is never left pointing at a pixel the layout doesn't fire.
         pixelOverrideAbandoned ? existingPage.metaPixelId : effectivePixelId,
         pixelOverrideAbandoned ? existingPage.metaAdAccountId : effectiveMetaAccountId,
+        // Generation OWNS the capture layer — this is the call that creates it.
+        { allowInstall: true },
       );
       if (!syncResult.committed && syncResult.reason !== "up-to-date") {
         console.warn(
@@ -6763,6 +6765,26 @@ export function findOrphanedCaptureEntries(
   return orphans;
 }
 
+/**
+ * Returned when a caller that may not INSTALL a capture layer targets a repo that has none.
+ * Distinct from every other skip reason because it is not transient: retrying, redeploying
+ * or waiting changes nothing, so the message shown to a user must not promise otherwise.
+ */
+export const NO_CAPTURE_LAYER = "no-capture-layer";
+
+/**
+ * Repos the platform generated and therefore owns the capture layer of. Platform repos are
+ * created as `lp-<slug>-<id>`; bespoke and v0-era customer sites are not.
+ *
+ * ⚠ A NAMING CONVENTION, NOT A CONTRACT — deliberately used only to decide whether the
+ * lead-list path may install into a repo that has no capture layer yet (the pre-ENG-309
+ * repair case). A repo misjudged here gets a WARNING instead of a silent install, which is
+ * the safe direction. Do not reuse this to decide anything that fails the other way.
+ */
+export function isPlatformGeneratedRepo(repoFullName: string): boolean {
+  return (repoFullName.split("/").pop() ?? "").startsWith("lp-");
+}
+
 export async function syncLeadCaptureFilesToRepo(
   repoFullName: string,
   /**
@@ -6778,6 +6800,12 @@ export async function syncLeadCaptureFilesToRepo(
   /** Threaded through to buildCaptureRoute — see its own doc comment. */
   pixelId?: string,
   metaAccountId?: string,
+  /**
+   * Whether this caller is allowed to CREATE the platform capture layer in a repo that has
+   * none. Defaults to FALSE so a new caller cannot install one by accident — see the guard
+   * below for why that direction is the safe one.
+   */
+  opts: { allowInstall?: boolean } = {},
 ): Promise<{ committed: boolean; reason?: string; pushedCommitSha?: string; pushTimestampMs?: number }> {
   const MAX_ATTEMPTS = 2;
   let lastErr: any;
@@ -6801,6 +6829,34 @@ export async function syncLeadCaptureFilesToRepo(
         readRepoFile(repoFullName, "domainMap.ts", ghHeaders),
         readRepoFile(repoFullName, "lib/agentweb-track.ts", ghHeaders),
       ]);
+
+      // ⚠ NEVER INSTALL A CAPTURE LAYER INTO A REPO THAT NEVER HAD ONE.
+      // `middleware.ts` and `lib/agentweb-track.ts` below are written UNCONDITIONALLY, and
+      // `domainMap.ts` whenever absent — so on a repo with none of them this does not
+      // "sync", it INSTALLS, straight to `main` with no PR and an immediate redeploy.
+      //
+      // Four repos in production are in exactly that state and are NOT platform-generated:
+      // agentweb-landing-page (hireemma.ai, AgentWeb's own marketing site),
+      // v0-xc-ures-landing-page, v0-waldium-lander and v0-haven-ai-landing-page — the last
+      // two managed clients — 34 landing-page records between them. Adding a ROOT
+      // middleware.ts to a Next.js app that has none changes request handling site-wide, and
+      // `app/api/capture/route.ts` collides with hireemma's own
+      // `app/(frontend)/api/capture/route.ts` — a collision that has already broken that site
+      // once (see its commit "fix: fully comment out app/api/capture to resolve conflicting
+      // route with (frontend)/api/capture").
+      //
+      // Installing is legitimate at GENERATION and at pixel-install, which pass allowInstall.
+      // It is never legitimate as a side effect of changing a page's lead list.
+      const hasCaptureLayer = existingMiddleware !== null;
+      if (!hasCaptureLayer && !opts.allowInstall) {
+        console.warn(
+          `[V0 SERVICE] ⚠ ${repoFullName} has no platform capture layer (middleware.ts absent) ` +
+            `and this caller may not install one — skipping the sync entirely. Committing here ` +
+            `would CREATE middleware.ts/app/api/capture/route.ts/lib/agentweb-track.ts on a repo ` +
+            `the platform does not own.`
+        );
+        return { committed: false, reason: NO_CAPTURE_LAYER };
+      }
 
       // Only write domainMap.ts if the repo has none. If it exists it may carry a real
       // subdomain map — clobbering it with {} would break the customer's routing.
