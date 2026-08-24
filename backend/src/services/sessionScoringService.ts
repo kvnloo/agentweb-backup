@@ -731,6 +731,15 @@ function isTestScheduledSession(session: ChatSession): boolean {
 const PUBLISH_WITHHELD_MARKER =
   /PUBLISH WITHHELD:\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))/i;
 
+// The 'revoked' variant specifically — emitted only when a run that WAS admitted
+// authorized=true (publishAdmission) had that consent narrowed away mid-run by
+// ENG-827's refreshPublishAuthorization. The admission snapshot is a one-time
+// stamp taken before the first turn, so on its own it cannot tell a run that
+// stayed authorized throughout apart from one revoked partway through — only the
+// marker variant the prompt reserves for that exact case can.
+const PUBLISH_WITHHELD_REVOKED_MARKER =
+  /PUBLISH WITHHELD:\s*this schedule's publish authorization has been revoked/i;
+
 /**
  * ENG-995 — two scheduled sessions with IDENTICAL behavior (drafted the content,
  * withheld the mandated publish for lack of authorization, reported it once, and
@@ -755,14 +764,26 @@ const PUBLISH_WITHHELD_MARKER =
  * marker as its last turn is excluded; an authorized run that emits the marker
  * anyway keeps none of those and stays in the judged cohort where a judge can
  * still catch the fabrication.
+ *
+ * The admission snapshot alone is not the full genuineness story, though: it is
+ * taken once, before the first turn, while authorization can be narrowed mid-run
+ * (refreshPublishAuthorization, ENG-827) if the owner revokes consent while the
+ * run is executing. A run admitted authorized=true that has consent revoked
+ * partway through settles on PUBLISH_WITHHELD_REVOKED_MARKER specifically — the
+ * one variant the prompt reserves for that case — so an admitted-authorized
+ * session is still excluded when its last turn matches THAT variant. Any other
+ * marker wording on an admitted-authorized session stays unexcluded (fabrication
+ * guard, above).
  */
 function isPublishGateWithheldSession(session: ChatSession): boolean {
   if (session.sessionType !== "scheduled") return false;
-  if (session.publishAdmission?.authorized === true) return false;
   const nonSystem = (session.messages || []).filter((m: any) => m.role !== "system");
   const last: any = nonSystem[nonSystem.length - 1];
   if (!last || last.role !== "assistant") return false;
   const text = typeof last.content === "string" ? last.content : "";
+  if (session.publishAdmission?.authorized === true) {
+    return PUBLISH_WITHHELD_REVOKED_MARKER.test(text);
+  }
   return PUBLISH_WITHHELD_MARKER.test(text);
 }
 
