@@ -86,12 +86,36 @@ describe('ENG-335 launch gate — CAMPAIGN RESUME', () => {
     expect(recordSpy).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'passed' }));
   });
 
-  it('proceeds and records an override when override_tracking_check=true despite an unmeasured URL', async () => {
+  // ENG-1526 changed the CONTRACT here, not the outcome. A bare override_tracking_check
+  // no longer proceeds — the model could set that on its own, which is the whole defect.
+  // It now halts, discloses the waiver, and issues a token; the replay carrying that token
+  // proceeds and is still recorded as 'overridden'. Both halves are asserted, because the
+  // outcome this test was protecting (an APPROVED override does work, and is recorded) is
+  // still exactly right.
+  it('halts on a bare override instead of silently waiving the check', async () => {
     (preflightTrackingGate as jest.Mock).mockResolvedValue(blockedGate);
     const result = await service.handleCallGoogleAdsApi('user-123', {
       customer_id: '1234567890', entity_type: 'CAMPAIGN', action: 'RESUME', campaign_resource_name: CAMPAIGN,
       override_tracking_check: true,
     }, { sessionId: 'sess-1' });
+
+    expect(result.awaitingUserConfirmation).toBe(true);
+    expect(typeof result.tracking_override_token).toBe('string');
+    expect(googleAdsService.resumeCampaign).not.toHaveBeenCalled();
+  });
+
+  it('proceeds and records an override once the approval token is replayed', async () => {
+    (preflightTrackingGate as jest.Mock).mockResolvedValue(blockedGate);
+    const args = {
+      customer_id: '1234567890', entity_type: 'CAMPAIGN' as const, action: 'RESUME', campaign_resource_name: CAMPAIGN,
+      override_tracking_check: true,
+    };
+    const halt = await service.handleCallGoogleAdsApi('user-123', args, { sessionId: 'sess-1' });
+    const result = await service.handleCallGoogleAdsApi(
+      'user-123',
+      { ...args, tracking_override_token: halt.tracking_override_token },
+      { sessionId: 'sess-1' },
+    );
 
     expect(result.success).toBe(true);
     expect(googleAdsService.resumeCampaign).toHaveBeenCalled();
@@ -180,15 +204,27 @@ describe('ENG-335 launch gate — AD CREATE on a live campaign', () => {
     expect(preflightTrackingGate).not.toHaveBeenCalled();
   });
 
-  it('proceeds and records an override when adding to a live campaign with override_tracking_check=true', async () => {
+  // ENG-1526: same contract change as the RESUME case above. The waiver is bound to an
+  // approval on EVERY path that accepts it, not just the launch one — a creative added to
+  // a live campaign serves paid traffic immediately, so it is the same exposure.
+  it('proceeds and records an override once the approval token is replayed', async () => {
     (googleAdsService.getAdGroupCampaign as jest.Mock).mockResolvedValue({ campaignResourceName: CAMPAIGN, campaignStatus: 'ENABLED' });
     (preflightTrackingGate as jest.Mock).mockResolvedValue(blockedGate);
 
-    const result = await service.handleCallGoogleAdsApi('user-123', {
-      customer_id: '1234567890', entity_type: 'AD', action: 'CREATE', ad_group_resource_name: AD_GROUP,
+    const args = {
+      customer_id: '1234567890', entity_type: 'AD' as const, action: 'CREATE', ad_group_resource_name: AD_GROUP,
       type: 'SEARCH', headlines: ['h'], descriptions: ['d'], final_url: 'https://acme.com/compare',
       override_tracking_check: true,
-    }, { sessionId: 'sess-1' });
+    };
+    const halt = await service.handleCallGoogleAdsApi('user-123', args, { sessionId: 'sess-1' });
+    expect(halt.awaitingUserConfirmation).toBe(true);
+    expect(googleAdsService.createAd).not.toHaveBeenCalled();
+
+    const result = await service.handleCallGoogleAdsApi(
+      'user-123',
+      { ...args, tracking_override_token: halt.tracking_override_token },
+      { sessionId: 'sess-1' },
+    );
 
     expect(result.success).toBe(true);
     expect(googleAdsService.createAd).toHaveBeenCalled();

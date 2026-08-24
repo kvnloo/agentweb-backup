@@ -34230,7 +34230,66 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }, opts?: { sessionId?: string }): Promise<any> {
     try {
       const { customer_id, entity_type, action } = args;
-      const overrideTrackingCheck = args.override_tracking_check === true;
+      /*
+       * ENG-1526. The override is bound to a disclosed approval, exactly as Meta's is.
+       *
+       * This used to be `args.override_tracking_check === true` and nothing else: the model
+       * could set it on its own, and the only thing standing against that was a sentence in
+       * the tool description ("Never set it on your own"). ENG-941 wrote the threat model
+       * down for the Meta path and dismissed precisely that defence — "an override the model
+       * can introduce after approval is not user-granted, whatever the tool description
+       * says" — then hardened Meta and left Google on the sentence.
+       *
+       * Reusing ENG-941's helpers rather than writing a second mechanism: HMAC over the
+       * exact call, keyed with a server-only secret so the caller cannot mint one, and
+       * key-order-independent so a re-emitted argument object still matches.
+       * `stableStringify` excludes the gate-only flags, so the replay carrying the token
+       * digests identically to the preview that issued it.
+       *
+       * A claimed-but-unapproved override does not fail — it HALTS and discloses, then
+       * issues the matching token. The path is a loop, not a dead end. A call that waives
+       * nothing is untouched: no token is ever required.
+       *
+       * Deliberately narrower than Meta's gate: this halts only when an override is
+       * claimed. Google Ads writes still have no general confirmation step — that is a
+       * bigger change and its own ticket (ENG-1527), and conflating the two would put an
+       * unrelated behaviour change inside a security fix.
+       */
+      const overrideClaimed = args.override_tracking_check === true;
+      const overrideDigest = overrideClaimed
+        ? computeTrackingOverrideDigest(getJwtSecret(), { customer_id, entity_type, action, args })
+        : '';
+      const overrideApproved =
+        overrideClaimed && trackingOverrideTokenMatches(args.tracking_override_token, overrideDigest);
+
+      if (overrideClaimed && !overrideApproved) {
+        const target = [entity_type, action, customer_id].filter(Boolean).join(' ');
+        return {
+          success: true,
+          requiresConfirmation: true,
+          awaitingUserConfirmation: true,
+          summary: `Waive the tracking pre-flight check for ${target}`,
+          confirmationPrompt:
+            `This Google Ads call would WAIVE the pre-flight tracking check.\n\n` +
+            `That check is what stops a campaign spending on pages that cannot report a ` +
+            `conversion. Waiving it means accepting that this launch may be unmeasurable — ` +
+            `you would be paying for traffic you cannot evaluate.\n\n` +
+            `Target: ${target}\n\n` +
+            `Reply "yes" / "confirm" to waive the check and proceed, or tell me to fix the ` +
+            `tracking first.`,
+          confirmationDetail: `Waive the tracking pre-flight check for ${target}`,
+          message:
+            `This call sets override_tracking_check, which waives the deterministic ` +
+            `pre-flight measurement check for ${target}. Show the user the warning above and ` +
+            `get explicit approval. Once approved, call call_google_ads_api again with the ` +
+            `same arguments PLUS tracking_override_token exactly as returned here — without ` +
+            `it the override will not apply and the gate will run normally.`,
+          // Only issued when an override was actually described in this halt, so it can
+          // only ever approve a waiver the user was shown.
+          tracking_override_token: overrideDigest,
+        } as any;
+      }
+      const overrideTrackingCheck = overrideApproved;
 
       if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
         const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
