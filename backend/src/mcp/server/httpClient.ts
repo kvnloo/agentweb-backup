@@ -93,8 +93,16 @@ function getBaseUrl(): string {
 // each time surfacing only the bare string "fetch failed"). A genuine request timeout
 // aborts with a distinct `AbortError`, not this TypeError, so retrying only this case
 // cannot mask a real timeout.
+//
+// Retries are gated to GET and PUT: both are safe to repeat by HTTP semantics
+// (GET has no side effect, PUT replaces state so re-sending the same body is a
+// no-op). POST/PATCH/DELETE self-calls (task execute, scheduled-chats/leads
+// create, toggle, etc.) are NOT retried — the error may have occurred after the
+// server already processed the request (e.g. ECONNRESET while reading the
+// response), and retrying a non-idempotent call risks silently duplicating it.
 const SELF_CALL_MAX_ATTEMPTS = 3;
 const SELF_CALL_RETRY_BASE_DELAY_MS = 200;
+const SELF_CALL_RETRYABLE_METHODS = new Set(['GET', 'PUT']);
 
 function isTransientNetworkError(error: unknown): boolean {
   return error instanceof TypeError && error.message === 'fetch failed';
@@ -102,20 +110,21 @@ function isTransientNetworkError(error: unknown): boolean {
 
 async function fetchSelfCallWithRetry(url: string, fetchOptions: RequestInit, method: string, path: string): Promise<Response> {
   const correlationId = randomUUID();
-  for (let attempt = 1; attempt <= SELF_CALL_MAX_ATTEMPTS; attempt++) {
+  const maxAttempts = SELF_CALL_RETRYABLE_METHODS.has(method) ? SELF_CALL_MAX_ATTEMPTS : 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await fetch(url, fetchOptions);
     } catch (error) {
       const cause: any = (error as any)?.cause;
       const detail = cause ? `${cause.code ? `${cause.code}: ` : ''}${cause.message || cause}` : (error as Error).message;
 
-      if (!isTransientNetworkError(error) || attempt >= SELF_CALL_MAX_ATTEMPTS) {
+      if (!isTransientNetworkError(error) || attempt >= maxAttempts) {
         console.error(`[MCP self-call ${correlationId}] ${method} ${path} failed after ${attempt} attempt(s): ${detail}`);
         throw new Error(`MCP self-call ${method} ${path} failed after ${attempt} attempt(s) [correlationId=${correlationId}]: ${detail}`);
       }
 
       const backoffMs = SELF_CALL_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
-      console.warn(`[MCP self-call ${correlationId}] ${method} ${path} network error on attempt ${attempt}/${SELF_CALL_MAX_ATTEMPTS}, retrying in ${backoffMs}ms: ${detail}`);
+      console.warn(`[MCP self-call ${correlationId}] ${method} ${path} network error on attempt ${attempt}/${maxAttempts}, retrying in ${backoffMs}ms: ${detail}`);
       await new Promise((resolve) => setTimeout(resolve, backoffMs));
     }
   }
