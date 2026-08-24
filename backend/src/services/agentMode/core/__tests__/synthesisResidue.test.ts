@@ -512,7 +512,34 @@ describe('extractProducedAssetCount', () => {
         ...fourScreenshotsForFooterTest(),
       ]),
     ];
-    expect(extractProducedAssetCount(messages)).toBe(5); // 1 html file + 4 screenshots
+    // Max across tool types, not a sum — see the dedicated "does not pad" test below
+    // for why. 1 create_html_file + 4 screenshots -> 4, not 5.
+    expect(extractProducedAssetCount(messages)).toBe(4);
+  });
+
+  // A step like "Render the Full Size Matrix" legitimately calls BOTH
+  // create_html_file (a few reusable templates) and playwright_browser_take_
+  // screenshot (one per requested size) — real work, not padding. But they are not
+  // interchangeable units of the step's deliverable: summing them would let, e.g.,
+  // 5 create_html_file calls + 7 screenshots satisfy expectedAssetCount=12 while
+  // only 7 of the 12 requested sizes were actually rendered — the exact class of
+  // false-completion bug this module exists to catch, just introduced by its own
+  // counting instead of the model's prose.
+  it('does not let one tool type pad another\'s count toward the total', () => {
+    const messages = [
+      assistantMessage([
+        ...Array.from({ length: 5 }, (_, i) => ({
+          name: 'create_html_file',
+          result: { success: true, s3_url: `https://s3.example.com/template-${i}.html` },
+        })),
+        ...Array.from({ length: 7 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/${i}.png` },
+        })),
+      ]),
+    ];
+    // NOT 12 (5 + 7) — only 7 of the primary per-size deliverable actually happened.
+    expect(extractProducedAssetCount(messages)).toBe(7);
   });
 
   it('counts generate_image successes too', () => {

@@ -452,14 +452,27 @@ function sinceLastStepBoundary(toolCalls: ExecutedToolCall[]): ExecutedToolCall[
   return toolCalls;
 }
 
-/** Total succeeded calls across every known asset-producing tool in the ledger. */
+/**
+ * The largest succeeded-call count among the known asset-producing tools in the
+ * ledger — NOT a sum across tool names. A step like "Render the Full Size Matrix"
+ * (requiredFunctionCalls: create_html_file + playwright_browser_take_screenshot)
+ * builds a FEW reusable HTML templates and takes MANY per-size screenshots from
+ * them; both tools are legitimately part of "this step's work", but they are not
+ * interchangeable units of the same deliverable. Summing them would let, e.g., 5
+ * create_html_file calls + 7 screenshots satisfy an expectedAssetCount of 12 while
+ * only 7 of the 12 requested sizes were actually rendered — the same
+ * "claimed count met by padding across unrelated calls" failure this module exists
+ * to catch, just introduced by ITS OWN counting instead of the model's prose. Max
+ * still correctly reports 12 when a step genuinely produces 12 of its primary
+ * deliverable, whichever single tool that turns out to be.
+ */
 function countProducedAssets(toolCalls: ExecutedToolCall[]): number {
   const counts = tallyExecutedActions(toolCalls);
-  let total = 0;
+  let max = 0;
   for (const [name, { ok }] of counts) {
-    if (ASSET_PRODUCING_TOOL_NAMES.has(name)) total += ok;
+    if (ASSET_PRODUCING_TOOL_NAMES.has(name)) max = Math.max(max, ok);
   }
-  return total;
+  return max;
 }
 
 /** Minimal shape of a persisted assistant message this reads — mirrors the
