@@ -1,3 +1,59 @@
+## ENG-1484: two correct instructions can still lose to each other (2026-08-23)
+
+ENG-1478 (same day) fixed the Work Plan Capabilities section to tell Emma to check
+`list_predefined_work_plans` on an unprompted goal statement. Live re-test after that fix deployed:
+"I'm interested in making some linkedin posts" *still* skipped the check and drafted 3 posts
+directly, despite a matching accessible plan ("Research Based Linkedin Founder Post") existing.
+
+Root cause: a separate "Page & Feature Tool Reference" table — framed for "a user refers to a page
+or feature by name" — has `"LinkedIn content", "LinkedIn posts", "LinkedIn page" →
+list_connected_account_posts, create_social_media_posts`, an unconditional keyword→tool arrow. Both
+this row and the Work Plan Capabilities paragraph are individually correct for what they're written
+to cover; neither one references the other, so a request that matches both keyword sets resolves
+to whichever pattern is more concrete and direct — the fixed-arrow table row, not the conditional
+paragraph. ENG-1478's fix never got a chance to run.
+
+Fix: added an explicit exception to that one row — a stated GOAL (not a literal "show me the page"
+request) defers to the Work Plan Capabilities check first. Scoped to the one row Harsha actually
+reproduced; the same table has ~15 other keyword→tool rows with the identical latent shape (a goal
+statement could plausibly match any of them before ever reaching a relevant work-plan check), but
+fixing all of them blind, with no reproduced case for the others, risks unintended behavior change
+across many more real flows than this PR can verify. Flagged as a known follow-up, not fixed here.
+
+## ENG-1478: a prompt can describe a branch correctly and still never enter it (2026-08-22)
+
+ENG-1472 added `recommend_predefined_work_plan` (an inline, soft-accept proposal card) and the
+system prompt's "Work Plan Capabilities" section already told Emma which tool to call once a
+goal-matching template was known: *"states a concrete current goal that clearly matches exactly one
+template from list_predefined_work_plans, call recommend_predefined_work_plan..."* That sentence
+reads as complete — it names the trigger, the tool, and the guardrails (ask-if-ambiguous, don't
+re-recommend). It is not: it silently assumes the plan list is already sitting in context.
+
+Live-reproduced (Harsha, 2026-08-22): a fresh chat, "I'm interested in making some linkedin posts",
+with a plan literally named `Research_Based_Linkedin_Founder_Post` accessible to the account —
+no recommendation. The prompt has one line just below this section stating the *active* work
+plan's status "is automatically provided in your context." Nothing says the same about the
+*available templates* — because it isn't true; `list_predefined_work_plans` is a tool call, not
+injected context. The branching instruction was written as if discovering a match were free. For
+an ordinary conversational turn where the user never mentioned work plans, calling an extra
+"informational" tool is exactly the kind of speculative call a model will skip unless told to make
+it — and nothing here told it to.
+
+Fix: added one explicit sentence — check for a match before replying; if `list_predefined_work_plans`
+hasn't already been called this session, call it now, even though the user never asked about work
+plans — plus a line stating outright that templates are not auto-injected the way active-plan status
+is. The rest of the branch (single-match → recommend, ambiguous → one clarifying question, no
+re-recommend) was already correct and is unchanged.
+
+Verification is the same convention every other `agentModeSystemPrompt.*` section uses: string
+assertions against the compiled `AGENT_MODE_SYSTEM_PROMPT` constant
+(`agentModeSystemPrompt.workPlanRecommendation.test.ts`) — this repo has 14 sibling files doing
+exactly this for other guardrails (menu selection, capability denial, lead-import resume, etc.), so
+prompt content here is treated as tested code, not prose. A live multi-turn transcript check (does
+the model actually call the tool now) is the residual proof this test shape can't give — flagged in
+the PR as the one thing NOT covered by a unit assertion, same as it is for every other guardrail in
+this file.
+
 ## ENG-1371: deleting a retired gate is easy; the things quietly leaning on it are not (2026-08-19)
 
 Greptile was dropped as a vendor. Its app had already stopped posting — the `Greptile Review`
@@ -7359,3 +7415,112 @@ Both reported lists need **CRM cleanup, not code** — delete or rename the orph
 `md99qvwnk`, and reconcile the Emma Partner Network page record onto the list its form
 actually writes to (or delete the duplicate, as `LANDERS.md` already says). Both are
 production data mutations behind the same data-plane gate.
+
+## ENG-1490 — recommend_predefined_work_plan lost to the "produce drafts without asking" policy (2026-08-23)
+
+Live DynamoDB trace (production `sessionId b71af8c0-afab-4cff-8417-d5148b05d286`) proved Emma calls
+`list_predefined_work_plans`, searches the result across three turns, finds a genuine match, and
+still calls `create_social_media_posts` directly — `recommend_predefined_work_plan` never fires.
+This is NOT a tool-batching race (the list result WAS seen before drafting); it's a prompt conflict.
+
+Root cause: two CRITICAL, apply-to-every-request policies sit much earlier in
+`agentModeSystemPrompt.ts` than the Work Plan Capabilities section (line 488, ~55% through the
+889-line file) and both tell the model to skip confirmation and just produce the deliverable:
+
+- "Decision Framework" (line 70): CLARIFY → CHECK skills → INSTALL → EXECUTE ("use your tools to
+  complete the request"). Never references the work-plan check at all.
+- "When to Ask Questions" (line 122): explicitly names "producing a draft" as exempt from
+  confirmation, and confirmation is required only for spend/publish/irreversible actions.
+
+Fix (this PR): four targeted edits making the recommendation an explicit substitute for drafting,
+not an extra step alongside it — (1) wired the work-plan check into the Decision Framework's
+EXECUTE step, (2) added a named carve-out in "When to Ask Questions" so a matching-plan proposal is
+not treated as a banned "should I proceed?" pause, (3) strengthened the Work Plan Capabilities
+paragraph to state the recommendation replaces drafting, (4) reworded the LinkedIn reference-table
+row from "before drafting" (sequencing) to "instead of ... in this same turn" (substitution). None
+of the spend/publish/irreversible exemption categories were touched.
+
+Verified via dev-environment before/after transcripts (not a single click-through) across 3
+phrasings against a freshly launched test-env: a clear LinkedIn-goal match now calls
+`recommend_predefined_work_plan` and does NOT also draft; a goal with no matching plan in the
+catalog (Google reviews) answers directly with no spurious recommendation; an ad-hoc draft request
+unrelated to any plan (birthday post) still drafts immediately with no pause. Full transcripts in
+the ENG-1490 PR description.
+
+**Known residual risk, not fixed here**: the agent loop's tool-calling is OpenAI-style batched
+(`agentModeService.ts` `responseMessage.tool_calls` can contain N calls executed concurrently via
+`Promise.all` in `toolDispatch.ts` before the next LLM turn) — nothing at the code level prevents a
+future phrasing from batching `list_predefined_work_plans` together with a drafting tool in one
+turn, which would reintroduce this failure mode even with the reworded prompt. The fix here is
+prompt-level only; a code-level sequencing guard (e.g. forcing `recommend_predefined_work_plan`
+decisions to complete before drafting tools are eligible in the same turn) is a larger change and
+was explicitly out of scope for this PR.
+
+**Also not fixed here**: ENG-1484's dev.md note flagged ~15 other "Page & Feature Tool Reference"
+rows with the same latent goal-vs-feature ambiguity as the LinkedIn row. This PR only reworded the
+LinkedIn row's own exception clause (already added in ENG-1484); it did not re-audit those other
+rows for the "before" vs "instead of" framing gap. Flagged for a follow-up, not reproduced per-row.
+
+## ENG-1490 follow-up — audited the other 18 "Page & Feature Tool Reference" rows (2026-08-23)
+
+Full audit of every non-LinkedIn row against the same goal-vs-feature-reference ambiguity, using a
+selection criterion (a row is a candidate only if its primary arrow-target tool CREATES/DRAFTS new
+content or LAUNCHES a new campaign — a "producing a draft"-shaped action per the "When to Ask
+Questions" exemption language, not a read-only/view/list/report row) and a live DynamoDB scan of
+`AW-WorkPlans` for real catalog evidence. Verified via an 8-agent adversarial workflow (7 patches +
+1 independent re-derivation of the "not a candidate" list) before applying — every proposed patch
+came back APPROVE with no edits, exact-text matches confirmed against `origin/main`, zero pinned-test
+collisions found.
+
+**Patched (7 rows), same substitution-framed exception as the LinkedIn row**: paid social/ads
+(strongest catalog evidence — 7+ real ad-campaign plans), landing pages (own trigger keywords already
+include goal phrasing "create/build a landing page"; 3 real matching plans), research/reports/deep
+research (4 real report plans), blog (real "AEO Article Engine" plan, structurally identical to the
+already-production-verified LinkedIn fix), images, videos, and newsletter (last 3 on catalog-agnostic
+reasoning — no exact-title plan confirmed today, but the mechanism no-ops harmlessly when
+`list_predefined_work_plans` returns no match, confirmed live via the "Google reviews" negative-result
+transcript in the original ENG-1490 PR, and the underlying instruction-precedence bug — a specific
+keyword row beating the generic Work Plan Capabilities paragraph — exists independent of today's
+catalog contents).
+
+**Examined and deliberately NOT patched — different bug shape**:
+- **GTM plan row** (`list_gtm_plans`/`read_gtm_plan`) — this row's own tools are read-only; the real
+  gap is that `create_gtm_plan` lives in a separate "GTM Plan Capabilities" section never referenced
+  by this row at all. That's a documentation/cross-reference gap, not the same specific-row-beats-
+  generic-instruction conflict (there's no creation tool on this row to lose the race in the first
+  place). Left as a distinct finding for a possible separate issue, not fixed here.
+- **Tasks/automations row** (`create_task_from_template`) — genuinely creation-capable, but it's
+  already a DIFFERENT templating system (AgentWeb's browser-automation Task Templates, unrelated to
+  predefined Work Plans). Forcing the same exception here would create ambiguity between two
+  competing guided-path systems rather than resolve one. Left unpatched.
+
+**Confirmed correctly excluded (read-only/navigational, no creation tool on the row)**: SEO/GEO, CRM/
+leads, general social-posts view, brand guidelines, website scan (diagnostic on an existing site, not
+a deliverable), market strategy, knowledge base, templates (its own creation tool lives under the
+separate newsletter row instead), books/ebook (row's own tools are read-only despite the word "ebook"
+— possibly a separately stale/incomplete row, different bug class, not investigated further here).
+Google Drive has genuine write tools (`create_folder`, `create_google_doc`) but its trigger phrases
+name a storage location, not a content-creation goal a user would naturally state ("I want to make a
+Google Drive" isn't a real request shape) — excluded on that basis, flagged as the one worth
+rechecking first if this audit's premise is ever found wrong.
+
+New regression test: `agentModeSystemPrompt.goalVsFeatureRowAudit.test.ts` pins all 7 rows' exception
+wording (substitution framing only, never the "before drafting" sequencing that lost to other prompt
+policies in the original bug), confirms the ads spend-confirmation and video CREATE-vs-ANALYZE
+distinctions are preserved, and confirms the excluded read-only rows got no exception added.
+
+**Dev-transcript verification (fresh test-env, real LLM calls, not a click-through)**: ran a
+representative sample of 3 of the 7 patched rows plus a negative control against a freshly launched
+dev environment.
+
+| Phrasing | Tool trace | recommend called? | primary creation tool called? |
+|---|---|---|---|
+| "I want a landing page for my new product launch" | list→search×3→**recommend_predefined_work_plan** | true | `generate_landing_page`: false |
+| "I want to write a blog post about our new feature" | list→read_brand_guidelines→read_market_strategy→search×5→read×7→**recommend_predefined_work_plan** | true | `create_blog_article`: false |
+| "help me launch a Meta ad campaign" | list→search×3→read×5→**recommend_predefined_work_plan** | true | `list_meta_ads_campaigns`: false |
+| "can you write me a haiku about coffee" (negative control) | (no tool calls) | false | n/a |
+
+All three positive cases: Emma checked the plan catalog and proposed a matching plan instead of
+proceeding with the row's primary tool, in the same shape already verified in production for the
+LinkedIn row. Negative control: no spurious recommendation, no spurious tool calls, answered
+directly. Full transcripts in the ENG-1490 follow-up PR.

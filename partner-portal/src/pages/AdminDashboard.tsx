@@ -8453,6 +8453,8 @@ const AgentModeSettings = () => {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [sidebarAddendum, setSidebarAddendum] = useState('');
   const [welcomeMessage, setWelcomeMessage] = useState('');
+  const [newChatNamedTemplate, setNewChatNamedTemplate] = useState("Hey {firstName}! Let's get after it");
+  const [newChatAnonymousText, setNewChatAnonymousText] = useState("Hey! Let's get after it");
   const [, setConversationStarters] = useState<string[]>([]);
   const [conversationStartersText, setConversationStartersText] = useState('');
   const [defaultModel, setDefaultModel] = useState('gpt-5-chat-2');
@@ -8462,6 +8464,7 @@ const AgentModeSettings = () => {
   const [savingDefaultModel, setSavingDefaultModel] = useState(false);
   const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
   const [savingWelcomeMessage, setSavingWelcomeMessage] = useState(false);
+  const [savingNewChatHeroGreeting, setSavingNewChatHeroGreeting] = useState(false);
   const [savingConversationStarters, setSavingConversationStarters] = useState(false);
   const [savingContentModel, setSavingContentModel] = useState(false);
   const [scheduledChatsDefaultModel, setScheduledChatsDefaultModel] = useState('');
@@ -8508,6 +8511,7 @@ const AgentModeSettings = () => {
 
       // Load welcome message
       await loadWelcomeMessage();
+      await loadNewChatHeroGreeting();
 
       // Load conversation starters
       await loadConversationStarters();
@@ -8653,6 +8657,20 @@ const AgentModeSettings = () => {
     } catch (error) {
       console.error('Error loading welcome message:', error);
       throw error;
+    }
+  };
+
+  const loadNewChatHeroGreeting = async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/agent-mode/new-chat-hero-greeting'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (typeof response.data?.namedTemplate === 'string' && typeof response.data?.anonymousText === 'string') {
+        setNewChatNamedTemplate(response.data.namedTemplate);
+        setNewChatAnonymousText(response.data.anonymousText);
+      }
+    } catch (loadError) {
+      console.error('Error loading New Chat hero greeting:', loadError);
     }
   };
 
@@ -9321,6 +9339,45 @@ const AgentModeSettings = () => {
       setError('Failed to save welcome message');
     } finally {
       setSavingWelcomeMessage(false);
+    }
+  };
+
+  const saveNewChatHeroGreeting = async () => {
+    try {
+      setSavingNewChatHeroGreeting(true);
+      setError('');
+      setSuccess('');
+      const response = await axios.put(buildApiUrl('/api/agent-mode/new-chat-hero-greeting'), {
+        namedTemplate: newChatNamedTemplate,
+        anonymousText: newChatAnonymousText,
+      }, { headers: { Authorization: `Bearer ${token}` } });
+      setNewChatNamedTemplate(response.data.namedTemplate);
+      setNewChatAnonymousText(response.data.anonymousText);
+      setSuccess('New Chat greeting updated successfully!');
+    } catch (saveError: any) {
+      console.error('Error saving New Chat hero greeting:', saveError);
+      setError(saveError.response?.data?.error || 'Failed to save New Chat greeting');
+    } finally {
+      setSavingNewChatHeroGreeting(false);
+    }
+  };
+
+  const resetNewChatHeroGreeting = async () => {
+    try {
+      setSavingNewChatHeroGreeting(true);
+      setError('');
+      setSuccess('');
+      const response = await axios.delete(buildApiUrl('/api/agent-mode/new-chat-hero-greeting'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setNewChatNamedTemplate(response.data.namedTemplate);
+      setNewChatAnonymousText(response.data.anonymousText);
+      setSuccess('Reset New Chat greeting to default.');
+    } catch (resetError) {
+      console.error('Error resetting New Chat hero greeting:', resetError);
+      setError('Failed to reset New Chat greeting');
+    } finally {
+      setSavingNewChatHeroGreeting(false);
     }
   };
 
@@ -10216,6 +10273,56 @@ const AgentModeSettings = () => {
             variant="outlined"
             sx={{ fontFamily: 'monospace', '& .MuiInputBase-input': { color: 'text.secondary' } }}
           />
+        </CardContent>
+      </Card>
+
+      {/* New Chat hero greeting — presentation only, never injected into Emma's prompt. */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Box>
+              <Typography variant="h6">New Chat greeting</Typography>
+              <Typography variant="body2" color="text.secondary">
+                The short greeting beside Emma's onboarding head. It is not chat context or a workplan message.
+              </Typography>
+            </Box>
+            <Box>
+              <Button variant="outlined" onClick={resetNewChatHeroGreeting} disabled={savingNewChatHeroGreeting} sx={{ mr: 1 }}>
+                Reset to Default
+              </Button>
+              <Button variant="contained" onClick={saveNewChatHeroGreeting} disabled={savingNewChatHeroGreeting}>
+                {savingNewChatHeroGreeting ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+          <TextField
+            fullWidth
+            label="Named greeting"
+            value={newChatNamedTemplate}
+            onChange={(event) => setNewChatNamedTemplate(event.target.value)}
+            helperText={`${newChatNamedTemplate.length}/120 characters. Use {firstName} exactly once. Example: Hey {firstName}! Let's get after it`}
+            inputProps={{ maxLength: 120 }}
+            sx={{ mb: 2 }}
+          />
+          <TextField
+            fullWidth
+            label="Anonymous greeting"
+            value={newChatAnonymousText}
+            onChange={(event) => setNewChatAnonymousText(event.target.value)}
+            helperText={`${newChatAnonymousText.length}/120 characters. Shown when the account has no explicit display name. Plain text only.`}
+            inputProps={{ maxLength: 120 }}
+          />
+          <Box mt={2} p={2} sx={{ bgcolor: 'action.hover', borderRadius: 1 }}>
+            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>
+              Preview
+            </Typography>
+            <Typography variant="body2" data-testid="new-chat-greeting-named-preview">
+              Named (e.g. Harsha): {newChatNamedTemplate.split('{firstName}').join('Harsha')}
+            </Typography>
+            <Typography variant="body2" data-testid="new-chat-greeting-anonymous-preview">
+              Anonymous: {newChatAnonymousText}
+            </Typography>
+          </Box>
         </CardContent>
       </Card>
 

@@ -12,6 +12,14 @@
  * read object-shaped errors and a status/reason fallback before giving up.
  */
 
+/** Preserves a structured, intentional tool refusal at the telemetry boundary. */
+export class ToolResultPolicyBlockedError extends Error {
+  constructor(message: string, readonly reason: string) {
+    super(message);
+    this.name = 'ToolResultPolicyBlockedError';
+  }
+}
+
 /**
  * Pull the most specific human-readable reason out of a (failed) tool result.
  * Returns '' only when the result genuinely carries no reason.
@@ -70,11 +78,23 @@ export function toolResultError(result: unknown): Error | null {
   if (!result || typeof result !== 'object') return null;
   const obj = result as Record<string, any>;
 
+  const policyBlock = () => {
+    if (obj.blocked !== true || typeof obj.reason !== 'string' || !obj.reason.trim()) return null;
+    return new ToolResultPolicyBlockedError(
+      extractToolResultMessage(obj) || `Tool was blocked by policy: ${obj.reason}`,
+      obj.reason,
+    );
+  };
+
   if (obj.isError === true) {
+    const blocked = policyBlock();
+    if (blocked) return blocked;
     return new Error(extractToolResultMessage(obj) || 'Tool returned isError=true');
   }
 
   if (obj.success === false) {
+    const blocked = policyBlock();
+    if (blocked) return blocked;
     return new Error(extractToolResultMessage(obj) || 'Tool returned success=false');
   }
 
