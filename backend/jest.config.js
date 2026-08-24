@@ -84,12 +84,11 @@ module.exports = {
     '!src/types/**',
     '!src/scripts/**',
   ],
-  // ENG-1376: no `coverageThreshold` here on purpose. Coverage is now collected
-  // by BOTH backend jobs and merged before it is judged (see the
-  // backend-coverage job in .github/workflows/tests.yml), so a per-job jest
-  // threshold would fail each job against a fraction of the evidence. The
-  // single enforcement point is backend/coverage-thresholds.json, applied once
-  // by scripts/coverage-report.mjs. Previously there were two mechanisms and
-  // this one was dead: CI passed `--coverageThreshold='{}'` to disable it and
-  // re-implemented the same 95% bar in a github-script step.
+  // No `coverageThreshold` here on purpose, and nothing enforces one elsewhere
+  // either. ENG-1376 made the merged-shard result the single enforcement point;
+  // ENG-1463 then removed coverage from CI altogether ("does not run routine
+  // product suites, enforce coverage, or deploy staging" — CLAUDE.md), taking
+  // that mechanism with it. `collectCoverageFrom` above is kept because it is
+  // what makes a local `npm run test:coverage` measure the whole backend rather
+  // than one directory; it is a local diagnostic now, not a gate.
 };
