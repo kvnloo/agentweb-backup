@@ -4643,33 +4643,39 @@ export async function generateChatResponse(
       throw new Error("Chat session not found");
     }
 
+    // ENG-1222: resolve skill/admin tool access ONCE, through agent-mode's own
+    // buildSkillContext, shared below by both the system prompt (skill
+    // systemPrompt injection) and tool binding — this is the single source of
+    // truth for "which tools + skill-context text does this session get",
+    // replacing two independently hand-rolled, silently-drifting copies of the
+    // same policy. Also picks up subscription-tier skill gating and
+    // __other_skills__ support that this path never had.
+    const sessionHasInstalledSkills = Array.isArray(session.associatedSkills) && session.associatedSkills.length > 0;
+    const sessionSkillIds = Array.isArray(session.associatedSkills) ? session.associatedSkills : [];
+    const skillToolGateOpen = portalType === 'customer' || (portalType as string) === 'emma-sidebar' || !!isDelegatedAdmin || sessionHasInstalledSkills;
+    const agentModeService = new AgentModeService();
+    let skillContext: { allowedToolNames: Set<string>; installedSkillContextMsg: string } = { allowedToolNames: new Set<string>(), installedSkillContextMsg: '' };
+    if (skillToolGateOpen) {
+      try {
+        await agentModeService.initialize();
+        const { skillService } = await import('./skillService');
+        const { getAllowedSkills } = await import('./subscriptionService');
+        const [associatedSkills, publishedSkills, userAllowedSkillIds] = await Promise.all([
+          sessionSkillIds.length > 0 ? skillService.getSkillsByIds(sessionSkillIds) : Promise.resolve([]),
+          skillService.getPublishedSkills(),
+          getAllowedSkills(userId!),
+        ]);
+        skillContext = agentModeService.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionSkillIds, !!isDelegatedAdmin);
+      } catch (skillContextErr) {
+        console.error('[generateChatResponse] Error resolving skill/tool context:', skillContextErr);
+      }
+    }
+
     // Get messages for OpenAI
     // Always inject the current system prompt fresh (ignoring the stale stored version)
     // so that DynamoDB overrides and prompt updates take effect immediately for all sessions.
     const freshSystemPrompt = portalType === "customer" ? getEmmaSystemContext(session.sessionType, orgRole) : null;
-
-    // ENG-1222: agent-mode's own pipeline (buildSkillContext) always injects each
-    // installed skill's own systemPrompt; this path never did, so a skill session
-    // reached here got tools bound (after 96641ba84) but none of the skill's own
-    // workflow/guardrail instructions — flying on the user's raw prompt text alone.
-    let skillSystemPrompt: string | null = null;
-    const sessionSkillIdsForPrompt = Array.isArray(session.associatedSkills) ? session.associatedSkills : [];
-    if (sessionSkillIdsForPrompt.length > 0) {
-      try {
-        const { skillService } = await import('./skillService');
-        const publishedSkills = await skillService.getPublishedSkills();
-        const activeSkillPrompts = sessionSkillIdsForPrompt
-          .map((id: string) => publishedSkills.find((s) => s.skillId === id)?.systemPrompt)
-          .filter((p): p is string => !!p);
-        if (activeSkillPrompts.length > 0) {
-          skillSystemPrompt = activeSkillPrompts.join('\n\n');
-        }
-      } catch (skillPromptErr) {
-        console.error('[generateChatResponse] Error loading skill system prompts:', skillPromptErr);
-      }
-    }
-
-    const combinedSystemPrompt = [freshSystemPrompt, skillSystemPrompt].filter(Boolean).join('\n\n') || null;
+    const combinedSystemPrompt = [freshSystemPrompt, skillContext.installedSkillContextMsg || null].filter(Boolean).join('\n\n') || null;
     const messages = [...session.messages];
     if (combinedSystemPrompt) {
       const firstSystemIdx = messages.findIndex((m) => m.role === "system");
@@ -4811,35 +4817,15 @@ export async function generateChatResponse(
     }
 
     // Initialize tool support for Emma (customer portal, or admin users on any portal)
-    const agentModeService = new AgentModeService();
     let toolDefinitions: any[] = [];
 
-    // ENG-1222: a session with skills installed (session.associatedSkills) expects
-    // its skill tools to be callable no matter which portalType the request landed
-    // under — e.g. the partner-portal's global chat widget sends messages via
-    // socket.emit('message') with no `portal` field, which the server defaults to
-    // 'partner'. Gating tool loading on portalType/isDelegatedAdmin alone silently
-    // dropped `tools` from the LLM call for those sessions, and the model then
-    // denied having the capability or fabricated a result instead of calling it.
-    const sessionHasInstalledSkills = Array.isArray(session.associatedSkills) && session.associatedSkills.length > 0;
-
-    if (portalType === 'customer' || (portalType as string) === 'emma-sidebar' || isDelegatedAdmin || sessionHasInstalledSkills) {
+    if (skillToolGateOpen) {
       try {
-        // Initialize AgentModeService to access tool registry and executeTool
-        await agentModeService.initialize();
-
-        // Base tools: foundation tools (always available in agent mode) + Emma-specific extras
+        // Base tools: agent-mode's resolved skill/admin/foundation tool names
+        // (computed once above, shared with the system prompt) + Emma-specific extras.
         // Only include customer-specific tools when on the customer portal or emma-sidebar
         const isCustomerContext = (portalType as string) === 'customer' || (portalType as string) === 'emma-sidebar';
-        // ENG-1222: agent-mode's own pipeline force-unions FOUNDATION_TOOLS onto every
-        // skill regardless of subscription/session state (a skill never needs to
-        // redeclare them), so a skill session reached here must get the same parity —
-        // otherwise a skill that (correctly) omits a foundation tool from its own
-        // toolNames silently loses that tool the moment it's routed through this path
-        // instead of agent-mode's real one.
-        const toolsToInclude = new Set<string>(isCustomerContext || sessionHasInstalledSkills ? [
-          ...AgentModeService.FOUNDATION_TOOLS,
-        ] : []);
+        const toolsToInclude = new Set<string>(skillContext.allowedToolNames);
         if (isCustomerContext) {
           [
             'read_page_source',
@@ -4883,12 +4869,6 @@ export async function generateChatResponse(
           }
         }
 
-        // Add admin tools when user is admin (direct or delegated)
-        if (isDelegatedAdmin) {
-          const adminToolNames = agentModeService.getAdminToolNames();
-          adminToolNames.forEach(t => toolsToInclude.add(t));
-        }
-
         if (!emmaToolsLoaded) {
           await import('../emma/tools');
           await import('../emma/tempEmailTools');
@@ -4898,46 +4878,6 @@ export async function generateChatResponse(
         }
         const { mcpToolRegistry } = await import('../mcp/server/registry');
         const { emmaToolRegistry } = await import('../emma/registry');
-
-        // Expand the tool set with any skills installed on this session
-        // (session.associatedSkills). Without this, skills installed via Emma's
-        // install_skills tool — or auto-installed when a work plan template is
-        // launched (launch_predefined_work_plan) — would have no effect on Emma's tool list,
-        // so the plan's required tools would never become available. This mirrors
-        // Agent Mode, which resolves a session's installed skills into tool names.
-        const sessionSkillIds = Array.isArray(session.associatedSkills) ? session.associatedSkills : [];
-        if (sessionSkillIds.length > 0) {
-          try {
-            const { resolveSkillsToToolNames } = await import('./subscriptionService');
-            const skillToolNames = await resolveSkillsToToolNames(sessionSkillIds);
-            // ENG-1222: resolveSkillsToToolNames returns ['*'] both when the
-            // caller explicitly asked for wildcard access (sessionSkillIds
-            // itself contains '*') AND when it hit an internal error and
-            // silently failed open — the two are indistinguishable from the
-            // return value alone (subscriptionService.ts's own catch is shared
-            // with other callers that have their own, separately-reasoned
-            // fail-open intent, so it isn't this call site's to change). Only
-            // honor the wildcard when this session's own associatedSkills
-            // actually requested it; otherwise treat it as a resolution
-            // failure rather than expanding to every registered tool — the
-            // hard gate below still catches a genuinely empty result.
-            const explicitWildcard = sessionSkillIds.includes('*');
-            if (skillToolNames.includes('*') && explicitWildcard) {
-              // Wildcard: every registered Emma/MCP tool becomes available.
-              emmaToolRegistry.getToolNames().forEach(t => toolsToInclude.add(t));
-              mcpToolRegistry.getToolNames().forEach(t => toolsToInclude.add(t));
-            } else if (!skillToolNames.includes('*')) {
-              skillToolNames.forEach(t => toolsToInclude.add(t));
-            } else {
-              console.error('[generateChatResponse] ENG-1222: resolveSkillsToToolNames returned a wildcard for a non-wildcard session — treating as a resolution failure, not expanding to every tool', {
-                sessionId,
-                sessionSkillIds,
-              });
-            }
-          } catch (skillErr) {
-            console.error('[generateChatResponse] Error resolving session skills to tools:', skillErr);
-          }
-        }
 
         // Expand the tool set with the active work plan's required function calls.
         // Predefined templates declare the tools each step needs via
