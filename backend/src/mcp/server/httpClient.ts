@@ -4,6 +4,7 @@
  */
 
 import jwt from 'jsonwebtoken';
+import { randomUUID } from 'node:crypto';
 import { getJwtSecret } from '../../config/jwt';
 import { Agent, setGlobalDispatcher } from 'undici';
 import { SCHEDULED_SESSION_HEADER } from '../../utils/scheduledPublishConsentGuard';
@@ -82,6 +83,46 @@ function getBaseUrl(): string {
   return `http://localhost:${port}`;
 }
 
+// ─── Network-error retry ────────────────────────────────────────────────────
+//
+// A self-call that fails before it ever reaches the route (connection refused/reset,
+// DNS lookup failure, etc. — e.g. because the backend process was mid-restart) makes
+// Node's fetch throw `TypeError: fetch failed`, which used to propagate to the LLM
+// verbatim via mcpServerCore's `Error: ${error.message}` with no endpoint, no cause,
+// and no retry (ENG-1189: manage_scheduled_chat failed 3 times this way in one session,
+// each time surfacing only the bare string "fetch failed"). A genuine request timeout
+// aborts with a distinct `AbortError`, not this TypeError, so retrying only this case
+// cannot mask a real timeout.
+const SELF_CALL_MAX_ATTEMPTS = 3;
+const SELF_CALL_RETRY_BASE_DELAY_MS = 200;
+
+function isTransientNetworkError(error: unknown): boolean {
+  return error instanceof TypeError && error.message === 'fetch failed';
+}
+
+async function fetchSelfCallWithRetry(url: string, fetchOptions: RequestInit, method: string, path: string): Promise<Response> {
+  const correlationId = randomUUID();
+  for (let attempt = 1; attempt <= SELF_CALL_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await fetch(url, fetchOptions);
+    } catch (error) {
+      const cause: any = (error as any)?.cause;
+      const detail = cause ? `${cause.code ? `${cause.code}: ` : ''}${cause.message || cause}` : (error as Error).message;
+
+      if (!isTransientNetworkError(error) || attempt >= SELF_CALL_MAX_ATTEMPTS) {
+        console.error(`[MCP self-call ${correlationId}] ${method} ${path} failed after ${attempt} attempt(s): ${detail}`);
+        throw new Error(`MCP self-call ${method} ${path} failed after ${attempt} attempt(s) [correlationId=${correlationId}]: ${detail}`);
+      }
+
+      const backoffMs = SELF_CALL_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+      console.warn(`[MCP self-call ${correlationId}] ${method} ${path} network error on attempt ${attempt}/${SELF_CALL_MAX_ATTEMPTS}, retrying in ${backoffMs}ms: ${detail}`);
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+    }
+  }
+  /* istanbul ignore next — loop always returns or throws */
+  throw new Error(`MCP self-call ${method} ${path} failed: exhausted retries`);
+}
+
 export async function mcpFetch(options: McpFetchOptions): Promise<any> {
   const { method, path, context, body, queryParams } = options;
 
@@ -135,7 +176,7 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
 
   let response: Response;
   try {
-    response = await fetch(url, fetchOptions);
+    response = await fetchSelfCallWithRetry(url, fetchOptions, method, path);
   } finally {
     clearTimeout(timeoutId);
   }
