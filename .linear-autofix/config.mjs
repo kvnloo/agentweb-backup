@@ -459,7 +459,7 @@ export const config = {
                                      // turn (the reason /compact felt like a no-op). Reversible A/B knob.
     full: {
       model: 'sonnet',
-      maxTurns: 100,
+      maxTurns: 150,                  // per-turn agent-loop cap; the 30-min timeout below is the co-limit
       timeoutMs: 30 * 60 * 1000,     // mirrors revise — a full-access turn is an interactive revise
     },
     readOnly: {
