@@ -1235,6 +1235,70 @@ export async function getSlackUserEmail(slackUserId: string): Promise<string | n
   return null;
 }
 
+// Cache team_id lookups for the lifetime of the process — mirrors displayNameCache above; a
+// user's home team never changes.
+const teamIdCache = new Map<string, Promise<string | null>>();
+
+/**
+ * Get a Slack user's home team_id (ENG-1263). Unlike profile.email, this does not require the
+ * users:read.email scope, and it is present on any users.info response that resolves at all —
+ * including a cross-workspace (Slack Connect) profile whose email specifically fails to resolve.
+ * Used as a positive "is this our own workspace" signal that doesn't depend on email resolution
+ * succeeding: an internal author's team_id equals our own workspace's team_id (getOwnSlackTeamId)
+ * even when their profile email is unreadable for whatever reason.
+ */
+export async function getSlackUserTeamId(slackUserId: string): Promise<string | null> {
+  if (!slackClient) {
+    return null;
+  }
+
+  const cached = teamIdCache.get(slackUserId);
+  if (cached) return cached;
+
+  const promise = (async () => {
+    try {
+      const result = await slackClient!.users.info({ user: slackUserId });
+      if (result.ok && result.user) {
+        return (result.user as any).team_id || null;
+      }
+    } catch (error) {
+      console.error(`Failed to get Slack user team_id for ${slackUserId}:`, error);
+    }
+    return null;
+  })();
+
+  teamIdCache.set(slackUserId, promise);
+  return promise;
+}
+
+// Our own workspace's team_id, resolved once via auth.test (no extra OAuth scope beyond a valid
+// token) and cached for the process lifetime — it cannot change without a full app reinstall.
+let ownTeamIdPromise: Promise<string | null> | null = null;
+
+/**
+ * Get the AgentWeb Slack app's own workspace team_id (ENG-1263), for comparison against
+ * getSlackUserTeamId() to positively identify our own team members.
+ */
+export async function getOwnSlackTeamId(): Promise<string | null> {
+  if (!slackClient) {
+    return null;
+  }
+
+  if (!ownTeamIdPromise) {
+    ownTeamIdPromise = (async () => {
+      try {
+        const result = await slackClient!.auth.test();
+        return (result as any).team_id || null;
+      } catch (error) {
+        console.error('Failed to resolve the AgentWeb Slack workspace team_id:', error);
+        return null;
+      }
+    })();
+  }
+
+  return ownTeamIdPromise;
+}
+
 /**
  * Post a temporary "thinking" message to a Slack thread
  * Returns the message timestamp so it can be updated/deleted later
