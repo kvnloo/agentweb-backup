@@ -1,936 +1,262 @@
-name: Tests
+name: Build
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
+# Product test suites run on Atem only when they protect a retained invariant or
+# a reproduced regression. GitHub Actions proves buildability and CI/deploy
+# control integrity; production deployment proves the runtime path.
 permissions:
   contents: read
   checks: read
-  # The coverage comment in `backend-coverage` (ENG-1376; it lived in
-  # `backend-tests-b` until that job stopped judging coverage on its own) reads
-  # and writes a PR comment, which is served by the issues comments endpoint.
-  issues: read
-  pull-requests: write
-  # ENG-1371: `id-token: write` removed. It was never used — no step in this
-  # file requests an OIDC token; `Configure AWS credentials` below authenticates
-  # with static `secrets.AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, not
-  # `role-to-assume`. Restore it if a job ever moves to OIDC federation.
-
-env:
-  AWS_REGION: 'us-west-2'
+  pull-requests: read
 
 jobs:
   detect-changes:
     name: Detect changed projects
-    # ENG-1277: draft-gated. This job ran unconditionally on every push
-    # including drafts — 446 of 1,489 Tests runs in Aug 2026 were draft-time
-    # and bought nothing (the heavy jobs it feeds were already skipping on
-    # draft; this stops paying the ~1 billed minute to compute filters nothing
-    # downstream will use). `ready_for_review` already re-triggers a full run,
-    # so no evidence is lost — merge-evidence.sh already treats an all-skipped
-    # draft-time run as NO_EVIDENCE, not a pass.
     if: github.event.pull_request.draft == false
-    # ENG-1277: 1 vCPU ubuntu-slim ($0.002/min vs ubuntu-latest's $0.006). This
-    # job is a ~15-25s paths-filter read via the REST API — no docker, no build.
     runs-on: ubuntu-slim
-    # Per-PR concurrency: a newer commit on the same PR cancels this superseded
-    # test job. Group is unique per job so jobs within one run never serialize
-    # against each other. The deploy job is deliberately excluded (own lane) so
-    # an in-flight staging deploy is never interrupted.
-    #
-    # ENG-1277: the draft flag is now part of every per-job group name in this
-    # file (except backend-staging-deploy's deliberate global lane). Incident:
-    # PR #2360 — a push, `gh pr ready`, and auto-merge landed within 5s; the
-    # per-ref cancel-in-progress group (previously keyed only on ref, with no
-    # draft distinction) cancelled the ready_for_review run, and the surviving
-    # synchronize run's payload still read draft:true — every gated job
-    # skipped, the run reported success, and GitHub counted the skipped
-    # required checks as passing. An untested change merged. With the draft
-    # flag in the group name, a still-draft run and a ready run on the same
-    # ref can never occupy the same group and so can never cancel each other.
-    # ENG-1371: explicit ceiling; without one a hung job burns GitHub's
-    # 360-minute default before anyone notices.
     timeout-minutes: 10
     concurrency:
-      group: ${{ github.workflow }}-detect-changes-${{ github.ref }}-${{ github.event.pull_request.draft }}
+      group: ${{ github.workflow }}-detect-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       partner: ${{ steps.filter.outputs.partner }}
       workflows: ${{ steps.filter.outputs.workflows }}
       ebconfig: ${{ steps.filter.outputs.ebconfig }}
-      # ENG-1041: "should this be tested" and "should this reach staging" are
-      # different questions and were one boolean. See the filter step below.
-      backend_deployable: ${{ steps.filter_deploy.outputs.backend_src == 'true' || steps.filter_deploy.outputs.deploy_ci == 'true' }}
+      relay: ${{ steps.filter.outputs.relay }}
+      remotion: ${{ steps.filter.outputs.remotion }}
     steps:
-      # ENG-729: shallow. This workflow only ever runs on `pull_request`, and on
-      # that event dorny/paths-filter reads the changed-file list from the
-      # GitHub REST API — "Uses GitHub REST API to fetch a list of modified
-      # files", needing only the `pull-requests: read` granted above. It runs
-      # git commands only for the push / merge_group / `base: HEAD` modes, none
-      # of which this workflow uses. So the full-history clone was never read by
-      # anything: the `Paths filter` step below measures 0s.
-      #
-      # It is not free, though. This job runs on every push to every PR, and
-      # `fetch-depth: 0` on a repo this size made its checkout the most
-      # expensive step in the run — 14s at best but 159s, 188s and 247s on
-      # sampled runs, against a steady 7-9s for the depth-1 checkouts elsewhere
-      # in this same file (`Backend tests (agentMode)`).
-      #
-      # The checkout could be dropped outright per those docs; a shallow one is
-      # kept so the workspace is still populated for anything added here later.
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
-
-      - name: Paths filter
-        id: filter
+          persist-credentials: false
+      - id: filter
         uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           filters: |
             backend:
               - 'backend/**'
-              # This workflow builds, tests and deploys the backend, and
-              # eb-deploy.sh is what decides whether that deploy really
-              # happened, so both are part of the backend deploy path. Without
-              # these two lines a change to `backend-staging-deploy` can never
-              # run on its own PR: the fix ships unexercised, and the first
-              # thing to exercise it is somebody else's backend PR. Whatever
-              # gates backend merges has to gate its own changes (ENG-743).
               - '.github/workflows/tests.yml'
               - '.github/scripts/eb-deploy.sh'
             partner:
               - 'partner-portal/**'
             workflows:
               - '.github/**'
-            # ENG-1039: the EB config-conflict job classifies only
-            # `.platform/*` and `.ebextensions/*.config` paths (see
-            # eb-config-conflict.sh), yet it ran on every PR — 397 runs /
-            # 480 min in 2026-08-01..10 with no path filter at all. Gate it on
-            # the only paths that can produce a hit, plus its own script and
-            # this workflow (whatever gates merges has to gate its own
-            # changes — ENG-743).
+            # ENG-1377: local-agent-relay and remotion-lambda had no CI of any
+            # kind — not dormant projects, 20 commits between them in the six
+            # months to 2026-08-21. Under ENG-1463 these get build checks, not
+            # a product test suite (see relay-build/remotion-build below).
+            # Included here for the ENG-743 reason: what gates a project's
+            # merges has to gate its own changes.
+            relay:
+              - 'local-agent-relay/**'
+              - '.github/workflows/tests.yml'
+            remotion:
+              - 'remotion-lambda/**'
+              - '.github/workflows/tests.yml'
             ebconfig:
               - '**/.ebextensions/**'
               - '**/.platform/**'
               - '.github/scripts/eb-config-conflict.sh'
               - '.github/workflows/tests.yml'
 
-      # ENG-1041: the DEPLOY decision, which is not the same question as the
-      # test decision above.
-      #
-      # `backend` answers "should this diff be tested" and is deliberately
-      # broad. `backend-staging-deploy` also read it, so a PR touching only
-      # `backend/src/**/__tests__/**` ran the full build → package → S3 → EB
-      # deploy. The runner minutes (569 billable over 99 executions) are the
-      # cheap half. The expensive half is that this job holds
-      # `concurrency: backend-staging-deploy` — a group keyed on nothing but its
-      # own name, so unlike every other job here it is one GLOBAL lane, and with
-      # `cancel-in-progress: false` an occupant is never preempted. A test-only
-      # PR took that single slot and every real backend PR in the repo queued
-      # behind it.
-      #
-      # WHY THIS IS A SEPARATE STEP and not two more patterns in the filter
-      # above: dorny/paths-filter compiles EACH pattern into its own picomatch
-      # matcher and OR-combines them (`patterns.some(...)`, quantifier defaults
-      # to `some`). A `!`-negated pattern there is therefore not an exclusion —
-      # picomatch returns true for every path OUTSIDE the named one, so
-      # `'backend/**'` + `'!backend/**/__tests__/**'` matches README.md and the
-      # filter is permanently true. The narrowing would read correctly and
-      # silently become a widening that deploys staging on every PR in the repo.
-      # `predicate-quantifier: 'every'` is what makes the negations mean
-      # exclusion, and it is per-step, which is why the broad filter above
-      # cannot host them. Pinned by staging-deploy-gate.test.sh, which fails on
-      # any negated pattern that is not under an `every` step.
-      - name: Paths filter (deployable backend)
-        id: filter_deploy
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # EVERY pattern must match, so the `!` lines below are exclusions.
-          predicate-quantifier: 'every'
-          filters: |
-            backend_src:
-              - 'backend/**'
-              # All 13 SOURCE test directories are `__tests__`, nested throughout the
-              # tree (backend/src/__tests__, backend/src/services/__tests__,
-              # backend/src/services/agentMode/core/__tests__, …) — excluding
-              # only backend/src/__tests__ would miss most of them.
-              #
-              # A `find backend -type d -name __tests__` returns 24, not 13.
-              # The extra 11 are stale copies under `backend/dist/`, which is
-              # gitignored build output with 0 tracked files — they can never
-              # appear in a PR diff, so they are irrelevant to this filter.
-              # Count `backend/src` only when checking this number. The
-              # *.test.ts globs match nothing today (there are zero colocated
-              # test files); they keep the rule true if that convention changes.
-              - '!backend/**/__tests__/**'
-              - '!backend/**/*.test.ts'
-              - '!backend/**/*.test.js'
-            # ENG-743, carried forward: a change to the deploy path must be
-            # exercised by the deploy path on its own PR, or the next
-            # backend-staging-deploy fix ships unexercised and the first thing
-            # to exercise it is somebody else's backend PR. One brace pattern
-            # rather than two entries because under `every` a second entry would
-            # require BOTH files to change.
-            deploy_ci:
-              - '.github/{workflows/tests.yml,scripts/eb-deploy.sh}'
-
-  # Job A: heavy agentMode files (~150 files, ~half the test time)
-  backend-tests-a:
-    name: Backend tests (agentMode)
-    needs: [detect-changes]
-    # Skip the heavy suite while the PR is a draft: intermediate pushes to a
-    # draft (e.g. the autofix pipeline's re-fix/revise commits) shouldn't burn
-    # ~26 runner-min they can't gate a merge with. Flipping the PR to Ready
-    # fires `ready_for_review` (see triggers) → one authoritative full run.
-    #
-    # ENG-1039 decoupled these jobs from the Greptile gate, and ENG-1371
-    # deleted that gate outright when Greptile was dropped as a vendor. The
-    # lesson survives the vendor and is why nothing should be put back in
-    # front of these two jobs: ENG-915 had serialized them behind
-    # `greptile-review` to save the runner-minutes a below-bar review
-    # invalidated, and measured 2026-08-01..10 the coupling cost more than it
-    # saved — the reviewer check failed 61% of the time (247 failures / 160
-    # successes, 947 min billed on failed polls), and every failure skipped
-    # the test jobs entirely (303 skipped executions). Each skip destroyed the
-    # run's test evidence, so authors re-pushed to recover, costing a whole
-    # fresh ~31-min backend pair. A flaky *reviewer* check was deciding
-    # whether *test* evidence exists. Gate these jobs on the path filter and
-    # the draft flag, and on nothing else.
-    #
-    # A `skipped` here is still ambiguous — path filter or draft — so
-    # merge-evidence.sh keeps demanding a positive `success` from these two
-    # jobs whenever the diff touches backend paths. Renaming either job means
-    # updating MERGE_EVIDENCE_BACKEND_JOBS there.
-    if: >-
-      needs.detect-changes.outputs.backend == 'true'
-      && github.event.pull_request.draft == false
+  backend-build:
+    name: Backend build
+    needs: detect-changes
+    if: needs.detect-changes.outputs.backend == 'true' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    # Distinct group from backend-tests-b so the two still run in parallel; a
-    # newer commit on the same PR cancels this job's superseded run. Draft flag
-    # in the group name per ENG-1277 — see the detect-changes job comment.
-    # ENG-1371: explicit ceiling; without one a hung job burns GitHub's
-    # 360-minute default before anyone notices. ENG-1376 raised it from 30:
-    # instrumenting this job for coverage took it from 12.6 min to 18.6 min
-    # (measured, PR #2547), leaving 11 min of headroom on a 30-min ceiling. The
-    # ceiling is there to catch a HUNG job, not a slow one, and 40 still does
-    # that inside GitHub's default — while a spurious kill costs a full ~19-min
-    # re-run plus the evidence merge-evidence.sh demands.
-    timeout-minutes: 40
+    timeout-minutes: 20
     concurrency:
-      group: ${{ github.workflow }}-backend-tests-a-${{ github.ref }}-${{ github.event.pull_request.draft }}
+      group: ${{ github.workflow }}-backend-build-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     steps:
-      # ENG-729: shallow. This job installs, type-checks and runs Jest against
-      # the working tree; nothing in it reads git history (no `git` invocation
-      # in backend/src/__tests__, and jest resolves from `src/`). One sampled
-      # run spent 209s here.
-      - name: Checkout PR head
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
-
-      - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          cache: 'npm'
+          cache: npm
           cache-dependency-path: backend/package-lock.json
-
       - name: Install dependencies
         working-directory: backend
         run: npm ci
-
-      # ENG-1277: type-check removed from THIS job. It ran identically in both
-      # backend-tests-a and backend-tests-b (same `tsc --noEmit` over the same
-      # tsconfig.json), so every PR paid for it twice — ~1,650 min/mo of pure
-      # duplication. backend-tests-b (below) still runs it, so the backend is
-      # still type-checked exactly once per run, and it is still the ONLY thing
-      # type-checking the backend (see the comment on that job's Type-check
-      # step for why: isolatedModules/transpile-only ts-jest reports no type
-      # errors, and this step is a strict superset of `npm run build`'s
-      # diagnostics since ENG-1059 pointed the deploy build at
-      # tsconfig.build.json). Nothing here depends on the type-check having
-      # already run in this job — Jest resolves and transpiles independently.
-      # ENG-1376: this job collects coverage now. It used not to, and that one
-      # fact was the largest single distortion in the backend coverage number:
-      # every module whose tests live here read as near-zero no matter how well
-      # tested it was, because the only job measuring anything was job B.
-      # Measured on the widened scope before this change,
-      # `services/agentModeService.ts` (12,790 statements) scored 13.4% and
-      # `controllers/agentModeController.ts` (3,908) scored 15.5% — together
-      # ~15% of the whole backend, mis-reported purely because of which job
-      # their tests were scheduled into.
-      #
-      # `npm run test:coverage` already carries `--maxWorkers=2 --forceExit`
-      # and a 4GB heap; only the reporter is set here. `json` (not
-      # `json-summary`) because the backend-coverage job below needs the
-      # per-statement counters to merge the two halves — a summary has already
-      # thrown away everything a merge needs.
-      - name: Run tests with coverage (agentMode files)
+      - name: Production build
         working-directory: backend
-        run: >
-          npm run test:coverage --
-          --testPathPattern="agentMode"
-          --coverageReporters=json
+        run: NODE_OPTIONS="--max-old-space-size=4096" npm run build
 
-      # No `if: always()`. A failed suite produces partial counters, and the
-      # backend-coverage job is skipped when this job fails anyway, so uploading
-      # them would only leave a misleading artifact behind.
-      - name: Upload coverage (agentMode half)
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: backend-coverage-a
-          path: backend/coverage/coverage-final.json
-          if-no-files-found: error
-          retention-days: 1
-
-  # Job B: everything else + coverage reporting
-  backend-tests-b:
-    name: Backend tests (all other + coverage)
-    needs: [detect-changes]
-    # Same gates as backend-tests-a (see above): drafts skip the heavy suite,
-    # and nothing else stands in front of it (ENG-1039, ENG-1371).
-    if: >-
-      needs.detect-changes.outputs.backend == 'true'
-      && github.event.pull_request.draft == false
+  partner-build:
+    name: Partner portal build
+    needs: detect-changes
+    if: needs.detect-changes.outputs.partner == 'true' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    # Distinct group from backend-tests-a so the two still run in parallel; a
-    # newer commit on the same PR cancels this job's superseded run. Draft flag
-    # in the group name per ENG-1277 — see the detect-changes job comment.
-    # ENG-1371: explicit ceiling; see backend-tests-a for why ENG-1376 raised
-    # this from 30. Widening the coverage scope took this job from 11.7 min to
-    # 16.3 min (measured, PR #2547).
-    timeout-minutes: 40
+    timeout-minutes: 20
     concurrency:
-      group: ${{ github.workflow }}-backend-tests-b-${{ github.ref }}-${{ github.event.pull_request.draft }}
+      group: ${{ github.workflow }}-partner-build-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     steps:
-      # ENG-729: shallow, for the same reason as backend-tests-a. The coverage
-      # comment step below talks to the GitHub API, not to git.
-      - name: Checkout PR head
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
-
-      - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          cache: 'npm'
-          cache-dependency-path: backend/package-lock.json
-
+          cache: npm
+          cache-dependency-path: partner-portal/package-lock.json
       - name: Install dependencies
-        working-directory: backend
+        working-directory: partner-portal
         run: npm ci
+      - name: Production build
+        working-directory: partner-portal
+        run: NODE_OPTIONS="--max-old-space-size=4096" npm run build
 
-      # ENG-729: type-check instead of build, for the same reason as
-      # backend-tests-a above — `dist/` is never read by Jest, the type-check is
-      # load-bearing and stays.
-      - name: Type-check
-        working-directory: backend
-        run: NODE_OPTIONS="--max-old-space-size=4096" npm run typecheck --if-present
-
-      # ENG-1371: `/__tests__/twins/` restored to this list. A CLI
-      # `--testPathIgnorePatterns` REPLACES the array in jest.config.js rather
-      # than extending it, so passing this flag silently dropped the config's
-      # twins exclusion and loaded both twin suites into this job. They
-      # self-skip without `.env.twins.json`, so it was benign — but they are
-      # opt-in by design (src/__tests__/twins/README.md) and should not sit in a
-      # required suite by accident. Coverage-neutral: a skipped suite executes
-      # nothing and therefore contributes nothing.
-      #
-      # `/__tests__/agentMode` is deliberately LEFT ALONE, and the mismatch it
-      # creates is deliberately accepted. Job A selects with
-      # `--testPathPattern="agentMode"`, which matches that substring anywhere
-      # in the path; this ignore requires the literal `/__tests__/agentMode`, so
-      # it only excludes the 263 files named `agentMode*` sitting DIRECTLY under
-      # a `__tests__/` dir. The other 23 — everything under
-      # `services/agentMode/**/__tests__/`, plus names like
-      # `loops.agentModeWiring.test.ts` — run in BOTH backend jobs, on every
-      # backend PR.
-      #
-      # Making the two lists exact complements was tried here and reverted,
-      # because it used to destroy coverage. Coverage was collected ONLY from
-      # `src/utils/**` and ONLY by this job — job A produced none — so the 23
-      # overlapping files were load-bearing: two of them
-      # (`src/__tests__/utils/agentModeAlerts.test.ts` and `.../agentModeErrors.test.ts`)
-      # were the only non-`agentMode`-named tests of two in-scope utils, and
-      # excluding them sent both modules to zero. Measured on PR #2491:
-      # branches 95.2% -> 93.99%, statements 98.35% -> 97.55%.
-      #
-      # ENG-1376 removed that constraint. Both jobs now collect coverage and the
-      # backend-coverage job merges the two before judging them, so a file that
-      # runs in job A instead of job B no longer costs anything — its counters
-      # arrive either way. The 23 overlapping files are now pure duplicated
-      # runtime (~23 files executed twice on every backend PR) and nothing but
-      # inertia keeps them there.
-      #
-      # Left alone in THIS change on purpose: ENG-1376 is about what coverage
-      # measures, and re-partitioning the suite in the same PR would mean any
-      # movement in the merged number could be either the new scope or the new
-      # split. Deduplicate it in its own change, where the before/after is one
-      # variable — and confirm the merged coverage holds when you do.
-      # ENG-1376: `--coverageThreshold='{}'` is gone, and so is the
-      # github-script step that used to re-implement the same 95% bar in
-      # JavaScript. There is now exactly one threshold in the backend:
-      # backend/coverage-thresholds.json, applied once by the backend-coverage
-      # job below against the MERGED coverage of both halves. Judging this job
-      # alone against a whole-suite bar would fail it on missing evidence, not
-      # on missing tests.
-      - name: Run tests with coverage (non-agentMode files)
-        working-directory: backend
-        run: >
-          npm run test:coverage --
-          --testPathIgnorePatterns="/node_modules/" "/__tests__/e2e/" "/__tests__/twins/" "/__tests__/agentMode"
-          --coverageReporters=json
-
-      - name: Upload coverage (non-agentMode half)
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: backend-coverage-b
-          path: backend/coverage/coverage-final.json
-          if-no-files-found: error
-          retention-days: 1
-
-  # ENG-1376: the backend's coverage gate. It exists as a separate job because
-  # the backend suite is split across two of them, and a coverage number is only
-  # meaningful once both halves are counted — see the comment on job B's
-  # testPathIgnorePatterns for the history of why splitting the suite silently
-  # broke the number.
-  #
-  # This is the ONLY place a backend coverage threshold is enforced. It replaces
-  # two mechanisms that both claimed to be it: a `coverageThreshold` in
-  # jest.config.js that CI disabled with `--coverageThreshold='{}'` on every
-  # run, and a github-script step that re-implemented the same 95% bar against
-  # `coverage.total`. Neither measured what it said: the scope was
-  # `src/utils/**` alone (112 of 811 source files) and the evidence was one of
-  # two jobs.
-  #
-  # It does NOT stand in front of the test jobs — the ENG-1039 lesson (see
-  # backend-tests-a) is about what gates the suite, and nothing here does. It
-  # runs after, on the artifacts they produce. If either test job fails or
-  # skips, GitHub skips this job too, and merge-evidence.sh already demands a
-  # positive `success` from both of them.
-  backend-coverage:
-    name: Backend coverage
-    needs: [detect-changes, backend-tests-a, backend-tests-b]
-    # Same gates as the two test jobs, restated rather than inherited: a job
-    # that can silently become a no-op is not a gate.
-    #
-    # Deliberately NOT added to MERGE_EVIDENCE_BACKEND_JOBS. It does not need to
-    # be: merge-evidence.sh fails on ANY check with a `failure` conclusion, not
-    # just the ones it names, so a real coverage regression blocks the merge on
-    # its own. The only thing the named list adds is catching a job that never
-    # reported at all — and this job can only fail to report when job A or job B
-    # skipped or failed, both of which are already in that list. Adding it would
-    # buy nothing and would block every open backend PR until it rebased onto
-    # this commit. See the note by BACKEND_JOBS in merge-evidence.sh.
-    if: >-
-      needs.detect-changes.outputs.backend == 'true'
-      && github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
-    # Minutes, not tens of minutes: this job runs no tests. It installs, merges
-    # two JSON files and posts a comment.
-    timeout-minutes: 10
-    concurrency:
-      group: ${{ github.workflow }}-backend-coverage-${{ github.ref }}-${{ github.event.pull_request.draft }}
-      cancel-in-progress: true
-    steps:
-      - name: Checkout PR head
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-
-      - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          cache: 'npm'
-          cache-dependency-path: backend/package-lock.json
-
-      - name: Install dependencies
-        working-directory: backend
-        run: npm ci
-
-      - name: Download coverage (agentMode half)
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: backend-coverage-a
-          path: coverage-a
-
-      - name: Download coverage (non-agentMode half)
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: backend-coverage-b
-          path: coverage-b
-
-      # The gate script has its own regression suite (~2s). It is the only thing
-      # standing between a coverage regression and main, so it does not get to
-      # be the untested script in the repo.
-      - name: Run coverage-report regression suite
-        working-directory: backend
-        run: node --test scripts/coverage-report.test.mjs
-
-      - name: Merge coverage and enforce the threshold
-        working-directory: backend
-        env:
-          COVERAGE_MARKDOWN_OUT: ${{ github.workspace }}/coverage-comment.md
-        run: >
-          node scripts/coverage-report.mjs
-          "${{ github.workspace }}/coverage-a/coverage-final.json"
-          "${{ github.workspace }}/coverage-b/coverage-final.json"
-
-      # `always()` so the comment lands even when the step above exited 1 — a
-      # PR that drops below the bar is exactly the one whose author needs to see
-      # the number. The job still fails: this step does not swallow the status.
-      #
-      # The `event_name` guard is redundant today (this workflow has only a
-      # `pull_request` trigger) and is kept as a guard for tomorrow: on a `push`
-      # run `context.issue.number` is undefined and every call below would throw
-      # on an otherwise-passing job.
-      - name: Post coverage comment on PR
-        if: always() && github.event_name == 'pull_request'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            const fs = require('fs');
-            const bodyPath = `${process.env.GITHUB_WORKSPACE}/coverage-comment.md`;
-            if (!fs.existsSync(bodyPath)) {
-              console.log('No coverage markdown produced, skipping comment');
-              return;
-            }
-            const body = fs.readFileSync(bodyPath, 'utf8');
-
-            // Identity is the hidden marker, NOT the visible heading, and the
-            // author must be this workflow's own bot.
-            //
-            // Matching on the heading is not a hypothetical failure: it
-            // happened on PR #2547, the PR that introduced this job. Linear's
-            // linkback comment quotes the ticket body, the ticket body quotes
-            // the old coverage comment verbatim — heading and emoji included —
-            // so the search matched Linear's comment and the update overwrote
-            // it. Any bot that ever quotes this report would do the same. A
-            // marker nothing else emits, plus an author check, is the fix.
-            const MARKER = '<!-- backend-coverage-report -->';
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              per_page: 100,
-            });
-            const existing = comments.find(
-              (c) => c.user.login === 'github-actions[bot]' && c.body.includes(MARKER),
-            );
-
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
-            }
-
-  # These scripts are the ones that decide whether a deploy really happened
-  # (ENG-734), whether CI ever ran
-  # at all (ENG-757), and whether anyone finds out a production deploy failed
-  # (ENG-865), so they get their own regression suites. All run the real script
-  # against a mocked CLI — no AWS access, no GitHub access, no Slack, ~30s.
-  #
-  # The job's gate is the `workflows` filter (`.github/**`), so a new script
-  # here is covered without touching any paths filter.
+  # These are short deterministic control-plane checks, not product tests.
+  # They protect the deployment and merge mechanisms themselves and run only
+  # when `.github/**` changes.
   ci-scripts-tests:
     name: CI script tests
     needs: detect-changes
     if: needs.detect-changes.outputs.workflows == 'true'
-    # ENG-1277: ubuntu-slim — shellcheck + bash regression suites, no docker.
     runs-on: ubuntu-slim
     timeout-minutes: 10
     concurrency:
-      group: ${{ github.workflow }}-ci-scripts-tests-${{ github.ref }}-${{ github.event.pull_request.draft }}
+      group: ${{ github.workflow }}-ci-controls-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     steps:
-      - name: Checkout PR head
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Lint CI scripts
         run: shellcheck .github/scripts/*.sh
+      - name: Run CI/deploy control checks
+        run: |
+          set -euo pipefail
+          bash .github/scripts/eb-deploy.test.sh
+          bash .github/scripts/dependabot-only-pr.test.sh
+          bash .github/scripts/dependabot-integrity-check.test.sh
+          bash .github/scripts/dependabot-config.test.sh
+          bash .github/scripts/merge-evidence.test.sh
+          bash .github/scripts/trunk-deploy-state.test.sh
+          bash .github/scripts/deploy-failure-alert.test.sh
+          bash .github/scripts/eb-config-conflict.test.sh
+          bash .github/scripts/pipefail-hygiene.test.sh
 
-      - name: Run eb-deploy.sh regression suite
-        run: bash .github/scripts/eb-deploy.test.sh
-
-      - name: Run dependabot-only-pr.sh regression suite
-        run: bash .github/scripts/dependabot-only-pr.test.sh
-
-      # ENG-1371: this suite existed in the repo but no job ran it, so the only
-      # genuinely security-relevant required check (`Dependabot Integrity
-      # Check`, ENG-1287) was the one with no regression coverage in CI.
-      - name: Run dependabot-integrity-check.sh regression suite
-        run: bash .github/scripts/dependabot-integrity-check.test.sh
-
-      # No script under test — asserts the github-actions grouping in
-      # .github/dependabot.yml itself, so it cannot be quietly "cleaned up"
-      # back to one PR per action without a red check (ENG-1042). Placed here,
-      # grouped with its sibling Dependabot suites and ahead of every later
-      # step: a `run:` step failure skips the rest of the job by default, so a
-      # step placed after a flaky or already-red suite can silently stop
-      # proving anything without the job itself going green-then-red to say so.
-      - name: Run dependabot-config contract suite
-        run: bash .github/scripts/dependabot-config.test.sh
-
-      - name: Run merge-evidence.sh regression suite
-        run: bash .github/scripts/merge-evidence.test.sh
-
-      - name: Run trunk-deploy-state.sh regression suite
-        run: bash .github/scripts/trunk-deploy-state.test.sh
-
-      - name: Run deploy-failure-alert.sh regression suite
-        run: bash .github/scripts/deploy-failure-alert.test.sh
-
-      - name: Run eb-config-conflict.sh regression suite
-        run: bash .github/scripts/eb-config-conflict.test.sh
-
-      # No script under test — this one asserts the `backend-staging-deploy`
-      # job condition in this same file, so the gate in front of the staging
-      # deploy cannot lose a clause without a red check (ENG-991).
-      - name: Run staging-deploy gate contract suite
-        run: bash .github/scripts/staging-deploy-gate.test.sh
-
-      # ENG-1412. No script under test: this greps every script in the
-      # directory for a pipeline feeding a reader that exits early (`grep -q`
-      # in any spelling, `head`), which under `set -o pipefail` turns a
-      # successful match into a failed pipeline and silently inverts the branch.
-      #
-      # Replaces the narrower assertion that lived in eb-config-conflict.test.sh
-      # — that one matched only `printf ... | grep -q...`, so `jq ... | head -n 1`
-      # in deploy-failure-alert.sh was invisible to it, and that one aborts the
-      # alerter outright under set -e. Measured head-to-head on a 12-shape
-      # corpus: 4 caught before, 12 now, no false positives either side.
-      - name: Run pipefail hygiene suite
-        run: bash .github/scripts/pipefail-hygiene.test.sh
-
-  # ENG-836: prod deploys immutable, which forbids changing resource config and
-  # instance config in one operation. PR #2237 did exactly that, EB accepted the
-  # request then refused it, and production sat undeployable for ~29 hours while
-  # every later merge inherited the same failure.
-  #
-  # Staging cannot catch it — staging is AllAtOnce, which has no such
-  # restriction, so it accepted the identical change and reported green. This
-  # job is the substitute for a check staging structurally cannot perform.
-  #
-  # Runs on the PR diff, so it is deliberately NOT behind the `workflows`
-  # filter: the files it guards are under `backend/`, not `.github/`.
-  eb-config-conflict:
-    name: EB resource/instance config conflict
+  # ENG-1377: local-agent-relay and remotion-lambda had no CI of any kind.
+  # Under ENG-1463, GitHub Actions proves buildability, not correctness, so
+  # these are build checks, not the product test suites an earlier version of
+  # this change ran directly in Actions. local-agent-relay's existing 35-test
+  # unittest suite is exactly the kind of thing that now belongs on Atem
+  # instead, if it is ever selected as protecting a retained invariant.
+  relay-build:
+    name: Local agent relay build
     needs: detect-changes
-    # ENG-1039: gated on the `ebconfig` filter — the classifier only reacts to
-    # `.platform/*` and `.ebextensions/*.config` paths, so PRs touching neither
-    # cannot produce a hit and were paying 397 runs / 480 min for nothing.
-    if: needs.detect-changes.outputs.ebconfig == 'true'
-    # ENG-1277: ubuntu-slim — a git diff + bash classifier, no docker.
-    runs-on: ubuntu-slim
-    # ENG-1371: raised 5 -> 12. The classifier itself is seconds, but this job
-    # needs `fetch-depth: 0` (see the checkout below — a DELETED config is
-    # classified by what it declared in the base revision, which requires
-    # history), and full-history checkout on this repo is measured at 14s at
-    # best but 159s, 188s and 247s on sampled runs — see the ENG-729 note on
-    # detect-changes' checkout. The 5-minute ceiling was set below this job's
-    # own worst case.
-    #
-    # It survived because the job is path-gated and had only executed 6 times
-    # in 197 runs, so it had never drawn the tail. It drew it on PR #2491:
-    # `Checkout PR head` ran 4m59s, the job was killed, the classifier step
-    # never executed, and GitHub reported the result as `cancelled` — which
-    # merge-evidence.sh correctly refuses to read as a pass.
-    #
-    # 12 rather than 15: ubuntu-slim's job cap is 15 minutes, and a ceiling AT
-    # the cap gives the runner no room to report a diagnosable timeout of its
-    # own before being killed from outside.
-    timeout-minutes: 12
+    if: needs.detect-changes.outputs.relay == 'true' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     concurrency:
-      group: ${{ github.workflow }}-eb-config-conflict-${{ github.ref }}-${{ github.event.pull_request.draft }}
+      group: ${{ github.workflow }}-relay-build-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     steps:
-      - name: Checkout PR head
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-
-      - name: Check for a resource+instance config conflict
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # Lets a DELETED config be classified by what it removed, rather than
-          # guessed at. Removing a file that declared `aws:elbv2:loadbalancer`
-          # is a resource change; removing one that declared `commands:` is an
-          # instance change. `fetch-depth: 0` above is what makes this readable.
-          EB_CONFLICT_BASE_REF: ${{ github.event.pull_request.base.sha }}
-        run: |
-          # Three dots: only what this PR changed relative to the merge base,
-          # so commits that landed on the base branch meanwhile are not blamed
-          # on this PR.
-          #
-          # --no-renames: with rename detection ON, git reports a rename as the
-          # DESTINATION path only. The classifier would then look that path up
-          # in the base revision, find nothing, and lose every declaration that
-          # existed at the source — so renaming a config while dropping its
-          # resource block, alongside an instance change, would pass. Turning
-          # detection off reports the rename as a delete plus an add, and both
-          # sides get classified: the old path from base, the new from head.
-          git diff --name-only --no-renames "${BASE_SHA}...${HEAD_SHA}" \
-            | bash .github/scripts/eb-config-conflict.sh
-
-  # The `dependabot[bot]` clause is the only addition to a gate that is otherwise
-  # unchanged (ENG-991). GitHub isolates repository secrets from Dependabot on
-  # `pull_request`: `secrets.AWS_ACCESS_KEY_ID` and `secrets.AWS_SECRET_ACCESS_KEY`
-  # resolve to the empty string unless they are ALSO stored as Dependabot secrets,
-  # which they deliberately are not — these are production deploy credentials and
-  # an automated dependency PR is the last place to widen their reach. So
-  # `Configure AWS credentials` below cannot succeed on a Dependabot PR under any
-  # circumstances, and re-running never changes that.
-  #
-  # Measured on the three open bumps (runs 31349777138 / 31349778959 / 31349790654,
-  # 2026-08-10): every other job passed — both backend suites included — and
-  # only this job failed, twice with "Could not load credentials
-  # from any providers" after 5m01s and 4m01s of checkout, npm ci, build and
-  # packaging done before reaching the credentials step. 12 runs over 7 days, 0
-  # successes.
-  #
-  # The wasted runner minutes are the smaller half. This job holds
-  # `concurrency: backend-staging-deploy`, the single shared staging lane, with
-  # `cancel-in-progress: false` — so a Dependabot PR queues for a deploy it can
-  # never perform and can evict a real PR's deploy. That is exactly what happened
-  # to the third run above: cancelled after 15s with "a higher priority waiting
-  # request for backend-staging-deploy exists", which then reported the whole PR
-  # red and invited a re-run of the ~30 runner-minute suite that had just passed.
-  #
-  # Author identity, not paths. Skipping the deploy for `.github/**`-only diffs
-  # would look equivalent and is not: the `backend` filter deliberately counts
-  # `.github/workflows/tests.yml` and `.github/scripts/eb-deploy.sh` as backend
-  # changes so the deploy path gates its own changes (ENG-743), and a path-based
-  # skip would silently delete that. The thing that makes this job impossible is
-  # who opened the PR, so that is what the condition tests.
-  #
-  # `github.event.pull_request.user.login` (the PR's author) rather than
-  # `github.actor` (whoever triggered this run): a human pushing to or reopening a
-  # Dependabot branch makes `github.actor` a human while the PR still runs without
-  # secrets, so the actor-based form would reintroduce the failure on exactly the
-  # push someone made trying to fix it.
-  #
-  # This removes no merge evidence. merge-evidence.sh requires a positive
-  # `success` from "Backend tests (agentMode)" and "Backend tests (all other +
-  # coverage)" only (MERGE_EVIDENCE_BACKEND_JOBS); the staging deploy has never
-  # been in that set, so a Dependabot PR still has to pass the same tests as
-  # anything else. Contract pinned by
-  # .github/scripts/staging-deploy-gate.test.sh.
-  #
-  # ENG-1376: `needs` stays at the two test jobs and does NOT pick up
-  # `backend-coverage`. This job already queues behind a single global
-  # concurrency lane; putting a report-and-compare job in front of it would add
-  # latency to every staging deploy to gate it on something that is not a
-  # correctness signal. A coverage regression blocks the merge, not the deploy.
-  backend-staging-deploy:
-    name: Backend deploy to staging (after tests pass)
-    needs: [detect-changes, backend-tests-a, backend-tests-b]
-    if: >-
-      github.event.pull_request.draft == false
-      && github.event.pull_request.user.login != 'dependabot[bot]'
-      && needs.detect-changes.outputs.backend_deployable == 'true'
-      && needs.backend-tests-a.result == 'success'
-      && needs.backend-tests-b.result == 'success'
-    runs-on: ubuntu-latest
-    environment: staging
-    # ENG-1371: the deploy step itself allows 35 min (EB_TOTAL_TIMEOUT_SECONDS
-    # 1800 + headroom); this is the whole-job ceiling above it.
-    timeout-minutes: 60
-    concurrency:
-      group: backend-staging-deploy
-      cancel-in-progress: false
-    steps:
-      # ENG-1277: this job queues behind the single global
-      # `backend-staging-deploy` concurrency lane above (cancel-in-progress:
-      # false, by design), so by the time it actually starts, a newer push to
-      # this same PR may already have superseded it — that newer push gets its
-      # own run, queued right behind this one. Deploying this stale SHA anyway
-      # wastes a full ~12-min deploy building a version nobody will look at
-      # (measured: 18 stale deploys / 176 min in Aug 2026). Not a required
-      # check, so skipping it here costs nothing.
-      - name: Preflight — skip if a newer push already superseded this head
-        id: preflight
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          LIVE_HEAD_SHA="$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq .head.sha)"
-          if [ "${LIVE_HEAD_SHA}" != "${{ github.event.pull_request.head.sha }}" ]; then
-            echo "stale=true" >> "$GITHUB_OUTPUT"
-            echo "This run's head (${{ github.event.pull_request.head.sha }}) is no longer the PR's live head (${LIVE_HEAD_SHA}) — a newer push superseded it. Skipping the deploy; the newer push gets its own run."
-          else
-            echo "stale=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Checkout
-        if: steps.preflight.outputs.stale != 'true'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Setup Node.js
-        if: steps.preflight.outputs.stale != 'true'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          cache: 'npm'
-          cache-dependency-path: backend/package-lock.json
-
-      - name: Install dependencies
-        if: steps.preflight.outputs.stale != 'true'
-        working-directory: backend
-        run: npm ci
-
-      - name: Build
-        if: steps.preflight.outputs.stale != 'true'
-        working-directory: backend
-        run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
-
-      - name: Copy dev env user-data script into dist
-        if: steps.preflight.outputs.stale != 'true'
-        working-directory: backend
-        run: cp ../test-env/user-data-dev-auto.sh dist/
-
-      # Resolved once and reused by every later step, like deploy.yml's backend
-      # job: the date and PR suffix used to be recomputed in three places, so a
-      # run crossing midnight could upload one label and deploy another.
-      #
-      # The short SHA is what makes the verification below mean anything. A PR
-      # deploys to staging on every push, and a label of only `-prN` is the same
-      # string on every one of those pushes — so the environment is already
-      # reporting that VersionLabel before this run starts, and "the environment
-      # took our version" would be satisfied by a deploy that never ran. With
-      # the SHA the label names exactly one build, which is also what makes a
-      # rollback to a labelled version reproducible (ENG-743).
-      - name: Resolve staging version label
-        if: steps.preflight.outputs.stale != 'true'
-        id: version
-        run: |
-          set -euo pipefail
-          SHORT_SHA="$(git rev-parse --short HEAD)"
-          VERSION_LABEL="backend-$(date +%Y%m%d)-pr${{ github.event.pull_request.number }}-${SHORT_SHA}"
-          echo "version_label=${VERSION_LABEL}" >> "$GITHUB_OUTPUT"
-          echo "Resolved staging version label: ${VERSION_LABEL}"
-
-      - name: Package artifact
-        if: steps.preflight.outputs.stale != 'true'
-        working-directory: backend
-        env:
-          VERSION_LABEL: ${{ steps.version.outputs.version_label }}
-        run: |
-          set -euo pipefail
-          mkdir -p builds
-          zip -r "builds/${VERSION_LABEL}.zip" dist package.json package-lock.json .env.example .platform .ebextensions || zip -r "builds/${VERSION_LABEL}.zip" dist package.json package-lock.json
-
-      - name: Configure AWS credentials
-        if: steps.preflight.outputs.stale != 'true'
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Upload deployment package to S3
-        if: steps.preflight.outputs.stale != 'true'
-        working-directory: backend
-        env:
-          VERSION_LABEL: ${{ steps.version.outputs.version_label }}
-        run: |
-          set -euo pipefail
-          aws s3 cp "builds/${VERSION_LABEL}.zip" \
-            "s3://elasticbeanstalk-${{ env.AWS_REGION }}-992382574572/builds/${VERSION_LABEL}.zip"
-
-      # Creates the application version, applies it, and then proves the
-      # environment actually came up on it. Every AWS failure fails this step —
-      # see .github/scripts/eb-deploy.sh (ENG-734, wired to staging in ENG-743).
-      # The script's own budget stays under this step's timeout so it always
-      # reports the reason instead of being killed mid-poll; together they keep
-      # the 35 minutes the previous deploy + readiness steps allowed.
-      - name: Deploy to Elastic Beanstalk and verify the environment took it
-        if: steps.preflight.outputs.stale != 'true'
-        timeout-minutes: 35
-        env:
-          EB_APPLICATION_NAME: ${{ vars.EB_BACKEND_STAGING_APPLICATION_NAME }}
-          EB_ENVIRONMENT_NAME: ${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }}
-          EB_VERSION_LABEL: ${{ steps.version.outputs.version_label }}
-          EB_SOURCE_BUNDLE_S3_BUCKET: elasticbeanstalk-${{ env.AWS_REGION }}-992382574572
-          EB_SOURCE_BUNDLE_S3_KEY: builds/${{ steps.version.outputs.version_label }}.zip
-          EB_TOTAL_TIMEOUT_SECONDS: '1800'
-        run: bash .github/scripts/eb-deploy.sh
-
-      # Only reachable when the step above proved the environment is Ready on
-      # this exact version, so this banner is now a report rather than a claim.
-      - name: Backend Staging Deployment Status
-        if: steps.preflight.outputs.stale != 'true'
-        env:
-          VERSION_LABEL: ${{ steps.version.outputs.version_label }}
-        run: |
-          echo "🚀 Backend staging deployment verified!"
-          echo "📊 Check deployment status: https://${{ env.AWS_REGION }}.console.aws.amazon.com/elasticbeanstalk/home?region=${{ env.AWS_REGION }}#/environments"
-          echo "✅ Environment ${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }} is running: ${VERSION_LABEL}"
-          echo "🔗 Staging URL: https://api-stage.agentweb.pro"
-
-  partner-tests:
-    name: Partner portal tests
-    needs: detect-changes
-    if: needs.detect-changes.outputs.partner == 'true'
-    runs-on: ubuntu-latest
-    # A newer commit on the same PR cancels this superseded test job. Draft
-    # flag in the group name per ENG-1277 — see detect-changes' comment.
-    # ENG-1371: explicit ceiling; without one a hung job burns GitHub's
-    # 360-minute default before anyone notices.
-    timeout-minutes: 20
-    concurrency:
-      group: ${{ github.workflow }}-partner-tests-${{ github.ref }}-${{ github.event.pull_request.draft }}
-      cancel-in-progress: true
-    steps:
-      # ENG-729: shallow — this job builds and tests the working tree only.
-      # Its `npm run build` below is deliberately KEPT: partner-portal's build
-      # is `tsc -b && vite build`, so unlike the backend jobs the build is the
-      # type-check here, not a discarded emit.
+      # persist-credentials: false — zizmor, via CodeRabbit on #2552. checkout
+      # defaults to leaving a GITHUB_TOKEN auth header in .git/config, and this
+      # job then builds the PR-authored code (the setuptools build backend runs
+      # from the PR head), which could read the credential back out. Nothing
+      # here needs it afterwards.
       - name: Checkout PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+          persist-credentials: false
 
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      # local-agent-relay is a setuptools package (pyproject.toml), not an
+      # application with its own build script. `pip install .` runs that build
+      # backend end to end — packaging metadata, `src/`-layout module
+      # discovery, dependency resolution — the same class of proof `npm run
+      # build` gives the Node projects here.
+      - name: Build package
+        working-directory: local-agent-relay
+        run: python -m pip install --disable-pip-version-check .
+
+  remotion-build:
+    name: Remotion lambda build
+    needs: detect-changes
+    if: needs.detect-changes.outputs.remotion == 'true' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-remotion-build-${{ github.ref }}-${{ github.event.pull_request.draft }}
+      cancel-in-progress: true
+    steps:
+      # persist-credentials: false — zizmor, via CodeRabbit on #2552. checkout
+      # defaults to leaving a GITHUB_TOKEN auth header in .git/config, and this
+      # job then runs `npm ci`, which executes install lifecycle scripts from
+      # the PR-authored lockfile and could read the credential back out.
+      # Nothing here needs it afterwards.
+      - name: Checkout PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # node-version pinned (CodeRabbit on #2552). Without it the job floats on
+      # whatever the hosted runner image ships, so the image changing under us
+      # is indistinguishable from a real break. 22 is not a guess: this job's
+      # first green run (32477303755) reported `node: v22.23.2`, so this pins
+      # the version it is already known to pass on rather than picking one.
+      #
+      # Repo-wide gap, deliberately not fixed here: NOTHING in this repo pins
+      # Node — no .nvmrc, no `engines` in any package.json, no `node-version` in
+      # any workflow. Every other job floats too. Pinning one new job is worth
+      # doing on its own, but it is not the fix for that.
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
+          node-version: '22'
           cache: 'npm'
-          cache-dependency-path: partner-portal/package-lock.json
+          cache-dependency-path: remotion-lambda/package-lock.json
 
+      # `npm ci`, which needs a lockfile — this project had none, so its pinned
+      # dependency versions were only pinned in package.json and everything
+      # transitive floated. The lockfile is committed in this same change.
       - name: Install dependencies
-        working-directory: partner-portal
+        working-directory: remotion-lambda
         run: npm ci
 
-      - name: Build
-        working-directory: partner-portal
-        run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
+      # Its own `npm run build` (`npx tsc`) was ALREADY FAILING when this job
+      # was written — a real type error in src/Root.tsx sitting on main with
+      # nothing to catch it. The fix ships in the same commit; see
+      # BrandedVideo.tsx.
+      - name: Production build
+        working-directory: remotion-lambda
+        run: npm run build
 
-      - name: Test
-        working-directory: partner-portal
-        shell: bash
+  eb-config-conflict:
+    name: EB resource/instance config conflict
+    needs: detect-changes
+    if: needs.detect-changes.outputs.ebconfig == 'true'
+    runs-on: ubuntu-slim
+    timeout-minutes: 12
+    concurrency:
+      group: ${{ github.workflow }}-eb-config-${{ github.ref }}-${{ github.event.pull_request.draft }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check for a resource and instance configuration conflict
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EB_CONFLICT_BASE_REF: ${{ github.event.pull_request.base.sha }}
         run: |
-          set -euo pipefail
-          TEST_SCRIPT=$(jq -r '.scripts.test // ""' package.json)
-          if [ -z "$TEST_SCRIPT" ] || [[ "$TEST_SCRIPT" == 'echo "Error: no test specified" && exit 1' ]]; then
-            echo "Skipping tests (no real test script)."
-            exit 0
-          fi
-          npm test --silent
+          set -o pipefail
+          git diff --name-only --no-renames "${BASE_SHA}...${HEAD_SHA}" | bash .github/scripts/eb-config-conflict.sh

@@ -217,10 +217,10 @@ describe('ENG-827 — the unattended publish directive is delivered, and deliver
     expect(anyPublishBlock).toBe(false);
   });
 
-  it('keeps scheduled/background runs out of the interactive OpenRouter canary', async () => {
+  it('routes scheduled/background runs through their independent OpenRouter canary', async () => {
     let options: any;
     await capture(ADMITTED_SESSION, { scheduleId: SCHEDULE_ID }, (value) => { options = value; });
-    expect(options.taskClass).toBeUndefined();
+    expect(options.taskClass).toBe('scheduled_background');
   });
 
   it('labels a regular customer run as interactive for the OpenRouter canary', async () => {

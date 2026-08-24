@@ -278,6 +278,7 @@ describe('WorkPlanService', () => {
         description: 'd', welcomeMessage: 'w', autocomplete: true, requireLogin: false,
         showLoginSignup: 'always', showInAgentMode: true, defaultModel: 'm',
         category: 'Strategy', ownerId: 'o', orgId: 'g', reviewFeedback: 'r',
+        display: { version: 1, title: 'Display title' },
       };
       await workPlanService.updateWorkPlan(full);
 
@@ -286,6 +287,7 @@ describe('WorkPlanService', () => {
         'title', 'steps', 'visibility', 'isBuiltIn', 'createdAt',
         'description', 'welcomeMessage', 'autocomplete', 'requireLogin', 'showLoginSignup',
         'showInAgentMode', 'defaultModel', 'category', 'ownerId', 'orgId', 'reviewFeedback',
+        'display',
       ]) {
         expect(arg.UpdateExpression).toContain(`#${field} = :${field}`);
         expect(arg.ExpressionAttributeValues[`:${field}`]).toEqual(full[field]);
@@ -323,6 +325,42 @@ describe('WorkPlanService', () => {
       expect(arg.UpdateExpression).toContain('#title = :title');
       expect(arg.UpdateExpression).toContain('#steps = :steps');
       expect(arg.UpdateExpression).toMatch(/REMOVE .*#description/);
+    });
+  });
+
+  // ENG-1469: `display` is an OPTIONAL_PLAN_FIELDS entry like any other — set
+  // when present, REMOVEd when the caller cleared it. This proves it follows
+  // the same attribute-scoped write path the thumbnail-isolation fix (ENG-889)
+  // established, rather than needing (or accidentally getting) special-casing.
+  describe('updateWorkPlan — display field (ENG-1469)', () => {
+    const plan: any = {
+      planId: 'p1', title: 'T', steps: [{ stepCount: 1, title: 'S' }],
+      visibility: 'system', isBuiltIn: true, createdAt: 'c', updatedAt: 'u',
+    };
+    const display = { version: 1, title: 'Launch a Meta campaign', categories: ['paid-ads'], nextPlanIds: ['p2'] };
+
+    it('writes a supplied display block', async () => {
+      await workPlanService.updateWorkPlan({ ...plan, display });
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.UpdateExpression).toContain('#display = :display');
+      expect(arg.ExpressionAttributeValues[':display']).toEqual(display);
+    });
+
+    it('removes the display block when the caller cleared it', async () => {
+      await workPlanService.updateWorkPlan({ ...plan, display: undefined });
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.UpdateExpression).toMatch(/REMOVE .*#display/);
+    });
+
+    it('never writes a thumbnail attribute while writing display', async () => {
+      await workPlanService.updateWorkPlan({ ...plan, display });
+
+      const arg = mockUpdate.mock.calls[0][0];
+      for (const field of ['thumbnail_url', 'thumbnail_source', 'thumbnail_alt_text', 'thumbnail_rev']) {
+        expect(arg.UpdateExpression).not.toContain(field);
+      }
     });
   });
 

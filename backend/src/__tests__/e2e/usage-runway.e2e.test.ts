@@ -32,12 +32,12 @@
  *   - a guard below REFUSES to run against a prod-looking base URL;
  *   - the IAM user this runs as is denied PutItem on the un-prefixed tables, so
  *     the wrong target fails closed rather than corrupting a billing ledger;
- *   - every seeded row is tracked and removed in afterEach, and the test user's
- *     original tokenUsage/bonus is snapshotted and restored in afterAll.
+ *   - every run creates a collision-protected ephemeral user, removes scenario
+ *     state in afterEach, and deletes the user in afterAll.
  *
  * Usage:
  *   RUN_E2E_TESTS=true E2E_BASE_URL=http://chat-14...:3001 \
- *     npx jest --testPathPattern=e2e/usage-runway --forceExit
+ *     npm run test:e2e:usage-runway
  */
 
 // `src/__mocks__/aws-sdk.ts` is a MANUAL MOCK, and `roots: ['<rootDir>/src']` makes Jest
@@ -67,8 +67,8 @@ const { DynamoDB } = realAws;
 
 const RUN = process.env.RUN_E2E_TESTS === 'true';
 const BASE_URL = process.env.E2E_BASE_URL || 'http://localhost:3001';
-const TEST_EMAIL = process.env.E2E_TEST_EMAIL || 'test@example.com';
-const TEST_PASSWORD = process.env.E2E_TEST_PASSWORD || 'Test123!';
+const SOURCE_EMAIL = process.env.E2E_TEST_EMAIL || 'test@example.com';
+const SOURCE_PASSWORD = process.env.E2E_TEST_PASSWORD || 'Test123!';
 const PREFIX = process.env.E2E_TABLE_PREFIX ?? 'Dev-';
 const REGION = process.env.AWS_REGION || 'us-west-2';
 
@@ -90,7 +90,11 @@ const SCHEDULES_TABLE = `${PREFIX}AW-TaskSchedules`;
  * `sk BETWEEN :start AND :end~`. Base36 sorts below `~`, so the extra segment
  * cannot fall outside a date range that should have matched.
  */
-const RUN_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+const RUN_ID = (
+  process.env.E2E_RUN_ID || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+).replace(/[^a-z0-9-]/gi, '-');
+const FIXTURE_EMAIL = `usage-runway-e2e-${RUN_ID}@agentweb.pro`;
+const FIXTURE_USER_ID = `usage-runway-e2e-${RUN_ID}`;
 
 /**
  * Refuse to seed against production, whatever the caller passed.
@@ -160,6 +164,7 @@ const ddb = new DynamoDB.DocumentClient({ region: REGION, credentials: e2eCreden
 
 let authToken = '';
 let userId = '';
+let fixtureCreated = false;
 /** Everything seeded this test, removed in afterEach even if the test throws. */
 const seededSortKeys: string[] = [];
 /** Schedules created by this suite, removed in afterAll. */
@@ -168,27 +173,9 @@ const createdScheduleIds: string[] = [];
  * Model changes applied but not yet undone.
  *
  * Tracked separately from the test body because an assertion that fails BETWEEN
- * apply and undo would otherwise leave the schedule switched -- and `afterAll`
- * restores only usage counters, not schedule state.
+ * apply and undo would otherwise leave the schedule switched.
  */
 const appliedChangeIds: string[] = [];
-/** The test user's real usage, restored in afterAll. */
-let originalTokenUsage: unknown;
-let originalBonus: unknown;
-/**
- * The account's real credit ledger.
- *
- * Captured because the COST ceiling is lifted by `llmUsageCredits`, not by
- * `tokenAllowanceBonus` — see `seedCreditGrant`. The shared test account already carries a
- * $200 admin grant, and overwriting it without restoring would silently change what every
- * later reader of this account sees.
- */
-let originalCredits: unknown;
-let hadCredits = false;
-/** Whether those attributes EXISTED. Absent is not the same as null or zero, and
- *  restoring the wrong one of the three leaves the account subtly rewritten. */
-let hadTokenUsage = false;
-let hadBonus = false;
 
 /** The account's live cost ceiling in USD, read rather than assumed. */
 async function readCostState(): Promise<{ used: number; allowance: number; allowed: boolean }> {
@@ -212,7 +199,7 @@ async function seedCreditGrant(amountMicroUsd: number): Promise<void> {
   await ddb
     .update({
       TableName: USERS_TABLE,
-      Key: { email: TEST_EMAIL },
+      Key: { email: FIXTURE_EMAIL },
       UpdateExpression: 'SET llmUsageCredits = :c',
       ExpressionAttributeValues: {
         ':c': {
@@ -265,7 +252,7 @@ async function seedUserSpend(opts: {
   await ddb
     .update({
       TableName: USERS_TABLE,
-      Key: { email: TEST_EMAIL },
+      Key: { email: FIXTURE_EMAIL },
       UpdateExpression: 'SET tokenUsage = :u, tokenAllowanceBonus = :b',
       ExpressionAttributeValues: {
         ':u': {
@@ -400,23 +387,11 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
     assertNotProduction();
     assertRealDynamoClient();
 
-    const login = await api('POST', '/api/auth/login', {
-      email: TEST_EMAIL,
-      password: TEST_PASSWORD,
-    });
-    if (login.status !== 200 || !login.data?.token) {
-      throw new Error(`Login failed (${login.status}). E2E cannot run without a session.`);
-    }
-    authToken = login.data.token;
-    userId = JSON.parse(
-      Buffer.from(authToken.split('.')[1], 'base64').toString('utf8'),
-    ).userId;
-
-    // Also the credential/table preflight: a failure here means the suite cannot see the
-    // data plane at all, and every scenario below would otherwise report on the account's
-    // pre-existing state while appearing to test what it seeded.
-    const existing = await ddb
-      .get({ TableName: USERS_TABLE, Key: { email: TEST_EMAIL } })
+    // Read one known login only as a password/tier template. Every scenario runs as a
+    // unique user owned by this suite, so existing ledger history can neither make the
+    // insufficient-history case unreachable nor be overwritten during teardown.
+    const source = await ddb
+      .get({ TableName: USERS_TABLE, Key: { email: SOURCE_EMAIL } })
       .promise()
       .catch((error: Error) => {
         throw new Error(
@@ -426,15 +401,53 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
             `E2E_AWS_ACCESS_KEY_ID/E2E_AWS_SECRET_ACCESS_KEY are set.`,
         );
       });
-    if (!existing.Item) {
-      throw new Error(`${TEST_EMAIL} does not exist in ${USERS_TABLE}; nothing to seed against.`);
+    if (!source.Item || typeof source.Item.password !== 'string') {
+      throw new Error(
+        `${SOURCE_EMAIL} is missing from ${USERS_TABLE} or has no password hash. ` +
+          `Set E2E_TEST_EMAIL/E2E_TEST_PASSWORD to a password-backed shared test fixture.`,
+      );
     }
-    originalTokenUsage = existing.Item?.tokenUsage;
-    originalBonus = existing.Item?.tokenAllowanceBonus;
-    hadTokenUsage = existing.Item ? 'tokenUsage' in existing.Item : false;
-    hadBonus = existing.Item ? 'tokenAllowanceBonus' in existing.Item : false;
-    originalCredits = existing.Item?.llmUsageCredits;
-    hadCredits = existing.Item ? 'llmUsageCredits' in existing.Item : false;
+
+    await ddb
+      .put({
+        TableName: USERS_TABLE,
+        ConditionExpression: 'attribute_not_exists(email)',
+        Item: {
+          email: FIXTURE_EMAIL,
+          userId: FIXTURE_USER_ID,
+          password: source.Item.password,
+          isOAuthUser: false,
+          isAdmin: false,
+          isActive: true,
+          roles: source.Item.roles ?? ['customer'],
+          displayName: `Usage runway E2E ${RUN_ID}`,
+          subscriptionType: source.Item.subscriptionType ?? 'Free',
+          allowedPages: source.Item.allowedPages,
+          allowedSkills: source.Item.allowedSkills,
+          allowedFeatures: source.Item.allowedFeatures,
+          createdAt: new Date().toISOString(),
+          e2eFixture: { kind: 'usage-runway', runId: RUN_ID },
+        },
+      })
+      .promise();
+    fixtureCreated = true;
+
+    const login = await api('POST', '/api/auth/login', {
+      email: FIXTURE_EMAIL,
+      password: SOURCE_PASSWORD,
+    });
+    if (login.status !== 200 || !login.data?.token) {
+      throw new Error(
+        `Ephemeral fixture login failed (${login.status}): ${JSON.stringify(login.data)}.`,
+      );
+    }
+    authToken = login.data.token;
+    userId = JSON.parse(
+      Buffer.from(authToken.split('.')[1], 'base64').toString('utf8'),
+    ).userId;
+    if (userId !== FIXTURE_USER_ID) {
+      throw new Error(`Fixture token belongs to ${userId}, expected ${FIXTURE_USER_ID}.`);
+    }
   }, 60_000);
 
   afterEach(async () => {
@@ -447,7 +460,7 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
     const failures: string[] = [];
 
     // Undo before deleting the ledger: an applied change outlives the rows that
-    // justified it, and `afterAll` restores usage counters only.
+    // justified it.
     // `api` awaits fetch, so a rejected request would throw straight out of this hook and
     // skip the ledger deletion below — leaving seeded spend in the table to change the burn
     // rate for every later scenario, which is the precise outcome this hook exists to
@@ -474,68 +487,26 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
       ),
     );
 
+    // Each scenario starts from the same empty billing state. This is an owned
+    // ephemeral user, so removing these attributes cannot erase real activity.
+    await ddb
+      .update({
+        TableName: USERS_TABLE,
+        Key: { email: FIXTURE_EMAIL },
+        UpdateExpression: 'REMOVE tokenUsage, tokenAllowanceBonus, llmUsageCredits',
+      })
+      .promise()
+      .catch((error: Error) => {
+        failures.push(`reset fixture billing state -> ${error.message}`);
+      });
+
     if (failures.length > 0) {
       throw new Error(`E2E cleanup failed, environment is now dirty:\n  ${failures.join('\n  ')}`);
     }
   }, 60_000);
 
   afterAll(async () => {
-    // Put the test user back exactly as found. Leaving a seeded cap behind would
-    // pause a shared dev account for whoever uses it next.
-    //
-    // KNOWN HAZARD on a SHARED account: this restores the value captured in `beforeAll`,
-    // so any real spend recorded by someone else DURING the run is overwritten and their
-    // usage silently rolled back. Observed live — a scheduled chat billed $0.73 to this
-    // account mid-run — it simply landed after the restore rather than before. The real
-    // remedy is an account whose ledger this suite owns (E2E_TEST_EMAIL), which scenario 8
-    // already requires for its own reasons.
-    if (!userId) return;
     const failures: string[] = [];
-
-    // ABSENT, null and 0 are three different states. `?? null` / `?? 0` would write
-    // an attribute onto an account that never had one — restoring the account into
-    // a shape it was never in is not a restore.
-    const sets: string[] = [];
-    const removes: string[] = [];
-    const values: Record<string, unknown> = {};
-    if (hadTokenUsage) {
-      sets.push('tokenUsage = :u');
-      values[':u'] = originalTokenUsage;
-    } else {
-      removes.push('tokenUsage');
-    }
-    if (hadBonus) {
-      sets.push('tokenAllowanceBonus = :b');
-      values[':b'] = originalBonus;
-    } else {
-      removes.push('tokenAllowanceBonus');
-    }
-    if (hadCredits) {
-      sets.push('llmUsageCredits = :c');
-      values[':c'] = originalCredits;
-    } else {
-      removes.push('llmUsageCredits');
-    }
-    const expression = [
-      sets.length ? `SET ${sets.join(', ')}` : '',
-      removes.length ? `REMOVE ${removes.join(', ')}` : '',
-    ]
-      .filter(Boolean)
-      .join(' ');
-
-    if (expression) {
-      await ddb
-        .update({
-          TableName: USERS_TABLE,
-          Key: { email: TEST_EMAIL },
-          UpdateExpression: expression,
-          ...(Object.keys(values).length ? { ExpressionAttributeValues: values } : {}),
-        })
-        .promise()
-        .catch((error: Error) => {
-          failures.push(`restore user -> ${error.message}`);
-        });
-    }
 
     for (const scheduleId of createdScheduleIds.splice(0)) {
       await ddb
@@ -546,9 +517,18 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
         });
     }
 
+    if (fixtureCreated) {
+      await ddb
+        .delete({ TableName: USERS_TABLE, Key: { email: FIXTURE_EMAIL } })
+        .promise()
+        .catch((error: Error) => {
+          failures.push(`delete fixture user ${FIXTURE_EMAIL} -> ${error.message}`);
+        });
+    }
+
     if (failures.length > 0) {
       throw new Error(
-        `E2E teardown failed — the test account was NOT fully restored:\n  ${failures.join('\n  ')}`,
+        `E2E teardown failed — ephemeral data remains:\n  ${failures.join('\n  ')}`,
       );
     }
   }, 60_000);
@@ -740,14 +720,9 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
     // extrapolate from, and guessing would be worse than saying so.
     await seedUserSpend({ totalCost: 5 });
 
-    // PRECONDITION, checked rather than assumed. "Insufficient history" is the one scenario
-    // that cannot be seeded INTO existence — it requires the absence of ledger rows, and no
-    // amount of writing produces an absence. The shared test account carries real spend
-    // across many days of the cycle, so on that account this scenario is unrunnable.
-    //
-    // Checked and failed loudly rather than skipped: a skip here would read as coverage of
-    // AC5's "no false-precision date", which is exactly the claim that would then be
-    // untrue. The remedy is an account whose ledger this suite owns, via E2E_TEST_EMAIL.
+    // The run-specific fixture starts with no ledger history and afterEach removes every
+    // row seeded by prior scenarios. Keep the precondition explicit: a polluted fixture
+    // must fail loudly rather than turn this into another false-green conditional skip.
     const cycleStart = `${currentMonth()}-01`;
     const existingRows = await ddb
       .query({
@@ -759,11 +734,10 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
       .promise();
     if ((existingRows.Count || 0) > 0) {
       throw new Error(
-        `SCENARIO 8 cannot run against ${TEST_EMAIL}: it has ${existingRows.Count} ledger ` +
+        `SCENARIO 8 cannot run against ${FIXTURE_EMAIL}: it has ${existingRows.Count} ledger ` +
           `row(s) in the current cycle, so the forecast has history to work from and ` +
-          `"insufficient history" is unreachable. Point E2E_TEST_EMAIL at an account whose ` +
-          `ledger this suite owns. Failing rather than skipping — a skip would look like ` +
-          `AC5 was covered when it was not.`,
+          `"insufficient history" is unreachable. Fixture cleanup failed or foreign data ` +
+          `was written under ${FIXTURE_USER_ID}; refusing to report AC5 as covered.`,
       );
     }
 

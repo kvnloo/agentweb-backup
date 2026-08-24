@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import dotenv from "dotenv";
 import path from "path";
 import { paginatedScan } from "../utils/dynamoPagination";
+import { buildWorkPlanInputRequest, type WorkPlanInputField } from './agentMode/core/workPlanInputRequest';
 
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -17,6 +18,21 @@ const dynamodb = new AWS.DynamoDB.DocumentClient({
 });
 
 export type WorkPlanVisibility = 'system' | 'private' | 'public' | 'pending_review';
+export type WorkPlanDisplayCategory = 'strategy' | 'paid-ads' | 'founder-led-sales' | 'event-led-sales' | 'content';
+export type WorkPlanDisplayChannel = 'meta' | 'google' | 'linkedin' | 'email' | 'event' | 'content' | 'cross-channel';
+
+/** Customer-facing metadata only. It never changes how a plan executes. */
+export interface WorkPlanDisplayMetadataV1 {
+  version: 1;
+  title?: string;
+  summary?: string;
+  categories?: WorkPlanDisplayCategory[];
+  channel?: WorkPlanDisplayChannel;
+  suite?: { id: string; name: string; position: number };
+  stepLabels?: string[];
+  /** Author-approved optional continuations; users may still start any plan. */
+  nextPlanIds?: string[];
+}
 
 /**
  * Maximum length of a step's userInstructions field. Capped so the
@@ -42,6 +58,7 @@ export interface WorkPlanStep {
    *  setWorkPlanStatus. Set this on multi-image steps (e.g. "Generate 18 images") so
    *  the step cannot be closed with only a fraction generated. */
   expectedAssetCount?: number;
+  inputRequest?: { title: string; prompt: string; fields: WorkPlanInputField[] };
 }
 
 export interface WorkPlan {
@@ -55,6 +72,7 @@ export interface WorkPlan {
   showInAgentMode?: boolean;
   defaultModel?: string;
   category?: string;
+  display?: WorkPlanDisplayMetadataV1;
   steps: WorkPlanStep[];
   ownerId?: string;
   orgId?: string;
@@ -90,6 +108,7 @@ const THUMBNAIL_FIELDS = ['thumbnail_url', 'thumbnail_source', 'thumbnail_alt_te
 const OPTIONAL_PLAN_FIELDS = [
   'description', 'welcomeMessage', 'autocomplete', 'requireLogin', 'showLoginSignup',
   'showInAgentMode', 'defaultModel', 'category', 'ownerId', 'orgId', 'reviewFeedback',
+  'display',
 ] as const;
 
 /** Always written. */
@@ -114,14 +133,16 @@ export class WorkPlanService {
   private validateSteps(steps: WorkPlanStep[] | undefined): void {
     if (!steps) return;
     steps.forEach((step, idx) => {
-      if (step.userInstructions === undefined || step.userInstructions === null) return;
-      if (typeof step.userInstructions !== 'string') {
+      if (step.userInstructions !== undefined && step.userInstructions !== null && typeof step.userInstructions !== 'string') {
         throw new Error(`step ${idx + 1}: userInstructions must be a string`);
       }
-      if (step.userInstructions.length > USER_INSTRUCTIONS_MAX_LENGTH) {
+      if (typeof step.userInstructions === 'string' && step.userInstructions.length > USER_INSTRUCTIONS_MAX_LENGTH) {
         throw new Error(
           `step ${idx + 1}: userInstructions exceeds ${USER_INSTRUCTIONS_MAX_LENGTH} characters (got ${step.userInstructions.length})`,
         );
+      }
+      if (step.inputRequest !== undefined) {
+        buildWorkPlanInputRequest({ requestId: `validation-step-${idx + 1}`, stepCount: idx + 1, ...step.inputRequest, createdAt: '1970-01-01T00:00:00.000Z' });
       }
     });
   }

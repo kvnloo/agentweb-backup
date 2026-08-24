@@ -1759,6 +1759,91 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       return true;
     };
 
+    // A generated branch has no CI of its own: the landing-page repository runs
+    // Tests for pull requests. Open (or reuse) that repository-supported review
+    // path, then inspect the exact draft SHA before any write can advance main.
+    // The route deliberately returns a retryable, non-500 result while GitHub is
+    // still running the check; it never treats a branch-level result as proof for
+    // a different commit.
+    if (await refuseIfConsentWithdrawn()) return;
+
+    const draftRefRes = await axios.get<any>(
+      `${repoBase}/git/ref/heads/${encodeURIComponent(branch)}`,
+      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+    );
+    const draftSha: string = draftRefRes.data.object.sha;
+    const findOpenDraftPr = () => axios.get<any[]>(`${repoBase}/pulls`, {
+      headers: ghHeaders,
+      timeout: GITHUB_TIMEOUT_MS,
+      params: { state: "open", head: `${owner}:${branch}`, base: "main" },
+    });
+    const existingPrRes = await findOpenDraftPr();
+
+    if (existingPrRes.data.length === 0) {
+      try {
+        await axios.post(
+          `${repoBase}/pulls`,
+          {
+            title: `Publish landing page changes from ${branch}`,
+            head: branch,
+            base: "main",
+            body: "Automated publish check for the generated landing-page draft.",
+          },
+          { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+        );
+      } catch (createPrErr: any) {
+        // Another publish request can create the same PR after our lookup. GitHub
+        // returns 422 for that benign race; prove the PR now exists before reuse.
+        const createPrMessages = [
+          createPrErr.response?.data?.message,
+          ...(Array.isArray(createPrErr.response?.data?.errors)
+            ? createPrErr.response.data.errors.map((error: { message?: string }) => error.message)
+            : []),
+        ].filter((message): message is string => typeof message === "string");
+        const isDuplicatePr = createPrMessages.some((message) => /pull request already exists/i.test(message));
+        if (createPrErr.response?.status !== 422 || !isDuplicatePr) throw createPrErr;
+        const racedPrRes = await findOpenDraftPr();
+        if (racedPrRes.data.length === 0) throw createPrErr;
+      }
+    }
+
+    const checksRes = await axios.get<any>(
+      `${repoBase}/commits/${draftSha}/check-runs`,
+      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+    );
+    const testsCheck = (checksRes.data.check_runs || []).find(
+      (check: { name?: string }) => check.name === "Tests"
+    );
+
+    if (!testsCheck || testsCheck.status !== "completed" || testsCheck.conclusion === "cancelled") {
+      const message = !testsCheck
+        ? "Required Tests check has not started for this draft yet. Keep the draft and retry publish after GitHub starts it."
+        : testsCheck.conclusion === "cancelled"
+          ? "Required Tests check was cancelled for this draft. Keep the draft and retry publish after Tests runs again."
+        : "Required Tests check is still running for this draft. Keep the draft and retry publish when it completes."
+      return res.status(409).json({ error: "required_tests_pending", message });
+    }
+    if (testsCheck.conclusion !== "success") {
+      return res.status(409).json({
+        error: "required_tests_failed",
+        message: "Required Tests check failed for this draft. Fix the draft and retry publish after Tests passes.",
+      });
+    }
+
+    // A Tests result belongs only to the SHA inspected above. Pin every later
+    // main-advancing operation to that SHA and refuse if the draft moved while
+    // the check was running; the newer commit needs its own Tests result.
+    const checkedDraftRefRes = await axios.get<any>(
+      `${repoBase}/git/ref/heads/${encodeURIComponent(branch)}`,
+      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+    );
+    if (checkedDraftRefRes.data.object.sha !== draftSha) {
+      return res.status(409).json({
+        error: "draft_changed_after_tests",
+        message: "The draft changed after its Tests check ran. Keep the newer draft and retry publish after Tests passes for its new commit.",
+      });
+    }
+
     if (await refuseIfConsentWithdrawn()) return;
 
     try {
@@ -1766,7 +1851,7 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
         `${repoBase}/merges`,
         {
           base: "main",
-          head: branch,
+          head: draftSha,
           commit_message: `Publish landing page changes from ${branch}`,
         },
         { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
@@ -1778,19 +1863,11 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
 
       console.warn(`[LP GENERATION] Standard merge returned 409; force-advancing main to draft branch tip`);
 
-      // Get the current SHA of the draft branch tip
-      const branchRes = await axios.get<any>(
-        `${repoBase}/git/ref/heads/${encodeURIComponent(branch)}`,
-        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
-      );
-      const draftSha: string = branchRes.data.object.sha;
-
-      // The branch lookup above is a second 30s window on top of the failed merge,
-      // so re-check here too: this force-update is what makes the page public on
-      // this path, and it must not run on consent read before either of them.
+      // The post-Tests ref read above proved that this exact SHA is still the
+      // draft tip. Use that immutable SHA here, never a newer untested branch tip.
       if (await refuseIfConsentWithdrawn()) return;
 
-      // Force-update main to point at the draft branch tip
+      // Force-update main to the tested draft SHA.
       await axios.patch<any>(
         `${repoBase}/git/refs/heads/main`,
         { sha: draftSha, force: true },
@@ -1802,10 +1879,18 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
 
     // Delete the draft branch
     try {
-      await axios.delete(`${repoBase}/git/refs/heads/${branch}`, {
-        headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
-      });
-      console.log(`[LP GENERATION] Deleted branch ${branch}`);
+      const deleteRefRes = await axios.get<any>(
+        `${repoBase}/git/ref/heads/${encodeURIComponent(branch)}`,
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+      if (deleteRefRes.data.object.sha !== draftSha) {
+        console.warn(`[LP GENERATION] Preserved newer draft branch ${branch} after publish`);
+      } else {
+        await axios.delete(`${repoBase}/git/refs/heads/${branch}`, {
+          headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
+        });
+        console.log(`[LP GENERATION] Deleted branch ${branch}`);
+      }
     } catch (delErr: any) {
       console.warn(`[LP GENERATION] Could not delete branch ${branch}: ${delErr.message}`);
     }

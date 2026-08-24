@@ -10,7 +10,7 @@ import { userDb } from '../services/db';
 import { canViewItem, canEditItem, isFeatureEffectivelyEnabled } from '../services/orgShareService';
 import { emailService } from '../services/emailService';
 import { Storage, Bucket } from '@google-cloud/storage';
-import { getAzureClient, meterUsageFromResponse } from '../utils/llmClients';
+import { agentModeService } from '../services/agentModeService';
 import axios from 'axios';
 import AWS from 'aws-sdk';
 import { dynamodb } from '../config/aws';
@@ -1390,19 +1390,15 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
     
     Based on the above information, provide ONLY the updated markdown content for the knowledge base. Do not include any explanations, notes, or additional text. Output only the markdown content that should replace the current knowledge base content.`;
 
-    // Call OpenAI to get the updated content
-    // Un-metered client + explicit meter below: a real userId means this spend
-    // must be charged to that user's cap (tokens + cost), not just recorded (ENG-200).
-    const openai = getAzureClient({ userId, feature: 'task_kb_update' }, process.env.AZURE_OPENAI_DEPLOYMENT, { metered: false });
-    const completion = await openai.chat.completions.create({
-      messages: [{ role: "user", content: prompt }],
-      model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
+    const completion = await agentModeService.callLLM(
+      process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-5.5',
+      [{ role: 'user', content: prompt }],
+      {
       temperature: 0.4,
-      max_tokens: 32768,
-    });
-    meterUsageFromResponse(
-      { userId, model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4', provider: 'azure-openai', feature: 'task_kb_update' },
-      completion
+        max_completion_tokens: 32768,
+        usageContext: { userId, feature: 'task_kb_update' },
+        taskClass: 'scheduled_background',
+      },
     );
 
     const updatedContent = completion.choices[0].message.content || '';

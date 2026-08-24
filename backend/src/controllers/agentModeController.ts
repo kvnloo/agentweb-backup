@@ -11,9 +11,12 @@ import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
+import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
+import { buildWorkPlanInputRequest, resolveWorkPlanInputAnswer, WorkPlanInputRequestError } from '../services/agentMode/core/workPlanInputRequest';
+import type { WorkPlanTurnDisposition } from '../services/agentMode/core/workPlanTurnDisposition';
 import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
@@ -75,6 +78,7 @@ import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
+import { validateNewChatHeroGreeting } from '../utils/newChatHeroGreeting';
 import { normalizeEmailList } from '../utils/validation';
 import {
   MAX_ATOMIC_RUN_RESULT_REMOVALS,
@@ -283,10 +287,6 @@ async function applyScheduleEditWithConsentNarrowing(
 type EffectiveModelPolicyDecision = PolicyModelDecision & {
   usageMode: 'full_choice' | 'optimized' | 'paused';
   usagePolicyVersion: string | null;
-  // undefined keeps unrestricted requests on the global backup behavior; optimized
-  // requests always carry string|null so provider retries cannot escape the catalog.
-  transientFallbackModel?: string | null;
-  transientFallbackSource?: ModelBackupSource | null;
 };
 
 function toStoredModelPolicyDecision(decision: EffectiveModelPolicyDecision) {
@@ -343,25 +343,10 @@ async function resolveEffectiveModelForUser(input: {
     supportedModelIds,
     policy: usage.policy,
   });
-  // ENG-1211: the policy-owned transient fallback existed only to keep an
-  // optimized-mode retry inside the cheap catalog. With optimized mode deleted
-  // these stay `undefined`, which `getBackupModel` reads as "preserve the
-  // admin-managed global backup" — i.e. a transient provider failure retries the
-  // way it did before usage caps, unconstrained by any catalog.
-  //
-  // Consequence worth knowing: the audit branch that rewrote the session's model
-  // when a policy fallback answered is now unreachable, so a global-backup retry
-  // is not written back to the session. That is pre-existing behavior for the
-  // unrestricted path, not a new gap — recording the model that actually ran on
-  // every path is ENG-1205 AC1.
-  const transientFallbackModel: string | null | undefined = undefined;
-  const transientFallbackSource: ModelBackupSource | null | undefined = undefined;
   return {
     ...decision,
     usageMode: usage.mode.usageMode,
     usagePolicyVersion: usage.policy?.version || null,
-    transientFallbackModel,
-    transientFallbackSource,
   };
 }
 
@@ -1023,8 +1008,6 @@ async function scheduleAutoMediaContinuation(
       undefined, // answeredQuestionMeta
       undefined, // turnStartMs — no whole-turn deadline for this background continuation
       undefined, // publishAuthorizationOverride
-      undefined, // transientFallbackModel
-      undefined, // modelPolicyDecisionForAudit
       undefined, // approvedRevisionImageSources
       'auto-continuation', // ENG-1239: hide this server-authored turn in the chat UI
     ),
@@ -2771,7 +2754,7 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
         // The closing of the message is where a halt lives; cap input for cost.
         { role: 'user', content: content.slice(-2500) },
       ],
-      { temperature: 0, max_completion_tokens: 3 }
+      { temperature: 0, max_completion_tokens: 3, taskClass: 'scheduled_background' }
     );
     const timeoutPromise = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error('confirmation judge timed out')), CONFIRMATION_JUDGE_TIMEOUT_MS)
@@ -2973,9 +2956,6 @@ export async function runVerifiedChat(
      * required-function list together, so they still cannot disagree.
      */
     refreshPublishAuthorization?: () => Promise<SchedulePublishAuthorization | null>;
-    // Already resolved by the cost policy. Optimized scheduled runs pass string|null
-    // so a transient retry remains inside the approved optimized catalog.
-    transientFallbackModel?: string | null;
     // ENG-936: approval-bound source URLs for `generate_image` revisions in
     // this run. Passed through to the tool dispatcher so confirm=true edits of
     // the wrong source are rejected before execution.
@@ -3423,8 +3403,6 @@ export async function runVerifiedChat(
           undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
           livePublishAuthorization,
-          params.transientFallbackModel,
-          params.modelPolicyDecisionForAudit,
           approvedRevisionImageSources
         );
         if (continuationResponse.content) {
@@ -3556,8 +3534,6 @@ export async function runVerifiedChat(
         undefined, undefined, undefined, undefined, undefined, undefined,
         undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
         livePublishAuthorization,
-        params.transientFallbackModel,
-        params.modelPolicyDecisionForAudit,
         approvedRevisionImageSources
       );
 
@@ -5121,7 +5097,6 @@ export async function runScheduledChat(
       maxAttempts: 20,
       attachments: fileAttachments,
       llmModel: modelToUse,
-      transientFallbackModel: scheduleModelPolicy.transientFallbackModel,
       modelPolicyDecisionForAudit: scheduleModelPolicy,
       // ENG-657: on a resume, count the abandoned portion's tool calls in
       // verification so requiredFunctionCalls isn't falsely missed (empty otherwise).
@@ -6386,13 +6361,6 @@ export async function generateSessionResponse(
   // When absent — the interactive route, or a resumed run entered directly — fall
   // back to reading the schedule for this turn.
   publishAuthorizationOverride?: SchedulePublishAuthorization,
-  // Cost-policy-owned transient retry target. Optimized callers always pass a
-  // string or null; omission preserves the unrestricted global backup behavior.
-  transientFallbackModel?: string | null,
-  // The caller's just-resolved admission decision. This is intentionally not sent
-  // to the worker; it only makes the post-fallback durable audit independent of a
-  // stale pre-admission session read.
-  modelPolicyDecisionForAudit?: EffectiveModelPolicyDecision,
   // ENG-936: approved image-source URLs for this run (currently used by
   // image-revision confirmation preflights). Passed into the worker only.
   approvedRevisionImageSources?: string[],
@@ -6400,6 +6368,9 @@ export async function generateSessionResponse(
   // customer-typed (e.g. 'auto-continuation'), so the customer-portal chat renderer
   // can hide it instead of showing the raw [SYSTEM] directive as a user chat bubble.
   userMessageKind?: string,
+  // Enforce a provider-independent structured outcome on workplan progression
+  // turns (step completion or a persisted input/question request).
+  requireWorkPlanDisposition: boolean = false,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -6408,9 +6379,6 @@ export async function generateSessionResponse(
   responseMessages: any[];
   workPlan?: any;
   skills?: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[];
-  backupModelUsed?: boolean;
-  originalModel?: string;
-  backupModel?: string;
   // ENG-244: true when the underlying run exhausted its step budget (maxIterations)
   // and was truncated before emitting the final deliverable. The scheduled-run
   // completion gate uses this flag (not response text) to force a synthesis turn.
@@ -6422,6 +6390,7 @@ export async function generateSessionResponse(
   // customer message) before it could compose a closing reply — content may be empty
   // even though toolCalls shows real work (an already-dispatched call can't be aborted).
   cancelled?: boolean;
+  workPlanTurnDisposition?: WorkPlanTurnDisposition;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
@@ -6489,6 +6458,8 @@ export async function generateSessionResponse(
   // Check if this is the first user message (excluding system message)
   const userMessages = session.messages?.filter(msg => msg.role === 'user') || [];
   const isFirstMessage = userMessages.length === 0;
+  const enforceWorkPlanDisposition = requireWorkPlanDisposition
+    || (Boolean(session.workPlan) && isFirstMessage);
 
   // If this is the first message, add system message with version info first
   if (isFirstMessage) {
@@ -6700,8 +6671,8 @@ export async function generateSessionResponse(
       // ENG-907: the caller's whole-turn deadline stamp (undefined when the caller
       // enforces no cap), so the loop wraps itself up against the real deadline.
       turnStartMs,
-      transientFallbackModel,
       approvedRevisionImageSources,
+      requireWorkPlanDisposition: enforceWorkPlanDisposition,
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -6709,27 +6680,6 @@ export async function generateSessionResponse(
     }
   );
 
-  // The admission decision is stamped before dispatch. If the provider then fails
-  // transiently and the approved optimized fallback actually answers, update the
-  // session to the model that incurred cost so audits never report the failed primary
-  // as the effective model. This is scoped to policy-owned fallbacks; unrestricted
-  // legacy retries retain their existing persistence behavior.
-  if (
-    response.backupModelUsed &&
-    response.backupModel &&
-    transientFallbackModel !== undefined &&
-    modelPolicyDecisionForAudit?.usageMode === 'optimized'
-  ) {
-    await chatbotDb.updateSessionLlmModel(sessionId, response.backupModel, {
-      ...toStoredModelPolicyDecision(modelPolicyDecisionForAudit),
-      effectiveModel: response.backupModel,
-      backupModel: response.backupModel,
-      backupSource: modelPolicyDecisionForAudit.transientFallbackSource || 'system',
-      modelSelection: 'corrected',
-      modelSelectionReason: 'primary_model_transient_failure_using_policy_fallback',
-      recordedAt: new Date().toISOString(),
-    });
-  }
 
   // If the user clicked Stop, drop the FINAL (in-flight) turn — we don't run the batch
   // below, so a page reload shows no ghost final response from the cancelled turn. Any
@@ -7205,7 +7155,7 @@ export const agentModeController = {
     let modelPolicyDecision: EffectiveModelPolicyDecision | undefined;
     try {
       const user = req.user as User;
-      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer } = req.body;
+      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer } = req.body;
       let { userMessage } = req.body;
 
       // If the request contains audio, transcribe it to text first
@@ -7333,6 +7283,33 @@ export const agentModeController = {
           // the REAL answer rather than silently discarding it.
           const fresh = await chatbotDb.getChatSession(sessionId);
           session.pendingUserQuestion = fresh?.pendingUserQuestion;
+        }
+      }
+
+      // Work-plan details are validated and persisted as structured values before
+      // Emma receives the continuation. This keeps chat and MCP answers identical
+      // and makes duplicate submits fail closed instead of overwriting the first.
+      if (workPlanInputAnswer) {
+        try {
+          const pendingWorkPlanInput = session.pendingWorkPlanInput;
+          if (!pendingWorkPlanInput) {
+            return res.status(409).json({ error: 'These details are no longer awaiting a response.', code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          const answered = resolveWorkPlanInputAnswer(
+            pendingWorkPlanInput,
+            workPlanInputAnswer.values,
+            new Date().toISOString(),
+          );
+          const persisted = await chatbotDb.updateSessionWorkPlanInputRequest(sessionId, answered, {
+            requireStillAwaiting: workPlanInputAnswer.requestId,
+          });
+          if (!persisted) return res.status(409).json({ error: 'These details were already submitted.', code: 'WORK_PLAN_INPUT_INVALID' });
+          userMessage = `${userMessage}\n\n[Structured work plan details: ${JSON.stringify(answered.answer?.values ?? {})}]`;
+        } catch (err) {
+          if (err instanceof WorkPlanInputRequestError || err instanceof TypeError) {
+            return res.status(409).json({ error: err.message, code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          throw err;
         }
       }
 
@@ -7541,8 +7518,9 @@ export const agentModeController = {
         answeredQuestionMeta, // ENG-396: structured click record stamped on the reply
         turnStartMs, // ENG-907: the deadline withGenerationTimeout below enforces
         undefined, // publishAuthorizationOverride — interactive path resolves per turn
-        modelPolicyDecision.transientFallbackModel,
-        modelPolicyDecision
+        undefined, // approvedRevisionImageSources
+        undefined, // userMessageKind
+        Boolean(questionAnswer || workPlanInputAnswer),
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -7754,7 +7732,7 @@ export const agentModeController = {
         workPlan: response.workPlan,
         skills: response.skills,
         ...(invalidations ? { invalidations } : {}),
-        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {}),
+        ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
         ...(modelPolicyDecision ? {
           requestedModel: modelPolicyDecision.requestedModel,
           effectiveModel: modelPolicyDecision.effectiveModel,
@@ -8139,6 +8117,42 @@ export const agentModeController = {
     }
   },
 
+  // Presentation-only New Chat greeting. It is never included in Emma's prompt
+  // or persisted as a chat message.
+  async getNewChatHeroGreeting(req: Request, res: Response) {
+    try {
+      res.json(await agentModeService.getNewChatHeroGreeting());
+    } catch (error) {
+      console.error('AgentMode: Get New Chat hero greeting error:', error);
+      res.status(500).json({ error: 'Failed to get New Chat hero greeting' });
+    }
+  },
+
+  async updateNewChatHeroGreeting(req: Request, res: Response) {
+    try {
+      const validationError = validateNewChatHeroGreeting(req.body);
+      if (validationError) return res.status(400).json({ error: validationError });
+
+      const greeting = await agentModeService.saveNewChatHeroGreeting(
+        req.body,
+        req.user?.email || 'system',
+      );
+      res.json(greeting);
+    } catch (error) {
+      console.error('AgentMode: Update New Chat hero greeting error:', error);
+      res.status(500).json({ error: 'Failed to update New Chat hero greeting' });
+    }
+  },
+
+  async resetNewChatHeroGreeting(req: Request, res: Response) {
+    try {
+      res.json(await agentModeService.resetNewChatHeroGreeting());
+    } catch (error) {
+      console.error('AgentMode: Reset New Chat hero greeting error:', error);
+      res.status(500).json({ error: 'Failed to reset New Chat hero greeting' });
+    }
+  },
+
   // Get conversation starters
   async getConversationStarters(req: Request, res: Response) {
     try {
@@ -8423,7 +8437,8 @@ export const agentModeController = {
           // reflect the real answered option (highlight + "Answered") instead of a bare
           // "View only". Everything here is already visible in the transcript's card, so
           // it leaks nothing new; the share stays read-only via the card's readOnly path.
-          pendingUserQuestion: session.pendingUserQuestion
+          pendingUserQuestion: session.pendingUserQuestion,
+          pendingWorkPlanInput: session.pendingWorkPlanInput
         }
       });
 
@@ -8470,7 +8485,8 @@ export const agentModeController = {
     try {
       const { shareId } = req.params;
       const { conversable } = req.query;
-      const { userMessage, llmModel, attachments = [] } = req.body;
+      const { userMessage, llmModel, attachments = [], workPlanInputAnswer } = req.body;
+      let effectiveUserMessage = userMessage;
 
       if (!userMessage) {
         return res.status(400).json({ error: 'User message is required' });
@@ -8517,6 +8533,32 @@ export const agentModeController = {
       }
 
       try {
+
+      if (workPlanInputAnswer) {
+        try {
+          const pendingWorkPlanInput = session.pendingWorkPlanInput;
+          if (!pendingWorkPlanInput) {
+            return res.status(409).json({ error: 'These details are no longer awaiting a response.', code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          const answered = resolveWorkPlanInputAnswer(
+            pendingWorkPlanInput,
+            workPlanInputAnswer.values,
+            new Date().toISOString(),
+          );
+          const persisted = await chatbotDb.updateSessionWorkPlanInputRequest(session.sessionId, answered, {
+            requireStillAwaiting: workPlanInputAnswer.requestId,
+          });
+          if (!persisted) {
+            return res.status(409).json({ error: 'These details were already submitted.', code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          effectiveUserMessage = `${effectiveUserMessage}\n\n[Structured work plan details: ${JSON.stringify(answered.answer?.values ?? {})}]`;
+        } catch (err) {
+          if (err instanceof WorkPlanInputRequestError || err instanceof TypeError) {
+            return res.status(409).json({ error: err.message, code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          throw err;
+        }
+      }
 
       // ENG-705: this route is registered before `router.use(authenticateToken)`,
       // so the caller is anonymous — but the spend is not. Gate on the share
@@ -8583,7 +8625,7 @@ export const agentModeController = {
       const response = await withGenerationTimeout(
         generateSessionResponse(
           session.sessionId,
-          userMessage,
+          effectiveUserMessage,
           session.userId,
           modelToUse,
           attachments,
@@ -8599,8 +8641,9 @@ export const agentModeController = {
           // for it, exactly as ENG-907 described.
           sharedTurnStartMs,
           undefined, // publishAuthorizationOverride — shared path has no schedule consent
-          modelPolicyDecision.transientFallbackModel,
-          modelPolicyDecision
+          undefined, // approvedRevisionImageSources
+          undefined, // userMessageKind
+          Boolean(workPlanInputAnswer),
         ),
         session.sessionId
       );
@@ -8614,7 +8657,7 @@ export const agentModeController = {
         sources: response.sources,
         workPlan: response.workPlan,
         skills: response.skills,
-        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
+        ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
       });
       } finally {
         releaseSessionGeneration(session.sessionId);
@@ -9183,6 +9226,108 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Submit message feedback error:', error);
       res.status(500).json({ error: 'Failed to submit feedback' });
+    }
+  },
+
+  /**
+   * POST /api/agent-mode/session/:sessionId/work-plan-recommendations/:recommendationId/accept
+   *
+   * ENG-1472: the owner-only accept endpoint for a `recommend_predefined_work_plan`
+   * proposal. Only the session owner may call it — this route sits below
+   * `router.use(authenticateToken)` and is deliberately NOT registered under the
+   * `/ishare`/`/share` public routes, so interactive/view-only shares (which
+   * authenticate via a conversable token, not a JWT) cannot reach it at all.
+   *
+   * The plan to instantiate is resolved from the SESSION'S OWN persisted
+   * recommendation record by recommendationId — never from anything in the
+   * request body — and re-resolved for access at click time before being
+   * applied via the existing applyPredefinedWorkPlan path.
+   */
+  async acceptWorkPlanRecommendation(req: AuthenticatedRequest, res: Response) {
+    try {
+      const { sessionId, recommendationId } = req.params;
+      const user = req.user as User;
+      if (!user) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Owner-only — no admin bypass. A delegated session already carries the
+      // target customer's userId as req.user (see the delegation docs in
+      // CLAUDE.md), so this still succeeds correctly for a delegated accept;
+      // a real admin viewing someone else's session without delegating is
+      // refused, same as everywhere else a customer's own plan is mutated.
+      if (session.userId !== user.userId) {
+        return res.status(403).json({ error: 'Only the session owner can accept a work plan recommendation.' });
+      }
+
+      const { findWorkPlanRecommendationToolResult, resolveAccessiblePredefinedWorkPlan } =
+        await import('../services/predefinedWorkPlanResolver');
+
+      const recommendation = findWorkPlanRecommendationToolResult(
+        session.messages,
+        (r) => r.recommendationId === recommendationId,
+      );
+      if (!recommendation || !recommendation.plan?.id) {
+        return res.status(404).json({
+          error: 'WORKPLAN_UNAVAILABLE',
+          code: 'WORKPLAN_UNAVAILABLE',
+          message: 'This work plan recommendation is no longer available.',
+        });
+      }
+      const planId = recommendation.plan.id;
+
+      // Idempotency requires the stable template identity. A legacy work plan
+      // without templatePlanId cannot safely be matched by title: ad-hoc plans
+      // can share a template title, so treating one as applied would silently
+      // suppress the selected recommendation.
+      const existingWorkPlan = session.workPlan;
+      const hasActivePlan = !!existingWorkPlan && Array.isArray(existingWorkPlan.steps) && existingWorkPlan.steps.length > 0;
+      const alreadyApplied = hasActivePlan && (existingWorkPlan as any).templatePlanId === planId;
+      if (alreadyApplied) {
+        return res.status(200).json({ success: true, alreadyApplied: true, workPlan: existingWorkPlan });
+      }
+
+      // A DIFFERENT work plan is already active — conflict, never force-replace here.
+      if (hasActivePlan) {
+        return res.status(409).json({
+          error: 'ACTIVE_WORK_PLAN',
+          code: 'ACTIVE_WORK_PLAN',
+          message: `A work plan "${existingWorkPlan!.title}" is already active in this session.`,
+        });
+      }
+
+      // Re-resolve access at click time — the plan can have been deleted,
+      // unpublished, or had its access changed since it was recommended.
+      const plan = await resolveAccessiblePredefinedWorkPlan({ planId, userId: user.userId });
+      if (!plan) {
+        return res.status(404).json({
+          error: 'WORKPLAN_UNAVAILABLE',
+          code: 'WORKPLAN_UNAVAILABLE',
+          message: 'This work plan is no longer available.',
+        });
+      }
+
+      const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId);
+      if (!result.success) {
+        // Defensive backstop for a race between our pre-check above and this
+        // call (e.g. a concurrent accept/launch landed in between) — never a
+        // silent partial: chat/session state is left exactly as applyPredefinedWorkPlan
+        // left it (unchanged on failure).
+        if (result.requiresConfirmation) {
+          return res.status(409).json({ error: 'ACTIVE_WORK_PLAN', code: 'ACTIVE_WORK_PLAN', message: result.message });
+        }
+        return res.status(404).json({ error: 'WORKPLAN_UNAVAILABLE', code: 'WORKPLAN_UNAVAILABLE', message: result.message });
+      }
+
+      return res.status(200).json({ success: true, alreadyApplied: false, workPlan: result.workPlan });
+    } catch (error) {
+      console.error('AgentMode: Accept work plan recommendation error:', error);
+      res.status(500).json({ error: 'Failed to accept work plan recommendation' });
     }
   },
 
@@ -11392,6 +11537,7 @@ export const agentModeController = {
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         workPlan: session.workPlan,
+        pendingWorkPlanInput: session.pendingWorkPlanInput,
         llmModel: modelToUse,
         isConversable: true
       });
@@ -11446,7 +11592,6 @@ export const agentModeController = {
         sources: response.sources,
         workPlan: response.workPlan,
         skills: response.skills,
-        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
     } catch (error) {
       console.error('AgentMode: Generate conversable response error:', error);
@@ -11547,7 +11692,11 @@ export const agentModeController = {
         }
       }
 
-      // Map to legacy shape expected by customer portal (uses 'id' not 'planId')
+      // Map to legacy shape expected by customer portal (uses 'id' not 'planId').
+      // `display` carries the new canonical customer-facing projection alongside
+      // the legacy keys above — existing PlanPage/AgentMode consumers keep
+      // working unchanged, and a consumer that wants the safe, deduped
+      // browse/recommendation shape reads `display` instead (ENG-1469).
       const mapPlan = (p: any) => ({
         id: p.planId,
         title: p.title,
@@ -11563,6 +11712,7 @@ export const agentModeController = {
         visibility: p.visibility,
         thumbnail_url: p.thumbnail_url,
         thumbnail_alt_text: p.thumbnail_alt_text,
+        display: projectWorkPlanForCustomer(p),
       });
 
       // Put private plans first, then public — deduplicate by title so user's
@@ -11641,6 +11791,9 @@ export const agentModeController = {
         defaultModel: workPlan.defaultModel,
         steps: workPlan.steps,
         visibility: workPlan.visibility,
+        // Canonical customer-facing projection alongside the legacy keys above
+        // — existing consumers are unaffected (ENG-1469).
+        display: projectWorkPlanForCustomer(workPlan),
       });
     } catch (error) {
       console.error('AgentMode: Get predefined work plan error:', error);
@@ -11726,6 +11879,7 @@ export const agentModeController = {
           // panel. Without this, the field set in the partner-portal
           // editor never reaches the customer portal.
           ...(step.userInstructions !== undefined && { userInstructions: step.userInstructions }),
+          ...(step.inputRequest !== undefined && { inputRequest: step.inputRequest }),
           status: 'pending' as const,
           completedAt: undefined,
           notes: undefined,
@@ -11742,9 +11896,22 @@ export const agentModeController = {
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
         autocomplete: predefinedPlan.autocomplete || false,
         showLoginSignup: predefinedPlan.showLoginSignup || 'after_plan_completed',
-        requireLogin: predefinedPlan.requireLogin || false
+        requireLogin: predefinedPlan.requireLogin || false,
+        // ENG-1472: stamp which template this session's plan came from — the
+        // same field applyPredefinedWorkPlan stamps on its own instantiation
+        // path — so every predefined-plan session is traceable back to its
+        // template regardless of which route created it.
+        templatePlanId: predefinedPlan.planId,
       };
       await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
+      const firstInput = predefinedPlan.steps[0]?.inputRequest;
+      if (firstInput) {
+        await chatbotDb.updateSessionWorkPlanInputRequest(session.sessionId, buildWorkPlanInputRequest({
+          ...firstInput,
+          requestId: uuidv4(),
+          stepCount: 1,
+        }), { failIfAwaitingExists: true });
+      }
 
       // Auto-install ALL skills from ALL work plan steps upfront.
       // Skills need to be available from the start because tool filtering is computed

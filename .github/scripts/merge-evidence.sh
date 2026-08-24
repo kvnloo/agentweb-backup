@@ -134,9 +134,11 @@
 #   GH_TOKEN                    token for `gh`
 #   MERGE_EVIDENCE_DRAFT_JOB    discriminator job name
 #                               (default "Detect changed projects")
-#   MERGE_EVIDENCE_BACKEND_JOBS US-separated job names that must carry a
-#                               `success` when the diff touches the backend
-#                               paths (ENG-915)
+#   MERGE_EVIDENCE_BACKEND_JOBS newline-separated build jobs that must carry a
+#                               `success` when the diff touches backend paths
+#   MERGE_EVIDENCE_RETIRED_CHECKS newline-separated check-run names ignored
+#                               outright, any conclusion (default "Require
+#                               Greptile Review") — see section 3, Pass 3
 
 set -uo pipefail
 
@@ -155,19 +157,30 @@ BACKEND_PATHS='backend/
 # separated; names are matched exactly, and a name that never appears in the
 # payload is treated as "did not run" rather than ignored, so a rename fails
 # closed instead of quietly deleting the requirement.
-BACKEND_JOBS="${MERGE_EVIDENCE_BACKEND_JOBS:-Backend tests (agentMode)
-Backend tests (all other + coverage)}"
+BACKEND_JOBS="${MERGE_EVIDENCE_BACKEND_JOBS:-Backend build}"
 
-# ENG-1376 added a third backend job, "Backend coverage", and deliberately left
-# it OUT of this list. Not an oversight:
-#   - A coverage regression already blocks the merge. Section 6 fails on any
-#     check whose conclusion is in `bad`, named here or not.
-#   - What this list uniquely catches is a job that never reported. "Backend
-#     coverage" needs both jobs above, so it can only fail to report when one of
-#     them skipped or failed — and both of those are already required here.
-#   - Naming it would immediately fail every open backend PR whose head predates
-#     that job, forcing ~20 rebases to close a hole that does not exist.
-# Add it here if it ever stops depending on both test jobs.
+# ENG-1453: check-run names ignored outright, regardless of conclusion.
+# GitHub's commits/{sha}/check-runs endpoint retains a check run forever, even
+# after the workflow job that produced it is deleted — a NEW commit cannot
+# overwrite a job that no longer exists to run. ENG-1371 deleted the
+# `Require Greptile Review` job, and live-verified 2026-08-24: two otherwise
+# green, unchanged agentweb PRs (#2417, #2334) still hard-fail this gate
+# solely on that retired job's leftover `failure`.
+#
+# Matched by exact name against an explicit allowlist, not by diffing against
+# `.github/workflows/*.yml` at runtime — this script has no YAML parser
+# (bash+jq+gh only), and every other name-matching decision here already
+# fails closed on a rename rather than trying to infer intent, which an
+# allowlist preserves and dynamic introspection would not.
+#
+# Also not matched by GitHub App identity, which reads as the more principled
+# axis until checked against the actual payload: `Require Greptile Review`
+# was a first-party Actions job (app "github-actions", the same app as every
+# other job in this workflow), not the third-party Greptile integration
+# itself (`Greptile Review`, app "greptile-apps", which passes and was never
+# the blocker). An app-identity rule would be unable to tell this job apart
+# from any other Actions job, active or not.
+RETIRED_CHECKS="${MERGE_EVIDENCE_RETIRED_CHECKS:-Require Greptile Review}"
 
 log() { printf 'merge-evidence: %s\n' "$*"; }
 
@@ -466,6 +479,40 @@ if [ "${jq_exit}" -ne 0 ] || [ -z "${runs_json}" ]; then
   hard_fail "unparseable check-runs payload while selecting the latest result for each check context at ${head_sha}"
 fi
 
+# Pass 3 — DROP CHECK-RUNS NAMED ON THE RETIRED-CHECK ALLOWLIST (ENG-1453).
+# Unlike passes 1-2, this is not about currency — a retired check-run is not
+# superseded by anything newer, because nothing runs under that name anymore.
+# It is simply not evidence of anything a merge decision needs: neither a
+# `failure` nor a `success` from a job that no longer exists describes the
+# code at this head. Dropped before classification, so it cannot count as
+# `bad` OR as the `success` section 6 requires — a PR whose only success was a
+# leftover from a deleted job is correctly NO_EVIDENCE, not a pass.
+if [ -n "${RETIRED_CHECKS}" ]; then
+  retired_names="$(printf '%s' "${runs_json}" | jq -r --arg retired "${RETIRED_CHECKS}" '
+      ($retired | split("\n") | map(select(length > 0))) as $r
+      | [ .check_runs[] | select(.name as $n | $r | index($n) != null)
+          | "\(.name) (\(.conclusion // .status))" ] | join(", ")' 2>/dev/null)"
+  jq_exit=$?
+
+  if [ "${jq_exit}" -ne 0 ]; then
+    surface 'check-runs response (raw)' "${runs_json}"
+    hard_fail "failed to identify retired-allowlisted check-runs in the payload at ${head_sha}"
+  fi
+
+  if [ -n "${retired_names}" ]; then
+    runs_json="$(printf '%s' "${runs_json}" | jq -c --arg retired "${RETIRED_CHECKS}" '
+        ($retired | split("\n") | map(select(length > 0))) as $r
+        | .check_runs |= map(select(.name as $n | $r | index($n) == null))' 2>/dev/null)"
+    jq_exit=$?
+
+    if [ "${jq_exit}" -ne 0 ] || [ -z "${runs_json}" ]; then
+      hard_fail "failed to exclude retired-allowlisted check-runs from the check-runs payload at ${head_sha}"
+    fi
+
+    log "ignored check-run(s) named on MERGE_EVIDENCE_RETIRED_CHECKS, any conclusion: ${retired_names}"
+  fi
+fi
+
 effective_count="$(printf '%s' "${runs_json}" | jq -r '.check_runs | length' 2>/dev/null)"
 if ! grep -qE '^[0-9]+$' <<<"${effective_count}"; then
   hard_fail "check-runs payload became unreadable after narrowing to effective runs at ${head_sha}"
@@ -477,12 +524,12 @@ superseded_count=$((returned_count - effective_count))
 returned_count="${effective_count}"
 
 if [ "${superseded_count}" -gt 0 ]; then
-  log "ignored ${superseded_count} superseded check-run(s): suites proven cancelled-and-re-run ${superseded_suites}, then the latest run per check context"
+  log "ignored ${superseded_count} superseded and/or retired-allowlisted check-run(s): suites proven cancelled-and-re-run ${superseded_suites}, then the latest run per check context, then the retired-check allowlist"
 fi
 
-# Every surviving row was dropped as superseded — nothing executed here.
+# Every surviving row was dropped as superseded and/or retired-allowlisted.
 if [ "${returned_count}" -eq 0 ]; then
-  verdict 'NO_EVIDENCE' "every check-run at head ${head_sha} of ${REPO}#${PR_NUMBER} belonged to a superseded workflow run. Nothing was actually measured against this head."
+  verdict 'NO_EVIDENCE' "every check-run at head ${head_sha} of ${REPO}#${PR_NUMBER} belonged to a superseded workflow run or matched MERGE_EVIDENCE_RETIRED_CHECKS. Nothing was actually measured against this head."
   exit 3
 fi
 
@@ -718,7 +765,7 @@ if [ "${gh_exit}" -ne 0 ]; then
   hard_fail "GitHub API call failed (exit ${gh_exit}) reading the changed files of ${REPO}#${PR_NUMBER}, so whether the backend suite was required here cannot be established: $(tr '\n' ' ' <"${stderr_file}")"
 fi
 if [ -z "${changed_files_tsv}" ]; then
-  hard_fail "${REPO}#${PR_NUMBER} reports no changed files at ${head_sha}. An open PR always has at least one, so this is an unreadable diff rather than an empty one, and the backend-suite requirement cannot be evaluated."
+  hard_fail "${REPO}#${PR_NUMBER} reports no changed files at ${head_sha}. An open PR always has at least one, so build evidence cannot be evaluated."
 fi
 
 # Current paths only — what the workflow's path filter classified on.
@@ -754,12 +801,8 @@ if [ -n "${touches_backend}" ]; then
     [ -n "${job}" ] || continue
     # "Did it ever pass at this head", not "is the newest entry a pass".
     #
-    # Without this, re-running the workflow at a head whose suite had already
-    # gone green reports NO_EVIDENCE the moment the re-run's discriminator
-    # comes back below 5/5: the tests skip, the skip is newer than the success,
-    # and a real green run at this exact SHA is discarded. That verdict is
-    # wrong on the facts — the suite did execute against this code — and it is
-    # unfixable by the author, because pushing to clear it changes the head.
+    # A successful build at an immutable head remains evidence even if a later
+    # superseded workflow attempt is cancelled or skipped.
     #
     # Safe because of where this sits: section 7 is reached only after the
     # classification above found nothing failed and nothing is pending. A later
@@ -779,13 +822,14 @@ if [ -n "${touches_backend}" ]; then
     job_state="$(printf '%s' "${runs_after_supersession}" | jq -r --arg job "${job}" '
         [ .check_runs[] | select(.name == $job) ] as $rows
         | if ($rows | length) == 0 then "ABSENT"
-          elif any($rows[]; .conclusion == "success") then "success"
+          elif ([ $rows[] | select((.conclusion // "") | IN("cancelled", "skipped") | not) ] | length) > 0
+            then ([ $rows[] | select((.conclusion // "") | IN("cancelled", "skipped") | not) ] | max_by(.id // 0) | .conclusion // "pending")
           else ($rows | max_by(.id // 0) | .conclusion // "pending")
           end' 2>/dev/null)"
     jq_exit=$?
     if [ "${jq_exit}" -ne 0 ] || [ -z "${job_state}" ]; then
       surface 'check-runs response (raw)' "${runs_json}"
-      hard_fail "unparseable check-runs payload while requiring the backend suite job '${job}' at ${head_sha}"
+      hard_fail "unparseable check-runs payload while requiring backend build job '${job}' at ${head_sha}"
     fi
     if [ "${job_state}" != "success" ]; then
       missing="${missing:+${missing}, }${job} (${job_state})"
@@ -793,7 +837,7 @@ if [ -n "${touches_backend}" ]; then
   done <<<"${BACKEND_JOBS}"
 
   if [ -n "${missing}" ]; then
-    verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} changes backend paths (e.g. ${touches_backend}), but the backend suite did not execute against head ${head_sha}: ${missing}. A skip here is not proof the path filter excluded them — it is the absence of the measurement this gate exists to require. Push or re-run the workflow at this head. If a job was renamed, set MERGE_EVIDENCE_BACKEND_JOBS."
+    verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} changes backend paths (e.g. ${touches_backend}), but the backend build did not succeed against head ${head_sha}: ${missing}. Push or re-run the workflow at this head. If a job was renamed, set MERGE_EVIDENCE_BACKEND_JOBS."
     exit 3
   fi
 fi
