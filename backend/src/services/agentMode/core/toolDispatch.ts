@@ -186,7 +186,10 @@ export function seedMediaCallKeysFromHistory(
     const ts = rawTs ? Date.parse(rawTs) : NaN;
     if (!Number.isFinite(ts) || ts < sinceMs) continue;
     for (const tc of toolCalls) {
-      if (!tc?.name || !DEFERRABLE_ASSET_TOOLS.has(tc.name)) continue;
+      // ENG-1331: deliberately MEDIA_GEN_TOOLS here, not the broader
+      // DEFERRABLE_ASSET_TOOLS — see the dedupe-key check below for why
+      // playwright_browser_take_screenshot must stay OUT of this reconstruction.
+      if (!tc?.name || !MEDIA_GEN_TOOLS.has(tc.name)) continue;
       if (tc.error || !tc.result || tc.result.deferred === true || tc.result.success === false) continue;
       if (!mediaGenProducedAsset(tc.name, tc.result)) continue;
       const key = `${tc.name}:${stableStringify(tc.arguments)}`;
@@ -727,16 +730,23 @@ export async function executePreparedTools(
         suppressedDuplicates.push({ toolCall, functionArgs: preparedFunctionArgs, duplicateOfId });
         continue;
       }
-      // ENG-510: cross-iteration dedupe for deferrable asset tools only. The per-iteration
-      // check above misses an identical generate_image (or, since ENG-1331, an identical
-      // screenshot render) re-emitted in a LATER iteration of the same turn (e.g. resuming
-      // after a timeout, the model re-requests an asset it already made). Suppress it if
-      // that exact call already produced an asset earlier this turn. Scoped to
-      // DEFERRABLE_ASSET_TOOLS so a legitimately-repeated mutating call (send_email) is
-      // never blocked; only successful generations are recorded, so a failed call can
-      // still be retried.
+      // ENG-510: cross-iteration dedupe for MEDIA_GEN_TOOLS only. The per-iteration check
+      // above misses an identical generate_image re-emitted in a LATER iteration of the
+      // same turn (e.g. resuming after a timeout, the model re-requests an image it already
+      // made). Suppress it if that exact call already produced an asset earlier this turn.
+      //
+      // ENG-1331: deliberately NOT extended to playwright_browser_take_screenshot, unlike
+      // the deferral/asset-count/duration checks above. generate_image's dedupe protects
+      // against re-paying for an expensive, rate-limited external API call; a screenshot is
+      // a cheap local action with the opposite risk profile — this exact template's own QA
+      // step ("Fix and re-render failures before delivery") calls for re-taking a screenshot
+      // with the SAME dimension-based filename after correcting a problem, and this dedupe
+      // would silently swallow that legitimate re-render as a false "already done" duplicate,
+      // leaving the broken original in place with no error surfaced. Media-only (not
+      // screenshot) so a legitimately-repeated mutating call (send_email) is also never
+      // blocked; only successful generations are recorded, so a failed call can still retry.
       if (
-        DEFERRABLE_ASSET_TOOLS.has(toolCall.function.name)
+        MEDIA_GEN_TOOLS.has(toolCall.function.name)
         && priorMediaCallKeys?.has(dedupeKey)
       ) {
         const duplicateOfId = priorMediaCallKeys.get(dedupeKey) as string;

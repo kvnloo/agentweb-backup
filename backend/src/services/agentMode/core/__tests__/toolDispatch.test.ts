@@ -1286,9 +1286,16 @@ describe('executePreparedTools — cross-iteration media dedupe (ENG-510)', () =
     expect(msg.role).toBe('tool');
   });
 
-  // ENG-1331: same cross-iteration protection now applies to screenshot renders — a
-  // resumed continuation must not re-screenshot an already-captured size.
-  it('records a produced screenshot key, then suppresses the same call next iteration', async () => {
+  // ENG-1331: deliberately the OPPOSITE of generate_image's cross-iteration dedupe.
+  // A dimension-based filename (e.g. "300x250.png") is inherently reused across
+  // attempts, and this exact template's QA step ("Fix and re-render failures before
+  // delivery") calls for re-taking a screenshot with that SAME filename after fixing
+  // a problem — deduping it would silently keep the broken original with no error
+  // surfaced. generate_image's dedupe protects against re-paying for an expensive,
+  // rate-limited external call; a screenshot has the opposite risk profile (cheap,
+  // local, and legitimately re-requested), so it must stay retryable even when an
+  // identical-argument call already succeeded earlier this run.
+  it('does NOT cross-iteration-dedupe a screenshot — a same-filename re-render must still run', async () => {
     const screenshotPorts = () =>
       makePorts({
         executePreparedAgentTool: async (_i: any) => ({ success: true, screenshotUrl: 'https://s3/300x250.png' }),
@@ -1302,17 +1309,24 @@ describe('executePreparedTools — cross-iteration media dedupe (ENG-510)', () =
     );
     const r1 = await executePreparedTools(in1);
     expect((ports1 as any).__execOrder).toEqual(['playwright_browser_take_screenshot']);
+    // producedMediaCallKeys IS populated for a screenshot too (countsAsAsset uses the
+    // broader DEFERRABLE_ASSET_TOOLS, kept for the deferral/duration bookkeeping this
+    // key-recording is bundled with) — the protection isn't that the key is absent,
+    // it's that the SUPPRESSION check below never consults it for this tool name.
     expect(r1.producedMediaCallKeys.size).toBe(1);
 
     const ports2 = screenshotPorts();
     const in2 = makeInput(
       [toolCall('b', 'playwright_browser_take_screenshot', '{"filename":"300x250.png"}')],
       ports2,
-      { priorMediaCallKeys: r1.producedMediaCallKeys },
+      // Simulate a key that WOULD suppress a generate_image call, to prove
+      // screenshot ignores priorMediaCallKeys entirely rather than merely never
+      // populating it.
+      { priorMediaCallKeys: new Map([[`playwright_browser_take_screenshot:${stableStringify({ filename: '300x250.png' })}`, 'a']]) },
     );
     const r2 = await executePreparedTools(in2);
-    expect((ports2 as any).__execOrder).toEqual([]); // did NOT re-screenshot the same size
-    expect(r2.mediaAssetsProduced).toBe(0);
+    expect((ports2 as any).__execOrder).toEqual(['playwright_browser_take_screenshot']); // re-ran, not suppressed
+    expect(r2.mediaAssetsProduced).toBe(1);
   });
 
   it('does NOT suppress a distinct variant (different args) from a prior iteration', async () => {
@@ -1442,11 +1456,13 @@ describe('seedMediaCallKeysFromHistory (ENG-1239)', () => {
     expect(seedMediaCallKeysFromHistory(msgs as any, 0).size).toBe(0);
   });
 
-  // ENG-1331: a screenshot-rendered work-plan step (e.g. a display-ad size matrix) is now
-  // deferral-eligible, so a resumed continuation turn needs the SAME cross-turn dedupe
-  // protection generate_image already got — otherwise a continuation could re-screenshot
-  // an already-captured size instead of only the still-missing ones.
-  it('seeds a key for a successful playwright_browser_take_screenshot call', () => {
+  // ENG-1331: deliberately does NOT seed a key for a screenshot, unlike
+  // generate_image. This reconstruction feeds the cross-iteration dedupe a
+  // screenshot must stay exempt from (see toolDispatch.ts's dedupe-check comment) —
+  // a dimension-based filename is legitimately reused when the QA step re-renders a
+  // corrected size, and seeding it here would make that re-render look like an
+  // already-done duplicate on the very next continuation turn.
+  it('does NOT seed a key for a successful playwright_browser_take_screenshot call', () => {
     const msgs = [{
       role: 'assistant',
       timestamp: '2026-08-18T09:12:37.587Z',
@@ -1459,8 +1475,6 @@ describe('seedMediaCallKeysFromHistory (ENG-1239)', () => {
         }],
       },
     }];
-    const seeded = seedMediaCallKeysFromHistory(msgs, 0);
-    const key = `playwright_browser_take_screenshot:${stableStringify({ filename: 'AgentWeb-300x250-MediumRectangle.png' })}`;
-    expect(seeded.get(key)).toBe('x');
+    expect(seedMediaCallKeysFromHistory(msgs, 0).size).toBe(0);
   });
 });
