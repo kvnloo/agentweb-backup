@@ -80,8 +80,24 @@ export interface CrmAutoEnrichmentCronDeps {
   }): Promise<boolean>;
 }
 
-function isUnenriched(lead: { enrichmentMetadata?: Record<string, unknown> }): boolean {
-  return !lead.enrichmentMetadata || Object.keys(lead.enrichmentMetadata).length === 0;
+/**
+ * A lead still needs an enrichment run when at least one currently-ENABLED
+ * config field has no entry in `enrichmentMetadata` — not merely when the
+ * metadata map is empty. Some writers stamp `enrichmentMetadata` for a field
+ * that isn't part of the enrichment config at all (e.g.
+ * `crmDb.setLeadEmailValidation` writes `enrichmentMetadata.email_validation`
+ * without ever running the configured fields), so "any key present" would
+ * wrongly mark such a lead permanently done and this cron would never pick
+ * it up. (CodeRabbit, PR #2583.)
+ */
+function isUnenriched(
+  lead: { enrichmentMetadata?: Record<string, unknown> },
+  config: EnrichmentConfig,
+): boolean {
+  const enabledFieldNames = config.fields.filter((f) => f.include).map((f) => f.name);
+  if (enabledFieldNames.length === 0) return false; // nothing configured to enrich
+  const meta = lead.enrichmentMetadata;
+  return enabledFieldNames.some((name) => !meta || !(name in meta));
 }
 
 // Module-level overlap guard: a listId in here has an in-flight run from a
@@ -138,7 +154,7 @@ export async function runCrmAutoEnrichmentCron(
 
       const leads = await deps.getAllLeadsByListId(listId);
       const unenrichedLeadIds = leads
-        .filter(isUnenriched)
+        .filter((lead) => isUnenriched(lead, config))
         .slice(0, MAX_LEADS_PER_LIST_PER_RUN)
         .map((lead) => lead.leadId);
 

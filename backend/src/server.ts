@@ -852,8 +852,13 @@ createTestAccount().then(async () => {
       try {
         const { runCrmAutoEnrichmentCheck } = await import('./cron/crmAutoEnrichmentCron');
         const CRM_AUTO_ENRICHMENT_INTERVAL_MS = 15 * 60 * 1000;
-        cronJobRegistry.track('crmAutoEnrichmentCron', runCrmAutoEnrichmentCheck())
-          .catch(e => console.error('[crmAutoEnrichmentCron] Error on first run:', e));
+        // Guard the initial run too, matching the interval callback below —
+        // a disabled-cron environment must not enrich real leads once on
+        // startup just because the guard was only on the recurring path.
+        if (isCronEnabled()) {
+          cronJobRegistry.track('crmAutoEnrichmentCron', runCrmAutoEnrichmentCheck())
+            .catch(e => console.error('[crmAutoEnrichmentCron] Error on first run:', e));
+        }
         setInterval(() => {
           if (!isCronEnabled()) return;
           cronJobRegistry.track('crmAutoEnrichmentCron', runCrmAutoEnrichmentCheck())

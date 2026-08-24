@@ -160,6 +160,32 @@ describe('runCrmAutoEnrichmentCron', () => {
     expect(summary.processedLeads).toBe(0);
   });
 
+  it('still treats a lead as un-enriched when its only enrichmentMetadata entry is for a field the config never enabled (e.g. email_validation)', async () => {
+    // Regression: crmDb.setLeadEmailValidation writes
+    // enrichmentMetadata.email_validation without ever running the
+    // configured enrichment fields. "any metadata key present" would
+    // wrongly mark this lead permanently done even though the enabled
+    // field (company_url) was never populated.
+    const deps = makeDeps({
+      getAutoEnrichEnabledLists: jest.fn().mockResolvedValue([{ listId: 'list-1', userId: 'u1' }]),
+      getEnrichmentConfig: jest.fn().mockResolvedValue({
+        config: baseConfig({ autoEnrich: true }), // enabled field: company_url
+        isDefault: false,
+      }),
+      getAllLeadsByListId: jest.fn().mockResolvedValue([
+        lead('lead-1', { enrichmentMetadata: { email_validation: { enrichedAt: '2026-08-01T00:00:00.000Z', source: 'validator' } } }),
+      ]),
+    });
+
+    const summary = await runCrmAutoEnrichmentCron(deps);
+
+    expect(deps.runEnrichment).toHaveBeenCalledWith(
+      expect.objectContaining({ leadIds: ['lead-1'] }),
+      expect.anything(),
+    );
+    expect(summary.eligibleLists).toBe(1);
+  });
+
   it('is idempotent across two consecutive runs — the second run only re-processes leads still un-enriched after the first', async () => {
     // Simulates: run 1 enriches lead-1; DB now reflects it as enriched;
     // run 2 must not re-select lead-1 (no double Apollo/LLM charge).
