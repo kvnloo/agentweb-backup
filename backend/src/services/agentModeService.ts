@@ -5395,9 +5395,14 @@ export class AgentModeService {
    * Excludes foundation tools and admin-only tools.
    */
   private getUnassociatedTools(publishedSkills: any[]): { name: string; description: string }[] {
-    // Collect all tool names used by any published skill
+    // Collect all tool names used by any published skill. Callers (e.g.
+    // loadAuthorizedSkillCatalog) pass a catalog that also mixes in unpublished
+    // private/org-shared skills for install purposes — those must NOT count here,
+    // or a single draft skill nobody published can silently steal a tool out of
+    // the shared __other_skills__ bundle for an entire org (ENG-1237).
     const associatedToolNames = new Set<string>();
     publishedSkills.forEach(skill => {
+      if (skill.isPublished !== true) return;
       skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
     });
 
