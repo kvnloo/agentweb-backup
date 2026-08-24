@@ -86,14 +86,26 @@ const NOTIFICATION_TOOL = {
   },
 };
 
+// Only reachable via the wildcard-expansion branch (mcpToolRegistry.getToolNames()),
+// never via a skill's own resolved toolNames in these tests — lets a test observe
+// whether wildcard expansion actually happened.
+const WILDCARD_ONLY_TOOL = {
+  definition: {
+    name: 'wildcard_only_tool',
+    description: 'Only reachable via full wildcard tool expansion',
+    inputSchema: { type: 'object', properties: {} },
+  },
+};
+
 jest.mock('../mcp/server/registry', () => ({
   mcpToolRegistry: {
     getTool: (name: string) => {
       if (name === 'list_connected_accounts') return GOOGLE_ADS_TOOL;
       if (name === 'send_notification') return NOTIFICATION_TOOL;
+      if (name === 'wildcard_only_tool') return WILDCARD_ONLY_TOOL;
       return undefined;
     },
-    getToolNames: () => ['list_connected_accounts', 'send_notification'],
+    getToolNames: () => ['list_connected_accounts', 'send_notification', 'wildcard_only_tool'],
   },
 }));
 
@@ -459,6 +471,52 @@ describe('generateChatResponse — ENG-1222 hard gate, retry, skill prompt, and 
         tools: expect.arrayContaining([
           expect.objectContaining({ function: expect.objectContaining({ name: 'list_connected_accounts' }) }),
           expect.objectContaining({ function: expect.objectContaining({ name: 'send_notification' }) }),
+        ]),
+      }),
+    );
+  });
+
+  it('does not expand to every registered tool when resolveSkillsToToolNames silently fails open to a wildcard', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] }); // no '*' — never asked for wildcard access
+    // subscriptionService.ts's own catch fails open to ['*'] on any internal error —
+    // indistinguishable at this call site from a legitimate wildcard request.
+    mockResolveSkillsToToolNames.mockResolvedValue(['*']);
+    mockCallLLM.mockResolvedValue(makeCompletion('ok'));
+
+    await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockCallLLM).toHaveBeenCalledWith(
+      'anthropic.claude-opus-5',
+      expect.any(Array),
+      expect.objectContaining({
+        tools: expect.not.arrayContaining([
+          expect.objectContaining({ function: expect.objectContaining({ name: 'wildcard_only_tool' }) }),
+        ]),
+      }),
+    );
+  });
+
+  it('does expand to every registered tool when the session itself explicitly has wildcard skill access', async () => {
+    seedSession({ associatedSkills: ['*'] });
+    mockResolveSkillsToToolNames.mockResolvedValue(['*']);
+    mockCallLLM.mockResolvedValue(makeCompletion('ok'));
+
+    await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockCallLLM).toHaveBeenCalledWith(
+      'anthropic.claude-opus-5',
+      expect.any(Array),
+      expect.objectContaining({
+        tools: expect.arrayContaining([
+          expect.objectContaining({ function: expect.objectContaining({ name: 'wildcard_only_tool' }) }),
         ]),
       }),
     );
