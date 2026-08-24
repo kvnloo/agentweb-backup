@@ -395,6 +395,14 @@ describe('GET /api/subscription/usage/reconciliation (ENG-1247)', () => {
       next();
     });
   });
+
+  it('returns the stable error response when reconciliation resolution fails', async () => {
+    mockResolveUsageCostReconciliation.mockRejectedValueOnce(new Error('resolver unavailable'));
+
+    const res = await request(app).get('/api/subscription/usage/reconciliation').expect(500);
+
+    expect(res.body).toEqual({ error: 'Failed to reconcile usage cost gate' });
+  });
 });
 
 
