@@ -721,6 +721,51 @@ function isTestScheduledSession(session: ChatSession): boolean {
   return marker.startsWith("Test: ");
 }
 
+// ENG-803/ENG-1245: the exact terminal sentence a scheduled run is instructed to end
+// on when it genuinely withholds a mandated publish for lack of authorization (see
+// getScheduledSessionOverride in agentModeSystemPrompt.ts). Mirrors
+// PUBLISH_WITHHELD_MARKER in controllers/agentModeController.ts — kept as a separate
+// copy here rather than an import so this scoring module does not pull in that
+// (much heavier) controller file; if the marker sentence ever changes, both copies
+// must change together.
+const PUBLISH_WITHHELD_MARKER =
+  /PUBLISH WITHHELD:\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))/i;
+
+/**
+ * ENG-995 — two scheduled sessions with IDENTICAL behavior (drafted the content,
+ * withheld the mandated publish for lack of authorization, reported it once, and
+ * stopped) were scored 5/5/5 by two judges and 2/4/5 (goalCompletion 2) by a third
+ * on the SAME transcript shape. PUBLISH_APPROVAL_WITHHOLDING_CLAUSE already tells
+ * every judge this is the correct, complete terminal state and must not be
+ * penalized — but a judge call is inherently a subjective LLM read, and three
+ * differently-worded judge prompts do not converge on it with perfect
+ * consistency. A 1-vs-5 spread on identical conduct makes the satisfaction metric
+ * itself noisy, so a session this deterministic is pulled out of the judged
+ * cohort entirely — the same treatment already given a no-task session (ENG-168)
+ * or a manual test-schedule run (ENG-499) — rather than leaving its score to
+ * chance.
+ *
+ * GENUINENESS, not just the marker text: the marker is model-authored, so on its
+ * own it proves nothing (an authorized run could in principle emit it to dodge a
+ * mandated publish — the same hole ENG-803's continuation classifier guards
+ * against via `withholdIsGenuine`). Here that same guard is `publishAdmission`
+ * (ENG-827) — the authorization this run was actually ADMITTED under, stamped by
+ * the dispatcher before the first turn. Only a session that (a) is scheduled, (b)
+ * was NOT admitted as authorized to publish, and (c) settled on the withheld
+ * marker as its last turn is excluded; an authorized run that emits the marker
+ * anyway keeps none of those and stays in the judged cohort where a judge can
+ * still catch the fabrication.
+ */
+function isPublishGateWithheldSession(session: ChatSession): boolean {
+  if (session.sessionType !== "scheduled") return false;
+  if (session.publishAdmission?.authorized === true) return false;
+  const nonSystem = (session.messages || []).filter((m: any) => m.role !== "system");
+  const last: any = nonSystem[nonSystem.length - 1];
+  if (!last || last.role !== "assistant") return false;
+  const text = typeof last.content === "string" ? last.content : "";
+  return PUBLISH_WITHHELD_MARKER.test(text);
+}
+
 /**
  * Returns true when the transcript ends in a state an agent tool loop cannot
  * terminate on — the run is still mid-flight even though hasAssistantTurn()
@@ -1249,6 +1294,16 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
+  // A genuinely-withheld scheduled publish gate (ENG-995): pull it out of the
+  // judged cohort rather than leave a divergent judge score on it — see
+  // isPublishGateWithheldSession. Placed BEFORE the already-scored early return,
+  // same reasoning as isNoTaskSession above, so an existing divergent score is
+  // retracted rather than kept forever.
+  if (isPublishGateWithheldSession(session)) {
+    await retractJudgeScore(session, judge.id);
+    return null;
+  }
+
   // Skip if already scored by this judge, up-to-date, and has dimensional scores
   const existingJudgeScore = session.judgeScores?.[judge.id];
   if (existingJudgeScore && existingJudgeScore.evaluatedMessageIndex >= messageCount && existingJudgeScore.dimensions) {
@@ -1354,6 +1409,16 @@ export async function scoreSessionIfNeeded(
   // keeping it forever (scoring skips it from now on, so nothing would ever
   // overwrite it).
   if (isNoTaskSession(session.messages, session.pageIdentifier) && hasAssistantTurn(session.messages)) {
+    await retractSatisfactionScore(session);
+    return null;
+  }
+
+  // A genuinely-withheld scheduled publish gate (ENG-995): pull it out of the
+  // judged cohort rather than leave a divergent satisfaction score on it — see
+  // isPublishGateWithheldSession. Placed BEFORE the already-scored early return,
+  // same reasoning as isNoTaskSession above, so an existing divergent score is
+  // retracted rather than kept forever.
+  if (isPublishGateWithheldSession(session)) {
     await retractSatisfactionScore(session);
     return null;
   }
