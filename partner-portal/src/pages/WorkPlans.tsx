@@ -1121,7 +1121,7 @@ export default function WorkPlans() {
                       }}
                       inputProps={{ min: 0 }}
                       sx={{ mt: 1, maxWidth: 220 }}
-                      helperText="This step cannot be completed until the run has generated this many images/videos. Counted across the whole run, not just this step. Leave blank for no requirement."
+                      helperText="This step cannot be completed until it has generated this many images/videos of its own (assets from earlier steps don't count). Leave blank for no requirement."
                     />
                   </Box>
                   {steps.length > 1 && (

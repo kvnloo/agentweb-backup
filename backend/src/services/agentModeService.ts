@@ -4879,8 +4879,13 @@ export class AgentModeService {
 
       // Surface the asset target so the model knows how many images/videos this step
       // owes before it can be completed (enforced by set_work_plan_status).
+      //
+      // ENG-897: "this session" was stale wording left over from before ENG-1188
+      // scoped the gate to per-step (assets produced since the previous step
+      // resolved, not the whole run) -- correcting it here so the model doesn't
+      // believe an earlier step's assets already satisfy this one.
       if (includeResumeGuidance && typeof step.expectedAssetCount === 'number' && step.expectedAssetCount > 0) {
-        workPlanContent += `   Required assets: ${step.expectedAssetCount} (this step cannot be completed until ${step.expectedAssetCount} images/assets have actually been generated this session)\n`;
+        workPlanContent += `   Required assets: ${step.expectedAssetCount} (this step cannot be completed until ${step.expectedAssetCount} images/assets have actually been generated for THIS step, after the previous step was resolved)\n`;
       }
 
       // Include skill IDs if available (for awareness)

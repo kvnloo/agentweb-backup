@@ -6128,7 +6128,7 @@ emmaToolRegistry.register({
               },
               expectedAssetCount: {
                 type: 'number',
-                description: 'Optional. For a step that must produce a specific number of media assets (e.g. "generate 18 images"), set this to that number. The step then cannot be marked completed until that many images/videos have actually been generated this session — preventing the step from being closed with only some assets produced. Omit for steps with no fixed asset count.'
+                description: 'Optional. For a step that must produce a specific number of media assets (e.g. "generate 18 images"), set this to that number. The step then cannot be marked completed until that many images/videos have actually been generated for this step (assets from earlier steps don\'t count) — preventing the step from being closed with only some assets produced. Omit for steps with no fixed asset count.'
               }
             },
             required: ['stepCount', 'title']
@@ -7465,7 +7465,7 @@ emmaToolRegistry.register({
               },
               expectedAssetCount: {
                 type: 'number',
-                description: 'Number of media assets that must have been generated in the run before this step can be completed (e.g. 18 for "generate 3 images per hook, 18 total"). Counted per run, not per step. Carried over from the session work plan when omitted.'
+                description: 'Number of media assets that must have been generated before this step can be completed (e.g. 18 for "generate 3 images per hook, 18 total"). Counted for this step only -- assets produced after the previous step resolved (the first step counts everything generated so far). Carried over from the session work plan when omitted.'
               },
             },
             required: ['stepCount', 'title']
