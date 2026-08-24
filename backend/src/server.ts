@@ -10,10 +10,10 @@ import bcrypt from 'bcryptjs';
 import http from 'http';
 import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
-import { generateChatResponse, chatbotDb } from './services/chatbotService';
-import { checkTokenUsage } from './services/tokenUsageService';
+import { chatbotDb } from './services/chatbotService';
 import { userDb } from './services/db';
 import { registerIo } from './services/sessionSockets';
+import { handleSocketChatMessage } from './services/chatSocketHandler';
 import {
   sendAudioChunk,
   sendAudioStreamEnd,
@@ -260,56 +260,13 @@ io.on('connection', (socket: Socket) => {
   });
 
   // Handle chat messages
-  socket.on('message', async (data: {
+  socket.on('message', (data: {
     sessionId: string;
     message: string;
     currentUrl?: string;
     pageContent?: string;
     portal?: 'customer' | 'partner';
-  }) => {
-    try {
-      // Get user ID from socket auth
-      const token = socket.handshake.auth.token;
-      if (!token) {
-        throw new Error('No authentication token provided');
-      }
-
-      const decoded = jwt.verify(token, getJwtSecret()) as { userId: string; isAdmin?: boolean; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
-      const userId = decoded.delegateAccess?.targetUserId || decoded.userId;
-      const isDelegatedAdmin = !!decoded.delegateAccess || decoded.isAdmin === true;
-
-      // Check token usage limits
-      const usageStatus = await checkTokenUsage(userId);
-      if (!usageStatus.allowed) {
-        socket.emit('error', {
-          message: 'Monthly token limit reached. Please contact support or upgrade your plan.',
-          code: 'TOKEN_LIMIT_EXCEEDED',
-          tokenUsage: usageStatus,
-        });
-        return;
-      }
-
-      const portalType = data.portal || 'partner';
-      const orgRole = portalType === 'customer' ? (await userDb.getUserById(userId))?.orgRole : undefined;
-      const response = await generateChatResponse(
-        data.sessionId,
-        data.message,
-        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id, isDelegatedAdmin, orgRole }
-      );
-
-      // Send response back to the client
-      const responseContent = typeof response === 'string' ? response : (response as any)?.content ?? '';
-      socket.emit('message', {
-        sessionId: data.sessionId,
-        content: responseContent
-      });
-    } catch (error) {
-      console.error('Error processing message:', error);
-      socket.emit('error', {
-        message: 'Failed to process message'
-      });
-    }
-  });
+  }) => handleSocketChatMessage(socket, data));
 
   // Implement automatic reconnection
   socket.on('reconnect_attempt', () => {

@@ -1,0 +1,89 @@
+import jwt from 'jsonwebtoken';
+import { getJwtSecret } from '../config/jwt';
+import { generateChatResponse, chatbotDb } from './chatbotService';
+import { checkTokenUsage } from './tokenUsageService';
+import { userDb } from './db';
+
+// Narrowed to exactly what this handler touches on a Socket.IO `Socket`, so a
+// test can pass a plain mock without satisfying the full (much larger)
+// `Handshake` shape.
+interface ChatSocketLike {
+  id: string;
+  handshake: { auth: { token?: string } };
+  emit: (event: string, ...args: any[]) => void;
+}
+
+// Extracted from server.ts's inline socket.on('message', ...) handler so the
+// ENG-1222 session-ownership check can be covered by a unit test without
+// booting the real HTTP/Socket.IO server that module starts as a side effect
+// of import (server.listen(...) runs unconditionally at module scope there).
+export async function handleSocketChatMessage(
+  socket: ChatSocketLike,
+  data: {
+    sessionId: string;
+    message: string;
+    currentUrl?: string;
+    pageContent?: string;
+    portal?: 'customer' | 'partner';
+  }
+): Promise<void> {
+  try {
+    // Get user ID from socket auth
+    const token = socket.handshake.auth.token;
+    if (!token) {
+      throw new Error('No authentication token provided');
+    }
+
+    const decoded = jwt.verify(token, getJwtSecret()) as { userId: string; isAdmin?: boolean; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
+    const userId = decoded.delegateAccess?.targetUserId || decoded.userId;
+    const isDelegatedAdmin = !!decoded.delegateAccess || decoded.isAdmin === true;
+
+    // Check token usage limits
+    const usageStatus = await checkTokenUsage(userId);
+    if (!usageStatus.allowed) {
+      socket.emit('error', {
+        message: 'Monthly token limit reached. Please contact support or upgrade your plan.',
+        code: 'TOKEN_LIMIT_EXCEEDED',
+        tokenUsage: usageStatus,
+      });
+      return;
+    }
+
+    // ENG-1222: this handler accepts a client-supplied sessionId with no
+    // ownership check, unlike the HTTP chatbot routes (controllers/chatbot.ts),
+    // which 403 when session.userId !== userId. Tools are now bound whenever
+    // the target session has installed skills, regardless of portalType, so a
+    // missing check here would let any authenticated caller execute another
+    // user's skill tools (scoped to their own account) just by knowing/guessing
+    // that user's sessionId.
+    const session = await chatbotDb.getChatSession(data.sessionId);
+    if (!session) {
+      socket.emit('error', { message: 'Chat session not found' });
+      return;
+    }
+    if (session.userId !== userId) {
+      socket.emit('error', { message: 'Unauthorized access to chat session' });
+      return;
+    }
+
+    const portalType = data.portal || 'partner';
+    const orgRole = portalType === 'customer' ? (await userDb.getUserById(userId))?.orgRole : undefined;
+    const response = await generateChatResponse(
+      data.sessionId,
+      data.message,
+      { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id, isDelegatedAdmin, orgRole }
+    );
+
+    // Send response back to the client
+    const responseContent = typeof response === 'string' ? response : (response as any)?.content ?? '';
+    socket.emit('message', {
+      sessionId: data.sessionId,
+      content: responseContent
+    });
+  } catch (error) {
+    console.error('Error processing message:', error);
+    socket.emit('error', {
+      message: 'Failed to process message'
+    });
+  }
+}
