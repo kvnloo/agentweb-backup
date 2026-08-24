@@ -35,6 +35,10 @@ install_mock_aws() {
 #   update_results     one "<exit>|<stderr message>" per update-environment call
 #   describe_states    one "<Status>|<Health>|<VersionLabel>" per describe call,
 #                      or "NOTFOUND", or "ERROR|<message>". Last line repeats.
+#   clock              ENG-1522: the virtual clock eb-deploy.sh reads through
+#                      EB_CLOCK_FILE. Advanced by clock_tick on every
+#                      describe-environments call, so one tick == one poll.
+#   clock_tick         seconds added per poll (default 1).
 MOCK_DIR="${EB_MOCK_DIR:?EB_MOCK_DIR must be set}"
 
 operation="${2:-}"
@@ -85,6 +89,17 @@ case "$operation" in
 
   describe-environments)
     line=$(next_line "${MOCK_DIR}/describe_states" "${MOCK_DIR}/describe_calls")
+
+    # ENG-1522: one describe-environments call is exactly one poll iteration, so
+    # advancing here makes eb-deploy.sh's clock a function of the scripted event
+    # sequence instead of the runner's wall clock. That is what removes the race:
+    # now_seconds() is now CONSTANT within an iteration, so the two reads that
+    # stamp and then test `ready_since` can no longer straddle a second boundary.
+    if [ -f "${MOCK_DIR}/clock" ]; then
+      tick=1
+      [ -f "${MOCK_DIR}/clock_tick" ] && tick=$(cat "${MOCK_DIR}/clock_tick")
+      printf '%s\n' "$(( $(cat "${MOCK_DIR}/clock") + tick ))" >"${MOCK_DIR}/clock"
+    fi
 
     if [ "$line" = "NOTFOUND" ]; then
       printf 'None\n'
@@ -249,6 +264,7 @@ new_mock_dir() {
   printf '0|\n' >"${dir}/create_result"
   printf '0|\n' >"${dir}/update_results"
   printf 'Ready|Green|old-version\n' >"${dir}/describe_states"
+  printf '0\n' >"${dir}/clock"
   printf '%s' "${dir}"
 }
 
@@ -280,6 +296,7 @@ run_deploy() {
   env \
     PATH="${WORKDIR}/bin:${PATH}" \
     EB_MOCK_DIR="${dir}" \
+    EB_CLOCK_FILE="${dir}/clock" \
     EB_APPLICATION_NAME='test-app' \
     EB_ENVIRONMENT_NAME='test-env' \
     EB_VERSION_LABEL='backend-20260729-pr2216' \
@@ -1003,6 +1020,71 @@ printf 'None\n' >"$M/asg_name"
 run_deploy "$M"
 check 'ENG-764: an environment with no ASG fails loudly' 1 \
   'returned no Auto Scaling group'
+
+# ---------------------------------------------------------------------------
+# ENG-1522 — the clock seam must never reach production.
+#
+# now_seconds() honours EB_CLOCK_FILE so this suite can drive time from the
+# mocked event sequence instead of the wall clock. That seam is harmless only
+# while it stays test-only: a workflow that set EB_CLOCK_FILE would freeze the
+# deploy's sense of time, and every budget in eb-deploy.sh -- the overall run
+# deadline, the settle timeout, the health settle window, the EB rejection
+# grace -- is a comparison against now_seconds(). A frozen clock means none of
+# them can ever expire, so a hung or rejected deploy would poll forever instead
+# of failing, in the script whose false-success and non-convergence modes cost
+# ~17h (ENG-865) and ~29h (ENG-836) of production downtime.
+#
+# No script under test here: this asserts the workflows themselves, the same
+# shape as paths-filter-hygiene.test.sh. It lives in this suite rather than a
+# new file on purpose -- three suites have already been found orphaned and
+# silently red in this repo (staging-deploy-gate, coverage-report,
+# paths-filter negation), and this one is already wired into `CI script tests`.
+printf '\nENG-1522: the clock seam is test-only\n'
+
+WORKFLOW_DIR="${SCRIPT_DIR}/../workflows"
+
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+clock_offenders=""
+for wf in "${WORKFLOW_DIR}"/*.yml "${WORKFLOW_DIR}"/*.yaml; do
+  [ -e "${wf}" ] || continue
+  if grep -qE '(^|[^A-Z_])EB_CLOCK_FILE' "${wf}"; then
+    clock_offenders="${clock_offenders} $(basename "${wf}")"
+  fi
+done
+if [ -z "${clock_offenders}" ]; then
+  pass 'ENG-1522: no workflow sets EB_CLOCK_FILE'
+else
+  printf '  FAIL ENG-1522: workflow(s) reference EB_CLOCK_FILE:%s\n' "${clock_offenders}"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+# Self-check. Current exposure is zero, so without proving the detector can
+# fail, a broken scan and a clean repo are indistinguishable -- exactly the
+# fail-open shape CodeRabbit caught in paths-filter-hygiene.
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+probe_dir="$(mktemp -d "${WORKDIR}/wfprobe.XXXXXX")"
+printf 'jobs:\n  deploy:\n    env:\n      EB_CLOCK_FILE: /tmp/x\n' >"${probe_dir}/bad.yml"
+probe_hits=""
+for wf in "${probe_dir}"/*.yml; do
+  grep -qE '(^|[^A-Z_])EB_CLOCK_FILE' "${wf}" && probe_hits="yes"
+done
+if [ -n "${probe_hits}" ]; then
+  pass 'ENG-1522: self-check — the scan detects a workflow that does set it'
+else
+  printf '  FAIL ENG-1522: the EB_CLOCK_FILE scan cannot detect an offender (fail-open)\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+# The production default must remain a real clock read.
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+real_now=$(env -u EB_CLOCK_FILE bash -c \
+  "$(sed -n '/^now_seconds() {/,/^}/p' "${EB_DEPLOY_SCRIPT}"); now_seconds")
+if [ "${real_now}" -gt 1000000000 ]; then
+  pass 'ENG-1522: with EB_CLOCK_FILE unset, now_seconds() returns real epoch time'
+else
+  printf '  FAIL ENG-1522: now_seconds() did not fall back to date +%%s when unset\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
 
 # ---------------------------------------------------------------------------
 
