@@ -6,6 +6,7 @@ import { authenticateToken } from '../../middleware/auth';
 import { resolveBillingUserId } from '../../services/tokenUsageService';
 import { listLlmChargeEvents } from '../../services/llmChargeAuditDb';
 import { readBilledLedgerRows } from '../../services/llmUsageLedgerReader';
+import { resolveUsageCostReconciliation } from '../../services/usageCostReconciliationResolver';
 
 // Mock the middleware
 jest.mock('../../middleware/auth', () => ({
@@ -54,12 +55,17 @@ jest.mock('../../services/llmUsageLedgerReader', () => ({
   readBilledLedgerRows: jest.fn(),
 }));
 
+jest.mock('../../services/usageCostReconciliationResolver', () => ({
+  resolveUsageCostReconciliation: jest.fn(),
+}));
+
 // @jest/globals' bare `jest.Mock` defaults its return type to `unknown`, so
 // mockResolvedValueOnce's argument infers as `never`. Tying the mock to the
 // real function's type gives it a real Promise<T> return to infer against.
 const mockResolveBillingUserId = resolveBillingUserId as jest.MockedFunction<typeof resolveBillingUserId>;
 const mockListLlmChargeEvents = listLlmChargeEvents as jest.MockedFunction<typeof listLlmChargeEvents>;
 const mockReadBilledLedgerRows = readBilledLedgerRows as jest.MockedFunction<typeof readBilledLedgerRows>;
+const mockResolveUsageCostReconciliation = resolveUsageCostReconciliation as jest.MockedFunction<typeof resolveUsageCostReconciliation>;
 
 let app: express.Application;
 
@@ -351,6 +357,43 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
 
   it('returns 400 for a malformed month', async () => {
     await request(app).get('/api/subscription/usage/itemized?month=not-a-month').expect(400);
+  });
+});
+
+describe('GET /api/subscription/usage/reconciliation (ENG-1247)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (authenticateToken as jest.Mock).mockImplementation((req: any, _res: any, next: any) => {
+      req.user = { userId: 'member-1' };
+      next();
+    });
+    app = express();
+    app.use(express.json());
+    app.use('/api/subscription', subscriptionRoutes);
+  });
+
+  it('returns the billing-subject report rather than the acting member\'s own slice', async () => {
+    mockResolveUsageCostReconciliation.mockResolvedValue({ billingUserId: 'owner-1', month: '2026-08' } as any);
+    const res = await request(app).get('/api/subscription/usage/reconciliation').expect(200);
+    expect(mockResolveUsageCostReconciliation).toHaveBeenCalledWith('member-1');
+    expect(res.body.billingUserId).toBe('owner-1');
+  });
+
+  it('does not turn a reconciliation read into a write', async () => {
+    mockResolveUsageCostReconciliation.mockResolvedValue({ billingUserId: 'owner-1', gate: { state: 'paused' } } as any);
+    await request(app).get('/api/subscription/usage/reconciliation').expect(200);
+    expect(mockResolveUsageCostReconciliation).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns 401 before resolving any billing data when unauthenticated', async () => {
+    (authenticateToken as jest.Mock).mockImplementation((req: any, _res: any, next: any) => { req.user = undefined; next(); });
+    app = express(); app.use(express.json()); app.use('/api/subscription', subscriptionRoutes);
+    await request(app).get('/api/subscription/usage/reconciliation').expect(401);
+    expect(mockResolveUsageCostReconciliation).not.toHaveBeenCalled();
+    (authenticateToken as jest.Mock).mockImplementation((req: any, _res: any, next: any) => {
+      req.user = { userId: 'u1' };
+      next();
+    });
   });
 });
 
