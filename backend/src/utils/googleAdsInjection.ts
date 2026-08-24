@@ -212,6 +212,33 @@ function extractGoogleAdsBlocks(content: string): string[] {
  * `conversionId` non-empty => exactly one block, carrying that exact id in both halves.
  * `conversionId` "" (removal) => zero blocks remain.
  */
+/**
+ * Does a hand-written tag actually initialise this conversion id?
+ *
+ * Two parts have to be present, the same two our own block writes:
+ *
+ *   - a gtag.js loader. Its id is NOT required to be the Ads id: loading gtag.js once for
+ *     GA4 (`gtag/js?id=G-…`) and then adding `gtag('config','AW-…')` is a normal, working
+ *     setup, and demanding `gtag/js?id=AW-…` would report those correctly tagged pages as
+ *     untagged.
+ *   - a `gtag('config', '<this id>')` call. This is the part that actually registers the
+ *     id; without it the loader sits there measuring nothing for Ads.
+ *
+ * Quoting is deliberately loose (either quote style, optional whitespace) because this
+ * reads code a human wrote, not code we generated.
+ */
+function handWrittenTagFires(content: string, conversionId: string): boolean {
+  const withoutOurs = stripOurBlock(content);
+  const scripts = (withoutOurs.match(/<script[\s\S]*?(?:\/>|<\/script>)/gi) || []).join('\n');
+  const hasLoader = /googletagmanager\.com\/gtag\/js\?id=/i.test(scripts);
+  const escaped = conversionId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const hasConfig = new RegExp(
+    `gtag\\s*\\(\\s*['"\`]config['"\`]\\s*,\\s*['"\`]${escaped}['"\`]`,
+    'i',
+  ).test(scripts);
+  return hasLoader && hasConfig;
+}
+
 export function verifyGoogleAdsInjection(content: string, conversionId: string): boolean {
   const blocks = extractGoogleAdsBlocks(content);
 
@@ -226,9 +253,17 @@ export function verifyGoogleAdsInjection(content: string, conversionId: string):
 
   // A hand-written tag carrying this exact id counts as installed: the question this
   // answers is "will a conversion fire against this id", not "did we write it".
+  //
+  // But it has to be a WORKING tag, held to the same standard as our own block below —
+  // which requires the loader AND the config call. This path used to accept the id's mere
+  // presence inside any <script>, so a loader with no gtag('config') — or even
+  // `var note = "AW-99999999 is our id"` — reported the page as installed, and we skipped
+  // writing the tag that would actually have fired. Reporting success while conversion
+  // tracking is silently absent is the one outcome this whole module exists to prevent.
   if (blocks.length === 0) {
     const foreign = foreignGoogleAdsIdsInCode(content);
-    return foreign.length === 1 && foreign[0] === conversionId.toUpperCase();
+    if (foreign.length !== 1 || foreign[0] !== conversionId.toUpperCase()) return false;
+    return handWrittenTagFires(content, conversionId);
   }
 
   return (

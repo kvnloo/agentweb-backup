@@ -114,11 +114,59 @@ describe('ENG-1527 verify (layout source) — deliberately NOT widened with the 
     expect(verifyGoogleAdsInjection(withConst, 'AW-11112222333')).toBe(false);
   });
 
-  it('still reports a hand-written script tag carrying the id as installed', () => {
+  it('still reports a complete hand-written tag as installed', () => {
     const handWritten = LAYOUT.replace(
       '<head>',
-      `<head><script async src="https://www.googletagmanager.com/gtag/js?id=AW-99999999"></script>`,
+      '<head><script async src="https://www.googletagmanager.com/gtag/js?id=AW-99999999"></script>'
+        + `<script>gtag('config', 'AW-99999999');</script>`,
     );
     expect(verifyGoogleAdsInjection(handWritten, 'AW-99999999')).toBe(true);
+  });
+});
+
+/**
+ * A hand-written tag is held to the SAME standard as our own block — loader plus config —
+ * because "installed" here means "a conversion will fire", not "the characters appear".
+ * Accepting the id's mere presence meant we reported success and skipped writing the tag
+ * that would actually have fired: tracking silently absent, which is the one outcome this
+ * module exists to prevent.
+ */
+describe('ENG-1527 a hand-written tag has to actually fire to count as installed', () => {
+  const inHead = (markup: string) => LAYOUT.replace('<head>', `<head>${markup}`);
+  const LOADER = '<script async src="https://www.googletagmanager.com/gtag/js?id=AW-99999999"></script>';
+  const CONFIG = `<script>gtag('config', 'AW-99999999');</script>`;
+
+  it('rejects a loader with no gtag config call', () => {
+    expect(verifyGoogleAdsInjection(inHead(LOADER), 'AW-99999999')).toBe(false);
+  });
+
+  it('rejects a config call with no gtag.js loaded at all', () => {
+    expect(verifyGoogleAdsInjection(inHead(CONFIG), 'AW-99999999')).toBe(false);
+  });
+
+  it('rejects the id merely mentioned in a string inside a script', () => {
+    const note = '<script>var note = "AW-99999999 is our id";</script>';
+    expect(verifyGoogleAdsInjection(inHead(LOADER + note), 'AW-99999999')).toBe(false);
+  });
+
+  it('rejects a config call that names a DIFFERENT id', () => {
+    const other = `<script>gtag('config', 'AW-11112222333');</script>`;
+    expect(verifyGoogleAdsInjection(inHead(LOADER + other), 'AW-99999999')).toBe(false);
+  });
+
+  it('accepts a config on a loader that carries the GA4 id instead', () => {
+    // The normal shared-gtag setup: gtag.js is loaded once for GA4, and the Ads id is
+    // registered with its own config call. Demanding gtag/js?id=AW- would report these
+    // correctly tagged pages as untagged.
+    const ga4Loader = '<script async src="https://www.googletagmanager.com/gtag/js?id=G-KKJE0Q33LF"></script>';
+    expect(verifyGoogleAdsInjection(inHead(ga4Loader + CONFIG), 'AW-99999999')).toBe(true);
+  });
+
+  it.each([
+    [`gtag("config", "AW-99999999")`, 'double quotes'],
+    [`gtag('config','AW-99999999')`, 'no spaces'],
+    ['gtag( "config" , "AW-99999999" )', 'extra spaces'],
+  ])('accepts %s (%s), because a human wrote it', (call) => {
+    expect(verifyGoogleAdsInjection(inHead(LOADER + `<script>${call};</script>`), 'AW-99999999')).toBe(true);
   });
 });
