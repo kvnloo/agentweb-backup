@@ -25,6 +25,13 @@ export interface AttioCompany {
   domainNames?: string[];
 }
 
+/** A single Attio List Entry, reshaped from the raw API response. */
+export interface AttioListEntry {
+  entryId: string;
+  personRecordId: string;
+  values: Record<string, any>;
+}
+
 // ─── Module-level account resolver ───────────────────────────────────────────
 
 async function resolveAttioAccount(userId: string, accountId?: string) {
@@ -784,5 +791,27 @@ export class AttioService {
       cursor = nextCursor;
     } while (cursor);
     return total;
+  }
+
+  /**
+   * Same page of list entries as listListEntries, reshaped into a typed,
+   * caller-friendly form (entryId, personRecordId, values) instead of the
+   * raw Attio response shape — keeps adapters from touching raw API shapes
+   * directly. Entries missing either id are dropped (defensive — matches
+   * findListEntry's null-safety style; shouldn't happen in practice).
+   */
+  async listListEntriesDetailed(
+    listId: string,
+    cursor?: string
+  ): Promise<{ entries: AttioListEntry[]; nextCursor?: string }> {
+    const { entries, nextCursor } = await this.listListEntries(listId, cursor);
+    const detailed = entries
+      .map((e: any) => ({
+        entryId: e?.id?.entry_id as string | undefined,
+        personRecordId: e?.parent_record_id as string | undefined,
+        values: (e?.entry_values ?? {}) as Record<string, any>,
+      }))
+      .filter((e): e is AttioListEntry => !!e.entryId && !!e.personRecordId);
+    return { entries: detailed, nextCursor };
   }
 }

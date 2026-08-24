@@ -270,7 +270,33 @@ export class AttioAdapter implements CrmAdapter {
         const pullCustomMappings = config.customFieldMapping.filter(
             m => m.enabled && m.direction !== 'push'
         );
+        const pullDealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'push');
         const standardEntryFields = ['company'];
+        const nativeDealFields = ['status', 'dealValue', 'dealCurrency'];
+
+        // Bulk-prefetch the deal list's entries (Attio's Deal analog) once per
+        // pull run, keyed by person id — avoids an API call per person, unlike
+        // HubSpot's per-contact association lookup, since Attio's List Entries
+        // are bulk-queryable. Only reads a list that already exists (pull must
+        // not create one — that's push's job); a prefetch failure is
+        // non-critical and degrades to contact-only pull for the whole run.
+        const dealEntriesByPersonId = new Map<string, { entryId: string; values: Record<string, any> }>();
+        let dealAttrCache: Map<string, string> | undefined;
+        if (pullDealMappings.length > 0 && config.attioDealListId) {
+            try {
+                dealAttrCache = await svc.loadAttributeTypes('people', config.attioDealListId);
+                let dealCursor: string | undefined;
+                do {
+                    const { entries, nextCursor: nextDealCursor } = await svc.listListEntriesDetailed(config.attioDealListId, dealCursor);
+                    for (const entry of entries) {
+                        dealEntriesByPersonId.set(entry.personRecordId, { entryId: entry.entryId, values: entry.values });
+                    }
+                    dealCursor = nextDealCursor;
+                } while (dealCursor);
+            } catch (e: any) {
+                console.error('[Attio-Pull] Failed to prefetch deal-list entries (non-critical):', e.response?.data?.message || e.message);
+            }
+        }
 
         let cursor: string | undefined;
 
@@ -320,6 +346,22 @@ export class AttioAdapter implements CrmAdapter {
                         }
                     }
 
+                    const dealEntry = dealEntriesByPersonId.get(personId);
+                    if (dealEntry && pullDealMappings.length > 0) {
+                        for (const m of pullDealMappings) {
+                            const slug = m.crmProperty;
+                            const type = dealAttrCache?.get(`list:${config.attioDealListId}:${slug}`) || 'text';
+                            const val = this.extractAttioValue(dealEntry.values[slug], type);
+                            if (val != null && val !== '') {
+                                if (nativeDealFields.includes(m.agentwebField)) {
+                                    leadData[m.agentwebField] = val;
+                                } else {
+                                    customFields[m.agentwebField] = val;
+                                }
+                            }
+                        }
+                        syncMetadata.attio_list_entry_id = dealEntry.entryId;
+                    }
 
                 } catch (e: any) {
                     console.error(`[Attio-Pull] Failed to fetch values for person ${personId}:`, e.message);

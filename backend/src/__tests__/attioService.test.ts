@@ -447,4 +447,70 @@ describe('AttioService', () => {
       expect(mockAxiosPost).toHaveBeenCalledTimes(2);
     });
   });
+
+  describe('listListEntriesDetailed', () => {
+    it('filters out an entry missing parent_record_id', async () => {
+      mockAxiosPost.mockResolvedValue({
+        data: {
+          data: [
+            { id: { entry_id: 'entry-1' }, entry_values: { deal_value: [{ value: '100' }] } },
+          ],
+        },
+      });
+      const { entries } = await service.listListEntriesDetailed('list-abc');
+      expect(entries).toHaveLength(0);
+    });
+
+    it('filters out an entry missing id.entry_id', async () => {
+      mockAxiosPost.mockResolvedValue({
+        data: { data: [{ parent_record_id: 'person-1', entry_values: {} }] },
+      });
+      const { entries } = await service.listListEntriesDetailed('list-abc');
+      expect(entries).toHaveLength(0);
+    });
+
+    it('extracts entryId, personRecordId, and values from a well-formed entry', async () => {
+      mockAxiosPost.mockResolvedValue({
+        data: {
+          data: [
+            {
+              id: { entry_id: 'entry-1' },
+              parent_record_id: 'person-1',
+              entry_values: { deal_value: [{ value: '100' }], deal_status: [{ status: 'open' }] },
+            },
+          ],
+          next_cursor: 'page-2',
+        },
+      });
+
+      const { entries, nextCursor } = await service.listListEntriesDetailed('list-abc');
+
+      expect(entries).toEqual([
+        {
+          entryId: 'entry-1',
+          personRecordId: 'person-1',
+          values: { deal_value: [{ value: '100' }], deal_status: [{ status: 'open' }] },
+        },
+      ]);
+      expect(nextCursor).toBe('page-2');
+    });
+
+    it('defaults values to {} when entry_values is absent', async () => {
+      mockAxiosPost.mockResolvedValue({
+        data: { data: [{ id: { entry_id: 'entry-1' }, parent_record_id: 'person-1' }] },
+      });
+      const { entries } = await service.listListEntriesDetailed('list-abc');
+      expect(entries[0].values).toEqual({});
+    });
+
+    it('passes the cursor through to the underlying request', async () => {
+      mockAxiosPost.mockResolvedValue({ data: { data: [] } });
+      await service.listListEntriesDetailed('list-abc', 'some-cursor');
+      expect(mockAxiosPost).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ cursor: 'some-cursor' }),
+        expect.any(Object)
+      );
+    });
+  });
 });
