@@ -1053,7 +1053,11 @@ describe('LinkedInOutreachService', () => {
         expect(mockResolveTopId).not.toHaveBeenCalled();
         const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
         expect(sentBody.location).toEqual(['103644278']);
-        expect(sentBody.industry).toEqual({ include: ['6'], exclude: [] });
+        // Unipile's classic people-search schema takes `industry` as a flat
+        // array of numeric ID strings — same shape as company/location/school
+        // — not an { include, exclude } object (ENG-1299: that shape 400s
+        // every structured search with "Expected union value").
+        expect(sentBody.industry).toEqual(['6']);
         expect(sentBody.school).toEqual(['12345']);
       });
 
