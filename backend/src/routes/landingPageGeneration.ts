@@ -35,7 +35,6 @@ import {
   updateLandingPageContext,
   updateLandingPageLeadList,
   syncLeadCaptureFilesToRepo,
-  isPlatformGeneratedRepo,
   NO_CAPTURE_LAYER,
   recordLandingPagePublish,
   markLandingPagePublishReverted,
@@ -2727,11 +2726,7 @@ async function saveMetaPixelForPage(
     }
     return listByPath;
   };
-  // Installing Meta tracking regenerates the capture layer by design — this route is one
-  // of the two callers allowed to CREATE it.
-  await syncLeadCaptureFilesToRepo(repoFullName, buildListByPath, pixelId || undefined, pixelId ? accountId : undefined, {
-    allowInstall: true,
-  });
+  await syncLeadCaptureFilesToRepo(repoFullName, buildListByPath, pixelId || undefined, pixelId ? accountId : undefined);
 
   // 3. Persist metaPixelId/metaAdAccountId on this record.
   await updateLandingPageMetaPixel(page.id, page.userId, pixelId, accountId);
@@ -3072,14 +3067,6 @@ async function syncLeadCaptureForPage(
       buildListByPath,
       rootRecord?.metaPixelId,
       rootRecord?.metaAdAccountId,
-      {
-        // ⚠ Changing a page's lead list must NEVER install a capture layer into a repo that
-        // has none — on a bespoke site that means creating a root middleware.ts and a
-        // colliding capture route on `main`, with an immediate redeploy. Platform-generated
-        // repos may still be repaired this way (a page generated before ENG-309 can legitimately
-        // have no capture files yet); everything else gets a warning instead.
-        allowInstall: isPlatformGeneratedRepo(repoFullName),
-      },
     );
     if (result.committed || result.reason === "up-to-date") return undefined;
     // Not transient: no retry or redeploy installs a capture layer we refuse to install, so

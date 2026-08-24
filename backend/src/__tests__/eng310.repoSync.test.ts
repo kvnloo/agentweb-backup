@@ -496,12 +496,9 @@ describe("syncLeadCaptureFilesToRepo", () => {
         : { "/a": "list_a", "/b": "list_b" };     // retry: fresh, includes the sibling that landed
     };
 
-    // allowInstall: this fixture makes every file read 404 on purpose (see above) so each
-    // attempt reaches a real commit. That is the install case, and the subject here is
-    // retry mechanics, not install policy — so opt in rather than let the guard short-circuit.
-    const result = await syncLeadCaptureFilesToRepo(REPO, buildListByPath, undefined, undefined, {
-      allowInstall: true,
-    });
+    // Every file reads 404 here on purpose (see above) so each attempt reaches a real commit.
+    // REPO is an lp-* repo, so the install floor permits creating the layer.
+    const result = await syncLeadCaptureFilesToRepo(REPO, buildListByPath);
 
     expect(result.committed).toBe(true);
     // Re-derived fresh on EACH attempt, not computed once and reused across retries.
@@ -523,57 +520,66 @@ describe("syncLeadCaptureFilesToRepo", () => {
 
 // =============================================================================
 // =============================================================================
-// The install guard: never CREATE a capture layer in a repo that never had one
+// The install guard: only ever write a capture layer we own, on a repo we generated
 // =============================================================================
+const BESPOKE_REPO = "AgentWebPro/agentweb-landing-page"; // hireemma.ai — AgentWeb's own site
+const OWNED_MIDDLEWARE = buildLandingPageMiddleware(); // carries the aw_first_touch marker
+
 describe("syncLeadCaptureFilesToRepo — install guard", () => {
   beforeEach(() => jest.clearAllMocks());
 
-  /** A bespoke / v0-era site: none of the platform capture files exist. */
-  const BESPOKE: Record<string, string> = {};
+  it("REFUSES a bespoke repo with no capture layer at all", async () => {
+    mockGitHub({});
+    const result = await syncLeadCaptureFilesToRepo(BESPOKE_REPO, () => ({ "/": "list_1" }));
 
-  it("REFUSES to install into a repo with no capture layer when the caller may not install", async () => {
-    // middleware.ts and lib/agentweb-track.ts are written UNCONDITIONALLY, so on a repo with
-    // neither this is not a sync — it CREATES a root middleware, which in Next.js changes
-    // request handling for the whole site, and pushes it to main with an immediate redeploy.
-    mockGitHub(BESPOKE);
-
-    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }));
-
-    expect(result.committed).toBe(false);
-    expect(result.reason).toBe(NO_CAPTURE_LAYER);
-    // Nothing was pushed at all — not a blob, not a tree, not a ref update.
+    expect(result).toEqual({ committed: false, reason: NO_CAPTURE_LAYER });
     expect(mockAxiosPatch).not.toHaveBeenCalled();
     expect(treePaths()).toEqual([]);
   });
 
-  it("the guard defaults CLOSED — a caller that passes no options cannot install", async () => {
-    mockGitHub(BESPOKE);
-    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }), undefined, undefined);
+  it("REFUSES a bespoke repo whose root middleware.ts is its OWN, and never overwrites it", async () => {
+    // The case a bare "middleware.ts exists" check gets wrong. A bespoke Next.js app may
+    // legitimately run middleware for auth/i18n/redirects; treating that as our capture layer
+    // would CLOBBER it — worse than the bug this guard exists for.
+    const customMiddleware = "export function middleware(req) { /* their auth gate */ }\n";
+    mockGitHub({ "middleware.ts": customMiddleware });
+
+    const result = await syncLeadCaptureFilesToRepo(BESPOKE_REPO, () => ({ "/": "list_1" }));
+
+    expect(result).toEqual({ committed: false, reason: NO_CAPTURE_LAYER });
+    expect(treePaths()).toEqual([]);
+    expect(mockAxiosPatch).not.toHaveBeenCalled();
+    // Nothing we uploaded may be our middleware — their file stands untouched.
+    for (const content of blobBySha.values()) expect(content).not.toBe(OWNED_MIDDLEWARE);
+  });
+
+  it("REFUSES a bespoke repo carrying its own app/api/capture/route.ts", async () => {
+    // v0-xc-ures-landing-page really is in this state, which is why a capture-route marker
+    // would be the wrong ownership signal.
+    mockGitHub({ "app/api/capture/route.ts": "// their own capture handler\n" });
+    const result = await syncLeadCaptureFilesToRepo(BESPOKE_REPO, () => ({ "/": "list_1" }));
     expect(result.reason).toBe(NO_CAPTURE_LAYER);
   });
 
-  it("ALLOWS the install when the caller owns the capture layer (generation, pixel install)", async () => {
-    mockGitHub(BESPOKE);
-
-    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }), undefined, undefined, {
-      allowInstall: true,
-    });
+  it("ALLOWS a platform-generated repo with no layer yet — the pre-ENG-309 repair case", async () => {
+    mockGitHub({});
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }));
 
     expect(result.committed).toBe(true);
     expect(treePaths()).toEqual(expect.arrayContaining(["middleware.ts", "app/api/capture/route.ts"]));
   });
 
-  it("does NOT change an ordinary sync — a repo that already has the layer still syncs without opting in", async () => {
+  it("ALLOWS any repo that already carries OUR layer — those are files we wrote", async () => {
     mockGitHub({
-      "middleware.ts": "// stale middleware\n",
+      "middleware.ts": OWNED_MIDDLEWARE,
+      "lib/agentweb-track.ts": "// stale helper\n",
       "app/api/capture/route.ts": "// stale route\n",
       "domainMap.ts": REAL_DOMAIN_MAP,
     });
 
-    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }));
+    const result = await syncLeadCaptureFilesToRepo(BESPOKE_REPO, () => ({ "/": "list_1" }));
 
     expect(result.committed).toBe(true);
-    expect(blobForPath("middleware.ts")).toBe(buildLandingPageMiddleware());
   });
 });
 
@@ -676,9 +682,6 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
       expect.any(Function), // ENG-485: now a callback, re-derived fresh on every retry
       "1012387921717047",
       "act_555",
-      // REPO is an lp-* repo, so the lead-list path MAY repair a platform site that has no
-      // capture layer yet. On a bespoke repo this argument is false and the sync is skipped.
-      { allowInstall: true },
     );
   });
 
@@ -716,13 +719,13 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
       .send({ leadListId: "list_home" });
 
     expect(res.status).toBe(200);
-    // The guard is decided by the caller, not left to the service to infer.
+    // The route still calls the sync — the refusal is decided centrally in the service, so
+    // no caller can opt out of it or forget to opt in.
     expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(
       "AgentWebPro/agentweb-landing-page",
       expect.any(Function),
       undefined,
       undefined,
-      { allowInstall: false },
     );
     // ⚠ Wording matters: this is NOT transient, so it must not promise a later retry.
     expect(res.body.captureSyncWarning).toMatch(/does not use the platform's lead-capture code/);
