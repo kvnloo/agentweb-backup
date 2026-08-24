@@ -935,3 +935,142 @@ describe("previewUsageRunway — combined, non-persisted what-if (ENG-1217 AC2/A
     expect(JSON.stringify(preview)).not.toMatch(/MicroUsd/);
   });
 });
+
+/**
+ * ENG-1533 — a switch is offered only where it can actually succeed.
+ *
+ * `usage-drivers` pools schedules across every org member, so this list
+ * routinely shows a caller a colleague's work. `llmModelChangeService` refuses
+ * a plain member's write on it (correctly — ENG-1528), which left the UI
+ * offering a Confirm button whose only possible outcome was an error.
+ *
+ * The row stays visible either way: the spend is real and was billed to this
+ * account, and hiding it would recreate the blind spot ENG-1440 closed. What
+ * `switchable` changes is whether an ACTION is offered on it.
+ */
+describe("ENG-1533 — `switchable` reflects this caller's real authority", () => {
+  const COLLEAGUE_SCHED = "sched-colleague";
+
+  const orgOf = (callerRole: string) => {
+    mockUser.mockImplementation(async (id: string) => {
+      if (id === "member-a") return { userId: "member-a", orgId: "org-1", orgRole: callerRole };
+      if (id === "colleague") return { userId: "colleague", orgId: "org-1", orgRole: "member" };
+      return { userId: "billing-root", orgId: "org-1", orgRole: "owner" };
+    });
+    mockOrg.mockResolvedValue({ orgId: "org-1", ownerUserId: "billing-root" });
+    mockMembers.mockResolvedValue([
+      { userId: "billing-root" },
+      { userId: "member-a" },
+      { userId: "colleague" },
+    ]);
+    mockSchedules.mockImplementation(async (id: string) =>
+      id === "colleague"
+        ? [{ scheduleId: COLLEAGUE_SCHED, scheduleName: "Colleague's daily scan", frequency: "daily" }]
+        : [],
+    );
+  };
+
+  /** One cycle whose only schedule-attributed spend belongs to `colleague`. */
+  const colleaguesSpend = () => {
+    mockQuery.mockResolvedValue([
+      ...opusLedger(),
+      {
+        userId: "billing-root",
+        sk: `2026-08-05#${OPUS}#agent_task:scheduled:${COLLEAGUE_SCHED}`,
+        date: "2026-08-05",
+        model: OPUS,
+        feature: `agent_task:scheduled:${COLLEAGUE_SCHED}`,
+        inputTokens: 500_000,
+        outputTokens: 100_000,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costMicroUsd: 20 * USD,
+        callCount: 8,
+        billingUserId: "billing-root",
+      },
+    ]);
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBillingQuery.mockResolvedValue([]);
+    mockPolicy.mockResolvedValue(policyFor());
+    mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+  });
+
+  it("refuses to offer a switch on a COLLEAGUE's schedule to a plain member", async () => {
+    // The defect. The write path 403s this exact caller on this exact schedule,
+    // so offering the button could only ever produce an error.
+    orgOf("member");
+    colleaguesSpend();
+
+    const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+    const row = scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED);
+
+    expect(row).toBeDefined();
+    expect(row!.switchable).toBe(false);
+  });
+
+  it("still SHOWS the row to that member — only the action is withheld", async () => {
+    // Hiding it would recreate the ENG-1440 blind spot: the spend is real and
+    // was billed to this account, so it must stay accounted for.
+    orgOf("member");
+    colleaguesSpend();
+
+    const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+    const row = scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED)!;
+
+    expect(row.title).toBe("Colleague's daily scan");
+    expect(row.shareOfTotal).toBeGreaterThan(0);
+    expect(row.callCount).toBe(8);
+  });
+
+  it("offers it to an org ADMIN, who genuinely can apply it", async () => {
+    // The other half of ENG-1528: `org:content:manage` is held by owner+admin,
+    // so for them the button works and withholding it would be a false refusal.
+    orgOf("admin");
+    colleaguesSpend();
+
+    const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+    expect(scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED)!.switchable).toBe(true);
+  });
+
+  it("offers it on the caller's OWN schedule, which needs no org role at all", async () => {
+    orgOf("member");
+    mockSchedules.mockImplementation(async (id: string) =>
+      id === "member-a"
+        ? [{ scheduleId: COLLEAGUE_SCHED, scheduleName: "My own scan", frequency: "daily" }]
+        : [],
+    );
+    colleaguesSpend();
+
+    const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+    expect(scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED)!.switchable).toBe(true);
+  });
+
+  it("marks a DELETED schedule unswitchable — no one can act on it, so no authority question arises", async () => {
+    orgOf("admin");
+    mockSchedules.mockResolvedValue([]);
+    colleaguesSpend();
+
+    const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+    const row = scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED)!;
+
+    expect(row.scheduleExists).toBe(false);
+    expect(row.switchable).toBe(false);
+  });
+
+  it("CROSSES the customer boundary — without it the UI cannot tell the two rows apart", async () => {
+    // The ENG-1438 lesson applied: a flag the UI depends on that never reaches
+    // it is a fix that ships inert.
+    orgOf("member");
+    colleaguesSpend();
+
+    const customer = toCustomerDrivers(await resolveUsageDrivers("member-a", { today: "2026-08-11" }));
+    const row = customer.scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED)!;
+
+    expect(row).toHaveProperty("switchable", false);
+    // And it stays customer-safe: authority, no economics.
+    expect(JSON.stringify(customer.scheduleDrivers)).not.toMatch(/MicroUsd/i);
+  });
+});
