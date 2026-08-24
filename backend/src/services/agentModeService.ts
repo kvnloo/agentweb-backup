@@ -13410,15 +13410,24 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       // here must never break the underlying write (matches the onboarding
       // backstop's own never-throws contract).
       let autoLogoAsset: { type: string; url: string; filename: string; key: string } | null = null;
+      // Replaces the CALLER's own logo asset entry with a pinned/rasterised
+      // one when its URL isn't safe to trust as-is (see the third branch
+      // below). Distinct from autoLogoAsset, which is appended fresh when no
+      // asset was supplied at all.
+      let callerLogoAssetOverride: { type: string; url: string; filename: string; key: string } | null = null;
       // Surfaced (not swallowed) when the fetch/rasterise attempt didn't land
       // an asset — see the failure branch below for why this must not read
       // as silent success.
       let logoAutoPinIssue: string | null = null;
       const incomingLogoUrl =
         typeof (brandData as any)?.logoUrl === 'string' ? (brandData as any).logoUrl.trim() : '';
-      const callerSuppliedLogoAsset = (
-        Array.isArray(brandAssets) ? brandAssets : brandAssets ? [brandAssets] : []
-      ).some((a: any) => a?.type === 'logo');
+      const normalizedBrandAssets: any[] = Array.isArray(brandAssets)
+        ? brandAssets
+        : brandAssets !== undefined && typeof brandAssets === 'object' && brandAssets !== null
+          ? [brandAssets]
+          : [];
+      const callerLogoAsset = normalizedBrandAssets.find((a: any) => a?.type === 'logo');
+      const callerSuppliedLogoAsset = !!callerLogoAsset;
       const existingLogoAssetUrl = getPersistedBrandLogoAssetUrl({
         attachments: existingBrand.attachments,
       });
@@ -13469,21 +13478,67 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         // Without this, the Logo & Assets card would keep showing the correct
         // pinned logo while brandData.logoUrl silently pointed somewhere else.
         updatedBrandData.logoUrl = existingLogoAssetUrl;
+      } else if (
+        callerSuppliedLogoAsset &&
+        typeof callerLogoAsset?.url === 'string' &&
+        callerLogoAsset.url.trim()
+      ) {
+        // ENG-933 live-verification finding: Emma's `update_brand_guidelines`
+        // tool lets her supply brandAssets directly, and when explicitly
+        // asked to save a logo she constructs her OWN asset object from
+        // whatever URL she has — bypassing the auto-pin above entirely
+        // (which only fires when brandAssets is absent) and storing the raw
+        // site URL (e.g. a .ico) unrasterised and unpinned. Never trust a
+        // caller-supplied logo URL blindly: run it through the same
+        // rasterise/pin pipeline unless it's already one of our own S3
+        // assets (the onboarding backstop's own call already looks like
+        // this, and re-fetching it would be pure waste).
+        const rawCallerLogoUrl = callerLogoAsset.url.trim();
+        try {
+          const { isS3Url } = await import('../utils/s3Utils');
+          if (!isS3Url(rawCallerLogoUrl)) {
+            const outcome = await downloadBrandLogoToS3(rawCallerLogoUrl, userId);
+            if (outcome.status === 'svg') {
+              logoAutoPinIssue =
+                'The provided logo asset URL is an SVG that could not be rasterised — it was stored as provided, which brand guidelines normally rejects. Ask the user to upload a PNG/JPEG/GIF/WEBP version instead.';
+            } else if (outcome.status !== 'uploaded') {
+              const detailSuffix = outcome.detail ? `: ${outcome.detail}` : '';
+              logoAutoPinIssue =
+                `Could not pin the provided logo asset URL (${outcome.status}${detailSuffix}) — it was stored as provided, which may not render reliably in every browser and isn't hosted on our own storage.`;
+            } else if (outcome.url) {
+              const filename = outcome.url.split('/').filter(Boolean).pop() || 'logo.png';
+              callerLogoAssetOverride = {
+                type: 'logo',
+                url: outcome.url,
+                filename,
+                // Preserve the caller's own key if it supplied one (keeps a
+                // stable React list key / delete-asset target), else mint a
+                // fresh one matching the auto-pin's own convention.
+                key:
+                  typeof callerLogoAsset.key === 'string' && callerLogoAsset.key
+                    ? callerLogoAsset.key
+                    : `auto-logo-${Date.now()}`,
+              };
+              updatedBrandData.logoUrl = outcome.url;
+            }
+          }
+        } catch (e: any) {
+          console.warn('[brandLogo] pinning a caller-supplied logo asset failed', {
+            userId,
+            error: e?.message ?? String(e),
+          });
+          logoAutoPinIssue =
+            'Could not pin the provided logo asset URL (unexpected error) — it was stored as provided.';
+        }
       }
 
       // Handle brandAssets update - merge by type to preserve existing assets
       let updatedAttachments = [...(existingBrand.attachments || [])];
       const updatedAssets: any[] = []; // Track which assets were actually updated
 
-      const assetsToMerge: any[] = [];
-      if (Array.isArray(brandAssets)) {
-        assetsToMerge.push(...brandAssets);
-      } else if (brandAssets !== undefined && typeof brandAssets === 'object' && brandAssets !== null) {
-        // Same guard the original single-asset branch used — a malformed
-        // `brandAssets` (null / string / number) is silently ignored here,
-        // not merged as a bogus attachment entry.
-        assetsToMerge.push(brandAssets);
-      }
+      const assetsToMerge: any[] = normalizedBrandAssets.map((a: any) =>
+        callerLogoAssetOverride && a?.type === 'logo' ? callerLogoAssetOverride : a
+      );
       if (autoLogoAsset) {
         assetsToMerge.push(autoLogoAsset);
       }
