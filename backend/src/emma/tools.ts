@@ -9062,7 +9062,7 @@ ENTITY_TYPE + ACTION MATRIX:
       properties: {
         entity_type: { type: 'string', enum: ['LIST_ENTRIES'], description: 'Attio resource to operate on.' },
         action:      { type: 'string', enum: ['COUNT'], description: 'Action to perform. See ACTION MATRIX.' },
-        list_id:     { type: 'string', description: 'Attio list ID. Required for LIST_ENTRIES COUNT.' },
+        list_id:     { type: 'string', description: 'Required for LIST_ENTRIES COUNT. Pass the AgentWeb lead list\'s id (e.g. from get_lead_lists/get_lead_details) — it is automatically resolved to that list\'s connected Attio deal-list id. A raw Attio list id also works if you already have one.' },
         account_id:  { type: 'string', description: 'Attio account ID. Required when the user has multiple Attio accounts connected — the error message will list them; ask the user which to use.' },
       },
       required: ['entity_type', 'action'],

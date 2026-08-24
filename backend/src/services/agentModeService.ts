@@ -35122,6 +35122,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   /**
+   * Resolves a `list_id` argument that may be either an AgentWeb lead-list id
+   * or a raw Attio list id. Emma's other tools (get_lead_lists, etc.) only
+   * ever hand back AgentWeb list ids, so without this the model has no way
+   * to discover the Attio deal-list's actual id and either guesses wrong
+   * (404) or asks the user to paste a UUID it has no reason to know. If
+   * `candidateId` matches one of the user's own lead lists with a cached
+   * `attioDealListId`, substitute that; otherwise assume it's already a raw
+   * Attio list id (still supported, for anyone who does have one to hand).
+   */
+  private async resolveAttioListId(userId: string, candidateId: string): Promise<string> {
+    const { externalCrmSyncService } = await import('./externalCrmSyncService');
+    try {
+      const config = await externalCrmSyncService.getConfig(userId, candidateId, 'attio');
+      if (config?.attioDealListId) return config.attioDealListId;
+    } catch {
+      // Not an AgentWeb list id (or no Attio config for it) — fall through.
+    }
+    return candidateId;
+  }
+
+  /**
    * Emma tool: read-only Attio lead counts, for CPL/attribution reporting.
    * Deliberately narrower than handleHubspotApi — Attio has no equivalent of
    * HubSpot's marketing-asset concepts (campaigns, emails, landing pages,
@@ -35139,7 +35160,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         switch (action) {
           case 'COUNT': {
             if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES COUNT.' };
-            const count = await svc.countListEntries(args.list_id);
+            const attioListId = await this.resolveAttioListId(userId, args.list_id);
+            const count = await svc.countListEntries(attioListId);
             return { success: true, count };
           }
           default:
