@@ -2224,6 +2224,12 @@ describe("v0Service - deployLandingPage", () => {
 
       expect(result.status).toBe("deployed");
       expect(getCalls).toBeGreaterThan(1); // proves the re-read actually happened
+      // CodeRabbit (ENG-1543): the re-read is only trustworthy if it's a STRONGLY
+      // consistent read — DynamoDB's default eventually-consistent get could still
+      // return the pre-PATCH value microseconds after the write and silently
+      // reintroduce the exact race this call exists to close.
+      const reReadCall = mockGet.mock.calls[1]?.[0];
+      expect(reReadCall).toMatchObject({ ConsistentRead: true });
       const captureRoute = pushedCaptureRouteBlob();
       expect(captureRoute).toBeDefined();
       expect(captureRoute).toContain("list_CORRECT_ATTACHED_MIDFLIGHT");

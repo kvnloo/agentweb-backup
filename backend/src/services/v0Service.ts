@@ -3304,7 +3304,8 @@ export async function deployLandingPage(
     // Falls back to the entry snapshot only if the re-read itself comes back empty
     // (e.g. the page was deleted mid-deploy) — never regresses to "no list" when the
     // snapshot already had one.
-    const currentLeadListId = (await getLandingPage(id, userId))?.leadListId ?? record.leadListId;
+    const currentLeadListId =
+      (await getLandingPage(id, userId, false, /* consistentRead */ true))?.leadListId ?? record.leadListId;
     const listByPath: Record<string, string> = currentLeadListId ? { [pagePath]: currentLeadListId } : {};
 
     // Resolve the Meta pixel to use, if one wasn't already manually set on this
@@ -5873,16 +5874,25 @@ async function finishIteration(
 
 /**
  * Get a single landing page by ID (scoped to user). Excludes archived unless requested.
+ *
+ * `consistentRead` defaults to false (DynamoDB eventually-consistent, half the RCU cost)
+ * — the right default for ordinary reads. Pass true for a caller that MUST observe a
+ * write that may have landed microseconds earlier, e.g. deployLandingPage's ENG-1543
+ * re-read of leadListId right before it's baked into the pushed capture route: an
+ * eventually-consistent read there could still return the pre-PATCH value and silently
+ * reintroduce the exact race this function call exists to close.
  */
 export async function getLandingPage(
   id: string,
   userId: string,
-  includeArchived = false
+  includeArchived = false,
+  consistentRead = false
 ): Promise<GeneratedLandingPage | null> {
   const result = await dynamodb
     .get({
       TableName: TABLE_NAME,
       Key: { id },
+      ConsistentRead: consistentRead,
     })
     .promise();
 
