@@ -635,6 +635,76 @@ describe('executePreparedTools', () => {
     });
   });
 
+  // ENG-1331: a Playwright-rendered asset loop (e.g. a display-ad size matrix) hits the
+  // exact same "one batch exceeds the run's wall clock" failure MEDIA_GEN_TOOLS already
+  // defers for — production evidence: a 12-size render silently stopped at 4 with no
+  // deferral marker and no auto-resume. playwright_browser_take_screenshot now shares the
+  // same deferral mechanism via DEFERRABLE_ASSET_TOOLS.
+  describe('playwright screenshot deferral (ENG-1331)', () => {
+    function screenshotPorts() {
+      const executed: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          executed.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async (i: any) => ({ success: true, screenshotUrl: `https://s3/${i.toolName}.png` }),
+      });
+      return { ports, executed };
+    }
+
+    it('defers a screenshot call once the deadline has passed and ≥1 asset already exists this run', async () => {
+      const { ports, executed } = screenshotPorts();
+      const input = makeInput(
+        [toolCall('a', 'playwright_browser_take_screenshot', '{"size":"300x250"}')],
+        ports,
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 1 },
+      );
+      const result = await executePreparedTools(input);
+
+      expect(executed).toEqual([]);
+      expect(result.mediaBudgetDeferred).toBe(true);
+      expect(result.mediaAssetsProduced).toBe(0);
+      expect(result.pendingCounterUpdates).toEqual({});
+      expect(input.messages[0]).toMatchObject({ tool_call_id: 'a', role: 'tool', name: 'playwright_browser_take_screenshot' });
+      expect(input.toolCallsLedger[0].result).toEqual({ deferred: true, reason: 'media_generation_time_budget' });
+    });
+
+    it('does NOT defer when no deadline is supplied (prior behavior preserved)', async () => {
+      const { ports, executed } = screenshotPorts();
+      const input = makeInput(
+        [toolCall('a', 'playwright_browser_take_screenshot', '{"size":"300x250"}')],
+        ports,
+        { mediaGenerationDeadlineMs: undefined, mediaAssetsProducedThisRun: 5 },
+      );
+      const result = await executePreparedTools(input);
+
+      expect(executed).toEqual(['playwright_browser_take_screenshot']);
+      expect(result.mediaBudgetDeferred).toBe(false);
+      expect(result.mediaAssetsProduced).toBe(1);
+    });
+
+    it('counts a successful screenshot toward mediaAssetsProduced (the ≥1-asset deferral gate)', async () => {
+      const { ports, executed } = screenshotPorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'playwright_browser_take_screenshot', '{"size":"300x250"}'),
+          toolCall('b', 'playwright_browser_take_screenshot', '{"size":"728x90"}'),
+        ],
+        ports,
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 0 },
+      );
+      const result = await executePreparedTools(input);
+
+      // First call makes forward progress (no asset produced yet this run); once it
+      // succeeds the second is deferred the same turn.
+      expect(executed).toEqual(['playwright_browser_take_screenshot']);
+      expect(result.mediaAssetsProduced).toBe(1);
+      expect(result.mediaBudgetDeferred).toBe(true);
+    });
+  });
+
   describe('adaptive hard-cap deferral (ENG-510)', () => {
     // Gateway fake whose media-gen calls report a configurable wall-clock duration,
     // so we can prove the deferral reserves enough time for one more call below the
@@ -1216,6 +1286,35 @@ describe('executePreparedTools — cross-iteration media dedupe (ENG-510)', () =
     expect(msg.role).toBe('tool');
   });
 
+  // ENG-1331: same cross-iteration protection now applies to screenshot renders — a
+  // resumed continuation must not re-screenshot an already-captured size.
+  it('records a produced screenshot key, then suppresses the same call next iteration', async () => {
+    const screenshotPorts = () =>
+      makePorts({
+        executePreparedAgentTool: async (_i: any) => ({ success: true, screenshotUrl: 'https://s3/300x250.png' }),
+      });
+
+    const ports1 = screenshotPorts();
+    const in1 = makeInput(
+      [toolCall('a', 'playwright_browser_take_screenshot', '{"filename":"300x250.png"}')],
+      ports1,
+      { priorMediaCallKeys: new Map<string, string>() },
+    );
+    const r1 = await executePreparedTools(in1);
+    expect((ports1 as any).__execOrder).toEqual(['playwright_browser_take_screenshot']);
+    expect(r1.producedMediaCallKeys.size).toBe(1);
+
+    const ports2 = screenshotPorts();
+    const in2 = makeInput(
+      [toolCall('b', 'playwright_browser_take_screenshot', '{"filename":"300x250.png"}')],
+      ports2,
+      { priorMediaCallKeys: r1.producedMediaCallKeys },
+    );
+    const r2 = await executePreparedTools(in2);
+    expect((ports2 as any).__execOrder).toEqual([]); // did NOT re-screenshot the same size
+    expect(r2.mediaAssetsProduced).toBe(0);
+  });
+
   it('does NOT suppress a distinct variant (different args) from a prior iteration', async () => {
     const prior = new Map<string, string>([[`generate_image:${stableStringify({ prompt: 'sun' })}`, 'a']]);
     const ports = imageGatewayPorts();
@@ -1341,5 +1440,27 @@ describe('seedMediaCallKeysFromHistory (ENG-1239)', () => {
       { role: 'assistant', metadata: { toolCalls: [null, {}] } },
     ];
     expect(seedMediaCallKeysFromHistory(msgs as any, 0).size).toBe(0);
+  });
+
+  // ENG-1331: a screenshot-rendered work-plan step (e.g. a display-ad size matrix) is now
+  // deferral-eligible, so a resumed continuation turn needs the SAME cross-turn dedupe
+  // protection generate_image already got — otherwise a continuation could re-screenshot
+  // an already-captured size instead of only the still-missing ones.
+  it('seeds a key for a successful playwright_browser_take_screenshot call', () => {
+    const msgs = [{
+      role: 'assistant',
+      timestamp: '2026-08-18T09:12:37.587Z',
+      metadata: {
+        toolCalls: [{
+          id: 'x',
+          name: 'playwright_browser_take_screenshot',
+          arguments: { filename: 'AgentWeb-300x250-MediumRectangle.png' },
+          result: { success: true, screenshotUrl: 'https://s3/300x250.png' },
+        }],
+      },
+    }];
+    const seeded = seedMediaCallKeysFromHistory(msgs, 0);
+    const key = `playwright_browser_take_screenshot:${stableStringify({ filename: 'AgentWeb-300x250-MediumRectangle.png' })}`;
+    expect(seeded.get(key)).toBe('x');
   });
 });

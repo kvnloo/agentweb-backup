@@ -61,6 +61,30 @@ export const MEDIA_GEN_TOOLS = new Set<string>([
 ]);
 
 /**
+ * ENG-1331: MEDIA_GEN_TOOLS' three rate-limited generation APIs share a time-budget
+ * deferral + auto-continuation mechanism (ENG-510/ENG-1239) that
+ * `playwright_browser_take_screenshot` never joined — even though a
+ * Playwright-rendered asset loop (e.g. a display-ad size matrix: create_html_file +
+ * one screenshot per size) hits the exact same "one batch exceeds the run's wall
+ * clock" failure. Without deferral eligibility it just runs until the whole-turn
+ * hard cap, with no deferral marker and no auto-resume — production evidence: a
+ * 12-size render stopped at 4 with nothing surfaced, then the closing synthesis
+ * claimed all 12 (the false-completion-claim guard now catches THAT symptom, but
+ * this is the mechanism that let the run truncate unannounced in the first place).
+ *
+ * Superset of MEDIA_GEN_TOOLS used ONLY for the deferral / asset-count /
+ * duration-tracking checks below — deliberately NOT folded into MEDIA_GEN_TOOLS
+ * itself, which also drives forced-serial batching (`hasMultipleMediaGenTools`
+ * below) and the confirmation-gate-pause check in `mediaGenProducedAsset`, both
+ * legitimately specific to rate-limited external generation APIs and not
+ * applicable to a local, unrate-limited browser screenshot.
+ */
+export const DEFERRABLE_ASSET_TOOLS = new Set<string>([
+  ...MEDIA_GEN_TOOLS,
+  'playwright_browser_take_screenshot',
+]);
+
+/**
  * ENG-510: how many media-gen calls batched in ONE assistant turn may run at once.
  * Multi-variant requests were previously forced strictly serial (concurrency 1) to
  * respect provider rate limits, but that makes N independent variants take N× a single
@@ -162,7 +186,7 @@ export function seedMediaCallKeysFromHistory(
     const ts = rawTs ? Date.parse(rawTs) : NaN;
     if (!Number.isFinite(ts) || ts < sinceMs) continue;
     for (const tc of toolCalls) {
-      if (!tc?.name || !MEDIA_GEN_TOOLS.has(tc.name)) continue;
+      if (!tc?.name || !DEFERRABLE_ASSET_TOOLS.has(tc.name)) continue;
       if (tc.error || !tc.result || tc.result.deferred === true || tc.result.success === false) continue;
       if (!mediaGenProducedAsset(tc.name, tc.result)) continue;
       const key = `${tc.name}:${stableStringify(tc.arguments)}`;
@@ -703,14 +727,16 @@ export async function executePreparedTools(
         suppressedDuplicates.push({ toolCall, functionArgs: preparedFunctionArgs, duplicateOfId });
         continue;
       }
-      // ENG-510: cross-iteration dedupe for MEDIA-GEN tools only. The per-iteration check
-      // above misses an identical generate_image re-emitted in a LATER iteration of the
-      // same turn (e.g. resuming after a timeout, the model re-requests an image it already
-      // made). Suppress it if that exact call already produced an asset earlier this turn.
-      // Media-only so a legitimately-repeated mutating call (send_email) is never blocked;
-      // only successful generations are recorded, so a failed call can still be retried.
+      // ENG-510: cross-iteration dedupe for deferrable asset tools only. The per-iteration
+      // check above misses an identical generate_image (or, since ENG-1331, an identical
+      // screenshot render) re-emitted in a LATER iteration of the same turn (e.g. resuming
+      // after a timeout, the model re-requests an asset it already made). Suppress it if
+      // that exact call already produced an asset earlier this turn. Scoped to
+      // DEFERRABLE_ASSET_TOOLS so a legitimately-repeated mutating call (send_email) is
+      // never blocked; only successful generations are recorded, so a failed call can
+      // still be retried.
       if (
-        MEDIA_GEN_TOOLS.has(toolCall.function.name)
+        DEFERRABLE_ASSET_TOOLS.has(toolCall.function.name)
         && priorMediaCallKeys?.has(dedupeKey)
       ) {
         const duplicateOfId = priorMediaCallKeys.get(dedupeKey) as string;
@@ -733,13 +759,24 @@ export async function executePreparedTools(
     }
   }
 
-  // Phase 2: Execute tools — sequential if wait_seconds is present (so the wait
-  // happens in order) or when multiple media-gen calls are batched (rate limits),
-  // parallel otherwise.
+  // Phase 2: Execute tools — sequential if wait_seconds is present (so the wait happens
+  // in order) or multiple screenshot calls are batched (see hasMultipleScreenshotCalls),
+  // bounded-concurrent when multiple media-gen calls are batched (rate limits), parallel
+  // otherwise.
   const hasWaitTool = preparedCalls.some(({ toolCall }) => toolCall.function.name === 'wait_seconds');
   const hasMultipleMediaGenTools = preparedCalls.length > 1 && preparedCalls.some(({ toolCall }) =>
     toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video' || toolCall.function.name === 'generate_voiceover'
   );
+  // ENG-1331: unlike the 3 rate-limited generation APIs above, multiple
+  // playwright_browser_take_screenshot calls in one turn act on the SAME shared browser
+  // page (resize-then-screenshot per size) — running them with bounded concurrency would
+  // race on that shared state, not just on a provider rate limit. Force strict sequential
+  // instead, alongside wait_seconds, so each call's deferral decision also settles
+  // race-free against the prior one's result (the plain parallel path below assumes at
+  // most one deferrable-asset call ever reaches it — see its comment).
+  const hasMultipleScreenshotCalls = preparedCalls.length > 1 && preparedCalls.filter(({ toolCall }) =>
+    toolCall.function.name === 'playwright_browser_take_screenshot'
+  ).length > 1;
 
   let toolResults: DispatchToolResult[];
 
@@ -822,7 +859,10 @@ export async function executePreparedTools(
   // ENG-510: run-wide longest media-call duration, seeded from prior iterations and
   // updated as calls settle below, so the adaptive reserve reflects real latency.
   let longestMediaCallMs = longestMediaCallMsThisRun;
-  const isMediaGenTool = (toolCall: any) => MEDIA_GEN_TOOLS.has(toolCall.function.name);
+  // ENG-1331: DEFERRABLE_ASSET_TOOLS (MEDIA_GEN_TOOLS + playwright_browser_take_screenshot)
+  // — broader than the name once was, so a Playwright render loop gets the same
+  // deferral/asset-counting/duration-tracking treatment as generate_image et al.
+  const isDeferrableAssetTool = (toolCall: any) => DEFERRABLE_ASSET_TOOLS.has(toolCall.function.name);
   // Fixed soft-budget deadline passed (the original, fast-image assumption).
   const softBudgetExceeded = (): boolean =>
     mediaGenerationDeadlineMs != null && Date.now() > mediaGenerationDeadlineMs;
@@ -835,7 +875,7 @@ export async function executePreparedTools(
     && longestMediaCallMs > 0
     && (generationHardCapMs - Date.now()) < longestMediaCallMs;
   const shouldDeferMedia = (toolCall: any): boolean =>
-    isMediaGenTool(toolCall)
+    isDeferrableAssetTool(toolCall)
     && (mediaAssetsProducedThisRun + assetsThisBatch) >= 1
     && (softBudgetExceeded() || withinOneMediaCallOfHardCap());
   const makeDeferred = (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision): DispatchToolResult => {
@@ -848,21 +888,22 @@ export async function executePreparedTools(
   // this batch" consistent with the calledFunctions / mediaAssetsProduced counters.
   const countsAsAsset = (dr: DispatchToolResult): boolean =>
     dr.status === 'success'
-    && isMediaGenTool(dr.toolCall)
+    && isDeferrableAssetTool(dr.toolCall)
     && !ports.toolResultError(dr.result)
     && mediaGenProducedAsset(dr.toolCall.function.name, dr.result);
   // ENG-510: track how long a media call actually took so the adaptive reserve (and the
   // value returned to the loop) reflects real latency. Updated as each call settles so a
   // later call in the SAME batch already sees the earlier call's duration.
   const recordMediaDuration = (dr: DispatchToolResult): void => {
-    if (isMediaGenTool(dr.toolCall) && dr.status !== 'deferred') {
+    if (isDeferrableAssetTool(dr.toolCall) && dr.status !== 'deferred') {
       longestMediaCallMs = Math.max(longestMediaCallMs, dr.duration || 0);
     }
   };
 
-  if (hasWaitTool) {
+  if (hasWaitTool || hasMultipleScreenshotCalls) {
     // Strict sequential: wait_seconds must take effect in emission order, so nothing
-    // batched with it may overlap it.
+    // batched with it may overlap it; multiple screenshot calls share one browser page
+    // (see hasMultipleScreenshotCalls above) and must not race on it either.
     toolResults = [];
     for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
       if (shouldDeferMedia(toolCall)) {
@@ -901,9 +942,10 @@ export async function executePreparedTools(
       });
     }
   } else {
-    // Parallel path carries at most one media-gen call (a solo call; any media call
-    // batched with other tools forces the sequential path above), so a single
-    // pre-launch deferral check is race-free.
+    // Parallel path carries at most one deferrable-asset call (a solo call; a media-gen
+    // call batched with other tools forces the bounded-concurrency path above, and 2+
+    // screenshot calls force the strict-sequential path above), so a single pre-launch
+    // deferral check is race-free.
     const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs, policyDecision }) => {
       if (shouldDeferMedia(toolCall)) {
         return makeDeferred(toolCall, functionArgs, policyDecision);
@@ -1034,9 +1076,11 @@ export async function executePreparedTools(
         pendingCounterUpdates[toolCall.function.name] =
           (pendingCounterUpdates[toolCall.function.name] || 0) + counterIncrement;
 
-        // Track media assets produced this iteration so the loop can carry a running
-        // per-run total into the next call's time-budget decision.
-        if (MEDIA_GEN_TOOLS.has(toolCall.function.name)) {
+        // Track media/deferrable assets produced this iteration so the loop can carry a
+        // running per-run total into the next call's time-budget decision (ENG-1331:
+        // includes playwright_browser_take_screenshot, consistent with shouldDeferMedia's
+        // "≥1 asset produced this batch" gate above).
+        if (DEFERRABLE_ASSET_TOOLS.has(toolCall.function.name)) {
           mediaAssetsProduced += 1;
         }
       }
