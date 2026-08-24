@@ -55,6 +55,8 @@ jest.mock('../services/agentModeService', () => ({
     getGeminiClient: jest.fn().mockResolvedValue({
       chat: { completions: { create: (...args: any[]) => mockGeminiCreate(...args) } },
     }),
+    callLLM: (model: string, messages: unknown[], options: Record<string, unknown>) =>
+      mockGeminiCreate({ model, messages, ...options }),
   },
 }));
 

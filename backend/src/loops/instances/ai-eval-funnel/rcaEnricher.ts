@@ -22,12 +22,11 @@
 
 import type { MutationProposal } from '../../core/types';
 import type { AiEvalProposalPayload } from './rules';
-import { resolveBedrockModelId } from '../../../utils/bedrockInferenceProfiles';
+import { agentModeService } from '../../../services/agentModeService';
 
 export const RCA_TIMEOUT_MS = 25_000;
 
-// claude-sonnet-4-6 requires the global cross-region inference profile ARN.
-const SONNET_4_6_INFERENCE_PROFILE = resolveBedrockModelId('anthropic.claude-sonnet-4-6');
+const RCA_MODEL = 'anthropic.claude-sonnet-4-6';
 
 export type RcaImpact = 'high' | 'med' | 'low';
 export type RcaConfidence = 'high' | 'med' | 'low';
@@ -224,66 +223,20 @@ function parseAndValidate(raw: string): { topHypotheses: string[]; rankedFixes: 
 // Bedrock call with hard timeout
 // ---------------------------------------------------------------------------
 
-async function callBedrockSonnet46(systemText: string, userText: string): Promise<string> {
-  // Lazy-import the AWS SDK so the test mock applies. The metered factory
-  // (llmClients) is lazy-imported for the same reason — it constructs the
-  // (mocked) BedrockRuntimeClient internally.
-  const { ConverseCommand } = await import('@aws-sdk/client-bedrock-runtime');
-  const { getBedrockClient } = await import('../../../utils/llmClients');
-
-  const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
-  const credentials = process.env.AWS_ACCESS_KEY_ID
-    ? {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
-      }
-    : undefined;
-
-  // Shadow usage metering: cron/loop context — no attributable user, so the
-  // recorder attributes to 'system'.
-  const client = await getBedrockClient(
-    { feature: 'other' },
-    {
-      region,
-      credentials,
-      requestHandler: {
-        connectionTimeout: 10_000,
-        requestTimeout: RCA_TIMEOUT_MS,
-      } as unknown as Record<string, unknown>,
-    }
-  );
-
-  // System prompt is stable across runs — attach cachePoint so Bedrock caches it.
-  // Use `any` for the input bag because cachePoint blocks aren't in the public
-  // SDK types yet (they are accepted at runtime — see agentModeService.ts).
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const converseInput: any = {
-    modelId: SONNET_4_6_INFERENCE_PROFILE,
-    system: [
-      { text: systemText },
-      { cachePoint: { type: 'default' } },
-    ],
-    messages: [
-      {
-        role: 'user',
-        content: [{ text: userText }],
-      },
-    ],
-    inferenceConfig: {
-      maxTokens: 2048,
-      temperature: 0.2,
-    },
-  };
-  const command = new ConverseCommand(converseInput);
-
-  const response = (await client.send(command as never)) as {
-    output?: { message?: { content?: Array<{ text?: string }> } };
-  };
-
-  const blocks = response?.output?.message?.content ?? [];
-  const text = blocks.map((b) => b?.text ?? '').join('');
+async function callRcaModel(systemText: string, userText: string): Promise<string> {
+  const response = await agentModeService.callLLM(RCA_MODEL, [
+    { role: 'system', content: systemText },
+    { role: 'user', content: userText },
+  ], {
+    temperature: 0.2,
+    max_completion_tokens: 2048,
+    timeoutMs: RCA_TIMEOUT_MS,
+    usageContext: { feature: 'other' },
+    taskClass: 'nonstandard_consumer',
+  });
+  const text = response.choices?.[0]?.message?.content || '';
   if (!text.trim()) {
-    throw new Error('Bedrock returned an empty response');
+    throw new Error('RCA model returned an empty response');
   }
   return text;
 }
@@ -301,7 +254,7 @@ async function callWithTimeout(systemText: string, userText: string): Promise<st
     }, RCA_TIMEOUT_MS);
   });
   try {
-    return await Promise.race([callBedrockSonnet46(systemText, userText), timeoutPromise]);
+    return await Promise.race([callRcaModel(systemText, userText), timeoutPromise]);
   } finally {
     if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
   }

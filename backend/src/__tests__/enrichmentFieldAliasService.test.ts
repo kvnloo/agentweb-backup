@@ -3,9 +3,7 @@
 const mockLLM = jest.fn();
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    getClientForModel: jest.fn().mockResolvedValue({
-      chat: { completions: { create: (...a: any[]) => mockLLM(...a) } },
-    }),
+    callLLM: (...a: any[]) => mockLLM(...a),
   },
 }));
 
@@ -27,18 +25,12 @@ jest.mock('../services/crmEnrichmentService', () => ({
   },
 }));
 
-const mockMeterUserUsage = jest.fn();
-jest.mock('../services/usageRecorderService', () => ({
-  meterUserUsage: (...a: any[]) => mockMeterUserUsage(...a),
-}));
-
 import { resolveFieldAliases, STATIC_FIELD_ALIASES, canonicalFieldSet } from '../services/enrichmentFieldAliasService';
 import { crmDb } from '../services/db';
 const mockDb = crmDb as jest.Mocked<typeof crmDb>;
 
 beforeEach(() => {
   mockLLM.mockReset();
-  mockMeterUserUsage.mockReset();
   mockDb.getLeadListById.mockReset();
   mockDb.updateLeadList.mockReset();
   mockDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'u1' } as any);
@@ -46,7 +38,7 @@ beforeEach(() => {
 });
 
 describe('resolveFieldAliases — per-user metering (ENG-200)', () => {
-  it('charges the field-mapping LLM call to the caller (userId + tokens) via meterUserUsage', async () => {
+  it('charges the field-mapping call through the shared gateway usage context', async () => {
     // A non-canonical field forces the LLM mapping tier to run.
     mockLLM.mockResolvedValue({
       choices: [{ message: { content: JSON.stringify({ some_weird_field: null }) } }],
@@ -55,12 +47,14 @@ describe('resolveFieldAliases — per-user metering (ENG-200)', () => {
 
     await resolveFieldAliases('list1', ['some_weird_field'], 'user-3');
 
-    expect(mockMeterUserUsage).toHaveBeenCalledWith(expect.objectContaining({
-      userId: 'user-3',
-      feature: 'crm_enrichment_field_alias',
-      inputTokens: 90,
-      outputTokens: 12,
-    }));
+    expect(mockLLM).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Array),
+      expect.objectContaining({
+        usageContext: { userId: 'user-3', feature: 'crm_enrichment_field_alias' },
+        taskClass: 'nonstandard_consumer',
+      }),
+    );
   });
 });
 
@@ -141,8 +135,8 @@ describe('resolveFieldAliases — LLM mapping (Tier 3)', () => {
     expect(r.newlyResolved).toEqual({ totally_novel: 'industry' });
     // LLM called exactly once with only the unresolved field
     expect(mockLLM).toHaveBeenCalledTimes(1);
-    const call = mockLLM.mock.calls[0][0];
-    const userMsg = call.messages.find((m: any) => m.role === 'user').content;
+    const messages = mockLLM.mock.calls[0][1];
+    const userMsg = messages.find((m: any) => m.role === 'user').content;
     expect(userMsg).toContain('totally_novel');
     expect(userMsg).not.toContain('funding_round');
   });
