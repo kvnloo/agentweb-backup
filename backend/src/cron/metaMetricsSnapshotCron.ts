@@ -37,6 +37,37 @@ function toDateStr(d: Date): string {
 }
 
 /**
+ * Every lead for a user, across all their lists, bucketed by `createdAt` date.
+ *
+ * ONE walk of each list serves the WHOLE settling window. The per-date helper below must scan
+ * every page (see its comment — ordering is by `leadId`, not `createdAt`, so it cannot early-stop),
+ * so calling it once per day meant SETTLING_WINDOW_DAYS full walks of every list on every run.
+ * At a 28-day window that is ~9x the DynamoDB read load of the original 3-day version for no extra
+ * information: the pages are identical each time, only the date filter differs. Bucketing once and
+ * indexing by date is strictly less work and changes no behaviour — a date with no leads simply has
+ * no entry, which the caller reads as an empty list exactly as before.
+ */
+async function getLeadsByDateForUser(userId: string): Promise<Map<string, any[]>> {
+  const byDate = new Map<string, any[]>();
+  const leadLists = await crmDb.getLeadListsByUserId(userId);
+  for (const list of leadLists) {
+    let lastKey: any = undefined;
+    do {
+      const { items, lastEvaluatedKey } = await crmDb.getLeadsByListId(list.listId, 100, lastKey);
+      for (const lead of items) {
+        const leadDate = (lead.createdAt || "").split("T")[0];
+        if (!leadDate) continue;
+        const bucket = byDate.get(leadDate);
+        if (bucket) bucket.push(lead);
+        else byDate.set(leadDate, [lead]);
+      }
+      lastKey = lastEvaluatedKey;
+    } while (lastKey);
+  }
+  return byDate;
+}
+
+/**
  * Leads for a single list on a single date. Scans every page for the list rather than
  * early-stopping on the first lead whose `createdAt` sorts before the target date.
  *
@@ -89,7 +120,8 @@ export interface ResolvedMetaCredentials {
 export async function snapshotMetaMetricsForDate(
   userId: string,
   dateStr: string,
-  resolvedCredentials?: ResolvedMetaCredentials
+  resolvedCredentials?: ResolvedMetaCredentials,
+  leadsByDate?: Map<string, any[]>
 ): Promise<SnapshotResult> {
   // Credentials are resolved ONCE PER RUN by runMetaMetricsSnapshot and passed in, because
   // getMetaAccountCredentials reads the user record and can refresh + PERSIST the Meta token
@@ -148,13 +180,20 @@ export async function snapshotMetaMetricsForDate(
     nextUrl = body?.paging?.next;
   }
 
-  // Resolve this user's leads for the date once, across all their lists — reused for
-  // every campaign's join below rather than re-querying per campaign.
-  const leadLists = await crmDb.getLeadListsByUserId(userId);
-  const leadsForDate: any[] = [];
-  for (const list of leadLists) {
-    const leads = await getLeadsForListOnDate(list.listId, dateStr);
-    leadsForDate.push(...leads);
+  // This user's leads for the date, across all their lists — reused for every campaign's join
+  // below rather than re-querying per campaign. runMetaMetricsSnapshot prefetches the whole
+  // settling window in one pass and passes it in; the per-list fallback keeps this function
+  // usable standalone (a future backfill script) without duplicating the walk.
+  let leadsForDate: any[];
+  if (leadsByDate) {
+    leadsForDate = leadsByDate.get(dateStr) || [];
+  } else {
+    const leadLists = await crmDb.getLeadListsByUserId(userId);
+    leadsForDate = [];
+    for (const list of leadLists) {
+      const leads = await getLeadsForListOnDate(list.listId, dateStr);
+      leadsForDate.push(...leads);
+    }
   }
 
   const knownCampaignIds = new Set(campaignRows.map((c) => String(c.campaign_id)));
@@ -240,6 +279,19 @@ export async function runMetaMetricsSnapshot(): Promise<void> {
     return;
   }
 
+  // One walk of every list serves all SETTLING_WINDOW_DAYS days. A failure here is fatal to the
+  // run for the same reason a credential failure is: every day would repeat the identical error.
+  let leadsByDate: Map<string, any[]>;
+  try {
+    leadsByDate = await getLeadsByDateForUser(HAVEN_USER_ID);
+  } catch (error) {
+    console.error(
+      "[MetaMetricsSnapshotCron] CRITICAL ERROR reading CRM leads — no days attempted:",
+      error
+    );
+    return;
+  }
+
   const today = new Date();
   for (let daysAgo = 1; daysAgo <= SETTLING_WINDOW_DAYS; daysAgo++) {
     const target = new Date(today);
@@ -247,7 +299,7 @@ export async function runMetaMetricsSnapshot(): Promise<void> {
     const dateStr = toDateStr(target);
 
     try {
-      const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, dateStr, credentials);
+      const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, dateStr, credentials, leadsByDate);
       console.log(
         `[MetaMetricsSnapshotCron] ${dateStr}: wrote ${result.rowsWritten} campaign rows, ` +
           `${result.leadCount} attributed leads, ${result.unattributedLeadCount} unattributed`

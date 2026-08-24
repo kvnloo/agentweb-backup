@@ -655,8 +655,9 @@ createTestAccount().then(async () => {
 
 
       // ENG-916: Meta Ads Metrics Snapshot — runs daily at 09:00 UTC (after
-      // ActivationCron at 08:00), re-pulling the last 3 days each run so
-      // attribution-window settling doesn't leave stale numbers stored.
+      // ActivationCron at 08:00), re-pulling the last SETTLING_WINDOW_DAYS days each run
+      // (28, sized against Meta's documented insights-mutability window) so a stored row
+      // doesn't freeze while Meta is still revising it.
       try {
         const METRICS_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
         const { runMetaMetricsSnapshot } = await import('./cron/metaMetricsSnapshotCron');

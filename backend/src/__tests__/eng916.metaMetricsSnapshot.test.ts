@@ -375,6 +375,25 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
     errorSpy.mockRestore();
   });
 
+  it('walks the CRM lead lists ONCE for the whole window, not once per day', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => makeCampaignInsightsResponse([
+        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+      ]),
+    });
+
+    await runMetaMetricsSnapshot();
+
+    // getLeadsForListOnDate cannot early-stop (AW-Leads orders by leadId, not createdAt), so it
+    // scans every page of every list. Calling it per day meant 28 identical full walks per run.
+    // One walk now serves the whole settling window, bucketed by date.
+    expect(mockCrmDb.getLeadListsByUserId).toHaveBeenCalledTimes(1);
+    expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledTimes(1);
+    // ...and every day in the window still got written.
+    expect(new Set(mockMetricsDb.putSnapshot.mock.calls.map((c: any) => c[0].date)).size).toBe(28);
+  });
+
   it('bounds every Graph read with an abort signal', async () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
