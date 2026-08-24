@@ -591,7 +591,10 @@ describe("POST /publish", () => {
       .post("/api/landing-pages/v0/generated/page-123/publish")
       .send({ branch: "draft/agentweb-preview" });
 
-    expect(res.status).not.toBe(200);
+    // Assert the REFUSAL, not merely "not 200" — a 500 from an exhausted axios queue or an
+    // exception would satisfy that too, and would hide the very regression this pins.
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
     expect(mockedAxios.post).not.toHaveBeenCalledWith(expect.stringContaining("/merges"), expect.anything(), expect.anything());
   });
 
@@ -603,7 +606,10 @@ describe("POST /publish", () => {
       .post("/api/landing-pages/v0/generated/page-123/publish")
       .send({ branch: "draft/agentweb-preview" });
 
-    expect(res.status).not.toBe(200);
+    // Assert the REFUSAL, not merely "not 200" — a 500 from an exhausted axios queue or an
+    // exception would satisfy that too, and would hide the very regression this pins.
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
     expect(mockedAxios.post).not.toHaveBeenCalledWith(expect.stringContaining("/merges"), expect.anything(), expect.anything());
   });
 
@@ -615,7 +621,10 @@ describe("POST /publish", () => {
       .post("/api/landing-pages/v0/generated/page-123/publish")
       .send({ branch: "draft/agentweb-preview" });
 
-    expect(res.status).not.toBe(200);
+    // Assert the REFUSAL, not merely "not 200" — a 500 from an exhausted axios queue or an
+    // exception would satisfy that too, and would hide the very regression this pins.
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
     expect(mockedAxios.post).not.toHaveBeenCalledWith(expect.stringContaining("/merges"), expect.anything(), expect.anything());
   });
 
