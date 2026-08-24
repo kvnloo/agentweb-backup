@@ -4647,13 +4647,36 @@ export async function generateChatResponse(
     // Always inject the current system prompt fresh (ignoring the stale stored version)
     // so that DynamoDB overrides and prompt updates take effect immediately for all sessions.
     const freshSystemPrompt = portalType === "customer" ? getEmmaSystemContext(session.sessionType, orgRole) : null;
+
+    // ENG-1222: agent-mode's own pipeline (buildSkillContext) always injects each
+    // installed skill's own systemPrompt; this path never did, so a skill session
+    // reached here got tools bound (after 96641ba84) but none of the skill's own
+    // workflow/guardrail instructions — flying on the user's raw prompt text alone.
+    let skillSystemPrompt: string | null = null;
+    const sessionSkillIdsForPrompt = Array.isArray(session.associatedSkills) ? session.associatedSkills : [];
+    if (sessionSkillIdsForPrompt.length > 0) {
+      try {
+        const { skillService } = await import('./skillService');
+        const publishedSkills = await skillService.getPublishedSkills();
+        const activeSkillPrompts = sessionSkillIdsForPrompt
+          .map((id: string) => publishedSkills.find((s) => s.skillId === id)?.systemPrompt)
+          .filter((p): p is string => !!p);
+        if (activeSkillPrompts.length > 0) {
+          skillSystemPrompt = activeSkillPrompts.join('\n\n');
+        }
+      } catch (skillPromptErr) {
+        console.error('[generateChatResponse] Error loading skill system prompts:', skillPromptErr);
+      }
+    }
+
+    const combinedSystemPrompt = [freshSystemPrompt, skillSystemPrompt].filter(Boolean).join('\n\n') || null;
     const messages = [...session.messages];
-    if (freshSystemPrompt) {
+    if (combinedSystemPrompt) {
       const firstSystemIdx = messages.findIndex((m) => m.role === "system");
       if (firstSystemIdx >= 0) {
-        messages[firstSystemIdx] = { ...messages[firstSystemIdx], content: freshSystemPrompt };
+        messages[firstSystemIdx] = { ...messages[firstSystemIdx], content: combinedSystemPrompt };
       } else {
-        messages.unshift({ role: "system", content: freshSystemPrompt, metadata: { timestamp: new Date().toISOString() } });
+        messages.unshift({ role: "system", content: combinedSystemPrompt, metadata: { timestamp: new Date().toISOString() } });
       }
     }
 
@@ -4808,16 +4831,26 @@ export async function generateChatResponse(
         // Base tools: foundation tools (always available in agent mode) + Emma-specific extras
         // Only include customer-specific tools when on the customer portal or emma-sidebar
         const isCustomerContext = (portalType as string) === 'customer' || (portalType as string) === 'emma-sidebar';
-        const toolsToInclude = new Set<string>(isCustomerContext ? [
+        // ENG-1222: agent-mode's own pipeline force-unions FOUNDATION_TOOLS onto every
+        // skill regardless of subscription/session state (a skill never needs to
+        // redeclare them), so a skill session reached here must get the same parity —
+        // otherwise a skill that (correctly) omits a foundation tool from its own
+        // toolNames silently loses that tool the moment it's routed through this path
+        // instead of agent-mode's real one.
+        const toolsToInclude = new Set<string>(isCustomerContext || sessionHasInstalledSkills ? [
           ...AgentModeService.FOUNDATION_TOOLS,
-          'read_page_source',
-          'enrich_leads_preview', 'enrich_leads_execute',
-          'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
-          'search_user_guide',
-          'report_product_issues',
-          'get_temp_email', 'check_temp_inbox',
-          'get_test_account', 'save_test_account', 'list_test_accounts',
         ] : []);
+        if (isCustomerContext) {
+          [
+            'read_page_source',
+            'enrich_leads_preview', 'enrich_leads_execute',
+            'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
+            'search_user_guide',
+            'report_product_issues',
+            'get_temp_email', 'check_temp_inbox',
+            'get_test_account', 'save_test_account', 'list_test_accounts',
+          ].forEach((t) => toolsToInclude.add(t));
+        }
 
         if (isCustomerContext) {
           // Page-aware tool injection based on the current page URL
@@ -4929,6 +4962,37 @@ export async function generateChatResponse(
       }
     }
 
+    // ENG-1222 hard gate: a skill session (session.associatedSkills non-empty)
+    // expects its skill's tools to be available, so resolving to zero tools here
+    // is a binding/configuration failure (e.g. an unregistered tool name, or a
+    // skill with no toolNames declared), not a legitimate "no tools needed" turn.
+    // Fail explicitly instead of letting the model free-text an answer it has no
+    // real capability to back up — this is the failure mode that produced the P0
+    // ("I don't have the capability to..." for a session that actually did).
+    if (sessionHasInstalledSkills && toolDefinitions.length === 0) {
+      console.error('[generateChatResponse] ENG-1222 hard gate: skill session resolved to zero tools', {
+        sessionId,
+        associatedSkills: session.associatedSkills,
+      });
+      const hardGateMessage = "I wasn't able to load the tools this task needs right now — that looks like a configuration issue on our side rather than something you did wrong. Please try again in a moment, and let us know if it keeps happening.";
+      await chatbotDb.addMessageToSession(sessionId, {
+        role: "assistant",
+        content: hardGateMessage,
+        metadata: { timestamp, portalType },
+      });
+      return hardGateMessage;
+    }
+
+    // ENG-1222 runtime assertion: if the user's message names one of the tools
+    // that IS available this turn (e.g. "call list_connected_accounts") and the
+    // model's first response makes zero tool calls, don't accept that as final —
+    // nudge once and give it a real chance to actually call the tool before
+    // falling back to whatever it says (still subject to the fabrication guard
+    // below either way).
+    const availableToolNames = toolDefinitions.map((t: any) => t.function.name);
+    const userNamedAvailableTool = availableToolNames.some((name: string) => userMessage.includes(name));
+    let retriedForMissingToolCall = false;
+
     // Iterative tool execution loop (follows Agent Mode pattern)
     const startMemory = process.memoryUsage();
     const startTime = Date.now();
@@ -5004,6 +5068,24 @@ export async function generateChatResponse(
 
       // Check if LLM wants to call tools
       if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
+        // toolCalls.length === 0 restricts the retry to "nothing real has executed
+        // yet this turn" — once a tool has actually run, a later toolless response
+        // is the model synthesizing its final answer from real results, not denying
+        // or fabricating, and must not be treated as another missed tool call.
+        if (userNamedAvailableTool && !retriedForMissingToolCall && toolCalls.length === 0) {
+          retriedForMissingToolCall = true;
+          console.warn('[generateChatResponse] ENG-1222 retry: user named an available tool but the model made zero tool calls this turn', {
+            sessionId,
+            availableToolNames,
+          });
+          iterationTimings.push({ iteration: iteration + 1, llmDurationMs, toolNames: [] });
+          messages.push({
+            role: 'user',
+            content: `Reminder: you have real tools available (${availableToolNames.join(', ')}) for this request — call the tool now instead of describing or simulating what it would return.`,
+          });
+          iteration++;
+          continue;
+        }
         // No tool calls - we're done
         iterationTimings.push({ iteration: iteration + 1, llmDurationMs, toolNames: [] });
         finalAssistantMessage = responseMessage.content || "I apologize, but I was unable to generate a response.";
