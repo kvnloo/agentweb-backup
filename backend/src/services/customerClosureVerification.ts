@@ -20,20 +20,38 @@ function field(body: string, name: string): string | null {
 // stays rejected exactly as before.
 const TRUSTED_VERIFIER_PREFIX = /^(post-merge-verifier|harsha-direct)\/\S+$/i;
 
+// CodeRabbit finding on the PR that added `harsha-direct` (2026-08-24): the check above matches
+// comment TEXT only, so any workspace member with comment access on the issue could type either
+// trusted prefix themselves and force their own closure through — for `harsha-direct` specifically,
+// that would let the row's own owner impersonate the one identity this gate is supposed to defer
+// to, defeating its entire point. Binding to the actual comment author closes that: only a comment
+// authored by Harsha's own Linear account counts, for either prefix.
+//
+// This does not yet distinguish the real Harsha from the automation loop acting AS Harsha — both
+// currently authenticate to Linear as the same account ("the loop writes as Harsha until ENG-637",
+// see pm-guard.py's ATTRIBUTION section) — so it cannot tell a genuine live human decision from an
+// automated post-merge-verifier run typing `harsha-direct/` instead of its own prefix. That
+// narrower gap is exactly what ENG-637 (a dedicated Linear identity for the loop) closes; until
+// then, "authored by Harsha's account" is the correct and available boundary, and it is a strictly
+// smaller trust surface than "anyone who can comment," which is what CodeRabbit flagged.
+const HARSHA_LINEAR_USER_ID = '142fef82-4d45-4070-99be-c5debe565ac6';
+
 /**
  * A customer-bug closure record is deliberately structured and fail-closed.
  * A merge/deploy claim cannot satisfy this contract: the verifier must explicitly
- * classify the evidence as a customer-symptom check and record what and how it checked.
+ * classify the evidence as a customer-symptom check and record what and how it checked,
+ * AND the comment itself must have been authored by the trusted Linear account.
  */
 export function hasCustomerSymptomVerification(comments: IssueCommentDetail[]): boolean {
-  return comments.some(({ body }) => {
+  return comments.some(({ body, authorId }) => {
     const verifier = field(body, 'Verifier');
     return body.includes(VERIFICATION_MARKER) &&
       field(body, 'Result')?.toLowerCase() === 'pass' &&
       field(body, 'Evidence type')?.toLowerCase() === 'customer-symptom' &&
       !!field(body, 'Checked') &&
       !!field(body, 'Method') &&
-      !!verifier && TRUSTED_VERIFIER_PREFIX.test(verifier);
+      !!verifier && TRUSTED_VERIFIER_PREFIX.test(verifier) &&
+      authorId === HARSHA_LINEAR_USER_ID;
   });
 }
 
