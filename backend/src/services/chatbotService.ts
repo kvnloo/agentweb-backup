@@ -4655,17 +4655,35 @@ export async function generateChatResponse(
     const skillToolGateOpen = portalType === 'customer' || (portalType as string) === 'emma-sidebar' || !!isDelegatedAdmin || sessionHasInstalledSkills;
     const agentModeService = new AgentModeService();
     let skillContext: { allowedToolNames: Set<string>; installedSkillContextMsg: string } = { allowedToolNames: new Set<string>(), installedSkillContextMsg: '' };
+    // Exposed for the ENG-1222 hard gate below, so it can tell "subscription
+    // correctly doesn't include this skill" apart from "tool resolution failed".
+    let userAllowedSkillIdsForGate: string[] = [];
     if (skillToolGateOpen) {
       try {
         await agentModeService.initialize();
         const { skillService } = await import('./skillService');
-        const { getAllowedSkills } = await import('./subscriptionService');
-        const [associatedSkills, publishedSkills, userAllowedSkillIds] = await Promise.all([
-          sessionSkillIds.length > 0 ? skillService.getSkillsByIds(sessionSkillIds) : Promise.resolve([]),
-          skillService.getPublishedSkills(),
-          getAllowedSkills(userId!),
-        ]);
-        skillContext = agentModeService.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionSkillIds, !!isDelegatedAdmin);
+        // buildSkillContext only ever consults publishedSkills/userAllowedSkillIds
+        // when the session itself has skill IDs to resolve or gate (regular skills,
+        // or the __other_skills__ virtual ID) — a plain skill-less customer/admin
+        // turn never uses either. Skipping them here avoids a subscription-tier
+        // lookup plus a full Dev-AW-Skills table scan on every single Emma message,
+        // not just the ones that actually have a skill installed.
+        if (sessionSkillIds.length > 0) {
+          const { getAllowedSkills, getPublicAllowedSkills } = await import('./subscriptionService');
+          const [associatedSkills, publishedSkills, userAllowedSkillIds] = await Promise.all([
+            skillService.getSkillsByIds(sessionSkillIds),
+            skillService.getPublishedSkills(),
+            // ENG-1222: userId is optional on this function (anonymous/public
+            // callers exist) — route those through the same public-allowlist path
+            // subscriptionService already defines, instead of letting getAllowedSkills
+            // throw on an undefined id and silently falling back to zero tools below.
+            userId ? getAllowedSkills(userId) : getPublicAllowedSkills(),
+          ]);
+          userAllowedSkillIdsForGate = userAllowedSkillIds;
+          skillContext = agentModeService.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionSkillIds, !!isDelegatedAdmin);
+        } else {
+          skillContext = agentModeService.buildSkillContext([], [], [], [], !!isDelegatedAdmin);
+        }
       } catch (skillContextErr) {
         console.error('[generateChatResponse] Error resolving skill/tool context:', skillContextErr);
       }
@@ -4927,11 +4945,22 @@ export async function generateChatResponse(
     // real capability to back up — this is the failure mode that produced the P0
     // ("I don't have the capability to..." for a session that actually did).
     if (sessionHasInstalledSkills && toolDefinitions.length === 0) {
+      // ENG-1222: subscription-tier gating (now enforced here via buildSkillContext,
+      // where before this path ignored it) correctly excludes a skill's tools when
+      // the caller's plan doesn't include it — that isn't a bug to apologize for or
+      // ask the user to retry. Tell them the real reason instead of the generic
+      // "configuration issue" message, which would be actively misleading here.
+      const isWildcardAllowed = userAllowedSkillIdsForGate.includes('*');
+      const isSubscriptionGated = !isWildcardAllowed && sessionSkillIds.length > 0
+        && sessionSkillIds.every((id) => !userAllowedSkillIdsForGate.includes(id));
       console.error('[generateChatResponse] ENG-1222 hard gate: skill session resolved to zero tools', {
         sessionId,
         associatedSkills: session.associatedSkills,
+        isSubscriptionGated,
       });
-      const hardGateMessage = "I wasn't able to load the tools this task needs right now — that looks like a configuration issue on our side rather than something you did wrong. Please try again in a moment, and let us know if it keeps happening.";
+      const hardGateMessage = isSubscriptionGated
+        ? "This skill isn't included in your current plan, so I don't have access to its tools right now. You may need to upgrade your subscription, or contact support if you believe this is a mistake."
+        : "I wasn't able to load the tools this task needs right now — that looks like a configuration issue on our side rather than something you did wrong. Please try again in a moment, and let us know if it keeps happening.";
       await chatbotDb.addMessageToSession(sessionId, {
         role: "assistant",
         content: hardGateMessage,
@@ -4947,7 +4976,18 @@ export async function generateChatResponse(
     // falling back to whatever it says (still subject to the fabrication guard
     // below either way).
     const availableToolNames = toolDefinitions.map((t: any) => t.function.name);
-    const userNamedAvailableTool = availableToolNames.some((name: string) => userMessage.includes(name));
+    const userNamedAvailableTool = availableToolNames.some((name: string) => {
+      if (!userMessage.includes(name)) return false;
+      // Exclude meta-questions ABOUT the tool ("what does X do?", "how does X
+      // work?", "explain X") from counting as a request to invoke it — a naive
+      // substring match would otherwise retry a question the model already
+      // answered correctly without calling anything.
+      const isMetaQuestionAboutTool = new RegExp(
+        `\\b(?:what (?:does|is)|how does|explain|describe|tell me about)\\b[^.!?]*${name}`,
+        'i',
+      ).test(userMessage);
+      return !isMetaQuestionAboutTool;
+    });
     let retriedForMissingToolCall = false;
 
     // Iterative tool execution loop (follows Agent Mode pattern)
@@ -5099,10 +5139,14 @@ export async function generateChatResponse(
     // prose as if it were actual/real tool-derived data — this is exactly the P0
     // fabrication pattern (an invented Google Ads account presented as "the
     // ACTUAL returned rows"). toolCalls.length === 0 is ground truth for whether
-    // anything really executed; the phrase match only narrows the block to
-    // genuine data-claim language so ordinary toolless conversation is unaffected.
-    const CLAIMS_REAL_TOOL_OUTPUT = /\bactual(?:ly)?\s+(?:returned|return|results?|rows?|data|account\s*(?:names?|ids?)?)\b|\breal\s+(?:api|account|customer)\s+data\b/i;
-    if (toolCalls.length === 0 && CLAIMS_REAL_TOOL_OUTPUT.test(finalAssistantMessage)) {
+    // anything really executed. The phrase match alone over-fires on innocent
+    // text like "based on your actual account settings" (no tool-result claim at
+    // all) — genuine fabrication also presents something ID/list-shaped to look
+    // authentic, so require both signals together to cut that false-positive rate
+    // without weakening the check against the actual incident pattern.
+    const CLAIMS_REAL_TOOL_OUTPUT = /\bactual(?:ly)?\s+(?:returned|return|results?|rows?|data|account\s+(?:names?|ids?))\b|\breal\s+(?:api|account|customer)\s+data\b/i;
+    const LOOKS_LIKE_TOOL_SHAPED_DATA = /\d{3,}|(?:^|\n)\s*[-*•]\s|(?:^|\n)\s*\d+[.)]\s/;
+    if (toolCalls.length === 0 && CLAIMS_REAL_TOOL_OUTPUT.test(finalAssistantMessage) && LOOKS_LIKE_TOOL_SHAPED_DATA.test(finalAssistantMessage)) {
       console.error('[generateChatResponse] Blocked a zero-tool-call response claiming real tool-derived data', { sessionId, portalType });
       finalAssistantMessage = "I wasn't able to actually run the tools needed to get real data for this, so I don't have genuine results to share. Please try again, and let us know if this keeps happening.";
     }
