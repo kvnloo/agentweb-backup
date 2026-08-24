@@ -332,7 +332,11 @@
      transparent (caret stays visible) and this layer — on top, transparent bg, pointer-events:none —
      paints the visible text. Box metrics mirror the textarea exactly so glyphs line up. */
   #input.hl { color: transparent; caret-color: var(--text); }
-  #inputHl { position: absolute; inset: 0; box-sizing: border-box; padding: 10px 12px; border: 1px solid transparent; border-radius: 10px; overflow: hidden; pointer-events: none; display: none; }
+  /* Keep the textarea's selected text transparent too — otherwise selecting reveals it UNDER the mirror
+     layer (which still paints the same text on top), which reads as doubled/overlapped text. */
+  #input.hl::selection { color: transparent; }
+  #input.hl::-moz-selection { color: transparent; }
+  #inputHl { position: absolute; inset: 0; box-sizing: border-box; padding: 10px 12px; border: 1px solid transparent; border-radius: 10px; overflow: hidden; pointer-events: none; user-select: none; display: none; }
   #input.hl ~ #inputHl { display: block; }
   #inputHl .hlin { font: inherit; white-space: pre-wrap; overflow-wrap: break-word; color: var(--text); }
   #inputHl .tok { color: var(--accent); font-weight: 600; }
