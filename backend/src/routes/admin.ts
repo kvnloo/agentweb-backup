@@ -46,6 +46,17 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_FILE_SIZE },
 });
+/**
+ * Lifetime of an admin/contractor "access as customer" delegate token (ENG-1506).
+ *
+ * Was 90 days, with a comment claiming that was "for security". Ninety days of
+ * standing customer impersonation, on a token with no revocation path, is the
+ * opposite of that. A support session is measured in hours, and re-minting is one
+ * API call, so the short default costs an admin nothing and caps the damage from
+ * a token that leaks. Override only with a deliberate reason.
+ */
+const DELEGATE_TOKEN_TTL = process.env.DELEGATE_TOKEN_TTL || "8h";
+
 const CRM_SYNC_SOURCES = new Set(["users", "waitlist"]);
 const CRM_SYNC_SETTING_PREFIX = "admin_crm_sync_";
 
@@ -1877,12 +1888,19 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
       });
     }
 
-    // Create delegation token
+    // Create delegation token.
+    //
+    // ENG-1506: `dte` and `sv` are what make this token revocable. Both are read
+    // from the TARGET user and compared on every request by the auth middleware —
+    // bumping either one rejects this token immediately. Without them the only
+    // limit on a leaked support token was its expiry.
     const delegatePayload = {
       userId: targetUser.userId, // This will be the active user in the token
       email: targetUser.email,
       roles: targetUser.roles,
       isAdmin: false, // Target user permissions
+      dte: targetUser.delegateTokenEpoch ?? 0,
+      sv: targetUser.sessionVersion ?? 0,
       delegateAccess: {
         adminUserId: adminReq.user.userId,
         adminEmail: adminReq.user.email,
@@ -1894,7 +1912,7 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
     const delegateToken = jwt.sign(
       delegatePayload,
       getJwtSecret(),
-      { expiresIn: "90d" } // Delegate tokens expire in 90 days for security
+      { expiresIn: DELEGATE_TOKEN_TTL }
     );
 
     // Return the delegate token and customer portal URL
@@ -1903,11 +1921,40 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
     res.json({
       delegateToken,
       customerPortalUrl: `${customerPortalUrl}/oauth-callback?token=${delegateToken}`,
-      expiresIn: "90d"
+      expiresIn: DELEGATE_TOKEN_TTL
     });
   } catch (error) {
     console.error("Error creating delegate access:", error);
     res.status(500).json({ message: "Error creating delegate access" });
+  }
+});
+
+// Revoke every outstanding delegate token for a user (ENG-1506).
+//
+// Deliberately per-user rather than per-token: the realistic incident is "a
+// support token for this customer may be loose" — not "revoke exactly this JWT,
+// whose id nobody wrote down." Bumping the epoch invalidates all of them at once
+// and costs the admin one re-mint to resume legitimate access. It does NOT touch
+// the customer's own sessions.
+router.post("/users/:userId/delegate-access/revoke", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const targetUser = await userDb.getUserById(userId);
+    if (!targetUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const delegateTokenEpoch = await userDb.incrementDelegateTokenEpoch(userId);
+
+    res.json({
+      success: true,
+      delegateTokenEpoch,
+      message: "All outstanding delegate tokens for this user have been revoked. The user's own sessions are unaffected.",
+    });
+  } catch (error) {
+    console.error("Error revoking delegate access:", error);
+    res.status(500).json({ message: "Error revoking delegate access" });
   }
 });
 
