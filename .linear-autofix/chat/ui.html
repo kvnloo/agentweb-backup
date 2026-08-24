@@ -336,6 +336,7 @@
   #input.hl ~ #inputHl { display: block; }
   #inputHl .hlin { font: inherit; white-space: pre-wrap; overflow-wrap: break-word; color: var(--text); }
   #inputHl .tok { color: var(--accent); font-weight: 600; }
+  #inputHl .ref { color: var(--green); font-weight: 600; }
   #input:focus { outline: 1px solid var(--accent); }
   #input:disabled { opacity: .45; cursor: not-allowed; }
   #send { background: var(--accent); color: #0d0f13; border: 0; border-radius: 8px; padding: 10px 18px; font-weight: 600; cursor: pointer; }
@@ -368,6 +369,12 @@
   #slashmenu .srow.sel { background: var(--user); }
   #slashmenu .srow .sn { color: var(--accent); font-weight: 600; font-size: 13px; min-width: 92px; }
   #slashmenu .srow .sd { color: var(--dim); font-size: 12px; }
+  /* @-mention file/folder picker — same shell as the slash menu, but scrollable (paths list can be long). */
+  #atmenu { position: absolute; left: 20px; right: 20px; bottom: 100%; margin-bottom: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.5); overflow-y: auto; max-height: 260px; display: none; z-index: 8; }
+  #atmenu .srow { display: flex; gap: 10px; align-items: baseline; justify-content: space-between; padding: 7px 12px; cursor: pointer; }
+  #atmenu .srow.sel { background: var(--user); }
+  #atmenu .srow .sn { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #atmenu .srow .sd { color: var(--dim); font-size: 11px; flex: none; }
   /* /status & /context overlay (Esc dismisses) */
   #cmd { position: absolute; inset: 0; z-index: 20; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.5); }
   #cmd:focus { outline: none; }
@@ -1836,6 +1843,12 @@ $('input').addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); hideSlash(); return; }
     if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopPropagation(); runSlash(); return; }
   }
+  if (S.at) { // the @-file menu owns these keys while it's open
+    if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopPropagation(); moveAt(-1); return; }
+    if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopPropagation(); moveAt(1); return; }
+    if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); hideAt(); return; }
+    if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopPropagation(); runAt(); return; }
+  }
   if (ev.key === 'Enter' && ev.altKey) return; // Alt+Enter is the sidebar toggle (handled globally), not a send
   if (ev.key === 'Enter' && !ev.shiftKey) {
     const inp = ev.target, pos = inp.selectionStart;
@@ -1867,17 +1880,29 @@ function autosize() { const i = $('input'); i.style.height = 'auto'; i.style.hei
 // starts with one; otherwise the textarea shows its own (normal-coloured) text and the layer is hidden.
 function renderInputHighlight() {
   const i = $('input'), hl = $('inputHl'); if (!hl) return;
-  const v = i.value, m = /^(\/\w+)/.exec(v);
-  if (!m) { i.classList.remove('hl'); hl.firstElementChild.innerHTML = ''; return; }
+  const v = i.value;
+  // Tokens to colour: a leading /command (tok, accent), and every @{…} file reference anywhere (ref, green).
+  const spans = [];
+  const cmd = /^\/\w+/.exec(v);
+  if (cmd) spans.push({ s: 0, e: cmd[0].length, c: 'tok' });
+  for (const mm of v.matchAll(/@\{[^}]*\}/g)) spans.push({ s: mm.index, e: mm.index + mm[0].length, c: 'ref' });
+  if (!spans.length) { i.classList.remove('hl'); hl.firstElementChild.innerHTML = ''; return; }
+  spans.sort((a, b) => a.s - b.s);
   i.classList.add('hl');
-  let html = `<span class="tok">${esc(m[1])}</span>${esc(v.slice(m[1].length))}`;
+  let html = '', pos = 0;
+  for (const sp of spans) {
+    if (sp.s < pos) continue; // ignore any overlap
+    html += esc(v.slice(pos, sp.s)) + `<span class="${sp.c}">${esc(v.slice(sp.s, sp.e))}</span>`;
+    pos = sp.e;
+  }
+  html += esc(v.slice(pos));
   if (v.endsWith('\n')) html += ' '; // keep the trailing empty line's height so the caret aligns
   hl.firstElementChild.innerHTML = html;
   hl.firstElementChild.style.transform = `translateY(${-i.scrollTop}px)`; // mirror vertical scroll
 }
-$('input').addEventListener('input', () => { S.escArmed = 0; autosize(); updateSlashMenu(); }); // typing breaks the Esc burst
+$('input').addEventListener('input', () => { S.escArmed = 0; autosize(); updateSlashMenu(); updateAtMenu(); }); // typing breaks the Esc burst
 $('input').addEventListener('scroll', () => { const hl = $('inputHl'); if (hl && $('input').classList.contains('hl')) hl.firstElementChild.style.transform = `translateY(${-$('input').scrollTop}px)`; });
-$('input').addEventListener('blur', () => { if (S.slash) setTimeout(hideSlash, 120); }); // let a row mousedown fire first
+$('input').addEventListener('blur', () => { if (S.slash) setTimeout(hideSlash, 120); if (S.at) setTimeout(hideAt, 120); }); // let a row mousedown fire first
 
 // ---------- voice: push-to-talk dictation ----------
 // TWO boxes share this one implementation: the main composer and the /btw side-thread box in the
@@ -2163,6 +2188,62 @@ function runSlash() {
   // the argument, rather than firing the command empty.
   if (c.needsArg) { const inp = $('input'); inp.value = c.name + ' '; autosize(); inp.focus(); return; }
   $('input').value = ''; autosize(); runCommand(c.name);
+}
+// ---------- @-mention file/folder picker ----------
+// Type @ in the composer to reference a file/folder from THIS chat's worktree. As you type, a dropdown
+// suggests matching paths (from /api/issues/<id>/files); picking one inserts @{that/path}, which the
+// highlight layer paints green and the agent reads as a workspace path.
+let atTimer = null, atFetchSeq = 0;
+function atContext() {
+  const inp = $('input'), caret = inp.selectionStart;
+  const m = /(^|\s)@\{?([^}\s]*)$/.exec(inp.value.slice(0, caret)); // @ at start-of-word, optional {, then query
+  return m ? { start: m.index + m[1].length, q: m[2] } : null;
+}
+function updateAtMenu() {
+  if (S.editing || S.deleting || !S.sel) { hideAt(); return; }
+  const ctx = atContext();
+  if (!ctx) { hideAt(); return; }
+  clearTimeout(atTimer);
+  const seq = ++atFetchSeq;
+  atTimer = setTimeout(async () => {
+    let items = [];
+    try {
+      const r = await fetch(`/api/issues/${encodeURIComponent(S.sel)}/files?q=${encodeURIComponent(ctx.q)}`);
+      if (r.ok) items = (await r.json()).items || [];
+    } catch { /* offline / no worktree → just no menu */ }
+    if (seq !== atFetchSeq) return;         // a newer keystroke superseded this fetch
+    const cur = atContext();                 // still an active mention at the caret?
+    if (!cur || !items.length) { hideAt(); return; }
+    S.at = { items, sel: 0, start: cur.start };
+    renderAt();
+  }, 120);
+}
+function renderAt() {
+  let el = $('atmenu');
+  if (!el) { el = document.createElement('div'); el.id = 'atmenu'; $('composer').appendChild(el); }
+  el.innerHTML = S.at.items.map((it, k) =>
+    `<div class="srow${k === S.at.sel ? ' sel' : ''}" data-k="${k}"><span class="sn">${it.type === 'dir' ? '📁' : '📄'} ${esc(it.path)}</span><span class="sd">${esc(it.type)}</span></div>`
+  ).join('');
+  for (const row of el.querySelectorAll('.srow')) {
+    row.onmouseenter = () => { S.at.sel = +row.dataset.k; for (const r of el.querySelectorAll('.srow')) r.classList.toggle('sel', r === row); };
+    row.onmousedown = (e) => { e.preventDefault(); S.at.sel = +row.dataset.k; runAt(); };
+  }
+  el.style.display = 'block';
+  const sel = el.querySelector('.srow.sel'); if (sel) sel.scrollIntoView({ block: 'nearest' });
+}
+function moveAt(d) { if (!S.at) return; const n = S.at.items.length; S.at.sel = (S.at.sel + d + n) % n; renderAt(); }
+function hideAt() { S.at = null; const el = $('atmenu'); if (el) el.style.display = 'none'; }
+function runAt() {
+  const it = S.at?.items[S.at.sel]; if (!it) return;
+  const inp = $('input');
+  const ctx = atContext();
+  const start = ctx ? ctx.start : (S.at.start ?? inp.selectionStart);
+  const insert = `@{${it.path}}`;
+  const before = inp.value.slice(0, start), after = inp.value.slice(inp.selectionStart);
+  inp.value = before + insert + after;
+  inp.selectionStart = inp.selectionEnd = before.length + insert.length;
+  hideAt();
+  autosize(); inp.focus();
 }
 function runCommand(cmd) {
   const raw = String(cmd).trim();

@@ -21,9 +21,10 @@ import path from 'node:path';
 import { config } from '../config.mjs';
 import { resolveIssue } from '../linear.mjs';
 import { gitIdentityEnv, resolveAssigneeGhToken, resolveAssigneeIdentity, applyWorktreeIdentity } from '../git-identity.mjs';
-import { acquireLock, releaseLock } from '../lock.mjs';
+import { acquireLockResult, lockUnavailableMessage, releaseLock } from '../lock.mjs';
 import { gitRepoOp } from '../repo-lock.mjs';
 import { transcriptContextUsed, pickResumeBase, isContextOverflowError } from './context-usage.mjs';
+import { searchWorktreeFiles } from './at-files.mjs';
 import { usageSnapshot, contextWindowFor } from './usage.mjs';
 import { makeEditableDecision, buildEditableBranch, promotedOutcome } from './editable.mjs';
 import { computeMetrics } from './metrics.mjs';
@@ -1102,7 +1103,9 @@ async function polishVoice(identifier, body) {
 
 function preamble(cap) {
   const base = 'You previously worked on this issue as an automated fixer; this workspace holds your fix. '
-    + 'The developer is now chatting with you about it — answer questions from the workspace and the pipeline logs. ';
+    + 'The developer is now chatting with you about it — answer questions from the workspace and the pipeline logs. '
+    + 'When the developer writes a path as `@{path}`, that is a file or folder in your workspace (relative to the '
+    + 'workspace root) they are pointing you at — read or inspect it as part of answering. ';
   const rules = cap === 'full'
     ? 'If the developer asks for changes: apply them on the current branch with a minimal diff, follow the '
       + 'repo conventions (CLAUDE.md), verify your work yourself (run `npx tsc` in the changed packages and '
@@ -2148,12 +2151,24 @@ async function route(req, res) {
   // merge drive in one call. See createHandoff.
   if (req.method === 'POST' && p === '/api/handoff') { const r = createHandoff(await readBody(req, HANDOFF_MAX_BYTES)); json(res, r.code, r.body || { error: r.error }); return; }
 
-  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat\/btw|\/chat\/make-editable|\/chat\/rename|\/chat\/owner|\/chat\/close|\/chat|\/preview)?$/);
+  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/files|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat\/btw|\/chat\/make-editable|\/chat\/rename|\/chat\/owner|\/chat\/close|\/chat|\/preview)?$/);
   if (!m) { json(res, 404, { error: 'not found' }); return; }
   const identifier = m[1].toUpperCase();
   const sub = m[2] || '';
 
   if (req.method === 'GET' && sub === '/events') { handleEvents(identifier, req, res); return; }
+
+  // @-mention file picker: suggest files/folders in this chat's worktree. Confined to the worktree
+  // (paths come only from `git ls-files`), contents never read. Same cwd resolution the turns use.
+  if (req.method === 'GET' && sub === '/files') {
+    const found = findEntry(identifier);
+    if (!found) { json(res, 404, { error: `no autofix record for ${identifier}` }); return; }
+    const WT = path.join(worktreesDir, identifier);
+    const cs = loadChatState()[identifier] || {};
+    const cwd = cs.cwd || (existsSync(WT) ? WT : agentRoot);
+    json(res, 200, { items: searchWorktreeFiles(cwd, u.searchParams.get('q') || '', 25) });
+    return;
+  }
 
   if (req.method === 'GET' && !sub) {
     const found = findEntry(identifier);
