@@ -314,6 +314,53 @@ describe('AgentModeService - Skills', () => {
       expect(result.message).toContain('not available with your current subscription');
       expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
     });
+
+    it('installs __other_skills__ when only an unpublished org-shared skill claims the remaining tools (ENG-1237 production repro)', async () => {
+      // Mirrors the harsha@agentweb.pro session: getSkillsAvailableToUser mixes a
+      // published skill in with an unpublished org-shared draft skill (included for
+      // install purposes only). Before the fix, the draft skill's toolNames silently
+      // counted as "associated", leaving no unassociated tools, so __other_skills__
+      // never appeared in getSkillsForDisplay and install_skills(['__other_skills__'])
+      // rejected with "not available with your current subscription".
+      const orgId = 'org-1';
+      const userId = 'harsha-user-id';
+      const publishedSkill = {
+        skillId: 'crm-skill', name: 'CRM & Lead Management', description: 'CRM tools',
+        toolNames: ['search_leads'], isPublished: true,
+      };
+      const unpublishedOrgSkill = {
+        skillId: 'draft-landing-pages', name: 'Landing Pages (draft)', description: 'Landing page tools',
+        toolNames: ['list_landing_pages'], isPublished: false, ownerId: 'other-owner', orgId, visibility: 'private',
+      };
+
+      const mockTools = [
+        { name: 'search_leads', definition: { function: { description: 'search leads' } } },
+        { name: 'list_landing_pages', definition: { function: { description: 'list landing pages' } } },
+      ];
+
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([publishedSkill, unpublishedOrgSkill]);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      const mockDb = require('../services/db');
+      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId, orgId, orgRole: 'member' }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({
+        orgId, ownerUserId: 'other-owner',
+        shareSettings: { skills: { enabled: true, editors: [] } },
+      }) };
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+
+      const result = await agentModeService.installSkills(
+        ['__other_skills__'],
+        userId,
+        'session-0e73690d'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.installedSkills).toContain('other_skills');
+      expect(chatbotDb.addAssociatedSkills).toHaveBeenCalledWith('session-0e73690d', ['__other_skills__']);
+    });
   });
 
   describe('buildSkillContext', () => {
