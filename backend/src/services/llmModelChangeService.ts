@@ -28,6 +28,7 @@
 
 import { randomUUID } from "crypto";
 import { scheduleDb, EXPECT_UNSET } from "./db";
+import { callerCan, type AuthzOrg } from "./orgAuthz";
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
 import { agentModeService } from "./agentModeService";
 import {
@@ -42,6 +43,21 @@ export class ModelChangeNotFoundError extends Error {
   constructor(message = "Not found") {
     super(message);
     this.name = "ModelChangeNotFoundError";
+  }
+}
+
+/**
+ * The scope exists and the caller may not change it (ENG-1528).
+ *
+ * Separate from `ModelChangeNotFoundError` because they need different words
+ * and different statuses. "Not found" told an org owner, looking at a row on
+ * their own billing page, that the thing in front of them did not exist —
+ * unactionable and untrue. This says what actually happened.
+ */
+export class ModelChangeForbiddenError extends Error {
+  constructor(message = "You cannot change that scheduled chat") {
+    super(message);
+    this.name = "ModelChangeForbiddenError";
   }
 }
 
@@ -163,16 +179,79 @@ function restoreModelArgs(
     : [scheduleId, { llmModel: modelBefore }, expect, undefined, undefined];
 }
 
-/** Load a scope the caller owns, or throw not-found. */
-async function loadOwnedSchedule(userId: string, scheduleId: string) {
+/**
+ * Load a schedule the caller is allowed to switch, or throw.
+ *
+ * ENG-1528. This was a bare `schedule.userId !== userId`, described as
+ * "owner-only, no org bypass: an org member does not get to retune a
+ * colleague's schedule because they share a bill."
+ *
+ * That reasoning is right about a MEMBER and wrong about an owner or admin,
+ * and `orgAuthz` already draws exactly that line:
+ *
+ *   `org:content:manage` — "Edit or delete another member's items as an
+ *                           org-level override."  (owner + admin; not member)
+ *
+ * The list this write serves is billing-scoped: `usage-drivers` pools schedules
+ * across every org member (`resolvePooledLedgerUserIds`), so an org owner is
+ * shown colleagues' spend, told it is theirs to reduce, and was then refused
+ * with a 404 on every one of those rows — an authority the org model already
+ * granted them. Measured on production: 8 of 10 schedules offered to the
+ * `AgentWeb` org owner were a colleague's, and all 8 failed.
+ *
+ * So the check now asks the authority model instead of comparing ids. Nothing
+ * is widened for a plain member: `ROLE_PERMISSIONS.member` is empty, so they
+ * are refused exactly as before.
+ */
+async function loadSwitchableSchedule(userId: string, scheduleId: string) {
   const schedule = await scheduleDb.getScheduleById(scheduleId);
-  // Owner-only, exactly as `updateScheduledChat` does. No org bypass: an org
-  // member does not get to retune a colleague's schedule because they share a
-  // bill.
-  if (!schedule || schedule.userId !== userId) {
+  if (!schedule) {
     throw new ModelChangeNotFoundError("Scheduled chat not found");
   }
-  return schedule;
+  if (schedule.userId === userId) return schedule;
+
+  // Not the caller's own. It is still switchable if the caller holds
+  // org-content authority over the org the OWNER belongs to — not the caller's
+  // own org, which would let someone carry authority across a tenant boundary.
+  // Resolved defensively. A failure here is an ABSENCE of authority, never a
+  // grant and never a 500: if the user or org record cannot be read, the caller
+  // is treated exactly as an unprivileged stranger and falls through to the
+  // not-found path below. Letting this throw would turn an authority lookup
+  // into a server error on a customer-facing button.
+  // `AuthzOrg` rather than a hand-written shape: `ownerUserId` is required
+  // there, and declaring it optional here made this unassignable to callerCan.
+  let org: AuthzOrg | null = null;
+  let callerOrgId: string | undefined;
+  let permitted = false;
+  try {
+    const { userDb, orgDb } = await import("./db");
+    const owner = await userDb.getUserById(schedule.userId);
+    org = owner?.orgId ? await orgDb.getOrgById(owner.orgId) : null;
+    if (org) permitted = await callerCan(userId, org, "org:content:manage");
+    callerOrgId = (await userDb.getUserById(userId))?.orgId;
+  } catch {
+    org = null;
+    callerOrgId = undefined;
+    permitted = false;
+  }
+  if (permitted) return schedule;
+
+  // Only a SAME-ORG caller is told the truth. The original 404 was deliberate
+  // anti-enumeration — "reports 'not found' rather than 'forbidden' so the
+  // endpoint cannot be used to discover which schedule ids exist" — and that
+  // protection must survive this change. A blanket 403 would turn the endpoint
+  // into an existence oracle for any UUID, across tenants.
+  //
+  // Inside the caller's own org it discloses nothing new: the schedule is
+  // already listed on their billing page, id and all. Outside it, they learn
+  // nothing they did not already have.
+  if (org && callerOrgId && callerOrgId === org.orgId) {
+    throw new ModelChangeForbiddenError(
+      "That scheduled chat belongs to another member, and only they can change its model",
+    );
+  }
+
+  throw new ModelChangeNotFoundError("Scheduled chat not found");
 }
 
 export async function applyModelChange(
@@ -185,7 +264,7 @@ export async function applyModelChange(
     throw new ModelNotAvailableError("Only scheduled work can be switched right now");
   }
 
-  const schedule = await loadOwnedSchedule(userId, input.scopeId);
+  const schedule = await loadSwitchableSchedule(userId, input.scopeId);
   const { billingUserId, catalog } = await resolveSwitchableModels(userId);
 
   if (!catalog.has(input.toModel)) {
@@ -239,7 +318,7 @@ export async function applyModelChange(
     // It moved. WHY decides the answer, so re-read rather than assume: another
     // confirm of the SAME model is the idempotent double-click, and anything else
     // is a genuine conflict.
-    const current = await loadOwnedSchedule(userId, input.scopeId);
+    const current = await loadSwitchableSchedule(userId, input.scopeId);
     if ((current.llmModel || null) === input.toModel) {
       return {
         applied: false,
@@ -344,7 +423,7 @@ export async function undoModelChange(
   // Re-check ownership at undo time rather than trusting the record: the scope
   // may have changed hands, and the audit row is evidence of the past, not a
   // capability for the present.
-  await loadOwnedSchedule(userId, change.scopeId);
+  await loadSwitchableSchedule(userId, change.scopeId);
 
   // Already undone: answer from the record and touch nothing. With the restore
   // moved first, omitting this would send an already-undone change into the
@@ -375,7 +454,7 @@ export async function undoModelChange(
     // attempt already restored it -- finish the stamp -- or the customer has moved
     // on since, in which case reinstating `modelBefore` would revert a choice they
     // made deliberately.
-    const current = await loadOwnedSchedule(userId, change.scopeId);
+    const current = await loadSwitchableSchedule(userId, change.scopeId);
     if ((current.llmModel || null) !== change.modelBefore) {
       throw new ModelChangeConflictError(
         "That schedule has changed since, so this switch can no longer be undone.",
