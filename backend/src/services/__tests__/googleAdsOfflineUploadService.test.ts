@@ -40,7 +40,10 @@ describe('uploadClickConversions', () => {
     await googleAdsService.uploadClickConversions('u', CUSTOMER, [conv]);
     const [method, path, , body] = callSpy.mock.calls[0];
     expect(method).toBe('POST');
-    expect(path).toBe(`/customers/${CUSTOMER}/conversionUploads:uploadClickConversions`);
+    // Pinned because the first version used a `conversionUploads` sub-collection and
+    // Google answered 404. uploadClickConversions is a custom method ON the customers
+    // resource — the same `resource:method` shape as customers:listAccessibleCustomers.
+    expect(path).toBe(`/customers/${CUSTOMER}:uploadClickConversions`);
     expect(body.partialFailure).toBe(true);
     expect(body.conversions).toEqual([conv]);
   });
@@ -95,5 +98,20 @@ describe('uploadClickConversions', () => {
   it('resolves credentials for the named customer, not a default', async () => {
     await googleAdsService.uploadClickConversions('u', CUSTOMER, [conv]);
     expect(credSpy).toHaveBeenCalledWith('u', CUSTOMER);
+  });
+});
+
+describe('the endpoint path shape (verified against the real API)', () => {
+  it('never reintroduces a conversionUploads sub-collection', async () => {
+    // Google returned a 404 naming that exact URL. A unit test could not have caught it —
+    // the mock answered whatever it was told — which is why validate_only against the
+    // real account ran before any trigger was built on top of this.
+    const src: string = require('fs').readFileSync(
+      require('path').join(__dirname, '../googleAdsService.ts'), 'utf8');
+    // Code lines only. The comment above the fix quotes the broken URL on purpose, and a
+    // whole-file match would flag the explanation as the defect.
+    const code = src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    expect(code).not.toMatch(/conversionUploads:uploadClickConversions/);
+    expect(code).toMatch(/customers\/\$\{customerId\}:uploadClickConversions/);
   });
 });

@@ -123,21 +123,18 @@ describe('AgentModeService - vision model (describe_image)', () => {
       expect(callLLMSpy.mock.calls[0][0]).toBe('gemini-3-flash-preview');
     });
 
-    it('retries transient describe_image failures with a fallback vision model', async () => {
+    it('surfaces a transient failure without issuing a second local model call', async () => {
       const transientError = Object.assign(new Error('503 temporarily unavailable'), { status: 503 });
       const callLLMSpy = jest
         .spyOn(service, 'callLLM')
-        .mockRejectedValueOnce(transientError)
-        .mockResolvedValueOnce({ choices: [{ message: { content: 'fallback description' } }] } as any);
+        .mockRejectedValue(transientError);
 
       const result = await service.describeImage('gemini-3-flash-preview', 'data:image/png;base64,iVBORw0KGgo=');
 
-      expect(result.success).toBe(true);
-      expect(result.description).toBe('fallback description');
-      expect(result.fallbackUsed).toBe(true);
-      expect(result.model).toBe('anthropic.claude-opus-4-8');
-      expect(callLLMSpy).toHaveBeenCalledTimes(2);
-      expect(callLLMSpy.mock.calls[1][0]).toBe('anthropic.claude-opus-4-8');
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('503 temporarily unavailable');
+      expect(callLLMSpy).toHaveBeenCalledTimes(1);
+      expect(callLLMSpy).toHaveBeenCalledWith('gemini-3-flash-preview', expect.any(Array), expect.any(Object));
     });
 
     it('does not retry non-retryable describe_image policy failures', async () => {

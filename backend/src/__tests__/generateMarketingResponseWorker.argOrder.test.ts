@@ -66,10 +66,9 @@ describe('ENG-827 — the worker forwards the publish authorization in the right
     process.send = originalSend;
   });
 
-  it('passes turnStartMs, publishAuthorizationOverride, and the policy fallback in declaration order', async () => {
+  it('passes turnStartMs and publishAuthorizationOverride in declaration order', async () => {
     const authorization = { authorized: true, tools: ['post_on_connected_account'] };
     const turnStartMs = 1_760_000_000_000;
-    const transientFallbackModel = 'gemini-3.1-flash-lite';
 
     await handleMessage({
       type: 'generateMarketingResponse',
@@ -82,7 +81,7 @@ describe('ENG-827 — the worker forwards the publish authorization in the right
         sessionId: 'sess-1',
         publishAuthorizationOverride: authorization,
         turnStartMs,
-        transientFallbackModel,
+        requireWorkPlanDisposition: true,
       },
     });
 
@@ -94,8 +93,8 @@ describe('ENG-827 — the worker forwards the publish authorization in the right
     // never an authorization, and an authorization is never a deadline.
     expect(args[args.length - 4]).toBe(turnStartMs);
     expect(args[args.length - 3]).toEqual(authorization);
-    expect(args[args.length - 2]).toBe(transientFallbackModel);
-    expect(args[args.length - 1]).toBeUndefined();
+    expect(args[args.length - 2]).toBeUndefined();
+    expect(args[args.length - 1]).toBe(true);
     expect(typeof args[args.length - 4]).toBe('number');
   });
 });

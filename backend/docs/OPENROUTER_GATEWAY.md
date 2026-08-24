@@ -1,13 +1,15 @@
 # OpenRouter Gateway Contract and Migration Inventory
 
 **Owner:** ENG-1413 program; foundation: ENG-1414
-**Status:** inventory baseline — no consumer traffic moved by this document
+**Status:** AgentMode text/tool/vision gateway law; non-text exceptions are listed below.
 
 ## Contract
 
-AgentWeb decides a logical model for a task. The gateway converts only the
-logical `openrouter/<provider>/<model>` identifier into OpenRouter's
-`<provider>/<model>` wire identifier. It owns the HTTP request boundary,
+AgentWeb decides a logical model for a task. Explicit
+`openrouter/<provider>/<model>` IDs use the normalization path, while migrated
+direct-provider logical IDs use the verified resolver below. Both produce an
+OpenRouter `<provider>/<model>` wire identifier. The gateway owns the HTTP
+request boundary,
 bounded timeout, typed transport errors, streamed terminal usage extraction,
 and exactly-one ledger event keyed by the logical decision and request event ID.
 
@@ -22,12 +24,32 @@ throttling. AgentWeb must not add a fallback graph after an OpenRouter failure.
 | `logicalModelId` | AgentWeb ID retained for policy, entitlement, and ledger attribution. |
 | `upstreamModelId` | Validated `provider/model` ID sent only at the OpenRouter boundary. |
 | `eventId` | Idempotency key for one completion's cost/usage event. |
-| `usage` | Actual input, output, cache-read, cache-write tokens and OpenRouter cost. |
+| `usage` | Actual input, output, cache-read, cache-write tokens, OpenRouter cost, and BYOK routing flag. |
 | `error` | Typed auth, invalid-model, rate-limit, timeout, malformed-response, or stream-terminal error. |
 
-`normalizeOpenRouterModelId` in `src/utils/openRouterGatewayContract.ts` is the
-only model-ID transformation. It intentionally performs no network access,
-provider selection, retry, or fallback.
+`normalizeOpenRouterModelId` preserves the existing explicit
+`openrouter/provider/model` namespace behavior. The migration-only
+`resolveOpenRouterUpstreamModelId` in the same module owns the verified mapping
+from AgentWeb's direct-provider logical IDs to OpenRouter wire IDs. Both are
+pure: neither performs network access, provider selection, retry, or fallback.
+
+## Runtime boundary
+
+All AgentMode text, tool, structured-output, streaming, and vision calls use
+the same `AgentModeService.callLLM` OpenRouter boundary. OpenRouter receives
+`allow_fallbacks=true` and owns upstream-provider recovery; AgentWeb performs
+no additional retry, fallback chain, circuit breaker, or task-class canary.
+Claude prompt caching uses explicit
+content-block breakpoints rather than OpenRouter's top-level automatic flag:
+the explicit form preserves routing across Anthropic, Bedrock, and Vertex while
+retaining the existing five-minute and human-paced one-hour TTL behavior.
+Gateway requests include OpenRouter usage metadata. OpenRouter-billed calls use
+its reported cost; BYOK calls fall back to AgentWeb's provider price book because
+the upstream provider bills those calls directly while OpenRouter reports zero
+OpenRouter-billed spend.
+
+`agent_engine` and `coding_agent` retain separately verified contracts; they
+are not implicit fallbacks for AgentMode.
 
 ## Direct text/chat/tool inventory at baseline
 
@@ -40,10 +62,10 @@ inventory.
 
 | Consumer / boundary | Code location(s) | Current SDK, credential, and model-ID path | Required capability | Migration owner |
 | --- | --- | --- | --- | --- |
-| Interactive Agent Mode | `services/agentModeService.ts` (`callLLM`, client constructors), `controllers/agentModeController.ts` | OpenAI SDK -> Azure env endpoint/key/deployment for `gpt-*`; Bedrock SDK -> workload IAM or `prod/AgentWeb/Bedrock/ApiKey` for `anthropic.*`; Google SDK -> `GEMINI_API_KEY` or `prod/AgentWeb/GeminiAPIKey` for `gemini-*`; Vertex REST -> `prod/AgentWeb/Google/Vertex` for `claude-*`; OpenAI SDK -> `prod/AgentWeb/OpenRouter` after stripping `openrouter/` | streaming, tools, JSON, vision, cache usage | ENG-1415 interactive |
-| Agent Mode internal scoring/content callers | `services/reportClassificationService.ts`, `services/sessionScoringService.ts`, `services/sessionSummaryService.ts`, `services/dedupService.ts`, `services/socialPostsService.ts`, plus internal calls in `services/agentModeService.ts` | `AgentModeService.callLLM`; logical model comes from the model registry, AW-Settings defaults, or the named caller constant, then follows the Agent Mode provider branches above | text, JSON, judge output, metering | ENG-1415 interactive/judge |
+| Interactive Agent Mode | `services/agentModeService.ts` (`callLLM`), `controllers/agentModeController.ts` | logical model -> verified OpenRouter ID -> OpenRouter SDK | streaming, tools, JSON, vision, cache usage | ENG-1458 |
+| Agent Mode internal scoring/content callers | `services/reportClassificationService.ts`, `services/sessionScoringService.ts`, `services/sessionSummaryService.ts`, `services/dedupService.ts`, `services/socialPostsService.ts`, plus internal calls in `services/agentModeService.ts` | `AgentModeService.callLLM` -> OpenRouter | text, JSON, judge output, metering | ENG-1458 |
 | Agent Mode native Gemini shim | `services/agentMode/core/geminiNativeClient.ts` | `@google/genai` -> Gemini key path above; caller supplies a `gemini-*` registry ID | tools, structured output, usage, thought filtering | ENG-1415 interactive |
-| Emma sidebar chat | `services/chatbotService.ts` | `getAzureClient` -> Azure env deployment by default; Agent Mode Bedrock/Gemini clients for `anthropic.*`/`claude-*` and `gemini-*`; selected model is the session/user logical ID | tools, streaming-shaped loop, retries, explicit metering | ENG-1415 interactive |
+| Emma sidebar chat | `services/chatbotService.ts` | `AgentModeService.callLLM` -> OpenRouter; Azure remains only for the narrow embeddings exception below. | tools, streaming-shaped loop, shared gateway metering | ENG-1458 |
 | Scheduled social and CRM helpers | `cron/socialEngagementExecutor.ts`, `routes/crm.ts` | Agent Mode Gemini OpenAI-compatible client -> Gemini key path; model IDs are the call-site/session-selected `gemini-*` values | text, JSON/content | ENG-1415 scheduled |
 | Scheduled/task/workflow Azure callers | `cron/linkedInConnectionSyncCron.ts`, `routes/tasks.ts`, `services/workflowGenerator.ts`, `services/growthGeniusService.ts`, `services/reportRevisionService.ts`, `services/inviteNoteShortener.ts` | OpenAI-compatible client from `llmClients`/service wrapper -> Azure env endpoint/key/deployment; model is the call-site constant or deployment env value | text, structured output, retries | ENG-1415 scheduled/content |
 | Native Gemini content/API callers | `controllers/blog.ts`, `routes/slack.ts`, `services/deepResearchService.ts` | `@google/genai` via `getGeminiClient` -> explicit key or `GEMINI_API_KEY`; call-site `gemini-*` model | long text, JSON, multimodal input | ENG-1415 content/MCP/API |

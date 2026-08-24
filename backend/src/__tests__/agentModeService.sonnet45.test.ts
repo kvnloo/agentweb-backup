@@ -608,14 +608,14 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(models).toContain('gpt-5.4');
     });
 
-    it('should have temperature support enabled for gpt-5.4', () => {
+    it('does not advertise unsupported temperature for gpt-5.4 through OpenRouter', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5.4'].supportsTemperature).toBe(true);
+      expect(llmModels['gpt-5.4'].supportsTemperature).toBe(false);
     });
 
-    it('should have a non-null client for gpt-5.4 (Azure client created eagerly)', () => {
+    it('does not construct an Azure client for gpt-5.4 at startup', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5.4'].client).not.toBeNull();
+      expect(llmModels['gpt-5.4'].client).toBeNull();
     });
 
     it('should include gpt-5.4-nano in the supported models', async () => {
@@ -623,14 +623,14 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(models).toContain('gpt-5.4-nano');
     });
 
-    it('should have temperature support enabled for gpt-5.4-nano', () => {
+    it('does not advertise unsupported temperature for gpt-5.4-nano through OpenRouter', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5.4-nano'].supportsTemperature).toBe(true);
+      expect(llmModels['gpt-5.4-nano'].supportsTemperature).toBe(false);
     });
 
-    it('should have a non-null client for gpt-5.4-nano (Azure client created eagerly)', () => {
+    it('does not construct an Azure client for gpt-5.4-nano at startup', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5.4-nano'].client).not.toBeNull();
+      expect(llmModels['gpt-5.4-nano'].client).toBeNull();
     });
 
     it('should include gpt-5.5 in the supported models', async () => {
@@ -643,9 +643,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gpt-5.5'].supportsTemperature).toBe(false);
     });
 
-    it('should have a non-null client for gpt-5.5 (Azure client created eagerly)', () => {
+    it('does not construct an Azure client for gpt-5.5 at startup', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5.5'].client).not.toBeNull();
+      expect(llmModels['gpt-5.5'].client).toBeNull();
     });
 
     it('should have maxTools: 128 for all Azure OpenAI gpt-5.x models', () => {
@@ -655,9 +655,13 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gpt-5.5'].maxTools).toBe(128);
     });
 
-    it('should NOT set maxTools on Gemini or Bedrock models', () => {
+    it('should enforce Google\'s 128-function limit on Gemini but not Bedrock models', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.1-pro-preview'].maxTools).toBeUndefined();
+      expect(llmModels['gemini-3.1-pro-preview'].maxTools).toBe(128);
+      expect(llmModels['gemini-3.1-flash-lite'].maxTools).toBe(128);
+      expect(llmModels['gemini-3.5-flash'].maxTools).toBe(128);
+      expect(llmModels['gemini-3.7-flash'].maxTools).toBe(128);
+      expect(llmModels['gemini-3-flash-preview'].maxTools).toBe(128);
       expect(llmModels['anthropic.claude-sonnet-4-6'].maxTools).toBeUndefined();
     });
 
@@ -706,9 +710,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gemini-3.5-flash'].client).toBeNull();
     });
 
-    it('should NOT set maxTools on Gemini 3.5 Flash', () => {
+    it('should set maxTools on Gemini 3.5 Flash', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.5-flash'].maxTools).toBeUndefined();
+      expect(llmModels['gemini-3.5-flash'].maxTools).toBe(128);
     });
 
     it('should return only anthropic non-opus models from getReportsModelOptions for non-admins', async () => {
@@ -750,7 +754,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     it('should place the configured default model first in the list', async () => {
       const { settingsService } = require('../services/settingsService');
       const llmModels = (agentModeService as any).llmModels;
-      const allModels = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
+      const allModels = Object.keys(llmModels).filter((m: string) =>
+        !llmModels[m].adminOnly && !llmModels[m].internalOnly);
       // Configure a model that is NOT first in the natural object-key order
       const nonFirstModel = allModels[allModels.length - 1];
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
@@ -766,7 +771,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
     it('should place the configured default model first in the list for admins (including opus)', async () => {
       const { settingsService } = require('../services/settingsService');
-      const allModels = Object.keys((agentModeService as any).llmModels);
+      const llmModels = (agentModeService as any).llmModels;
+      const allModels = Object.keys(llmModels).filter((m: string) => !llmModels[m].internalOnly);
       const nonFirstModel = allModels[allModels.length - 1];
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
         settingValue: nonFirstModel,
@@ -819,273 +825,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       const llmModels = (agentModeService as any).llmModels;
       const models = await agentModeService.getSupportedModels();
-      const naturalOrder = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
+      const naturalOrder = Object.keys(llmModels).filter((m: string) =>
+        !llmModels[m].adminOnly && !llmModels[m].internalOnly);
       // Falls back to env/hardcoded default which is likely first anyway
       expect(models.length).toBe(naturalOrder.length);
     });
-  });
-
-  describe('Bedrock client lazy-loading', () => {
-    beforeEach(() => {
-      // Mock ConverseCommand response format (Bedrock native, not LangChain)
-      mockBedrockSend.mockResolvedValue({
-        output: { message: { role: 'assistant', content: [{ text: 'test response' }] } },
-        usage: { inputTokens: 10, outputTokens: 5 },
-        stopReason: 'end_turn',
-      });
-    });
-
-    it('should lazy-load Bedrock client for Sonnet 4.5 on first callLLM', async () => {
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-sonnet-4-5-20250929-v1:0',
-        messages
-      );
-
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['anthropic.claude-sonnet-4-5-20250929-v1:0'].client).not.toBeNull();
-    });
-
-    it('should lazy-load Bedrock client for Sonnet 4.6 on first callLLM', async () => {
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-sonnet-4-6',
-        messages
-      );
-
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['anthropic.claude-sonnet-4-6'].client).not.toBeNull();
-    });
-
-    it('should lazy-load Bedrock client for Opus 4.6 on first callLLM', async () => {
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-opus-4-6-v1',
-        messages
-      );
-
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['anthropic.claude-opus-4-6-v1'].client).not.toBeNull();
-    });
-
-  });
-
-  describe('Gemini client lazy-loading', () => {
-    // ENG-737: gemini calls always resolve via getGeminiNativeClient (the only
-    // transport — no compat fallback, no kill-switch) instead of caching on
-    // llmModels[model].client — that cache was removed deliberately so nothing
-    // stale can survive a settings change. getGeminiNativeClient is synchronous.
-
-    it('should lazy-load the native Gemini client for gemini-3.1-pro-preview on first callLLM', async () => {
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { content: 'test response' } }],
-        usage: { prompt_tokens: 10, completion_tokens: 5 },
-      });
-      const mockGeminiClient = { chat: { completions: { create: mockCreate } } };
-
-      jest.spyOn(agentModeService as any, 'getGeminiNativeClient').mockReturnValue(mockGeminiClient);
-
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM('gemini-3.1-pro-preview', messages);
-
-      expect((agentModeService as any).getGeminiNativeClient).toHaveBeenCalled();
-      expect(mockCreate).toHaveBeenCalled();
-    });
-
-    it('should lazy-load the native Gemini client for gemini-3.1-flash-lite on first callLLM', async () => {
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { content: 'test response' } }],
-        usage: { prompt_tokens: 10, completion_tokens: 5 },
-      });
-      const mockGeminiClient = { chat: { completions: { create: mockCreate } } };
-
-      jest.spyOn(agentModeService as any, 'getGeminiNativeClient').mockReturnValue(mockGeminiClient);
-
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM('gemini-3.1-flash-lite', messages);
-
-      expect((agentModeService as any).getGeminiNativeClient).toHaveBeenCalled();
-      expect(mockCreate).toHaveBeenCalled();
-    });
-
-    it('should lazy-load the native Gemini client for gemini-3.5-flash on first callLLM', async () => {
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { content: 'test response' } }],
-        usage: { prompt_tokens: 10, completion_tokens: 5 },
-      });
-      const mockGeminiClient = { chat: { completions: { create: mockCreate } } };
-
-      jest.spyOn(agentModeService as any, 'getGeminiNativeClient').mockReturnValue(mockGeminiClient);
-
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM('gemini-3.5-flash', messages);
-
-      expect((agentModeService as any).getGeminiNativeClient).toHaveBeenCalled();
-      expect(mockCreate).toHaveBeenCalled();
-    });
-  });
-
-  describe('Bedrock client lazy-loading (Opus 4.8)', () => {
-    it('should lazy-load the Bedrock client for anthropic.claude-opus-4-8 on first callLLM', async () => {
-      // Opus 4.8 runs on Bedrock (separate account, bearer-token auth) despite its
-      // bare "claude-" id, so it must route to getBedrockClient, not Vertex.
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { role: 'assistant', content: 'Hi!', tool_calls: undefined }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 9, completion_tokens: 13, total_tokens: 22 },
-      });
-      const mockBedrockClient = { chat: { completions: { create: mockCreate } } };
-
-      jest.spyOn(agentModeService as any, 'getBedrockClient').mockResolvedValue(mockBedrockClient);
-      const vertexSpy = jest.spyOn(agentModeService as any, 'getVertexClient');
-
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM('anthropic.claude-opus-4-8', messages);
-
-      expect((agentModeService as any).getBedrockClient).toHaveBeenCalledWith('anthropic.claude-opus-4-8');
-      expect(vertexSpy).not.toHaveBeenCalled();
-
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['anthropic.claude-opus-4-8'].client).toBe(mockBedrockClient);
-    });
-  });
-
-  describe('Legacy model id normalization (Opus 4.8 rename)', () => {
-    // Sessions created before commit c86c8ec1 persisted the bare "claude-opus-4-8"
-    // id (Vertex era). After the rename to "anthropic.claude-opus-4-8" (Bedrock),
-    // those legacy ids must be transparently mapped so old sessions keep working
-    // instead of throwing "Invalid model 'claude-opus-4-8'".
-    it('should NOT throw "Invalid model" for the legacy claude-opus-4-8 id', async () => {
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { role: 'assistant', content: 'Hi!', tool_calls: undefined }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 9, completion_tokens: 13, total_tokens: 22 },
-      });
-      const mockBedrockClient = { chat: { completions: { create: mockCreate } } };
-      jest.spyOn(agentModeService as any, 'getBedrockClient').mockResolvedValue(mockBedrockClient);
-
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await expect(
-        (agentModeService as any).callLLM('claude-opus-4-8', messages)
-      ).resolves.toBeDefined();
-    });
-
-    it('should route the legacy claude-opus-4-8 id to the Bedrock client, not Vertex', async () => {
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { role: 'assistant', content: 'Hi!', tool_calls: undefined }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 9, completion_tokens: 13, total_tokens: 22 },
-      });
-      const mockBedrockClient = { chat: { completions: { create: mockCreate } } };
-      jest.spyOn(agentModeService as any, 'getBedrockClient').mockResolvedValue(mockBedrockClient);
-      const vertexSpy = jest.spyOn(agentModeService as any, 'getVertexClient');
-
-      const messages = [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: 'Hello' },
-      ];
-
-      await (agentModeService as any).callLLM('claude-opus-4-8', messages);
-
-      // Must resolve to the canonical Bedrock id, never the Vertex client.
-      expect((agentModeService as any).getBedrockClient).toHaveBeenCalledWith('anthropic.claude-opus-4-8');
-      expect(vertexSpy).not.toHaveBeenCalled();
-    });
-
-    it('normalizeModelId maps the legacy id to the canonical Bedrock id', () => {
-      expect((agentModeService as any).normalizeModelId('claude-opus-4-8')).toBe('anthropic.claude-opus-4-8');
-    });
-
-    it('normalizeModelId leaves canonical and unknown ids unchanged', () => {
-      expect((agentModeService as any).normalizeModelId('anthropic.claude-opus-4-8')).toBe('anthropic.claude-opus-4-8');
-      expect((agentModeService as any).normalizeModelId('gpt-5.5')).toBe('gpt-5.5');
-      expect((agentModeService as any).normalizeModelId(undefined)).toBeUndefined();
-    });
-  });
-
-  describe('Inference profile ARN mapping', () => {
-    beforeEach(() => {
-      mockBedrockSend.mockResolvedValue({
-        output: { message: { role: 'assistant', content: [{ text: 'test response' }] } },
-        usage: { inputTokens: 10, outputTokens: 5 },
-        stopReason: 'end_turn',
-      });
-    });
-
-    it('should map Sonnet 4.5 to its inference profile ARN', async () => {
-      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-sonnet-4-5-20250929-v1:0',
-        [{ role: 'system', content: 'Test' }, { role: 'user', content: 'Hello' }]
-      );
-
-      expect(ConverseCommand).toHaveBeenCalledWith(
-        expect.objectContaining({
-          modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
-        })
-      );
-    });
-
-    it('should map Sonnet 4.6 to its inference profile ARN', async () => {
-      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-sonnet-4-6',
-        [{ role: 'system', content: 'Test' }, { role: 'user', content: 'Hello' }]
-      );
-
-      expect(ConverseCommand).toHaveBeenCalledWith(
-        expect.objectContaining({
-          modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
-        })
-      );
-    });
-
-    it('should map Opus 4.6 to its inference profile ARN', async () => {
-      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
-
-      await (agentModeService as any).callLLM(
-        'anthropic.claude-opus-4-6-v1',
-        [{ role: 'system', content: 'Test' }, { role: 'user', content: 'Hello' }]
-      );
-
-      expect(ConverseCommand).toHaveBeenCalledWith(
-        expect.objectContaining({
-          modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
-        })
-      );
-    });
-
   });
 
   describe('callLLM rejects unknown models', () => {
@@ -1098,14 +842,15 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     });
   });
 
-  describe('callLLM maxTools truncation (Azure OpenAI 128-tool limit)', () => {
+  describe('callLLM maxTools truncation (provider 128-tool limits)', () => {
     it('should truncate tools to maxTools limit for gpt-5.4', async () => {
       const mockCreate = jest.fn().mockResolvedValue({
         choices: [{ message: { content: 'response', tool_calls: null } }],
         usage: { prompt_tokens: 10, completion_tokens: 5 },
       });
-      const llmModels = (agentModeService as any).llmModels;
-      llmModels['gpt-5.4'].client = { chat: { completions: { create: mockCreate } } };
+      jest.spyOn(agentModeService as any, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create: mockCreate } },
+      });
 
       const tools = Array.from({ length: 143 }, (_, i) => ({
         type: 'function',
@@ -1125,8 +870,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         choices: [{ message: { content: 'response', tool_calls: null } }],
         usage: { prompt_tokens: 10, completion_tokens: 5 },
       });
-      const llmModels = (agentModeService as any).llmModels;
-      llmModels['gpt-5.4'].client = { chat: { completions: { create: mockCreate } } };
+      jest.spyOn(agentModeService as any, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create: mockCreate } },
+      });
 
       const tools = Array.from({ length: 128 }, (_, i) => ({
         type: 'function',
@@ -1137,6 +883,28 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       const calledParams = mockCreate.mock.calls[0][0];
       expect(calledParams.tools).toHaveLength(128);
+    });
+
+    it('should truncate Gemini tools to Google\'s 128-function limit', async () => {
+      const mockCreate = jest.fn().mockResolvedValue({
+        choices: [{ message: { content: 'response', tool_calls: null } }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+      jest.spyOn(agentModeService as any, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create: mockCreate } },
+      });
+      const tools = Array.from({ length: 207 }, (_, i) => ({
+        type: 'function',
+        function: { name: `tool_${i}`, description: `Tool ${i}`, parameters: { type: 'object', properties: {} } }
+      }));
+
+      await (agentModeService as any).callLLM(
+        'gemini-3.1-flash-lite',
+        [{ role: 'user', content: 'test' }],
+        { tools },
+      );
+
+      expect(mockCreate.mock.calls[0][0].tools).toHaveLength(128);
     });
   });
 

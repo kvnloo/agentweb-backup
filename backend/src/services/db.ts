@@ -471,6 +471,15 @@ export interface User {
    */
   sessionVersion?: number;
   /**
+   * Monotonic revocation counter for DELEGATE tokens minted against this user
+   * (admin/contractor "access as customer"). Embedded as `dte` in every delegate
+   * token. Bumping it rejects every outstanding delegate token for this user
+   * without touching their own sessions — which `sessionVersion` cannot do, since
+   * that would log the customer out of their own devices as a side effect of a
+   * support-access cleanup. Absent = 0. See ENG-1506.
+   */
+  delegateTokenEpoch?: number;
+  /**
    * Set when the account is created with a system-generated initial password
    * (e.g. admin creating a user from the waitlist). The user MUST set their own
    * password before this timestamp; the initial secret cannot become a
@@ -1685,6 +1694,42 @@ export class UserDB {
       return (result.Attributes as { sessionVersion: number }).sessionVersion;
     } catch (error) {
       handleDynamoDbError(error, "incrementSessionVersion");
+      throw error;
+    }
+  }
+
+  /**
+   * Atomically increment a user's delegateTokenEpoch, rejecting every delegate
+   * token minted against them with a prior value. Returns the new epoch.
+   *
+   * Deliberately separate from `sessionVersion`: revoking support access must not
+   * log the customer out of their own devices, and a customer changing their
+   * password should not be the only way to cut off a delegate token. Both signals
+   * are checked independently in the auth middleware.
+   *
+   * Same `if_not_exists` shape as incrementSessionVersion, so records predating
+   * the field are treated as 0 and bumped to 1.
+   */
+  async incrementDelegateTokenEpoch(userId: string): Promise<number> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+
+    const params = {
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression: "SET #dte = if_not_exists(#dte, :zero) + :one",
+      ExpressionAttributeNames: { "#dte": "delegateTokenEpoch" },
+      ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
+      ReturnValues: "UPDATED_NEW",
+    };
+
+    try {
+      const result = await this.docClient.update(params).promise();
+      return (result.Attributes as { delegateTokenEpoch: number }).delegateTokenEpoch;
+    } catch (error) {
+      handleDynamoDbError(error, "incrementDelegateTokenEpoch");
       throw error;
     }
   }
@@ -5189,6 +5234,30 @@ export const crmDb = {
         TableName: `${TABLE_PREFIX}AW-LeadLists`,
         ProjectionExpression: 'listId, #n, userId',
         ExpressionAttributeNames: { '#n': 'name' },
+        ExclusiveStartKey: lastEvaluatedKey,
+      }).promise();
+      items.push(...(result.Items || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return items;
+  },
+
+  /**
+   * Lists opted into the CRM auto-enrichment cron (ENG-88):
+   * `enrichmentConfig.autoEnrich === true`. Scoped scan, not a rename/reuse
+   * of getAllLeadLists — that function's minimal projection is depended on
+   * elsewhere, and this needs the enrichmentConfig attribute plus a filter.
+   * Cheap by design: `autoEnrich` is opt-in and expected to stay rare.
+   */
+  async getAutoEnrichEnabledLists(): Promise<Array<{ listId: string; userId: string }>> {
+    const items: any[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.scan({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        ProjectionExpression: 'listId, userId',
+        FilterExpression: 'enrichmentConfig.autoEnrich = :true',
+        ExpressionAttributeValues: { ':true': true },
         ExclusiveStartKey: lastEvaluatedKey,
       }).promise();
       items.push(...(result.Items || []));

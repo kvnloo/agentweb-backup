@@ -77,6 +77,8 @@ const mockUpdateLeadList = jest.fn();
 const mockGetLandingPagesByOwner = jest.fn();
 const mockSyncLeadCaptureFilesToRepo = jest.fn();
 const mockGetLeadListById = jest.fn();
+/** crmDb.updateLeadList — distinct from v0Service.updateLandingPageLeadList above. */
+const mockUpdateLeadListRecord = jest.fn();
 const mockGetUserById = jest.fn();
 const mockGetOrgById = jest.fn();
 const mockCanEditItem = jest.fn();
@@ -95,7 +97,10 @@ jest.mock("../services/v0Service", () => {
 jest.mock("../services/db", () => ({
   userDb: { getUserById: (...a: any[]) => mockGetUserById(...a) },
   orgDb: { getOrgById: (...a: any[]) => mockGetOrgById(...a) },
-  crmDb: { getLeadListById: (...a: any[]) => mockGetLeadListById(...a) },
+  crmDb: {
+    getLeadListById: (...a: any[]) => mockGetLeadListById(...a),
+    updateLeadList: (...a: any[]) => mockUpdateLeadListRecord(...a),
+  },
 }));
 
 jest.mock("../services/orgShareService", () => ({
@@ -121,6 +126,8 @@ import { findOrphanedCaptureEntries } from "../services/v0Service";
 // so reach past it here). Its axios / aws-sdk / secrets deps are still mocked.
 const {
   syncLeadCaptureFilesToRepo,
+  isPlatformGeneratedRepo,
+  NO_CAPTURE_LAYER,
   buildLandingPageMiddleware,
   buildCaptureRoute,
   buildDomainMapFile,
@@ -361,6 +368,30 @@ describe("syncLeadCaptureFilesToRepo", () => {
     expect(result.committed).toBe(true);
     expect(treePaths()).not.toContain("app/api/capture/route.ts");
     expect(treePaths()).toEqual(expect.arrayContaining(["middleware.ts"]));
+    // ⚠ committed:true here does NOT mean the capture route carries the caller's pixel — it
+    // was deliberately excluded. Callers configuring tracking must be able to see that, or
+    // they report success over a route we never wrote.
+    expect(result.captureRouteSkipped).toBe(true);
+  });
+
+  it("flags a skipped capture route even when NOTHING is committed (up-to-date no-op)", async () => {
+    // The gap a commit-status flag alone leaves: every other file already matches, so we
+    // return "up-to-date" and never write the route — which was unreadable anyway. A caller
+    // configuring tracking would otherwise see a clean no-op over a route we did not touch.
+    mockGitHub({
+      "middleware.ts": buildLandingPageMiddleware(),
+      "lib/agentweb-track.ts": buildTrackingHelper(),
+      "app/api/capture/route.ts":
+        'const LIST_BY_PATH: Record<string, string> = { "/": someIdentifier\n};\n',
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/pricing": "list_p" }));
+
+    expect(result.committed).toBe(false);
+    expect(result.reason).toBe("up-to-date");
+    expect(result.captureRouteSkipped).toBe(true);
+    expect(mockAxiosPatch).not.toHaveBeenCalled();
   });
 
   it("commits the capture route normally when the deployed map has no extra paths", async () => {
@@ -489,6 +520,8 @@ describe("syncLeadCaptureFilesToRepo", () => {
         : { "/a": "list_a", "/b": "list_b" };     // retry: fresh, includes the sibling that landed
     };
 
+    // Every file reads 404 here on purpose (see above) so each attempt reaches a real commit.
+    // REPO is an lp-* repo, so the install floor permits creating the layer.
     const result = await syncLeadCaptureFilesToRepo(REPO, buildListByPath);
 
     expect(result.committed).toBe(true);
@@ -510,6 +543,89 @@ describe("syncLeadCaptureFilesToRepo", () => {
 });
 
 // =============================================================================
+// =============================================================================
+// The install guard: only ever write a capture layer we own, on a repo we generated
+// =============================================================================
+const BESPOKE_REPO = "AgentWebPro/agentweb-landing-page"; // hireemma.ai — AgentWeb's own site
+const OWNED_MIDDLEWARE = buildLandingPageMiddleware(); // carries the aw_first_touch marker
+
+describe("syncLeadCaptureFilesToRepo — install guard", () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it("REFUSES a bespoke repo with no capture layer at all", async () => {
+    mockGitHub({});
+    const result = await syncLeadCaptureFilesToRepo(BESPOKE_REPO, () => ({ "/": "list_1" }));
+
+    expect(result).toEqual({ committed: false, reason: NO_CAPTURE_LAYER });
+    expect(mockAxiosPatch).not.toHaveBeenCalled();
+    expect(treePaths()).toEqual([]);
+  });
+
+  it("REFUSES a bespoke repo whose root middleware.ts is its OWN, and never overwrites it", async () => {
+    // The case a bare "middleware.ts exists" check gets wrong. A bespoke Next.js app may
+    // legitimately run middleware for auth/i18n/redirects; treating that as our capture layer
+    // would CLOBBER it — worse than the bug this guard exists for.
+    const customMiddleware = "export function middleware(req) { /* their auth gate */ }\n";
+    mockGitHub({ "middleware.ts": customMiddleware });
+
+    const result = await syncLeadCaptureFilesToRepo(BESPOKE_REPO, () => ({ "/": "list_1" }));
+
+    expect(result).toEqual({ committed: false, reason: NO_CAPTURE_LAYER });
+    expect(treePaths()).toEqual([]);
+    expect(mockAxiosPatch).not.toHaveBeenCalled();
+    // Nothing we uploaded may be our middleware — their file stands untouched.
+    for (const content of blobBySha.values()) expect(content).not.toBe(OWNED_MIDDLEWARE);
+  });
+
+  it("REFUSES a bespoke repo carrying its own app/api/capture/route.ts", async () => {
+    // v0-xc-ures-landing-page really is in this state, which is why a capture-route marker
+    // would be the wrong ownership signal.
+    mockGitHub({ "app/api/capture/route.ts": "// their own capture handler\n" });
+    const result = await syncLeadCaptureFilesToRepo(BESPOKE_REPO, () => ({ "/": "list_1" }));
+    expect(result.reason).toBe(NO_CAPTURE_LAYER);
+  });
+
+  it("ALLOWS a platform-generated repo with no layer yet — the pre-ENG-309 repair case", async () => {
+    mockGitHub({});
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }));
+
+    expect(result.committed).toBe(true);
+    expect(treePaths()).toEqual(expect.arrayContaining(["middleware.ts", "app/api/capture/route.ts"]));
+  });
+
+  it("ALLOWS any repo that already carries OUR layer — those are files we wrote", async () => {
+    mockGitHub({
+      "middleware.ts": OWNED_MIDDLEWARE,
+      "lib/agentweb-track.ts": "// stale helper\n",
+      "app/api/capture/route.ts": "// stale route\n",
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(BESPOKE_REPO, () => ({ "/": "list_1" }));
+
+    expect(result.committed).toBe(true);
+  });
+});
+
+describe("isPlatformGeneratedRepo", () => {
+  it("recognises platform-generated repos", () => {
+    expect(isPlatformGeneratedRepo("AgentWebPro/lp-taskflow-test-page-249d7f67")).toBe(true);
+    expect(isPlatformGeneratedRepo("lp-demystifying-ai-agentweb-lead-180f2e2b")).toBe(true);
+  });
+
+  it("rejects the bespoke and v0-era customer sites, which is the whole point", () => {
+    // Real production repos: 34 landing-page records point at these four.
+    for (const r of [
+      "AgentWebPro/agentweb-landing-page",
+      "AgentWebPro/v0-xc-ures-landing-page",
+      "AgentWebPro/v0-waldium-lander",
+      "AgentWebPro/v0-haven-ai-landing-page",
+    ]) {
+      expect(isPlatformGeneratedRepo(r)).toBe(false);
+    }
+  });
+});
+
 // Route: PATCH /generated/:id/lead-list
 // =============================================================================
 const app: Application = express();
@@ -547,7 +663,12 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
     mockGetLandingPageById.mockResolvedValue(rootPage);
     mockGetUserById.mockResolvedValue({ userId: "u1" });
     mockUpdateLeadList.mockResolvedValue(undefined);
-    mockGetLeadListById.mockResolvedValue({ listId: "list_home", userId: "u1" });
+    // ENG-967: a page-bound list is publicly submittable in the healthy state this suite
+    // describes. Leaving the flag off here would make every case below also exercise the
+    // enabling write and carry its warning — the binding behaviour is covered on its own in
+    // routes.landingPages.leadList.test.ts.
+    mockGetLeadListById.mockResolvedValue({ listId: "list_home", userId: "u1", publicAccessEnabled: true });
+    mockUpdateLeadListRecord.mockResolvedValue(undefined);
     mockGetLandingPagesByOwner.mockResolvedValue([rootPage, pricingPage, otherSitePage]);
     mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: true });
   });
@@ -609,6 +730,47 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
     await expect(buildListByPath()).resolves.toEqual({ "/pricing": "list_pricing" });
   });
 
+  it("BESPOKE REPO: DETACHING says 'removed', not 'saved'", async () => {
+    const bespoke = { ...rootPage, githubRepoUrl: "https://github.com/AgentWebPro/agentweb-landing-page", leadListId: "list_home" };
+    mockGetLandingPageById.mockResolvedValue(bespoke);
+    mockGetLandingPagesByOwner.mockResolvedValue([bespoke]);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: false, reason: NO_CAPTURE_LAYER });
+
+    const res = await request(app)
+      .patch("/api/landing-pages/v0/generated/p1/lead-list")
+      .send({ leadListId: null });
+
+    expect(res.status).toBe(200);
+    expect(res.body.captureSyncWarning).toMatch(/^Lead list removed/);
+    expect(res.body.captureSyncWarning).not.toMatch(/Lead list saved/);
+  });
+
+  it("BESPOKE REPO: the lead-list path may not install a capture layer, and says so accurately", async () => {
+    // hireemma.ai. 34 production records point at four repos like this one. Committing here
+    // would CREATE a root middleware.ts on AgentWeb's own marketing site.
+    const bespoke = { ...rootPage, githubRepoUrl: "https://github.com/AgentWebPro/agentweb-landing-page" };
+    mockGetLandingPageById.mockResolvedValue(bespoke);
+    mockGetLandingPagesByOwner.mockResolvedValue([bespoke]);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: false, reason: NO_CAPTURE_LAYER });
+
+    const res = await request(app)
+      .patch("/api/landing-pages/v0/generated/p1/lead-list")
+      .send({ leadListId: "list_home" });
+
+    expect(res.status).toBe(200);
+    // The route still calls the sync — the refusal is decided centrally in the service, so
+    // no caller can opt out of it or forget to opt in.
+    expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(
+      "AgentWebPro/agentweb-landing-page",
+      expect.any(Function),
+      undefined,
+      undefined,
+    );
+    // ⚠ Wording matters: this is NOT transient, so it must not promise a later retry.
+    expect(res.body.captureSyncWarning).toMatch(/does not use the platform's lead-capture code/);
+    expect(res.body.captureSyncWarning).not.toMatch(/next deploy or retry/);
+  });
+
   it("a GitHub failure does not lose the DB write — 200 with captureSyncWarning", async () => {
     mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: false, reason: "github 500: boom" });
 
@@ -644,6 +806,23 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
     expect(res.status).toBe(200);
     expect(mockSyncLeadCaptureFilesToRepo).not.toHaveBeenCalled();
     expect(res.body.captureSyncWarning).toBeUndefined();
+  });
+
+  it("ENG-967: a failed public-access enable and a failed repo sync BOTH surface", async () => {
+    // Two independent failures, one response field. Reporting only the sync failure would
+    // tell the customer to check GitHub while their form keeps 403ing at forward-lead.
+    mockGetLeadListById.mockResolvedValue({ listId: "list_home", userId: "u1", publicAccessEnabled: false });
+    mockUpdateLeadListRecord.mockRejectedValue(new Error("dynamo blip"));
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: false, reason: "github 500: boom" });
+
+    const res = await request(app)
+      .patch("/api/landing-pages/v0/generated/p1/lead-list")
+      .send({ leadListId: "list_home" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings).toHaveLength(2);
+    expect(res.body.captureSyncWarning).toMatch(/public/);
+    expect(res.body.captureSyncWarning).toMatch(/boom/);
   });
 
   it("an up-to-date repo is not a warning", async () => {

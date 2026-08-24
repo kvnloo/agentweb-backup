@@ -1,6 +1,5 @@
 import OpenAI from "openai";
 import { getAzureClient } from "../utils/llmClients";
-import { meterUserUsage } from "./usageRecorderService";
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import dotenv from "dotenv";
@@ -25,7 +24,6 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../utils/citations';
-import { isTransientLLMError } from '../utils/agentModeErrors';
 import { shrinkMessageForPersistence } from '../utils/messageSizeGuard';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
@@ -34,6 +32,7 @@ import { computeCostMicroUsd } from './usageRecorderService';
 import type { CacheWriteByTtl } from '../utils/llmPricing';
 import { approvalDb } from './approvalDb';
 import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
+import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -58,15 +57,6 @@ export const dynamodb = new AWS.DynamoDB.DocumentClient({
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
   },
 });
-
-// Metered Azure OpenAI client for Emma chat. Same standard deployment the
-// module singleton used; usage is recorded per user/session via the factory.
-function chatClient(userId?: string, sessionId?: string) {
-  return getAzureClient(
-    { userId, feature: "chat", sessionId },
-    process.env.AZURE_OPENAI_DEPLOYMENT
-  );
-}
 
 // Metered client for embeddings (knowledge-base semantic search). Uses the
 // separate EMBEDDINGS endpoint/key/api-version the module singleton used. No
@@ -209,11 +199,19 @@ export interface ChatSession {
       // step (e.g. "Generate 3 Images Per Hook — 18 total") from being marked done with
       // only a fraction generated (the xCures incident). Unset = no asset-count gate.
       expectedAssetCount?: number;
+      inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
     }>;
     createdAt: string;
     updatedAt: string;
     welcomeMessage?: string; // Custom welcome message for this work plan
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
+    // ENG-1472: the predefined WorkPlan template (AW-WorkPlans planId) this
+    // session's work plan was instantiated from, when it was launched from a
+    // template (launch_predefined_work_plan, the public plan-session route, or
+    // the recommend-then-accept flow). Absent for plans created ad hoc via
+    // create_work_plan. Used for accept-endpoint idempotency and to chain into
+    // a completed template's author-approved "next plan" suggestions.
+    templatePlanId?: string;
   };
   contextLimitReported?: boolean; // True once a context-limit issue report has been auto-filed
   // ENG-396: the single structured question Emma is currently blocked on (if any).
@@ -226,6 +224,11 @@ export interface ChatSession {
   // write gate (checkQuestionGate) still find an earlier human answer even
   // after Emma has moved on to asking something else in the same session.
   answeredQuestions?: Record<string, PendingUserQuestion>;
+  // One channel-neutral information request emitted by the current work-plan
+  // step. It is intentionally separate from pendingUserQuestion because it
+  // carries typed values rather than an option selection; the write guard
+  // still makes the two mutually exclusive while either is awaiting.
+  pendingWorkPlanInput?: WorkPlanInputRequest;
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
@@ -3113,6 +3116,68 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Persist the typed information a work-plan step is waiting for. The same
+   * request is rendered as a chat card in the portal or as MCP elicitation;
+   * persisting the channel-neutral form lets a reconnect resume safely.
+   *
+   * There is one human-input interruption at a time across both structured
+   * interaction types. A second request must wait instead of racing to steal
+   * the user's answer slot.
+   */
+  async updateSessionWorkPlanInputRequest(
+    sessionId: string,
+    pendingWorkPlanInput: WorkPlanInputRequest | null,
+    opts?: { failIfAwaitingExists?: boolean; requireStillAwaiting?: string },
+  ): Promise<ChatSession | null> {
+    const guard = opts?.failIfAwaitingExists === true && pendingWorkPlanInput !== null;
+    const requireStillAwaiting =
+      typeof opts?.requireStillAwaiting === 'string' ? opts.requireStillAwaiting : undefined;
+
+    const params: any = pendingWorkPlanInput
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET pendingWorkPlanInput = :pendingWorkPlanInput, adminListPartition = :adminListPartition',
+          ExpressionAttributeValues: {
+            ':pendingWorkPlanInput': pendingWorkPlanInput,
+            ':adminListPartition': 'all',
+          },
+          ReturnValues: 'ALL_NEW',
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'REMOVE pendingWorkPlanInput',
+          ReturnValues: 'ALL_NEW',
+        };
+
+    if (guard) {
+      params.ConditionExpression = '(attribute_not_exists(pendingWorkPlanInput) OR pendingWorkPlanInput.#inputStatus <> :awaitingStatus) AND (attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#questionStatus <> :awaitingStatus)';
+      params.ExpressionAttributeNames = { '#inputStatus': 'status', '#questionStatus': 'status' };
+      params.ExpressionAttributeValues[':awaitingStatus'] = 'awaiting';
+    } else if (requireStillAwaiting) {
+      params.ConditionExpression = 'pendingWorkPlanInput.requestId = :requestId AND pendingWorkPlanInput.#inputStatus = :awaitingStatus';
+      params.ExpressionAttributeNames = { '#inputStatus': 'status' };
+      params.ExpressionAttributeValues = {
+        ...(params.ExpressionAttributeValues || {}),
+        ':requestId': requireStillAwaiting,
+        ':awaitingStatus': 'awaiting',
+      };
+    }
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      if ((guard || requireStillAwaiting) && (error as any)?.code === 'ConditionalCheckFailedException') {
+        return null;
+      }
+      console.error('Error updating session work-plan input request:', error);
+      throw error;
+    }
+  }
+
   async updateSessionWorkPlan(
     sessionId: string,
     workPlan: {
@@ -3133,11 +3198,14 @@ export class ChatbotDB {
         requiredFunctionCalls?: string[];
         skillIds?: string[];
         expectedAssetCount?: number;
+        inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
       }>;
       createdAt: string;
       updatedAt: string;
       welcomeMessage?: string;
       autocomplete?: boolean;
+      /** ENG-1472: see the matching field on the read-side workPlan type above. */
+      templatePlanId?: string;
     }
   ): Promise<ChatSession> {
     const timestamp = new Date().toISOString();
@@ -4265,7 +4333,8 @@ export function calculateCost(
 // Helper function to log token usage
 function logTokenUsage(
   response: OpenAI.Chat.ChatCompletion,
-  context: string = ""
+  context: string = "",
+  pricingModel: string = response.model
 ) {
   const usage = response.usage;
   if (!usage) return;
@@ -4274,14 +4343,14 @@ function logTokenUsage(
   const cost = calculateCost(
     usage.prompt_tokens,
     usage.completion_tokens,
-    response.model,
+    pricingModel,
     u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
     u.cache_creation_input_tokens || 0,
     u.cache_creation_by_ttl
   );
 
   console.log(
-    `[Token Usage] Model: ${response.model} | Prompt: ${
+    `[Token Usage] Model: ${pricingModel} | Prompt: ${
       usage.prompt_tokens
     } | Completion: ${usage.completion_tokens} | Total: ${
       usage.total_tokens
@@ -4711,13 +4780,12 @@ export async function generateChatResponse(
     }
 
     // Initialize tool support for Emma (customer portal, or admin users on any portal)
-    let agentModeService: AgentModeService | null = null;
+    const agentModeService = new AgentModeService();
     let toolDefinitions: any[] = [];
 
     if (portalType === 'customer' || (portalType as string) === 'emma-sidebar' || isDelegatedAdmin) {
       try {
         // Initialize AgentModeService to access tool registry and executeTool
-        agentModeService = new AgentModeService();
         await agentModeService.initialize();
 
         // Base tools: foundation tools (always available in agent mode) + Emma-specific extras
@@ -4857,55 +4925,11 @@ export async function generateChatResponse(
     let finalAssistantMessage = '';
     let finalUsageData: any = null;
 
-    const isGeminiModel = model ? model.toLowerCase().includes('gemini') : false;
-    // Match 'claude' or 'anthropic.' prefixed Bedrock IDs (e.g. anthropic.claude-3-5-sonnet-20241022)
-    // Deliberately excludes generic 'sonnet' to avoid false positives on unrelated model names.
-    const isClaudeModel = model ? (model.toLowerCase().includes('claude') || model.startsWith('anthropic.')) : false;
-
-    // Select the active client:
-    // - Claude/Bedrock: use agentModeService.getBedrockClient() which returns an
-    //   OpenAI-compatible wrapper that fully supports tool calling via ChatBedrockConverse.
-    // - Gemini: use agentModeService.getGeminiClient() which returns an
-    //   OpenAI-compatible wrapper that supports tool calling.
-    // - Azure OpenAI (default): use the standard OpenAI SDK client.
-    const activeDeployment = isClaudeModel ? model! : (model || process.env.AZURE_OPENAI_DEPLOYMENT || '');
-    let activeClient: any;
-
-    if (isClaudeModel || isGeminiModel) {
-      if (!agentModeService) {
-        throw new Error('AgentModeService not initialized');
-      }
-    }
-
-    // ENG-1134: NONE of these clients charges the quota. The llmClients factories
-    // fire `recordUsage` only (see fireRecord) — a ledger row, no deduction — and
-    // the Bedrock/Gemini wrappers from agentModeService do not meter at all.
-    // Message persistence used to be the single charge point for every Emma path,
-    // so removing it (it double-charged agent mode) would have left Emma spending
-    // for free on all three providers.
-    //
-    // So Emma meters explicitly below, for every provider. The Azure client is
-    // therefore requested UN-metered: leaving its factory recording while we also
-    // meter here would write two ledger rows for one call, trading a missing
-    // charge for a doubled record.
-
-    if (isClaudeModel) {
-      activeClient = await agentModeService!.getBedrockClient(model!);
-    } else if (isGeminiModel) {
-      activeClient = await agentModeService!.getGeminiClient();
-    } else {
-      // model specified → that Azure deployment; otherwise the default
-      // deployment (what the module singleton used). Metered via the factory.
-      activeClient = getAzureClient(
-        { userId, feature: "chat", sessionId },
-        model || process.env.AZURE_OPENAI_DEPLOYMENT,
-        // Un-metered: the meter below is the single record-and-charge point.
-        { metered: false }
-      );
-    }
-
-    // Helper: Sleep function for exponential backoff
-    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+    // One logical model and one shared execution boundary for every Emma portal.
+    // callLLM owns provider transport, retries/fallback, and exactly-once metering;
+    // the sidebar owns only conversation/tool behavior.
+    const activeModel = model || session.llmModel || await agentModeService.getDefaultModel();
+    const isEmmaInteractive = portalType === 'customer';
 
     while (iteration < MAX_ITERATIONS) {
       console.log(`[generateChatResponse] Iteration ${iteration + 1}`);
@@ -4913,16 +4937,11 @@ export async function generateChatResponse(
       // Trim large old tool results to prevent context window overflow
       const trimmedMessages = trimToolMessagesForContext(messages);
 
-      // Generate response using OpenAI (with tools if available)
+      // Generate through the shared runtime gateway (with tools if available).
       const llmStartMs = Date.now();
-      let response: any;
-      const maxAttempts = 3;
-      const baseDelayMs = 2000;
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-          response = await activeClient.chat.completions.create({
-            model: activeDeployment,
-            messages: trimmedMessages.map(({ role, content, name, tool_call_id, tool_calls }: any) => {
+      const response = await agentModeService.callLLM(
+        activeModel,
+        trimmedMessages.map(({ role, content, name, tool_call_id, tool_calls }: any) => {
           const message: any = { role, content };
           if (role === 'tool' && tool_call_id) {
             message.tool_call_id = tool_call_id;
@@ -4935,21 +4954,13 @@ export async function generateChatResponse(
           }
           return message;
         }),
-        // Add tools only for customer portal with tools loaded
-        ...(toolDefinitions.length > 0 ? { tools: toolDefinitions, tool_choice: 'auto' } : {})
-          });
-          break; // Success, break the retry loop
-        } catch (error) {
-          const isLastAttempt = attempt >= maxAttempts;
-          if (!isTransientLLMError(error) || isLastAttempt) {
-            throw error;
-          }
-          const jitterMs = Math.floor(Math.random() * 500);
-          const delayMs = baseDelayMs * Math.pow(2, attempt - 1) + jitterMs;
-          console.warn(`[generateChatResponse] Rate limit/transient error for model "${activeDeployment}", attempt ${attempt}/${maxAttempts}. Waiting ${delayMs}ms before retry...`);
-          await sleep(delayMs);
-        }
-      }
+        {
+          ...(toolDefinitions.length > 0 ? { tools: toolDefinitions, tool_choice: 'auto' as const } : {}),
+          ...(isEmmaInteractive ? { taskClass: 'interactive_chat' as const } : {}),
+          humanPaced: true,
+          usageContext: { userId, sessionId, feature: 'chat' },
+        },
+      );
 
       const llmDurationMs = Date.now() - llmStartMs;
       const responseMessage = response.choices[0]?.message;
@@ -4960,42 +4971,9 @@ export async function generateChatResponse(
       // Log token usage for this iteration
       logTokenUsage(
         response,
-        `Iteration ${iteration + 1}${contextInfo ? `, used ${contextInfo.length} chars of context` : ''}`
+        `Iteration ${iteration + 1}${contextInfo ? `, used ${contextInfo.length} chars of context` : ''}`,
+        activeModel,
       );
-
-      // ENG-1134: meter this turn for the clients that do not meter themselves.
-      // Runs per iteration, because each loop pass is a separate billable call —
-      // metering only the final one would undercount every tool-using turn.
-      // Fire-and-forget and fail-open by contract, like every other meter.
-      {
-        // Tokens are read exactly the way callLLM reads them, NOT via
-        // meterUsageFromResponse. That helper dispatches on response shape, and
-        // the Bedrock Converse wrapper answers in OpenAI shape — so it would take
-        // normalizeOpenAIUsage, which only knows `prompt_tokens_details.cached_tokens`
-        // and would silently record Bedrock's cache tokens as zero. Cache is ~73%
-        // of traffic, so that would under-count this spend by roughly 4x, in the
-        // very ledger the cost cap is about to be enforced against.
-        const u: any = response?.usage;
-        if (u) {
-          meterUserUsage({
-            userId,
-            sessionId,
-            model: activeDeployment,
-            provider: isClaudeModel ? 'bedrock' : isGeminiModel ? 'gemini' : 'azure-openai',
-            feature: 'chat',
-            // ENG-1251: response.id is stable across a retried/re-processed
-            // response and distinct across real calls — closes the "retries
-            // defeat charge dedup" Greptile P1 for this iteration's charge.
-            eventId: typeof response?.id === 'string' ? response.id : undefined,
-            inputTokens: u.prompt_tokens || 0,
-            outputTokens: u.completion_tokens || 0,
-            cacheReadTokens: u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
-            cacheWriteTokens: u.cache_creation_input_tokens || 0,
-            // ENG-893: bill writes at the TTL Bedrock actually applied.
-            cacheWriteByTtl: u.cache_creation_by_ttl,
-          });
-        }
-      }
 
       // Add assistant message to messages array (for next iteration)
       const assistantMsg: any = {
@@ -5012,7 +4990,7 @@ export async function generateChatResponse(
         // No tool calls - we're done
         iterationTimings.push({ iteration: iteration + 1, llmDurationMs, toolNames: [] });
         finalAssistantMessage = responseMessage.content || "I apologize, but I was unable to generate a response.";
-        finalUsageData = logTokenUsage(response, "Final response");
+        finalUsageData = logTokenUsage(response, "Final response", activeModel);
         break;
       }
 
@@ -5024,12 +5002,11 @@ export async function generateChatResponse(
           functionArgs = JSON.parse(toolCall.function.arguments);
           console.log(`[generateChatResponse] Executing tool: ${toolCall.function.name}`, functionArgs);
           onToolStart?.(toolCall.function.name);
-          if (!agentModeService) throw new Error("AgentModeService not initialized");
           const extraContext: Record<string, any> = {};
           if (socketId) extraContext.socketId = socketId;
           if (isDelegatedAdmin) extraContext.isDelegatedAdmin = true;
           if (isDelegatedAdmin && adminEmail) extraContext.adminEmail = adminEmail;
-          const result = await agentModeService.executeTool(response.model, toolCall.function.name, functionArgs, userId!, sessionId, false, Object.keys(extraContext).length ? extraContext : undefined);
+          const result = await agentModeService.executeTool(activeModel, toolCall.function.name, functionArgs, userId!, sessionId, false, Object.keys(extraContext).length ? extraContext : undefined);
           console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
           // ENG-351: harvest web-search sources into the citation registry.
           let citationBatch: Citation[] = [];

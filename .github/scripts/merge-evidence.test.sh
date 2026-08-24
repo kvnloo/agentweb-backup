@@ -216,6 +216,7 @@ run_gate() {
     REPO='AgentWebPro/agentweb' \
     PR_NUMBER='2231' \
     GH_TOKEN='mock' \
+    MERGE_EVIDENCE_BACKEND_JOBS=$'Backend tests (agentMode)\nBackend tests (all other + coverage)' \
     bash "${GATE_SCRIPT}" 2>&1)"
   LAST_EXIT=$?
 }
@@ -625,7 +626,7 @@ pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" "${SUPERSEDED_CANCELLED_RUN}"
 workflowruns "${d}" "${SUPERSEDED_CANCELLED_WFRUNS}"
 run_gate "${d}"
-check 'the verdict reports how many superseded check-runs were ignored' 0 'ignored 2 superseded check-run(s)'
+check 'the verdict reports how many superseded check-runs were ignored' 0 'ignored 2 superseded and/or retired-allowlisted check-run(s)'
 
 # The inverse guards against a cosmetic dedupe that simply prefers success:
 # the latest suite still owns the context when it is the failing one.
@@ -892,6 +893,75 @@ checkruns "${d}" "${SUPERSEDED_2231}"
 printf '{"total_count":40,"workflow_runs":%s}\n' "${SUPERSEDED_2231_WFRUNS}" >"${d}/workflowruns.json"
 run_gate "${d}"
 check 'a truncated workflow-run page fails loud, never passes' 4 'truncated'
+
+# ---------------------------------------------------------------------------
+# ENG-1453 — a retired check-run left on GitHub cannot block forever
+# ---------------------------------------------------------------------------
+#
+# ENG-1371 deleted the `Require Greptile Review` job. GitHub's
+# commits/{sha}/check-runs endpoint keeps its last row forever — a new run
+# cannot overwrite a job that no longer exists to schedule one. Live-verified
+# 2026-08-24: agentweb#2417 and #2334 are otherwise green, unchanged PRs that
+# still hard-fail this gate on nothing but that leftover `failure`.
+
+# The real #2417 shape, trimmed: otherwise-healthy run, one retired failure.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success"},
+  {"name":"CI script tests","status":"completed","conclusion":"skipped"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"failure"}
+]'
+run_gate "${d}"
+check 'ENG-1453: an otherwise-green run with only the retired check failing is PASS' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"failure"}
+]'
+run_gate "${d}"
+check 'ENG-1453: the ignored retired check is named in the log, not silently dropped' 0 'ignored check-run(s) named on MERGE_EVIDENCE_RETIRED_CHECKS'
+
+# A retired check with a SUCCESS conclusion is ignored too ("any conclusion") —
+# it must not be counted toward the positive-success requirement either, since
+# a leftover success from a deleted job describes nothing about this head.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Require Greptile Review","status":"completed","conclusion":"success"}
+]'
+run_gate "${d}"
+check "ENG-1453: a retired check's success alone is still NO_EVIDENCE, not a pass" 3 'NO_EVIDENCE'
+
+# The allowlist matches by exact name. A DIFFERENT, still-active failing check
+# must keep blocking — this is not a general "ignore anything Greptile-shaped"
+# rule, and CI-script/backend jobs must never be swallowed by it.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"CI script tests","status":"completed","conclusion":"failure"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"failure"}
+]'
+run_gate "${d}"
+check 'ENG-1453: an active, currently-defined check still blocks alongside a retired one' 1 'CI script tests (failure)'
+
+# Exact-name matching, not substring: a job whose name merely CONTAINS the
+# allowlisted string must not be swallowed by it.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Require Greptile Review (extended)","status":"completed","conclusion":"failure"}
+]'
+run_gate "${d}"
+check 'ENG-1453: a similarly-named but distinct check is NOT swallowed by the allowlist' 1 'Require Greptile Review (extended) (failure)'
 
 # ---------------------------------------------------------------------------
 # Regression proof — the previous procedure returns a false green here
@@ -1382,7 +1452,7 @@ fi
 
 GATE_SH="${SCRIPT_DIR}/merge-evidence.sh"
 
-for job_key in backend-tests-a backend-tests-b; do
+for job_key in backend-build partner-build; do
   # Collect the job's whole header (needs + the `>-` if block scalar) so a
   # dependency reintroduced in either field is caught.
   # Comment lines are dropped: they legitimately narrate the ENG-1039 history
@@ -1403,24 +1473,21 @@ for job_key in backend-tests-a backend-tests-b; do
 
   TESTS_RUN=$((TESTS_RUN + 1))
   # ENG-1277: here-string, not a pipe — see the check() fix above for why.
-  if [ "${JOB_NEEDS}" = "[detect-changes]" ]; then
-    printf "ok    invariant: %s depends on detect-changes and nothing else (ENG-1039/1371)\n" "${job_key}"
+  if [ "${JOB_NEEDS}" = "detect-changes" ]; then
+    printf "ok    invariant: %s depends on detect-changes and nothing else\n" "${job_key}"
   else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     printf "FAIL  invariant: %s must declare exactly 'needs: [detect-changes]'.\n" "${job_key}"
     printf "      Found: '%s'\n" "${JOB_NEEDS}"
-    printf "      ENG-1039: serializing the suite behind another job means that job's\n"
-    printf "      failures decide whether test evidence exists at all. A 61%%-flaky\n"
-    printf "      reviewer check once skipped this suite 303 times. Do not add a\n"
-    printf "      dependency here — gate on the path filter and the draft flag only.\n"
+    printf "      Build evidence must not be serialized behind an unrelated gate.\n"
   fi
 
-  # The suite must still be draft-gated and path-gated — decoupling from the
-  # reviewer check must not turn into running on every draft push.
+  surface='backend'
+  [ "${job_key}" = 'partner-build' ] && surface='partner'
   TESTS_RUN=$((TESTS_RUN + 1))
   if grep -qF "github.event.pull_request.draft == false" <<<"${JOB_HEADER}" \
-     && grep -qF "needs.detect-changes.outputs.backend == 'true'" <<<"${JOB_HEADER}"; then
-    printf "ok    invariant: %s keeps the draft and backend-path gates\n" "${job_key}"
+     && grep -qF "needs.detect-changes.outputs.${surface} == 'true'" <<<"${JOB_HEADER}"; then
+    printf "ok    invariant: %s keeps the draft and %s-path gates\n" "${job_key}" "${surface}"
   else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     printf "FAIL  invariant: %s must keep the draft gate and backend path filter.\n" "${job_key}"
@@ -1428,25 +1495,15 @@ for job_key in backend-tests-a backend-tests-b; do
   fi
 done
 
-# The requirement is matched by exact job name. A rename in tests.yml alone
-# would leave merge-evidence.sh demanding a job nobody reports — which fails
-# closed, so it is safe, but it blocks every backend PR until someone finds
-# this. Catch it in the PR that renames the job instead.
-TESTS_RUN=$((TESTS_RUN + 1))
-missing_name=''
-while IFS= read -r job_name; do
-  [ -n "${job_name}" ] || continue
-  grep -qF "name: ${job_name}" "${WORKFLOW}" || missing_name="${job_name}"
-done < <(sed -n '/^BACKEND_JOBS=/,/}"$/p' "${GATE_SH}" \
-  | sed -e 's/^BACKEND_JOBS=.*:-//' -e 's/}"$//')
-
-if [ -z "${missing_name}" ]; then
-  printf "ok    invariant: every MERGE_EVIDENCE_BACKEND_JOBS default names a real job in tests.yml\n"
-else
-  TESTS_FAILED=$((TESTS_FAILED + 1))
-  printf "FAIL  invariant: merge-evidence.sh requires the job '%s', which tests.yml does not define.\n" "${missing_name}"
-  printf "      Rename both together, or the backend-suite requirement blocks every backend PR.\n"
-fi
+for job_name in 'Backend build' 'Partner portal build'; do
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if grep -qF "name: ${job_name}" "${WORKFLOW}"; then
+    printf "ok    invariant: required build job '%s' exists in tests.yml\n" "${job_name}"
+  else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    printf "FAIL  invariant: required build job '%s' is missing from tests.yml.\n" "${job_name}"
+  fi
+done
 
 # BACKEND_PATHS hand-mirrors the `backend` filter in tests.yml, and the two
 # drift in one direction silently: adding a path to the workflow filter widens

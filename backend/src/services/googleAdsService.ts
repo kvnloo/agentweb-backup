@@ -637,7 +637,12 @@ export class GoogleAdsService {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const raw = await this.callApiPublic(
       'POST',
-      `/customers/${customerId}/conversionUploads:uploadClickConversions`,
+      // `resource:method`, not a sub-collection. Verified against the real API: the
+      // sub-collection form returned Google's own 404 naming the URL
+      // `/v24/customers/…/conversionUploads:uploadClickConversions`. Same shape as the
+      // two other custom methods in this service, `customers:listAccessibleCustomers`
+      // and `geoTargetConstants:suggest`.
+      `/customers/${customerId}:uploadClickConversions`,
       accessToken,
       { conversions, partialFailure: true, validateOnly: opts?.validateOnly === true },
       loginCustomerId,
