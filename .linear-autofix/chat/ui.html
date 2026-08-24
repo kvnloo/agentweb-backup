@@ -336,7 +336,8 @@
   #input.hl ~ #inputHl { display: block; }
   #inputHl .hlin { font: inherit; white-space: pre-wrap; overflow-wrap: break-word; color: var(--text); }
   #inputHl .tok { color: var(--accent); font-weight: 600; }
-  #inputHl .ref { color: var(--green); font-weight: 600; pointer-events: auto; cursor: default; }
+  #inputHl .ref { color: var(--green); font-weight: 600; pointer-events: auto; cursor: default; } /* file reference */
+  #inputHl .refdir { color: var(--amber); } /* folder reference — distinct colour from files */
   #input:focus { outline: 1px solid var(--accent); }
   #input:disabled { opacity: .45; cursor: not-allowed; }
   #send { background: var(--accent); color: #0d0f13; border: 0; border-radius: 8px; padding: 10px 18px; font-weight: 600; cursor: pointer; }
@@ -375,10 +376,8 @@
   #atmenu .srow.sel { background: var(--user); }
   #atmenu .srow .sn { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
   #atmenu .srow .sd { color: var(--dim); font-size: 11px; flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #atmenu .srow .rowsel, #atmenu .srow .rowopen { font-size: 11px; flex: none; cursor: pointer; padding: 0 3px; white-space: nowrap; }
-  #atmenu .srow .rowsel { color: var(--green); }
-  #atmenu .srow .rowopen { color: var(--accent); }
-  #atmenu .srow .rowsel:hover, #atmenu .srow .rowopen:hover { text-decoration: underline; }
+  #atmenu .srow .rowopen { font-size: 11px; flex: none; cursor: pointer; padding: 0 3px; white-space: nowrap; color: var(--accent); }
+  #atmenu .srow .rowopen:hover { text-decoration: underline; }
   #atmenu .atcrumb { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 12px; position: sticky; top: 0; background: var(--panel); }
   #atmenu .atcrumb .atup { cursor: pointer; color: var(--accent); user-select: none; }
   #atmenu .atcrumb .atpath { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
@@ -1856,9 +1855,9 @@ $('input').addEventListener('keydown', (ev) => {
     if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopPropagation(); moveAt(-1); return; }
     if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopPropagation(); moveAt(1); return; }
     if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); hideAt(); return; }
-    if (ev.key === 'Enter' && ev.shiftKey) { ev.preventDefault(); ev.stopPropagation(); selectAt(); return; } // Shift+Enter: reference the selection as-is (folder or file)
-    if (ev.key === 'Enter') { ev.preventDefault(); ev.stopPropagation(); runAt(); return; }        // Enter: enter a folder / insert a file
-    if (ev.key === 'Tab') { ev.preventDefault(); ev.stopPropagation(); selectAt(); return; }        // Tab: same as Shift+Enter
+    if (ev.key === 'Enter' && ev.shiftKey) { ev.preventDefault(); ev.stopPropagation(); runAt(); return; }  // Shift+Enter: open a folder to browse (a file just inserts)
+    if (ev.key === 'Enter') { ev.preventDefault(); ev.stopPropagation(); selectAt(); return; }      // Enter: select/insert the item (folder or file)
+    if (ev.key === 'Tab') { ev.preventDefault(); ev.stopPropagation(); selectAt(); return; }        // Tab: same as Enter (select)
     if (ev.key === 'Backspace' && S.at.prefix) { const c = atContext(); if (c && !c.q) { ev.preventDefault(); ev.stopPropagation(); goUp(); return; } }
   }
   if (ev.key === 'Enter' && ev.altKey) return; // Alt+Enter is the sidebar toggle (handled globally), not a send
@@ -1904,8 +1903,8 @@ function renderInputHighlight() {
     const re = new RegExp(`(^|\\s)(${names.join('|')})(?![\\w./\\-])`, 'g');
     for (let mm; (mm = re.exec(v)); ) {
       const at = mm.index + mm[1].length, name = mm[2];
-      const path = (refs.find((r) => r.name === name) || {}).path || name;
-      spans.push({ s: at, e: at + name.length, c: 'ref', t: path });
+      const r = refs.find((x) => x.name === name) || {};
+      spans.push({ s: at, e: at + name.length, c: r.type === 'dir' ? 'ref refdir' : 'ref', t: r.path || name });
     }
   }
   if (!spans.length) { i.classList.remove('hl'); hl.firstElementChild.innerHTML = ''; return; }
@@ -2213,11 +2212,10 @@ function runSlash() {
 }
 // ---------- @-mention file/folder picker ----------
 // Type @ in the composer to reference a file/folder from THIS chat's worktree. A dropdown suggests
-// paths; the @ is only the trigger — selecting a FILE inserts a short NAME pill (no @; full path on
-// hover, expanded to @fullpath on send), selecting a FOLDER (click/Enter) drills into it, and "use" /
-// Tab references a folder as-is. Arrow keys move the selection in place. See renderInputHighlight for
-// how a pill is coloured (each occurrence of a referenced name is shown green — a visible cue for what
-// will expand on send).
+// paths; the @ is only the trigger. Enter / click / Tab SELECTS the item (inserts a short NAME pill —
+// no @; full path on hover; expands to @fullpath on send). For a folder, Shift+Enter (or the "open ›"
+// button) instead enters it to browse. Arrow keys move the selection in place. renderInputHighlight
+// colours each referenced name — green for a file, amber for a folder — a visible cue for what expands.
 let atTimer = null, atFetchSeq = 0;
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const baseName = (p) => p.slice(p.lastIndexOf('/') + 1);
@@ -2257,19 +2255,16 @@ function renderAt() {
     : '';
   const rows = S.at.items.map((it, k) => {
     const nm = baseName(it.path) + (it.type === 'dir' ? '/' : '');
-    const dirBtns = it.type === 'dir' ? `<span class="rowsel" data-k="${k}" title="Reference this folder (Shift+Enter / Tab)">select</span><span class="rowopen" data-k="${k}" title="Open this folder (Enter)">open ›</span>` : '';
+    const dirBtns = it.type === 'dir' ? `<span class="rowopen" data-k="${k}" title="Open this folder to browse (Shift+Enter)">open ›</span>` : '';
     return `<div class="srow${k === S.at.sel ? ' sel' : ''}" data-k="${k}" title="${esc(it.path)}"><span class="sn">${it.type === 'dir' ? '📁' : '📄'} ${esc(nm)}</span><span class="sd">${esc(dirName(it.path) || '·')}</span>${dirBtns}</div>`;
   }).join('') || `<div class="atempty">no matches</div>`;
   el.innerHTML = crumb + rows;
   for (const row of el.querySelectorAll('.srow')) {
     row.onmouseenter = () => { S.at.sel = +row.dataset.k; for (const r of el.querySelectorAll('.srow')) r.classList.toggle('sel', r === row); };
-    row.onmousedown = (e) => { e.preventDefault(); S.at.sel = +row.dataset.k; runAt(); }; // click a folder to enter it, a file to insert
-  }
-  for (const b of el.querySelectorAll('.rowsel')) {
-    b.onmousedown = (e) => { e.preventDefault(); e.stopPropagation(); S.at.sel = +b.dataset.k; selectAt(); }; // "select" references a folder without entering it
+    row.onmousedown = (e) => { e.preventDefault(); S.at.sel = +row.dataset.k; selectAt(); }; // click selects (references) the item — a file or a folder
   }
   for (const b of el.querySelectorAll('.rowopen')) {
-    b.onmousedown = (e) => { e.preventDefault(); e.stopPropagation(); S.at.sel = +b.dataset.k; runAt(); }; // "open" enters the folder to browse
+    b.onmousedown = (e) => { e.preventDefault(); e.stopPropagation(); S.at.sel = +b.dataset.k; runAt(); }; // "open ›" enters the folder to browse
   }
   const up = el.querySelector('.atup'); if (up) up.onmousedown = (e) => { e.preventDefault(); goUp(); };
   const use = el.querySelector('.atuse'); if (use) use.onmousedown = (e) => { e.preventDefault(); insertRef({ path: S.at.prefix, type: 'dir' }); };
