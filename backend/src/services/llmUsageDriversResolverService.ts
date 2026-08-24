@@ -766,6 +766,13 @@ export function toCustomerDrivers(resolved: ResolvedUsageDrivers) {
     drivers: resolved.attribution
       ? {
           byModel: toShares(resolved.attribution.byModel),
+          // ENG-1519: per-unit vendor spend IS attributed — to a vendor rather
+          // than to a model — and this boundary was dropping it. Removing it
+          // from `byModel` without naming it anywhere left the model list
+          // covering less than the cycle with no sentence saying why, which
+          // trades a wrong row for a silent gap. null when the cycle bought
+          // nothing per-unit, so a UI states absence instead of rendering zero.
+          byVendor: resolved.attribution.byVendor ? toShares(resolved.attribution.byVendor) : null,
           byFeature: toShares(resolved.attribution.byFeature),
           // null until the metering tag has produced at least one row this cycle.
           bySource: resolved.attribution.bySource ? toShares(resolved.attribution.bySource) : null,

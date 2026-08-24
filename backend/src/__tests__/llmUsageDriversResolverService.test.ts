@@ -766,6 +766,53 @@ describe("toCustomerDrivers — AC4 exposure boundary", () => {
     // And it stays customer-safe: a boolean about existence, no economics.
     expect(JSON.stringify(customer.scheduleDrivers)).not.toMatch(/MicroUsd/i);
   });
+
+  it("ENG-1519: vendor spend CROSSES the boundary, so removing it from `byModel` does not hide it", async () => {
+    // The half of ENG-1519 that was missing. Keeping `twitter:get_user_tweets`
+    // out of `byModel` was correct — it is not a model and must never be
+    // offered as one to switch — but this boundary then dropped it entirely,
+    // so the model list silently covered less than the cycle with no sentence
+    // saying why. A wrong row traded for a blind spot is not a fix.
+    mockQuery.mockResolvedValue([
+      ...opusLedger(),
+      {
+        userId: "billing-root",
+        sk: "2026-08-05#twitter:get_user_tweets#agent_task",
+        date: "2026-08-05",
+        model: "twitter:get_user_tweets",
+        feature: "agent_task",
+        costMicroUsd: 20 * USD,
+        callCount: 40,
+        provider: "twitter",
+        unit: "call",
+        billingUserId: "billing-root",
+      },
+    ]);
+
+    const customer = toCustomerDrivers(await resolveUsageDrivers("u1", { today: "2026-08-11" }));
+
+    expect(customer.drivers!.byVendor).not.toBeNull();
+    expect(customer.drivers!.byVendor!.map((d) => d.key)).toEqual(["twitter:get_user_tweets"]);
+    expect(customer.drivers!.byVendor![0].callCount).toBe(40);
+    // It is a vendor INSTEAD of a model, never both — double-counting the same
+    // spend across two lists would overstate the cycle.
+    expect(customer.drivers!.byModel.map((d) => d.key)).not.toContain("twitter:get_user_tweets");
+    // Same denominator as every other grouping, so the shares are comparable.
+    expect(customer.drivers!.byVendor![0].shareOfTotal).toBeCloseTo(20 / 70, 5);
+    // And it stays inside the AC4 contract: shares and counts, no dollars.
+    expect(JSON.stringify(customer.drivers!.byVendor)).not.toMatch(/MicroUsd/i);
+  });
+
+  it("reports `byVendor` as null — not an empty list — for a cycle that bought nothing per-unit", async () => {
+    // Absence stated rather than rendered as zero: an empty array would let the
+    // UI draw a "Tools & data" heading over nothing, asserting the customer
+    // used tools and spent nothing on them.
+    mockQuery.mockResolvedValue(opusLedger());
+
+    const customer = toCustomerDrivers(await resolveUsageDrivers("u1", { today: "2026-08-11" }));
+
+    expect(customer.drivers!.byVendor).toBeNull();
+  });
 });
 
 /**
