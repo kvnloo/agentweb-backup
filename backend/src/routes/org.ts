@@ -6,8 +6,17 @@ import { callerCan, can, roleOf } from "../services/orgAuthz";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
+import { getUserSubscriptionType } from "../services/subscriptionService";
 
 const router = Router();
+
+const ORGANIZATION_CREATION_TIERS = new Set([
+  "starter",
+  "pro",
+  "partner",
+  "super premium",
+  "managed",
+]);
 
 type MarketStrategy = NonNullable<Organization["marketStrategy"]>;
 type MarketIcp = MarketStrategy["icp"][number];
@@ -387,6 +396,13 @@ router.post("/", async (req: Request, res: Response) => {
     const { name } = req.body;
     if (!name || typeof name !== "string" || name.trim().length === 0) {
       return res.status(400).json({ error: "Organization name is required" });
+    }
+
+    const subscriptionType = await getUserSubscriptionType(userId);
+    if (!ORGANIZATION_CREATION_TIERS.has(subscriptionType.trim().toLowerCase())) {
+      return res.status(403).json({
+        error: "A Starter plan or higher is required to create an organization.",
+      });
     }
 
     const now = new Date().toISOString();
