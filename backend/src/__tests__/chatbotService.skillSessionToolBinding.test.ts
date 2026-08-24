@@ -107,12 +107,27 @@ jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3: jest.fn().mockResolvedValue({ success: false }),
 }));
 
-import { generateChatResponse, __resetEmmaSystemContextCache } from '../services/chatbotService';
+import { generateChatResponse, __resetEmmaSystemContextCache, chatbotDb } from '../services/chatbotService';
 
 function makeCompletion(content = 'Hello') {
   return {
     id: 'completion-1',
     choices: [{ message: { role: 'assistant', content, tool_calls: null } }],
+    usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+    model: 'anthropic.claude-opus-5',
+  };
+}
+
+function makeToolCallCompletion(toolName: string, args: object = {}) {
+  return {
+    id: 'completion-tool',
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'call-1', type: 'function', function: { name: toolName, arguments: JSON.stringify(args) } }],
+      },
+    }],
     usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
     model: 'anthropic.claude-opus-5',
   };
@@ -221,5 +236,86 @@ describe('generateChatResponse — skill-session tool binding (ENG-1222)', () =>
         ]),
       }),
     );
+  });
+});
+
+describe('generateChatResponse — ENG-1222 attribution stamp + fabrication guard', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    __resetEmmaSystemContextCache();
+    putPromiseMock.mockResolvedValue({});
+    updatePromiseMock.mockResolvedValue({});
+    mockGetDefaultModel.mockResolvedValue('gpt-5.4');
+    mockResolveSkillsToToolNames.mockResolvedValue(['list_connected_accounts']);
+  });
+
+  it('stamps .llm on the persisted assistant message so telemetry can attribute the turn', async () => {
+    seedSession({ associatedSkills: [] });
+    mockCallLLM.mockResolvedValue(makeCompletion('Hi there!'));
+    const addMessageSpy = jest.spyOn(chatbotDb, 'addMessageToSession');
+
+    await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(addMessageSpy).toHaveBeenCalledWith(
+      'sess-1',
+      expect.objectContaining({ role: 'assistant', llm: 'anthropic.claude-opus-5' }),
+    );
+  });
+
+  it('blocks a zero-tool-call response that claims to present actual/real tool-derived data', async () => {
+    seedSession({ associatedSkills: [] });
+    mockCallLLM.mockResolvedValue(makeCompletion(
+      'Here are the actual returned rows: Acme Widgets Main, customer ID 123-456-7890.'
+    ));
+    const addMessageSpy = jest.spyOn(chatbotDb, 'addMessageToSession');
+
+    const response = await generateChatResponse('sess-1', 'Report the ACTUAL returned rows', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(response).not.toMatch(/Acme Widgets Main/);
+    expect(addMessageSpy).toHaveBeenCalledWith(
+      'sess-1',
+      expect.objectContaining({
+        role: 'assistant',
+        content: expect.not.stringContaining('Acme Widgets Main'),
+      }),
+    );
+  });
+
+  it('does not block a normal zero-tool-call reply that makes no real-data claim', async () => {
+    seedSession({ associatedSkills: [] });
+    mockCallLLM.mockResolvedValue(makeCompletion('Sure, I can help with that — what would you like to do?'));
+
+    const response = await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(response).toBe('Sure, I can help with that — what would you like to do?');
+  });
+
+  it('does not block a response that reports real data after actually calling a tool', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockExecuteTool.mockResolvedValue({ accounts: [{ name: 'Real Customer LLC', id: '999' }] });
+    mockCallLLM
+      .mockResolvedValueOnce(makeToolCallCompletion('list_connected_accounts'))
+      .mockResolvedValueOnce(makeCompletion('Here are the actual returned rows: Real Customer LLC, ID 999.'));
+
+    const response = await generateChatResponse('sess-1', 'Run list_connected_accounts', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    const content = typeof response === 'string' ? response : response.content;
+    expect(content).toContain('Real Customer LLC');
   });
 });
