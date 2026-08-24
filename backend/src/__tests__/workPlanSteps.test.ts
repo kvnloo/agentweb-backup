@@ -61,12 +61,55 @@ describe("normalizeWorkPlanSteps", () => {
 
     expect("userInstructions" in steps[0]).toBe(false);
     expect("expectedAssetCount" in steps[0]).toBe(false);
+    expect("expectedAssetCountTools" in steps[0]).toBe(false);
   });
 
   it("keeps an explicit zero asset count rather than treating it as absent", () => {
     const { steps } = normalizeWorkPlanSteps([{ stepCount: 1, title: "Step", expectedAssetCount: 0 }]);
 
     expect(steps[0].expectedAssetCount).toBe(0);
+  });
+
+  // ENG-1331 (post-launch hardening): expectedAssetCountTools must survive this
+  // normalizer exactly like expectedAssetCount does — it is the field this whole
+  // file's own doc comment names as a past ENG-889 victim of being left off this
+  // list, and this new field would have repeated that history unnoticed.
+  describe("expectedAssetCountTools", () => {
+    it("keeps a valid tools array", () => {
+      const { steps, warnings } = normalizeWorkPlanSteps([
+        { stepCount: 1, title: "Step", expectedAssetCountTools: ["playwright_browser_take_screenshot"] },
+      ]);
+      expect(steps[0].expectedAssetCountTools).toEqual(["playwright_browser_take_screenshot"]);
+      expect(warnings).toEqual([]);
+    });
+
+    it("keeps an explicit empty array rather than treating it as absent", () => {
+      const { steps, warnings } = normalizeWorkPlanSteps([
+        { stepCount: 1, title: "Step", expectedAssetCountTools: [] },
+      ]);
+      expect(steps[0].expectedAssetCountTools).toEqual([]);
+      expect(warnings).toEqual([]);
+    });
+
+    it("drops and reports a non-array value instead of storing it", () => {
+      const { steps, warnings } = normalizeWorkPlanSteps([
+        { stepCount: 1, title: "Step", expectedAssetCountTools: "playwright_browser_take_screenshot" },
+      ]);
+      expect("expectedAssetCountTools" in steps[0]).toBe(false);
+      expect(warnings).toEqual([
+        "step 1: ignored expectedAssetCountTools — expected an array",
+      ]);
+    });
+
+    it("keeps the usable strings and reports the rest", () => {
+      const { steps, warnings } = normalizeWorkPlanSteps([
+        { stepCount: 1, title: "Step", expectedAssetCountTools: ["generate_image", 123, {}, null, "generate_video", ""] },
+      ]);
+      expect(steps[0].expectedAssetCountTools).toEqual(["generate_image", "generate_video"]);
+      expect(warnings).toEqual([
+        "step 1: dropped 4 non-string entries from expectedAssetCountTools",
+      ]);
+    });
   });
 
   it("reports discarded fields per step with a 1-based pointer", () => {
