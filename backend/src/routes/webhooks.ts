@@ -487,6 +487,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       source,
       customFields,
       attribution,
+      // ENG-1499. First touch and last touch arrive as separate fields from the
+      // lander. `attribution` is the acquiring click and never changes; this is
+      // the most recent attributed visit, and for a returning visitor the two
+      // genuinely differ. Absent for a single-visit lead.
+      lastTouch: incomingLastTouch,
       utm,
       // Baked into the generated app/api/capture/route.ts (see buildCaptureRoute) — not
       // spread through automatically, this handler destructures a fixed field list rather
@@ -601,7 +606,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // compact payload can still carry hundreds of keys straight into storage.
     const HANDLED_TOP_LEVEL_KEYS = new Set([
       'listId', 'email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes',
-      'linkedin', 'source', 'customFields', 'attribution', 'utm', 'pixelId',
+      'linkedin', 'source', 'customFields', 'attribution', 'lastTouch', 'utm', 'pixelId',
       'metaAccountId', 'eventId', 'fbp', 'fbc', 'capturedAtMs',
       // ENG-926 §B. Absent from this set they would fall through into customFields as junk
       // instead of being read as identity — the passthrough collector is deliberately
@@ -655,7 +660,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     );
     if (touch) {
       leadData.firstTouch = touch;
-      leadData.lastTouch = touch;
+      // ENG-1499. Prefer the lander's own last-touch when it sent one. Falling back
+      // to `touch` keeps a single-visit lead's lastTouch populated rather than
+      // empty — but where the two differ, storing first touch in both is exactly
+      // the bug this closes: last-touch reporting silently showed first-touch
+      // numbers, with nothing to indicate it.
+      leadData.lastTouch = normalizeAttribution(incomingLastTouch) ?? touch;
     }
 
     // Check if lead already exists by email - merge instead of dropping

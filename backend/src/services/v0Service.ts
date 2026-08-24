@@ -4298,6 +4298,9 @@ import type { NextRequest } from "next/server";
 import { DOMAIN_MAP } from "./domainMap";
 
 const COOKIE = "aw_first_touch";
+// ENG-1499. Last touch is a SEPARATE cookie, overwritten on every attributed
+// visit, where first touch is written once and never again.
+const LAST_COOKIE = "aw_last_touch";
 const MAX_AGE = 60 * 60 * 24 * 90; // 90 days
 
 export function middleware(req: NextRequest) {
@@ -4339,11 +4342,16 @@ export function middleware(req: NextRequest) {
   const PAGE_COOKIE = "aw_page";
   res.cookies.set(PAGE_COOKIE, targetPath || req.nextUrl.pathname, { path: "/", sameSite: "lax" });
 
-  // 3. First-touch attribution capture, on WHICHEVER response we are returning.
+  // 3. Attribution capture, on WHICHEVER response we are returning.
   //    (Returning the rewrite early here would silently kill attribution on every
   //    page that has a custom domain — which is most of the ones that matter.)
-  if (req.cookies.get(COOKIE)) return res;              // first-touch: never overwrite
-
+  //
+  //    ENG-1499: this used to return early when the first-touch cookie existed,
+  //    which meant a returning visitor's later campaign touch was never recorded
+  //    anywhere. lastTouch could therefore never differ from firstTouch for a
+  //    lander-captured lead, so last-touch reporting silently showed first-touch
+  //    numbers. The parse now happens BEFORE that decision, and the two cookies
+  //    are written under different rules.
   const sp = req.nextUrl.searchParams;
   const utm: Record<string, string> = {};
   for (const k of ["source", "medium", "campaign", "content", "term"]) {
@@ -4362,7 +4370,33 @@ export function middleware(req: NextRequest) {
   if (referrer && !referrer.includes(req.nextUrl.host)) touch.referrer = referrer;
   if (ref) touch.ref = ref;
 
-  res.cookies.set(COOKIE, JSON.stringify(touch), { maxAge: MAX_AGE, path: "/", sameSite: "lax" });
+  const serialized = JSON.stringify(touch);
+
+  // First touch: written once, never overwritten — the acquiring click is immutable.
+  // Written for ANY visit, tagged or not: direct traffic is a real acquisition
+  // channel, and firstTouch is deliberately not a proxy for "attributed" (ENG-308,
+  // and see LeadAttributionFields in utils/leadSchema.ts).
+  if (!req.cookies.get(COOKIE)) {
+    res.cookies.set(COOKIE, serialized, { maxAge: MAX_AGE, path: "/", sameSite: "lax" });
+  }
+
+  // Last touch: the most recent ATTRIBUTED visit, and only those. The gate is the
+  // difference between the two cookies, not a general filter — applying it to first
+  // touch as well would break the untagged-visit contract above.
+  //
+  // An ordinary internal navigation carries no utm, no click id, no ref and no
+  // external referrer. Letting one count as a touch would overwrite a real campaign
+  // last-touch with an empty one every time the visitor clicked through to a second
+  // page — turning a merely-useless field into an actively wrong one, which is worse
+  // than the bug this fixes.
+  const isAttributed =
+    Object.keys(utm).length > 0 ||
+    Object.keys(clickIds).length > 0 ||
+    Boolean(ref) ||
+    Boolean(touch.referrer);
+  if (isAttributed) {
+    res.cookies.set(LAST_COOKIE, serialized, { maxAge: MAX_AGE, path: "/", sameSite: "lax" });
+  }
   return res;
 }
 
@@ -4473,6 +4507,14 @@ export async function POST(req: Request) {
     const raw = (await cookies()).get("aw_first_touch")?.value;
     if (raw) { try { attribution = JSON.parse(raw); } catch {} }
 
+    // ENG-1499. Forwarded separately from the attribution field above (which is
+    // first touch) so the backend can tell "the click that acquired them" from
+    // "the click they came back on". Absent for a single-visit lead, and the
+    // backend falls back to first touch in that case rather than storing nothing.
+    let lastTouch: unknown;
+    const rawLast = (await cookies()).get("aw_last_touch")?.value;
+    if (rawLast) { try { lastTouch = JSON.parse(rawLast); } catch {} }
+
     // Meta's own first-party click-id cookies (set by the base Pixel snippet, already
     // platform-injected). Forwarded deterministically here — no v0-authored client code
     // needs to read or forward these itself.
@@ -4513,6 +4555,7 @@ export async function POST(req: Request) {
         source: "landing-page",
         capturedAtMs,
         ...(attribution ? { attribution } : {}),
+        ...(lastTouch ? { lastTouch } : {}),
         ...(PIXEL_ID ? { pixelId: PIXEL_ID, metaAccountId: META_ACCOUNT_ID } : {}),
         ...(fbp ? { fbp } : {}),
         ...(fbc ? { fbc } : {}),
