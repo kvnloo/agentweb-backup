@@ -28,7 +28,7 @@
 
 import { randomUUID } from "crypto";
 import { scheduleDb, EXPECT_UNSET } from "./db";
-import { callerCan } from "./orgAuthz";
+import { callerCan, type AuthzOrg } from "./orgAuthz";
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
 import { agentModeService } from "./agentModeService";
 import {
@@ -218,7 +218,9 @@ async function loadSwitchableSchedule(userId: string, scheduleId: string) {
   // is treated exactly as an unprivileged stranger and falls through to the
   // not-found path below. Letting this throw would turn an authority lookup
   // into a server error on a customer-facing button.
-  let org: { orgId: string; ownerUserId?: string } | null = null;
+  // `AuthzOrg` rather than a hand-written shape: `ownerUserId` is required
+  // there, and declaring it optional here made this unassignable to callerCan.
+  let org: AuthzOrg | null = null;
   let callerOrgId: string | undefined;
   let permitted = false;
   try {
