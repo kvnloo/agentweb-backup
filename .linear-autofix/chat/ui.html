@@ -336,7 +336,7 @@
   #input.hl ~ #inputHl { display: block; }
   #inputHl .hlin { font: inherit; white-space: pre-wrap; overflow-wrap: break-word; color: var(--text); }
   #inputHl .tok { color: var(--accent); font-weight: 600; }
-  #inputHl .ref { color: var(--green); font-weight: 600; }
+  #inputHl .ref { color: var(--green); font-weight: 600; pointer-events: auto; cursor: default; }
   #input:focus { outline: 1px solid var(--accent); }
   #input:disabled { opacity: .45; cursor: not-allowed; }
   #send { background: var(--accent); color: #0d0f13; border: 0; border-radius: 8px; padding: 10px 18px; font-weight: 600; cursor: pointer; }
@@ -374,7 +374,12 @@
   #atmenu .srow { display: flex; gap: 10px; align-items: baseline; justify-content: space-between; padding: 7px 12px; cursor: pointer; }
   #atmenu .srow.sel { background: var(--user); }
   #atmenu .srow .sn { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #atmenu .srow .sd { color: var(--dim); font-size: 11px; flex: none; }
+  #atmenu .srow .sd { color: var(--dim); font-size: 11px; flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #atmenu .atcrumb { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 12px; position: sticky; top: 0; background: var(--panel); }
+  #atmenu .atcrumb .atup { cursor: pointer; color: var(--accent); user-select: none; }
+  #atmenu .atcrumb .atpath { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  #atmenu .atcrumb .atuse { cursor: pointer; color: var(--green); user-select: none; white-space: nowrap; }
+  #atmenu .atempty { padding: 8px 12px; color: var(--dim); font-size: 12px; }
   /* /status & /context overlay (Esc dismisses) */
   #cmd { position: absolute; inset: 0; z-index: 20; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.5); }
   #cmd:focus { outline: none; }
@@ -1708,14 +1713,14 @@ async function send() {
     await doEditSend(false);
     return;
   }
-  const message = $('input').value.trim();
+  const message = expandRefs($('input').value.trim()); // @name pills → full @path for the record + agent
   const atts = S.attachments;
   if (!message && !atts.length) { if (!S.busy && S.queue.length) drainNext(); return; } // empty Enter resumes a paused queue
   if (!S.sel) return;
-  if (message[0] === '/' && !atts.length) { hideSlash(); $('input').value = ''; autosize(); runCommand(message); return; } // slash command
+  if (message[0] === '/' && !atts.length) { hideSlash(); $('input').value = ''; S.refs = []; autosize(); runCommand(message); return; } // slash command
   S.attachments = []; renderAttachments(); // consume the composer's attachments for this send
   if (S.busy) { queueMessage(message, atts); return; } // a turn is running — queue it instead of interrupting
-  $('input').value = ''; autosize();
+  $('input').value = ''; S.refs = []; autosize();
   sendMessage(message, atts);
 }
 // POST one chat message (with any attachments) and go busy. Used for a fresh send AND queue drains.
@@ -1783,7 +1788,7 @@ function renderAttachments() {
 function queueMessage(text, atts = []) {
   S.queue.push({ text, attachments: atts });
   S.queuePaused = false; // a fresh queue action resumes auto-draining
-  $('input').value = ''; autosize(); hideSlash();
+  $('input').value = ''; S.refs = []; autosize(); hideSlash();
   renderQueue();
 }
 function renderQueue() {
@@ -1848,6 +1853,7 @@ $('input').addEventListener('keydown', (ev) => {
     if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopPropagation(); moveAt(1); return; }
     if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); hideAt(); return; }
     if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopPropagation(); runAt(); return; }
+    if (ev.key === 'Backspace' && S.at.prefix) { const c = atContext(); if (c && !c.q) { ev.preventDefault(); ev.stopPropagation(); goUp(); return; } }
   }
   if (ev.key === 'Enter' && ev.altKey) return; // Alt+Enter is the sidebar toggle (handled globally), not a send
   if (ev.key === 'Enter' && !ev.shiftKey) {
@@ -1881,18 +1887,28 @@ function autosize() { const i = $('input'); i.style.height = 'auto'; i.style.hei
 function renderInputHighlight() {
   const i = $('input'), hl = $('inputHl'); if (!hl) return;
   const v = i.value;
-  // Tokens to colour: a leading /command (tok, accent), and every @{…} file reference anywhere (ref, green).
+  // Tokens to colour: a leading /command (tok, accent), and each @name that is a known file reference
+  // (ref, green, full path on hover). @names come from S.refs — a bare typed @foo is left as plain text.
   const spans = [];
   const cmd = /^\/\w+/.exec(v);
-  if (cmd) spans.push({ s: 0, e: cmd[0].length, c: 'tok' });
-  for (const mm of v.matchAll(/@\{[^}]*\}/g)) spans.push({ s: mm.index, e: mm.index + mm[0].length, c: 'ref' });
+  if (cmd) spans.push({ s: 0, e: cmd[0].length, c: 'tok', t: '' });
+  const refs = S.refs || [];
+  if (refs.length) {
+    const names = [...new Set(refs.map((r) => r.name))].sort((a, b) => b.length - a.length).map(escapeRe);
+    const re = new RegExp(`(^|\\s)@(${names.join('|')})(?![\\w./\\-])`, 'g');
+    for (let mm; (mm = re.exec(v)); ) {
+      const at = mm.index + mm[1].length, name = mm[2];
+      const path = (refs.find((r) => r.name === name) || {}).path || name;
+      spans.push({ s: at, e: at + 1 + name.length, c: 'ref', t: path });
+    }
+  }
   if (!spans.length) { i.classList.remove('hl'); hl.firstElementChild.innerHTML = ''; return; }
   spans.sort((a, b) => a.s - b.s);
   i.classList.add('hl');
   let html = '', pos = 0;
   for (const sp of spans) {
     if (sp.s < pos) continue; // ignore any overlap
-    html += esc(v.slice(pos, sp.s)) + `<span class="${sp.c}">${esc(v.slice(sp.s, sp.e))}</span>`;
+    html += esc(v.slice(pos, sp.s)) + `<span class="${sp.c}"${sp.t ? ` title="${esc(sp.t)}"` : ''}>${esc(v.slice(sp.s, sp.e))}</span>`;
     pos = sp.e;
   }
   html += esc(v.slice(pos));
@@ -2190,60 +2206,101 @@ function runSlash() {
   $('input').value = ''; autosize(); runCommand(c.name);
 }
 // ---------- @-mention file/folder picker ----------
-// Type @ in the composer to reference a file/folder from THIS chat's worktree. As you type, a dropdown
-// suggests matching paths (from /api/issues/<id>/files); picking one inserts @{that/path}, which the
-// highlight layer paints green and the agent reads as a workspace path.
+// Type @ in the composer to reference a file/folder from THIS chat's worktree. A dropdown suggests
+// paths; selecting a FILE inserts a short @name pill (full path on hover, expanded to the full @path on
+// send), selecting a FOLDER drills into it (browse its contents), and "use folder" references the folder.
 let atTimer = null, atFetchSeq = 0;
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const baseName = (p) => p.slice(p.lastIndexOf('/') + 1);
+const dirName = (p) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
+// The active @-mention just before the caret: an @ at a word start, then the (space-free) typed query.
 function atContext() {
-  const inp = $('input'), caret = inp.selectionStart;
-  const m = /(^|\s)@\{?([^}\s]*)$/.exec(inp.value.slice(0, caret)); // @ at start-of-word, optional {, then query
+  const inp = $('input');
+  const m = /(^|\s)@([^\s]*)$/.exec(inp.value.slice(0, inp.selectionStart));
   return m ? { start: m.index + m[1].length, q: m[2] } : null;
 }
 function updateAtMenu() {
   if (S.editing || S.deleting || !S.sel) { hideAt(); return; }
   const ctx = atContext();
   if (!ctx) { hideAt(); return; }
+  const prefix = (S.at && S.at.prefix) || '';
   clearTimeout(atTimer);
   const seq = ++atFetchSeq;
   atTimer = setTimeout(async () => {
     let items = [];
     try {
-      const r = await fetch(`/api/issues/${encodeURIComponent(S.sel)}/files?q=${encodeURIComponent(ctx.q)}`);
+      const qs = `q=${encodeURIComponent(ctx.q)}${prefix ? `&dir=${encodeURIComponent(prefix)}` : ''}`;
+      const r = await fetch(`/api/issues/${encodeURIComponent(S.sel)}/files?${qs}`);
       if (r.ok) items = (await r.json()).items || [];
     } catch { /* offline / no worktree → just no menu */ }
-    if (seq !== atFetchSeq) return;         // a newer keystroke superseded this fetch
-    const cur = atContext();                 // still an active mention at the caret?
-    if (!cur || !items.length) { hideAt(); return; }
-    S.at = { items, sel: 0, start: cur.start };
+    if (seq !== atFetchSeq) return;                 // a newer keystroke superseded this fetch
+    const cur = atContext();
+    if (!cur || (!items.length && !prefix)) { hideAt(); return; } // stay open inside a folder (breadcrumb)
+    S.at = { items, sel: 0, start: cur.start, prefix };
     renderAt();
   }, 120);
 }
 function renderAt() {
   let el = $('atmenu');
   if (!el) { el = document.createElement('div'); el.id = 'atmenu'; $('composer').appendChild(el); }
-  el.innerHTML = S.at.items.map((it, k) =>
-    `<div class="srow${k === S.at.sel ? ' sel' : ''}" data-k="${k}"><span class="sn">${it.type === 'dir' ? '📁' : '📄'} ${esc(it.path)}</span><span class="sd">${esc(it.type)}</span></div>`
-  ).join('');
+  const crumb = S.at.prefix
+    ? `<div class="atcrumb"><span class="atup" title="Up a level (Backspace)">⬅</span><span class="atpath" title="${esc(S.at.prefix)}">${esc(S.at.prefix)}/</span><span class="atuse" title="Reference this folder">use folder</span></div>`
+    : '';
+  const rows = S.at.items.map((it, k) => {
+    const nm = baseName(it.path) + (it.type === 'dir' ? '/' : '');
+    return `<div class="srow${k === S.at.sel ? ' sel' : ''}" data-k="${k}" title="${esc(it.path)}"><span class="sn">${it.type === 'dir' ? '📁' : '📄'} ${esc(nm)}</span><span class="sd">${esc(dirName(it.path) || '·')}</span></div>`;
+  }).join('') || `<div class="atempty">no matches</div>`;
+  el.innerHTML = crumb + rows;
   for (const row of el.querySelectorAll('.srow')) {
     row.onmouseenter = () => { S.at.sel = +row.dataset.k; for (const r of el.querySelectorAll('.srow')) r.classList.toggle('sel', r === row); };
     row.onmousedown = (e) => { e.preventDefault(); S.at.sel = +row.dataset.k; runAt(); };
   }
+  const up = el.querySelector('.atup'); if (up) up.onmousedown = (e) => { e.preventDefault(); goUp(); };
+  const use = el.querySelector('.atuse'); if (use) use.onmousedown = (e) => { e.preventDefault(); insertRef({ path: S.at.prefix, type: 'dir' }); };
   el.style.display = 'block';
   const sel = el.querySelector('.srow.sel'); if (sel) sel.scrollIntoView({ block: 'nearest' });
 }
-function moveAt(d) { if (!S.at) return; const n = S.at.items.length; S.at.sel = (S.at.sel + d + n) % n; renderAt(); }
+function moveAt(d) { if (!S.at || !S.at.items.length) return; const n = S.at.items.length; S.at.sel = (S.at.sel + d + n) % n; renderAt(); }
 function hideAt() { S.at = null; const el = $('atmenu'); if (el) el.style.display = 'none'; }
+// Reset the typed query back to just "@" (keep everything up to and including the @) — used when drilling.
+function clearAtQuery() {
+  const inp = $('input'), ctx = atContext(); if (!ctx) return;
+  inp.value = inp.value.slice(0, ctx.start + 1) + inp.value.slice(inp.selectionStart);
+  inp.selectionStart = inp.selectionEnd = ctx.start + 1;
+  autosize();
+}
+function goUp() {
+  if (!S.at) return;
+  const p = S.at.prefix || '';
+  S.at.prefix = p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '';
+  clearAtQuery();
+  updateAtMenu();
+}
 function runAt() {
   const it = S.at?.items[S.at.sel]; if (!it) return;
-  const inp = $('input');
-  const ctx = atContext();
-  const start = ctx ? ctx.start : (S.at.start ?? inp.selectionStart);
-  const insert = `@{${it.path}}`;
+  if (it.type === 'dir') { S.at.prefix = it.path; clearAtQuery(); updateAtMenu(); return; } // drill into the folder
+  insertRef(it);
+}
+// Insert a short @name pill for `it`, remembering its full path so hover + send-time expansion resolve it.
+function insertRef(it) {
+  const inp = $('input'), ctx = atContext();
+  const start = ctx ? ctx.start : (S.at?.start ?? inp.selectionStart);
+  const name = baseName(it.path);
   const before = inp.value.slice(0, start), after = inp.value.slice(inp.selectionStart);
+  const insert = `@${name}` + (after.startsWith(' ') ? '' : ' ');
   inp.value = before + insert + after;
   inp.selectionStart = inp.selectionEnd = before.length + insert.length;
+  (S.refs || (S.refs = [])).push({ name, path: it.path, type: it.type });
   hideAt();
   autosize(); inp.focus();
+}
+// On send, expand each @name pill back to its full @path so the record and the agent are unambiguous.
+function expandRefs(text) {
+  let out = text;
+  for (const r of [...(S.refs || [])].sort((a, b) => b.name.length - a.name.length)) {
+    out = out.replace(new RegExp(`(^|\\s)@${escapeRe(r.name)}(?![\\w./\\-])`, 'g'), (m, pre) => `${pre}@${r.path}${r.type === 'dir' ? '/' : ''}`);
+  }
+  return out;
 }
 function runCommand(cmd) {
   const raw = String(cmd).trim();

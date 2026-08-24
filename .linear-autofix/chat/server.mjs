@@ -1104,8 +1104,9 @@ async function polishVoice(identifier, body) {
 function preamble(cap) {
   const base = 'You previously worked on this issue as an automated fixer; this workspace holds your fix. '
     + 'The developer is now chatting with you about it — answer questions from the workspace and the pipeline logs. '
-    + 'When the developer writes a path as `@{path}`, that is a file or folder in your workspace (relative to the '
-    + 'workspace root) they are pointing you at — read or inspect it as part of answering. ';
+    + 'When the developer writes a path as `@path` (e.g. `@backend/src/server.ts`), that is a file or folder in '
+    + 'your workspace (relative to the workspace root) they are pointing you at — read or inspect it as part of '
+    + 'answering. ';
   const rules = cap === 'full'
     ? 'If the developer asks for changes: apply them on the current branch with a minimal diff, follow the '
       + 'repo conventions (CLAUDE.md), verify your work yourself (run `npx tsc` in the changed packages and '
@@ -2166,7 +2167,7 @@ async function route(req, res) {
     const WT = path.join(worktreesDir, identifier);
     const cs = loadChatState()[identifier] || {};
     const cwd = cs.cwd || (existsSync(WT) ? WT : agentRoot);
-    json(res, 200, { items: searchWorktreeFiles(cwd, u.searchParams.get('q') || '', 25) });
+    json(res, 200, { items: searchWorktreeFiles(cwd, u.searchParams.get('q') || '', 25, { dir: u.searchParams.get('dir') || '' }) });
     return;
   }
 

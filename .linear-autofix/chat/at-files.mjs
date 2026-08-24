@@ -36,6 +36,9 @@ export function listWorktreeEntries(cwd, { cache = true } = {}) {
   return entries;
 }
 
+// Dirs before files, then alphabetical.
+const byTypeThenName = (a, b) => (a.type === b.type ? a.path.localeCompare(b.path) : a.type === 'dir' ? -1 : 1);
+
 // Rank: exact basename < basename-prefix < path-prefix < basename-substring < path-substring; -1 = no match.
 function score(p, query) {
   const lp = p.toLowerCase();
@@ -47,18 +50,7 @@ function score(p, query) {
   if (lp.includes(query)) return 4;
   return -1;
 }
-
-// Suggestions for an @-mention query. Empty query → a shallow first page (top-level entries, folders
-// first). Otherwise ranked substring matches over the whole worktree, capped at `limit`.
-export function searchWorktreeFiles(cwd, q, limit = 25, opts) {
-  const entries = listWorktreeEntries(cwd, opts);
-  const query = String(q || '').trim().toLowerCase();
-  if (!query) {
-    return entries
-      .filter((e) => !e.path.includes('/'))
-      .sort((a, b) => (a.type === b.type ? a.path.localeCompare(b.path) : a.type === 'dir' ? -1 : 1))
-      .slice(0, limit);
-  }
+function rank(entries, query, limit) {
   const scored = [];
   for (const e of entries) {
     const s = score(e.path, query);
@@ -66,4 +58,35 @@ export function searchWorktreeFiles(cwd, q, limit = 25, opts) {
   }
   scored.sort((a, b) => a.s - b.s || a.e.path.length - b.e.path.length || a.e.path.localeCompare(b.e.path));
   return scored.slice(0, limit).map((x) => x.e);
+}
+
+// The immediate children of `pfx` (one segment down), so a folder can be browsed one level at a time.
+function immediateChildren(scoped, pfx, limit) {
+  const seen = new Set(), out = [];
+  for (const e of scoped) {
+    const rest = e.path.slice(pfx.length);
+    const slash = rest.indexOf('/');
+    const seg = slash >= 0 ? rest.slice(0, slash) : rest;
+    const childPath = pfx + seg;
+    if (seen.has(childPath)) continue;
+    seen.add(childPath);
+    out.push({ path: childPath, type: slash >= 0 ? 'dir' : e.type });
+  }
+  return out.sort(byTypeThenName).slice(0, limit);
+}
+
+// Suggestions for an @-mention. Without `dir`: empty query → top-level entries, else a ranked substring
+// search over the whole worktree. With `dir` (browsing a folder): empty query → that folder's immediate
+// children, else a ranked search scoped to that folder's subtree.
+export function searchWorktreeFiles(cwd, q, limit = 25, opts = {}) {
+  const entries = listWorktreeEntries(cwd, opts);
+  const query = String(q || '').trim().toLowerCase();
+  const dir = String(opts.dir || '').replace(/\/+$/, '');
+  if (dir) {
+    const pfx = dir + '/';
+    const scoped = entries.filter((e) => e.path.startsWith(pfx));
+    return query ? rank(scoped, query, limit) : immediateChildren(scoped, pfx, limit);
+  }
+  if (!query) return entries.filter((e) => !e.path.includes('/')).sort(byTypeThenName).slice(0, limit);
+  return rank(entries, query, limit);
 }

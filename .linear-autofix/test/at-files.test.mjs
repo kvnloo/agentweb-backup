@@ -55,6 +55,17 @@ ok(r4.findIndex((e) => e.type === 'dir') < r4.findIndex((e) => e.type === 'file'
 const r5 = searchWorktreeFiles(dir, 's', 2, opt);
 ok(r5.length <= 2, 'respects the limit cap');
 
+// Folder drill-down: browse a dir's immediate children (empty query), then search within its subtree.
+const b1 = searchWorktreeFiles(dir, '', 25, { ...opt, dir: 'src' });
+ok(paths(b1).includes('src/server.ts') && paths(b1).includes('src/api'), 'browse src/ lists its immediate children');
+ok(!paths(b1).includes('src/api/routes.ts'), 'browse src/ does NOT list deeper descendants (one level only)');
+ok(b1.find((e) => e.path === 'src/api').type === 'dir', 'browsed child src/api is typed as a dir');
+ok(paths(b1).includes('src/fresh.ts'), 'browse src/ includes the new untracked child');
+const b2 = searchWorktreeFiles(dir, 'routes', 25, { ...opt, dir: 'src' });
+ok(paths(b2).includes('src/api/routes.ts') && paths(b2).every((p) => p.startsWith('src/')), 'search within src/ finds deep matches, scoped to the subtree');
+const b3 = searchWorktreeFiles(dir, '', 25, { ...opt, dir: 'src/api' });
+ok(paths(b3).includes('src/api/routes.ts') && !paths(b3).includes('src/server.ts'), 'browse src/api/ is scoped to that folder');
+
 let threw = false;
 try { searchWorktreeFiles('/nonexistent-xyz-12345', 'x', 5, opt); } catch { threw = true; }
 ok(!threw, 'invalid cwd does not throw (returns empty)');
