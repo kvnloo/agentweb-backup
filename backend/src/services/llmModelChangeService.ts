@@ -28,7 +28,7 @@
 
 import { randomUUID } from "crypto";
 import { scheduleDb, EXPECT_UNSET } from "./db";
-import { callerCan, type AuthzOrg } from "./orgAuthz";
+import { contentAuthorityOver } from "./orgContentAuthority";
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
 import { agentModeService } from "./agentModeService";
 import {
@@ -208,32 +208,12 @@ async function loadSwitchableSchedule(userId: string, scheduleId: string) {
   if (!schedule) {
     throw new ModelChangeNotFoundError("Scheduled chat not found");
   }
-  if (schedule.userId === userId) return schedule;
 
-  // Not the caller's own. It is still switchable if the caller holds
-  // org-content authority over the org the OWNER belongs to — not the caller's
-  // own org, which would let someone carry authority across a tenant boundary.
-  // Resolved defensively. A failure here is an ABSENCE of authority, never a
-  // grant and never a 500: if the user or org record cannot be read, the caller
-  // is treated exactly as an unprivileged stranger and falls through to the
-  // not-found path below. Letting this throw would turn an authority lookup
-  // into a server error on a customer-facing button.
-  // `AuthzOrg` rather than a hand-written shape: `ownerUserId` is required
-  // there, and declaring it optional here made this unassignable to callerCan.
-  let org: AuthzOrg | null = null;
-  let callerOrgId: string | undefined;
-  let permitted = false;
-  try {
-    const { userDb, orgDb } = await import("./db");
-    const owner = await userDb.getUserById(schedule.userId);
-    org = owner?.orgId ? await orgDb.getOrgById(owner.orgId) : null;
-    if (org) permitted = await callerCan(userId, org, "org:content:manage");
-    callerOrgId = (await userDb.getUserById(userId))?.orgId;
-  } catch {
-    org = null;
-    callerOrgId = undefined;
-    permitted = false;
-  }
+  // ENG-1533: the same predicate the drivers resolver uses to decide whether to
+  // OFFER this switch. Shared rather than reimplemented — a UI that offers a
+  // button exactly when the write will refuse it is the defect, and two copies
+  // of this rule would drift apart on the first change to the role model.
+  const { permitted, sameOrg } = await contentAuthorityOver(userId, schedule.userId);
   if (permitted) return schedule;
 
   // Only a SAME-ORG caller is told the truth. The original 404 was deliberate
@@ -245,7 +225,7 @@ async function loadSwitchableSchedule(userId: string, scheduleId: string) {
   // Inside the caller's own org it discloses nothing new: the schedule is
   // already listed on their billing page, id and all. Outside it, they learn
   // nothing they did not already have.
-  if (org && callerOrgId && callerOrgId === org.orgId) {
+  if (sameOrg) {
     throw new ModelChangeForbiddenError(
       "That scheduled chat belongs to another member, and only they can change its model",
     );
