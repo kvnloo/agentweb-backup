@@ -2643,7 +2643,7 @@ async function saveMetaPixelForPage(
   page: GeneratedLandingPage,
   pixelId: string,
   accountId?: string,
-): Promise<void> {
+): Promise<string | undefined> {
   if (!page.githubRepoUrl) throw new Error("Landing page has no GitHub repository");
 
   const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
@@ -2726,7 +2726,25 @@ async function saveMetaPixelForPage(
     }
     return listByPath;
   };
-  await syncLeadCaptureFilesToRepo(repoFullName, buildListByPath, pixelId || undefined, pixelId ? accountId : undefined);
+  const captureSync = await syncLeadCaptureFilesToRepo(
+    repoFullName,
+    buildListByPath,
+    pixelId || undefined,
+    pixelId ? accountId : undefined,
+  );
+  // The base pixel snippet goes into the layout regardless, but the SERVER-side half lives in
+  // the capture route — and on a repo the platform does not own we refuse to write it. Saying
+  // "Meta Pixel injected" here would report full tracking while CAPI was never configured.
+  // ⚠ `!committed &&` is load-bearing, not defensive noise: a successful sync carries
+  // `reason: undefined`, and in any suite that mocks v0Service with an object literal the
+  // imported NO_CAPTURE_LAYER is ALSO undefined — so a bare equality would fire this warning
+  // on every successful pixel install under test.
+  const captureWarning =
+    !captureSync.committed && captureSync.reason === NO_CAPTURE_LAYER
+      ? "The browser pixel was updated, but this site does not use the platform's lead-capture " +
+        "code, so server-side conversion tracking was not configured for it. Wire it in the " +
+        "site's own repository."
+      : undefined;
 
   // 3. Persist metaPixelId/metaAdAccountId on this record.
   await updateLandingPageMetaPixel(page.id, page.userId, pixelId, accountId);
@@ -2761,6 +2779,8 @@ async function saveMetaPixelForPage(
       console.warn(`[LP GENERATION] Could not trigger Vercel re-deploy after Meta Pixel inject: ${deployErr.message}`);
     }
   }
+
+  return captureWarning;
 }
 
 // ---------------------------------------------------------------------------
@@ -2786,7 +2806,7 @@ router.post("/generated/:id/meta-pixel", editRateLimiter, async (req, res: Respo
       return res.status(400).json({ error: "Invalid Meta pixel id. Expected a numeric id." });
     }
 
-    await saveMetaPixelForPage(page, trimmed, accountId);
+    const captureWarning = await saveMetaPixelForPage(page, trimmed, accountId);
 
     res.json({
       success: true,
@@ -2794,6 +2814,7 @@ router.post("/generated/:id/meta-pixel", editRateLimiter, async (req, res: Respo
       message: trimmed
         ? `Meta Pixel ${trimmed} injected. Your site will redeploy shortly.`
         : "Meta Pixel removed. Your site will redeploy shortly.",
+      ...(captureWarning ? { warnings: [captureWarning] } : {}),
     });
   } catch (error: any) {
     console.error("[LP GENERATION] Error injecting Meta Pixel:", error);
