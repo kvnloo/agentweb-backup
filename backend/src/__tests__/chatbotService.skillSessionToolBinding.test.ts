@@ -11,6 +11,15 @@
  * skill's tools and either denies having the capability or fabricates a
  * result in prose — this is the P0 bug in production sessions
  * bb89e75d-20da-4d44-879c-3b59c648bf22 and 0e5792fd-4982-4547-acf1-0a1c738cca59.
+ *
+ * generateChatResponse now resolves "which tools + skill-context text does
+ * this session get" through agentModeService.buildSkillContext — the same
+ * function agent-mode's own real pipeline uses — instead of a second,
+ * independently hand-rolled copy of that policy. These tests mock
+ * buildSkillContext directly: its own internal behavior (subscription-tier
+ * skill gating, FOUNDATION_TOOLS unioning, __other_skills__, admin tools) is
+ * agent-mode's to test; this file only verifies chatbotService wires the call
+ * correctly and uses its result correctly.
  */
 
 const queryPromiseMock = jest.fn();
@@ -39,35 +48,36 @@ const mockCallLLM = jest.fn();
 const mockGetDefaultModel = jest.fn().mockResolvedValue('gpt-5.4');
 const mockExecuteTool = jest.fn().mockResolvedValue({ success: true });
 const mockInitialize = jest.fn().mockResolvedValue(undefined);
-const mockGetAdminToolNames = jest.fn().mockReturnValue([]);
+const mockBuildSkillContext = jest.fn();
 const mockAgentModeService = {
   callLLM: mockCallLLM,
   getDefaultModel: mockGetDefaultModel,
   executeTool: mockExecuteTool,
   initialize: mockInitialize,
-  getAdminToolNames: mockGetAdminToolNames,
+  buildSkillContext: (...args: any[]) => mockBuildSkillContext(...args),
 };
 
 jest.mock('../services/agentModeService', () => {
   const AgentModeService = jest.fn().mockImplementation(() => mockAgentModeService);
   Object.assign(AgentModeService, {
-    // 'send_notification' is a foundation-only tool never listed in any test
-    // skill's own toolNames, so it distinguishes "came from FOUNDATION_TOOLS"
-    // from "came from resolveSkillsToToolNames".
     FOUNDATION_TOOLS: ['send_notification'],
     buildWorkPlanContextMessages: jest.fn().mockReturnValue([]),
   });
   return { AgentModeService, agentModeService: mockAgentModeService };
 });
 
-const mockResolveSkillsToToolNames = jest.fn();
+const mockGetAllowedSkills = jest.fn().mockResolvedValue(['*']);
 jest.mock('../services/subscriptionService', () => ({
-  resolveSkillsToToolNames: (...args: any[]) => mockResolveSkillsToToolNames(...args),
+  getAllowedSkills: (...args: any[]) => mockGetAllowedSkills(...args),
 }));
 
+const mockGetSkillsByIds = jest.fn().mockResolvedValue([]);
 const mockGetPublishedSkills = jest.fn().mockResolvedValue([]);
 jest.mock('../services/skillService', () => ({
-  skillService: { getPublishedSkills: (...args: any[]) => mockGetPublishedSkills(...args) },
+  skillService: {
+    getSkillsByIds: (...args: any[]) => mockGetSkillsByIds(...args),
+    getPublishedSkills: (...args: any[]) => mockGetPublishedSkills(...args),
+  },
 }));
 
 const GOOGLE_ADS_TOOL = {
@@ -86,26 +96,14 @@ const NOTIFICATION_TOOL = {
   },
 };
 
-// Only reachable via the wildcard-expansion branch (mcpToolRegistry.getToolNames()),
-// never via a skill's own resolved toolNames in these tests — lets a test observe
-// whether wildcard expansion actually happened.
-const WILDCARD_ONLY_TOOL = {
-  definition: {
-    name: 'wildcard_only_tool',
-    description: 'Only reachable via full wildcard tool expansion',
-    inputSchema: { type: 'object', properties: {} },
-  },
-};
-
 jest.mock('../mcp/server/registry', () => ({
   mcpToolRegistry: {
     getTool: (name: string) => {
       if (name === 'list_connected_accounts') return GOOGLE_ADS_TOOL;
       if (name === 'send_notification') return NOTIFICATION_TOOL;
-      if (name === 'wildcard_only_tool') return WILDCARD_ONLY_TOOL;
       return undefined;
     },
-    getToolNames: () => ['list_connected_accounts', 'send_notification', 'wildcard_only_tool'],
+    getToolNames: () => ['list_connected_accounts', 'send_notification'],
   },
 }));
 
@@ -140,7 +138,6 @@ jest.mock('../utils/s3Utils', () => ({
 }));
 
 import { generateChatResponse, __resetEmmaSystemContextCache, chatbotDb } from '../services/chatbotService';
-import { mcpToolRegistry } from '../mcp/server/registry';
 
 function makeCompletion(content = 'Hello') {
   return {
@@ -182,24 +179,34 @@ function seedSession(overrides: Record<string, any> = {}) {
   queryPromiseMock.mockResolvedValue({ Items: [] });
 }
 
+// Reset shared mocks before every test in this file. clearAllMocks() resets
+// call history but NOT a mock's queued mockResolvedValueOnce() chain or its
+// mockReturnValue/mockResolvedValue default — a prior test that queued more
+// once-values than it consumed, or set a default another test doesn't expect,
+// would otherwise leak into the next test's first call. mockReset() clears both.
+function resetSharedMocks() {
+  jest.clearAllMocks();
+  mockCallLLM.mockReset();
+  mockBuildSkillContext.mockReset();
+  __resetEmmaSystemContextCache();
+  putPromiseMock.mockResolvedValue({});
+  updatePromiseMock.mockResolvedValue({});
+  mockGetDefaultModel.mockResolvedValue('gpt-5.4');
+  mockGetAllowedSkills.mockResolvedValue(['*']);
+  mockGetSkillsByIds.mockResolvedValue([]);
+  mockGetPublishedSkills.mockResolvedValue([]);
+  mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(), installedSkillContextMsg: '' });
+}
+
 describe('generateChatResponse — skill-session tool binding (ENG-1222)', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
-    // clearAllMocks() resets call history but NOT a mock's queued
-    // mockResolvedValueOnce() chain — a prior test that queued more once-values
-    // than it consumed would otherwise leak the leftover into this test's first
-    // mockCallLLM() call. Reset it explicitly, then re-establish this block's default.
-    mockCallLLM.mockReset();
-    __resetEmmaSystemContextCache();
-    putPromiseMock.mockResolvedValue({});
-    updatePromiseMock.mockResolvedValue({});
-    mockGetDefaultModel.mockResolvedValue('gpt-5.4');
+    resetSharedMocks();
     mockCallLLM.mockResolvedValue(makeCompletion());
-    mockResolveSkillsToToolNames.mockResolvedValue(['list_connected_accounts']);
   });
 
   it('binds the session skill tools even when portalType is "partner" and the caller is not an admin', async () => {
     seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(['list_connected_accounts']), installedSkillContextMsg: '' });
 
     await generateChatResponse('sess-1', 'Run list_connected_accounts', {
       portalType: 'partner',
@@ -218,7 +225,7 @@ describe('generateChatResponse — skill-session tool binding (ENG-1222)', () =>
     );
   });
 
-  it('omits tools for a "partner" session with no installed skills (no regression)', async () => {
+  it('omits tools for a "partner" session with no installed skills, not delegated-admin (no regression)', async () => {
     seedSession({ associatedSkills: [] });
 
     await generateChatResponse('sess-1', 'Hello', {
@@ -227,6 +234,7 @@ describe('generateChatResponse — skill-session tool binding (ENG-1222)', () =>
       model: 'anthropic.claude-opus-5',
     });
 
+    expect(mockBuildSkillContext).not.toHaveBeenCalled();
     expect(mockCallLLM).toHaveBeenCalledWith(
       'anthropic.claude-opus-5',
       expect.any(Array),
@@ -236,6 +244,7 @@ describe('generateChatResponse — skill-session tool binding (ENG-1222)', () =>
 
   it('still binds skill tools on the "customer" portal (existing behavior preserved)', async () => {
     seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(['list_connected_accounts']), installedSkillContextMsg: '' });
 
     await generateChatResponse('sess-1', 'Run list_connected_accounts', {
       portalType: 'customer',
@@ -256,7 +265,7 @@ describe('generateChatResponse — skill-session tool binding (ENG-1222)', () =>
 
   it('still binds admin tools for a delegated admin with no installed skills (existing behavior preserved)', async () => {
     seedSession({ associatedSkills: [] });
-    mockGetAdminToolNames.mockReturnValue(['list_connected_accounts']);
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(['send_notification']), installedSkillContextMsg: '' });
 
     await generateChatResponse('sess-1', 'Hello', {
       portalType: 'partner',
@@ -265,29 +274,47 @@ describe('generateChatResponse — skill-session tool binding (ENG-1222)', () =>
       isDelegatedAdmin: true,
     });
 
+    expect(mockBuildSkillContext).toHaveBeenCalledWith([], ['*'], [], [], true);
     expect(mockCallLLM).toHaveBeenCalledWith(
       'anthropic.claude-opus-5',
       expect.any(Array),
       expect.objectContaining({
         tools: expect.arrayContaining([
-          expect.objectContaining({ function: expect.objectContaining({ name: 'list_connected_accounts' }) }),
+          expect.objectContaining({ function: expect.objectContaining({ name: 'send_notification' }) }),
         ]),
       }),
+    );
+  });
+
+  it('resolves skill/admin tool access through buildSkillContext with the correct session context', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    const googleAdsSkill = { skillId: 'google-ads-skill', name: 'Google Ads', description: '', toolNames: ['list_connected_accounts'] };
+    mockGetSkillsByIds.mockResolvedValue([googleAdsSkill]);
+    mockGetPublishedSkills.mockResolvedValue([googleAdsSkill]);
+    mockGetAllowedSkills.mockResolvedValue(['google-ads-skill']);
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(['list_connected_accounts']), installedSkillContextMsg: '' });
+
+    await generateChatResponse('sess-1', 'Run list_connected_accounts', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockGetSkillsByIds).toHaveBeenCalledWith(['google-ads-skill']);
+    expect(mockGetAllowedSkills).toHaveBeenCalledWith('user-1');
+    expect(mockBuildSkillContext).toHaveBeenCalledWith(
+      [googleAdsSkill],
+      ['google-ads-skill'],
+      [googleAdsSkill],
+      ['google-ads-skill'],
+      false,
     );
   });
 });
 
 describe('generateChatResponse — ENG-1222 attribution stamp + fabrication guard', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
-    // See the first describe block's beforeEach for why this is necessary:
-    // clearAllMocks() doesn't drain a mock's queued mockResolvedValueOnce() chain.
-    mockCallLLM.mockReset();
-    __resetEmmaSystemContextCache();
-    putPromiseMock.mockResolvedValue({});
-    updatePromiseMock.mockResolvedValue({});
-    mockGetDefaultModel.mockResolvedValue('gpt-5.4');
-    mockResolveSkillsToToolNames.mockResolvedValue(['list_connected_accounts']);
+    resetSharedMocks();
   });
 
   it('stamps .llm on the persisted assistant message so telemetry can attribute the turn', async () => {
@@ -345,6 +372,7 @@ describe('generateChatResponse — ENG-1222 attribution stamp + fabrication guar
 
   it('does not block a response that reports real data after actually calling a tool', async () => {
     seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(['list_connected_accounts']), installedSkillContextMsg: '' });
     mockExecuteTool.mockResolvedValue({ accounts: [{ name: 'Real Customer LLC', id: '999' }] });
     mockCallLLM
       .mockResolvedValueOnce(makeToolCallCompletion('list_connected_accounts'))
@@ -361,25 +389,16 @@ describe('generateChatResponse — ENG-1222 attribution stamp + fabrication guar
   });
 });
 
-describe('generateChatResponse — ENG-1222 hard gate, retry, skill prompt, and foundation-tool parity', () => {
+describe('generateChatResponse — ENG-1222 hard gate, retry, and skill-prompt injection', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
-    // See the first describe block's beforeEach for why this is necessary:
-    // clearAllMocks() doesn't drain a mock's queued mockResolvedValueOnce() chain.
-    mockCallLLM.mockReset();
-    __resetEmmaSystemContextCache();
-    putPromiseMock.mockResolvedValue({});
-    updatePromiseMock.mockResolvedValue({});
-    mockGetDefaultModel.mockResolvedValue('gpt-5.4');
-    mockGetPublishedSkills.mockResolvedValue([]);
+    resetSharedMocks();
   });
 
   it('hard-fails a skill session that resolves to zero tools instead of letting the model answer toolless', async () => {
     seedSession({ associatedSkills: ['google-ads-skill'] });
-    mockResolveSkillsToToolNames.mockResolvedValue(['unregistered_tool']);
-    // Even FOUNDATION_TOOLS (send_notification) must fail to resolve here — otherwise
-    // the ENG-1222 parity fix means a skill session almost never truly hits zero tools.
-    const getToolSpy = jest.spyOn(mcpToolRegistry, 'getTool').mockReturnValue(undefined);
+    // buildSkillContext resolving to nothing (e.g. an unregistered tool name, or a
+    // skill with no toolNames declared) is the anomaly this gate exists to catch.
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(), installedSkillContextMsg: '' });
 
     const response = await generateChatResponse('sess-1', 'Run list_connected_accounts', {
       portalType: 'partner',
@@ -389,12 +408,11 @@ describe('generateChatResponse — ENG-1222 hard gate, retry, skill prompt, and 
 
     expect(mockCallLLM).not.toHaveBeenCalled();
     expect(response).toMatch(/wasn't able to load the tools/i);
-    getToolSpy.mockRestore();
   });
 
   it('retries once when the user names an available tool but the model makes zero tool calls', async () => {
     seedSession({ associatedSkills: ['google-ads-skill'] });
-    mockResolveSkillsToToolNames.mockResolvedValue(['list_connected_accounts']);
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(['list_connected_accounts']), installedSkillContextMsg: '' });
     mockExecuteTool.mockResolvedValue({ accounts: [{ name: 'Real Customer LLC', id: '999' }] });
     mockCallLLM
       .mockResolvedValueOnce(makeCompletion("I don't have the capability to run tools."))
@@ -417,7 +435,7 @@ describe('generateChatResponse — ENG-1222 hard gate, retry, skill prompt, and 
 
   it('does not retry a normal toolless reply when the user never named an available tool', async () => {
     seedSession({ associatedSkills: ['google-ads-skill'] });
-    mockResolveSkillsToToolNames.mockResolvedValue(['list_connected_accounts']);
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(['list_connected_accounts']), installedSkillContextMsg: '' });
     mockCallLLM.mockResolvedValue(makeCompletion('Sure, what would you like to do?'));
 
     await generateChatResponse('sess-1', 'Hello there', {
@@ -429,12 +447,12 @@ describe('generateChatResponse — ENG-1222 hard gate, retry, skill prompt, and 
     expect(mockCallLLM).toHaveBeenCalledTimes(1);
   });
 
-  it('injects the installed skill\'s own systemPrompt even on the non-customer portal', async () => {
+  it("injects buildSkillContext's installedSkillContextMsg even on the non-customer portal", async () => {
     seedSession({ associatedSkills: ['google-ads-skill'] });
-    mockResolveSkillsToToolNames.mockResolvedValue(['list_connected_accounts']);
-    mockGetPublishedSkills.mockResolvedValue([
-      { skillId: 'google-ads-skill', systemPrompt: 'You are running the Google Ads Pre-Flight Health Gate skill.' },
-    ]);
+    mockBuildSkillContext.mockReturnValue({
+      allowedToolNames: new Set(['list_connected_accounts']),
+      installedSkillContextMsg: 'Installed Skills:\ngoogle-ads-skill- Google Ads: Pre-flight health checks. You are running the Google Ads Pre-Flight Health Gate skill.',
+    });
     mockCallLLM.mockResolvedValue(makeCompletion('ok'));
 
     await generateChatResponse('sess-1', 'Hello', {
@@ -449,76 +467,6 @@ describe('generateChatResponse — ENG-1222 hard gate, retry, skill prompt, and 
         expect.objectContaining({ role: 'system', content: expect.stringContaining('Pre-Flight Health Gate') }),
       ]),
       expect.anything(),
-    );
-  });
-
-  it('unions FOUNDATION_TOOLS onto a skill session even when the skill itself does not redeclare them', async () => {
-    seedSession({ associatedSkills: ['google-ads-skill'] });
-    // The skill only declares list_connected_accounts — not the foundation-only send_notification tool.
-    mockResolveSkillsToToolNames.mockResolvedValue(['list_connected_accounts']);
-    mockCallLLM.mockResolvedValue(makeCompletion('ok'));
-
-    await generateChatResponse('sess-1', 'Hello', {
-      portalType: 'partner',
-      userId: 'user-1',
-      model: 'anthropic.claude-opus-5',
-    });
-
-    expect(mockCallLLM).toHaveBeenCalledWith(
-      'anthropic.claude-opus-5',
-      expect.any(Array),
-      expect.objectContaining({
-        tools: expect.arrayContaining([
-          expect.objectContaining({ function: expect.objectContaining({ name: 'list_connected_accounts' }) }),
-          expect.objectContaining({ function: expect.objectContaining({ name: 'send_notification' }) }),
-        ]),
-      }),
-    );
-  });
-
-  it('does not expand to every registered tool when resolveSkillsToToolNames silently fails open to a wildcard', async () => {
-    seedSession({ associatedSkills: ['google-ads-skill'] }); // no '*' — never asked for wildcard access
-    // subscriptionService.ts's own catch fails open to ['*'] on any internal error —
-    // indistinguishable at this call site from a legitimate wildcard request.
-    mockResolveSkillsToToolNames.mockResolvedValue(['*']);
-    mockCallLLM.mockResolvedValue(makeCompletion('ok'));
-
-    await generateChatResponse('sess-1', 'Hello', {
-      portalType: 'partner',
-      userId: 'user-1',
-      model: 'anthropic.claude-opus-5',
-    });
-
-    expect(mockCallLLM).toHaveBeenCalledWith(
-      'anthropic.claude-opus-5',
-      expect.any(Array),
-      expect.objectContaining({
-        tools: expect.not.arrayContaining([
-          expect.objectContaining({ function: expect.objectContaining({ name: 'wildcard_only_tool' }) }),
-        ]),
-      }),
-    );
-  });
-
-  it('does expand to every registered tool when the session itself explicitly has wildcard skill access', async () => {
-    seedSession({ associatedSkills: ['*'] });
-    mockResolveSkillsToToolNames.mockResolvedValue(['*']);
-    mockCallLLM.mockResolvedValue(makeCompletion('ok'));
-
-    await generateChatResponse('sess-1', 'Hello', {
-      portalType: 'partner',
-      userId: 'user-1',
-      model: 'anthropic.claude-opus-5',
-    });
-
-    expect(mockCallLLM).toHaveBeenCalledWith(
-      'anthropic.claude-opus-5',
-      expect.any(Array),
-      expect.objectContaining({
-        tools: expect.arrayContaining([
-          expect.objectContaining({ function: expect.objectContaining({ name: 'wildcard_only_tool' }) }),
-        ]),
-      }),
     );
   });
 });
