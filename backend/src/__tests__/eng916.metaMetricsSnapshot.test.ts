@@ -336,4 +336,60 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
     expect(errorSpy).toHaveBeenCalled();
     errorSpy.mockRestore();
   });
+
+  it('resolves Meta credentials ONCE for the whole run, not once per day', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => makeCampaignInsightsResponse([
+        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+      ]),
+    });
+
+    await runMetaMetricsSnapshot();
+
+    // getMetaAccountCredentials can refresh and PERSIST the Meta token inline, so resolving it
+    // per day meant 28 reads (and 28 chances to write) against a live managed client's record
+    // every run. One resolution is reused for every day in the settling window.
+    expect(mockGetCreds).toHaveBeenCalledTimes(1);
+    expect(mockUserDb.getUserById).toHaveBeenCalledTimes(1);
+    // ...while every day in the window still got written.
+    const datesWritten = mockMetricsDb.putSnapshot.mock.calls.map((c: any) => c[0].date);
+    expect(new Set(datesWritten).size).toBe(28);
+  });
+
+  it('attempts NO days and logs once when credentials cannot be resolved', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockGetCreds.mockRejectedValue(new Error('Meta access token has expired'));
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => makeCampaignInsightsResponse([]),
+    });
+
+    await runMetaMetricsSnapshot();
+
+    // If credentials are dead no day can succeed, so the run must fail fast with one clear line
+    // rather than repeating the identical error once per day in the settling window.
+    expect(mockMetricsDb.putSnapshot).not.toHaveBeenCalled();
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    errorSpy.mockRestore();
+  });
+
+  it('bounds every Graph read with an abort signal', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => makeCampaignInsightsResponse([
+        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+      ]),
+    });
+
+    await runMetaMetricsSnapshot();
+
+    // Node's fetch has no default deadline and these reads are sequential across the window,
+    // so one hung connection would stall every remaining day and read as "the cron did not run".
+    expect((global.fetch as jest.Mock).mock.calls.length).toBeGreaterThan(0);
+    for (const call of (global.fetch as jest.Mock).mock.calls) {
+      expect(call[1]?.signal).toBeInstanceOf(AbortSignal);
+    }
+  });
 });

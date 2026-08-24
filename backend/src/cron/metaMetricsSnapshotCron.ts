@@ -1,6 +1,7 @@
 import { userDb, crmDb } from "../services/db";
 import { getMetaAccountCredentials } from "../services/metaAccountCredentials";
 import { metaAdsMetricsDb } from "../services/metaAdsMetricsDb";
+import { META_GRAPH_TIMEOUT_MS } from "../utils/metaApiFetch";
 
 // ENG-916: Haven only, deliberately. Every.io's Meta CAPI gap (ENG-993) means its
 // Meta-reported conversions would read as artificially low/zero even with real leads
@@ -80,14 +81,32 @@ export interface SnapshotResult {
  * per campaign Meta reported activity for. Also usable by a future backfill script
  * without duplicating this logic.
  */
+export interface ResolvedMetaCredentials {
+  accountId: string;
+  accessToken: string;
+}
+
 export async function snapshotMetaMetricsForDate(
   userId: string,
-  dateStr: string
+  dateStr: string,
+  resolvedCredentials?: ResolvedMetaCredentials
 ): Promise<SnapshotResult> {
-  const user = await userDb.getUserById(userId);
-  if (!user) {
-    throw new Error(`[ENG-916] User ${userId} not found`);
-  }
+  // Credentials are resolved ONCE PER RUN by runMetaMetricsSnapshot and passed in, because
+  // getMetaAccountCredentials reads the user record and can refresh + PERSIST the Meta token
+  // inline (fb_exchange_token). Resolving per day meant SETTLING_WINDOW_DAYS redundant reads
+  // against a live managed client's record every run, and — once a token finally expires —
+  // that many identical CRITICAL ERRORs instead of one. The parameter stays optional so this
+  // function is still usable standalone (a future backfill script) without duplicating the
+  // resolution.
+  let accountId: string;
+  let accessToken: string;
+  if (resolvedCredentials) {
+    ({ accountId, accessToken } = resolvedCredentials);
+  } else {
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      throw new Error(`[ENG-916] User ${userId} not found`);
+    }
 
   // ⚠ SCOPE LIMIT, deliberate while this card is Haven-only: getMetaAccountCredentials returns
   // exactly ONE {accountId, accessToken}. A user with two connected ad accounts therefore gets one
@@ -95,7 +114,8 @@ export async function snapshotMetaMetricsForDate(
   // user records (21 connection rows resolve to 15 distinct ad accounts), so a user-keyed read can
   // resolve an account whose leads live under a different record. Widening past Haven means
   // iterating accounts here, not just changing HAVEN_USER_ID.
-  const { accountId, accessToken } = await getMetaAccountCredentials(user, userId);
+    ({ accountId, accessToken } = await getMetaAccountCredentials(user, userId));
+  }
 
   // No campaign filter — this IS the dynamic-discovery step. Meta's level=campaign
   // insights query returns one row per campaign that had any activity in the window,
@@ -112,7 +132,12 @@ export async function snapshotMetaMetricsForDate(
   const campaignRows: any[] = [];
   let nextUrl: string | undefined = insightsUrl;
   while (nextUrl) {
-    const res = await fetch(nextUrl);
+    // Bounded deliberately: Node's fetch applies NO default deadline, and these reads run
+    // sequentially inside the settling-window loop — so one connection that accepts a request
+    // and never completes stalls every remaining day and surfaces as "the cron did not run"
+    // rather than as a network fault. AbortSignal.timeout is preferred over a manual controller
+    // so no timer can outlive the process.
+    const res = await fetch(nextUrl, { signal: AbortSignal.timeout(META_GRAPH_TIMEOUT_MS) });
     const body: any = await res.json();
     if (!res.ok || body?.error) {
       throw new Error(
@@ -198,6 +223,23 @@ export async function snapshotMetaMetricsForDate(
 export async function runMetaMetricsSnapshot(): Promise<void> {
   console.log("[MetaMetricsSnapshotCron] Starting execution...");
 
+  // Resolve credentials once for the whole run. If they cannot be resolved, NO day can succeed,
+  // so fail fast with one clear line rather than repeating the same error once per day.
+  let credentials: ResolvedMetaCredentials;
+  try {
+    const user = await userDb.getUserById(HAVEN_USER_ID);
+    if (!user) {
+      throw new Error(`[ENG-916] User ${HAVEN_USER_ID} not found`);
+    }
+    credentials = await getMetaAccountCredentials(user, HAVEN_USER_ID);
+  } catch (error) {
+    console.error(
+      "[MetaMetricsSnapshotCron] CRITICAL ERROR resolving Meta credentials — no days attempted:",
+      error
+    );
+    return;
+  }
+
   const today = new Date();
   for (let daysAgo = 1; daysAgo <= SETTLING_WINDOW_DAYS; daysAgo++) {
     const target = new Date(today);
@@ -205,7 +247,7 @@ export async function runMetaMetricsSnapshot(): Promise<void> {
     const dateStr = toDateStr(target);
 
     try {
-      const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, dateStr);
+      const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, dateStr, credentials);
       console.log(
         `[MetaMetricsSnapshotCron] ${dateStr}: wrote ${result.rowsWritten} campaign rows, ` +
           `${result.leadCount} attributed leads, ${result.unattributedLeadCount} unattributed`
