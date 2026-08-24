@@ -22,9 +22,11 @@ jest.mock('../services/intakeService', () => ({
   }),
 }));
 
-// Must match HARSHA_LINEAR_USER_ID in services/customerClosureVerification.ts — the only
-// authorId the verification gate trusts for either verifier prefix.
-const HARSHA_LINEAR_USER_ID = '142fef82-4d45-4070-99be-c5debe565ac6';
+// Prefixed `mock` deliberately — Jest's hoisting only allows a jest.mock() factory to reference
+// module-scope variables whose name starts with "mock". Must match HARSHA_LINEAR_USER_ID in
+// services/customerClosureVerification.ts — the only authorId the verification gate trusts for
+// either verifier prefix.
+const mockHarshaLinearUserId = '142fef82-4d45-4070-99be-c5debe565ac6';
 
 jest.mock('../services/linearService', () => ({
   getIssueCommentsDetailed: jest.fn().mockResolvedValue([
@@ -38,7 +40,7 @@ jest.mock('../services/linearService', () => ({
         '- Verifier: post-merge-verifier/run-123',
       ].join('\n'),
       createdAt: '2026-08-20T00:00:00.000Z',
-      authorId: '142fef82-4d45-4070-99be-c5debe565ac6',
+      authorId: mockHarshaLinearUserId,
     },
   ]),
   reopenIssue: jest.fn().mockResolvedValue(undefined),
@@ -372,7 +374,7 @@ describe('POST /api/integrations/linear/webhook — customer symptom verificatio
           '- Verifier: harsha-direct/2026-08-24-live-session',
         ].join('\n'),
         createdAt: '2026-08-24T00:00:00.000Z',
-        authorId: HARSHA_LINEAR_USER_ID,
+        authorId: mockHarshaLinearUserId,
       },
     ]);
 
