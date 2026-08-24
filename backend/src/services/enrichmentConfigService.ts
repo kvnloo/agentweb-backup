@@ -228,6 +228,15 @@ function validateConfig(config: EnrichmentConfig): { warnings: string[] } {
     );
   }
 
+  // autoEnrich (ENG-88) opts a list into the unattended enrichment cron —
+  // reject a malformed value outright rather than silently coercing it,
+  // since a truthy-but-wrong type here would be a silent behavior change.
+  if (config.autoEnrich !== undefined && typeof config.autoEnrich !== 'boolean') {
+    throw new ConfigValidationError(
+      `autoEnrich must be a boolean when present; received ${typeof config.autoEnrich}`,
+    );
+  }
+
   // Two fields routing to the same canonical name → routing collision.
   // Covers both: explicit aliasFor collisions AND a self-canonical name
   // (e.g. `email`) clashing with an inferred alias (e.g. `Email`→`email`).

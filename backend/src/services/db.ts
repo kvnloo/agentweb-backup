@@ -5197,6 +5197,30 @@ export const crmDb = {
     return items;
   },
 
+  /**
+   * Lists opted into the CRM auto-enrichment cron (ENG-88):
+   * `enrichmentConfig.autoEnrich === true`. Scoped scan, not a rename/reuse
+   * of getAllLeadLists — that function's minimal projection is depended on
+   * elsewhere, and this needs the enrichmentConfig attribute plus a filter.
+   * Cheap by design: `autoEnrich` is opt-in and expected to stay rare.
+   */
+  async getAutoEnrichEnabledLists(): Promise<Array<{ listId: string; userId: string }>> {
+    const items: any[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.scan({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        ProjectionExpression: 'listId, userId',
+        FilterExpression: 'enrichmentConfig.autoEnrich = :true',
+        ExpressionAttributeValues: { ':true': true },
+        ExclusiveStartKey: lastEvaluatedKey,
+      }).promise();
+      items.push(...(result.Items || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return items;
+  },
+
   // Returns true if userId owns the list OR has CRM read access to the owner's org lists.
   // Respects shareSettings.crm.enabled: when false, only the list owner, the org owner,
   // and listed crm.editors retain cross-member read access.
