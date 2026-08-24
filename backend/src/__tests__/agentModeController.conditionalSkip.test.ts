@@ -532,6 +532,7 @@ describe('scheduledRunSignalsConditionalSkip', () => {
         'perform_deep_research -> create_blog_article',
         'read_file_content -> describe_image',
         'read_file_content -> describe_video',
+        'recommend_predefined_work_plan -> launch_predefined_work_plan',
         'remove_c2pa_from_image -> remove_image_background',
         'remove_image_background -> generate_image',
         'remove_image_background -> update_html_file',
