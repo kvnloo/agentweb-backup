@@ -92,6 +92,10 @@ def get_openai_api_key() -> str:
     return _env_or_string_secret('OPENAI_API_KEY', 'openai')
 
 
+def get_openrouter_api_key() -> str:
+    return _env_or_string_secret('OPENROUTER_API_KEY', 'openrouter')
+
+
 def get_gemini_api_key() -> str:
     return _env_or_string_secret('GEMINI_API_KEY', 'gemini')
 

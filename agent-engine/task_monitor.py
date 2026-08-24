@@ -30,8 +30,8 @@ import resource
 from email_utils import get_task_subscribers
 import requests
 from google.cloud import storage
-from openai import AzureOpenAI
-from task_utils import get_azure_openai_llm3, create_jwt_token
+from openrouter_gateway import get_openrouter_llm
+from task_utils import create_jwt_token
 from knowledge_base_utils import get_knowledge_base_manager
 
 # Increase file descriptor limit
@@ -1344,7 +1344,7 @@ Context - Original Task: {base_prompt}"""
                                 logger.info(f"Starting knowledge base update for task {task_id}")
                                 # Initialize clients
                                 storage_client = storage.Client()
-                                openai_client = get_azure_openai_llm3('gpt-5-chat')
+                                openai_client = get_openrouter_llm('azure->openai->gpt-5-chat')
 
                                 # Determine which bucket to use based on knowledgeBaseType
                                 bucket_type = task.get('knowledgeBaseType', 'private')

@@ -19,7 +19,6 @@
 import { crmDb } from './db';
 import { agentModeService } from './agentModeService';
 import { buildClusterFieldsSystemPrompt, buildClusterFieldsUserPrompt } from './enrichmentPrompts';
-import { meterUsageFromResponse } from '../utils/llmClients';
 
 export interface FieldCluster {
   /** User-facing field names this cluster covers. */
@@ -61,23 +60,15 @@ async function llmClusterFields(
   try {
     const { CrmEnrichmentService } = await import('./crmEnrichmentService');
     const { enrichmentModel } = await CrmEnrichmentService.getEnrichmentConfig();
-    const llm = await agentModeService.getClientForModel(enrichmentModel);
-
-    const completion = await llm.chat.completions.create({
-      model: enrichmentModel,
-      temperature: 0.1,
-      messages: [
+    const completion = await agentModeService.callLLM(enrichmentModel, [
         { role: 'system', content: buildClusterFieldsSystemPrompt() },
         { role: 'user', content: buildClusterFieldsUserPrompt(fields, exampleLead) },
-      ],
+      ], {
+      temperature: 0.1,
       response_format: { type: 'json_object' },
+      usageContext: { userId, feature: 'crm_enrichment_cluster' },
+      taskClass: 'nonstandard_consumer',
     });
-    meterUsageFromResponse({
-      userId,
-      model: enrichmentModel,
-      provider: enrichmentModel.startsWith('anthropic') || enrichmentModel.startsWith('claude') ? 'bedrock' : 'azure',
-      feature: 'crm_enrichment_cluster',
-    }, completion);
     const raw = completion.choices?.[0]?.message?.content || '';
     const parsed = JSON.parse(raw);
     const candidates = Array.isArray(parsed) ? parsed : (parsed?.clusters || []);

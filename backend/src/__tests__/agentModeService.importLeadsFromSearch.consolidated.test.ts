@@ -272,7 +272,7 @@ describe('AgentModeService.importLeadsFromSearch — auto_enrich', () => {
 // ─── Company fallback chain ───────────────────────────────────────────────────
 
 const mockChatCreate = jest.fn();
-const fakeLlmClient = { chat: { completions: { create: (...args: any[]) => mockChatCreate(...args) } } };
+const fakeGateway = { callLLM: (...args: any[]) => mockChatCreate(...args) };
 
 describe('parseCompanyFromTitle (regex)', () => {
   const parse = (agentModeServiceTestHooks as any).parseCompanyFromTitle as (t: any) => string | null;
@@ -300,7 +300,7 @@ describe('batchParseCompaniesFromTitlesWithLLM', () => {
   beforeEach(() => { mockChatCreate.mockReset(); });
 
   it('returns [] for empty array without calling LLM', async () => {
-    expect(await batchParse([], fakeLlmClient)).toEqual([]);
+    expect(await batchParse([], fakeGateway)).toEqual([]);
     expect(mockChatCreate).not.toHaveBeenCalled();
   });
 
@@ -312,65 +312,69 @@ describe('batchParseCompaniesFromTitlesWithLLM', () => {
 
   it('returns the parsed JSON array on success', async () => {
     mockChatCreate.mockResolvedValue({ choices: [{ message: { content: '["Google", "Acme Inc", "NONE"]' } }] });
-    expect(await batchParse(['Engineer at Google', 'Founder | Acme Inc', 'Senior Engineer'], fakeLlmClient)).toEqual(['Google', 'Acme Inc', 'NONE']);
+    expect(await batchParse(['Engineer at Google', 'Founder | Acme Inc', 'Senior Engineer'], fakeGateway)).toEqual(['Google', 'Acme Inc', 'NONE']);
   });
 
   it('makes exactly one LLM call for the whole batch', async () => {
     mockChatCreate.mockResolvedValue({ choices: [{ message: { content: '["A", "B", "C", "D"]' } }] });
-    await batchParse(['t1', 't2', 't3', 't4'], fakeLlmClient);
+    await batchParse(['t1', 't2', 't3', 't4'], fakeGateway);
     expect(mockChatCreate).toHaveBeenCalledTimes(1);
   });
 
-  it('uses gemini-2.5-flash with low temperature', async () => {
+  it('uses the current Gemini Flash model through the nonstandard-consumer gateway class', async () => {
     mockChatCreate.mockResolvedValue({ choices: [{ message: { content: '["X"]' } }] });
-    await batchParse(['Founder | X'], fakeLlmClient);
-    expect(mockChatCreate.mock.calls[0][0].model).toBe('gemini-2.5-flash');
-    expect(mockChatCreate.mock.calls[0][0].temperature).toBeLessThanOrEqual(0.2);
+    await batchParse(['Founder | X'], fakeGateway);
+    expect(mockChatCreate.mock.calls[0][0]).toBe('gemini-3.1-flash-lite');
+    expect(mockChatCreate.mock.calls[0][2]).toEqual(expect.objectContaining({
+      temperature: expect.any(Number),
+      taskClass: 'nonstandard_consumer',
+    }));
+    expect(mockChatCreate.mock.calls[0][2].temperature).toBeLessThanOrEqual(0.2);
   });
 
   it('strips ```json fences', async () => {
     mockChatCreate.mockResolvedValue({ choices: [{ message: { content: '```json\n["Google"]\n```' } }] });
-    expect(await batchParse(['Engineer at Google'], fakeLlmClient)).toEqual(['Google']);
+    expect(await batchParse(['Engineer at Google'], fakeGateway)).toEqual(['Google']);
   });
 
   it('returns all-NONE when LLM response is the wrong length', async () => {
     mockChatCreate.mockResolvedValue({ choices: [{ message: { content: '["Google"]' } }] });
-    expect(await batchParse(['a', 'b', 'c'], fakeLlmClient)).toEqual(['NONE', 'NONE', 'NONE']);
+    expect(await batchParse(['a', 'b', 'c'], fakeGateway)).toEqual(['NONE', 'NONE', 'NONE']);
   });
 
   it('returns all-NONE when LLM returns non-JSON', async () => {
     mockChatCreate.mockResolvedValue({ choices: [{ message: { content: 'Sorry, I cannot help.' } }] });
-    expect(await batchParse(['a', 'b'], fakeLlmClient)).toEqual(['NONE', 'NONE']);
+    expect(await batchParse(['a', 'b'], fakeGateway)).toEqual(['NONE', 'NONE']);
   });
 
   it('returns all-NONE when LLM throws', async () => {
     mockChatCreate.mockRejectedValue(new Error('Gemini timeout'));
-    expect(await batchParse(['a', 'b'], fakeLlmClient)).toEqual(['NONE', 'NONE']);
+    expect(await batchParse(['a', 'b'], fakeGateway)).toEqual(['NONE', 'NONE']);
   });
 
   it('normalises NONE / empty / runaway entries', async () => {
     mockChatCreate.mockResolvedValue({ choices: [{ message: { content: JSON.stringify(['Real Co', 'NONE', '   ', 'X'.repeat(200), 42]) } }] });
-    expect(await batchParse(['t1', 't2', 't3', 't4', 't5'], fakeLlmClient)).toEqual(['Real Co', 'NONE', 'NONE', 'NONE', 'NONE']);
+    expect(await batchParse(['t1', 't2', 't3', 't4', 't5'], fakeGateway)).toEqual(['Real Co', 'NONE', 'NONE', 'NONE', 'NONE']);
   });
 
   it('trims whitespace', async () => {
     mockChatCreate.mockResolvedValue({ choices: [{ message: { content: '["  Google  ", "  Acme  "]' } }] });
-    expect(await batchParse(['a', 'b'], fakeLlmClient)).toEqual(['Google', 'Acme']);
+    expect(await batchParse(['a', 'b'], fakeGateway)).toEqual(['Google', 'Acme']);
   });
 
   it('extracts JSON array when LLM adds a preamble', async () => {
     mockChatCreate.mockResolvedValue({ choices: [{ message: { content: 'Sure! Here are the results:\n["Shopify"]' } }] });
-    expect(await batchParse(['VP of Engineering'], fakeLlmClient)).toEqual(['Shopify']);
+    expect(await batchParse(['VP of Engineering'], fakeGateway)).toEqual(['Shopify']);
   });
 
   it('extracts JSON array when LLM adds a postamble', async () => {
     mockChatCreate.mockResolvedValue({ choices: [{ message: { content: '["Google", "Stripe"]\n\nHope this helps!' } }] });
-    expect(await batchParse(['t1', 't2'], fakeLlmClient)).toEqual(['Google', 'Stripe']);
+    expect(await batchParse(['t1', 't2'], fakeGateway)).toEqual(['Google', 'Stripe']);
   });
 
   it('extracts JSON array when LLM wraps in fence + preamble', async () => {
     mockChatCreate.mockResolvedValue({ choices: [{ message: { content: 'Here is the JSON:\n```json\n["Acme Inc"]\n```' } }] });
-    expect(await batchParse(['Founder | Acme Inc'], fakeLlmClient)).toEqual(['Acme Inc']);
+    expect(await batchParse(['Founder | Acme Inc'], fakeGateway)).toEqual(['Acme Inc']);
   });
 });
 
@@ -381,7 +385,7 @@ describe('AgentModeService.importLeadsFromSearch — company fallback chain', ()
     jest.clearAllMocks();
     mockChatCreate.mockReset();
     service = new AgentModeService();
-    jest.spyOn(service, 'getClientForModel').mockResolvedValue(fakeLlmClient);
+    jest.spyOn(service, 'callLLM').mockImplementation((...args: any[]) => mockChatCreate(...args));
     mockResolveAccountId.mockResolvedValue('test-account-id');
     mockBatchCreateLeads.mockResolvedValue({ newCount: 1, mergedCount: 0, errors: [], created: [{ leadId: 'lead-new-1' }] });
     mockGetLeadListById.mockResolvedValue({ userId: 'user-1', leadCount: 1 });
@@ -430,7 +434,7 @@ describe('AgentModeService.importLeadsFromSearch — company fallback chain', ()
     await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO' });
 
     expect(mockChatCreate).toHaveBeenCalledTimes(1);
-    const userMsg = mockChatCreate.mock.calls[0][0].messages[1].content;
+    const userMsg = mockChatCreate.mock.calls[0][1][1].content;
     expect(userMsg).toContain('Founder | Acme Inc');
     expect(userMsg).toContain('Developer · Microsoft');
     expect(userMsg).toContain('Just building stuff');

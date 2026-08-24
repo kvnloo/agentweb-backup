@@ -121,15 +121,14 @@ export interface ConnectivityAccountInput {
 }
 
 /**
- * Flags an account with no currently-connected, unexpired ad-platform integration —
- * ThinkingAI (never connected) and TransAmerica's (silently expired) failure modes.
- * Generalizes `renewalIntegrationHealthCron.hasHealthyAdIntegration` to run for every
- * account on every sweep rather than only inside the pre-renewal lookahead window.
+ * Flags an account whose configured ad-platform integration has expired. An absent
+ * ad account is not a connectivity failure: the caller must first establish that
+ * paid ads are in scope for that customer.
  */
 export function evaluateAdConnectivity(accounts: ConnectivityAccountInput[], nowMs: number = Date.now()): HealthFlag {
   const adAccounts = accounts.filter((acc) => acc && AD_HEALTH_PLATFORMS.has(acc.platform));
   if (adAccounts.length === 0) {
-    return { flagged: true, reason: 'no ad-platform account connected' };
+    return { flagged: false, reason: 'no ad-platform account configured' };
   }
   const now = nowMs;
   const hasValid = adAccounts.some(

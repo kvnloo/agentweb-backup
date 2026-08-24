@@ -808,7 +808,7 @@ Tool result: ${resultJson}`;
       agentModeService.callLLM(
         ARTIFACT_EXTRACT_MODEL,
         [{ role: 'user', content: prompt }],
-        { max_completion_tokens: 600, temperature: 0 },
+        { max_completion_tokens: 600, temperature: 0, taskClass: 'interactive_chat' },
       ),
       LIVE_TOOL_SUMMARY_TIMEOUT_MS,
       `Live tool summary for ${toolName}`,

@@ -213,6 +213,11 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'openrouter/moonshotai/kimi-k2.7-code': withDerivedCache(0.67, 3.4),
   'openrouter/z-ai/glm-5.2': withDerivedCache(0.42, 1.32), // live "70% off" promo vs list
   'openrouter/z-ai/glm-4.7-flash': withDerivedCache(0.06, 0.4),
+  // Perplexity search fees/reasoning charges are additional provider-native
+  // dimensions. OpenRouter's reported `usage.cost` remains authoritative; these
+  // token rates are only the pre-call/local fallback required by this registry.
+  'openrouter/perplexity/sonar-deep-research': withDerivedCache(2, 8),
+  'openrouter/perplexity/sonar-pro-search': withDerivedCache(3, 15),
 
   // ── Embeddings (output side is always 0 — embeddings have no completion) ────
   'text-embedding-3-large': { inPerM: 0.13, outPerM: 0 },

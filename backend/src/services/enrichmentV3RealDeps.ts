@@ -37,8 +37,8 @@ import { extractJson } from './util/extractJson';
 import { getUnipileCompanyService } from './unipileCompanyServiceFactory';
 import { getUnipileProfileService } from './unipileProfileServiceFactory';
 
-// Models — match what v2 enrichment uses (gpt-5-chat-2 via Azure OpenAI; see
-// `crmEnrichmentService.ts:260-261`). Overridable via env for cost tuning.
+// Logical model defaults preserve existing settings while callLLM normalizes
+// retired IDs and owns OpenRouter transport, fallback, and metering.
 const EXTRACT_MODEL      = process.env.CRM_ENRICH_V3_EXTRACT_MODEL      || 'gpt-5-chat-2';
 const CRITIC_MODEL       = process.env.CRM_ENRICH_V3_CRITIC_MODEL       || 'gpt-5-chat-2';
 // The default deployment (gpt-5-chat-2) rejects ANY non-default temperature with
@@ -52,9 +52,8 @@ const CRITIC_TEMPERATURE: number | null =
   process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE !== ''
     ? Number(process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE)
     : null;
-// Model used for Tier 4 web extraction — must support web search tool.
-// Set to a Gemini model (e.g. "gemini-2.0-flash") for Google Search grounding,
-// or an Azure deployment of gpt-4o-search-preview for OpenAI web_search_preview.
+// Model used for Tier 4 extraction. OpenRouter executes the provider-independent
+// web-search server tool, so no model-specific search adapter or secret is needed.
 const WEB_SEARCH_MODEL   = process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL   || EXTRACT_MODEL;
 
 // ─── Identity resolver deps ───────────────────────────────────────────────────

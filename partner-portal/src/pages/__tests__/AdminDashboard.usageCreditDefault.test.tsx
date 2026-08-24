@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "@testing-library/jest-dom";
 import { MemoryRouter } from "react-router-dom";
@@ -112,7 +112,9 @@ describe("AdminDashboard one-time usage credit default", () => {
 
   it("submits $500 when the admin accepts the default", async () => {
     const actor = await openUsageCreditDialog();
-    await actor.type(screen.getByLabelText(/Reason \/ campaign/), "GROW-106 founder grant");
+    fireEvent.change(screen.getByLabelText(/Reason \/ campaign/), {
+      target: { value: "GROW-106 founder grant" },
+    });
     await actor.click(screen.getByRole("button", { name: "Grant Credit" }));
     expect(axios.post).toHaveBeenCalledWith(
       "https://api.test/api/admin/users/credit-user/llm-usage-credit",
