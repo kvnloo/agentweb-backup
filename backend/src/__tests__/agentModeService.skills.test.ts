@@ -427,6 +427,27 @@ describe('AgentModeService - Skills', () => {
       expect(result[0].description).toBe('orphan desc');
     });
 
+    it('should NOT treat a tool as associated when only an unpublished (private/org-shared) skill claims it (ENG-1237)', () => {
+      // loadAuthorizedSkillCatalog's org-sharing bypass mixes unpublished private/
+      // org skills into the same list passed here — a draft skill nobody published
+      // must not be able to silently steal a tool out of __other_skills__ for the
+      // whole org.
+      const publishedSkills = [
+        { skillId: 's1', name: 'S1', toolNames: ['tool1'], isPublished: true },
+        { skillId: 'draft1', name: 'Draft Skill', toolNames: ['tool1', 'orphan_tool'], isPublished: false }
+      ];
+      const mockTools = [
+        { name: 'tool1', definition: { function: { description: 'desc1' } } },
+        { name: 'orphan_tool', definition: { function: { description: 'orphan desc' } } }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).getUnassociatedTools(publishedSkills);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe('orphan_tool');
+    });
+
     it('should exclude infrastructure tools', () => {
       const publishedSkills: any[] = [];
       const mockTools = [
