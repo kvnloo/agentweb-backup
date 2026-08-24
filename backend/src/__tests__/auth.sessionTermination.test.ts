@@ -263,20 +263,50 @@ describe('Session termination on password change', () => {
       expect(result.user).toBeNull();
     });
 
-    it('does NOT apply sessionVersion check to delegate tokens', async () => {
+    // ENG-1506 changed this contract deliberately. This test previously asserted
+    // that delegate tokens bypass the sessionVersion check entirely — but that
+    // bypass was a CONSEQUENCE of the old minting, not a security decision: the
+    // delegate payload carried no `sv` at all, so enforcing the check would have
+    // rejected every delegate token for any customer who had ever changed their
+    // password. The mint now stamps `sv` from the target user, so the comparison
+    // is meaningful and a password change ends delegate sessions too.
+    //
+    // Deliberate consequence: a delegate token minted BEFORE this change carries
+    // no `sv`, so it is rejected against a user whose sessionVersion was already
+    // bumped. Those tokens should not have outlived that password change; a
+    // re-mint is one API call.
+    const delegateFor = (targetUser: any, claims: Record<string, unknown> = {}) => {
       (mockJwt.verify as jest.Mock).mockReturnValue({
         userId: 'admin-1',
         delegateAccess: { adminUserId: 'admin-1', adminEmail: 'a@e.com', targetUserId: 'user-1', targetEmail: 'u@e.com' },
+        ...claims,
       });
       mockUserDb.getUserById.mockImplementation(async (id: string) => {
         if (id === 'admin-1') return { userId: 'admin-1', email: 'a@e.com', isAdmin: true } as any;
-        return { userId: 'user-1', email: 'u@e.com', isAdmin: false, roles: ['customer'], sessionVersion: 9 } as any;
+        return targetUser;
       });
+    };
+
+    it('accepts a delegate token carrying the current sessionVersion', async () => {
+      delegateFor(
+        { userId: 'user-1', email: 'u@e.com', isAdmin: false, roles: ['customer'], sessionVersion: 9 } as any,
+        { sv: 9 },
+      );
 
       const result = await getUserFromToken(reqWithToken());
 
-      // Delegate session resolves to the target user regardless of sessionVersion
       expect(result.user?.userId).toBe('user-1');
+    });
+
+    it('rejects a delegate token minted before the target changed their password', async () => {
+      delegateFor(
+        { userId: 'user-1', email: 'u@e.com', isAdmin: false, roles: ['customer'], sessionVersion: 9 } as any,
+        { sv: 8 },
+      );
+
+      const result = await getUserFromToken(reqWithToken());
+
+      expect(result.user).toBeNull();
     });
   });
 });
