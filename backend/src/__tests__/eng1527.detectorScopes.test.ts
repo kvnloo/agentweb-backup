@@ -247,6 +247,33 @@ describe('ENG-1527 a hand-written tag has to actually fire to count as installed
       expect(verifyGoogleAdsInjection(inHead(LOADER + withArrow), 'AW-99999999')).toBe(true);
     });
 
+    /**
+     * Round 4. Scanning the raw characters cannot tell an ELEMENT from a description of
+     * one, and a developer commenting out an old tag block is ordinary. Both of these
+     * reported a working tag on a page that has none — we skipped writing the tag and the
+     * lander shipped measuring nothing.
+     *
+     * Comments cannot be stripped by regex here either: the loader URL contains `//`, so
+     * the obvious line-comment pattern eats the very thing being looked for. The source is
+     * parsed as JSX instead.
+     */
+    it('ignores a tag block commented out with a JSX comment', () => {
+      const removed = '{/* old approach, removed:\n' + LOADER + '\n' + CONFIG + '\n*/}';
+      expect(verifyGoogleAdsInjection(inHead(removed), 'AW-99999999')).toBe(false);
+    });
+
+    it('ignores a tag block commented out with a JS line comment', () => {
+      const removed = `// ${LOADER}${CONFIG}`;
+      expect(verifyGoogleAdsInjection(removed + '\n' + LAYOUT, 'AW-99999999')).toBe(false);
+    });
+
+    it('reads Next.js <Script> elements, not just lowercase <script>', () => {
+      // What App Router layouts actually use. The previous regex only knew <script.
+      const next = '<Script async src={`https://www.googletagmanager.com/gtag/js?id=AW-99999999`} />'
+        + '<Script id="c" dangerouslySetInnerHTML={{ __html: `' + "gtag('config','AW-99999999');" + '` }} />';
+      expect(verifyGoogleAdsInjection(inHead(next), 'AW-99999999')).toBe(true);
+    });
+
     it('is not fooled by a config call naming a different id in real code', () => {
       const other = `<script>gtag('config', 'AW-12312312312');</script>`;
       expect(verifyGoogleAdsInjection(inHead(LOADER + other), 'AW-99999999')).toBe(false);

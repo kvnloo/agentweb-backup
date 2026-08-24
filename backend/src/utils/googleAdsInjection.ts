@@ -215,67 +215,53 @@ function extractGoogleAdsBlocks(content: string): string[] {
  * `conversionId` "" (removal) => zero blocks remain.
  */
 /**
- * Script elements, split into their attribute text and their inline body.
+ * The script elements a browser would actually render, taken from a JSX PARSE of the
+ * layout source rather than from a regex over its characters.
  *
- * Regex rather than an HTML parser on purpose: this reads layout.tsx SOURCE, which is JSX,
- * and an HTML parser would mangle `{...}` expression containers and self-closing <Script/>.
+ * Scanning the raw text cannot tell an element from a description of one. Both of these
+ * used to report a working tag on a page that has none:
+ *
+ *     {/* old approach, removed:
+ *         <script src="…/gtag/js?id=AW-…"></script>
+ *         <script>gtag('config', 'AW-…');</script>
+ *     *​/}
+ *
+ *     // <script src="…/gtag/js?id=AW-…"></script>
+ *
+ * A developer commenting out an old tag block is ordinary, and the consequence was not:
+ * verify reported the page as already tagged, we skipped writing the tag, and the lander
+ * shipped measuring nothing. Comments cannot be stripped by regex here either — the loader
+ * URL contains `//`, so the obvious line-comment pattern eats the very thing being looked
+ * for. Parsing removes the whole class instead of another special case, and it settles the
+ * self-closing and attribute-boundary questions for free: the parser already knows where a
+ * tag ends, `>` inside a JSX expression and all.
+ *
+ * Both `script` and Next's `Script` count — the second is what App Router layouts use.
  */
 function scriptElements(source: string): Array<{ attrs: string; body: string }> {
   const out: Array<{ attrs: string; body: string }> = [];
-  const opens = /<script\b/gi;
-  let m: RegExpExecArray | null;
-
-  while ((m = opens.exec(source)) !== null) {
-    const attrsStart = m.index + m[0].length;
-
-    // Walk to the end of the opening tag rather than stopping at the first '>'.
-    // JSX attributes routinely contain one — an arrow function, a comparison, a template
-    // literal — and truncating there loses the rest of the attributes, dangerouslySetInnerHTML
-    // most of all. Quotes and braces are tracked so only a top-level '>' ends the tag.
-    let k = attrsStart;
-    let quote: string | null = null;
-    let depth = 0;
-    let tagEnd = -1;
-    while (k < source.length) {
-      const ch = source[k];
-      if (quote) {
-        if (ch === quote && source[k - 1] !== '\\') quote = null;
-      } else if (ch === '"' || ch === "'" || ch === '`') {
-        quote = ch;
-      } else if (ch === '{') {
-        depth++;
-      } else if (ch === '}') {
-        if (depth > 0) depth--;
-      } else if (ch === '>' && depth === 0) {
-        tagEnd = k;
-        break;
-      }
-      k++;
+  // setParentNodes: true — getText() walks to the source file through the parent chain.
+  const sf = ts.createSourceFile('layout.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const isScriptTag = (name: string): boolean => name === 'script' || name === 'Script';
+  const text = (node: ts.Node): string => {
+    try {
+      return node.getText(sf);
+    } catch {
+      return '';
     }
-    if (tagEnd === -1) break; // unterminated tag: nothing further is parseable
-
-    const selfClosing = source[tagEnd - 1] === '/';
-    const attrs = source.slice(attrsStart, selfClosing ? tagEnd - 1 : tagEnd);
-
-    if (selfClosing) {
-      // Decided per tag, in one ordered pass. Two independent passes could not tell a
-      // self-closing tag from an opening one, so `<script … />` paired with whatever
-      // </script> came next and swallowed an unrelated element's contents as its body.
-      out.push({ attrs, body: '' });
-      opens.lastIndex = tagEnd + 1;
-      continue;
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isJsxSelfClosingElement(node) && isScriptTag(text(node.tagName))) {
+      out.push({ attrs: text(node.attributes), body: '' });
+    } else if (ts.isJsxElement(node) && isScriptTag(text(node.openingElement.tagName))) {
+      out.push({
+        attrs: text(node.openingElement.attributes),
+        body: node.children.map(text).join(''),
+      });
     }
-
-    const rest = source.slice(tagEnd + 1);
-    const closeAt = rest.search(/<\/script\s*>/i);
-    if (closeAt === -1) {
-      out.push({ attrs, body: rest });
-      break;
-    }
-    out.push({ attrs, body: rest.slice(0, closeAt) });
-    opens.lastIndex = tagEnd + 1 + closeAt;
-  }
-
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sf, visit);
   return out;
 }
 
