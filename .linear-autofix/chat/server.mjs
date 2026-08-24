@@ -1071,12 +1071,11 @@ function runProc(cmd, args, { timeoutMs = 30000, env } = {}) {
     child.on('close', (code) => { clearTimeout(timer); resolve({ ok: code === 0, code, out, err }); });
   });
 }
-// Local push-to-talk transcription: browser audio -> ffmpeg (16kHz mono wav) -> whisper.cpp -> text.
-// Confined to the configured binary + model on this box; nothing leaves it. { ok, text } | { ok:false, err }.
+// Local push-to-talk transcription: browser audio -> ffmpeg (16kHz mono wav) -> the persistent
+// whisper.cpp server -> text. Nothing leaves the box. { ok, text } | { ok:false, err }.
 async function transcribeAudio(buf) {
   const stt = CHAT.stt || {};
-  if (!stt.enabled) return { ok: false, err: 'stt disabled' };
-  if (!existsSync(stt.bin) || !existsSync(stt.model)) return { ok: false, err: 'stt not installed' };
+  if (!stt.enabled || !stt.serverUrl) return { ok: false, err: 'stt disabled' };
   const dir = mkdtempSync(path.join(os.tmpdir(), 'aw-stt-'));
   try {
     const inFile = path.join(dir, 'in'), wav = path.join(dir, 'a.wav');
@@ -1085,11 +1084,17 @@ async function transcribeAudio(buf) {
       ['-hide_banner', '-loglevel', 'error', '-i', inFile, '-ar', '16000', '-ac', '1', '-f', 'wav', '-y', wav],
       { timeoutMs: 20000 });
     if (!ff.ok || !existsSync(wav)) return { ok: false, err: 'ffmpeg: ' + (ff.err || 'failed').slice(0, 200) };
-    const w = await runProc(stt.bin,
-      ['-m', stt.model, '-f', wav, '-np', '-nt', '-t', String(stt.threads || 4)],
-      { timeoutMs: 60000, env: { ...process.env, LD_LIBRARY_PATH: stt.libDir || '' } });
-    if (!w.ok) return { ok: false, err: 'whisper: ' + (w.err || 'failed').slice(0, 200) };
-    return { ok: true, text: w.out.toString('utf8').replace(/\s+/g, ' ').trim() };
+    const fd = new FormData();
+    fd.append('file', new Blob([readFileSync(wav)], { type: 'audio/wav' }), 'a.wav');
+    fd.append('response_format', 'text');
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 30000);
+    try {
+      const r = await fetch(stt.serverUrl, { method: 'POST', body: fd, signal: ac.signal });
+      if (!r.ok) return { ok: false, err: `whisper-server HTTP ${r.status}` };
+      return { ok: true, text: (await r.text()).replace(/\s+/g, ' ').trim() };
+    } catch (e) { return { ok: false, err: 'whisper-server: ' + String(e.name === 'AbortError' ? 'timeout' : (e.message || e)).slice(0, 120) }; }
+    finally { clearTimeout(timer); }
   } finally { try { rmSync(dir, { recursive: true, force: true }); } catch {} }
 }
 async function polishVoice(identifier, body) {

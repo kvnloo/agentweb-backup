@@ -462,11 +462,14 @@ export const config = {
     // VOICE_ENGINE = 'browser' in chat/ui.html. The Haiku polish pass runs on top either way.
     stt: {
       enabled: true,
-      bin: '/home/ec2-user/whisper/whisper-bin-ubuntu-x64/whisper-cli',
-      libDir: '/home/ec2-user/whisper/whisper-bin-ubuntu-x64',
-      model: '/home/ec2-user/whisper/models/ggml-small.en.bin',
+      // A persistent whisper.cpp server (systemd unit whisper-server.service — base.en, port 8791) holds
+      // the model in RAM, so there's no per-request reload. The chat server just ffmpeg's the audio to
+      // 16kHz mono wav and POSTs it here. base.en on this CPU box is ~1-1.5s (small.en was ~4s).
+      // REVERT: `sudo systemctl disable --now whisper-server` + enabled:false + VOICE_ENGINE='browser'.
+      serverUrl: 'http://127.0.0.1:8791/inference',
       ffmpeg: '/home/ec2-user/bin/ffmpeg',
-      threads: 4,                    // keep CPU polite on the shared box
+      // Model + threads live in the systemd unit; swap speed/accuracy there (tiny.en ~0.6s / base.en
+      // ~1.2s / small.en ~4s) and `systemctl restart whisper-server`.
     },
     full: {
       model: 'sonnet',
