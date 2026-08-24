@@ -4910,12 +4910,29 @@ export async function generateChatResponse(
           try {
             const { resolveSkillsToToolNames } = await import('./subscriptionService');
             const skillToolNames = await resolveSkillsToToolNames(sessionSkillIds);
-            if (skillToolNames.includes('*')) {
+            // ENG-1222: resolveSkillsToToolNames returns ['*'] both when the
+            // caller explicitly asked for wildcard access (sessionSkillIds
+            // itself contains '*') AND when it hit an internal error and
+            // silently failed open — the two are indistinguishable from the
+            // return value alone (subscriptionService.ts's own catch is shared
+            // with other callers that have their own, separately-reasoned
+            // fail-open intent, so it isn't this call site's to change). Only
+            // honor the wildcard when this session's own associatedSkills
+            // actually requested it; otherwise treat it as a resolution
+            // failure rather than expanding to every registered tool — the
+            // hard gate below still catches a genuinely empty result.
+            const explicitWildcard = sessionSkillIds.includes('*');
+            if (skillToolNames.includes('*') && explicitWildcard) {
               // Wildcard: every registered Emma/MCP tool becomes available.
               emmaToolRegistry.getToolNames().forEach(t => toolsToInclude.add(t));
               mcpToolRegistry.getToolNames().forEach(t => toolsToInclude.add(t));
-            } else {
+            } else if (!skillToolNames.includes('*')) {
               skillToolNames.forEach(t => toolsToInclude.add(t));
+            } else {
+              console.error('[generateChatResponse] ENG-1222: resolveSkillsToToolNames returned a wildcard for a non-wildcard session — treating as a resolution failure, not expanding to every tool', {
+                sessionId,
+                sessionSkillIds,
+              });
             }
           } catch (skillErr) {
             console.error('[generateChatResponse] Error resolving session skills to tools:', skillErr);
