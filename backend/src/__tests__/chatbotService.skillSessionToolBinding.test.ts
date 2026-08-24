@@ -51,7 +51,10 @@ const mockAgentModeService = {
 jest.mock('../services/agentModeService', () => {
   const AgentModeService = jest.fn().mockImplementation(() => mockAgentModeService);
   Object.assign(AgentModeService, {
-    FOUNDATION_TOOLS: [],
+    // 'send_notification' is a foundation-only tool never listed in any test
+    // skill's own toolNames, so it distinguishes "came from FOUNDATION_TOOLS"
+    // from "came from resolveSkillsToToolNames".
+    FOUNDATION_TOOLS: ['send_notification'],
     buildWorkPlanContextMessages: jest.fn().mockReturnValue([]),
   });
   return { AgentModeService, agentModeService: mockAgentModeService };
@@ -62,6 +65,11 @@ jest.mock('../services/subscriptionService', () => ({
   resolveSkillsToToolNames: (...args: any[]) => mockResolveSkillsToToolNames(...args),
 }));
 
+const mockGetPublishedSkills = jest.fn().mockResolvedValue([]);
+jest.mock('../services/skillService', () => ({
+  skillService: { getPublishedSkills: (...args: any[]) => mockGetPublishedSkills(...args) },
+}));
+
 const GOOGLE_ADS_TOOL = {
   definition: {
     name: 'list_connected_accounts',
@@ -70,10 +78,22 @@ const GOOGLE_ADS_TOOL = {
   },
 };
 
+const NOTIFICATION_TOOL = {
+  definition: {
+    name: 'send_notification',
+    description: 'Send a notification',
+    inputSchema: { type: 'object', properties: {} },
+  },
+};
+
 jest.mock('../mcp/server/registry', () => ({
   mcpToolRegistry: {
-    getTool: (name: string) => (name === 'list_connected_accounts' ? GOOGLE_ADS_TOOL : undefined),
-    getToolNames: () => ['list_connected_accounts'],
+    getTool: (name: string) => {
+      if (name === 'list_connected_accounts') return GOOGLE_ADS_TOOL;
+      if (name === 'send_notification') return NOTIFICATION_TOOL;
+      return undefined;
+    },
+    getToolNames: () => ['list_connected_accounts', 'send_notification'],
   },
 }));
 
@@ -108,6 +128,7 @@ jest.mock('../utils/s3Utils', () => ({
 }));
 
 import { generateChatResponse, __resetEmmaSystemContextCache, chatbotDb } from '../services/chatbotService';
+import { mcpToolRegistry } from '../mcp/server/registry';
 
 function makeCompletion(content = 'Hello') {
   return {
@@ -152,6 +173,11 @@ function seedSession(overrides: Record<string, any> = {}) {
 describe('generateChatResponse — skill-session tool binding (ENG-1222)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // clearAllMocks() resets call history but NOT a mock's queued
+    // mockResolvedValueOnce() chain — a prior test that queued more once-values
+    // than it consumed would otherwise leak the leftover into this test's first
+    // mockCallLLM() call. Reset it explicitly, then re-establish this block's default.
+    mockCallLLM.mockReset();
     __resetEmmaSystemContextCache();
     putPromiseMock.mockResolvedValue({});
     updatePromiseMock.mockResolvedValue({});
@@ -242,6 +268,9 @@ describe('generateChatResponse — skill-session tool binding (ENG-1222)', () =>
 describe('generateChatResponse — ENG-1222 attribution stamp + fabrication guard', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // See the first describe block's beforeEach for why this is necessary:
+    // clearAllMocks() doesn't drain a mock's queued mockResolvedValueOnce() chain.
+    mockCallLLM.mockReset();
     __resetEmmaSystemContextCache();
     putPromiseMock.mockResolvedValue({});
     updatePromiseMock.mockResolvedValue({});
@@ -317,5 +346,121 @@ describe('generateChatResponse — ENG-1222 attribution stamp + fabrication guar
 
     const content = typeof response === 'string' ? response : response.content;
     expect(content).toContain('Real Customer LLC');
+  });
+});
+
+describe('generateChatResponse — ENG-1222 hard gate, retry, skill prompt, and foundation-tool parity', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // See the first describe block's beforeEach for why this is necessary:
+    // clearAllMocks() doesn't drain a mock's queued mockResolvedValueOnce() chain.
+    mockCallLLM.mockReset();
+    __resetEmmaSystemContextCache();
+    putPromiseMock.mockResolvedValue({});
+    updatePromiseMock.mockResolvedValue({});
+    mockGetDefaultModel.mockResolvedValue('gpt-5.4');
+    mockGetPublishedSkills.mockResolvedValue([]);
+  });
+
+  it('hard-fails a skill session that resolves to zero tools instead of letting the model answer toolless', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockResolveSkillsToToolNames.mockResolvedValue(['unregistered_tool']);
+    // Even FOUNDATION_TOOLS (send_notification) must fail to resolve here — otherwise
+    // the ENG-1222 parity fix means a skill session almost never truly hits zero tools.
+    const getToolSpy = jest.spyOn(mcpToolRegistry, 'getTool').mockReturnValue(undefined);
+
+    const response = await generateChatResponse('sess-1', 'Run list_connected_accounts', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(response).toMatch(/wasn't able to load the tools/i);
+    getToolSpy.mockRestore();
+  });
+
+  it('retries once when the user names an available tool but the model makes zero tool calls', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockResolveSkillsToToolNames.mockResolvedValue(['list_connected_accounts']);
+    mockExecuteTool.mockResolvedValue({ accounts: [{ name: 'Real Customer LLC', id: '999' }] });
+    mockCallLLM
+      .mockResolvedValueOnce(makeCompletion("I don't have the capability to run tools."))
+      .mockResolvedValueOnce(makeToolCallCompletion('list_connected_accounts'))
+      .mockResolvedValueOnce(makeCompletion('Here are the actual returned rows: Real Customer LLC, ID 999.'));
+
+    const response = await generateChatResponse('sess-1', 'Call list_connected_accounts for google_ads', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockCallLLM).toHaveBeenCalledTimes(3);
+    expect(mockExecuteTool).toHaveBeenCalledWith(
+      'anthropic.claude-opus-5', 'list_connected_accounts', expect.anything(), 'user-1', 'sess-1', false, undefined,
+    );
+    const content = typeof response === 'string' ? response : response.content;
+    expect(content).toContain('Real Customer LLC');
+  });
+
+  it('does not retry a normal toolless reply when the user never named an available tool', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockResolveSkillsToToolNames.mockResolvedValue(['list_connected_accounts']);
+    mockCallLLM.mockResolvedValue(makeCompletion('Sure, what would you like to do?'));
+
+    await generateChatResponse('sess-1', 'Hello there', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+  });
+
+  it('injects the installed skill\'s own systemPrompt even on the non-customer portal', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockResolveSkillsToToolNames.mockResolvedValue(['list_connected_accounts']);
+    mockGetPublishedSkills.mockResolvedValue([
+      { skillId: 'google-ads-skill', systemPrompt: 'You are running the Google Ads Pre-Flight Health Gate skill.' },
+    ]);
+    mockCallLLM.mockResolvedValue(makeCompletion('ok'));
+
+    await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockCallLLM).toHaveBeenCalledWith(
+      'anthropic.claude-opus-5',
+      expect.arrayContaining([
+        expect.objectContaining({ role: 'system', content: expect.stringContaining('Pre-Flight Health Gate') }),
+      ]),
+      expect.anything(),
+    );
+  });
+
+  it('unions FOUNDATION_TOOLS onto a skill session even when the skill itself does not redeclare them', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    // The skill only declares list_connected_accounts — not the foundation-only send_notification tool.
+    mockResolveSkillsToToolNames.mockResolvedValue(['list_connected_accounts']);
+    mockCallLLM.mockResolvedValue(makeCompletion('ok'));
+
+    await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockCallLLM).toHaveBeenCalledWith(
+      'anthropic.claude-opus-5',
+      expect.any(Array),
+      expect.objectContaining({
+        tools: expect.arrayContaining([
+          expect.objectContaining({ function: expect.objectContaining({ name: 'list_connected_accounts' }) }),
+          expect.objectContaining({ function: expect.objectContaining({ name: 'send_notification' }) }),
+        ]),
+      }),
+    );
   });
 });
