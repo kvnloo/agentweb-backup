@@ -67,8 +67,10 @@ jest.mock('../services/agentModeService', () => {
 });
 
 const mockGetAllowedSkills = jest.fn().mockResolvedValue(['*']);
+const mockGetPublicAllowedSkills = jest.fn().mockResolvedValue([]);
 jest.mock('../services/subscriptionService', () => ({
   getAllowedSkills: (...args: any[]) => mockGetAllowedSkills(...args),
+  getPublicAllowedSkills: (...args: any[]) => mockGetPublicAllowedSkills(...args),
 }));
 
 const mockGetSkillsByIds = jest.fn().mockResolvedValue([]);
@@ -193,6 +195,7 @@ function resetSharedMocks() {
   updatePromiseMock.mockResolvedValue({});
   mockGetDefaultModel.mockResolvedValue('gpt-5.4');
   mockGetAllowedSkills.mockResolvedValue(['*']);
+  mockGetPublicAllowedSkills.mockResolvedValue([]);
   mockGetSkillsByIds.mockResolvedValue([]);
   mockGetPublishedSkills.mockResolvedValue([]);
   mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(), installedSkillContextMsg: '' });
@@ -274,7 +277,9 @@ describe('generateChatResponse — skill-session tool binding (ENG-1222)', () =>
       isDelegatedAdmin: true,
     });
 
-    expect(mockBuildSkillContext).toHaveBeenCalledWith([], ['*'], [], [], true);
+    // No installed skills → the subscription/published-skills lookups are skipped
+    // entirely (buildSkillContext never consults them for a skill-less session).
+    expect(mockBuildSkillContext).toHaveBeenCalledWith([], [], [], [], true);
     expect(mockCallLLM).toHaveBeenCalledWith(
       'anthropic.claude-opus-5',
       expect.any(Array),
@@ -468,5 +473,141 @@ describe('generateChatResponse — ENG-1222 hard gate, retry, and skill-prompt i
       ]),
       expect.anything(),
     );
+  });
+});
+
+describe('generateChatResponse — ENG-1222 risk-hardening: perf, anonymous users, subscription messaging, false positives', () => {
+  beforeEach(() => {
+    resetSharedMocks();
+  });
+
+  it('skips the subscription/published-skills lookups entirely for a skill-less session', async () => {
+    seedSession({ associatedSkills: [] });
+    mockCallLLM.mockResolvedValue(makeCompletion('ok'));
+
+    await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'customer',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockGetSkillsByIds).not.toHaveBeenCalled();
+    expect(mockGetPublishedSkills).not.toHaveBeenCalled();
+    expect(mockGetAllowedSkills).not.toHaveBeenCalled();
+  });
+
+  it('routes an anonymous (no userId) skill session through getPublicAllowedSkills instead of throwing into zero tools', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    const googleAdsSkill = { skillId: 'google-ads-skill', name: 'Google Ads', description: '', toolNames: ['list_connected_accounts'] };
+    mockGetSkillsByIds.mockResolvedValue([googleAdsSkill]);
+    mockGetPublishedSkills.mockResolvedValue([googleAdsSkill]);
+    mockGetPublicAllowedSkills.mockResolvedValue(['google-ads-skill']);
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(['list_connected_accounts']), installedSkillContextMsg: '' });
+    mockCallLLM.mockResolvedValue(makeCompletion('ok'));
+
+    await generateChatResponse('sess-1', 'Run list_connected_accounts', {
+      portalType: 'partner',
+      // no userId
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockGetAllowedSkills).not.toHaveBeenCalled();
+    expect(mockGetPublicAllowedSkills).toHaveBeenCalled();
+    expect(mockBuildSkillContext).toHaveBeenCalledWith(
+      [googleAdsSkill], ['google-ads-skill'], [googleAdsSkill], ['google-ads-skill'], false,
+    );
+  });
+
+  it('gives an accurate plan-upgrade message (not a generic error) when the hard gate fires due to subscription gating', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockGetAllowedSkills.mockResolvedValue(['some-other-skill']); // does not include google-ads-skill, and not '*'
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(), installedSkillContextMsg: '' });
+
+    const response = await generateChatResponse('sess-1', 'Run list_connected_accounts', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(response).toMatch(/current plan/i);
+    expect(response).not.toMatch(/configuration issue/i);
+  });
+
+  it('still gives the generic configuration-issue message when the hard gate fires for a genuine resolution failure', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockGetAllowedSkills.mockResolvedValue(['*']); // wildcard: not a subscription restriction
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(), installedSkillContextMsg: '' });
+
+    const response = await generateChatResponse('sess-1', 'Run list_connected_accounts', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(response).toMatch(/configuration issue/i);
+    expect(response).not.toMatch(/current plan/i);
+  });
+
+  it('does not block an honest zero-tool reply that merely mentions "actual account" in an innocent context', async () => {
+    seedSession({ associatedSkills: [] });
+    mockCallLLM.mockResolvedValue(makeCompletion(
+      "I can help with that — based on your actual account settings, I'd recommend adjusting your notification preferences."
+    ));
+
+    const response = await generateChatResponse('sess-1', 'How do I manage notifications?', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(response).toContain('actual account settings');
+  });
+
+  it('still blocks the real fabrication pattern (claim + ID-shaped data)', async () => {
+    seedSession({ associatedSkills: [] });
+    mockCallLLM.mockResolvedValue(makeCompletion(
+      'Here are the actual returned rows: Acme Widgets Main, customer ID 123-456-7890.'
+    ));
+
+    const response = await generateChatResponse('sess-1', 'Report the ACTUAL returned rows', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(response).not.toMatch(/Acme Widgets Main/);
+  });
+
+  it('does not retry when the user asks a meta-question about a tool instead of requesting it', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(['list_connected_accounts']), installedSkillContextMsg: '' });
+    mockCallLLM.mockResolvedValue(makeCompletion('list_connected_accounts lists any social or ad accounts you have connected.'));
+
+    await generateChatResponse('sess-1', 'What does list_connected_accounts do?', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+  });
+
+  it('still retries a genuine request that happens to name the tool directly', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(['list_connected_accounts']), installedSkillContextMsg: '' });
+    mockExecuteTool.mockResolvedValue({ accounts: [{ name: 'Real Customer LLC', id: '999' }] });
+    mockCallLLM
+      .mockResolvedValueOnce(makeCompletion("I don't have the capability to run tools."))
+      .mockResolvedValueOnce(makeToolCallCompletion('list_connected_accounts'))
+      .mockResolvedValueOnce(makeCompletion('Here are the actual returned rows: Real Customer LLC, ID 999.'));
+
+    await generateChatResponse('sess-1', 'Call list_connected_accounts for google_ads now.', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockCallLLM).toHaveBeenCalledTimes(3);
   });
 });
