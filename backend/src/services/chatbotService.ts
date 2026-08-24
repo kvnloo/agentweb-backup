@@ -4387,6 +4387,31 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5)
   }
 }
 
+// ENG-1222 follow-up: the Vertex AI Discovery Engine calls below have no
+// timeout of their own and can hang indefinitely — observed directly in a
+// live environment, where a single call blocked an entire chat turn for
+// several minutes. Every chatbotService.ts turn goes through this function
+// (not just skill sessions), so an unbounded hang here stalls the whole
+// generateChatResponse call. Mirrors the same pattern already used
+// independently in v0Service.ts / linkedInOutreachService.ts / etc. — a
+// shared utility would be a separate, larger cleanup, not bundled in here.
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const e: any = new Error(`${label} timed out after ${Math.round(ms / 1000)}s`);
+      e.code = 'KNOWLEDGE_BASE_SEARCH_TIMEOUT';
+      reject(e);
+    }, ms);
+    // Don't keep the event loop alive solely for this guard timer.
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+const KNOWLEDGE_BASE_SEARCH_TIMEOUT_MS = 10_000;
+
 // Function to search platform-wide knowledge base using Vertex AI Search
 export async function searchPlatformKnowledgeBase(query: string, maxResults: number = 10, userId?: string): Promise<ContextChunk[]> {
   try {
@@ -4444,10 +4469,14 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
     };
 
     // Search both knowledge bases in parallel
-    const [publicResults, privateResults] = await Promise.all([
-      publicClient.search({ ...searchRequest, servingConfig: publicServingConfig }),
-      privateClient.search({ ...searchRequest, servingConfig: privateServingConfig })
-    ]);
+    const [publicResults, privateResults] = await withTimeout(
+      Promise.all([
+        publicClient.search({ ...searchRequest, servingConfig: publicServingConfig }),
+        privateClient.search({ ...searchRequest, servingConfig: privateServingConfig })
+      ]),
+      KNOWLEDGE_BASE_SEARCH_TIMEOUT_MS,
+      'searchPlatformKnowledgeBase',
+    );
 
     const results: ContextChunk[] = [];
 
