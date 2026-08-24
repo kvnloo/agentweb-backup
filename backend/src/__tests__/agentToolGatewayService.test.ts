@@ -1204,6 +1204,17 @@ describe('agentToolGatewayService', () => {
     }
   });
 
+  describe('call_attio_api effect classification', () => {
+    it('classifies as read/low-risk (read-only tool, no write actions)', () => {
+      const decision = evaluateAgentToolPolicy({
+        toolName: 'call_attio_api',
+        args: { entity_type: 'LIST_ENTRIES', action: 'COUNT' },
+      });
+      expect(decision.effect).toBe('read');
+      expect(decision.risk).toBe('low');
+    });
+  });
+
   describe('repeated-failure circuit breaker', () => {
     beforeEach(() => {
       _resetAgentToolFailureBreaker();

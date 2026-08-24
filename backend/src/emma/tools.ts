@@ -9042,6 +9042,40 @@ TYPICAL WORKFLOW:
 });
 
 emmaToolRegistry.register({
+  name: 'call_attio_api',
+  definition: {
+    name: 'call_attio_api',
+    description: `Read Attio lead counts, for CPL/attribution reporting.
+
+Read-only. Attio has no equivalent of HubSpot's marketing-asset concepts
+(campaigns, emails, landing pages, workflows, social broadcasts) — this tool
+only covers counting leads synced into an Attio list.
+
+ENTITY_TYPE + ACTION MATRIX:
+
+  LIST_ENTRIES → COUNT (list_id)
+               Returns the number of entries in the given Attio list — use
+               this to confirm how many leads a synced AgentWeb list has
+               pushed into Attio (e.g. for CPL = spend / count).`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        entity_type: { type: 'string', enum: ['LIST_ENTRIES'], description: 'Attio resource to operate on.' },
+        action:      { type: 'string', enum: ['COUNT'], description: 'Action to perform. See ACTION MATRIX.' },
+        list_id:     { type: 'string', description: 'Attio list ID. Required for LIST_ENTRIES COUNT.' },
+        account_id:  { type: 'string', description: 'Attio account ID. Required when the user has multiple Attio accounts connected — the error message will list them; ask the user which to use.' },
+      },
+      required: ['entity_type', 'action'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId;
+    if (!userId) return { success: false, error: 'Authentication required: no user context.' };
+    return agentModeService.handleAttioApi(userId, args);
+  },
+});
+
+emmaToolRegistry.register({
   name: 'read_google_doc',
   definition: {
     name: 'read_google_doc',

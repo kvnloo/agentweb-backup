@@ -334,6 +334,7 @@ import {
   trackingOverrideTokenMatches,
 } from './metaLaunchGate';
 import { HubSpotService } from './hubspotService';
+import { AttioService } from './attioService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
@@ -35095,6 +35096,60 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
       return { success: false, error: err?.message ?? 'HubSpot API call failed.', hubspotError: err?.response?.data ?? null, status: err?.response?.status ?? null };
+    }
+  }
+
+  private async resolveAttioService(userId: string, accountId?: string): Promise<AttioService> {
+    try {
+      return await AttioService.create(userId, accountId);
+    } catch (err: any) {
+      // An explicit account_id or a multi-account ambiguity is actionable by the
+      // caller — surface it instead of silently falling back to token-paste.
+      if (accountId || /multiple attio accounts/i.test(err?.message ?? '')) throw err;
+      // Fall back to token-paste: scan lead lists for Attio apiKeyEncrypted
+    }
+    const { crmDb } = await import('./db');
+    const lists = await crmDb.getLeadListsByUserId(userId);
+    for (const list of lists as any[]) {
+      const attioConfig = list?.externalCrmSyncConfigs?.attio;
+      if (attioConfig?.apiKeyEncrypted) {
+        const { decryptPassword } = await import('../utils/crypto');
+        const { password } = decryptPassword(attioConfig.apiKeyEncrypted);
+        return AttioService.fromToken(password);
+      }
+    }
+    throw new Error('No Attio account connected. Please connect Attio in Settings → External CRM Sync or via OAuth in Connected Accounts.');
+  }
+
+  /**
+   * Emma tool: read-only Attio lead counts, for CPL/attribution reporting.
+   * Deliberately narrower than handleHubspotApi — Attio has no equivalent of
+   * HubSpot's marketing-asset concepts (campaigns, emails, landing pages,
+   * workflows, social broadcasts), so this only covers what was actually
+   * asked for: counting leads in an Attio list.
+   */
+  public async handleAttioApi(userId: string, args: any): Promise<any> {
+    const entityType: string = (args?.entity_type ?? '').toUpperCase();
+    const action: string = (args?.action ?? '').toUpperCase();
+    try {
+      const svc = await this.resolveAttioService(userId, args?.account_id);
+
+      // ─── LIST_ENTRIES ──────────────────────────────────────────────────────
+      if (entityType === 'LIST_ENTRIES') {
+        switch (action) {
+          case 'COUNT': {
+            if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES COUNT.' };
+            const count = await svc.countListEntries(args.list_id);
+            return { success: true, count };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for LIST_ENTRIES. Valid: COUNT.` };
+        }
+      }
+
+      return { success: false, error: `Unknown entity_type "${entityType}". Valid: LIST_ENTRIES.` };
+    } catch (err: any) {
+      return { success: false, error: err?.message ?? 'Attio API call failed.', attioError: err?.response?.data ?? null, status: err?.response?.status ?? null };
     }
   }
 

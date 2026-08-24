@@ -768,4 +768,21 @@ export class AttioService {
       nextCursor: (res.data as any).next_cursor,
     };
   }
+
+  /**
+   * Total entry count for a list. Attio's list-entries endpoint doesn't return
+   * a total in its response envelope, so this pages through with
+   * listListEntries and sums — same page-and-sum shape as
+   * businessFunnelService.fetchLeadCount for AgentWeb's own lead lists.
+   */
+  async countListEntries(listId: string): Promise<number> {
+    let total = 0;
+    let cursor: string | undefined;
+    do {
+      const { entries, nextCursor } = await this.listListEntries(listId, cursor);
+      total += entries.length;
+      cursor = nextCursor;
+    } while (cursor);
+    return total;
+  }
 }

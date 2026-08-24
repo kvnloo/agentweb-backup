@@ -423,4 +423,28 @@ describe('AttioService', () => {
       expect(entryId).toBe('entry-1');
     });
   });
+
+  describe('countListEntries', () => {
+    it('propagates an error from the underlying request (e.g. invalid/unknown list)', async () => {
+      mockAxiosPost.mockRejectedValue(new Error('Not Found'));
+      await expect(service.countListEntries('bad-list')).rejects.toThrow('Not Found');
+    });
+
+    it('returns 0 for an empty list', async () => {
+      mockAxiosPost.mockResolvedValue({ data: { data: [] } });
+      const count = await service.countListEntries('list-abc');
+      expect(count).toBe(0);
+    });
+
+    it('sums entries across multiple pages', async () => {
+      mockAxiosPost
+        .mockResolvedValueOnce({ data: { data: [{ id: 1 }, { id: 2 }], next_cursor: 'page-2' } })
+        .mockResolvedValueOnce({ data: { data: [{ id: 3 }], next_cursor: undefined } });
+
+      const count = await service.countListEntries('list-abc');
+
+      expect(count).toBe(3);
+      expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+    });
+  });
 });
