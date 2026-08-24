@@ -11,13 +11,25 @@ const HAVEN_USER_ID = "a3917669-1c7d-45ed-8ef9-f454de109b6f";
 
 const META_API_VERSION = process.env.META_API_VERSION || "v25.0";
 
-// How many days back from "yesterday" to re-pull and overwrite each run. Ad platforms
-// keep attributing click-through conversions back to a day for a while after it ends —
-// pulling a day only once would let our stored number silently drift out of sync with
-// what Meta's own dashboard shows for that same day later. This is a starting
-// assumption, not a researched attribution-window constant — confirm against Meta's
-// actual attribution-window docs and adjust if it needs to be longer.
-const SETTLING_WINDOW_DAYS = 3;
+// How many days back from "yesterday" to re-pull and overwrite each run.
+//
+// Sized against Meta's INSIGHTS MUTABILITY window, which is 28 days — NOT the conversion
+// ATTRIBUTION window (~7 days). They are different things and only the former governs when a
+// stored row stops moving. Meta, verbatim (Marketing API > Insights > Best Practices):
+// "Insights refresh every 15 minutes and do not change after 28 days of being reported",
+// plus "metrics may continue updating for a couple of days after an ad completes its run".
+// It applies to insights generally, not only to conversion fields.
+//
+// This was 3, with a TODO asking to confirm against "Meta's actual attribution-window docs" —
+// that framing pointed at the 7-day number, which is the wrong window. At 3 we froze a day's row
+// while Meta kept revising it for another 25 days, which breaks ENG-885 Phase 1's own gate
+// ("stored figures reconcile with Meta Ads Manager to within 1%") in the flattering direction:
+// reconcile inside 3 days and it passes, reconcile at day 10 and the gap has opened.
+//
+// Cost is one Graph call per day per account, so 28 is trivial at this card's Haven-only scope.
+// If this ever covers the fleet, TIER it (daily for the recent tail, weekly for days 8-28) —
+// the cost multiplies by accounts and by pagination, not just by days.
+const SETTLING_WINDOW_DAYS = 28;
 
 function toDateStr(d: Date): string {
   return d.toISOString().split("T")[0];
@@ -77,6 +89,12 @@ export async function snapshotMetaMetricsForDate(
     throw new Error(`[ENG-916] User ${userId} not found`);
   }
 
+  // ⚠ SCOPE LIMIT, deliberate while this card is Haven-only: getMetaAccountCredentials returns
+  // exactly ONE {accountId, accessToken}. A user with two connected ad accounts therefore gets one
+  // snapshotted and NO signal that the others were skipped. One ad account can also sit on several
+  // user records (21 connection rows resolve to 15 distinct ad accounts), so a user-keyed read can
+  // resolve an account whose leads live under a different record. Widening past Haven means
+  // iterating accounts here, not just changing HAVEN_USER_ID.
   const { accountId, accessToken } = await getMetaAccountCredentials(user, userId);
 
   // No campaign filter — this IS the dynamic-discovery step. Meta's level=campaign
@@ -152,6 +170,12 @@ export async function snapshotMetaMetricsForDate(
       // Previously hardcoded to 0, which made a real lost-attribution count indistinguishable
       // from a genuine zero (ENG-916 Greptile P1 #3); the value now survives past the cron's
       // own log line.
+      //
+      // ⚠ CONSUMERS MUST NOT SUM THIS ACROSS CAMPAIGNS. It is one account-wide figure repeated
+      // on each row, so summing N campaign rows reports N x the real number. Read it from any
+      // single row for the date, or take MAX across the date's rows — never SUM. This is the
+      // same shape as the spendDuringAbsence over-count in the tracking monitor, where three
+      // families over five $200 days reported $3,000 against $1,000 actually spent.
       unattributedLeadCount,
       snapshotSource: "daily",
       capturedAt,

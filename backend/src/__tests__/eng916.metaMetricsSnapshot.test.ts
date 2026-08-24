@@ -278,7 +278,7 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
   });
 });
 
-describe('ENG-916 runMetaMetricsSnapshot (3-day settling window + per-day failure isolation)', () => {
+describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failure isolation)', () => {
   const cronModule = jest.requireActual('../cron/metaMetricsSnapshotCron');
 
   beforeEach(() => {
@@ -294,7 +294,11 @@ describe('ENG-916 runMetaMetricsSnapshot (3-day settling window + per-day failur
     mockMetricsDb.putSnapshot.mockResolvedValue(undefined as any);
   });
 
-  it('processes 3 distinct dates (today-1 through today-3), not just yesterday', async () => {
+  // The 28 below is PINNED ON PURPOSE rather than imported from the module. Asserting against
+  // the constant itself would pass for any value, which is exactly how this drifted to 3 in the
+  // first place — the number is sized against Meta's documented 28-day insights-mutability window,
+  // so changing it must be a deliberate edit here too.
+  it('processes 28 distinct dates (today-1 through today-28), not just yesterday', async () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
@@ -305,7 +309,7 @@ describe('ENG-916 runMetaMetricsSnapshot (3-day settling window + per-day failur
     await runMetaMetricsSnapshot();
 
     const datesWritten = mockMetricsDb.putSnapshot.mock.calls.map((c: any) => c[0].date);
-    expect(new Set(datesWritten).size).toBe(3);
+    expect(new Set(datesWritten).size).toBe(28);
   });
 
   it('logs and continues when one day in the window fails, instead of aborting the whole run', async () => {
@@ -326,8 +330,8 @@ describe('ENG-916 runMetaMetricsSnapshot (3-day settling window + per-day failur
 
     await runMetaMetricsSnapshot();
 
-    // 2 of the 3 days should still have succeeded and written a row.
-    expect(mockMetricsDb.putSnapshot).toHaveBeenCalledTimes(2);
+    // 27 of the 28 days should still have succeeded and written a row.
+    expect(mockMetricsDb.putSnapshot).toHaveBeenCalledTimes(27);
     // The failure must be visible, not swallowed silently.
     expect(errorSpy).toHaveBeenCalled();
     errorSpy.mockRestore();
