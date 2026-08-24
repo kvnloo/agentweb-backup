@@ -296,8 +296,28 @@ function chatHistoryFailureScope(args: unknown): string {
   return `sync=${sync}|limit=${limit}|hours=${hours}`;
 }
 
+// ENG-969: get_lead_details returns a structured not-found failure ("The
+// specified lead does not exist in this list") for a lead_id/list_id pair
+// that doesn't resolve — a normal per-entity outcome, not a retry spiral.
+// Verified in production session 6082779b-f9f1-4e38-a8eb-34abbc3da419: three
+// DIFFERENT lead ids each 404'd against the wrong list (unscoped, so all
+// three shared the tool-wide '' bucket) and tripped the breaker at threshold
+// 3, permanently blocking every later call in the run — including ones with
+// corrected, valid list_id + lead_id. Scope by the target lead (exactly like
+// the ENG-182/ENG-313 LinkedIn per-recipient scoping above) so a miss on one
+// lead doesn't block a call for a different lead; a genuine repeat on the
+// SAME lead still trips.
+function leadDetailsFailureScope(args: unknown): string {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const record = args as Record<string, unknown>;
+  const listId = typeof record.list_id === 'string' ? record.list_id.trim() : '';
+  const leadId = typeof record.lead_id === 'string' ? record.lead_id.trim() : '';
+  return `${listId}|${leadId}`.slice(0, ERROR_KEY_LENGTH);
+}
+
 function failureScope(toolName: string, args: unknown): string {
   if (toolName === 'get_chat_history') return chatHistoryFailureScope(args);
+  if (toolName === 'get_lead_details') return leadDetailsFailureScope(args);
   if (toolName !== 'linkedin_outreach') return '';
   if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
   const record = args as Record<string, unknown>;
