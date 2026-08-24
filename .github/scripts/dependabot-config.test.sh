@@ -6,8 +6,9 @@
 # Unlike its sibling suites in this directory, this one has no script under
 # test -- dependabot.yml is pure declarative config that only GitHub's own
 # Dependabot service interprets, and nothing in this repo can execute it
-# locally (same situation as staging-deploy-gate.test.sh, which documents the
-# same tradeoff). So this parses the real file and asserts its structure:
+# locally. Parsing the real file and asserting its structure is a weaker proof
+# than executing the thing under test, and is deliberately still worth having.
+# So this parses the real file and asserts its structure:
 # that multiple github-actions releases in one week are configured to group
 # into a single PR, and that grouping did NOT regress the weekly cadence, the
 # PR limit, the commit-message prefix, the label, or the SHA-pinning
@@ -22,9 +23,9 @@
 # "Notes for whoever takes it" section says to verify it operationally,
 # not to fake a simulation of it here.
 #
-# Deliberately grep, not PyYAML: same reasoning as staging-deploy-gate.test.sh
-# -- PyYAML is not guaranteed on the runner image, and a missing import here
-# would fail this job for a reason unrelated to the actual contract.
+# Deliberately grep, not PyYAML: PyYAML is not guaranteed on the runner image,
+# and a missing import here would fail this job for a reason unrelated to the
+# actual contract.
 #
 # Run with:  bash .github/scripts/dependabot-config.test.sh
 
