@@ -682,12 +682,24 @@ export class ExternalCrmSyncService {
       return { properties: props.map(p => ({ name: p.name, label: p.label, type: p.type })) };
     }
 
-    // Attio: contacts use People attributes, while deal mappings use Deals attributes.
+    // Attio: contacts use People attributes, while deal mappings use the
+    // deal list's own attributes.
     const svc = auth.type === 'token'
       ? AttioService.fromToken(auth.apiKey!)
       : await AttioService.create(auth.userId!, auth.accountId!);
 
-
+    if (options.objectType === 'deal') {
+      const config = await this.getConfig(userId, listId, provider);
+      const dealListId = config?.attioDealListId;
+      // No deal list yet (nothing pushed with a deal mapping enabled) — fall
+      // back to an empty list; the dialog's mapping combobox already free-text
+      // falls back in this case, same as a HubSpot fetch failure does.
+      if (!dealListId) return { properties: [] };
+      const attrs = await svc.listListAttributes(dealListId);
+      return {
+        properties: attrs.map((a: any) => ({ name: a.api_slug, label: a.title, type: a.type })),
+      };
+    }
 
     // Attio: merge People object attributes + list-entry attributes
 
