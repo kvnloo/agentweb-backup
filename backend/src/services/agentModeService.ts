@@ -34150,6 +34150,90 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * to a PAUSED/DRAFT campaign are not gated here; they are re-checked when that
    * campaign is later enabled/resumed.
    */
+  /**
+   * ENG-1527. Resolve the parent campaign's status and run the creative-addition gate,
+   * failing CLOSED when the answer cannot be established.
+   *
+   * Both call sites used to swallow every failure and proceed, on this rationale:
+   *
+   *   "defence-in-depth (the RESUME / UPDATE→ENABLED gate is the hard guarantee), so a
+   *    transient parent-status lookup failure must NOT break an otherwise-valid create"
+   *
+   * That is exactly backwards for the case this gate exists to cover. The gate only ever
+   * matters when the parent is ALREADY ENABLED — and an already-enabled campaign has no
+   * future RESUME or UPDATE→ENABLED for the "hard guarantee" to fire on. The creative IS
+   * the launch, it serves paid traffic the moment it is created, and this gate is the only
+   * thing standing in front of it. Calling it defence-in-depth described a second layer
+   * that, in this specific situation, does not exist.
+   *
+   * Three ways the old code proceeded without ever checking anything, all silent:
+   *   - the parent lookup threw;
+   *   - the parent lookup returned nothing, so the gate call was skipped entirely;
+   *   - the gate itself threw while fetching the landing page.
+   *
+   * Now: a status we could not determine is treated as possibly-ENABLED and refused. A
+   * status we DID determine to be anything other than ENABLED still proceeds untouched —
+   * there is no launch to guard, so a flaky lookup must not block ordinary staging work.
+   * An approved override still wins, because it is a user's disclosed decision to accept
+   * exactly this risk, and it keeps the refusal from being a dead end.
+   */
+  private async guardCreativeAddition(opts: {
+    customerId: string;
+    action: string;
+    override: boolean;
+    sessionId?: string;
+    finalUrls: Array<string | undefined>;
+    resolveParent: () => Promise<{ campaignResourceName: string; campaignStatus: string | null } | null>;
+  }): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
+    const refuse = async (why: string, campaignResourceName: string, err?: unknown) => {
+      if (opts.override) {
+        console.error(`[ENG-1527] ${opts.action} creative-addition gate unresolved (${why}); proceeding on an approved override:`, err);
+        return { proceed: true };
+      }
+      console.error(`[ENG-1527] ${opts.action} creative-addition gate unresolved (${why}); refusing:`, err);
+      const urls = opts.finalUrls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
+      await chatbotDb.recordGoogleAdsMeasurementCheck(opts.sessionId || '', {
+        customerId: opts.customerId,
+        campaignResourceName,
+        action: opts.action,
+        outcome: 'blocked',
+        urlResults: urls.map(url => ({ url, status: 'unknown', mechanisms: [], error: why })),
+        checkedAt: new Date().toISOString(),
+      });
+      return {
+        proceed: false,
+        blockResult: {
+          success: false,
+          blocked: true,
+          reason: 'tracking_preflight_unresolved',
+          error: `Cannot confirm this creative is safe to add: ${why}. If the parent campaign is already ENABLED the creative starts serving paid traffic immediately, so refusing is the safe answer rather than adding it unchecked. Retry — this is usually transient. Nothing was created.`,
+          trackingCheck: { measured: false, urlResults: [] },
+        },
+      };
+    };
+
+    let parent: { campaignResourceName: string; campaignStatus: string | null } | null;
+    try {
+      parent = await opts.resolveParent();
+    } catch (err) {
+      return refuse('the parent campaign\'s status could not be read from Google Ads', '', err);
+    }
+    if (!parent || !parent.campaignStatus) {
+      return refuse('the parent campaign was not found, or returned no status', parent?.campaignResourceName || '');
+    }
+    // Not a launch: nothing to guard, so a gate failure here cannot cost anything.
+    if (parent.campaignStatus !== 'ENABLED') return { proceed: true };
+
+    try {
+      return await this.enforceGoogleAdsCreativeAdditionGate(
+        opts.customerId, parent.campaignResourceName, parent.campaignStatus,
+        opts.action, opts.override, opts.sessionId, opts.finalUrls,
+      );
+    } catch (err) {
+      return refuse('the landing page tracking check could not be completed', parent.campaignResourceName, err);
+    }
+  }
+
   private async enforceGoogleAdsCreativeAdditionGate(
     customerId: string,
     campaignResourceName: string,
@@ -34693,23 +34777,21 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           }
           // ENG-335: an ad added to an already-live campaign serves paid traffic
           // instantly — gate its final_url like a launch when the parent is ENABLED.
-          // Fail-open on a lookup/gate error: this is defence-in-depth (the RESUME /
-          // UPDATE→ENABLED gate is the hard guarantee), so a transient parent-status
-          // lookup failure must NOT break an otherwise-valid ad creation.
           // ENG-1358: adding a creative to an already-ENABLED campaign is a launch too. The
           // gate already computes the warning; relaying it here is what stops it being
           // computed and discarded — the exact failure this ticket's own comment names.
-          let creativeTrackingWarning: string | undefined;
-          try {
-            const parent = await googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name);
-            if (parent) {
-              const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, parent.campaignResourceName, parent.campaignStatus, 'AD_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
-              if (!gate.proceed) return gate.blockResult;
-              creativeTrackingWarning = gate.warning;
-            }
-          } catch (gateErr) {
-            console.error('[ENG-335] AD_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
-          }
+          // ENG-1527: fails CLOSED when the parent's status cannot be established — see
+          // guardCreativeAddition for why "the RESUME gate still guards it" was inverted.
+          const adGate = await this.guardCreativeAddition({
+            customerId: customer_id,
+            action: 'AD_CREATE',
+            override: overrideTrackingCheck,
+            sessionId: opts?.sessionId,
+            finalUrls: [args.final_url],
+            resolveParent: () => googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name),
+          });
+          if (!adGate.proceed) return adGate.blockResult;
+          const creativeTrackingWarning = adGate.warning;
           let adType = args.type as string;
           if (adType === 'SEARCH') adType = 'RESPONSIVE_SEARCH_AD';
           else if (adType === 'DISPLAY') adType = 'RESPONSIVE_DISPLAY_AD';
@@ -34782,18 +34864,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         // ENG-335: a PMax asset group added to an already-live campaign serves paid
         // traffic instantly — gate its final_url like a launch when the parent is ENABLED.
-        // Fail-open on a lookup/gate error (see AD_CREATE above): defence-in-depth, so a
-        // transient campaign-status lookup failure must NOT break a valid asset-group create.
-        // Same relay as AD CREATE — a PMax asset group on an ENABLED campaign is a launch.
-        let creativeTrackingWarning: string | undefined;
-        try {
-          const campaignStatus = await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name);
-          const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, args.campaign_resource_name, campaignStatus, 'ASSET_GROUP_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
-          if (!gate.proceed) return gate.blockResult;
-          creativeTrackingWarning = gate.warning;
-        } catch (gateErr) {
-          console.error('[ENG-335] ASSET_GROUP_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
-        }
+        // Same relay as AD CREATE — a PMax asset group on an ENABLED campaign is a launch —
+        // and the same ENG-1527 fail-closed treatment, through the same helper so the two
+        // call sites cannot drift apart.
+        const assetGroupGate = await this.guardCreativeAddition({
+          customerId: customer_id,
+          action: 'ASSET_GROUP_CREATE',
+          override: overrideTrackingCheck,
+          sessionId: opts?.sessionId,
+          finalUrls: [args.final_url],
+          resolveParent: async () => ({
+            campaignResourceName: args.campaign_resource_name,
+            campaignStatus: await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name),
+          }),
+        });
+        if (!assetGroupGate.proceed) return assetGroupGate.blockResult;
+        const creativeTrackingWarning = assetGroupGate.warning;
         const assetGroup = await googleAdsService.createAssetGroup(userId, customer_id, {
           name: args.name,
           campaignResourceName: args.campaign_resource_name,
