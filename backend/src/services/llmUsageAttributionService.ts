@@ -47,6 +47,21 @@ export interface AttributionRow {
   cacheWriteTokens?: number;
   costMicroUsd: number;
   callCount?: number;
+  /**
+   * Present only on per-unit VENDOR rows (ENG-1519).
+   *
+   * `recordVendorUsage` shares this ledger with token-priced LLM calls and
+   * namespaces the model slot as `{provider}:{operation}` — deliberately, so
+   * that two vendors cannot collide on a `{date}#{model}#{feature}` sort key.
+   * Nothing here could tell such a row apart, so `twitter:get_user_tweets`
+   * was aggregated as if it were a model and rendered to the customer as one,
+   * in the very list whose purpose is recommending which model to switch.
+   *
+   * Both are required, matching `isVendorEntry`: an LLM row may carry a
+   * provider and is still token-priced spend, not a vendor entry.
+   */
+  provider?: string;
+  unit?: string;
 }
 
 export interface CostDriver {
@@ -69,6 +84,15 @@ const SOURCE_TAGS: readonly string[] = ["scheduled", "interactive"];
 export interface CostAttribution {
   totalCostMicroUsd: number;
   byModel: CostDriver[];
+  /**
+   * Per-unit vendor calls (ENG-1519), keyed `{provider}:{operation}`.
+   *
+   * Null when the cycle contains none. Separated from `byModel` because they
+   * are not models: they cannot be switched, have no cheaper equivalent, and
+   * appearing in that list made every real model's share understate itself
+   * against a denominator holding a non-model.
+   */
+  byVendor: CostDriver[] | null;
   byFeature: CostDriver[];
   /**
    * Scheduled vs interactive, for rows written since the metering tag shipped.
@@ -179,9 +203,11 @@ export function attributeCosts(rows: AttributionRow[]): CostAttribution {
   const byFeature = new Map<string, { cost: number; calls: number }>();
   const bySource = new Map<string, { cost: number; calls: number }>();
   const bySchedule = new Map<string, { cost: number; calls: number }>();
+  const byVendor = new Map<string, { cost: number; calls: number }>();
   let total = 0;
   let unattributed = 0;
   let sourceUnattributed = 0;
+  let vendorCost = 0;
 
   for (const row of rows) {
     const cost = Math.max(0, row.costMicroUsd || 0);
@@ -207,6 +233,22 @@ export function attributeCosts(rows: AttributionRow[]): CostAttribution {
     const model = (row.model || "").trim();
     const feature = normaliseFeature(row.feature);
 
+    // A per-unit vendor call is real spend on this bill, but it is not a model
+    // and must never be offered as one. It still counts toward the total and
+    // toward every other grouping — dropping it would understate the bill,
+    // which is the opposite failure.
+    const isVendor = row.provider != null && row.unit != null;
+    if (isVendor && model) {
+      const v = byVendor.get(model) || { cost: 0, calls: 0 };
+      byVendor.set(model, { cost: v.cost + cost, calls: v.calls + calls });
+      vendorCost += cost;
+      if (feature) {
+        const f = byFeature.get(feature) || { cost: 0, calls: 0 };
+        byFeature.set(feature, { cost: f.cost + cost, calls: f.calls + calls });
+      }
+      continue;
+    }
+
     // A row missing either dimension cannot be placed. It is added to an explicit
     // remainder so the parts still sum to the whole (AC2) — the failure mode to
     // avoid is a driver list that quietly totals less than the bill.
@@ -221,7 +263,11 @@ export function attributeCosts(rows: AttributionRow[]): CostAttribution {
     byFeature.set(feature, { cost: f.cost + cost, calls: f.calls + calls });
   }
 
-  const attributed = [...byModel.values()].reduce((s, v) => s + v.cost, 0);
+  // Vendor spend IS attributed — to a vendor rather than to a model. Leaving it
+  // out here would report it as unattributable and break `reconciles`, turning
+  // a naming fix into a false claim that the ledger does not add up.
+  const attributed =
+    [...byModel.values()].reduce((s, v) => s + v.cost, 0) + vendorCost;
 
   // Available the moment ANY row carries the tag. A cycle that straddles the
   // cutover reports the split it can prove plus the remainder it cannot, rather
@@ -240,6 +286,7 @@ export function attributeCosts(rows: AttributionRow[]): CostAttribution {
   return {
     totalCostMicroUsd: total,
     byModel: toDrivers(byModel, total),
+    byVendor: byVendor.size > 0 ? toDrivers(byVendor, total) : null,
     byFeature: toDrivers(byFeature, total),
     bySource: sourceAvailable ? toDrivers(bySource, total) : null,
     bySchedule: scheduleAvailable ? toDrivers(bySchedule, total) : null,

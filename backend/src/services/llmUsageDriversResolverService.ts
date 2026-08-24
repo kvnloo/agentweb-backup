@@ -311,6 +311,11 @@ export async function previewUsageRunway(
     cacheWriteTokens: r.cacheWriteTokens,
     costMicroUsd: r.costMicroUsd || 0,
     callCount: r.callCount,
+    // ENG-1519: carried through so attribution can tell a per-unit vendor call
+    // from a token-priced model call. Without them every vendor row was
+    // aggregated as a model.
+    provider: r.provider,
+    unit: r.unit,
   }));
 
   const observedByDate = new Map<string, number>();
@@ -431,6 +436,11 @@ export async function resolveUsageDrivers(
     cacheWriteTokens: r.cacheWriteTokens,
     costMicroUsd: r.costMicroUsd || 0,
     callCount: r.callCount,
+    // ENG-1519: carried through so attribution can tell a per-unit vendor call
+    // from a token-priced model call. Without them every vendor row was
+    // aggregated as a model.
+    provider: r.provider,
+    unit: r.unit,
   }));
 
   const attribution = attributeCosts(ledger);
