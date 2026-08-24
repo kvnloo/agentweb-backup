@@ -152,6 +152,35 @@ describe('genuinely publish-gate-withheld scheduled runs are excluded from the j
     expect(result?.score).toBe(2);
   });
 
+  it('still excludes a run admitted authorized=true if consent was revoked mid-run (revoked marker variant)', async () => {
+    const revokedMessages: ChatMessage[] = [
+      { role: 'user', content: 'Draft and post today\'s LinkedIn update.' },
+      {
+        role: 'assistant',
+        content: 'Drafted the post.',
+        metadata: { toolCalls: [{ name: 'update_knowledge_base_file' }] },
+      } as any,
+      {
+        role: 'assistant',
+        content:
+          'Saved the draft; nothing was posted because publish authorization was revoked mid-run.\n\n' +
+          "PUBLISH WITHHELD: this schedule's publish authorization has been revoked.",
+      },
+    ];
+
+    const result = await scoreSessionIfNeeded(
+      withheldSession({
+        messages: revokedMessages,
+        messageCount: revokedMessages.length,
+        publishAdmission: { authorized: true, tools: ['post_on_connected_account'], recordedAt: '2026-01-01T00:00:00Z' },
+      })
+    );
+
+    expect(result).toBeNull();
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(mockUpdateSatisfaction).not.toHaveBeenCalled();
+  });
+
   it('does NOT exclude a scheduled run whose last turn is not from the assistant (still mid-flight, handled elsewhere)', async () => {
     mockCallLLM.mockResolvedValue(makeLLMResponse(5, 'ok', { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 }));
 
