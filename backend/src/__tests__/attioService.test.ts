@@ -235,6 +235,24 @@ describe('AttioService', () => {
     });
   });
 
+  describe('deleteListEntry', () => {
+    it('calls delete with the correct list and entry id', async () => {
+      mockAxiosDelete.mockResolvedValue({ data: {} });
+
+      await service.deleteListEntry('list-abc', 'entry-1');
+
+      expect(mockAxiosDelete).toHaveBeenCalledWith(
+        'https://api.attio.com/v2/lists/list-abc/entries/entry-1',
+        expect.any(Object)
+      );
+    });
+
+    it('throws on API error', async () => {
+      mockAxiosDelete.mockRejectedValue(new Error('Not found'));
+      await expect(service.deleteListEntry('list-abc', 'bad-entry')).rejects.toThrow('Not found');
+    });
+  });
+
   // ─── Companies ───────────────────────────────────────────────────
 
   describe('listCompanies', () => {

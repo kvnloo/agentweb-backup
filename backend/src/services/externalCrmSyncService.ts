@@ -795,6 +795,16 @@ export class ExternalCrmSyncService {
       const svc = auth.type === 'token'
         ? AttioService.fromToken(auth.apiKey!)
         : await AttioService.create(auth.userId!, auth.accountId!);
+      // Symmetric with HubSpot's contact+deal deletion above — Attio's deal
+      // analog (a List Entry) must also be removed, or it's orphaned in the
+      // workspace. Non-critical: an entry-deletion failure shouldn't block
+      // deleting the Person record.
+      const entryId = lead.syncMetadata?.attio_list_entry_id ?? lead.customFields?.attio_list_entry_id;
+      if (entryId && config.attioDealListId) {
+        await svc.deleteListEntry(config.attioDealListId, entryId).catch(err =>
+          console.error(`[ExternalCrmSync] deleteLeadFromCrm: failed to delete list entry ${entryId}:`, err.message)
+        );
+      }
       const recordId = lead.syncMetadata?.attio_record_id ?? lead.customFields?.attio_record_id;
       if (recordId) {
         await svc.deletePerson(recordId);
@@ -1305,17 +1315,6 @@ export class ExternalCrmSyncService {
     }
     config.updatedAt = now;
     await this.saveUpdatedConfig(config);
-  }
-
-  private mergeAttioEntryMappings(
-    customMappings: FieldMapping[] = [],
-    legacyDealMappings: FieldMapping[] = []
-  ): FieldMapping[] {
-    const merged = new Map<string, FieldMapping>();
-    for (const mapping of [...DEFAULT_ATTIO_CUSTOM_MAPPING, ...legacyDealMappings, ...customMappings]) {
-      merged.set(mapping.agentwebField, mapping);
-    }
-    return Array.from(merged.values());
   }
 
   private async syncHubSpotStatusOptions(

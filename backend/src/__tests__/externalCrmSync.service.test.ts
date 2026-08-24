@@ -64,6 +64,7 @@ const mockAttioServiceInstance = {
   getAllPeopleAttributes: jest.fn().mockResolvedValue([]),
   listListAttributes: jest.fn().mockResolvedValue([]),
   deletePerson: jest.fn().mockResolvedValue(undefined),
+  deleteListEntry: jest.fn().mockResolvedValue(undefined),
 };
 
 jest.mock('../services/hubspotService', () => ({
@@ -1798,6 +1799,45 @@ describe('ExternalCrmSyncService', () => {
       });
 
       expect((mockHubSpotServiceInstance as any).deleteContact).toHaveBeenCalledWith('c123');
+    });
+
+    it('calls Attio deletePerson when deleteOnPush=true and attio_record_id exists', async () => {
+      const config = makeConfig({ provider: 'attio', deleteOnPush: true });
+      mockListWithConfig(config, 'attio');
+
+      await service.deleteLeadFromCrm('user1', 'list1', 'attio', {
+        leadId: 'l1', email: 'a@b.com',
+        syncMetadata: { attio_record_id: 'p123' },
+      });
+
+      expect(mockAttioServiceInstance.deletePerson).toHaveBeenCalledWith('p123');
+      expect(mockAttioServiceInstance.deleteListEntry).not.toHaveBeenCalled();
+    });
+
+    it('also deletes the Deal List Entry when attio_list_entry_id exists (Gap: HubSpot deletes contact+deal, Attio must delete person+entry)', async () => {
+      const config = makeConfig({ provider: 'attio', deleteOnPush: true, attioDealListId: 'deallist_1' });
+      mockListWithConfig(config, 'attio');
+
+      await service.deleteLeadFromCrm('user1', 'list1', 'attio', {
+        leadId: 'l1', email: 'a@b.com',
+        syncMetadata: { attio_record_id: 'p123', attio_list_entry_id: 'entry_1' },
+      });
+
+      expect(mockAttioServiceInstance.deletePerson).toHaveBeenCalledWith('p123');
+      expect(mockAttioServiceInstance.deleteListEntry).toHaveBeenCalledWith('deallist_1', 'entry_1');
+    });
+
+    it('does not fail person deletion when list-entry deletion fails (non-critical)', async () => {
+      const config = makeConfig({ provider: 'attio', deleteOnPush: true, attioDealListId: 'deallist_1' });
+      mockListWithConfig(config, 'attio');
+      mockAttioServiceInstance.deleteListEntry.mockRejectedValueOnce(new Error('already gone'));
+
+      await expect(service.deleteLeadFromCrm('user1', 'list1', 'attio', {
+        leadId: 'l1', email: 'a@b.com',
+        syncMetadata: { attio_record_id: 'p123', attio_list_entry_id: 'entry_1' },
+      })).resolves.not.toThrow();
+
+      expect(mockAttioServiceInstance.deletePerson).toHaveBeenCalledWith('p123');
     });
   });
 });

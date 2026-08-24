@@ -548,6 +548,13 @@ export class AttioService {
     );
   }
 
+  async deleteListEntry(listId: string, entryId: string): Promise<void> {
+    await axiosInstance.delete(
+      `${this.baseUrl}/lists/${listId}/entries/${entryId}`,
+      { headers: this.headers() }
+    );
+  }
+
   async addCompanyToList(listId: string, recordId: string): Promise<void> {
     await axiosInstance.post(
       `${this.baseUrl}/lists/${listId}/entries`,
