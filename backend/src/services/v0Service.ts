@@ -1989,6 +1989,60 @@ async function addPageToExistingRepo(
           }
         }
 
+        // ENG-1524. Sibling of the deployLandingPage check, and it has to exist in BOTH
+        // places for the same reason the pixel check does: a sub-page has its own form
+        // component, and `subPageGoogleAds` above inherits the site's conversion pair, so
+        // the generated handler is expected to fire it. Adding this on one branch only is
+        // how the original gap happened.
+        //
+        // Post-remap file set (ENG-482), like the pixel check: previewFiles is v0's raw
+        // zip, and its scaffold layout.tsx can carry a gtag conversion that never ships —
+        // which would satisfy the inline-pattern arm against code the site never sees.
+        if (subPageGoogleAds) {
+          const adsCheck = validateGoogleAdsConversion(remapFilesForSubPage(previewFiles, slug, name));
+          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call missing for /${slug} (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
+
+            await guardedV0CorrectionMessage({
+              userId,
+              scopeId: existingPage.siteId ?? existingPage.id,
+              chatId: chatId!,
+              attempt: validationAttempt,
+              send: () => withRetry(
+                () => v0.chats.sendMessage({
+                  chatId: chatId!,
+                  message:
+                    "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
+                    "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
+                    "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
+                    "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
+                    "shared root layout. " +
+                    `Issue: ${adsCheck.reason}`,
+                }),
+                "v0 correction message (google ads conversion, sub-page)",
+                undefined, undefined, undefined,
+                { retryOnTimeout: false }
+              ),
+            });
+
+            versionId = await waitForCompletedV0Version(
+              v0,
+              chatId!,
+              "v0 correction (google ads conversion, sub-page)",
+              {
+                heartbeat: () => touchLandingPageRecord(id),
+                deadline: buildDeadline,
+                afterVersionId: versionId,
+              }
+            );
+
+            continue;
+          }
+          if (!adsCheck.ok) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call still missing for /${slug} after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
+          }
+        }
+
         if (leadListId && bridgeOutUrl) {
           // Same post-remap file set rationale as the pixel check above (ENG-482).
           const bridgeCheck = validateBridgeOutRedirect(remapFilesForSubPage(previewFiles, slug, name), bridgeOutUrl);
