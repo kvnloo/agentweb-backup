@@ -34362,6 +34362,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             campaignResourceName: args.campaign_resource_name,
             type: args.type,
             cpcBidMicros: args.cpc_bid_micros,
+            // ENG-1514. ENG-1293 taught createAdGroup to accept a status; this call
+            // site never sent one, so `params.status ?? 'ENABLED'` fired and an
+            // explicit PAUSED was dropped behind a success response. Defaulting to
+            // PAUSED (not ENABLED) matches CAMPAIGN CREATE above and RULE 11.
+            status: args.status || 'PAUSED',
           });
           return { success: true, adGroupResourceName: adGroup.resourceName };
         }
@@ -34467,6 +34472,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             descriptions: args.descriptions,
             finalUrl: args.final_url,
             imageAssetResourceNames: args.image_asset_resource_names,
+            // ENG-1514, same as the AD_GROUP CREATE above: the status the caller
+            // asked for has to reach the service, or a staged ad goes live the
+            // moment its campaign is enabled.
+            status: args.status || 'PAUSED',
           });
           return { success: true, adResourceName: ad.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
         }
