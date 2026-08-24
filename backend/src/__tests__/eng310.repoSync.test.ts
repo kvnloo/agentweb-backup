@@ -374,6 +374,26 @@ describe("syncLeadCaptureFilesToRepo", () => {
     expect(result.captureRouteSkipped).toBe(true);
   });
 
+  it("flags a skipped capture route even when NOTHING is committed (up-to-date no-op)", async () => {
+    // The gap a commit-status flag alone leaves: every other file already matches, so we
+    // return "up-to-date" and never write the route — which was unreadable anyway. A caller
+    // configuring tracking would otherwise see a clean no-op over a route we did not touch.
+    mockGitHub({
+      "middleware.ts": buildLandingPageMiddleware(),
+      "lib/agentweb-track.ts": buildTrackingHelper(),
+      "app/api/capture/route.ts":
+        'const LIST_BY_PATH: Record<string, string> = { "/": someIdentifier\n};\n',
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/pricing": "list_p" }));
+
+    expect(result.committed).toBe(false);
+    expect(result.reason).toBe("up-to-date");
+    expect(result.captureRouteSkipped).toBe(true);
+    expect(mockAxiosPatch).not.toHaveBeenCalled();
+  });
+
   it("commits the capture route normally when the deployed map has no extra paths", async () => {
     // The guard must not become "never update anything". A deployed map that is a subset of
     // ours (a page was added) is not hand-edited and must still be rewritten.

@@ -6623,13 +6623,6 @@ export async function syncMiddlewareAndTrackingHelper(
   reason?: string;
   pushedCommitSha?: string;
   pushTimestampMs?: number;
-  /**
-   * True when the commit deliberately EXCLUDED app/api/capture/route.ts because its deployed
-   * LIST_BY_PATH could not be parsed. `committed: true` alone therefore does not mean the
-   * capture route carries the caller's requested pixel — callers that configure tracking must
-   * check this or they report success over a route they never wrote.
-   */
-  captureRouteSkipped?: boolean;
 }> {
   try {
     const { token: ghToken } = await getGitHubOrgToken();
@@ -6823,10 +6816,12 @@ export async function syncLeadCaptureFilesToRepo(
   pushedCommitSha?: string;
   pushTimestampMs?: number;
   /**
-   * True when the commit deliberately EXCLUDED app/api/capture/route.ts because its deployed
-   * LIST_BY_PATH could not be parsed. `committed: true` alone therefore does NOT mean the
-   * capture route carries the caller's requested pixel — a caller configuring tracking must
-   * check this or it reports success over a route it never wrote.
+   * True when app/api/capture/route.ts was NOT written because its deployed LIST_BY_PATH
+   * could not be parsed. Set on BOTH outcomes it can occur with — a commit that excluded the
+   * route, and an "up-to-date" no-op where the other files already matched. Neither
+   * `committed: true` nor `reason: "up-to-date"` therefore means the route carries the
+   * caller's requested pixel; a caller configuring tracking must check this flag or it
+   * reports success over a route it never wrote.
    */
   captureRouteSkipped?: boolean;
 }> {
@@ -6951,7 +6946,14 @@ export async function syncLeadCaptureFilesToRepo(
         console.log(
           `[V0 SERVICE] Lead-capture files already up to date in ${repoFullName} — skipping commit (no redeploy)`
         );
-        return { committed: false, reason: "up-to-date" };
+        // ⚠ "up-to-date" here can coexist with an UNREADABLE capture route: the other files
+        // matched and the route was never going to be written either way. Without the flag a
+        // caller configuring tracking sees a clean no-op over a route we did not touch.
+        return {
+          committed: false,
+          reason: "up-to-date",
+          ...(captureRouteUnreadable ? { captureRouteSkipped: true } : {}),
+        };
       }
 
       // ⚠ FAIL CLOSED ON A HAND-EDITED CAPTURE ROUTE. If the deployed file claims a page path
