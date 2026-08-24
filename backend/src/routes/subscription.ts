@@ -15,6 +15,7 @@ import {
   undoModelChange,
   ModelChangeConflictError,
   ModelChangeNotFoundError,
+  ModelChangeForbiddenError,
   ModelNotAvailableError,
 } from '../services/llmModelChangeService';
 import { resolveBillingUserId } from '../services/tokenUsageService';
@@ -218,6 +219,12 @@ router.post('/usage-runway/apply', authenticateToken, async (req, res) => {
     });
     return res.json(result);
   } catch (error) {
+    // 403, not 404: the scope exists, the caller may not change it. ENG-1528 —
+    // telling an org owner their colleague's schedule "was not found" while it
+    // is listed on their own billing page is both false and unactionable.
+    if (error instanceof ModelChangeForbiddenError) {
+      return res.status(403).json({ error: error.message });
+    }
     if (error instanceof ModelChangeNotFoundError) {
       return res.status(404).json({ error: error.message });
     }
@@ -248,6 +255,12 @@ router.post('/usage-runway/undo', authenticateToken, async (req, res) => {
     const result = await undoModelChange(userId, changeId.trim());
     return res.json(result);
   } catch (error) {
+    // 403, not 404: the scope exists, the caller may not change it. ENG-1528 —
+    // telling an org owner their colleague's schedule "was not found" while it
+    // is listed on their own billing page is both false and unactionable.
+    if (error instanceof ModelChangeForbiddenError) {
+      return res.status(403).json({ error: error.message });
+    }
     if (error instanceof ModelChangeNotFoundError) {
       return res.status(404).json({ error: error.message });
     }
