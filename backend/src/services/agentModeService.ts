@@ -34185,20 +34185,49 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     finalUrls: Array<string | undefined>;
     resolveParent: () => Promise<{ campaignResourceName: string; campaignStatus: string | null } | null>;
   }): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
-    const refuse = async (why: string, campaignResourceName: string, err?: unknown) => {
-      if (opts.override) {
+    /**
+     * `overridable` is FALSE for every parent-status failure, and that is deliberate.
+     *
+     * The approval the user actually saw says: "this launch will SKIP the tracking
+     * pre-flight check. Paid delivery may start at a destination that cannot report
+     * conversions." It discloses one risk — an unverified destination. It says nothing
+     * about "we could not establish whether this campaign is even live", which is a
+     * different and undisclosed risk. ENG-941 already settled this principle for Meta:
+     * an override the user was not told about is not user-granted, whatever else it was
+     * attached to. So the override only spends against the risk it named.
+     *
+     * That leaves no override path for an unresolved status, which is correct: a lookup
+     * failure is either transient (retry) or a wrong resource name (fix it). Neither is
+     * something to wave through.
+     */
+    const refuse = async (
+      why: string,
+      campaignResourceName: string,
+      opts2: { overridable: boolean; advice: string },
+      err?: unknown,
+    ) => {
+      const urls = opts.finalUrls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
+      // Same per-URL detail in the response as in the run record. Recording richer data
+      // than we return means the caller is told less than we know, and the run record was
+      // the only place this detail survived.
+      const urlResults = urls.map(url => ({ url, status: 'unknown', mechanisms: [] as string[], error: why }));
+
+      if (opts2.overridable && opts.override) {
+        // Recorded, not just logged. The non-override path writes a run record, so leaving
+        // this one to a console line would put a hole in the audit trail at exactly the
+        // point where a human made a deliberate decision.
+        await chatbotDb.recordGoogleAdsMeasurementCheck(opts.sessionId || '', {
+          customerId: opts.customerId, campaignResourceName, action: opts.action,
+          outcome: 'overridden', urlResults, checkedAt: new Date().toISOString(),
+        });
         console.error(`[ENG-1527] ${opts.action} creative-addition gate unresolved (${why}); proceeding on an approved override:`, err);
         return { proceed: true };
       }
+
       console.error(`[ENG-1527] ${opts.action} creative-addition gate unresolved (${why}); refusing:`, err);
-      const urls = opts.finalUrls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
       await chatbotDb.recordGoogleAdsMeasurementCheck(opts.sessionId || '', {
-        customerId: opts.customerId,
-        campaignResourceName,
-        action: opts.action,
-        outcome: 'blocked',
-        urlResults: urls.map(url => ({ url, status: 'unknown', mechanisms: [], error: why })),
-        checkedAt: new Date().toISOString(),
+        customerId: opts.customerId, campaignResourceName, action: opts.action,
+        outcome: 'blocked', urlResults, checkedAt: new Date().toISOString(),
       });
       return {
         proceed: false,
@@ -34206,8 +34235,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           success: false,
           blocked: true,
           reason: 'tracking_preflight_unresolved',
-          error: `Cannot confirm this creative is safe to add: ${why}. If the parent campaign is already ENABLED the creative starts serving paid traffic immediately, so refusing is the safe answer rather than adding it unchecked. Retry — this is usually transient. Nothing was created.`,
-          trackingCheck: { measured: false, urlResults: [] },
+          error: `Cannot confirm this creative is safe to add: ${why}. If the parent campaign is already ENABLED the creative starts serving paid traffic immediately, so refusing is the safe answer rather than adding it unchecked. ${opts2.advice} Nothing was created.`,
+          trackingCheck: { measured: false, urlResults },
         },
       };
     };
@@ -34216,10 +34245,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     try {
       parent = await opts.resolveParent();
     } catch (err) {
-      return refuse('the parent campaign\'s status could not be read from Google Ads', '', err);
+      return refuse(
+        'the parent campaign\'s status could not be read from Google Ads', '',
+        { overridable: false, advice: 'Retry — a read failure here is usually transient.' }, err,
+      );
     }
     if (!parent || !parent.campaignStatus) {
-      return refuse('the parent campaign was not found, or returned no status', parent?.campaignResourceName || '');
+      // Deliberately NOT described as transient: the usual cause is a stale or wrong
+      // ad_group_resource_name, and telling the agent to retry a permanent failure just
+      // buys a retry loop.
+      return refuse(
+        'the parent campaign was not found, or returned no status',
+        parent?.campaignResourceName || '',
+        { overridable: false, advice: 'Check the resource name is current — a campaign that does not resolve will not resolve on a retry either.' },
+      );
     }
     // Not a launch: nothing to guard, so a gate failure here cannot cost anything.
     if (parent.campaignStatus !== 'ENABLED') return { proceed: true };
@@ -34230,7 +34269,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         opts.action, opts.override, opts.sessionId, opts.finalUrls,
       );
     } catch (err) {
-      return refuse('the landing page tracking check could not be completed', parent.campaignResourceName, err);
+      // The ONE overridable case: this is the tracking pre-flight failing to run, which is
+      // exactly the risk the override's confirmation text discloses.
+      return refuse(
+        'the landing page tracking check could not be completed', parent.campaignResourceName,
+        { overridable: true, advice: 'Retry — a landing-page fetch failure is usually transient.' }, err,
+      );
     }
   }
 

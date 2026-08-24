@@ -242,27 +242,67 @@ describe('ENG-335 launch gate — AD CREATE on a live campaign', () => {
     expect(googleAdsService.createAd).not.toHaveBeenCalled();
   });
 
-  it('an approved override still gets through an unresolved lookup, so the refusal is not a dead end', async () => {
-    // The refusal has to keep a recovery path, exactly as the blocked path does: an
-    // override here is a user's disclosed decision to accept this specific risk. It still
-    // has to be a REAL approval — the first call halts and issues the token (ENG-1526).
-    (googleAdsService.getAdGroupCampaign as jest.Mock).mockRejectedValue(new Error('transient GAQL 500'));
-    const args = {
-      customer_id: '1234567890', entity_type: 'AD' as const, action: 'CREATE', ad_group_resource_name: AD_GROUP,
-      type: 'SEARCH', headlines: ['h'], descriptions: ['d'], final_url: 'https://acme.com/compare',
-      override_tracking_check: true,
-    };
-    const halt = await service.handleCallGoogleAdsApi('user-123', args, { sessionId: 'sess-1' });
+  /**
+   * ENG-1527, from CodeRabbit's review. An earlier draft let the override bypass EVERY
+   * refusal reason. It should not, because the approval the user actually saw says only:
+   *
+   *   "this launch will SKIP the tracking pre-flight check. Paid delivery may start at a
+   *    destination that cannot report conversions."
+   *
+   * That discloses an unverified destination. It says nothing about "we could not
+   * establish whether this campaign is even live" — a different, undisclosed risk. ENG-941
+   * settled the principle for Meta: an override the user was not told about is not
+   * user-granted, whatever else it was attached to.
+   */
+  const overrideArgs = {
+    customer_id: '1234567890', entity_type: 'AD' as const, action: 'CREATE', ad_group_resource_name: AD_GROUP,
+    type: 'SEARCH', headlines: ['h'], descriptions: ['d'], final_url: 'https://acme.com/compare',
+    override_tracking_check: true,
+  };
+  const replayApprovedOverride = async () => {
+    const halt = await service.handleCallGoogleAdsApi('user-123', overrideArgs, { sessionId: 'sess-1' });
     expect(halt.awaitingUserConfirmation).toBe(true);
-    expect(googleAdsService.createAd).not.toHaveBeenCalled();
-
-    const result = await service.handleCallGoogleAdsApi(
+    return service.handleCallGoogleAdsApi(
       'user-123',
-      { ...args, tracking_override_token: halt.tracking_override_token },
+      { ...overrideArgs, tracking_override_token: halt.tracking_override_token },
       { sessionId: 'sess-1' },
     );
+  };
+
+  it('an approved override does NOT bypass an unresolved parent status: that risk was never disclosed', async () => {
+    (googleAdsService.getAdGroupCampaign as jest.Mock).mockRejectedValue(new Error('transient GAQL 500'));
+    const result = await replayApprovedOverride();
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('tracking_preflight_unresolved');
+    expect(googleAdsService.createAd).not.toHaveBeenCalled();
+  });
+
+  it('an approved override DOES bypass a failed tracking check, which is the risk it names', async () => {
+    (googleAdsService.getAdGroupCampaign as jest.Mock).mockResolvedValue({ campaignResourceName: CAMPAIGN, campaignStatus: 'ENABLED' });
+    (preflightTrackingGate as jest.Mock).mockRejectedValue(new Error('landing page fetch timed out'));
+    const result = await replayApprovedOverride();
     expect(result.success).toBe(true);
     expect(googleAdsService.createAd).toHaveBeenCalled();
+    // Recorded, not merely logged: a deliberate human decision is exactly what the audit
+    // trail must not lose.
+    expect(recordSpy).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'overridden' }));
+  });
+
+  it('a refusal returns the per-URL detail it wrote to the run record, and tailors its advice', async () => {
+    (googleAdsService.getAdGroupCampaign as jest.Mock).mockResolvedValue(null);
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890', entity_type: 'AD', action: 'CREATE', ad_group_resource_name: AD_GROUP,
+      type: 'SEARCH', headlines: ['h'], descriptions: ['d'], final_url: 'https://acme.com/compare',
+    }, { sessionId: 'sess-1' });
+
+    expect(result.trackingCheck.urlResults).toEqual([
+      expect.objectContaining({ url: 'https://acme.com/compare', status: 'unknown' }),
+    ]);
+    // A campaign that does not resolve will not resolve on a retry, so this one must NOT
+    // be sold as transient — that just buys a retry loop.
+    expect(result.error).toMatch(/check the resource name/i);
+    expect(result.error).not.toMatch(/usually transient/i);
+    expect(recordSpy).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'blocked' }));
   });
 
   it('still creates the ad when the parent is confirmed NOT enabled, even if the gate would fail', async () => {
