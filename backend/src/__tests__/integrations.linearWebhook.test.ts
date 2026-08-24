@@ -286,6 +286,97 @@ describe('POST /api/integrations/linear/webhook — customer symptom verificatio
     expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
   });
 
+  it('rejects a free-text human name as Verifier, even a genuine independent one (ENG-1268 gap, 2026-08-24)', async () => {
+    // Reproduces a live incident: Harsha reviewed the evidence himself, directly, and wrote
+    // "Verifier: Harsha Vankayalapati (direct review, live session, 2026-08-24)" with every
+    // other field correctly filled in — and the gate rejected it anyway, because only the
+    // literal "post-merge-verifier/" prefix was ever accepted. This must keep failing until
+    // the fix below adds an explicit, deliberate human-attestation prefix; a bare name is
+    // exactly the unstructured claim this gate exists to distrust.
+    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
+      {
+        body: [
+          '<!-- customer-symptom-verification:v1 -->',
+          '- Result: pass',
+          '- Evidence type: customer-symptom',
+          '- Checked: the exact reported symptom',
+          '- Method: live production readback, reviewed independently of the implementer',
+          '- Verifier: Harsha Vankayalapati (direct review, live session, 2026-08-24)',
+        ].join('\n'),
+        createdAt: '2026-08-24T00:00:00.000Z',
+      },
+    ]);
+
+    await post(transitionIntoDone());
+
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+    expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
+  });
+
+  it('rejects "harsha-direct" with no run identifier — the prefix alone is not a record', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
+      {
+        body: [
+          '<!-- customer-symptom-verification:v1 -->',
+          '- Result: pass',
+          '- Evidence type: customer-symptom',
+          '- Checked: the exact reported symptom',
+          '- Method: live production readback',
+          '- Verifier: harsha-direct',
+        ].join('\n'),
+        createdAt: '2026-08-24T00:00:00.000Z',
+      },
+    ]);
+
+    await post(transitionIntoDone());
+
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+    expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
+  });
+
+  it('rejects a near-miss prefix that merely starts with the trusted string', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
+      {
+        body: [
+          '<!-- customer-symptom-verification:v1 -->',
+          '- Result: pass',
+          '- Evidence type: customer-symptom',
+          '- Checked: the exact reported symptom',
+          '- Method: live production readback',
+          '- Verifier: harsha-direct-ish/2026-08-24',
+        ].join('\n'),
+        createdAt: '2026-08-24T00:00:00.000Z',
+      },
+    ]);
+
+    await post(transitionIntoDone());
+
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+    expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
+  });
+
+  it('allows a properly structured harsha-direct attestation to reach the resolve bridge', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
+      {
+        body: [
+          '<!-- customer-symptom-verification:v1 -->',
+          '- Result: pass',
+          '- Evidence type: customer-symptom',
+          '- Checked: the exact reported symptom',
+          '- Method: live production readback, reviewed independently of the implementer',
+          '- Verifier: harsha-direct/2026-08-24-live-session',
+        ].join('\n'),
+        createdAt: '2026-08-24T00:00:00.000Z',
+      },
+    ]);
+
+    const res = await post(transitionIntoDone());
+
+    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
+    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
+    expect(linear.reopenIssue).not.toHaveBeenCalled();
+  });
+
   it('fails closed on the reporter-ticket rail when expanded labels are absent', async () => {
     linear.getIssueCommentsDetailed.mockResolvedValueOnce([
       {
