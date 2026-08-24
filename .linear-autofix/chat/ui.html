@@ -325,7 +325,17 @@
   /* Composer */
   #composer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 20px; position: relative; }
   #composer .row { display: flex; gap: 10px; align-items: flex-end; }
-  #input { flex: 1; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font: inherit; resize: none; min-height: 42px; max-height: 160px; }
+  #inputwrap { flex: 1; position: relative; display: block; }
+  #input { display: block; width: 100%; box-sizing: border-box; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font: inherit; resize: none; min-height: 42px; max-height: 160px; overflow-wrap: break-word; }
+  /* Highlight layer behind the composer: mirrors the text so a leading /command token can be coloured
+     in place (accent + heavier) while the rest reads normally. When active the textarea's own text goes
+     transparent (caret stays visible) and this layer — on top, transparent bg, pointer-events:none —
+     paints the visible text. Box metrics mirror the textarea exactly so glyphs line up. */
+  #input.hl { color: transparent; caret-color: var(--text); }
+  #inputHl { position: absolute; inset: 0; box-sizing: border-box; padding: 10px 12px; border: 1px solid transparent; border-radius: 10px; overflow: hidden; pointer-events: none; display: none; }
+  #input.hl ~ #inputHl { display: block; }
+  #inputHl .hlin { font: inherit; white-space: pre-wrap; overflow-wrap: break-word; color: var(--text); }
+  #inputHl .tok { color: var(--accent); font-weight: 600; }
   #input:focus { outline: 1px solid var(--accent); }
   #input:disabled { opacity: .45; cursor: not-allowed; }
   #send { background: var(--accent); color: #0d0f13; border: 0; border-radius: 8px; padding: 10px 18px; font-weight: 600; cursor: pointer; }
@@ -425,7 +435,7 @@
       <div id="attachbar" style="display:none"></div>
       <div class="row">
         <button id="attach" title="Attach images or files for the agent to read">📎</button>
-        <textarea id="input" rows="1" placeholder="Ask about this fix, or tell the agent what to change…"></textarea>
+        <div id="inputwrap"><textarea id="input" rows="1" placeholder="Ask about this fix, or tell the agent what to change…"></textarea><div id="inputHl" aria-hidden="true"><div class="hlin"></div></div></div>
         <button id="send">Send</button>
       </div>
       <input id="fileinput" type="file" accept="image/*,.pdf,.txt,.md,.log,.json,.csv" multiple style="display:none">
@@ -1852,8 +1862,21 @@ $('chat').addEventListener('scroll', () => {
   if (S.stick || !goingDown) hideJump(); else flashJump(); // pill only while scrolling DOWN and not at bottom
 });
 $('jumpDown').onclick = () => scrollBottom();
-function autosize() { const i = $('input'); i.style.height = 'auto'; i.style.height = Math.min(i.scrollHeight, 160) + 'px'; }
+function autosize() { const i = $('input'); i.style.height = 'auto'; i.style.height = Math.min(i.scrollHeight, 160) + 'px'; renderInputHighlight(); }
+// Paint the highlight layer: colour a leading /command token in place. Active only while the line
+// starts with one; otherwise the textarea shows its own (normal-coloured) text and the layer is hidden.
+function renderInputHighlight() {
+  const i = $('input'), hl = $('inputHl'); if (!hl) return;
+  const v = i.value, m = /^(\/\w+)/.exec(v);
+  if (!m) { i.classList.remove('hl'); hl.firstElementChild.innerHTML = ''; return; }
+  i.classList.add('hl');
+  let html = `<span class="tok">${esc(m[1])}</span>${esc(v.slice(m[1].length))}`;
+  if (v.endsWith('\n')) html += ' '; // keep the trailing empty line's height so the caret aligns
+  hl.firstElementChild.innerHTML = html;
+  hl.firstElementChild.style.transform = `translateY(${-i.scrollTop}px)`; // mirror vertical scroll
+}
 $('input').addEventListener('input', () => { S.escArmed = 0; autosize(); updateSlashMenu(); }); // typing breaks the Esc burst
+$('input').addEventListener('scroll', () => { const hl = $('inputHl'); if (hl && $('input').classList.contains('hl')) hl.firstElementChild.style.transform = `translateY(${-$('input').scrollTop}px)`; });
 $('input').addEventListener('blur', () => { if (S.slash) setTimeout(hideSlash, 120); }); // let a row mousedown fire first
 
 // ---------- voice: push-to-talk dictation ----------
@@ -2359,8 +2382,16 @@ document.addEventListener('keydown', (ev) => {
     const composer = $('composer');
     if (!typing && S.sel && composer && composer.style.display !== 'none') { ev.preventDefault(); $('input').focus(); return; }
   }
+  // Ctrl/Cmd+Shift+F focuses the sidebar search box (leaves plain Ctrl+F for the browser's native find).
+  if ((ev.key === 'f' || ev.key === 'F') && (ev.ctrlKey || ev.metaKey) && ev.shiftKey) { ev.preventDefault(); $('search').focus(); return; }
 
   if (ev.key !== 'Escape') return;
+  // Escape also lifts focus out of the search box, or the composer when idle — a standalone "leave the
+  // field". It returns here, BEFORE the turn-stop / esc-burst logic below, so it never contributes to
+  // that Escape. While a turn runs (or an abort-restore/edit is pending), Escape keeps its existing job.
+  const escAe = document.activeElement;
+  if (escAe === $('search')) { ev.preventDefault(); escAe.blur(); return; }
+  if (escAe === $('input') && !S.busy && !S.escArmed && !S.editing && !S.deleting) { ev.preventDefault(); escAe.blur(); return; }
   if (S.editing || S.deleting) { ev.preventDefault(); clearBars(); return; } // Esc cancels an open edit/delete
 
   // Claude-Code-style Esc burst — only while Claude hasn't put ANYTHING in the bubble yet:
