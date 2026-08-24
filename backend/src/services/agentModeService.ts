@@ -5855,6 +5855,60 @@ export class AgentModeService {
       return base;
     }
 
+    // ENG-1523. Preserve a REFUSED launch for ANY tool, for the same reason the
+    // confirmation gate above is preserved: the per-tool minimizers below drop unknown
+    // fields and everything unrecognised falls through to `return {}`. There is no
+    // `call_google_ads_api` branch, so a RULE 7.5 block arrived at the browser as an
+    // empty object — and a block is a RETURNED value, not a throw, so `toolCall.error`
+    // stays unset and the frontend's status ternary resolves it to 'completed'. The
+    // user was shown a green success tick on a launch the backend had just refused.
+    //
+    // Tool-agnostic on purpose: metaLaunchGate returns this exact shape in five places,
+    // so the same erasure was happening to Meta launch blocks. Keyed on the payload,
+    // not the tool name, so a future gate is covered without another branch here.
+    //
+    // A refusal the operator never sees is indistinguishable from one that never
+    // happened, which is the failure the gate exists to prevent.
+    if (result && result.blocked === true) {
+      return {
+        success: false,
+        blocked: true,
+        reason: result.reason,
+        error: result.error,
+        ...(result.trackingCheck ? { trackingCheck: result.trackingCheck } : {}),
+      };
+    }
+
+    // ENG-1523 / ENG-1358. The launch was PERMITTED, but the page proves only that some
+    // Google tag is present — not that an Ads conversion can be recorded. The gate
+    // already computes this warning and its callers deliberately relay it rather than
+    // swallow it; without this branch the minimizer discards it one layer later, which
+    // is the same outcome by a longer route.
+    //
+    // The identifier has to come with it. Two of the four producers return one —
+    // AD CREATE (`adResourceName`) and ASSET_GROUP CREATE (`assetGroupResourceName`) —
+    // and dropping it would leave the persisted toolCalls ledger describing a resource
+    // that was created without saying which, so neither the UI nor any later
+    // reconciliation could find it. Warning the operator while losing the thing the
+    // warning is ABOUT is its own bug.
+    //
+    // Carried by suffix rather than a fixed list so a future producer is covered, and
+    // restricted to top-level strings so this stays a minimizer: no array or nested
+    // object can ride along on the back of a warning.
+    if (result && typeof result.trackingWarning === 'string' && result.trackingWarning) {
+      const identifiers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(result)) {
+        if (k.endsWith('ResourceName') && typeof v === 'string') identifiers[k] = v;
+      }
+      return {
+        success: result.success !== false,
+        trackingWarning: result.trackingWarning,
+        ...(typeof result.message === 'string' ? { message: result.message } : {}),
+        ...identifiers,
+      };
+    }
+
+
     // ENG-1131: preserve the ENG-975 people-search-outage marker. Both tools that
     // can raise it (`linkedin_outreach` search-people/search-parameters and the
     // `find_leads` top-up loop) fall through to the `{}` default at the bottom of
