@@ -208,10 +208,19 @@ describe('AgentModeService - Brand Guidelines Update', () => {
       });
 
       mockUserDb.updateUser.mockResolvedValue({});
+      // Not yet on our own S3 (ENG-933 follow-up), so this exercises the
+      // caller-supplied-asset pinning path too — mock it as a realistic
+      // pass-through re-host rather than leaving it unmocked.
+      const { downloadBrandLogoToS3 } = require('../services/agentMode/brandLogo');
+      downloadBrandLogoToS3.mockResolvedValue({
+        status: 'uploaded',
+        url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/test-user-123/brand/logo/logo.png',
+      });
 
       const result = await (agentModeService as any).updateBrandGuidelines(updateData, userId);
 
       expect(result.success).toBe(true);
+      expect(result.logoAutoPinIssue).toBeUndefined();
     });
 
     it('should allow SVG files for non-logo brand assets (e.g., brandGuide)', async () => {
@@ -445,11 +454,13 @@ describe('AgentModeService - Brand Guidelines Update', () => {
         ]);
       });
 
-      it('does not re-fetch when the caller already supplies a logo asset alongside logoUrl', async () => {
+      it('does not re-fetch when the caller supplies a logo asset already pinned to our own S3', async () => {
         // This is exactly how the onboarding backstop's own persist call is
-        // shaped (brandLogo.ts defaultPersistBrandLogo) — it must not trigger
-        // a second, redundant download.
+        // shaped (brandLogo.ts defaultPersistBrandLogo) — a real S3 URL for
+        // our bucket must not trigger a second, redundant download.
         const userId = 'test-user-123';
+        const pinnedUrl =
+          'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/test-user-123/brand/logo/logo.png';
         mockUserDb.getUserById.mockResolvedValue({
           userId,
           email: 'test@example.com',
@@ -464,16 +475,92 @@ describe('AgentModeService - Brand Guidelines Update', () => {
 
         const result = await (agentModeService as any).updateBrandGuidelines(
           {
-            brandData: { logoUrl: 'https://s3/brand/logo.png' },
-            brandAssets: { type: 'logo', url: 'https://s3/brand/logo.png', filename: 'logo.png' },
+            brandData: { logoUrl: pinnedUrl },
+            brandAssets: { type: 'logo', url: pinnedUrl, filename: 'logo.png' },
           },
           userId,
         );
 
         expect(downloadBrandLogoToS3).not.toHaveBeenCalled();
         expect(result.attachments).toEqual([
-          expect.objectContaining({ type: 'logo', url: 'https://s3/brand/logo.png' }),
+          expect.objectContaining({ type: 'logo', url: pinnedUrl }),
         ]);
+        expect(result.logoAutoPinIssue).toBeUndefined();
+      });
+
+      it('pins a caller-supplied logo asset whose URL is not yet on our own S3 (e.g. Emma constructing her own asset from a raw site URL)', async () => {
+        // ENG-933 live-verification finding: Emma's update_brand_guidelines
+        // tool lets her supply brandAssets directly, and when asked to save a
+        // logo she sometimes builds her own asset object from the raw
+        // site URL instead of leaving brandAssets empty for the auto-pin
+        // above — bypassing rasterisation/pinning entirely unless this path
+        // catches it too.
+        const userId = 'test-user-123';
+        mockUserDb.getUserById.mockResolvedValue({
+          userId,
+          email: 'test@example.com',
+          brandGuidelines: {
+            brandData: { brandName: 'Acme' },
+            attachments: [],
+            createdAt: '2023-01-01T00:00:00.000Z',
+            updatedAt: '2023-01-01T00:00:00.000Z',
+          },
+        });
+        mockUserDb.updateUser.mockResolvedValue({});
+        downloadBrandLogoToS3.mockResolvedValue({
+          status: 'uploaded',
+          url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/test-user-123/brand/logo/logo.png',
+        });
+
+        const result = await (agentModeService as any).updateBrandGuidelines(
+          {
+            brandData: { logoUrl: 'https://acme.com/favicon.ico' },
+            brandAssets: { type: 'logo', url: 'https://acme.com/favicon.ico', filename: 'favicon.ico' },
+          },
+          userId,
+        );
+
+        expect(downloadBrandLogoToS3).toHaveBeenCalledWith('https://acme.com/favicon.ico', userId);
+        expect(result.attachments).toEqual([
+          expect.objectContaining({
+            type: 'logo',
+            url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/test-user-123/brand/logo/logo.png',
+          }),
+        ]);
+        expect(result.brandData.logoUrl).toBe(
+          'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/test-user-123/brand/logo/logo.png',
+        );
+        expect(result.logoAutoPinIssue).toBeUndefined();
+      });
+
+      it('keeps a caller-supplied logo asset as provided (and surfaces logoAutoPinIssue) when pinning it fails', async () => {
+        const userId = 'test-user-123';
+        mockUserDb.getUserById.mockResolvedValue({
+          userId,
+          email: 'test@example.com',
+          brandGuidelines: {
+            brandData: { brandName: 'Acme' },
+            attachments: [],
+            createdAt: '2023-01-01T00:00:00.000Z',
+            updatedAt: '2023-01-01T00:00:00.000Z',
+          },
+        });
+        mockUserDb.updateUser.mockResolvedValue({});
+        downloadBrandLogoToS3.mockResolvedValue({ status: 'download-failed', detail: 'timeout' });
+
+        const result = await (agentModeService as any).updateBrandGuidelines(
+          {
+            brandData: { logoUrl: 'https://dead.example.com/logo.ico' },
+            brandAssets: { type: 'logo', url: 'https://dead.example.com/logo.ico', filename: 'logo.ico' },
+          },
+          userId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.attachments).toEqual([
+          expect.objectContaining({ type: 'logo', url: 'https://dead.example.com/logo.ico' }),
+        ]);
+        expect(result.logoAutoPinIssue).toEqual(expect.stringContaining('provided'));
       });
 
       it('does not touch an already-persisted logo asset (manual/prior upload protection)', async () => {
