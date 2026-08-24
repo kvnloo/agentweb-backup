@@ -3289,7 +3289,23 @@ export async function deployLandingPage(
     // NB: `slug` above names the REPO. The page PATH is the record's own slug — the same
     // convention routes/domains.ts uses to build its domain map (`p.slug ? "/"+p.slug : "/"`).
     const pagePath = record.slug ? `/${record.slug}` : "/";
-    const listByPath: Record<string, string> = record.leadListId ? { [pagePath]: record.leadListId } : {};
+    // ENG-1543: `record` was snapshotted at this function's ENTRY (top of
+    // deployLandingPage), but everything above — the v0 version poll, download,
+    // validation, and correction retries — can run for up to V0_GENERATION_BUDGET_MS
+    // (20 min). A lead list attached via PATCH /generated/:id/lead-list during that
+    // window writes leadListId to DynamoDB immediately, but syncLeadCaptureForPage
+    // no-ops on it (page.githubRepoUrl isn't set yet, so it assumes generation "has it
+    // covered" — see that function's own comment). If this push then baked the STALE
+    // snapshot's leadListId into LIST_BY_PATH, that assumption would be false: the DB
+    // shows the newly-attached list, the deployed capture route still carries the old
+    // one (or none), and nothing ever re-syncs afterward — the page 422s "no lead list
+    // configured" forever despite a correct DB record. Re-read the CURRENT value right
+    // before baking it in so a concurrent attach always wins over a stale snapshot.
+    // Falls back to the entry snapshot only if the re-read itself comes back empty
+    // (e.g. the page was deleted mid-deploy) — never regresses to "no list" when the
+    // snapshot already had one.
+    const currentLeadListId = (await getLandingPage(id, userId))?.leadListId ?? record.leadListId;
+    const listByPath: Record<string, string> = currentLeadListId ? { [pagePath]: currentLeadListId } : {};
 
     // Resolve the Meta pixel to use, if one wasn't already manually set on this
     // record. A Meta API hiccup (or an unconnected/ambiguous account) must never fail

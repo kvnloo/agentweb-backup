@@ -2158,6 +2158,108 @@ describe("v0Service - deployLandingPage", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // ENG-1543: `record` (the leadListId source for the pushed capture route) is
+  // snapshotted ONCE at deployLandingPage's entry, then the function can sit in
+  // v0 generation/build validation for up to V0_GENERATION_BUDGET_MS (20 min). A
+  // lead list attached via PATCH /generated/:id/lead-list during that window
+  // writes leadListId to DynamoDB immediately, but syncLeadCaptureForPage no-ops
+  // on it — `page.githubRepoUrl` isn't set yet (page is still "generating"), and
+  // that function's own comment assumes generation "has it covered". If the push
+  // then bakes the STALE snapshot's leadListId into LIST_BY_PATH, that assumption
+  // is false: the DB shows the newly-attached list, the deployed capture route
+  // still carries the old one (or none), and nothing ever re-syncs afterward —
+  // the page 422s "no lead list configured" forever despite a correct DB record.
+  // ---------------------------------------------------------------------------
+  function pushedCaptureRouteBlob(): string | undefined {
+    return mockAxiosPost.mock.calls
+      .filter((c) => typeof c[0] === "string" && c[0].includes("/git/blobs"))
+      .map((c) => Buffer.from(c[1].content, "base64").toString("utf8"))
+      .find((content) => content.includes("LIST_BY_PATH"));
+  }
+
+  // Both tests below drive mockGet by CALL COUNT rather than a fixed once-queue:
+  // jest.clearAllMocks() (this file's global beforeEach) clears call/results history
+  // but does NOT drain a mockReturnValueOnce queue, so an unconsumed queued value
+  // silently bleeds into the next test's first dynamodb.get() call — exactly the kind
+  // of cross-test pollution these tests would otherwise cause pre-fix (the code path
+  // under test here calls get() a variable number of times depending on whether the
+  // fix has landed). mockReset() + a restored default in afterEach keeps both tests
+  // fully self-contained regardless of run order or how many times get() is called.
+  describe("ENG-1543 leadListId race", () => {
+    afterEach(() => {
+      mockGet.mockReset();
+      mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: null }) });
+    });
+
+    it("SUCCESS (ENG-1543): a lead list attached mid-generation (after the entry-time record snapshot) is baked into the pushed capture route, not the stale one", async () => {
+      // getLandingPage must be re-read right before the push to catch anything written
+      // since entry. First call simulates the snapshot at deployLandingPage's start;
+      // every call after that simulates the CURRENT DB state after a concurrent PATCH
+      // attached the real list while githubRepoUrl was still unset.
+      let getCalls = 0;
+      mockGet.mockImplementation(() => {
+        getCalls += 1;
+        const leadListId = getCalls === 1 ? "list_STALE_DEFAULT" : "list_CORRECT_ATTACHED_MIDFLIGHT";
+        return {
+          promise: () =>
+            Promise.resolve({
+              Item: {
+                id: "page-1",
+                userId: "user-1",
+                name: "Race Landing Page",
+                prompt: "Build a landing page",
+                status: "draft",
+                v0ChatId: "chat_1",
+                iterations: 0,
+                leadListId,
+              },
+            }),
+        };
+      });
+      mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(await createMinimalV0Zip());
+      wireHappyPathDeploy();
+
+      const result = await deployLandingPage("page-1", "user-1");
+
+      expect(result.status).toBe("deployed");
+      expect(getCalls).toBeGreaterThan(1); // proves the re-read actually happened
+      const captureRoute = pushedCaptureRouteBlob();
+      expect(captureRoute).toBeDefined();
+      expect(captureRoute).toContain("list_CORRECT_ATTACHED_MIDFLIGHT");
+      expect(captureRoute).not.toContain("list_STALE_DEFAULT");
+    });
+
+    it("SUCCESS (ENG-1543): the re-read is defensive, not load-bearing — a page with no leadListId at any read still deploys with an empty LIST_BY_PATH (behavior-preserving)", async () => {
+      mockGet.mockImplementation(() => ({
+        promise: () =>
+          Promise.resolve({
+            Item: {
+              id: "page-1",
+              userId: "user-1",
+              name: "Unbound Landing Page",
+              prompt: "Build a landing page",
+              status: "draft",
+              v0ChatId: "chat_1",
+              iterations: 0,
+              // leadListId intentionally absent
+            },
+          }),
+      }));
+      mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(await createMinimalV0Zip());
+      wireHappyPathDeploy();
+
+      const result = await deployLandingPage("page-1", "user-1");
+
+      expect(result.status).toBe("deployed");
+      const captureRoute = pushedCaptureRouteBlob();
+      expect(captureRoute).toBeDefined();
+      expect(captureRoute).toContain("LIST_BY_PATH: Record<string, string> = {}");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // Meta Pixel auto-injection wiring — the resolved metaPixelId flows through
   // the push path into the files array pushed to GitHub, and metaTrackingInstalled is
   // persisted. Mirrors the GTM wiring section above. resolveMetaPixelForUser
