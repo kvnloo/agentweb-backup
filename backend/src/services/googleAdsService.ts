@@ -70,6 +70,116 @@ export type GoogleAdsAccountNode =
   | { type: 'leaf'; customerId: string; name: string; currency: string; loginCustomerId: string; alreadyConnected?: boolean }
   | { type: 'manager'; customerId: string; name: string; children: GoogleAdLeaf[] };
 
+/**
+ * ENG-1527. Refuse a bid target that cannot be written, instead of dropping it.
+ *
+ * Google stores a bid target as a LEAF of the bidding strategy — `target_cpa.target_cpa_micros`,
+ * `target_roas.target_roas`, `maximize_conversions.target_cpa_micros` and so on. There is no
+ * strategy-agnostic field, so a target supplied without a strategy has nowhere to go: both
+ * createCampaign and updateCampaign read it into `params` and then never touch it.
+ *
+ * On UPDATE that was silent whenever any OTHER field was masked — `name` alone made the
+ * update mask non-empty, the mutate went through, and the caller was told "Campaign updated"
+ * while the target it asked for was never sent. Smart bidding then keeps optimising to the
+ * old target, spending real money at the wrong efficiency point, and there is no read-back on
+ * campaigns to catch it.
+ *
+ * Refused rather than inferred: guessing the leaf would mean reading the campaign's current
+ * strategy and writing a MONEY field based on a value that can change between the read and
+ * the write. A refusal costs the caller one retry; a wrong guess costs budget.
+ *
+ * Shared by both call sites deliberately. The same invariant written twice is how these
+ * diverge, which is the shape of most of the defects this ticket collects.
+ */
+/**
+ * Which bid targets each strategy can actually carry, and where Google stores them.
+ *
+ * `target` is bidding_strategy_target, `ceiling` is cpc_bid_ceiling_micros. A `false` here
+ * does not mean "we chose not to support it" — it means the field does not exist on that
+ * strategy at campaign level, so sending it writes nothing.
+ *
+ * cpc_bid_ceiling_micros is documented as "mutable for portfolio bidding strategies only",
+ * which is why it is false on every STANDARD strategy that is not TARGET_IMPRESSION_SHARE
+ * (where it is required) or TARGET_SPEND (where it is the strategy's only knob). We
+ * deliberately do NOT start writing it onto TargetCpa/TargetRoas to "support" it: that is a
+ * new, spend-affecting write we cannot validate against the live API from here, and the
+ * caller is better served by a loud rejection than by a bid cap that may be ignored.
+ */
+const BID_TARGET_SUPPORT: Record<string, { target: boolean; ceiling: boolean; targetMeans: string }> = {
+  MAXIMIZE_CONVERSIONS:      { target: true,  ceiling: false, targetMeans: 'a target CPA' },
+  MAXIMIZE_CONVERSION_VALUE: { target: true,  ceiling: false, targetMeans: 'a target ROAS' },
+  TARGET_CPA:                { target: true,  ceiling: false, targetMeans: 'a target CPA' },
+  TARGET_ROAS:               { target: true,  ceiling: false, targetMeans: 'a target ROAS' },
+  TARGET_IMPRESSION_SHARE:   { target: true,  ceiling: true,  targetMeans: 'an impression share fraction' },
+  TARGET_SPEND:              { target: false, ceiling: true,  targetMeans: '' },
+  MANUAL_CPC:                { target: false, ceiling: false, targetMeans: '' },
+};
+
+/**
+ * Refuse any bid target the selected strategy cannot store, BEFORE anything is sent.
+ *
+ * Google keeps a bid target as a leaf of the bidding strategy (target_cpa.target_cpa_micros
+ * and friends), so a target is only reachable through the strategy branch that owns it.
+ * Every combination this rejects used to be accepted, dropped on the floor, and reported as
+ * `success: true` — the caller was told the campaign was updated while the number they sent
+ * was never written, leaving smart bidding optimising to the OLD target with real money.
+ *
+ * Three distinct shapes of that bug, all confirmed against the mutate payload:
+ *   - no strategy at all: the target had no branch to live in;
+ *   - a strategy that has no such field (MANUAL_CPC + target, TARGET_SPEND + target,
+ *     MAXIMIZE_* + ceiling);
+ *   - a portfolio resource name, where the campaign only carries a REFERENCE and every
+ *     target belongs to the shared strategy object instead.
+ */
+function assertBidTargetIsAddressable(params: {
+  biddingStrategy?: string;
+  biddingStrategyResourceName?: string;
+  biddingStrategyTarget?: number;
+  cpcBidCeilingMicros?: number;
+}): void {
+  const sentTarget = params.biddingStrategyTarget !== undefined;
+  const sentCeiling = params.cpcBidCeilingMicros !== undefined;
+  if (!sentTarget && !sentCeiling) return;
+
+  const supplied = [
+    sentTarget ? 'bidding_strategy_target' : '',
+    sentCeiling ? 'cpc_bid_ceiling_micros' : '',
+  ].filter(Boolean).join(' / ');
+
+  if (!params.biddingStrategy && !params.biddingStrategyResourceName) {
+    throw new Error(
+      `${supplied} cannot be applied on their own: Google stores a bid target as a leaf of the bidding strategy, so the strategy has to be named to know which field to write. Re-send with bidding_strategy set to the campaign's current strategy (read it with call_google_ads_reporting_api: SELECT campaign.bidding_strategy_type FROM campaign). Nothing was sent to Google Ads.`,
+    );
+  }
+
+  // A portfolio/shared strategy is attached to the campaign by REFERENCE. The campaign row
+  // has nowhere to put a target, so one supplied here would be silently discarded — it has
+  // to be written on the shared strategy object itself, where it applies to every campaign
+  // using it.
+  if (params.biddingStrategyResourceName) {
+    throw new Error(
+      `${supplied} cannot be set on a campaign that uses the portfolio bidding strategy ${params.biddingStrategyResourceName}: the campaign only holds a reference to it, and the target lives on the shared strategy, where it applies to every campaign using that strategy. Update the bidding strategy itself instead. Nothing was sent to Google Ads.`,
+    );
+  }
+
+  const support = BID_TARGET_SUPPORT[params.biddingStrategy as string];
+  // An unknown strategy is rejected further down with the list of supported values; let
+  // that error win rather than shadowing it with a less specific one.
+  if (!support) return;
+
+  if (sentTarget && !support.target) {
+    throw new Error(
+      `bidding_strategy_target is not a field of ${params.biddingStrategy}: that strategy has no bid target to set${params.biddingStrategy === 'MANUAL_CPC' ? ' (bids are per ad group / keyword with MANUAL_CPC)' : ''}. Drop bidding_strategy_target, or choose a strategy that takes one (${Object.entries(BID_TARGET_SUPPORT).filter(([, v]) => v.target).map(([k]) => k).join(', ')}). Nothing was sent to Google Ads.`,
+    );
+  }
+
+  if (sentCeiling && !support.ceiling) {
+    throw new Error(
+      `cpc_bid_ceiling_micros is not a campaign-level field of ${params.biddingStrategy}: Google makes the ceiling on this strategy mutable only through a PORTFOLIO bidding strategy, so a ceiling sent here is not stored and the campaign keeps bidding uncapped. Either move the campaign onto a portfolio strategy that carries the ceiling, or drop cpc_bid_ceiling_micros${support.target ? ` and control cost with bidding_strategy_target (${support.targetMeans})` : ''}. Nothing was sent to Google Ads.`,
+    );
+  }
+}
+
 export class GoogleAdsService {
   // Single-flight refresh guard: userId:accountId → in-flight promise
   private refreshInFlight = new Map<string, Promise<string>>();
@@ -700,7 +810,6 @@ export class GoogleAdsService {
     brandBusinessName?: string;
     brandLogoAssetResourceName?: string;
   }): Promise<{ resourceName: string }> {
-    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
     // DISPLAY campaigns cannot use MAXIMIZE_CONVERSIONS with a shared budget
     if (params.type === 'DISPLAY' && params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') {
@@ -710,6 +819,7 @@ export class GoogleAdsService {
     if (params.biddingStrategy && params.biddingStrategyResourceName) {
       throw new Error('Provide either bidding_strategy (a standard strategy) or bidding_strategy_resource_name (a portfolio/shared strategy), not both.');
     }
+    assertBidTargetIsAddressable(params);
     if (!params.biddingStrategy && !params.biddingStrategyResourceName) {
       throw new Error('A campaign requires a bidding strategy: pass bidding_strategy (standard) or bidding_strategy_resource_name (portfolio/shared).');
     }
@@ -717,8 +827,15 @@ export class GoogleAdsService {
     const biddingField: Record<string, any> = {};
     // Portfolio/shared strategy: attach by resource-name reference on campaign.bidding_strategy.
     if (params.biddingStrategyResourceName) biddingField.biddingStrategy = params.biddingStrategyResourceName;
-    else if (params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') biddingField.maximizeConversions = {};
-    else if (params.biddingStrategy === 'MAXIMIZE_CONVERSION_VALUE') biddingField.maximizeConversionValue = {};
+    // A supplied target is carried, matching updateCampaign. This branch used to emit `{}`
+    // unconditionally, so a target sent at CREATE was dropped while the same call at UPDATE
+    // applied it — the campaign launched optimising to no target at all.
+    else if (params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') biddingField.maximizeConversions =
+      params.biddingStrategyTarget !== undefined
+        ? { targetCpaMicros: String(Math.round(params.biddingStrategyTarget * 1_000_000)) }
+        : {};
+    else if (params.biddingStrategy === 'MAXIMIZE_CONVERSION_VALUE') biddingField.maximizeConversionValue =
+      params.biddingStrategyTarget !== undefined ? { targetRoas: params.biddingStrategyTarget } : {};
     else if (params.biddingStrategy === 'TARGET_CPA') biddingField.targetCpa = { targetCpaMicros: String(Math.round((params.biddingStrategyTarget || 0) * 1_000_000)) };
     else if (params.biddingStrategy === 'TARGET_ROAS') biddingField.targetRoas = { targetRoas: params.biddingStrategyTarget || 1 };
     else if (params.biddingStrategy === 'TARGET_IMPRESSION_SHARE') biddingField.targetImpressionShare = {
@@ -738,6 +855,13 @@ export class GoogleAdsService {
         : {};
     }
     else throw new Error(`Unsupported bidding_strategy '${params.biddingStrategy}' for CAMPAIGN CREATE. Supported values: MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, TARGET_CPA, TARGET_ROAS, TARGET_IMPRESSION_SHARE, TARGET_SPEND, MANUAL_CPC.`);
+
+    // Credentials are loaded only AFTER every local validation above, matching
+    // updateCampaign. Loading them first meant an invalid request could trigger a token
+    // refresh and rewrite the stored tokens on its way to being rejected, and a caller
+    // with an expired connection got an authentication error instead of the validation
+    // error that actually described their mistake.
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
     const campaignCreate = {
       name: params.name,
@@ -880,6 +1004,7 @@ export class GoogleAdsService {
     if (params.biddingStrategy && params.biddingStrategyResourceName) {
       throw new Error('Provide either bidding_strategy (a standard strategy) or bidding_strategy_resource_name (a portfolio/shared strategy), not both.');
     }
+    assertBidTargetIsAddressable(params);
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
     const update: any = { resourceName: campaignResourceName };
@@ -894,10 +1019,25 @@ export class GoogleAdsService {
       updateMask.push('bidding_strategy');
     } else if (params.biddingStrategy) {
       if (params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') {
-        update.maximizeConversions = { targetCpaMicros: '0' };
+        // ENG-1527. The target is OPTIONAL on Maximize Conversions, and 0 means "no CPA
+        // constraint" — so 0 is the right value when none was supplied, and was the only
+        // value ever written. A caller who DID supply one got it discarded on a success
+        // response, which is the same silent drop as the guard above by another route.
+        //
+        // This is also what makes that guard's advice safe: it tells the caller to restate
+        // the strategy, and before this, restating MAXIMIZE_CONVERSIONS would have wiped
+        // the very target they were trying to set.
+        update.maximizeConversions = {
+          targetCpaMicros: params.biddingStrategyTarget !== undefined
+            ? String(Math.round(params.biddingStrategyTarget * 1_000_000))
+            : '0',
+        };
         updateMask.push('maximize_conversions.target_cpa_micros');
       } else if (params.biddingStrategy === 'MAXIMIZE_CONVERSION_VALUE') {
-        update.maximizeConversionValue = { targetRoas: 0 };
+        // Same as above: 0 = no ROAS constraint, which is correct only when none was given.
+        update.maximizeConversionValue = {
+          targetRoas: params.biddingStrategyTarget !== undefined ? params.biddingStrategyTarget : 0,
+        };
         updateMask.push('maximize_conversion_value.target_roas');
       } else if (params.biddingStrategy === 'TARGET_CPA') {
         update.targetCpa = { targetCpaMicros: String(Math.round((params.biddingStrategyTarget || 0) * 1_000_000)) };
@@ -1118,15 +1258,29 @@ export class GoogleAdsService {
 
   // ── Keywords ─────────────────────────────────────────────────────────────
 
+  /**
+   * ENG-1527. `status` was hardcoded ENABLED with no parameter at all — the last create on
+   * this surface that could not be staged, after ENG-1514 gave AD_GROUP and AD one.
+   *
+   * The greenfield case was contained (a keyword under a paused ad group cannot serve), but
+   * that containment does not exist on the path that matters: adding keywords to an
+   * ALREADY-LIVE ad group starts buying new queries on the next refresh, at the ad group's
+   * default bid, with no review of match type or bid — and unlike AD CREATE and
+   * ASSET_GROUP CREATE, KEYWORD ADD passes through no gate at all.
+   *
+   * Defaults to PAUSED, matching CAMPAIGN/AD_GROUP/AD and Management RULE 11. That is a
+   * deliberate trade: an operator who expected delivery sees keywords sitting paused, which
+   * is visible and one call to fix, where unreviewed spend is neither.
+   */
   async addKeywords(userId: string, customerId: string, adGroupResourceName: string, keywords: {
     text: string;
     matchType: 'BROAD' | 'PHRASE' | 'EXACT';
-  }[]): Promise<void> {
+  }[], status: 'ENABLED' | 'PAUSED' = 'PAUSED'): Promise<void> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'adGroupCriteria', keywords.map(kw => ({
       create: {
         adGroup: adGroupResourceName,
-        status: 'ENABLED',
+        status,
         keyword: { text: kw.text, matchType: kw.matchType },
       },
     })), loginCustomerId);

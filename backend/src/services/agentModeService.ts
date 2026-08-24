@@ -34774,7 +34774,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'ADD') {
           if (!args.ad_group_resource_name || !args.keywords) return { success: false, error: 'ad_group_resource_name and keywords array are required' };
-          await googleAdsService.addKeywords(userId, customer_id, args.ad_group_resource_name, args.keywords);
+          // ENG-1527: forward the caller's status. Same shape as the CAMPAIGN/AD_GROUP/AD
+          // creates — the argument the schema advertises has to reach the service.
+          await googleAdsService.addKeywords(userId, customer_id, args.ad_group_resource_name, args.keywords, args.status || 'PAUSED');
           return { success: true, message: `Added ${args.keywords.length} keyword(s)` };
         }
         if (action === 'ADD_NEGATIVE') {
