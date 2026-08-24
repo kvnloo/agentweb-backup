@@ -438,4 +438,30 @@ describe('SessionScoring - fabrication grounding (ENG-1223)', () => {
     expect(getUserMessage()).not.toContain('[TOOL CALL MANIFEST: 0 tool calls were made anywhere in this session');
     expect(getUserMessage()).toContain('get_chat_history');
   });
+
+  it('CODERABBIT FINDING: reports the inline result/error on a metadata.toolCalls entry when no separate tool-role message exists', async () => {
+    mockCallLLM.mockResolvedValue(makeLLMResponse(4, { goalCompletion: 4, dataAccuracy: 4, outputQuality: 4 }));
+
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Save a memory and look up connected accounts.' },
+      {
+        role: 'assistant',
+        content: 'Done.',
+        metadata: {
+          toolCalls: [
+            { id: 'ok1', name: 'save_memory', arguments: {}, result: { saved: true } },
+            { id: 'fail1', name: 'get_connected_accounts', arguments: {}, error: 'timeout' },
+          ],
+        },
+      } as any,
+      // Deliberately no separate 'tool'-role messages for either call — this is
+      // the inline-only shape the outcome detection must now handle.
+    ];
+
+    await scoreSession(messages, messages.length);
+
+    const manifestLine = getUserMessage();
+    expect(manifestLine).toContain('save_memory (success)');
+    expect(manifestLine).toContain('get_connected_accounts (failed)');
+  });
 });

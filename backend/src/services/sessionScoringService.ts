@@ -100,8 +100,11 @@ function describeToolOutcome(content: unknown): "success" | "failed" | "unknown"
  * capable of forcing dataAccuracy to 1 on a legitimate, accurate, tool-backed
  * response.
  */
-function normalizeToolCallEntries(m: ChatMessage): Array<{ id?: string; name: string }> {
-  const metaCalls: Array<{ id?: string; name: string }> = (m as any).metadata?.toolCalls || [];
+function normalizeToolCallEntries(
+  m: ChatMessage
+): Array<{ id?: string; name: string; result?: any; error?: string }> {
+  const metaCalls: Array<{ id?: string; name: string; result?: any; error?: string }> =
+    (m as any).metadata?.toolCalls || [];
   const topCalls: Array<{ id?: string; name?: string; function?: { name?: string } }> =
     (m as any).tool_calls || [];
   const normalizedTop = topCalls
@@ -109,9 +112,11 @@ function normalizeToolCallEntries(m: ChatMessage): Array<{ id?: string; name: st
     .filter((tc) => tc.name);
 
   // A single call could in principle be represented in both fields on the same
-  // message — de-dupe by id so it is never double-counted.
+  // message — de-dupe by id so it is never double-counted. metadata.toolCalls
+  // entries come first so their inline result/error (top-level tool_calls has
+  // neither — the result always lives in a separate tool-role message) wins.
   const seen = new Set<string>();
-  const combined: Array<{ id?: string; name: string }> = [];
+  const combined: Array<{ id?: string; name: string; result?: any; error?: string }> = [];
   for (const tc of [...metaCalls, ...normalizedTop]) {
     const key = tc.id || `${tc.name}:${combined.length}`;
     if (seen.has(key)) continue;
@@ -143,7 +148,17 @@ function buildToolCallManifest(messages: ChatMessage[]): { count: number; text: 
       const resultMsg = tc.id
         ? messages.find((mm: any) => mm.role === "tool" && mm.tool_call_id === tc.id)
         : undefined;
-      const outcome = resultMsg ? describeToolOutcome((resultMsg as any).content) : "unknown";
+      // A separate tool-role message is the primary source (it's how agent-mode's
+      // top-level tool_calls always report their result). When none exists, fall
+      // back to result/error already inline on a metadata.toolCalls entry rather
+      // than reporting a known outcome as "unknown".
+      const outcome: "success" | "failed" | "unknown" = resultMsg
+        ? describeToolOutcome((resultMsg as any).content)
+        : tc.error
+        ? "failed"
+        : tc.result !== undefined
+        ? "success"
+        : "unknown";
       entries.push(outcome === "unknown" ? tc.name : `${tc.name} (${outcome})`);
     }
   }
