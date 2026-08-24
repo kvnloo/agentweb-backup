@@ -1235,8 +1235,9 @@ export async function getSlackUserEmail(slackUserId: string): Promise<string | n
   return null;
 }
 
-// Cache team_id lookups for the lifetime of the process — mirrors displayNameCache above; a
-// user's home team never changes.
+// Cache successful team_id lookups for the lifetime of the process — a user's home team never
+// changes. Failed lookups are deliberately retried: treating a transient Slack outage as
+// permanently external would reopen the ENG-1263 false-positive path until restart.
 const teamIdCache = new Map<string, Promise<string | null>>();
 
 /**
@@ -1268,11 +1269,15 @@ export async function getSlackUserTeamId(slackUserId: string): Promise<string | 
   })();
 
   teamIdCache.set(slackUserId, promise);
-  return promise;
+  const teamId = await promise;
+  if (!teamId && teamIdCache.get(slackUserId) === promise) {
+    teamIdCache.delete(slackUserId);
+  }
+  return teamId;
 }
 
-// Our own workspace's team_id, resolved once via auth.test (no extra OAuth scope beyond a valid
-// token) and cached for the process lifetime — it cannot change without a full app reinstall.
+// Our own workspace's team_id, resolved via auth.test (no extra OAuth scope beyond a valid token)
+// and cached after a successful lookup — it cannot change without a full app reinstall.
 let ownTeamIdPromise: Promise<string | null> | null = null;
 
 /**
@@ -1285,7 +1290,7 @@ export async function getOwnSlackTeamId(): Promise<string | null> {
   }
 
   if (!ownTeamIdPromise) {
-    ownTeamIdPromise = (async () => {
+    const promise = (async () => {
       try {
         const result = await slackClient!.auth.test();
         return (result as any).team_id || null;
@@ -1294,6 +1299,13 @@ export async function getOwnSlackTeamId(): Promise<string | null> {
         return null;
       }
     })();
+    ownTeamIdPromise = promise;
+
+    const teamId = await promise;
+    if (!teamId && ownTeamIdPromise === promise) {
+      ownTeamIdPromise = null;
+    }
+    return teamId;
   }
 
   return ownTeamIdPromise;
