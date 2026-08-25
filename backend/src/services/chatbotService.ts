@@ -4476,11 +4476,14 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
       }
     };
 
-    // Search both knowledge bases in parallel
+    // Search both knowledge bases in parallel. The outer withTimeout guard only
+    // abandons the *promise* on the caller's side — without also passing
+    // CallOptions.timeout, the underlying RPCs stay in flight past the 10s
+    // deadline, holding the socket and retry budget open.
     const [publicResults, privateResults] = await withTimeout(
       Promise.all([
-        publicClient.search({ ...searchRequest, servingConfig: publicServingConfig }),
-        privateClient.search({ ...searchRequest, servingConfig: privateServingConfig })
+        publicClient.search({ ...searchRequest, servingConfig: publicServingConfig }, { timeout: KNOWLEDGE_BASE_SEARCH_TIMEOUT_MS }),
+        privateClient.search({ ...searchRequest, servingConfig: privateServingConfig }, { timeout: KNOWLEDGE_BASE_SEARCH_TIMEOUT_MS })
       ]),
       KNOWLEDGE_BASE_SEARCH_TIMEOUT_MS,
       'searchPlatformKnowledgeBase',
@@ -5202,8 +5205,13 @@ export async function generateChatResponse(
     // must still be caught, so a bare "don't"/"can't" elsewhere in the sentence
     // doesn't exempt it.
     const DENIES_REAL_TOOL_ACCESS = /\b(?:can(?:'|’)?t|cannot|don(?:'|’)?t|unable to|without)\s+(?:access(?:ing)?|reach(?:ing)?|retriev(?:e|ing)|get(?:ting)?|provid(?:e|ing)|check(?:ing)?|pull(?:ing)?|fetch(?:ing)?|see(?:ing)?)\b[^.!?]{0,30}\bactual\b/i;
+    // A turn where every tool call threw still pushes those failures into
+    // toolCalls (see the catch block above), so toolCalls.length alone isn't
+    // "something really executed" — it must have at least one call that didn't
+    // error and didn't report an explicit { success: false } result.
+    const hasSuccessfulToolCall = toolCalls.some((tc) => !tc.error && (tc.result as any)?.success !== false);
     if (
-      toolCalls.length === 0
+      !hasSuccessfulToolCall
       && CLAIMS_REAL_TOOL_OUTPUT.test(finalAssistantMessage)
       && LOOKS_LIKE_TOOL_SHAPED_DATA.test(finalAssistantMessage)
       && !DENIES_REAL_TOOL_ACCESS.test(finalAssistantMessage)
