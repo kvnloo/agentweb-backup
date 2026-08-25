@@ -610,10 +610,21 @@ export interface FalseCompletionClaim {
  * when there is no such claim or the ledger meets or exceeds it. A claim that
  * already admits a shortfall (e.g. "4 of the 12 requested sizes") does not match
  * any of these patterns, so an honest partial report is never flagged.
+ *
+ * `scopeToLastStepBoundary` (default true) restricts the ledger to
+ * `sinceLastStepBoundary` before counting — correct for the single-turn closing
+ * synthesis this was built for (ENG-1188: an earlier variant's successes must not
+ * paper over a later variant's shortfall). A caller summarizing an entire
+ * multi-step session (CodeRabbit, ENG-1331 follow-up) needs the OPPOSITE: a
+ * truthful claim about assets produced across several already-closed steps would
+ * be scoped down to "since the last set_work_plan_status" and misread as false
+ * whenever the currently-open step hasn't produced anything yet. Pass `false` to
+ * count the whole ledger instead.
  */
 export function detectFalseCompletionClaim(
   content: unknown,
   toolCalls: ExecutedToolCall[],
+  scopeToLastStepBoundary: boolean = true,
 ): FalseCompletionClaim | null {
   if (typeof content !== 'string' || !content.trim()) return null;
 
@@ -629,7 +640,8 @@ export function detectFalseCompletionClaim(
   if (claims.size === 0) return null;
 
   const claimed = Math.max(...claims);
-  const actual = countProducedAssets(sinceLastStepBoundary(toolCalls));
+  const scopedToolCalls = scopeToLastStepBoundary ? sinceLastStepBoundary(toolCalls) : toolCalls;
+  const actual = countProducedAssets(scopedToolCalls);
   if (actual >= claimed) return null;
   return { claimed, actual };
 }

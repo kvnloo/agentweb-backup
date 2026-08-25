@@ -113,6 +113,89 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
     expect(campaignRows()[0].unattributedLeadCount).toBeUndefined();
   });
 
+  it('falls back to campaign NAME when the lead was tagged with {{campaign.name}}', async () => {
+    // Measured reality: Phoenix's 46 ACTIVE ads all carry {{campaign.name}}, so an id-only join
+    // misses 100% of the portfolio's biggest spender. campaign_name already comes back in the same
+    // insights response, so matching it costs nothing.
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => makeCampaignInsightsResponse([
+        { campaign_id: '120244135557390173', campaign_name: 'Leasing Automation', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+      ]),
+    });
+    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: HAVEN_USER_ID }] as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [
+        makeLead('Leasing Automation', `${TEST_DATE}T10:00:00.000Z`),      // exact name
+        makeLead('Leasing+Automation', `${TEST_DATE}T11:00:00.000Z`),      // plus-encoded
+        makeLead('Leasing%20Automation', `${TEST_DATE}T12:00:00.000Z`),    // percent-encoded
+        makeLead('120244135557390173', `${TEST_DATE}T13:00:00.000Z`),      // id still wins
+      ],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+
+    expect(result.leadCount).toBe(4);
+    expect(result.unattributedLeadCount).toBe(0);
+    // All four land on the campaign ID, never on the name — the row key stays the id.
+    expect(campaignRows()[0].leadCount).toBe(4);
+    expect(campaignRows()[0].campaignId).toBe('120244135557390173');
+  });
+
+  it('refuses to guess when two campaigns share a name, counting those leads unattributed', async () => {
+    // Meta permits duplicate campaign names. Attributing to either would invent a fact, so the
+    // ambiguous name is dropped from the map and the lead stays visibly uncounted.
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => makeCampaignInsightsResponse([
+        { campaign_id: '111', campaign_name: 'Duplicate Name', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+        { campaign_id: '222', campaign_name: 'Duplicate Name', spend: '2', impressions: '20', clicks: '2', ctr: '1', cpm: '1', frequency: '1' },
+      ]),
+    });
+    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: HAVEN_USER_ID }] as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [makeLead('Duplicate Name', `${TEST_DATE}T10:00:00.000Z`)],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+
+    expect(result.unattributedLeadCount).toBe(1);
+    expect(result.leadCount).toBe(0);
+    for (const r of campaignRows()) expect(r.leadCount).toBe(0);
+  });
+
+  it('refuses a lead whose OTHER spelling collides with a different campaign', async () => {
+    // `A+B` and `A B` are the same string once `+` is decoded, so a lead tagged `A+B` could have
+    // come from either campaign. Matching the raw spelling first would attribute it to one of them.
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => makeCampaignInsightsResponse([
+        { campaign_id: '111', campaign_name: 'Spring+Sale', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+        { campaign_id: '222', campaign_name: 'Spring Sale', spend: '2', impressions: '20', clicks: '2', ctr: '1', cpm: '1', frequency: '1' },
+      ]),
+    });
+    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: HAVEN_USER_ID }] as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [
+        makeLead('Spring+Sale', `${TEST_DATE}T10:00:00.000Z`),
+        makeLead('Spring Sale', `${TEST_DATE}T11:00:00.000Z`),
+      ],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+
+    // Neither spelling can be resolved to one campaign, so neither lead is attributed.
+    expect(result.unattributedLeadCount).toBe(2);
+    expect(result.leadCount).toBe(0);
+    for (const r of campaignRows()) expect(r.leadCount).toBe(0);
+  });
+
   it('counts leads with no matching campaignId as unattributed instead of dropping them', async () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
