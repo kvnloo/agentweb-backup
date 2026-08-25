@@ -925,6 +925,19 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(mockDriveFiles.get).not.toHaveBeenCalled();
     });
 
+    it('rejects an oversized file even when Drive metadata under-reports size (e.g. 0 mid virus-scan)', async () => {
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [{ id: 'file-1', name: 'huge.png', mimeType: 'image/png', size: '0' }] },
+      });
+      const oversizedBuffer = Buffer.alloc(201 * 1024 * 1024); // 201MB > 200MB ceiling
+      mockDriveFiles.get.mockResolvedValue({ data: oversizedBuffer });
+
+      const result = await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'huge.png', USER_ID);
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/limit/i);
+      expect((s3Utils.uploadFileToS3 as jest.Mock)).not.toHaveBeenCalled();
+    });
+
     it('downloads the binary via alt:media with supportsAllDrives and uploads to S3', async () => {
       mockDriveFiles.list.mockResolvedValue({
         data: { files: [{ id: 'file-1', name: 'ad.png', mimeType: 'image/png', size: '2048' }] },

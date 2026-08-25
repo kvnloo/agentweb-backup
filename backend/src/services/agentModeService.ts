@@ -22504,6 +22504,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
       const buffer = Buffer.from(mediaResponse.data as any);
 
+      // Drive's reported `size` can be missing/stale (e.g. 0 during virus-scan) —
+      // re-check the actual downloaded bytes so an oversized file can't slip
+      // through on bad metadata and get uploaded/reported with a wrong size.
+      if (buffer.length > AgentModeService.MATERIALIZE_ASSET_MAX_BYTES) {
+        return {
+          success: false,
+          message: `"${fileName}" is ${Math.round(buffer.length / (1024 * 1024))}MB, over the ${AgentModeService.MATERIALIZE_ASSET_MAX_BYTES / (1024 * 1024)}MB limit for asset materialization`
+        };
+      }
+
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const uploadResult = await uploadFileToS3(buffer, file.name || fileName, userId, mimeType);
 
