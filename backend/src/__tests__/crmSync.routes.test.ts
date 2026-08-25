@@ -106,12 +106,12 @@ afterAll(async () => {
 describe('PUT /api/crm-sync/config/:listId/:provider/pipeline — change pipeline', () => {
   const { externalCrmSyncService } = require('../services/externalCrmSyncService');
 
-  it('rejects a non-hubspot provider with 400', async () => {
+  it('rejects an unsupported provider with 400', async () => {
     const res = await request(app)
-      .put('/api/crm-sync/config/list-1/attio/pipeline')
+      .put('/api/crm-sync/config/list-1/salesforce/pipeline')
       .send({ externalPipelineId: 'p1' })
       .expect(400);
-    expect(res.body.error).toMatch(/only supported for HubSpot/i);
+    expect(res.body.error).toMatch(/hubspot and attio/i);
   });
 
   it('rejects a missing externalPipelineId with 400', async () => {
@@ -138,6 +138,23 @@ describe('PUT /api/crm-sync/config/:listId/:provider/pipeline — change pipelin
       .send({ externalPipelineId: 'nope' })
       .expect(500);
     expect(res.body.error).toMatch(/not found/i);
+  });
+
+  it('changes the Attio deal list and returns the updated config', async () => {
+    externalCrmSyncService.changePipeline.mockResolvedValueOnce({
+      provider: 'attio',
+      listId: 'list-1',
+      userId: 'user-1',
+      accountId: 'acct-1',
+      attioDealListId: 'new-list',
+      autoSyncEnabled: true,
+    });
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/attio/pipeline')
+      .send({ externalPipelineId: 'new-list' })
+      .expect(200);
+    expect(externalCrmSyncService.changePipeline).toHaveBeenCalledWith('user-1', 'list-1', 'attio', 'new-list');
+    expect(res.body.config.attioDealListId).toBe('new-list');
   });
 });
 
