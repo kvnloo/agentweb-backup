@@ -318,6 +318,18 @@ describe('AgentModeService - Google Drive methods', () => {
       const result = await service.listGoogleDriveFolder('folder-id', USER_ID);
       expect(result.message).not.toMatch(/Showing first 100/i);
     });
+
+    // Regression test for the Phoenix Technologies incident (2026-08-25): a
+    // folder living inside a Google Shared Drive returns zero results (not an
+    // error) unless supportsAllDrives + includeItemsFromAllDrives are passed,
+    // even when the folder is fully public.
+    it('passes supportsAllDrives and includeItemsFromAllDrives so Shared Drive folders resolve', async () => {
+      mockDriveFiles.list.mockResolvedValue({ data: { files: [] } });
+      await service.listGoogleDriveFolder('folder-id', USER_ID);
+      expect(mockDriveFiles.list).toHaveBeenCalledWith(
+        expect.objectContaining({ supportsAllDrives: true, includeItemsFromAllDrives: true })
+      );
+    });
   });
 
   // ────────────────────────────────────────────────────────────────────────────
@@ -668,6 +680,15 @@ describe('AgentModeService - Google Drive methods', () => {
         expect.objectContaining({ auth: mockOAuth2Client })
       );
       expect(result.success).toBe(true);
+    });
+
+    // Regression test for the Phoenix Technologies incident (2026-08-25): a
+    // file living inside a Google Shared Drive returns 404 unless
+    // supportsAllDrives is passed, even when it's fully public.
+    it('passes supportsAllDrives on the file metadata fetch', async () => {
+      await service.readGoogleFileById('file-id', USER_ID);
+      const metaCall = mockDriveFiles.get.mock.calls.find((call: any[]) => call[0]?.alt !== 'media');
+      expect(metaCall?.[0]).toMatchObject({ supportsAllDrives: true });
     });
 
     it('goes straight to SA when Drive is not connected (OAuth throws)', async () => {
