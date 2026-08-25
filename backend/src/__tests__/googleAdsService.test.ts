@@ -120,8 +120,37 @@ describe('listAccountHierarchy', () => {
 
     const tree = await service.listAccountHierarchy('test-access-token');
     expect(tree).toEqual([
-      { type: 'leaf', customerId: '1234567890', name: 'Test Account', currency: 'USD', loginCustomerId: '1234567890' },
+      { type: 'leaf', customerId: '1234567890', name: 'Test Account', currency: 'USD', loginCustomerId: '1234567890', testAccount: false },
     ]);
+  });
+
+  /**
+   * ENG-1362. Note the fixture above: an account DESCRIPTIVELY NAMED "Test Account" whose
+   * `test_account` flag is false. That is not a contrived case — it is the live situation
+   * this ticket was filed over, and it is why the flag is captured here rather than
+   * inferred downstream from the name.
+   */
+  it('captures a genuine Google test account as testAccount: true', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/1234567890'] } });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ customer: { id: '1234567890', descriptiveName: 'Production', currencyCode: 'USD', manager: false, testAccount: true } }] },
+    });
+
+    const tree = await service.listAccountHierarchy('test-access-token');
+    expect(tree[0]).toMatchObject({ customerId: '1234567890', testAccount: true });
+  });
+
+  it('treats an absent test_account as false rather than undefined', async () => {
+    // Google omits the field on some responses. Undefined would flow downstream as
+    // "unknown", and unknown must never soften into "safe" — so it is pinned to false
+    // at the point of capture, where the query that asked for it is in scope.
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/1234567890'] } });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ customer: { id: '1234567890', descriptiveName: 'Sandbox', currencyCode: 'USD', manager: false } }] },
+    });
+
+    const tree = await service.listAccountHierarchy('test-access-token');
+    expect(tree[0]).toMatchObject({ testAccount: false });
   });
 
   it('returns empty array if no accessible customers', async () => {
@@ -142,8 +171,8 @@ describe('listAccountHierarchy', () => {
     const tree = await service.listAccountHierarchy('test-access-token');
     expect(tree).toEqual([
       { type: 'manager', customerId: '9999999999', name: 'MCC Account', children: [
-        { customerId: '222', name: 'Child A', currency: 'USD', loginCustomerId: '9999999999' },
-        { customerId: '333', name: 'Child B', currency: 'EUR', loginCustomerId: '9999999999' },
+        { customerId: '222', name: 'Child A', currency: 'USD', loginCustomerId: '9999999999', testAccount: false },
+        { customerId: '333', name: 'Child B', currency: 'EUR', loginCustomerId: '9999999999', testAccount: false },
       ] },
     ]);
     // the customer_client enumeration must run with the manager as login-customer-id
@@ -166,7 +195,7 @@ describe('listAccountHierarchy', () => {
     const tree = await service.listAccountHierarchy('test-access-token');
     expect(tree).toEqual([
       { type: 'manager', customerId: '999', name: 'Top MCC', children: [
-        { customerId: '444', name: 'Deep Leaf', currency: 'USD', loginCustomerId: '999' },
+        { customerId: '444', name: 'Deep Leaf', currency: 'USD', loginCustomerId: '999', testAccount: false },
       ] },
     ]);
   });
@@ -195,7 +224,7 @@ describe('listAccountHierarchy', () => {
     // 222 must NOT appear as a top-level leaf; only the manager node carries it
     expect(tree).toEqual([
       { type: 'manager', customerId: '999', name: 'My MCC', children: [
-        { customerId: '222', name: 'My Leaf', currency: 'USD', loginCustomerId: '999' },
+        { customerId: '222', name: 'My Leaf', currency: 'USD', loginCustomerId: '999', testAccount: false },
       ] },
     ]);
   });
@@ -208,7 +237,7 @@ describe('listAccountHierarchy', () => {
 
     const tree = await service.listAccountHierarchy('test-access-token');
     expect(tree).toEqual([
-      { type: 'leaf', customerId: '333', name: 'Reachable', currency: 'USD', loginCustomerId: '333' },
+      { type: 'leaf', customerId: '333', name: 'Reachable', currency: 'USD', loginCustomerId: '333', testAccount: false },
     ]);
   });
 
@@ -260,7 +289,7 @@ describe('listAccountHierarchy', () => {
     const tree = await service.listAccountHierarchy('test-access-token');
 
     expect(tree).toEqual([
-      { type: 'leaf', customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111' },
+      { type: 'leaf', customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111', testAccount: false },
       { type: 'manager', customerId: '999', name: 'My MCC', children: [] },
     ]);
     warnSpy.mockRestore();
@@ -271,14 +300,14 @@ describe('listAccountHierarchy', () => {
 describe('flattenConnectableLeaves', () => {
   it('flattens leaves and manager children into a single connectable list', () => {
     const flat = service.flattenConnectableLeaves([
-      { type: 'leaf', customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111' },
+      { type: 'leaf', customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111', testAccount: false },
       { type: 'manager', customerId: '999', name: 'MCC', children: [
-        { customerId: '222', name: 'Child', currency: 'USD', loginCustomerId: '999' },
+        { customerId: '222', name: 'Child', currency: 'USD', loginCustomerId: '999', testAccount: false },
       ] },
     ]);
     expect(flat).toEqual([
-      { customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111' },
-      { customerId: '222', name: 'Child', currency: 'USD', loginCustomerId: '999' },
+      { customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111', testAccount: false },
+      { customerId: '222', name: 'Child', currency: 'USD', loginCustomerId: '999', testAccount: false },
     ]);
   });
 });

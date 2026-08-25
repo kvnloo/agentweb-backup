@@ -279,6 +279,18 @@ export interface GoogleAdsConfig extends BaseOAuthConfig {
   customer_id: string;
   currency: string;
   /**
+   * ENG-1362. Google's `test_account` flag, captured at connect time.
+   *
+   * `true` is Google's guarantee that the account cannot serve ads and cannot spend.
+   * `false` means real money. **Absent** means the account was connected before this was
+   * recorded — which must be read as billable, never as safe, and is resolved live by
+   * `googleAdsService.isTestAccount`.
+   *
+   * Stored because the account NAME carries no such guarantee: a real, billable, ENABLED
+   * account descriptively named "Test" is exactly the case this field disambiguates.
+   */
+  test_account?: boolean;
+  /**
    * The manager (MCC) account id to send as `login-customer-id` on every Google Ads
    * API call for this account. Set when the account is a leaf reached through a manager
    * the user has access to. Omitted/equal to customer_id for standalone/direct accounts.
