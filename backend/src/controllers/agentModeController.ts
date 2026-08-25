@@ -10833,23 +10833,34 @@ export const agentModeController = {
   /**
    * POST /api/agent-mode/scheduled-chats/:scheduleId/publish-consent
    *
-   * ENG-827 (Greptile): a REVOKE-ONLY lever for a schedule's unattended publishing.
+   * ENG-827: sets or clears a schedule's standing unattended-publish consent
+   * (`authorized: true` grants, `authorized: false` revokes). The function name
+   * predates the grant direction being added and is now inaccurate — kept as-is
+   * to avoid an unrelated rename in a docs-only fix; the body below is current.
    *
-   * The setting itself is not writable from the generic update body or the MCP
-   * allowlist, because a model that could GRANT it would be manufacturing standing
-   * consent to post under the owner's name. Revoking is the opposite: it can only ever
-   * make a schedule safer, and it is what lets an owner (or Emma acting on their spoken
-   * instruction — "stop auto-posting on this one") stop future unattended publishing
-   * without hunting through the schedule form.
+   * The setting is still NOT writable from the generic update body or the MCP
+   * allowlist — only this dedicated endpoint can touch it — because a model that
+   * could grant it that way would be manufacturing standing consent to post under
+   * the owner's name with none of the checks below. Those checks are what make the
+   * grant direction safe to expose here at all:
    *
-   * The asymmetry is enforced here rather than trusted to the caller: `authorized: true`
-   * is REJECTED outright. There is no request shape that turns publishing on.
+   *   - Never from a delegated/admin session — only the account owner's own
+   *     authenticated request may grant (revoke stays open to delegation; it only
+   *     ever makes a schedule safer, matching ENG-803's original concern that a
+   *     model able to switch the hold ON could quietly stop a schedule publishing
+   *     and truthfully cite the block).
+   *   - Scope is derived from the schedule's own `requiredFunctionCalls` (or, for
+   *     the one legacy backfill, an explicit ENG-1245 `tools=` line) — never
+   *     inferred or left open-ended. No designated publish tool means nothing to
+   *     authorize, and the request is rejected rather than silently granting
+   *     everything or nothing.
+   *   - The write is optimistic-locked to the exact tools/consent-state read a
+   *     moment earlier, so a schedule edited mid-request 409s instead of
+   *     authorizing a scope the owner never actually saw.
    *
-   * ENG-803's concern is real and is why this stays revoke-only: a model able to switch
-   * the hold ON could quietly stop a schedule publishing and then truthfully cite the
-   * block, recreating that ticket's bug through a legitimate mechanism. That failure is
-   * visible, durable and reversible by the owner — a stray grant would be an
-   * irreversible public post — so the two directions do not deserve the same treatment.
+   * See `agentModeController.revokePublishConsent.test.ts` for the full contract
+   * (both directions, the delegation block, the tool-scope requirement, and the
+   * optimistic-lock behavior on concurrent edits).
    */
   async revokeScheduledChatPublishConsent(req: Request, res: Response) {
     try {
