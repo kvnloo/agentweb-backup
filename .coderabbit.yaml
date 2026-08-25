@@ -18,12 +18,30 @@ knowledge_base:
     # Explicit allowlist, NOT "**/*.md" — CodeRabbit applies every matched file as review
     # criteria, so a blanket glob would let a PR edit README.md (or any other doc) and have
     # that edit change its own review guidance. CodeRabbit flagged this on the sibling portal
-    # PR (#1115) and the same risk applies here. Only these named, deliberately-maintained
-    # policy docs count.
-    filePatterns: ["CLAUDE.md", "AGENTS.md", "dev.md", "backend/docs/**/*.md"]
+    # PR (#1115), then flagged that even "backend/docs/**/*.md" was too broad here — narrowed
+    # to just the three tightly-controlled root policy docs.
+    filePatterns: ["CLAUDE.md", "AGENTS.md", "dev.md"]
 
 chat:
   auto_reply: true
+
+# Unit-test GENERATION reads path-specific guidance from HERE, not from reviews.path_instructions
+# (that only governs review commentary — CodeRabbit caught this mismatch on agentweb#2630: the
+# Jest/supertest/mocking conventions were sitting in reviews.path_instructions where
+# finishing_touches.unit_tests never reads them). This is the correct, functional location.
+code_generation:
+  unit_tests:
+    path_instructions:
+      - path: "backend/src/**/*.ts"
+        instructions: >
+          Use Jest with `supertest` for route/controller tests, matching this repo's existing
+          convention (see backend/src/__tests__/ for examples). Mock the auth middleware
+          explicitly (set req.user with userId/isAdmin rather than bypassing auth entirely) and
+          mock external services (DynamoDB, settingsService, subscriptionService, etc.) at the
+          module boundary via jest.mock — never hit real AWS or a live third-party API. Cover: the
+          happy path, an unauthenticated/unauthorized request, a missing-required-field request,
+          and one boundary/empty-input case. Prefer asserting on response status + body over
+          asserting on internal mock call counts alone.
 
 reviews:
   enable_prompt_for_ai_agents: true # findings are structured for the coding agent to read and act on
@@ -128,16 +146,6 @@ reviews:
       instructions: >
         Flag components rendering unbounded lists without a key or virtualization above ~100 items,
         and any dangerouslySetInnerHTML usage without visible sanitization.
-    - path: "backend/src/**/*.ts"
-      instructions: >
-        When generating or reviewing unit tests: use Jest with `supertest` for route/controller
-        tests, matching this repo's existing convention (see backend/src/__tests__/ for examples).
-        Mock the auth middleware explicitly (set req.user with userId/isAdmin rather than bypassing
-        auth entirely) and mock external services (DynamoDB, settingsService, subscriptionService,
-        etc.) at the module boundary via jest.mock — never hit real AWS or a live third-party API.
-        Cover: the happy path, an unauthenticated/unauthorized request, a missing-required-field
-        request, and one boundary/empty-input case. Prefer asserting on response status + body over
-        asserting on internal mock call counts alone.
     # Catch-all, adapted from both vendor examples — keep review volume proportional to rate limit
     - path: "**/*"
       instructions: >
