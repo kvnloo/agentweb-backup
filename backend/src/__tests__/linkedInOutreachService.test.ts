@@ -1009,15 +1009,42 @@ describe('LinkedInOutreachService', () => {
         expect(sentBody.advanced_keywords?.company).toBeUndefined();
       });
 
-      it('falls back to free-text advanced_keywords.company when resolver returns null', async () => {
+      it('falls back to free-text advanced_keywords.company when resolver returns null, and flags the result as degraded', async () => {
         mockResolveTopId.mockResolvedValueOnce(null);
-        await linkedInOutreachService.searchPeople('account-123', {
+        const result = await linkedInOutreachService.searchPeople('account-123', {
           keywords: 'engineer',
           company: 'NonexistentCo',
         });
         const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
         expect(sentBody.company).toBeUndefined();
         expect(sentBody.advanced_keywords).toEqual({ company: 'NonexistentCo' });
+        expect(result.degraded).toBe(true);
+        expect(result.droppedFacets).toEqual(['company']);
+      });
+
+      // ENG-1299 follow-up: a resolver miss degrades a facet to keyword-only
+      // matching with no prior signal back to the caller. `degraded`/
+      // `droppedFacets` makes that deterministic instead of relying on the
+      // agent to infer it from the request/response shape.
+      it('flags multiple dropped facets, excludes title (no ID equivalent), and omits the flag when nothing degrades', async () => {
+        mockResolveTopId.mockResolvedValueOnce(null); // company
+        mockResolveTopId.mockResolvedValueOnce('90000084'); // location resolves fine
+        mockResolveTopId.mockResolvedValueOnce(null); // industry
+        const degraded = await linkedInOutreachService.searchPeople('account-123', {
+          title: 'Product Manager',
+          company: 'NonexistentCo',
+          location: 'San Francisco Bay Area',
+          industry: 'Financial Services',
+        });
+        expect(degraded.degraded).toBe(true);
+        expect(degraded.droppedFacets.sort()).toEqual(['company', 'industry']);
+
+        const clean = await linkedInOutreachService.searchPeople('account-123', {
+          keywords: 'engineer',
+          location_id: '90000084',
+        });
+        expect(clean.degraded).toBeUndefined();
+        expect(clean.droppedFacets).toBeUndefined();
       });
 
       it('falls back to free-text when resolver throws (search must not fail)', async () => {
