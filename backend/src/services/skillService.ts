@@ -72,6 +72,13 @@ export class SkillService {
   // rather than waiting out the TTL.
   private publishedSkillsCache: { data: Skill[]; expiresAt: number } | null = null;
   private static readonly PUBLISHED_SKILLS_CACHE_TTL_MS = 30_000;
+  // CodeRabbit (ENG-1222 review): a scan in flight when create/update/delete
+  // invalidates the cache would otherwise finish afterward and unconditionally
+  // overwrite the null with its own now-stale result, silently reviving data
+  // from before the edit until the TTL expires. Bump this on every invalidation
+  // and only let a scan publish its result if the generation it started under
+  // is still current.
+  private publishedSkillsCacheGeneration = 0;
 
   constructor() {
     this.tableName = `${TABLE_PREFIX}AW-Skills`;
@@ -79,6 +86,7 @@ export class SkillService {
 
   private invalidatePublishedSkillsCache(): void {
     this.publishedSkillsCache = null;
+    this.publishedSkillsCacheGeneration++;
   }
 
   private normalizeSkill(item: any): Skill {
@@ -187,6 +195,7 @@ export class SkillService {
       return this.publishedSkillsCache.data;
     }
 
+    const generationAtScanStart = this.publishedSkillsCacheGeneration;
     const params = {
       TableName: this.tableName,
       FilterExpression: "isPublished = :isPublished",
@@ -199,7 +208,12 @@ export class SkillService {
       const items = await paginatedScan(dynamodb, params);
       const result = ((items.map(item => this.normalizeSkill(item)) as Skill[]) || [])
         .filter(skill => skill.visibility !== 'pending_review');
-      this.publishedSkillsCache = { data: result, expiresAt: Date.now() + SkillService.PUBLISHED_SKILLS_CACHE_TTL_MS };
+      // Only publish this scan's result if nothing invalidated the cache while
+      // it was in flight — otherwise a deferred scan would resurrect stale data
+      // right after a create/update/delete/sync explicitly cleared it.
+      if (this.publishedSkillsCacheGeneration === generationAtScanStart) {
+        this.publishedSkillsCache = { data: result, expiresAt: Date.now() + SkillService.PUBLISHED_SKILLS_CACHE_TTL_MS };
+      }
       return result;
     } catch (error) {
       if ((error as any).code === 'ResourceNotFoundException') {
