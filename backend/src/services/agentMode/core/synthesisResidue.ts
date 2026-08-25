@@ -435,9 +435,23 @@ const ASSET_PRODUCING_TOOL_NAMES = new Set([
  */
 const STEP_BOUNDARY_TOOL_NAME = 'set_work_plan_status';
 
-/** True for a successful (not errored, not reported-failed) step-boundary call. */
+/**
+ * True for a successful, actually-executed (not errored, not reported-failed,
+ * not a same-turn duplicate) step-boundary call.
+ *
+ * CodeRabbit (ENG-1331 follow-up): a `set_work_plan_status` call the dispatcher
+ * collapsed as a duplicate of an earlier identical one (`duplicateOf` set) never
+ * ran — the call it points at is the real boundary and is its own ledger entry.
+ * Counting the duplicate too could point `sinceLastStepBoundary` at a boundary
+ * that only APPEARS to be the last one in array order, double-counting or
+ * mis-scoping around it. Mirrors `tallyExecutedActions`' existing `duplicateOf`
+ * exclusion elsewhere in this file — same rule, same reason.
+ */
 function isSuccessfulBoundary(call: ExecutedToolCall | undefined): boolean {
-  return !!call && call.name === STEP_BOUNDARY_TOOL_NAME && !('error' in call) && !isReportedFailure(call);
+  if (!call || call.name !== STEP_BOUNDARY_TOOL_NAME) return false;
+  if ('error' in call || isReportedFailure(call)) return false;
+  if (call.duplicateOf !== undefined && call.duplicateOf !== null) return false;
+  return true;
 }
 
 /**
@@ -464,15 +478,22 @@ function isSuccessfulBoundary(call: ExecutedToolCall | undefined): boolean {
  *    false-UNDERCLAIM bug (CodeRabbit, ENG-1331 follow-up) on top of the
  *    over-claim bug this module was built to catch in the first place.
  *
- * "Nothing after it" — literally the last element of the ledger — is what
- * distinguishes the two: any tool call after the last boundary (asset-producing
- * or not) means a NEW step's work is underway and the synthesis is about that,
- * not about what already closed.
+ * "Nothing after it" is what distinguishes the two — but "nothing" means no
+ * MEANINGFUL call, not literally no ledger entries. A same-turn duplicate of the
+ * boundary itself (the model re-emits an identical set_work_plan_status; the
+ * dispatcher collapses the second one with `duplicateOf` set) trailing the real
+ * close is not new work — it never ran — so it must not make a genuinely
+ * self-closing step look like it has "a not-yet-closed step's" shape and get
+ * mis-scoped back to empty (CodeRabbit, ENG-1331 follow-up, second pass: found by
+ * live-tracing the first duplicateOf fix rather than trusting it).
  */
 function sinceLastStepBoundary(toolCalls: ExecutedToolCall[]): ExecutedToolCall[] {
+  const isDuplicateEntry = (call: ExecutedToolCall | undefined): boolean =>
+    !!call && call.duplicateOf !== undefined && call.duplicateOf !== null;
+
   for (let i = toolCalls.length - 1; i >= 0; i--) {
     if (!isSuccessfulBoundary(toolCalls[i])) continue;
-    if (i === toolCalls.length - 1) {
+    if (toolCalls.slice(i + 1).every(isDuplicateEntry)) {
       for (let j = i - 1; j >= 0; j--) {
         if (!isSuccessfulBoundary(toolCalls[j])) continue;
         return toolCalls.slice(j + 1);

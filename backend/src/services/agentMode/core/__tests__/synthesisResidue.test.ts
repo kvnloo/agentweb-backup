@@ -443,6 +443,57 @@ describe('detectFalseCompletionClaim', () => {
     expect(claim).toBeNull();
   });
 
+  // CodeRabbit (ENG-1331 follow-up, second pass): a set_work_plan_status call the
+  // dispatcher collapsed as a same-turn duplicate (duplicateOf set) never actually
+  // ran — the call it points at is the real boundary and is its own ledger entry.
+  // Treating the duplicate itself as a successful boundary too could point
+  // sinceLastStepBoundary at an entry that only looks like the true last boundary
+  // in array order. Mirrors tallyExecutedActions' existing duplicateOf exclusion.
+  it('does NOT treat a duplicate-collapsed set_work_plan_status call as a step boundary', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved for Variant 4.",
+      [
+        ...Array.from({ length: 40 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/earlier-${i + 1}.png` },
+        })),
+        { name: 'set_work_plan_status', result: { success: true } },
+        ...fourScreenshots,
+        // The model re-emits an identical set_work_plan_status later in the same
+        // turn; the dispatcher collapses it as a duplicate of the real call above.
+        { name: 'set_work_plan_status', duplicateOf: 'call-id-of-the-real-close', result: { success: true } },
+      ],
+    );
+    // In THIS shape the buggy and fixed code happen to agree (both land on
+    // "since the real close, before the trailing duplicate") — kept as a basic
+    // sanity check, but the test below is the one that actually distinguishes
+    // correct from buggy: it fails without the fix and passes with it.
+    expect(claim).toEqual({ claimed: 12, actual: 4 });
+  });
+
+  // The scenario that actually distinguishes correct behavior from the bug: a
+  // step genuinely finishes and closes itself, and the model then re-emits an
+  // identical close as the LAST thing in the turn (collapsed as a duplicate).
+  // Naively checking "is the boundary the literal last array element" says NO
+  // here (the duplicate follows it) and wrongly falls back to the
+  // not-yet-closed-step rule — slicing to just the duplicate call itself, actual
+  // = 0, falsely flagging a truthful "all 12 done". The fix must recognize that
+  // nothing MEANINGFUL (non-duplicate) follows the real close.
+  it('treats a step as self-closing even when a duplicate close trails the real one', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved.",
+      [
+        ...Array.from({ length: 12 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/${i + 1}.png` },
+        })),
+        { name: 'set_work_plan_status', result: { success: true } },
+        { name: 'set_work_plan_status', duplicateOf: 'call-id-of-the-real-close', result: { success: true } },
+      ],
+    );
+    expect(claim).toBeNull(); // truthful — must NOT be flagged
+  });
+
   // CodeRabbit (ENG-1331 follow-up), confirmed live against production: when a
   // step's OWN assets are immediately followed by its OWN successful
   // set_work_plan_status close (the normal shape in an AUTOCOMPLETE turn — the
