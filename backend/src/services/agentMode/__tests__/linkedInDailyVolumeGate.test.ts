@@ -132,10 +132,28 @@ describe('paceLinkedInWrite — check ordering and persistence', () => {
     expect(ownerArg).toBe('owner-user-id'); // the OWNER, not some other id
     expect(platformArg).toBe('unipile');
     expect(accountIdArg).toBe(ACCOUNT_ID);
-    expect(updateArg.daily_volume.invite.count).toBe(1);
+    expect(typeof updateArg).toBe('function');
+    expect(updateArg({ daily_invite_cap: 10 }).updates.daily_volume.invite.count).toBe(1);
   });
 
-  it('a persistence failure is swallowed — a DB hiccup must not turn a successful write into a reported failure', async () => {
+  it('recomputes from the fresh durable state and refuses when another write used the final slot', async () => {
+    mockUpdateAccountConfig.mockImplementationOnce(async (_owner: string, _platform: string, _accountId: string, mutation: any) => {
+      expect(mutation({
+        daily_invite_cap: 10,
+        daily_volume: { invite: { count: 10, windowStartedAt: Date.now() } },
+      }).skip).toBe(true);
+    });
+
+    const result = await paceLinkedInWrite(
+      'send-invite',
+      { ownerUserId: 'user-1', configuredDailyInviteCap: 10, dailyVolumeState: undefined },
+      ACCOUNT_ID,
+    );
+
+    expect(result.refusal!.message).toBe('LinkedIn daily volume limit reached');
+  });
+
+  it('fails closed when a durable daily reservation cannot be persisted', async () => {
     mockUpdateAccountConfig.mockRejectedValueOnce(new Error('boom'));
 
     const result = await paceLinkedInWrite(
@@ -144,7 +162,7 @@ describe('paceLinkedInWrite — check ordering and persistence', () => {
       ACCOUNT_ID,
     );
 
-    expect(result.refusal).toBeNull();
+    expect(result.refusal!.message).toBe('LinkedIn daily volume reservation could not be secured');
   });
 });
 
@@ -153,5 +171,19 @@ describe('setDailyInviteCap', () => {
     await setDailyInviteCap({ ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined }, ACCOUNT_ID, 30);
 
     expect(mockUpdateAccountConfig).toHaveBeenCalledWith('owner-user-id', 'unipile', ACCOUNT_ID, { daily_invite_cap: 30 });
+  });
+
+  it('validates and clamps the cap inside the focused gate helper', async () => {
+    await expect(setDailyInviteCap(
+      { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined },
+      ACCOUNT_ID,
+      -1,
+    )).rejects.toThrow('daily_invite_cap must be a non-negative number');
+
+    await expect(setDailyInviteCap(
+      { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined },
+      ACCOUNT_ID,
+      100,
+    )).resolves.toBe(30);
   });
 });

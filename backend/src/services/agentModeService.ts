@@ -32933,25 +32933,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // conversation, whether their connected LinkedIn account has Premium —
           // never guess, never infer it from anything else, and never call this
           // for an unattended/scheduled run (there's no one to ask).
-          const rawCap = args.daily_invite_cap;
-          const parsedCap = typeof rawCap === 'number' ? rawCap : Number(rawCap);
-          if (!Number.isFinite(parsedCap) || parsedCap < 0) {
-            throw new Error('daily_invite_cap must be a non-negative number for set-daily-invite-cap');
-          }
-          const { dailyInviteAbsoluteMax } = await import('./linkedInWritePacer');
-          const absoluteMax = dailyInviteAbsoluteMax();
-          const clampedCap = Number.isFinite(absoluteMax) && absoluteMax > 0
-            ? Math.min(parsedCap, absoluteMax)
-            : parsedCap;
           // Writes through the account OWNER's record, not necessarily the
           // caller's — see linkedInDailyVolumeGate.ts's module doc comment.
-          await setDailyInviteCap(resolvedLinkedInAccount!, account_id, clampedCap);
+          const clampedCap = await setDailyInviteCap(
+            resolvedLinkedInAccount!,
+            account_id,
+            args.daily_invite_cap,
+          );
           return {
             success: true,
             data: {
               account_id,
               daily_invite_cap: clampedCap,
-              ...(clampedCap !== parsedCap ? { note: `Requested ${parsedCap} was clamped to the system-wide maximum of ${clampedCap}.` } : {}),
+              ...(clampedCap !== Number(args.daily_invite_cap) ? { note: `Requested ${args.daily_invite_cap} was clamped to the system-wide maximum of ${clampedCap}.` } : {}),
             },
           };
         }

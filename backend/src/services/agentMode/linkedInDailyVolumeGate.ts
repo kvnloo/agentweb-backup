@@ -29,29 +29,17 @@
  *    is committed: daily check (cheap, no I/O) -> hourly/burst check (may
  *    sleep) -> only on both passing, persist the daily increment.
  *
- * Scope, stated honestly (a further CodeRabbit finding, same review): the
- * daily reservation is check-then-write, not a single atomic conditional
- * update. Two truly concurrent calls on the SAME account from DIFFERENT
- * backend instances could both read count N and both persist N+1 — the
- * account would then be under-counted by one for that day, not over its
- * limit by an unbounded amount. This is the IDENTICAL scope limitation
- * `linkedInWritePacer.ts` already documents and ships for the hourly/burst
- * ceiling ("the gate is per-process... a distributed lease would be cost
- * without a matching risk"), for the same reason: the observed failure mode
- * driving both pacers is ONE session's parallel tool calls within a single
- * process, not two processes racing the same account. A fully durable,
- * serialized reservation (recomputed inside a DynamoDB conditional-update
- * retry loop) would close this gap but is real added complexity for a risk
- * this codebase already accepts elsewhere — revisit both together if writes
- * ever fan out across instances in a way that makes the race routine rather
- * than theoretical. Persistence failure is logged loudly
- * (`[linkedInDailyVolumeGate] failed to persist...`) rather than blocking the
- * write, matching the same best-effort philosophy as the hourly pacer.
+ * The daily reservation uses `updateAccountConfig`'s conditional-update retry
+ * callback. Each retry derives the next state from the newly read account
+ * config, so concurrent writes cannot overwrite a newer daily count. A failed
+ * durable reservation refuses the LinkedIn write rather than bypassing the
+ * account safety limit.
  */
 
 import { getAccountsWithOwnerIncludingOrgShared, updateAccountConfig } from '../connectedAccountsDb';
 import {
   PACED_WRITE_ACTIONS,
+  dailyInviteAbsoluteMax,
   reserveDailyVolumeSlot,
   reserveWriteSlot,
   type DailyVolumeState,
@@ -150,13 +138,50 @@ export async function paceLinkedInWrite(
     };
   }
 
-  // Both checks passed — NOW commit the daily reservation, against the
-  // account OWNER's record, not necessarily the calling user's (see module
-  // doc comment, bug 1). Best-effort: a persistence hiccup must not turn an
-  // otherwise-successful write into a reported failure.
-  await updateAccountConfig(account.ownerUserId, 'unipile', accountId, { daily_volume: dailySlot.nextState }).catch(
-    (err) => console.error(`[linkedInDailyVolumeGate] failed to persist daily volume state for ${accountId}:`, err),
-  );
+  // Both checks passed — NOW durably commit the daily reservation against the
+  // account OWNER's record. The callback runs again from fresh config on every
+  // CAS retry, so concurrent writers cannot lose a reservation. Failing closed
+  // here matters: the actual Unipile call happens only after this returns.
+  let durableRefusalReason: string | undefined;
+  try {
+    await updateAccountConfig(account.ownerUserId, 'unipile', accountId, (freshConfig) => {
+      const freshDailySlot = reserveDailyVolumeSlot(
+        action,
+        freshConfig.daily_invite_cap,
+        freshConfig.daily_volume,
+      );
+      if (!freshDailySlot.allowed) {
+        durableRefusalReason = freshDailySlot.reason;
+        return { updates: {}, skip: true };
+      }
+      return { updates: { daily_volume: freshDailySlot.nextState } };
+    });
+  } catch (err) {
+    console.error(`[linkedInDailyVolumeGate] failed to reserve daily volume for ${accountId}:`, err);
+    return {
+      refusal: {
+        success: false,
+        message: 'LinkedIn daily volume reservation could not be secured',
+        error: 'The LinkedIn write was not attempted because its daily safety reservation could not be persisted. Please try again later.',
+      },
+    };
+  }
+
+  if (durableRefusalReason) {
+    return {
+      refusal: {
+        success: false,
+        message: 'LinkedIn daily volume limit reached',
+        error: [
+          durableRefusalReason,
+          '',
+          'This is a deliberate daily safety limit on our side, not a LinkedIn rejection.',
+          '',
+          'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
+        ].join('\n'),
+      },
+    };
+  }
 
   return { refusal: null };
 }
@@ -169,7 +194,16 @@ export async function paceLinkedInWrite(
 export async function setDailyInviteCap(
   account: ResolvedLinkedInAccount,
   accountId: string,
-  cap: number,
-): Promise<void> {
-  await updateAccountConfig(account.ownerUserId, 'unipile', accountId, { daily_invite_cap: cap });
+  cap: unknown,
+): Promise<number> {
+  const parsedCap = typeof cap === 'number' ? cap : Number(cap);
+  if (!Number.isFinite(parsedCap) || parsedCap < 0) {
+    throw new Error('daily_invite_cap must be a non-negative number for set-daily-invite-cap');
+  }
+  const absoluteMax = dailyInviteAbsoluteMax();
+  const clampedCap = Number.isFinite(absoluteMax) && absoluteMax > 0
+    ? Math.min(parsedCap, absoluteMax)
+    : parsedCap;
+  await updateAccountConfig(account.ownerUserId, 'unipile', accountId, { daily_invite_cap: clampedCap });
+  return clampedCap;
 }
