@@ -11,6 +11,7 @@ import {
   externalCrmSyncService,
 } from '../services/externalCrmSyncService';
 import { ensureWebhookSubscriptions } from '../utils/hubspotWebhookSubscriptions';
+import { ensureAttioWebhook } from '../utils/attioWebhookSubscription';
 
 const router = express.Router();
 router.use(authenticateToken);
@@ -226,6 +227,15 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
         contactFieldMapping ?? config.contactFieldMapping ?? [],
         customFieldMapping ?? config.customFieldMapping ?? [],
       );
+    }
+
+    // Fire-and-forget: register a real-time webhook subscription for this
+    // Attio workspace (per-workspace registration, unlike HubSpot's app-wide
+    // list above). Idempotent — ensureAttioWebhook no-ops if already
+    // registered. Only for OAuth connections; manual token users use
+    // per-list webhooks (crmWebhook.ts) instead.
+    if (provider === 'attio' && (accountId || config.accountId)) {
+      void ensureAttioWebhook(userId, accountId ?? config.accountId!);
     }
 
     res.json({

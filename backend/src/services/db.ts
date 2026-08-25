@@ -6775,6 +6775,44 @@ export const crmDb = {
     }
   },
 
+  async getLeadByAttioRecordId(listId: string, recordId: string) {
+    try {
+      const params: any = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        KeyConditionExpression: 'listId = :listId',
+        FilterExpression: 'syncMetadata.attio_record_id = :recordId',
+        ExpressionAttributeValues: {
+          ':listId': listId,
+          ':recordId': recordId,
+        },
+      };
+      const result = await dynamodb.query(params).promise();
+      return result.Items?.[0] ?? null;
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadByAttioRecordId");
+      throw error;
+    }
+  },
+
+  async getLeadByAttioListEntryId(listId: string, entryId: string) {
+    try {
+      const params: any = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        KeyConditionExpression: 'listId = :listId',
+        FilterExpression: 'syncMetadata.attio_list_entry_id = :entryId',
+        ExpressionAttributeValues: {
+          ':listId': listId,
+          ':entryId': entryId,
+        },
+      };
+      const result = await dynamodb.query(params).promise();
+      return result.Items?.[0] ?? null;
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadByAttioListEntryId");
+      throw error;
+    }
+  },
+
   async updateLead(listId: string, leadId: string, updates: {
     email?: string;
     firstName?: string;

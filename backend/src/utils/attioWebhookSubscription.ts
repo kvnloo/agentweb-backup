@@ -1,0 +1,57 @@
+import { AttioService } from '../services/attioService';
+import { updateAccountConfig, getAccountById } from '../services/connectedAccountsDb';
+
+/**
+ * Registers a real-time webhook subscription for a connected Attio workspace,
+ * covering Person/Company record changes and Deal-analog (List Entry)
+ * changes — the same event scope HubSpot's app-wide webhook already covers
+ * for contacts + deals.
+ *
+ * Attio's model is per-workspace (register against this account's own OAuth
+ * token), not HubSpot's single app-wide subscription list — mirrors the
+ * existing Calendly per-account registration pattern (`calendlyAuth.ts`'s
+ * `createWebhookSubscription`/`provisionCalendlyWebhook`), not
+ * `ensureWebhookSubscriptions`'s HubSpot app-wide diffing loop.
+ *
+ * Idempotent by construction: no-ops if this account already has a
+ * `webhook_id` on record, so it's safe to call on every CRM sync config
+ * save (mirroring HubSpot's `ensureWebhookSubscriptions` trigger point)
+ * without ever hitting Attio's 409 duplicate-subscription error in normal
+ * operation. Never throws — fire-and-forget-safe.
+ */
+export async function ensureAttioWebhook(userId: string, accountId: string): Promise<void> {
+  try {
+    const account = await getAccountById(accountId, userId);
+    if (!account || account.platform !== 'attio') {
+      console.warn(`[Attio Webhook] ensureAttioWebhook: account ${accountId} not found or not Attio`);
+      return;
+    }
+    if ((account.config as any).webhook_id) {
+      return; // already registered
+    }
+
+    const svc = await AttioService.create(userId, accountId);
+    const targetUrl = `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/webhooks/attio`;
+    const { webhookId, secret } = await svc.registerWebhook(targetUrl);
+
+    if (!webhookId || !secret) {
+      console.warn(`[Attio Webhook] registerWebhook returned an unexpected shape for account ${accountId}`);
+      return;
+    }
+
+    await updateAccountConfig(userId, 'attio', accountId, {
+      webhook_id: webhookId,
+      webhook_signing_key: secret,
+    });
+    console.log(`[Attio Webhook] Registered webhook ${webhookId} for account ${accountId}`);
+  } catch (error: any) {
+    if (error?.response?.status === 403) {
+      // Missing webhook:read-write scope — connected before the scope was
+      // added to the app. Flag for reconnect rather than retrying forever.
+      console.warn(`[Attio Webhook] 403 registering webhook for account ${accountId} — flagging needs_reconnect`);
+      await updateAccountConfig(userId, 'attio', accountId, { needs_reconnect: true }).catch(() => {});
+      return;
+    }
+    console.warn(`[Attio Webhook] Webhook registration failed for account ${accountId}:`, error?.response?.data || error?.message);
+  }
+}

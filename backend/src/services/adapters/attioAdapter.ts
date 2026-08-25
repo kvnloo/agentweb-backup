@@ -410,6 +410,78 @@ export class AttioAdapter implements CrmAdapter {
         await svc.deletePerson(externalIds.recordId);
     }
 
+    // ─── Webhook: list-entry (deal-analog) events ─────────────────────────────────
+
+    /**
+     * Applies a single `list-entry.*` webhook event — the Deal-analog side of
+     * real-time auto-pull, alongside applyAttioPersonEvent's Person side.
+     * Reuses gap 2's field-extraction/routing logic (extractAttioValue,
+     * nativeDealFields) narrowed to the one changed entry, via a targeted
+     * single-entry fetch (AttioService.getListEntry) rather than
+     * re-paginating the whole deal list per event.
+     *
+     * `list-entry.deleted` clears the link (syncMetadata.attio_list_entry_id)
+     * rather than deleting the lead itself — a deal being removed doesn't
+     * mean the person is gone, unlike record.deleted's hard-delete.
+     */
+    async applyListEntryWebhookEvent(
+        listId: string,
+        config: ExternalCrmSyncConfig,
+        svc: AttioService,
+        entryId: string,
+        eventType: string,
+    ): Promise<void> {
+        if (!config.attioDealListId) return;
+        const pullDealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'push');
+        if (pullDealMappings.length === 0) return;
+
+        if (eventType === 'list-entry.deleted') {
+            const lead = await crmDb.getLeadByAttioListEntryId(listId, entryId);
+            if (!lead) return;
+            // syncMetadata is a whole-object SET at the DynamoDB layer (no
+            // per-key REMOVE support), so the cleared key must be genuinely
+            // absent from the merged object, not set to undefined — an
+            // explicit `undefined` value would still be a key on the object
+            // as far as DynamoDB's marshaller is concerned.
+            const syncMetadata = { ...(lead.syncMetadata || {}) };
+            delete syncMetadata.attio_list_entry_id;
+            await crmDb.updateLead(listId, lead.leadId, { syncMetadata });
+            console.log(`[AttioWebhook] Cleared deal link on lead ${lead.leadId} in list ${listId} (entry ${entryId} deleted)`);
+            return;
+        }
+
+        const entry = await svc.getListEntry(config.attioDealListId, entryId);
+        if (!entry) return; // not in our deal list — irrelevant event
+
+        const lead = await crmDb.getLeadByAttioRecordId(listId, entry.personRecordId);
+        if (!lead) return; // deal entry for a person we haven't pulled/pushed — nothing to update
+
+        const dealAttrCache = await svc.loadAttributeTypes('people', config.attioDealListId);
+        const nativeDealFields = ['status', 'dealValue', 'dealCurrency'];
+        const leadUpdates: Record<string, any> = {};
+        const customFieldUpdates: Record<string, any> = {};
+
+        for (const m of pullDealMappings) {
+            const slug = m.crmProperty;
+            const type = dealAttrCache.get(`list:${config.attioDealListId}:${slug}`) || 'text';
+            const val = this.extractAttioValue(entry.values[slug], type);
+            if (val == null || val === '') continue;
+            if (nativeDealFields.includes(m.agentwebField)) {
+                leadUpdates[m.agentwebField] = val;
+            } else {
+                customFieldUpdates[m.agentwebField] = val;
+            }
+        }
+
+        if (Object.keys(customFieldUpdates).length > 0) {
+            leadUpdates.customFields = { ...(lead.customFields || {}), ...customFieldUpdates };
+        }
+        leadUpdates.syncMetadata = { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId };
+
+        await crmDb.updateLead(listId, lead.leadId, leadUpdates);
+        console.log(`[AttioWebhook] Updated deal fields on lead ${lead.leadId} in list ${listId} from entry ${entryId}`);
+    }
+
     // ─── Field mapping helpers ────────────────────────────────────────────────────
 
     private getNestedValue(obj: any, path: string): any {

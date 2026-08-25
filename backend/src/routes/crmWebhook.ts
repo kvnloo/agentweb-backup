@@ -21,6 +21,7 @@ import { externalCrmSyncService, ExternalCrmSyncConfig } from '../services/exter
 import { HubSpotService } from '../services/hubspotService';
 import { AttioService } from '../services/attioService';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
+import { applyAttioPersonEvent } from '../utils/attioPersonWebhookEvent';
 
 const router = express.Router();
 
@@ -212,8 +213,9 @@ async function handleHubSpotEvent(
 // ─── Attio event handler ──────────────────────────────────────────────────────
 
 /**
- * Attio sends a single event per request.
- * We only handle 'people' object events — companies are ignored.
+ * Attio sends a single event per request. Per-event handling lives in
+ * `applyAttioPersonEvent` (shared with the OAuth-app shared endpoint in
+ * `webhooks.ts`) — this just normalizes the payload shape and resolves auth.
  */
 async function handleAttioEvent(
   userId: string,
@@ -229,84 +231,7 @@ async function handleAttioEvent(
     : await AttioService.create(auth.userId!, auth.accountId!);
 
   for (const event of events) {
-    const eventType: string = event?.event_type ?? '';
-    const recordId: string = event?.data?.record?.id?.record_id ?? event?.id?.record_id ?? '';
-    const actorType: string = event?.actor?.type ?? event?.data?.actor?.type ?? '';
-    const objectSlug: string = event?.data?.object?.slug ?? '';
-
-    const relevant = ['record.created', 'record.updated', 'record.deleted'].includes(eventType);
-    if (!relevant || !recordId) continue;
-    // Only process People records — skip Companies and other object types
-    if (objectSlug && objectSlug !== 'people') continue;
-    if (actorType === 'api-token') {
-      console.log(`[CrmWebhook/Attio] Skipping API-sourced event for recordId=${recordId}`);
-      continue;
-    }
-
-    if (eventType === 'record.deleted') {
-      if (!config.deleteOnPull) {
-        console.log(`[CrmWebhook/Attio] deletion event for recordId=${recordId} ignored (deleteOnPull is disabled)`);
-        continue;
-      }
-      try {
-        const values = await svc.getPersonValues(recordId);
-        const email = values.email_addresses?.[0]?.email_address ?? '';
-        if (!email) continue;
-        const lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
-        if (lead) {
-          await crmDb.deleteLead(listId, lead.leadId);
-          console.log(`[CrmWebhook/Attio] Deleted lead ${lead.leadId} from list ${listId}`);
-        }
-      } catch (err: any) {
-        console.error(`[CrmWebhook/Attio] Failed to process deletion for recordId=${recordId}:`, err?.message);
-      }
-      continue;
-    }
-
-    // Fetch person values from Attio for created/updated
-    let values: Record<string, any>;
-    try {
-      values = await svc.getPersonValues(recordId);
-    } catch (err: any) {
-      console.error(`[CrmWebhook/Attio] Failed to fetch person values for recordId=${recordId}:`, err?.message);
-      continue;
-    }
-
-    const email = values.email_addresses?.[0]?.email_address ?? '';
-    if (!email) {
-      console.log(`[CrmWebhook/Attio] No email for recordId=${recordId}, skipping`);
-      continue;
-    }
-
-    const firstName = values.name?.[0]?.first_name ?? '';
-    const lastName = values.name?.[0]?.last_name ?? '';
-    const phone = values.phone_numbers?.[0]?.original_phone_number ?? '';
-    const title = values.job_title?.[0]?.value ?? '';
-    const linkedin = values.linkedin?.[0]?.value ?? '';
-
-    const lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
-
-    if (!lead) {
-      const newLead: Record<string, any> = { email: email.toLowerCase(), syncMetadata: { attio_record_id: recordId } };
-      if (firstName) newLead.firstName = firstName;
-      if (lastName) newLead.lastName = lastName;
-      if (phone) newLead.phone = phone;
-      if (title) newLead.title = title;
-      if (linkedin) newLead.linkedin = linkedin;
-      await crmDb.createLead(listId, newLead);
-      console.log(`[CrmWebhook/Attio] Created lead for ${email} in list ${listId}`);
-    } else {
-      const updates: Record<string, any> = {};
-      if (firstName) updates.firstName = firstName;
-      if (lastName) updates.lastName = lastName;
-      if (phone) updates.phone = phone;
-      if (title) updates.title = title;
-      if (linkedin) updates.linkedin = linkedin;
-      if (Object.keys(updates).length > 0) {
-        await crmDb.updateLead(listId, lead.leadId, updates);
-        console.log(`[CrmWebhook/Attio] Updated lead ${lead.leadId} in list ${listId}`);
-      }
-    }
+    await applyAttioPersonEvent(listId, config, svc, event);
   }
 }
 

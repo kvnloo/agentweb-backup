@@ -569,6 +569,39 @@ export class AttioService {
     );
   }
 
+  // ─── Webhooks ──────────────────────────────────────────────────────────────
+  // Attio's webhook model is per-workspace (register against this token, not
+  // an app-wide subscription list like HubSpot's) — confirmed against
+  // docs.attio.com. One create call carries every event type we want in a
+  // single `subscriptions` array; the returned `secret` is shown exactly
+  // once and must be persisted by the caller immediately.
+
+  /**
+   * Registers a webhook subscription for this workspace covering Person/
+   * Company record changes and Deal-analog (List Entry) changes — the same
+   * event scope HubSpot's webhook already covers for contacts + deals.
+   */
+  async registerWebhook(targetUrl: string): Promise<{ webhookId: string; secret: string }> {
+    const res = await axiosInstance.post(
+      `${this.baseUrl}/webhooks`,
+      {
+        data: {
+          target_url: targetUrl,
+          subscriptions: [
+            { event_type: 'record.created', filter: null },
+            { event_type: 'record.updated', filter: null },
+            { event_type: 'record.deleted', filter: null },
+            { event_type: 'list-entry.created', filter: null },
+            { event_type: 'list-entry.updated', filter: null },
+            { event_type: 'list-entry.deleted', filter: null },
+          ],
+        },
+      },
+      { headers: this.headers() }
+    );
+    const data = (res.data as any)?.data;
+    return { webhookId: data?.id?.webhook_id, secret: data?.secret };
+  }
 
   // ─── Sync helpers (used by AttioAdapter) ──────────────────────────────────
 
@@ -820,5 +853,33 @@ export class AttioService {
       }))
       .filter((e): e is AttioListEntry => !!e.entryId && !!e.personRecordId);
     return { entries: detailed, nextCursor };
+  }
+
+  /**
+   * Fetches one list entry directly by id (GET /v2/lists/{list}/entries/{entry_id})
+   * instead of paginating through listListEntriesDetailed to find it — the
+   * targeted read a webhook handler needs when it only has an entryId from
+   * the event payload. Requesting it scoped to `listId` doubles as a
+   * membership check: a 404 means the entry isn't in that list (wrong list,
+   * or already deleted), which the caller treats as "not found", not an error.
+   */
+  async getListEntry(listId: string, entryId: string): Promise<AttioListEntry | null> {
+    try {
+      const res = await axiosInstance.get(
+        `${this.baseUrl}/lists/${listId}/entries/${entryId}`,
+        { headers: this.headers() }
+      );
+      const e = (res.data as any)?.data;
+      const reshaped: AttioListEntry = {
+        entryId: e?.id?.entry_id,
+        personRecordId: e?.parent_record_id,
+        values: e?.entry_values ?? {},
+      };
+      if (!reshaped.entryId || !reshaped.personRecordId) return null;
+      return reshaped;
+    } catch (err: any) {
+      if (err?.response?.status === 404) return null;
+      throw err;
+    }
   }
 }
