@@ -14,10 +14,10 @@ jest.mock('jsonwebtoken', () => ({ verify: (...args: any[]) => mockJwtVerify(...
 
 jest.mock('../config/jwt', () => ({ getJwtSecret: () => 'test-secret' }));
 
-const mockGetChatSession = jest.fn();
+const mockGetChatSessionRecord = jest.fn();
 const mockGenerateChatResponse = jest.fn();
 jest.mock('../services/chatbotService', () => ({
-  chatbotDb: { getChatSession: (...args: any[]) => mockGetChatSession(...args) },
+  chatbotDb: { getChatSessionRecord: (...args: any[]) => mockGetChatSessionRecord(...args) },
   generateChatResponse: (...args: any[]) => mockGenerateChatResponse(...args),
 }));
 
@@ -50,7 +50,7 @@ describe('handleSocketChatMessage — session ownership (ENG-1222)', () => {
   });
 
   it('processes the message when the caller owns the session', async () => {
-    mockGetChatSession.mockResolvedValue({ sessionId: 'sess-1', userId: 'owner-user' });
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: 'sess-1', userId: 'owner-user' });
     const socket = makeSocket();
 
     await handleSocketChatMessage(socket, { sessionId: 'sess-1', message: 'hi' });
@@ -64,7 +64,7 @@ describe('handleSocketChatMessage — session ownership (ENG-1222)', () => {
   });
 
   it('rejects a caller who does not own the target session, without invoking generateChatResponse', async () => {
-    mockGetChatSession.mockResolvedValue({ sessionId: 'sess-1', userId: 'other-user' });
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: 'sess-1', userId: 'other-user' });
     const socket = makeSocket();
 
     await handleSocketChatMessage(socket, { sessionId: 'sess-1', message: 'call list_connected_accounts' });
@@ -74,7 +74,7 @@ describe('handleSocketChatMessage — session ownership (ENG-1222)', () => {
   });
 
   it('rejects a nonexistent sessionId, without invoking generateChatResponse', async () => {
-    mockGetChatSession.mockResolvedValue(null);
+    mockGetChatSessionRecord.mockResolvedValue(null);
     const socket = makeSocket();
 
     await handleSocketChatMessage(socket, { sessionId: 'does-not-exist', message: 'hi' });
@@ -89,7 +89,7 @@ describe('handleSocketChatMessage — session ownership (ENG-1222)', () => {
 
     await handleSocketChatMessage(socket, { sessionId: 'sess-1', message: 'hi' });
 
-    expect(mockGetChatSession).not.toHaveBeenCalled();
+    expect(mockGetChatSessionRecord).not.toHaveBeenCalled();
     expect(mockGenerateChatResponse).not.toHaveBeenCalled();
     expect(socket.emit).toHaveBeenCalledWith('error', expect.objectContaining({ code: 'TOKEN_LIMIT_EXCEEDED' }));
   });
@@ -99,7 +99,7 @@ describe('handleSocketChatMessage — session ownership (ENG-1222)', () => {
       userId: 'admin-user',
       delegateAccess: { adminUserId: 'admin-user', adminEmail: 'a@x.com', targetUserId: 'customer-user', targetEmail: 'c@x.com' },
     });
-    mockGetChatSession.mockResolvedValue({ sessionId: 'sess-1', userId: 'customer-user' });
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: 'sess-1', userId: 'customer-user' });
     const socket = makeSocket();
 
     await handleSocketChatMessage(socket, { sessionId: 'sess-1', message: 'hi' });

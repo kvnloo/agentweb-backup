@@ -56,7 +56,15 @@ export async function handleSocketChatMessage(
     // missing check here would let any authenticated caller execute another
     // user's skill tools (scoped to their own account) just by knowing/guessing
     // that user's sessionId.
-    const session = await chatbotDb.getChatSession(data.sessionId);
+    //
+    // getChatSessionRecord, not getChatSession: the latter also reads
+    // AW-ChatMessages and, for a legacy session, WRITES a migration of its
+    // messages into that table — an unauthorized caller could otherwise force
+    // a read (and possibly a write) against another user's session data
+    // merely by attempting access, before ownership is ever checked. Only
+    // session.userId is needed here; generateChatResponse below does its own
+    // full getChatSession once ownership is confirmed.
+    const session = await chatbotDb.getChatSessionRecord(data.sessionId);
     if (!session) {
       socket.emit('error', { message: 'Chat session not found' });
       return;
