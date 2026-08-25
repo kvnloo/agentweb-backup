@@ -599,6 +599,14 @@ export class AttioService {
     );
   }
 
+  /** Deletes an entire Attio List (not just one entry). */
+  async deleteList(listId: string): Promise<void> {
+    await axiosInstance.delete(
+      `${this.baseUrl}/lists/${listId}`,
+      { headers: this.headers() }
+    );
+  }
+
   async addCompanyToList(listId: string, recordId: string): Promise<void> {
     await axiosInstance.post(
       `${this.baseUrl}/lists/${listId}/entries`,

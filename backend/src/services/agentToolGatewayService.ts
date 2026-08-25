@@ -525,10 +525,6 @@ const READ_TOOLS = new Set([
   'you_search_web',
   'you_search_news',
   'google_search_web',
-  // Unlike call_hubspot_api, this tool is read-only by design (no
-  // CREATE/UPDATE/DELETE/PUBLISH actions), so a single blanket classification
-  // is correct — no per-action branch needed like call_hubspot_api's below.
-  'call_attio_api',
 ]);
 
 const INTERNAL_WRITE_TOOLS = new Set([
@@ -980,6 +976,13 @@ function classifyToolEffect(toolName: string, args: unknown): AgentToolEffect {
       action === 'ARCHIVE'
     )
       return 'internal_write';
+    return 'read';
+  }
+
+  if (toolName === 'call_attio_api') {
+    const action = stringField(args, 'action').toUpperCase();
+    if (action === 'DELETE' || action === 'REMOVE_ENTRIES') return 'destructive';
+    if (action === 'CREATE' || action === 'ADD_ENTRIES') return 'internal_write';
     return 'read';
   }
 

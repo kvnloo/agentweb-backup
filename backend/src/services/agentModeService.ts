@@ -35156,6 +35156,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       const svc = await this.resolveAttioService(userId, args?.account_id);
 
       // ─── LIST_ENTRIES ──────────────────────────────────────────────────────
+      // Entry-level actions scoped to one already-identified list — these go
+      // through resolveAttioListId (AgentWeb list id or raw Attio list id),
+      // same as the pre-existing COUNT action.
       if (entityType === 'LIST_ENTRIES') {
         switch (action) {
           case 'COUNT': {
@@ -35164,12 +35167,80 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             const count = await svc.countListEntries(attioListId);
             return { success: true, count };
           }
+          case 'ADD_ENTRIES': {
+            if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES ADD_ENTRIES.' };
+            const recordIds: string[] = args?.record_ids ?? [];
+            if (!recordIds.length) return { success: false, error: 'record_ids array is required for LIST_ENTRIES ADD_ENTRIES.' };
+            const attioListId = await this.resolveAttioListId(userId, args.list_id);
+            const results = await Promise.all(recordIds.map(async recordId => {
+              try {
+                const entryId = await svc.addPersonToList(attioListId, recordId);
+                return { recordId, success: true, entryId };
+              } catch (err: any) {
+                return { recordId, success: false, error: err?.response?.data?.message ?? err?.message };
+              }
+            }));
+            return { success: true, results };
+          }
+          case 'REMOVE_ENTRIES': {
+            if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES REMOVE_ENTRIES.' };
+            const recordIds: string[] = args?.record_ids ?? [];
+            if (!recordIds.length) return { success: false, error: 'record_ids array is required for LIST_ENTRIES REMOVE_ENTRIES.' };
+            const attioListId = await this.resolveAttioListId(userId, args.list_id);
+            const results = await Promise.all(recordIds.map(async recordId => {
+              try {
+                const entryId = await svc.findListEntry(attioListId, recordId);
+                if (!entryId) return { recordId, success: false, error: 'No list entry found for this record.' };
+                await svc.deleteListEntry(attioListId, entryId);
+                return { recordId, success: true };
+              } catch (err: any) {
+                return { recordId, success: false, error: err?.response?.data?.message ?? err?.message };
+              }
+            }));
+            return { success: true, results };
+          }
           default:
-            return { success: false, error: `Unknown action "${action}" for LIST_ENTRIES. Valid: COUNT.` };
+            return { success: false, error: `Unknown action "${action}" for LIST_ENTRIES. Valid: COUNT, ADD_ENTRIES, REMOVE_ENTRIES.` };
         }
       }
 
-      return { success: false, error: `Unknown entity_type "${entityType}". Valid: LIST_ENTRIES.` };
+      // ─── LISTS ─────────────────────────────────────────────────────────────
+      // Whole-list actions (create/delete/enumerate a list itself). Deliberately
+      // NOT routed through resolveAttioListId — that helper exists specifically
+      // to disambiguate an entry-scoped id against one already-bound deal list,
+      // and applying it here (e.g. to a raw id returned by LIST/GET) risks
+      // silently resolving to an unrelated AgentWeb list's own deal-list id.
+      if (entityType === 'LISTS') {
+        switch (action) {
+          case 'LIST': {
+            const lists = await svc.getAllLists();
+            return { success: true, lists };
+          }
+          case 'GET': {
+            if (!args?.list_id) return { success: false, error: 'list_id is required for LISTS GET.' };
+            const lists = await svc.getAllLists();
+            const list = lists.find(l => l.id === args.list_id);
+            if (!list) return { success: false, error: `List not found in Attio: ${args.list_id}` };
+            return { success: true, list };
+          }
+          case 'CREATE': {
+            const name: string = args?.name ?? '';
+            if (!name.trim()) return { success: false, error: 'name is required for LISTS CREATE.' };
+            const objectSlug: 'people' | 'companies' = args?.object_type === 'companies' ? 'companies' : 'people';
+            const listId = await svc.createList(name.trim(), objectSlug);
+            return { success: true, list_id: listId };
+          }
+          case 'DELETE': {
+            if (!args?.list_id) return { success: false, error: 'list_id is required for LISTS DELETE.' };
+            await svc.deleteList(args.list_id);
+            return { success: true, deleted: args.list_id };
+          }
+          default:
+            return { success: false, error: `Unknown action "${action}" for LISTS. Valid: LIST, GET, CREATE, DELETE.` };
+        }
+      }
+
+      return { success: false, error: `Unknown entity_type "${entityType}". Valid: LIST_ENTRIES, LISTS.` };
     } catch (err: any) {
       return { success: false, error: err?.message ?? 'Attio API call failed.', attioError: err?.response?.data ?? null, status: err?.response?.status ?? null };
     }
