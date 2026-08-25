@@ -67,6 +67,12 @@ export class AttioService {
   private readonly _token: string;
   private readonly _userId?: string;
   private readonly _accountId?: string;
+  // object_id -> api_slug, lazily populated by getObjectSlug(). object/slug
+  // mappings are effectively permanent within a workspace, so a per-instance
+  // cache (this instance's lifetime — one webhook job, one request) is
+  // enough to avoid a GET /v2/objects call per event without needing a
+  // module-level cache or TTL.
+  private objectSlugCache: Map<string, string> | null = null;
 
   private constructor(token: string, userId?: string, accountId?: string) {
     this._token = token;
@@ -353,6 +359,25 @@ export class AttioService {
   // ─── Lists ────────────────────────────────────────────────────────────────
   // Attio Lists are named collections of People or Company records.
   // Use the /v2/lists endpoint. Lists are scoped per object type (people/companies).
+
+  /**
+   * Resolves an Attio object_id (a UUID, e.g. from a webhook event's
+   * `id.object_id`) to its api_slug (e.g. 'people', 'companies'). Live-caught
+   * bug (ENG-1380): webhook payloads never carry a slug directly — only this
+   * UUID — so anything trying to filter events by object type needs this
+   * lookup. Cached per-instance since the mapping is effectively permanent.
+   */
+  async getObjectSlug(objectId: string): Promise<string | null> {
+    if (!this.objectSlugCache) {
+      const res = await axiosInstance.get(`${this.baseUrl}/objects`, { headers: this.headers() });
+      this.objectSlugCache = new Map(
+        ((res.data as any)?.data ?? [])
+          .filter((o: any) => o?.id?.object_id && o?.api_slug)
+          .map((o: any) => [o.id.object_id as string, o.api_slug as string])
+      );
+    }
+    return this.objectSlugCache.get(objectId) ?? null;
+  }
 
   async getAllLists(): Promise<Array<{ id: string; name: string }>> {
     const res = await axiosInstance.get(`${this.baseUrl}/lists`, { headers: this.headers() });

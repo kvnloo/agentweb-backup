@@ -30,11 +30,21 @@ export async function applyAttioPersonEvent(
   const recordId: string = event?.data?.record?.id?.record_id ?? event?.id?.record_id ?? '';
   const actorType: string = event?.actor?.type ?? event?.data?.actor?.type ?? '';
   const actorId: string = event?.actor?.id ?? event?.data?.actor?.id ?? '';
-  const objectSlug: string = event?.data?.object?.slug ?? '';
+  // Real deliveries never carry a slug directly (live-verified, ENG-1380) —
+  // only an object_id UUID at event.id.object_id. Check for a direct slug
+  // first (cheap, and covers any payload shape that does include one),
+  // falling back to resolving the UUID via AttioService.getObjectSlug.
+  const objectSlugDirect: string = event?.data?.object?.slug ?? '';
+  const objectId: string = event?.id?.object_id ?? event?.data?.object?.id ?? '';
 
   const relevant = ['record.created', 'record.updated', 'record.deleted'].includes(eventType);
   if (!relevant || !recordId) return;
+
   // Only process People records — skip Companies and other object types.
+  let objectSlug = objectSlugDirect;
+  if (!objectSlug && objectId) {
+    objectSlug = (await svc.getObjectSlug(objectId).catch(() => null)) ?? '';
+  }
   if (objectSlug && objectSlug !== 'people') return;
 
   if (actorType === 'app') {
