@@ -2,6 +2,7 @@ import { crmDb } from '../services/db';
 import { AttioService } from '../services/attioService';
 import { ExternalCrmSyncConfig } from '../services/externalCrmSyncService';
 import { getAttioConfig } from '../config/integrations';
+import { extractAttioValue } from '../services/adapters/attioAdapter';
 
 /**
  * Applies a single Attio `record.*` (People only — Companies are skipped,
@@ -87,36 +88,70 @@ export async function applyAttioPersonEvent(
     return;
   }
 
-  const email = values.email_addresses?.[0]?.email_address ?? '';
+  // Config-driven field extraction, mirroring attioAdapter.ts's pullContacts
+  // exactly (same mapping filters, same 'first_name'/'last_name'/'company'
+  // special cases, same extractAttioValue value-shape interpretation) — so a
+  // webhook-triggered auto-pull covers the same fields a manual Pull would,
+  // rather than a narrower hardcoded set. Live-caught gap (ENG-1380): the
+  // previous hardcoded firstName/lastName/phone/title/linkedin list silently
+  // dropped company and every custom-field mapping, and ignored each field's
+  // configured pull direction (e.g. the default mapping's linkedin is
+  // push-only, but the old code synced it on every webhook event anyway).
+  const pullContactMappings = config.contactFieldMapping.filter(m => m.enabled && m.direction !== 'push');
+  const pullCustomMappings = config.customFieldMapping.filter(m => m.enabled && m.direction !== 'push');
+  const attrCache = await svc.loadAttributeTypes('people');
+
+  const leadData: Record<string, any> = {};
+  for (const m of pullContactMappings) {
+    const slug = m.crmProperty;
+    let val: any;
+    if (slug === 'first_name' || slug === 'last_name') {
+      const nameAttr = values['name'];
+      if (Array.isArray(nameAttr) && nameAttr.length > 0) val = nameAttr[0][slug];
+    } else if (slug === 'company') {
+      const companyRef = values['company']?.[0]?.target_record_id;
+      if (companyRef) {
+        const comp = await svc.getCompanyById(companyRef);
+        val = comp?.name;
+      }
+    } else {
+      const type = attrCache.get(`object:people:${slug}`) || 'text';
+      val = extractAttioValue(values[slug], type);
+    }
+    if (val != null && val !== '') leadData[m.agentwebField] = val;
+  }
+
+  const customFields: Record<string, any> = {};
+  for (const m of pullCustomMappings) {
+    const slug = m.crmProperty;
+    const type = attrCache.get(`object:people:${slug}`) || 'text';
+    const val = extractAttioValue(values[slug], type);
+    if (val != null && val !== '') customFields[m.agentwebField] = val;
+  }
+
+  const email: string | undefined = leadData.email;
   if (!email) {
     console.log(`[AttioWebhook] No email for recordId=${recordId}, skipping`);
     return;
   }
-
-  const firstName = values.name?.[0]?.first_name ?? '';
-  const lastName = values.name?.[0]?.last_name ?? '';
-  const phone = values.phone_numbers?.[0]?.original_phone_number ?? '';
-  const title = values.job_title?.[0]?.value ?? '';
-  const linkedin = values.linkedin?.[0]?.value ?? '';
+  delete leadData.email; // used only as the lookup key / stamped separately below
 
   const lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
 
   if (!lead) {
-    const newLead: Record<string, any> = { email: email.toLowerCase(), syncMetadata: { attio_record_id: recordId } };
-    if (firstName) newLead.firstName = firstName;
-    if (lastName) newLead.lastName = lastName;
-    if (phone) newLead.phone = phone;
-    if (title) newLead.title = title;
-    if (linkedin) newLead.linkedin = linkedin;
+    const newLead: Record<string, any> = {
+      email: email.toLowerCase(),
+      ...leadData,
+      syncMetadata: { attio_record_id: recordId },
+    };
+    if (Object.keys(customFields).length > 0) newLead.customFields = customFields;
     await crmDb.createLead(listId, newLead);
     console.log(`[AttioWebhook] Created lead for ${email} in list ${listId}`);
   } else {
-    const updates: Record<string, any> = {};
-    if (firstName) updates.firstName = firstName;
-    if (lastName) updates.lastName = lastName;
-    if (phone) updates.phone = phone;
-    if (title) updates.title = title;
-    if (linkedin) updates.linkedin = linkedin;
+    const updates: Record<string, any> = { ...leadData };
+    if (Object.keys(customFields).length > 0) {
+      updates.customFields = { ...(lead.customFields || {}), ...customFields };
+    }
     if (Object.keys(updates).length > 0) {
       await crmDb.updateLead(listId, lead.leadId, updates);
       console.log(`[AttioWebhook] Updated lead ${lead.leadId} in list ${listId}`);

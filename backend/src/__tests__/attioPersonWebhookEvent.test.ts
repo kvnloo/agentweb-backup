@@ -36,11 +36,37 @@ import { applyAttioPersonEvent } from '../utils/attioPersonWebhookEvent';
 
 const OUR_CLIENT_ID = 'our-app-client-id';
 
-const baseConfig: any = { deleteOnPull: true };
+// Mirrors DEFAULT_ATTIO_CONTACT_MAPPING (externalCrmSyncService.ts) — real
+// default mapping, including linkedin's push-only direction (the exact gap
+// this file's tests below prove is now respected by the webhook path too).
+const DEFAULT_CONTACT_MAPPING = [
+  { agentwebField: 'email', crmProperty: 'email_addresses', direction: 'both', enabled: true },
+  { agentwebField: 'firstName', crmProperty: 'first_name', direction: 'both', enabled: true },
+  { agentwebField: 'lastName', crmProperty: 'last_name', direction: 'both', enabled: true },
+  { agentwebField: 'phone', crmProperty: 'phone_numbers', direction: 'both', enabled: true },
+  { agentwebField: 'title', crmProperty: 'job_title', direction: 'both', enabled: true },
+  { agentwebField: 'company', crmProperty: 'company', direction: 'both', enabled: true },
+  { agentwebField: 'linkedin', crmProperty: 'linkedin', direction: 'push', enabled: true },
+];
 
-const makeSvc = (personValues: Record<string, any>, objectSlugsById: Record<string, string> = {}) => ({
+const baseConfig: any = {
+  deleteOnPull: true,
+  contactFieldMapping: DEFAULT_CONTACT_MAPPING,
+  customFieldMapping: [],
+};
+
+const makeSvc = (
+  personValues: Record<string, any>,
+  objectSlugsById: Record<string, string> = {},
+  opts: { attrTypes?: Record<string, string>; companies?: Record<string, any> } = {},
+) => ({
   getPersonValues: jest.fn().mockResolvedValue(personValues),
   getObjectSlug: jest.fn((id: string) => Promise.resolve(objectSlugsById[id] ?? null)),
+  loadAttributeTypes: jest.fn().mockResolvedValue(new Map(
+    Object.entries(opts.attrTypes ?? { email_addresses: 'email_address', phone_numbers: 'phone_number' })
+      .map(([slug, type]) => [`object:people:${slug}`, type])
+  )),
+  getCompanyById: jest.fn((id: string) => Promise.resolve(opts.companies?.[id] ?? null)),
 });
 
 beforeEach(() => {
@@ -162,6 +188,116 @@ describe('applyAttioPersonEvent', () => {
       phone: '+15551234567',
       title: 'Engineer',
       syncMetadata: { attio_record_id: 'rec-1' },
+    }));
+  });
+
+  // Live-caught gap (ENG-1380): the webhook handler used to hardcode a
+  // firstName/lastName/phone/title/linkedin-only field list and ignore the
+  // list's actual field mapping — company and every custom field were
+  // silently never synced by auto-pull, only by a manual Pull. These tests
+  // prove the fix: webhook auto-pull now covers the same fields, respecting
+  // the same enabled/direction config, as pullContacts's manual pull.
+  it('syncs company via the associated Attio company record (webhook parity with manual pull)', async () => {
+    const svc = makeSvc(
+      {
+        email_addresses: [{ email_address: 'new@example.com' }],
+        company: [{ target_record_id: 'comp-1' }],
+      },
+      {},
+      { companies: { 'comp-1': { name: 'Acme Corp' } } },
+    );
+    mockGetLeadByEmail.mockResolvedValue(null);
+
+    await applyAttioPersonEvent('list-1', baseConfig, svc as any, {
+      event_type: 'record.created',
+      id: { record_id: 'rec-1' },
+    });
+
+    expect(svc.getCompanyById).toHaveBeenCalledWith('comp-1');
+    expect(mockCreateLead).toHaveBeenCalledWith('list-1', expect.objectContaining({
+      email: 'new@example.com',
+      company: 'Acme Corp',
+    }));
+  });
+
+  it('does NOT sync linkedin via webhook — the default mapping marks it push-only, same as manual pull respects', async () => {
+    const svc = makeSvc({
+      email_addresses: [{ email_address: 'new@example.com' }],
+      linkedin: [{ value: 'https://linkedin.com/in/test' }],
+    });
+    mockGetLeadByEmail.mockResolvedValue(null);
+
+    await applyAttioPersonEvent('list-1', baseConfig, svc as any, {
+      event_type: 'record.created',
+      id: { record_id: 'rec-1' },
+    });
+
+    const createdLead = mockCreateLead.mock.calls[0][1];
+    expect(createdLead.linkedin).toBeUndefined();
+  });
+
+  it('respects a disabled contact field mapping — skips a field even though Attio has a value', async () => {
+    const config = {
+      ...baseConfig,
+      contactFieldMapping: DEFAULT_CONTACT_MAPPING.map(m => m.agentwebField === 'title' ? { ...m, enabled: false } : m),
+    };
+    const svc = makeSvc({
+      email_addresses: [{ email_address: 'new@example.com' }],
+      job_title: [{ value: 'Engineer' }],
+    });
+    mockGetLeadByEmail.mockResolvedValue(null);
+
+    await applyAttioPersonEvent('list-1', config, svc as any, {
+      event_type: 'record.created',
+      id: { record_id: 'rec-1' },
+    });
+
+    const createdLead = mockCreateLead.mock.calls[0][1];
+    expect(createdLead.title).toBeUndefined();
+  });
+
+  it('syncs enabled custom fields on create', async () => {
+    const config = {
+      ...baseConfig,
+      customFieldMapping: [{ agentwebField: 'favoriteColor', crmProperty: 'favorite_color', direction: 'both', enabled: true }],
+    };
+    const svc = makeSvc(
+      {
+        email_addresses: [{ email_address: 'new@example.com' }],
+        favorite_color: [{ value: 'blue' }],
+      },
+    );
+
+    mockGetLeadByEmail.mockResolvedValue(null);
+
+    await applyAttioPersonEvent('list-1', config, svc as any, {
+      event_type: 'record.created',
+      id: { record_id: 'rec-1' },
+    });
+
+    expect(mockCreateLead).toHaveBeenCalledWith('list-1', expect.objectContaining({
+      customFields: { favoriteColor: 'blue' },
+    }));
+  });
+
+  it('merges enabled custom fields into an existing lead\'s customFields on update, rather than overwriting them', async () => {
+    const config = {
+      ...baseConfig,
+      customFieldMapping: [{ agentwebField: 'favoriteColor', crmProperty: 'favorite_color', direction: 'both', enabled: true }],
+    };
+    const svc = makeSvc({
+      email_addresses: [{ email_address: 'existing@example.com' }],
+      favorite_color: [{ value: 'green' }],
+    });
+    mockGetLeadByEmail.mockResolvedValue({ leadId: 'lead-1', customFields: { otherField: 'kept' } });
+
+    await applyAttioPersonEvent('list-1', config, svc as any, {
+      event_type: 'record.updated',
+      id: { record_id: 'rec-1' },
+    });
+
+    expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-1', expect.objectContaining({
+      customFields: { otherField: 'kept', favoriteColor: 'green' },
     }));
   });
 

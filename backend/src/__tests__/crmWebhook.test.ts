@@ -42,10 +42,17 @@ jest.mock('../services/hubspotService', () => ({
 }));
 
 const mockAttioGetPersonValues = jest.fn();
+const mockAttioSvcExtras = {
+  loadAttributeTypes: jest.fn().mockResolvedValue(new Map([
+    ['object:people:email_addresses', 'email_address'],
+    ['object:people:phone_numbers', 'phone_number'],
+  ])),
+  getCompanyById: jest.fn().mockResolvedValue(null),
+};
 jest.mock('../services/attioService', () => ({
   AttioService: {
-    fromToken: jest.fn().mockReturnValue({ getPersonValues: mockAttioGetPersonValues }),
-    create: jest.fn().mockResolvedValue({ getPersonValues: mockAttioGetPersonValues }),
+    fromToken: jest.fn().mockReturnValue({ getPersonValues: mockAttioGetPersonValues, ...mockAttioSvcExtras }),
+    create: jest.fn().mockResolvedValue({ getPersonValues: mockAttioGetPersonValues, ...mockAttioSvcExtras }),
   },
 }));
 
@@ -69,7 +76,19 @@ const mockConfig = (provider: string) => ({
   webhookSecret: VALID_SECRET,
   deleteOnPull: false,
   autoSyncEnabled: false,
-  contactFieldMapping: [],
+  // Mirrors DEFAULT_ATTIO_CONTACT_MAPPING (externalCrmSyncService.ts) — the
+  // Attio webhook path is config-driven now (ENG-1380), so its tests need a
+  // realistic mapping. HubSpot's webhook handler hardcodes its own field
+  // list and never reads this, so it's safe to share across both providers.
+  contactFieldMapping: [
+    { agentwebField: 'email', crmProperty: 'email_addresses', direction: 'both', enabled: true },
+    { agentwebField: 'firstName', crmProperty: 'first_name', direction: 'both', enabled: true },
+    { agentwebField: 'lastName', crmProperty: 'last_name', direction: 'both', enabled: true },
+    { agentwebField: 'phone', crmProperty: 'phone_numbers', direction: 'both', enabled: true },
+    { agentwebField: 'title', crmProperty: 'job_title', direction: 'both', enabled: true },
+    { agentwebField: 'company', crmProperty: 'company', direction: 'both', enabled: true },
+    { agentwebField: 'linkedin', crmProperty: 'linkedin', direction: 'push', enabled: true },
+  ],
   dealFieldMapping: [],
   customFieldMapping: [],
   createdAt: '2026-01-01T00:00:00Z',

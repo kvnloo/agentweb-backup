@@ -607,20 +607,28 @@ export class AttioAdapter implements CrmAdapter {
 
 
     private extractAttioValue(values: any[], type: string): any {
-        if (!values || !values.length) return undefined;
-        const entry = values[0];
-        const cleanType = type.replace(/-/g, '_');
-        switch (cleanType) {
-            case 'status': return entry.status?.title ?? entry.status?.target;
-            case 'select': return entry.option?.title ?? entry.option?.target;
-            case 'currency': return entry.currency_value;
-            case 'number': return entry.value;
-            case 'email_address': return entry.email_address;
-            case 'phone_number': return entry.original_phone_number;
-            case 'personal_name':
-            case 'name':
-                return `${entry.first_name || ''} ${entry.last_name || ''}`.trim();
-            default: return entry.value;
-        }
+        return extractAttioValue(values, type);
+    }
+}
+
+// Shared with applyAttioPersonEvent (attioPersonWebhookEvent.ts) so the
+// webhook auto-pull path interprets Attio value shapes identically to
+// pullContacts's manual pull — a standalone export rather than a private
+// class method since it has no adapter-instance state.
+export function extractAttioValue(values: any[], type: string): any {
+    if (!values || !values.length) return undefined;
+    const entry = values[0];
+    const cleanType = type.replace(/-/g, '_');
+    switch (cleanType) {
+        case 'status': return entry.status?.title ?? entry.status?.target;
+        case 'select': return entry.option?.title ?? entry.option?.target;
+        case 'currency': return entry.currency_value;
+        case 'number': return entry.value;
+        case 'email_address': return entry.email_address;
+        case 'phone_number': return entry.original_phone_number;
+        case 'personal_name':
+        case 'name':
+            return `${entry.first_name || ''} ${entry.last_name || ''}`.trim();
+        default: return entry.value;
     }
 }
