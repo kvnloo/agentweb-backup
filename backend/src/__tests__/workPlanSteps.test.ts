@@ -107,8 +107,29 @@ describe("normalizeWorkPlanSteps", () => {
       ]);
       expect(steps[0].expectedAssetCountTools).toEqual(["generate_image", "generate_video"]);
       expect(warnings).toEqual([
-        "step 1: dropped 4 non-string entries from expectedAssetCountTools",
+        "step 1: dropped 4 invalid entries from expectedAssetCountTools",
       ]);
+    });
+
+    // CodeRabbit (ENG-1331 follow-up): a whitespace-only string passed `entry !== ''`
+    // unchanged and persisted as a "valid" tool name that can never match a real
+    // call — a step scoped to only that name could never reach expectedAssetCount.
+    it("rejects whitespace-only entries instead of storing them as valid tool names", () => {
+      const { steps, warnings } = normalizeWorkPlanSteps([
+        { stepCount: 1, title: "Step", expectedAssetCountTools: ["playwright_browser_take_screenshot", "   "] },
+      ]);
+      expect(steps[0].expectedAssetCountTools).toEqual(["playwright_browser_take_screenshot"]);
+      expect(warnings).toEqual([
+        "step 1: dropped 1 invalid entries from expectedAssetCountTools",
+      ]);
+    });
+
+    it("trims surrounding whitespace on an otherwise-valid tool name", () => {
+      const { steps, warnings } = normalizeWorkPlanSteps([
+        { stepCount: 1, title: "Step", expectedAssetCountTools: ["  playwright_browser_take_screenshot  "] },
+      ]);
+      expect(steps[0].expectedAssetCountTools).toEqual(["playwright_browser_take_screenshot"]);
+      expect(warnings).toEqual([]);
     });
   });
 
