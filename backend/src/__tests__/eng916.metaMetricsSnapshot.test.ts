@@ -42,8 +42,14 @@ const mockGetCreds = getMetaAccountCredentials as jest.Mock;
 const HAVEN_USER_ID = 'a3917669-1c7d-45ed-8ef9-f454de109b6f';
 const TEST_DATE = '2026-08-09';
 
+/**
+ * Serves BOTH Graph calls a run makes: the account-context read (currency + timezone_name) and the
+ * insights read (data). The context call is first and now fails closed without a currency, so a
+ * fixture that only carried `data` would abort every run before a single date was attempted — which
+ * is correct behaviour, and exactly what the dedicated no-currency test asserts with its own mock.
+ */
 function makeCampaignInsightsResponse(rows: Array<Record<string, any>>) {
-  return { data: rows };
+  return { data: rows, currency: 'USD', timezone_name: 'America/Los_Angeles' };
 }
 
 function makeLead(campaign: string | undefined, createdAt: string) {
@@ -406,6 +412,23 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
     // 27 of the 28 days should still have succeeded and written a campaign row.
     expect(campaignRows()).toHaveLength(27);
     // The failure must be visible, not swallowed silently.
+    expect(errorSpy).toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it('refuses to store spend when Meta reports no currency, instead of writing an unusable row', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    // Account-context call answers without a currency.
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: 'act_1842363582956923', timezone_name: 'America/Los_Angeles' }),
+    });
+
+    await runMetaMetricsSnapshot();
+
+    // A spend figure whose unit is unknown is uninterpretable, and writing it beside
+    // dataQuality: 'exact' asserts a confidence we do not have. Nothing is stored.
+    expect(mockAdsDb.putSnapshot).not.toHaveBeenCalled();
     expect(errorSpy).toHaveBeenCalled();
     errorSpy.mockRestore();
   });

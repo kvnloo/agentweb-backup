@@ -160,8 +160,23 @@ export async function fetchMetaAccountContext(
   if (!res.ok || body?.error) {
     throw new Error(`[ENG-916] Meta account context failed: ${body?.error?.message || res.status}`);
   }
+  const currency = String(body.currency || "").trim();
+  if (!currency) {
+    // FAIL CLOSED. A spend figure whose unit is unknown is not a weaker measurement, it is an
+    // uninterpretable one — and writing it beside dataQuality: "exact" actively asserts a
+    // confidence we do not have. The entire reason currency is stored rather than inferred is that
+    // a mis-stated one once reported a $5,000 deal as ₹5,000, ~80x off and silently; an EMPTY
+    // currency is the same failure with the evidence removed. Better no row than an unusable one.
+    throw new Error(
+      `[ENG-916] Meta account ${accountId} returned no currency — refusing to store spend whose unit is unknown`
+    );
+  }
+
   return {
-    currency: String(body.currency || ""),
+    currency,
+    // Null is honest here in a way it is not for currency: a missing timezone makes cross-platform
+    // day-boundary comparison unsafe, which a consumer can detect and decline, whereas a missing
+    // currency makes the number itself meaningless.
     reportingTimezone: body.timezone_name ? String(body.timezone_name) : null,
   };
 }
