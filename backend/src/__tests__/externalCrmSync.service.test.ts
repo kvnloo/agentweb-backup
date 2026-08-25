@@ -62,6 +62,7 @@ const mockAttioServiceInstance = {
   createCompany: jest.fn().mockResolvedValue({ recordId: 'comp_123', name: 'Test Corp' }),
   getCompanyById: jest.fn().mockResolvedValue({ recordId: 'comp_123', name: 'Test Corp' }),
   getAllPeopleAttributes: jest.fn().mockResolvedValue([]),
+  getAllObjectAttributes: jest.fn().mockResolvedValue([]),
   listListAttributes: jest.fn().mockResolvedValue([]),
   deletePerson: jest.fn().mockResolvedValue(undefined),
   deleteListEntry: jest.fn().mockResolvedValue(undefined),
@@ -470,6 +471,57 @@ describe('ExternalCrmSyncService', () => {
       const saved = call[2] as Record<string, any>;
       expect(saved.dealFieldMapping).toEqual(dealMapping);
       expect(saved.customFieldMapping).toEqual(customMapping);
+    });
+
+    it('saves Attio company field mapping', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      const companyMapping: FieldMapping[] = [
+        { agentwebField: 'industry', crmProperty: 'industry', direction: 'both', enabled: true },
+      ];
+      await service.saveConfig('user1', 'list1', 'attio', { companyFieldMapping: companyMapping });
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.companyFieldMapping).toEqual(companyMapping);
+    });
+
+    it('defaults companyFieldMapping to empty for a fresh Attio config', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'attio', {});
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.companyFieldMapping).toEqual([]);
+    });
+
+    it('defaults companyFieldMapping to empty for HubSpot (no Company-object concept)', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', {});
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.companyFieldMapping).toEqual([]);
+    });
+
+    it('preserves an existing companyFieldMapping across an unrelated partial save', async () => {
+      const companyMapping: FieldMapping[] = [
+        { agentwebField: 'industry', crmProperty: 'industry', direction: 'both', enabled: true },
+      ];
+      const existing = makeConfig({ provider: 'attio', companyFieldMapping: companyMapping } as any);
+      mockListWithConfig(existing, 'attio');
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'attio', { autoSyncEnabled: false });
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.companyFieldMapping).toEqual(companyMapping);
     });
 
     it('keeps the Attio deal list ID locked after first sync', async () => {
@@ -1722,6 +1774,24 @@ describe('ExternalCrmSyncService', () => {
       expect((mockHubSpotServiceInstance as any).listContactProperties).not.toHaveBeenCalled();
       expect(result.properties).toHaveLength(dealProps.length);
       expect(result.properties[0]).toMatchObject({ name: 'amount', label: 'Amount' });
+    });
+
+    it('returns Attio Company object attributes when objectType=company', async () => {
+      const config = makeConfig({ provider: 'attio' });
+      mockListWithConfig(config, 'attio');
+      (mockAttioServiceInstance as any).getAllObjectAttributes = jest.fn().mockResolvedValue([
+        { api_slug: 'industry', title: 'Industry', type: 'select', is_system_attribute: false, attribute_id: 'a1' },
+        { api_slug: 'employee_range', title: 'Employee Range', type: 'select', is_system_attribute: true, attribute_id: 'a2' },
+      ]);
+
+      const result = await service.getExternalProperties('user1', 'list1', 'attio', { objectType: 'company' });
+
+      expect((mockAttioServiceInstance as any).getAllObjectAttributes).toHaveBeenCalledWith('companies');
+      expect((mockAttioServiceInstance as any).getAllPeopleAttributes).not.toHaveBeenCalled();
+      expect(result.properties).toEqual([
+        { name: 'industry', label: 'Industry', type: 'select' },
+        { name: 'employee_range', label: 'Employee Range', type: 'select' },
+      ]);
     });
 
     it('returns Attio people attributes for any objectType', async () => {
