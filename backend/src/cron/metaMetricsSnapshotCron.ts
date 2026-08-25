@@ -46,6 +46,34 @@ const PLATFORM: AdsPlatform = "meta";
 // the cost multiplies by accounts and by pagination, not just by days.
 const SETTLING_WINDOW_DAYS = 28;
 
+/**
+ * The spellings a campaign name can legitimately arrive as in a `utm_campaign` value.
+ *
+ * The `{{campaign.name}}` macro expands into a URL, so the value reaching a lead is percent- or
+ * plus-encoded depending on the path it took. Decoding is attempted but never assumed —
+ * `decodeURIComponent` THROWS on a malformed sequence (a lone `%`), which is ordinary in
+ * hand-written ad URLs, so a failure falls back to the raw value rather than dropping the lead.
+ *
+ * Deliberately NOT case-folded and NOT otherwise normalised: the macro emits the advertiser's exact
+ * name, and folding case would let two genuinely different campaigns collide into one — the same
+ * over-normalisation trap that makes two distinct pages share one verdict elsewhere in this codebase.
+ */
+export function campaignNameKeys(name: unknown): string[] {
+  const raw = name === undefined || name === null ? "" : String(name).trim();
+  if (!raw) return [];
+  const keys = new Set<string>([raw]);
+  const plusDecoded = raw.replace(/\+/g, " ");
+  keys.add(plusDecoded);
+  for (const candidate of [raw, plusDecoded]) {
+    try {
+      keys.add(decodeURIComponent(candidate));
+    } catch {
+      // Malformed percent-encoding — keep the undecoded spellings we already have.
+    }
+  }
+  return [...keys].filter(Boolean);
+}
+
 function toDateStr(d: Date): string {
   return d.toISOString().split("T")[0];
 }
@@ -265,6 +293,39 @@ export async function snapshotMetaMetricsForDate(
   }
 
   const knownCampaignIds = new Set(campaignRows.map((c) => String(c.campaign_id)));
+
+  /*
+   * NAME FALLBACK — measured 2026-08-25, not speculative.
+   *
+   * A lead's `utm_campaign` is whatever the ad's `url_tags` macro expanded to, and across the real
+   * managed accounts that is NOT reliably the campaign id:
+   *   Haven   — 3 of 9 ACTIVE ads carry `{{campaign.id}}`; the other 6 carry no url_tags at all
+   *   Phoenix — 46 of 46 ACTIVE ads carry `{{campaign.name}}`, so an id-only join misses 100% of
+   *             the portfolio's biggest spender (~$5.6k/7d)
+   *
+   * Matching name as well as id costs NOTHING — `campaign_name` already comes back in the same
+   * insights response — and it takes Phoenix from structurally unjoinable to joining today. The
+   * alternative, retagging the ads to `{{campaign.id}}`, is per-ad and manual AND swaps the
+   * creative, which RESETS Meta's learning phase. Nobody should pay that to fix a reporting join.
+   *
+   * ⚠ AMBIGUOUS NAMES ARE EXCLUDED, NOT GUESSED. Meta permits two campaigns to share a name, and a
+   * lead tagged with a duplicated name cannot be attributed to either without inventing a fact.
+   * Such names are dropped from the map entirely, so those leads land in unattributedLeadCount —
+   * visibly uncounted rather than silently misattributed.
+   */
+  const nameToCampaignId = new Map<string, string>();
+  const ambiguousNames = new Set<string>();
+  for (const c of campaignRows) {
+    for (const key of campaignNameKeys(c.campaign_name)) {
+      const existing = nameToCampaignId.get(key);
+      if (existing && existing !== String(c.campaign_id)) ambiguousNames.add(key);
+      else nameToCampaignId.set(key, String(c.campaign_id));
+    }
+  }
+  // NOTE: ambiguous keys are deliberately LEFT IN the map. They are needed as a positive signal
+  // when matching below — deleting them made an ambiguous name merely "absent", which a lead's
+  // OTHER spelling could then route around.
+
   // Named for what it actually is. It counts leads MATCHED to a campaign the platform reported —
   // it is not the day's total, and calling it that made the account_day row able to claim
   // `totalLeadCount: 0` alongside `unattributedLeadCount: 1` (CodeRabbit Major).
@@ -274,8 +335,32 @@ export async function snapshotMetaMetricsForDate(
 
   for (const lead of leadsForDate) {
     const campaign = lead.firstTouch?.utm?.campaign;
-    if (campaign && knownCampaignIds.has(String(campaign))) {
-      leadCountByCampaign.set(String(campaign), (leadCountByCampaign.get(String(campaign)) || 0) + 1);
+    const raw = campaign === undefined || campaign === null ? "" : String(campaign);
+    // Id first — it is exact and unambiguous. Only then name, which is a convention.
+    let matchedId: string | undefined;
+    if (raw && knownCampaignIds.has(raw)) matchedId = raw;
+    else if (raw) {
+      /*
+       * EVERY spelling is evaluated before deciding — first-match-wins was wrong (CodeRabbit Major).
+       * With campaigns named `A+B` and `A B`, only the shared key `A B` was marked ambiguous, so a
+       * lead tagged `A+B` matched the raw key and was attributed to the first campaign — even though
+       * `+` is a legitimate encoding of the ambiguous `A B`. The lead genuinely could have come from
+       * either, so attributing it invents a fact.
+       *
+       * Attribute ONLY when every spelling agrees on exactly one campaign and none of them is known
+       * to be ambiguous. Anything else stays unattributed — visibly uncounted beats silently wrong.
+       */
+      const resolved = new Set<string>();
+      let ambiguous = false;
+      for (const key of campaignNameKeys(raw)) {
+        if (ambiguousNames.has(key)) { ambiguous = true; break; }
+        const hit = nameToCampaignId.get(key);
+        if (hit) resolved.add(hit);
+      }
+      if (!ambiguous && resolved.size === 1) matchedId = [...resolved][0];
+    }
+    if (matchedId) {
+      leadCountByCampaign.set(matchedId, (leadCountByCampaign.get(matchedId) || 0) + 1);
       attributedLeadCount++;
     } else {
       // Not silently dropped — a future UTM-convention drift must be visible, not
