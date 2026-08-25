@@ -4999,12 +4999,14 @@ export async function generateChatResponse(
     // installed skill (e.g. a CRM-page turn on a customer session), so a nonzero
     // toolDefinitions.length doesn't prove the skill's own tools bound. Gate on
     // the subset that actually came from the skill (+ virtual-skill) resolution
-    // instead — excluding FOUNDATION_TOOLS specifically, since buildSkillContext
-    // unions those into allowedToolNames unconditionally for every session, so a
-    // single registered foundation tool would otherwise mask the exact "this
-    // skill's own tools failed to bind" failure the gate exists to catch.
+    // instead — excluding FOUNDATION_TOOLS and the delegated-admin tool set,
+    // since buildSkillContext unions both into allowedToolNames unconditionally
+    // (foundation tools for every session, admin tools for any delegated admin),
+    // so a single registered tool from either would otherwise mask the exact
+    // "this skill's own tools failed to bind" failure the gate exists to catch.
+    const adminToolNames = new Set(agentModeService.getAdminToolNames());
     const skillOnlyToolNames = new Set(
-      [...skillContext.allowedToolNames].filter((name) => !AgentModeService.FOUNDATION_TOOLS.has(name)),
+      [...skillContext.allowedToolNames].filter((name) => !AgentModeService.FOUNDATION_TOOLS.has(name) && !adminToolNames.has(name)),
     );
     const skillToolDefinitions = toolDefinitions.filter((t: any) => skillOnlyToolNames.has(t.function.name));
     if (sessionHasInstalledSkills && skillToolDefinitions.length === 0) {
