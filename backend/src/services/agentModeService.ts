@@ -5698,7 +5698,17 @@ export class AgentModeService {
     }
   }
 
-  private buildSkillContext(
+  /**
+   * ENG-1222: the single source of truth for "which tools + skill-context text
+   * does a session with these installed skills get". Was private to Agent Mode
+   * until chatbotService.generateChatResponse (the Emma-widget path) started
+   * independently hand-rolling the same policy and drifting from it — a skill
+   * session reached through that path could get tools without the skill's own
+   * systemPrompt, or bypass subscription-tier skill gating entirely. Public so
+   * both pipelines resolve tool access through the same, tested logic; each
+   * still looks up tool *definitions* from its own appropriate registry.
+   */
+  public buildSkillContext(
     associatedSkills: any[],
     userAllowedSkillIds: string[],
     publishedSkills: any[],
