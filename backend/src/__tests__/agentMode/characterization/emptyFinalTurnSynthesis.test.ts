@@ -132,9 +132,19 @@ describe('ENG-946 — the terminating turn, not the accumulator, decides whether
       { content: '' },
     ]);
 
-    // One nudge only (MAX_EMPTY_SYNTHESIS_RETRIES = 1), then terminate.
+    // One nudge only (MAX_EMPTY_SYNTHESIS_RETRIES = 1), then terminate — this
+    // invariant (bounded, no infinite loop) is unchanged.
     expect(llmCalls).toBe(3);
-    expect(result.content).toBe(NARRATION);
+    // ENG-1331 follow-up (CodeRabbit, PR #2620): this used to assert
+    // result.content === NARRATION — that pinned an incidental side effect (the
+    // sticky `content` accumulator still held turn 1's narration), not a real
+    // invariant. The terminating turn produced no text of its own, so shipping
+    // the stale narration as if it answered is exactly the "turn did real work
+    // but the response doesn't reflect it" failure this whole file characterizes.
+    // The fallback below now correctly replaces it with the truthful ledger.
+    expect(result.content).not.toBe(NARRATION);
+    expect(result.content).toContain('built directly from the actions I actually ran');
+    expect(result.content).toContain('you_search_web');
   });
 
   it('does not disturb a healthy run that answers on its final turn', async () => {
@@ -171,6 +181,30 @@ describe('ENG-946 — the terminating turn, not the accumulator, decides whether
 
     expect(llmCalls).toBe(3);
     expect(result.content).not.toBe('');
+    expect(result.content).toContain('built directly from the actions I actually ran');
+    expect(result.content).toContain('playwright_browser_take_screenshot');
+  });
+
+  // CodeRabbit (PR #2620): the fallback above must key off THIS iteration's own
+  // text (turnHadUsableText), not the sticky `content` accumulator. An earlier
+  // iteration that narrated something ("I'll start rendering now") alongside its
+  // tool calls leaves `content` non-empty for the rest of the turn — even after a
+  // LATER iteration performs more tool calls and terminates with genuinely nothing
+  // of its own. Gating on `!content` would see the stale narration as "not empty"
+  // and skip the fallback, shipping that stale text as if it answered the empty
+  // terminating turn instead of the truthful ledger recap.
+  it('falls back to the ledger on a genuinely empty terminating turn even when an earlier turn narrated', async () => {
+    const { result, llmCalls } = await runScriptedLoop([
+      {
+        content: "I'll start rendering now.",
+        tool_calls: [{ id: 'c1', name: 'playwright_browser_take_screenshot', arguments: '{}' }],
+      },
+      { content: '' }, // the terminating iteration has nothing of its own
+      { content: '' }, // the one nudge retry also comes back empty
+    ]);
+
+    expect(llmCalls).toBe(3);
+    expect(result.content).not.toBe("I'll start rendering now.");
     expect(result.content).toContain('built directly from the actions I actually ran');
     expect(result.content).toContain('playwright_browser_take_screenshot');
   });
