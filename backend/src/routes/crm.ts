@@ -5353,6 +5353,199 @@ router.get('/email-domain/status', async (req: Request, res: Response) => {
   }
 });
 
+// ── Multi-domain endpoints (ENG-265) ──────────────────────────────────────
+// The singular /email-domain* routes above stay as-is for backward
+// compatibility during rollout. These plural routes operate on User.emailDomains[]
+// instead of the single emailDomain/resendDomainId scalar fields.
+
+type SenderDomainEntry = { id: string; domain: string; status: string; addedAt: string };
+
+/**
+ * @route GET /api/crm/email-domains
+ * @desc List every sending domain registered by the authenticated user, each enriched with live Resend status/records
+ * @access Private
+ */
+router.get('/email-domains', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const user = await userDb.getUserById(userId);
+    const domains: SenderDomainEntry[] = user?.emailDomains || [];
+
+    const enriched = await Promise.all(domains.map(async (d: SenderDomainEntry) => {
+      const details = await resendService.getDomain(d.id);
+      return {
+        id: d.id,
+        domain: d.domain,
+        addedAt: d.addedAt,
+        status: details?.status || d.status,
+        records: details?.records || [],
+      };
+    }));
+
+    res.json({ domains: enriched });
+  } catch (error: any) {
+    console.error('Error listing email domains:', error);
+    res.status(500).json({ message: error.message || 'Failed to list email domains' });
+  }
+});
+
+/**
+ * @route POST /api/crm/email-domains
+ * @desc Register an additional sending domain in Resend for the authenticated user
+ * @access Private
+ */
+router.post('/email-domains', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { domain } = req.body;
+    if (!domain || typeof domain !== 'string') {
+      return res.status(400).json({ message: 'Domain is required' });
+    }
+
+    const normalizedDomain = domain.trim().toLowerCase();
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(normalizedDomain)) {
+      return res.status(400).json({ message: 'Invalid domain format' });
+    }
+
+    const user = await userDb.getUserById(userId);
+    const existingDomains: SenderDomainEntry[] = user?.emailDomains || [];
+
+    const alreadyOwned = existingDomains.find((d: SenderDomainEntry) => d.domain === normalizedDomain);
+    if (alreadyOwned) {
+      return res.status(409).json({ message: 'You have already registered this domain', domain: alreadyOwned });
+    }
+
+    // Check if another user already has this domain (legacy scalar or emailDomains[])
+    const usersWithDomain = await userDb.getUsersByEmailDomain(normalizedDomain);
+    const otherUserWithDomain = usersWithDomain.find(u => u.userId !== userId);
+    if (otherUserWithDomain) {
+      return res.status(409).json({ message: 'This domain is already in use by another account' });
+    }
+
+    // Check if domain already exists in Resend
+    const resendDomains = await resendService.listDomains();
+    const existingResendDomain = resendDomains.find(d => d.name === normalizedDomain);
+
+    let domainResult: { id: string; name: string; status: string; records: any[] } | null;
+    let alreadyExists = false;
+    if (existingResendDomain) {
+      domainResult = await resendService.getDomain(existingResendDomain.id);
+      alreadyExists = true;
+    } else {
+      domainResult = await resendService.createDomain(normalizedDomain);
+    }
+
+    if (!domainResult) {
+      return res.status(500).json({ message: 'Failed to register domain in Resend' });
+    }
+
+    const newEntry = {
+      id: domainResult.id,
+      domain: normalizedDomain,
+      status: domainResult.status,
+      addedAt: new Date().toISOString(),
+    };
+    const updatedDomains = [...existingDomains, newEntry];
+
+    await userDb.updateUser(userId, {
+      emailDomains: updatedDomains,
+      emailDomainList: updatedDomains.map(d => d.domain),
+    });
+
+    res.json({
+      message: alreadyExists
+        ? 'Domain already registered in Resend'
+        : 'Domain created successfully. Add the DNS records below to verify.',
+      domain: domainResult,
+      alreadyExists,
+    });
+  } catch (error: any) {
+    console.error('Error creating email domain:', error);
+    res.status(500).json({ message: error.message || 'Failed to create email domain' });
+  }
+});
+
+/**
+ * @route POST /api/crm/email-domains/:domainId/verify
+ * @desc Trigger Resend verification for one of the user's registered domains
+ * @access Private
+ */
+router.post('/email-domains/:domainId/verify', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { domainId } = req.params;
+    const user = await userDb.getUserById(userId);
+    const entry = ((user?.emailDomains || []) as SenderDomainEntry[]).find((d: SenderDomainEntry) => d.id === domainId);
+    if (!entry) {
+      return res.status(404).json({ message: 'Domain not found' });
+    }
+
+    await resendService.verifyDomain(entry.id);
+    const domainDetails = await resendService.getDomain(entry.id);
+    if (!domainDetails) {
+      return res.status(500).json({ message: 'Failed to retrieve domain status after verification' });
+    }
+
+    res.json({
+      message: domainDetails.status === 'verified'
+        ? 'Domain verified successfully!'
+        : 'Verification triggered. DNS records may take a few minutes to propagate.',
+      domain: domainDetails,
+    });
+  } catch (error: any) {
+    console.error('Error verifying email domain:', error);
+    res.status(500).json({ message: error.message || 'Failed to verify email domain' });
+  }
+});
+
+/**
+ * @route DELETE /api/crm/email-domains/:domainId
+ * @desc Remove one of the user's registered sending domains (does not delete from Resend — may be shared or reused)
+ * @access Private
+ */
+router.delete('/email-domains/:domainId', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { domainId } = req.params;
+    const user = await userDb.getUserById(userId);
+    const existingDomains: SenderDomainEntry[] = user?.emailDomains || [];
+    if (!existingDomains.some((d: SenderDomainEntry) => d.id === domainId)) {
+      return res.status(404).json({ message: 'Domain not found' });
+    }
+
+    const updatedDomains = existingDomains.filter((d: SenderDomainEntry) => d.id !== domainId);
+    await userDb.updateUser(userId, {
+      emailDomains: updatedDomains,
+      emailDomainList: updatedDomains.map((d: SenderDomainEntry) => d.domain),
+    });
+
+    res.json({ message: 'Domain removed.' });
+  } catch (error: any) {
+    console.error('Error removing email domain:', error);
+    res.status(500).json({ message: error.message || 'Failed to remove email domain' });
+  }
+});
+
 /**
  * @route POST /api/crm/lists/:listId/leads/:leadId/send-email
  * @desc Send email draft to a lead using Resend
