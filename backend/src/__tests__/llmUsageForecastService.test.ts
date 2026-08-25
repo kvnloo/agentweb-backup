@@ -15,6 +15,7 @@
  */
 
 import {
+  assessForecastAccuracy,
   computeUsageRunway,
   USAGE_RUNWAY_VERSION,
   type UsageRunwayInput,
@@ -264,5 +265,124 @@ describe("computeUsageRunway — determinism and telemetry (ENG-1212 AC1, AC6)",
     expect(r.completeDaysElapsed).toBe(3);
     // ($3 + $5 + $5) / 3 days
     expect(r.diagnostics.cycleToDateBurnMicroUsdPerDay).toBeCloseTo((13 / 3) * USD, 0);
+  });
+});
+
+/**
+ * ENG-1215 AC4 — telemetry must record forecast versus ACTUAL, not only what we
+ * showed. Every other event says what the customer was told; none said whether
+ * it turned out to be true, so nothing could answer "is this forecast any good"
+ * on a screen whose whole value is asking people to act on it.
+ *
+ * Measured by backtest rather than from a stored snapshot: `computeUsageRunway`
+ * is pure, so the forecast that WOULD have been made on an earlier day is
+ * reproducible exactly, and the days since are already in the same ledger as
+ * ground truth.
+ */
+describe("assessForecastAccuracy — forecast vs actual (ENG-1215 AC4)", () => {
+  /** Days [from, to] inclusive, 1-indexed within August, each costing `perDayUsd`. */
+  const daysFrom = (from: number, to: number, perDayUsd: number) =>
+    Array.from({ length: to - from + 1 }, (_, i) => ({
+      date: `2026-08-${String(from + i).padStart(2, "0")}`,
+      costMicroUsd: perDayUsd * USD,
+    }));
+
+  const assess = (over: Partial<UsageRunwayInput> = {}) => {
+    const input = base(over);
+    return assessForecastAccuracy(input, computeUsageRunway(input));
+  };
+
+  it("scores a steady cycle at a burn ratio of 1 — the forecast called it exactly", () => {
+    // 10 complete days at $5. The first 5 predict $5/day; the last 5 spent $5/day.
+    const r = assess({ dailyCostMicroUsd: evenDays(10, 5), costUsedMicroUsd: 50 * USD });
+
+    expect(r).not.toBeNull();
+    expect(r!.asOfDate).toBe("2026-08-06");
+    expect(r!.observedDaysAtForecast).toBe(5);
+    expect(r!.daysMeasuredSince).toBe(5);
+    expect(r!.burnRatio).toBeCloseTo(1, 5);
+  });
+
+  it("reports a ratio above 1 when the account accelerated after the forecast", () => {
+    // $2/day for 5 days, then $8/day for 5. The early forecast could only see $2.
+    const r = assess({
+      dailyCostMicroUsd: [...daysFrom(1, 5, 2), ...daysFrom(6, 10, 8)],
+      costUsedMicroUsd: 50 * USD,
+    });
+
+    expect(r!.burnRatio).toBeGreaterThan(1);
+    expect(r!.burnRatio).toBeCloseTo(4, 5);
+  });
+
+  it("reports a ratio below 1 when the account slowed down", () => {
+    const r = assess({
+      dailyCostMicroUsd: [...daysFrom(1, 5, 8), ...daysFrom(6, 10, 2)],
+      costUsedMicroUsd: 50 * USD,
+    });
+
+    expect(r!.burnRatio).toBeLessThan(1);
+    expect(r!.burnRatio).toBeCloseTo(0.25, 5);
+  });
+
+  it("does NOT leak today's remaining allowance into the past forecast", () => {
+    // The classic backtest leak. If the retrospective forecast is handed
+    // today's `costUsedMicroUsd`, it "knows" spend that had not happened yet and
+    // its on-track call is computed against the wrong remaining allowance —
+    // which would make the accuracy metric flatter the forecast it is meant to
+    // audit. Same ledger, wildly different reported spend-to-date: the
+    // measurement must not move.
+    const rows = evenDays(10, 5);
+    const honest = assess({ dailyCostMicroUsd: rows, costUsedMicroUsd: 50 * USD });
+    const inflated = assess({ dailyCostMicroUsd: rows, costUsedMicroUsd: 149 * USD });
+
+    expect(inflated!.burnRatio).toBeCloseTo(honest!.burnRatio as number, 5);
+    expect(inflated!.predictedOnTrack).toBe(honest!.predictedOnTrack);
+  });
+
+  it("returns null for a cycle too short to hold both a forecast and an outcome", () => {
+    // Silence, not a zero. A zero here would read as a perfect score.
+    expect(assess({ dailyCostMicroUsd: evenDays(3, 5), today: "2026-08-04" })).toBeNull();
+    expect(assess({ dailyCostMicroUsd: [], today: "2026-08-01" })).toBeNull();
+  });
+
+  it("reports no burn ratio when the earlier forecast declined to predict", () => {
+    // A cycle too quiet to forecast produced no prediction, so there is nothing
+    // to be right or wrong about. Inventing an error figure for a forecast that
+    // was never made would be a fabricated number in the one place whose job is
+    // measuring whether our numbers are fabricated.
+    const r = assess({
+      dailyCostMicroUsd: [...daysFrom(1, 5, 0), ...daysFrom(6, 10, 5)],
+      costUsedMicroUsd: 25 * USD,
+    });
+
+    expect(r).not.toBeNull();
+    expect(r!.burnRatio).toBeNull();
+    expect(r!.predictedOnTrack).toBeNull();
+    expect(r!.onTrackAgrees).toBeNull();
+  });
+
+  it("records whether the earlier on-track call still stands", () => {
+    // Slow first half predicts survival; a heavy second half overturns it. That
+    // disagreement is the single most useful thing this metric can report.
+    const r = assess({
+      dailyCostMicroUsd: [...daysFrom(1, 5, 1), ...daysFrom(6, 10, 28)],
+      costUsedMicroUsd: 145 * USD,
+    });
+
+    expect(r!.predictedOnTrack).toBe(true);
+    expect(r!.actualOnTrack).toBe(false);
+    expect(r!.onTrackAgrees).toBe(false);
+  });
+
+  it("carries no micro-USD — accuracy is reportable without the economics", () => {
+    // AC4: forecast-vs-actual WITHOUT customer-visible internal dollars. A burn
+    // rate is exactly what `toCustomerRunway` exists to strip, so the ratio is
+    // the whole point rather than a convenience.
+    const r = assess({ dailyCostMicroUsd: evenDays(10, 5), costUsedMicroUsd: 50 * USD });
+
+    expect(JSON.stringify(r)).not.toMatch(/MicroUsd/i);
+    for (const value of Object.values(r as unknown as Record<string, unknown>)) {
+      expect(typeof value === "number" ? value < 1_000 : true).toBe(true);
+    }
   });
 });

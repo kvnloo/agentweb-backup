@@ -42,12 +42,19 @@ jest.mock("../services/db", () => ({
   userDb: { getUserById: jest.fn() },
   orgDb: { getOrgById: jest.fn(), getOrgMembers: jest.fn() },
 }));
+// ENG-1215 AC4: the accuracy event has to be OBSERVABLE, or a fix that never
+// reaches the sink ships inert and no test notices — the ENG-1438 lesson.
+jest.mock("../services/llmUsageTelemetry", () => {
+  const actual = jest.requireActual("../services/llmUsageTelemetry");
+  return { ...actual, recordUsageTelemetry: jest.fn(async () => {}) };
+});
 
 import { resolveUsageRunway } from "../services/llmUsageRunwayResolverService";
 import { getEffectiveLlmUsagePolicy } from "../services/llmUsagePolicyResolverService";
 import { usageRecordDb } from "../services/usageRecordDb";
 import { userDb, orgDb } from "../services/db";
 import { toCustomerRunway } from "../services/llmUsageForecastService";
+import { recordUsageTelemetry, USAGE_TELEMETRY_EVENTS } from "../services/llmUsageTelemetry";
 
 const mockPolicy = getEffectiveLlmUsagePolicy as jest.Mock;
 const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
@@ -368,5 +375,62 @@ describe("toCustomerRunway — AC4 exposure boundary", () => {
     // read as on track. Off-by-one here is the difference between a warned
     // customer and a surprised one.
     expect(customer.onTrack).toBe(false);
+  });
+});
+
+/**
+ * ENG-1215 AC4 — forecast versus actual reaches telemetry.
+ *
+ * The arithmetic is covered in the forecast suite. What is covered HERE is the
+ * wiring: that the resolver actually emits it, over the same inputs the shown
+ * forecast used, and that nothing internal rides along.
+ */
+describe("resolveUsageRunway — forecast accuracy telemetry (ENG-1215 AC4)", () => {
+  const emitted = (event: string) =>
+    (recordUsageTelemetry as jest.Mock).mock.calls.filter((c) => c[1] === event);
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    soloAccount();
+    mockBillingQuery.mockResolvedValue([]);
+    mockPolicy.mockResolvedValue(policyFor());
+  });
+
+  it("emits the accuracy event alongside the forecast once the cycle is long enough", () => {
+    mockQuery.mockResolvedValue(ledgerDays(10, 5));
+
+    return resolveUsageRunway("billing-root", { today: "2026-08-11" }).then(() => {
+      const shown = emitted(USAGE_TELEMETRY_EVENTS.forecastComputed);
+      const accuracy = emitted(USAGE_TELEMETRY_EVENTS.forecastAccuracy);
+
+      expect(shown).toHaveLength(1);
+      expect(accuracy).toHaveLength(1);
+      expect(accuracy[0][2]).toMatchObject({
+        observedDaysAtForecast: 5,
+        daysMeasuredSince: 5,
+      });
+      expect(accuracy[0][2].burnRatio).toBeCloseTo(1, 5);
+    });
+  });
+
+  it("stays SILENT on a cycle too short to check a forecast against", async () => {
+    // Emitting a zero here would read as a perfect score for a forecast that was
+    // never tested.
+    mockQuery.mockResolvedValue(ledgerDays(2, 5));
+
+    await resolveUsageRunway("billing-root", { today: "2026-08-03" });
+
+    expect(emitted(USAGE_TELEMETRY_EVENTS.forecastComputed)).toHaveLength(1);
+    expect(emitted(USAGE_TELEMETRY_EVENTS.forecastAccuracy)).toHaveLength(0);
+  });
+
+  it("carries no internal dollars into the sink (AC4)", async () => {
+    mockQuery.mockResolvedValue(ledgerDays(10, 5));
+
+    await resolveUsageRunway("billing-root", { today: "2026-08-11" });
+
+    const payload = JSON.stringify(emitted(USAGE_TELEMETRY_EVENTS.forecastAccuracy)[0][2]);
+    expect(payload).not.toMatch(/MicroUsd/i);
+    expect(payload).not.toMatch(/burnMicroUsdPerDay|remainingAllowance/i);
   });
 });

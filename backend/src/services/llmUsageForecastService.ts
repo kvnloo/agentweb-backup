@@ -230,6 +230,131 @@ export function computeUsageRunway(input: UsageRunwayInput): UsageRunway {
 }
 
 /**
+ * How a forecast made EARLIER this cycle compares with what actually happened
+ * since (ENG-1215 AC4).
+ *
+ * Ratios and day counts only. No micro-USD: AC4 asks that telemetry record
+ * forecast-versus-actual *without* internal dollars, and a burn rate is exactly
+ * the internal economics `toCustomerRunway` exists to strip. A ratio answers
+ * "was the forecast right" without carrying what the account spends.
+ */
+export interface ForecastAccuracy {
+  /** The earlier day the retrospective forecast was made as of, `YYYY-MM-DD`. */
+  asOfDate: string;
+  /** Complete days that retrospective forecast had to work from. */
+  observedDaysAtForecast: number;
+  /** Complete days of real spend it is being measured against. */
+  daysMeasuredSince: number;
+  /**
+   * `actual / predicted` daily burn. 1.0 is a perfect call, 2.0 means the
+   * account burned twice as fast as predicted, 0.5 half as fast.
+   *
+   * null when the retrospective forecast declined to predict — a cycle can be
+   * too quiet to forecast, and inventing an error figure for a forecast that
+   * was never made would be a made-up number in the one place measuring
+   * whether our numbers are made up.
+   */
+  burnRatio: number | null;
+  /** What that earlier forecast said about surviving the cycle. */
+  predictedOnTrack: boolean | null;
+  /** What the CURRENT forecast says, having seen the days since. */
+  actualOnTrack: boolean | null;
+  /**
+   * Whether the earlier call still stands. null when either side has no
+   * opinion — "we did not know then" is not a wrong answer, and scoring it as
+   * one would make the accuracy metric punish honesty.
+   */
+  onTrackAgrees: boolean | null;
+}
+
+/**
+ * Minimum complete days on EACH side of the split.
+ *
+ * Two, not one: a single day is indistinguishable from a spike, and the whole
+ * point of ENG-1210's spike scenario is that one day must not be read as a
+ * trend. Below this the honest answer is no measurement, not a noisy one.
+ */
+const MIN_DAYS_PER_SIDE = 2;
+
+/**
+ * Backtest the forecast against the cycle's own ledger (ENG-1215 AC4).
+ *
+ * ## Why this needs no stored forecast
+ *
+ * `computeUsageRunway` is pure over the ledger, so the forecast that WOULD have
+ * been made on an earlier day is recomputable exactly — and the days since are
+ * already in the same ledger as ground truth. Persisting a daily forecast
+ * snapshot would add a write path to a billing-adjacent table to store
+ * something already derivable, and a stored snapshot can drift from the code
+ * that produced it. Recomputing cannot.
+ *
+ * The split is the midpoint of complete days, chosen for determinism: the same
+ * ledger always produces the same measurement, so a change in the number means
+ * the forecast changed rather than the sampling did.
+ *
+ * Returns null rather than a fabricated figure whenever the cycle is too short
+ * to have both a forecast and an outcome to check it against.
+ */
+export function assessForecastAccuracy(
+  input: UsageRunwayInput,
+  current: UsageRunway,
+): ForecastAccuracy | null {
+  const startMs = toUtcDay(input.cycleStartDate);
+  const todayMs = toUtcDay(input.today);
+  const completeDays = Math.max(0, Math.round((todayMs - startMs) / MS_PER_DAY));
+  if (completeDays < MIN_DAYS_PER_SIDE * 2) return null;
+
+  const observedDays = Math.floor(completeDays / 2);
+  if (observedDays < MIN_DAYS_PER_SIDE) return null;
+  const daysSince = completeDays - observedDays;
+  if (daysSince < MIN_DAYS_PER_SIDE) return null;
+
+  const asOfMs = startMs + observedDays * MS_PER_DAY;
+  const asOfDate = toIsoDay(asOfMs);
+
+  // Spend strictly BEFORE the split is what the earlier forecast could see.
+  // Re-using today's `costUsedMicroUsd` would hand the past forecast a
+  // remaining allowance it did not have, which is the classic backtest leak.
+  let spentBefore = 0;
+  let spentSince = 0;
+  for (const row of input.dailyCostMicroUsd) {
+    const dayMs = toUtcDay(row.date);
+    if (dayMs < startMs || dayMs >= todayMs) continue;
+    const cost = Math.max(0, row.costMicroUsd || 0);
+    if (dayMs < asOfMs) spentBefore += cost;
+    else spentSince += cost;
+  }
+
+  const past = computeUsageRunway({
+    ...input,
+    today: asOfDate,
+    costUsedMicroUsd: spentBefore,
+  });
+
+  const predictedBurn = past.diagnostics.forecastBurnMicroUsdPerDay;
+  const actualBurn = spentSince / daysSince;
+  const burnRatio =
+    predictedBurn !== null && predictedBurn > 0 ? actualBurn / predictedBurn : null;
+
+  const predictedOnTrack = past.onTrack;
+  const actualOnTrack = current.onTrack;
+  const onTrackAgrees =
+    predictedOnTrack === null || actualOnTrack === null
+      ? null
+      : predictedOnTrack === actualOnTrack;
+
+  return {
+    asOfDate,
+    observedDaysAtForecast: observedDays,
+    daysMeasuredSince: daysSince,
+    burnRatio,
+    predictedOnTrack,
+    actualOnTrack,
+    onTrackAgrees,
+  };
+}
+
+/**
  * Strip everything a customer must not see (AC4). The API layer returns THIS,
  * never the raw runway — no internal dollar ceilings, no raw burn rates.
  */
