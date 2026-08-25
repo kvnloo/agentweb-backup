@@ -11,6 +11,7 @@
 jest.mock('../services/db', () => ({
   crmDb: {
     updateLead: jest.fn().mockResolvedValue(undefined),
+    getLeadListById: jest.fn().mockResolvedValue(null),
   },
 }));
 
@@ -129,11 +130,15 @@ describe('AttioAdapter.pushLeads — deal list sync', () => {
     expect(mockFindCompanyByName).not.toHaveBeenCalled();
   });
 
-  it('still pushes a lead with no email at all (unaffected by the invalid-email guard)', async () => {
+  it('still pushes a lead with no email at all, given it has other real content (unaffected by the invalid-email guard)', async () => {
+    const mappingWithName: FieldMapping[] = [
+      ...contactMapping,
+      { agentwebField: 'firstName', crmProperty: 'first_name', direction: 'both', enabled: true },
+    ];
     const result = await adapter.pushLeads(
       auth,
-      [makeLead({ email: undefined, syncMetadata: { attio_record_id: 'existing_1' } })],
-      makeConfig({ dealFieldMapping: [] })
+      [makeLead({ email: undefined, firstName: 'Jane', syncMetadata: { attio_record_id: 'existing_1' } })],
+      makeConfig({ contactFieldMapping: mappingWithName, dealFieldMapping: [] })
     );
 
     expect(result.errorCount).toBe(0);
