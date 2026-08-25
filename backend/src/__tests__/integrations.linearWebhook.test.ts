@@ -4,14 +4,15 @@
  * Contract under test:
  *   - HMAC-SHA256 signature (`linear-signature` over the raw payload bytes) is enforced for every
  *     event type when LINEAR_WEBHOOK_SECRET is set
- *   - customer comms fire only on an Issue update that transitions into the configured Done state
+ *   - customer comms fire on ANY Issue update that transitions into the configured Done state —
+ *     customer-reported or not. The pre-flight verification gate (ENG-1268: require a structured
+ *     customer-symptom-check comment before the bridge could fire) is deliberately removed
+ *     (Harsha, 2026-08-25: "i don't give a shit about closure risk anymore its annoying, torch
+ *     it"). A customer-reported bug transitioning to Done behaves exactly like any other issue —
+ *     no comment lookup, no block, no reopen.
  *   - completed-type states that are not Done, already-Done edits, and Issue create events fire no
  *     resolve bridge
  *   - missing LINEAR_DONE_STATE_ID fails loud for Issue updates and never fires customer comms
- *   - customer-reported bugs require a well-formed `customer-symptom-verification:v1` comment
- *     (Result/Evidence type/Checked/Method/Verifier fields present) before Done sticks — from ANY
- *     Linear author, including the fix's own implementer (ENG-1556, 2026-08-25); only the
- *     structured-content requirement is enforced, not who posted it
  *   - Issue create carrying the "Featurebase" label triggers funnel enrichment
  *   - Featurebase enrichment errors return 200 so Linear does not retry-storm
  */
@@ -26,36 +27,8 @@ jest.mock('../services/intakeService', () => ({
   }),
 }));
 
-// Prefixed `mock` deliberately — Jest's hoisting only allows a jest.mock() factory to reference
-// module-scope variables whose name starts with "mock". Historically the only authorId the
-// verification gate trusted; ENG-1556 (2026-08-25, Harsha's directive) removed that author-identity
-// restriction from `hasCustomerSymptomVerification()`, so this id is now just an example author —
-// kept as a named constant purely for readability, not because it carries any special meaning to
-// the gate anymore.
-const mockHarshaLinearUserId = '142fef82-4d45-4070-99be-c5debe565ac6';
-
-jest.mock('../services/linearService', () => ({
-  getIssueCommentsDetailed: jest.fn().mockResolvedValue([
-    {
-      body: [
-        '<!-- customer-symptom-verification:v1 -->',
-        '- Result: pass',
-        '- Evidence type: customer-symptom',
-        '- Checked: the customer-facing symptom',
-        '- Method: independent production readback',
-        '- Verifier: post-merge-verifier/run-123',
-      ].join('\n'),
-      createdAt: '2026-08-20T00:00:00.000Z',
-      authorId: mockHarshaLinearUserId,
-    },
-  ]),
-  reopenIssue: jest.fn().mockResolvedValue(undefined),
-  addIssueComment: jest.fn().mockResolvedValue(undefined),
-}));
-
 import integrationsRouter from '../routes/integrations';
 const intake = require('../services/intakeService');
-const linear = require('../services/linearService');
 
 const app = express();
 // Mirror app.ts: raw body for the linear webhook path, json elsewhere.
@@ -213,8 +186,27 @@ describe('POST /api/integrations/linear/webhook — Done-only transition gating'
   });
 });
 
-describe('POST /api/integrations/linear/webhook — customer symptom verification gate (ENG-1268)', () => {
-  it('does not add a preflight comment dependency for an explicitly non-customer issue', async () => {
+describe('POST /api/integrations/linear/webhook — no customer-verification gate (ENG-1268 removed 2026-08-25)', () => {
+  it('a customer-reported bug transitions straight through, no comment lookup, no block', async () => {
+    // transitionIntoDone()'s default payload already carries Bug + Customer Reported — this is
+    // the exact shape that used to require a structured verification comment before the bridge
+    // would fire. It no longer does.
+    const res = await post(transitionIntoDone());
+
+    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
+    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
+    expect(intake.notifyCanonicalResolved).toHaveBeenCalledWith('issue-1', 'A customer bug');
+  });
+
+  it('a customer-reported bug with a reporter-ticket comment but no verification record still fires', async () => {
+    // Previously "Fixed in PR #123." alone (or nothing at all) would have blocked this. Now the
+    // resolve bridge doesn't inspect comments for this decision at all.
+    const res = await post(transitionIntoDone());
+    expect(res.body.ok).toBe(true);
+    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
+  });
+
+  it('an explicitly non-customer bug behaves identically to a customer-reported one', async () => {
     const res = await post(transitionIntoDone({
       data: {
         id: 'issue-1',
@@ -225,292 +217,7 @@ describe('POST /api/integrations/linear/webhook — customer symptom verificatio
     }));
 
     expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
-    expect(linear.getIssueCommentsDetailed).not.toHaveBeenCalled();
     expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
-  });
-
-  it('blocks a customer-reported bug with no verification record and explains the missing evidence', async () => {
-    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
-      { body: 'Fixed in PR #123.', createdAt: '2026-08-20T00:00:00.000Z' },
-    ]);
-
-    const res = await post(transitionIntoDone());
-
-    expect(res.body).toMatchObject({ ok: false, blocked: 'customer verification required' });
-    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
-    expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
-    expect(linear.addIssueComment).toHaveBeenCalledWith(
-      'issue-1',
-      expect.stringContaining('actual customer-facing symptom'),
-    );
-  });
-
-  it('rejects the three RankAI false-fixed comment shapes as code claims, not symptom proof', async () => {
-    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
-      { body: 'Fixed and deployed on 2026-07-24.', createdAt: '2026-07-24T00:00:00.000Z' },
-      { body: 'The patch merged; resolving this.', createdAt: '2026-07-30T00:00:00.000Z' },
-      { body: 'Confirmed the code is live in production.', createdAt: '2026-08-03T00:00:00.000Z' },
-    ]);
-
-    await post(transitionIntoDone());
-
-    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
-    expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
-  });
-
-  it('rejects a marker that reports code deployment instead of a customer-facing check', async () => {
-    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
-      {
-        body: [
-          '<!-- customer-symptom-verification:v1 -->',
-          '- Result: pass',
-          '- Checked: PR #123 merged',
-          '- Method: GitHub checks green',
-          '- Verifier: fix-author',
-        ].join('\n'),
-        createdAt: '2026-08-20T00:00:00.000Z',
-      },
-    ]);
-
-    await post(transitionIntoDone());
-
-    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
-    expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
-  });
-
-  it('allows self-authored evidence when the structured symptom fields are present (ENG-1556)', async () => {
-    // Was "rejects self-authored evidence..." until ENG-1556 (2026-08-25, Harsha's directive):
-    // "i don't give a shit about that fix anymore that no one can verify their own fixes, we do
-    // that all the time, remove that as a rule." The Verifier text "fix-author" was never a
-    // trusted prefix, but that content check is gone too (grep confirms TRUSTED_VERIFIER_PREFIX
-    // no longer exists) — only presence of a well-formed structured record matters now.
-    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
-      {
-        body: [
-          '<!-- customer-symptom-verification:v1 -->',
-          '- Result: pass',
-          '- Evidence type: customer-symptom',
-          '- Checked: live customer pixel fired',
-          '- Method: raw production readback',
-          '- Verifier: fix-author',
-        ].join('\n'),
-        createdAt: '2026-08-20T00:00:00.000Z',
-      },
-    ]);
-
-    const res = await post(transitionIntoDone());
-
-    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
-    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
-    expect(linear.reopenIssue).not.toHaveBeenCalled();
-  });
-
-  it('allows a free-text human name as Verifier (ENG-1268 gap superseded by ENG-1556)', async () => {
-    // Originally reproduced a live incident: Harsha reviewed the evidence himself, directly, and
-    // wrote "Verifier: Harsha Vankayalapati (direct review, live session, 2026-08-24)" with every
-    // other field correctly filled in — and the gate rejected it anyway, because only the literal
-    // "post-merge-verifier/" prefix was ever accepted. ENG-1556 (2026-08-25, Harsha's directive)
-    // removed the trusted-prefix content check entirely — a bare, well-formed Verifier value from
-    // any author is now accepted; only the structured Result/Evidence type/Checked/Method fields
-    // are still enforced.
-    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
-      {
-        body: [
-          '<!-- customer-symptom-verification:v1 -->',
-          '- Result: pass',
-          '- Evidence type: customer-symptom',
-          '- Checked: the exact reported symptom',
-          '- Method: live production readback, reviewed independently of the implementer',
-          '- Verifier: Harsha Vankayalapati (direct review, live session, 2026-08-24)',
-        ].join('\n'),
-        createdAt: '2026-08-24T00:00:00.000Z',
-      },
-    ]);
-
-    const res = await post(transitionIntoDone());
-
-    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
-    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
-    expect(linear.reopenIssue).not.toHaveBeenCalled();
-  });
-
-  it('allows "harsha-direct" with no run identifier — the trusted-prefix format check is gone (ENG-1556)', async () => {
-    // Was "rejects... the prefix alone is not a record": TRUSTED_VERIFIER_PREFIX required a
-    // "/<something>" suffix, so a bare "harsha-direct" failed the regex. ENG-1556 deleted
-    // TRUSTED_VERIFIER_PREFIX entirely (grep confirms no remaining reference) — any non-empty
-    // Verifier text now satisfies the field-presence check.
-    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
-      {
-        body: [
-          '<!-- customer-symptom-verification:v1 -->',
-          '- Result: pass',
-          '- Evidence type: customer-symptom',
-          '- Checked: the exact reported symptom',
-          '- Method: live production readback',
-          '- Verifier: harsha-direct',
-        ].join('\n'),
-        createdAt: '2026-08-24T00:00:00.000Z',
-      },
-    ]);
-
-    const res = await post(transitionIntoDone());
-
-    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
-    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
-    expect(linear.reopenIssue).not.toHaveBeenCalled();
-  });
-
-  it('allows a near-miss prefix that merely starts with the old trusted string (ENG-1556 — no format check remains)', async () => {
-    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
-      {
-        body: [
-          '<!-- customer-symptom-verification:v1 -->',
-          '- Result: pass',
-          '- Evidence type: customer-symptom',
-          '- Checked: the exact reported symptom',
-          '- Method: live production readback',
-          '- Verifier: harsha-direct-ish/2026-08-24',
-        ].join('\n'),
-        createdAt: '2026-08-24T00:00:00.000Z',
-      },
-    ]);
-
-    const res = await post(transitionIntoDone());
-
-    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
-    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
-    expect(linear.reopenIssue).not.toHaveBeenCalled();
-  });
-
-  it('allows a properly structured harsha-direct attestation to reach the resolve bridge', async () => {
-    // `harsha-direct/...` carries no special meaning to the gate post-ENG-1556 (it's just text in
-    // the Verifier field, same as any other value), and authorId is likewise no longer inspected —
-    // this comment happens to use both, but neither is why it passes; it passes because the
-    // structured Result/Evidence type/Checked/Method fields are present and well-formed.
-    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
-      {
-        body: [
-          '<!-- customer-symptom-verification:v1 -->',
-          '- Result: pass',
-          '- Evidence type: customer-symptom',
-          '- Checked: the exact reported symptom',
-          '- Method: live production readback, reviewed independently of the implementer',
-          '- Verifier: harsha-direct/2026-08-24-live-session',
-        ].join('\n'),
-        createdAt: '2026-08-24T00:00:00.000Z',
-        authorId: mockHarshaLinearUserId,
-      },
-    ]);
-
-    const res = await post(transitionIntoDone());
-
-    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
-    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
-    expect(linear.reopenIssue).not.toHaveBeenCalled();
-  });
-
-  it('allows a perfectly formatted verifier record posted by anyone other than Harsha\'s own Linear account (ENG-1556, supersedes the CodeRabbit finding of 2026-08-24)', async () => {
-    // Until 2026-08-25 this was "rejects...", added in direct response to a CodeRabbit finding
-    // that comment TEXT alone (without author binding) let anyone impersonate Harsha's sign-off.
-    // ENG-1268/ENG-1465 then surfaced the cost of that fix: no engineer — Anurag included — could
-    // ever self-certify their own thoroughly-tested fix, no matter how solid the evidence. Harsha's
-    // explicit, authorized ruling on ENG-1556 (2026-08-25): "i don't give a shit about that fix
-    // anymore that no one can verify their own fixes, we do that all the time, remove that as a
-    // rule." This is not a re-introduction of the vulnerability CodeRabbit flagged — it's the
-    // deliberate removal of the identity gate entirely, by the product owner's own instruction.
-    // The structured-evidence requirement (Result/Evidence type/Checked/Method) that made the old
-    // exploit "perfectly formatted" is exactly what still has to be true for ANY author now.
-    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
-      {
-        body: [
-          '<!-- customer-symptom-verification:v1 -->',
-          '- Result: pass',
-          '- Evidence type: customer-symptom',
-          '- Checked: the exact reported symptom',
-          '- Method: live production readback, reviewed independently of the implementer',
-          '- Verifier: harsha-direct/2026-08-24-self-attested',
-        ].join('\n'),
-        createdAt: '2026-08-24T00:00:00.000Z',
-        authorId: 'cabadf7c-b95d-4455-b9ec-df11d5d83f5f', // Manan Varma, not Harsha — now fine
-      },
-    ]);
-
-    const res = await post(transitionIntoDone());
-
-    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
-    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
-    expect(linear.reopenIssue).not.toHaveBeenCalled();
-  });
-
-  it('allows a well-formed verifier record with no author on the comment at all (ENG-1556 — author is never inspected)', async () => {
-    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
-      {
-        body: [
-          '<!-- customer-symptom-verification:v1 -->',
-          '- Result: pass',
-          '- Evidence type: customer-symptom',
-          '- Checked: the exact reported symptom',
-          '- Method: live production readback',
-          '- Verifier: post-merge-verifier/run-999',
-        ].join('\n'),
-        createdAt: '2026-08-24T00:00:00.000Z',
-        // authorId omitted — e.g. a deleted user or a system/API path that didn't resolve one.
-        // Previously this alone was fatal (authorId === HARSHA_LINEAR_USER_ID could never be true
-        // for undefined); the author check no longer exists, so this is just a well-formed record.
-      },
-    ]);
-
-    const res = await post(transitionIntoDone());
-
-    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
-    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
-    expect(linear.reopenIssue).not.toHaveBeenCalled();
-  });
-
-  it('still blocks Done when a required structured field (Method) is missing, regardless of author — the content requirement is unchanged (ENG-1556 AC2)', async () => {
-    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
-      {
-        body: [
-          '<!-- customer-symptom-verification:v1 -->',
-          '- Result: pass',
-          '- Evidence type: customer-symptom',
-          '- Checked: the exact reported symptom',
-          '- Verifier: post-merge-verifier/run-1000',
-          // Method: intentionally omitted
-        ].join('\n'),
-        createdAt: '2026-08-25T00:00:00.000Z',
-        authorId: 'cabadf7c-b95d-4455-b9ec-df11d5d83f5f', // Manan Varma — author no longer matters
-      },
-    ]);
-
-    await post(transitionIntoDone());
-
-    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
-    expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
-  });
-
-  it('fails closed on the reporter-ticket rail when expanded labels are absent', async () => {
-    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
-      {
-        body: '[reporter-ticket #42 customer@example.com] Affected user: customer@example.com',
-        createdAt: '2026-08-20T00:00:00.000Z',
-      },
-    ]);
-    const event = transitionIntoDone();
-    delete event.data.labels;
-
-    await post(event);
-
-    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
-    expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
-  });
-
-  it('allows a complete symptom-level verification record to reach the existing resolve bridge', async () => {
-    const res = await post(transitionIntoDone());
-
-    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
-    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
-    expect(linear.reopenIssue).not.toHaveBeenCalled();
   });
 });
 
