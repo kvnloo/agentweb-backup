@@ -1380,7 +1380,14 @@ mcpToolRegistry.register({
   name: 'list_connected_accounts',
   definition: {
     name: 'list_connected_accounts',
-    description: 'List all connected social media and integration accounts.',
+    description: `List all connected social media and integration accounts.
+
+GOOGLE ADS SPEND RISK (ENG-1362). google_ads rows carry test_account and can_spend.
+  test_account: true = Google guarantees the account CANNOT serve ads and CANNOT spend.
+  test_account: false = real, billable.
+  test_account absent = never recorded; treat as billable.
+  can_spend = false ONLY when test_account is true.
+Never infer this from account_name — a fully billable account can be named "Test", and one is connected here.`,
     inputSchema: {
       type: 'object',
       properties: {

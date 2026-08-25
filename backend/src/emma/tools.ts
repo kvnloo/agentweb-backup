@@ -4288,7 +4288,15 @@ emmaToolRegistry.register({
   name: 'list_connected_accounts',
   definition: {
     name: 'list_connected_accounts',
-    description: 'Returns list of social media accounts connected by the user. PLATFORM MAPPING: use platform="linkedin" for standard LinkedIn posting accounts; use platform="unipile" for LinkedIn Outreach accounts (sending connection invites and direct messages via the linkedin_outreach tool).',
+    description: `Returns list of social media accounts connected by the user. PLATFORM MAPPING: use platform="linkedin" for standard LinkedIn posting accounts; use platform="unipile" for LinkedIn Outreach accounts (sending connection invites and direct messages via the linkedin_outreach tool).
+
+GOOGLE ADS SPEND RISK (ENG-1362). Each google_ads account reports two extra fields:
+  test_account: true  = Google guarantees this account CANNOT serve ads and CANNOT spend.
+  test_account: false = a real, billable account.
+  test_account: null  = never recorded and could not be checked right now. Treat as billable.
+  can_spend           = states it directly; false ONLY when test_account is true.
+NEVER infer any of this from account_name. A fully billable account can be named "Test" — one such account is connected on this platform right now. The name is not a safety property and never was.
+If asked to try something in "the test account", choose by test_account. If none of them is a real test account, say so and confirm before touching one that can spend.`,
     inputSchema: {
       type: 'object',
       properties: {
