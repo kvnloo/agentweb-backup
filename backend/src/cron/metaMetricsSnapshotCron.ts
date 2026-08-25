@@ -322,7 +322,9 @@ export async function snapshotMetaMetricsForDate(
       else nameToCampaignId.set(key, String(c.campaign_id));
     }
   }
-  for (const key of ambiguousNames) nameToCampaignId.delete(key);
+  // NOTE: ambiguous keys are deliberately LEFT IN the map. They are needed as a positive signal
+  // when matching below — deleting them made an ambiguous name merely "absent", which a lead's
+  // OTHER spelling could then route around.
 
   // Named for what it actually is. It counts leads MATCHED to a campaign the platform reported —
   // it is not the day's total, and calling it that made the account_day row able to claim
@@ -338,10 +340,24 @@ export async function snapshotMetaMetricsForDate(
     let matchedId: string | undefined;
     if (raw && knownCampaignIds.has(raw)) matchedId = raw;
     else if (raw) {
+      /*
+       * EVERY spelling is evaluated before deciding — first-match-wins was wrong (CodeRabbit Major).
+       * With campaigns named `A+B` and `A B`, only the shared key `A B` was marked ambiguous, so a
+       * lead tagged `A+B` matched the raw key and was attributed to the first campaign — even though
+       * `+` is a legitimate encoding of the ambiguous `A B`. The lead genuinely could have come from
+       * either, so attributing it invents a fact.
+       *
+       * Attribute ONLY when every spelling agrees on exactly one campaign and none of them is known
+       * to be ambiguous. Anything else stays unattributed — visibly uncounted beats silently wrong.
+       */
+      const resolved = new Set<string>();
+      let ambiguous = false;
       for (const key of campaignNameKeys(raw)) {
+        if (ambiguousNames.has(key)) { ambiguous = true; break; }
         const hit = nameToCampaignId.get(key);
-        if (hit) { matchedId = hit; break; }
+        if (hit) resolved.add(hit);
       }
+      if (!ambiguous && resolved.size === 1) matchedId = [...resolved][0];
     }
     if (matchedId) {
       leadCountByCampaign.set(matchedId, (leadCountByCampaign.get(matchedId) || 0) + 1);

@@ -168,6 +168,34 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
     for (const r of campaignRows()) expect(r.leadCount).toBe(0);
   });
 
+  it('refuses a lead whose OTHER spelling collides with a different campaign', async () => {
+    // `A+B` and `A B` are the same string once `+` is decoded, so a lead tagged `A+B` could have
+    // come from either campaign. Matching the raw spelling first would attribute it to one of them.
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => makeCampaignInsightsResponse([
+        { campaign_id: '111', campaign_name: 'Spring+Sale', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+        { campaign_id: '222', campaign_name: 'Spring Sale', spend: '2', impressions: '20', clicks: '2', ctr: '1', cpm: '1', frequency: '1' },
+      ]),
+    });
+    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: HAVEN_USER_ID }] as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [
+        makeLead('Spring+Sale', `${TEST_DATE}T10:00:00.000Z`),
+        makeLead('Spring Sale', `${TEST_DATE}T11:00:00.000Z`),
+      ],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+
+    // Neither spelling can be resolved to one campaign, so neither lead is attributed.
+    expect(result.unattributedLeadCount).toBe(2);
+    expect(result.leadCount).toBe(0);
+    for (const r of campaignRows()) expect(r.leadCount).toBe(0);
+  });
+
   it('counts leads with no matching campaignId as unattributed instead of dropping them', async () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
