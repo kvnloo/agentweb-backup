@@ -4998,8 +4998,15 @@ export async function generateChatResponse(
     // toolDefinitions also carries customer/page/work-plan tools unrelated to the
     // installed skill (e.g. a CRM-page turn on a customer session), so a nonzero
     // toolDefinitions.length doesn't prove the skill's own tools bound. Gate on
-    // the subset that actually came from the skill/foundation resolution instead.
-    const skillToolDefinitions = toolDefinitions.filter((t: any) => skillContext.allowedToolNames.has(t.function.name));
+    // the subset that actually came from the skill (+ virtual-skill) resolution
+    // instead — excluding FOUNDATION_TOOLS specifically, since buildSkillContext
+    // unions those into allowedToolNames unconditionally for every session, so a
+    // single registered foundation tool would otherwise mask the exact "this
+    // skill's own tools failed to bind" failure the gate exists to catch.
+    const skillOnlyToolNames = new Set(
+      [...skillContext.allowedToolNames].filter((name) => !AgentModeService.FOUNDATION_TOOLS.has(name)),
+    );
+    const skillToolDefinitions = toolDefinitions.filter((t: any) => skillOnlyToolNames.has(t.function.name));
     if (sessionHasInstalledSkills && skillToolDefinitions.length === 0) {
       // ENG-1222: subscription-tier gating (now enforced here via buildSkillContext,
       // where before this path ignored it) correctly excludes a skill's tools when
