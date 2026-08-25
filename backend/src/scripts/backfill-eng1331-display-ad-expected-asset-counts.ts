@@ -236,16 +236,29 @@ export async function main() {
   console.log(`\nApplied. ${toWrite.length} step(s) updated. New steps_rev: ${newRev}`);
 }
 
+/**
+ * CodeRabbit (ENG-1331 follow-up): the previous fix for the exit-code-masking bug
+ * (`process.exit(process.exitCode ?? 0)`) was only provable by testing `main()`
+ * directly and inferring the runner would respect `process.exitCode` — main()
+ * itself never called `process.exit`, so no test actually exercised the runner's
+ * own exit-code selection. Extracted here as a pure-ish (no direct process.exit)
+ * async function so a test can invoke the FULL CLI flow — main() plus the exact
+ * exit-code logic the real CLI entry point uses — and assert on its return value
+ * instead of on `process.exit`/`process.exitCode` side effects.
+ */
+export async function runCli(): Promise<number> {
+  try {
+    await main();
+    // Node types process.exitCode as string | number | undefined (it accepts a
+    // numeric string too); this script only ever sets it to the literal number
+    // 1, but coerce defensively rather than assume.
+    return Number(process.exitCode ?? 0);
+  } catch (err) {
+    console.error("Fatal:", err);
+    return 1;
+  }
+}
+
 if (require.main === module) {
-  main()
-    // CodeRabbit (ENG-1331 follow-up): process.exit(0) unconditionally overrode
-    // the process.exitCode = 1 the candidates.length !== 1 abort path sets, so
-    // this script always reported success even when it aborted and wrote
-    // nothing. Automation checking the exit status (the entire point of a
-    // script instead of a manual API call) could not detect that abort.
-    .then(() => process.exit(process.exitCode ?? 0))
-    .catch((err) => {
-      console.error("Fatal:", err);
-      process.exit(1);
-    });
+  runCli().then((code) => process.exit(code));
 }

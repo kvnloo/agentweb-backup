@@ -126,16 +126,15 @@ describe("backfill-eng1331-display-ad-expected-asset-counts — planExpectedAsse
   });
 });
 
-describe("backfill-eng1331-display-ad-expected-asset-counts — main() exit code", () => {
-  // CodeRabbit (ENG-1331 follow-up): main() set process.exitCode = 1 on the
-  // candidates.length !== 1 abort path, but the CLI runner called
-  // process.exit(0) unconditionally, which overrides any previously-set
-  // exitCode — so the abort was invisible to anything checking the exit
-  // status, even though it wrote nothing. main() itself doesn't call
-  // process.exit (only the require.main===module runner block does, which
-  // this test doesn't invoke), so this pins the exitCode CONTRACT main() must
-  // uphold for that runner-level fix (`process.exit(process.exitCode ?? 0)`)
-  // to actually work.
+describe("backfill-eng1331-display-ad-expected-asset-counts — runCli() exit code", () => {
+  // CodeRabbit (ENG-1331 follow-up, second pass): the first version of these
+  // tests called main() directly and asserted on process.exitCode — which
+  // passed even BEFORE the runner-level fix, since main() always set exitCode
+  // correctly; only the runner's own `process.exit(0)` (now
+  // `process.exit(process.exitCode ?? 0)` via runCli()) actually threw that
+  // value away. Testing runCli() instead exercises the EXACT logic the real
+  // CLI entry point runs (main() + the same exit-code selection), so this
+  // closes the gap: these tests would have failed against the original bug.
   const workPlanServicePath = "../services/workPlanService";
 
   beforeEach(() => {
@@ -152,20 +151,19 @@ describe("backfill-eng1331-display-ad-expected-asset-counts — main() exit code
     process.exitCode = undefined;
   });
 
-  it("sets process.exitCode = 1 when zero matching plans are found", async () => {
+  it("returns exit code 1 when zero matching plans are found", async () => {
     jest.doMock(workPlanServicePath, () => ({
       workPlanService: { getPublicPlansForAgentMode: jest.fn().mockResolvedValue([]) },
     }));
-    const { main } = await import("../scripts/backfill-eng1331-display-ad-expected-asset-counts");
+    const { runCli } = await import("../scripts/backfill-eng1331-display-ad-expected-asset-counts");
     jest.spyOn(console, "error").mockImplementation(() => {});
     jest.spyOn(console, "log").mockImplementation(() => {});
 
     process.exitCode = undefined;
-    await main();
-    expect(process.exitCode).toBe(1);
+    await expect(runCli()).resolves.toBe(1);
   });
 
-  it("sets process.exitCode = 1 when more than one matching plan is found", async () => {
+  it("returns exit code 1 when more than one matching plan is found", async () => {
     jest.doMock(workPlanServicePath, () => ({
       workPlanService: {
         getPublicPlansForAgentMode: jest.fn().mockResolvedValue([
@@ -174,16 +172,15 @@ describe("backfill-eng1331-display-ad-expected-asset-counts — main() exit code
         ]),
       },
     }));
-    const { main } = await import("../scripts/backfill-eng1331-display-ad-expected-asset-counts");
+    const { runCli } = await import("../scripts/backfill-eng1331-display-ad-expected-asset-counts");
     jest.spyOn(console, "error").mockImplementation(() => {});
     jest.spyOn(console, "log").mockImplementation(() => {});
 
     process.exitCode = undefined;
-    await main();
-    expect(process.exitCode).toBe(1);
+    await expect(runCli()).resolves.toBe(1);
   });
 
-  it("leaves process.exitCode unset on a normal (non-abort) run", async () => {
+  it("returns exit code 0 on a normal (non-abort) run", async () => {
     jest.doMock(workPlanServicePath, () => ({
       workPlanService: {
         getPublicPlansForAgentMode: jest.fn().mockResolvedValue([
@@ -202,13 +199,27 @@ describe("backfill-eng1331-display-ad-expected-asset-counts — main() exit code
         ]),
       },
     }));
-    const { main } = await import("../scripts/backfill-eng1331-display-ad-expected-asset-counts");
+    const { runCli } = await import("../scripts/backfill-eng1331-display-ad-expected-asset-counts");
     jest.spyOn(console, "error").mockImplementation(() => {});
     jest.spyOn(console, "log").mockImplementation(() => {});
     jest.spyOn(console, "warn").mockImplementation(() => {});
 
     process.exitCode = undefined;
-    await main(); // dry run (no --apply in argv) — never touches workPlanService.updateWorkPlan
-    expect(process.exitCode).toBeUndefined();
+    // dry run (no --apply in argv) — never touches workPlanService.updateWorkPlan
+    await expect(runCli()).resolves.toBe(0);
+  });
+
+  it("returns exit code 1 and logs when main() throws", async () => {
+    jest.doMock(workPlanServicePath, () => ({
+      workPlanService: {
+        getPublicPlansForAgentMode: jest.fn().mockRejectedValue(new Error("DynamoDB unavailable")),
+      },
+    }));
+    const { runCli } = await import("../scripts/backfill-eng1331-display-ad-expected-asset-counts");
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    process.exitCode = undefined;
+    await expect(runCli()).resolves.toBe(1);
+    expect(errorSpy).toHaveBeenCalledWith("Fatal:", expect.any(Error));
   });
 });
