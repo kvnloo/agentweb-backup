@@ -49,12 +49,14 @@ const mockGetDefaultModel = jest.fn().mockResolvedValue('gpt-5.4');
 const mockExecuteTool = jest.fn().mockResolvedValue({ success: true });
 const mockInitialize = jest.fn().mockResolvedValue(undefined);
 const mockBuildSkillContext = jest.fn();
+const mockGetAdminToolNames = jest.fn().mockReturnValue([]);
 const mockAgentModeService = {
   callLLM: mockCallLLM,
   getDefaultModel: mockGetDefaultModel,
   executeTool: mockExecuteTool,
   initialize: mockInitialize,
   buildSkillContext: (...args: any[]) => mockBuildSkillContext(...args),
+  getAdminToolNames: (...args: any[]) => mockGetAdminToolNames(...args),
 };
 
 jest.mock('../services/agentModeService', () => {
@@ -109,15 +111,27 @@ const PAGE_SOURCE_TOOL = {
   },
 };
 
+// A real delegated-admin tool name (mirrors agentModeService's
+// ADMIN_SKILL_TOOL_NAMES) — buildSkillContext unions these into
+// allowedToolNames for any delegated admin, unrelated to installed skills.
+const ADMIN_TOOL = {
+  definition: {
+    name: 'list_all_clients',
+    description: 'List all platform clients',
+    inputSchema: { type: 'object', properties: {} },
+  },
+};
+
 jest.mock('../mcp/server/registry', () => ({
   mcpToolRegistry: {
     getTool: (name: string) => {
       if (name === 'list_connected_accounts') return GOOGLE_ADS_TOOL;
       if (name === 'send_notification') return NOTIFICATION_TOOL;
       if (name === 'read_page_source') return PAGE_SOURCE_TOOL;
+      if (name === 'list_all_clients') return ADMIN_TOOL;
       return undefined;
     },
-    getToolNames: () => ['list_connected_accounts', 'send_notification', 'read_page_source'],
+    getToolNames: () => ['list_connected_accounts', 'send_notification', 'read_page_source', 'list_all_clients'],
   },
 }));
 
@@ -210,6 +224,7 @@ function resetSharedMocks() {
   mockGetPublicAllowedSkills.mockResolvedValue([]);
   mockGetSkillsByIds.mockResolvedValue([]);
   mockGetPublishedSkills.mockResolvedValue([]);
+  mockGetAdminToolNames.mockReturnValue([]);
   mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(), installedSkillContextMsg: '' });
 }
 
@@ -606,6 +621,31 @@ describe('generateChatResponse — ENG-1222 risk-hardening: perf, anonymous user
       portalType: 'customer',
       userId: 'user-1',
       model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(response).toMatch(/configuration issue/i);
+  });
+
+  it('still fires the hard gate for a delegated admin when only an admin tool resolves, not the skill\'s own tool', async () => {
+    // CodeRabbit (ENG-1222 review): buildSkillContext also unions the
+    // delegated-admin tool set into allowedToolNames unconditionally whenever
+    // isDelegatedAdmin is true — the same masking risk as FOUNDATION_TOOLS, just
+    // for the admin path. A registered admin tool must not stand in for the
+    // installed skill's own (unregistered) tool.
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockGetAllowedSkills.mockResolvedValue(['*']);
+    mockGetAdminToolNames.mockReturnValue(['list_all_clients']);
+    mockBuildSkillContext.mockReturnValue({
+      allowedToolNames: new Set(['unregistered_skill_tool', 'list_all_clients']),
+      installedSkillContextMsg: '',
+    });
+
+    const response = await generateChatResponse('sess-1', 'Run list_connected_accounts', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+      isDelegatedAdmin: true,
     });
 
     expect(mockCallLLM).not.toHaveBeenCalled();
