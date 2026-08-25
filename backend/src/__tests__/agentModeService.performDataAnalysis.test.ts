@@ -393,7 +393,9 @@ describe('AgentModeService.performDataAnalysis', () => {
     mockedGetS3ObjectAsString.mockResolvedValueOnce(csvContent);
     mockedAxiosPost.mockResolvedValueOnce({
       data: {
-        candidates: [{ content: { parts: [{ text: 'Analysis complete.' }] } }]
+        // ENG-1295 hard guard: file_urls was supplied, so a codeExecutionResult (or
+        // other execution signal) is required alongside the narrative text part.
+        candidates: [{ content: { parts: [{ text: 'Analysis complete.' }, { codeExecutionResult: { output: 'foo,1\nbar,2' } }] } }]
       }
     });
 
@@ -438,7 +440,9 @@ describe('AgentModeService.performDataAnalysis', () => {
     });
     mockedAxiosPost.mockResolvedValueOnce({
       data: {
-        candidates: [{ content: { parts: [{ text: 'Done.' }] } }]
+        // ENG-1295 hard guard: file_urls was supplied, so a codeExecutionResult (or
+        // other execution signal) is required alongside the narrative text part.
+        candidates: [{ content: { parts: [{ text: 'Done.' }, { codeExecutionResult: { output: 'combined output' } }] } }]
       }
     });
 
@@ -511,7 +515,9 @@ describe('AgentModeService.performDataAnalysis', () => {
     const s3Key = `tool-responses/${sessionId}/get_chat_history.json`;
     mockedGetS3ObjectAsString.mockResolvedValueOnce('{"sessions":[{"cost":1.5}],"total":1.5}');
     mockedAxiosPost.mockResolvedValueOnce({
-      data: { candidates: [{ content: { parts: [{ text: 'Done.' }] } }] }
+      // ENG-1295 hard guard: file_urls was supplied, so a codeExecutionResult (or
+      // other execution signal) is required alongside the narrative text part.
+      data: { candidates: [{ content: { parts: [{ text: 'Done.' }, { codeExecutionResult: { output: 'total: 1.5' } }] } }] }
     });
 
     const result = await (service as any).performDataAnalysis([s3Key], 'Total the cost.', 'user-1');
@@ -875,6 +881,131 @@ describe('AgentModeService.performDataAnalysis', () => {
     // triggered blind retries.
     expect(result.message).toMatch(/did not return|incomplete|try again|rephrase|simplif/i);
     expect(result.message).not.toBe('No analysis results received from Gemini');
+  });
+
+  // ─── ENG-1295 hardening: hard guard, self-consistency check, provenance stub ─
+
+  test('rejects a narrative-only response when file_urls were supplied and no code execution occurred', async () => {
+    mockedAxiosGet.mockResolvedValueOnce({
+      data: Buffer.from('col1,col2\na,b'),
+      headers: { 'content-type': 'text/csv' }
+    });
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [{ text: 'Here is my summary of the data.' }] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis(['https://files.test/data.csv'], 'Break down by group.', 'user-1');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('execution_failed');
+    expect(result.message).toContain('narrative summary');
+  });
+
+  test('rejects the second of two identical calls when the generated CSV grouping-key set changes', async () => {
+    const csv1 = 'ad_group,impressions\nBrand Terms,100\nCompetitor Terms,50';
+    const csv2 = 'ad_group,impressions\nBrand Terms,100\nGame Analytics Platform,50';
+
+    mockedAxiosPost
+      .mockResolvedValueOnce({
+        data: { candidates: [{ content: { parts: [
+          { text: 'Breakdown one.' },
+          { inlineData: { data: Buffer.from(csv1, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+        ] } }] }
+      })
+      .mockResolvedValueOnce({
+        data: { candidates: [{ content: { parts: [
+          { text: 'Breakdown two.' },
+          { inlineData: { data: Buffer.from(csv2, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+        ] } }] }
+      });
+
+    const instruction = 'Break down Q3 performance by ad group.';
+    const first = await (service as any).performDataAnalysis([], instruction, 'user-1');
+    expect(first.success).toBe(true);
+
+    const second = await (service as any).performDataAnalysis([], instruction, 'user-1');
+    expect(second.success).toBe(false);
+    expect(second.error).toBe('inconsistent_result');
+    expect(second.message).toContain('DIFFERENT set of result names');
+  });
+
+  test('does not flag a repeat call as inconsistent when the grouping-key values match', async () => {
+    const csv = 'ad_group,impressions\nBrand Terms,100\nCompetitor Terms,50';
+
+    mockedAxiosPost.mockResolvedValue({
+      data: { candidates: [{ content: { parts: [
+        { text: 'Breakdown.' },
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] }
+    });
+
+    const instruction = 'Break down Q3 performance by ad group.';
+    const first = await (service as any).performDataAnalysis([], instruction, 'user-1');
+    const second = await (service as any).performDataAnalysis([], instruction, 'user-1');
+
+    expect(first.success).toBe(true);
+    expect(second.success).toBe(true);
+  });
+
+  test('does not apply the self-consistency check across different userIds', async () => {
+    const csv1 = 'ad_group,impressions\nBrand Terms,100';
+    const csv2 = 'ad_group,impressions\nDifferent Name,100';
+
+    mockedAxiosPost
+      .mockResolvedValueOnce({
+        data: { candidates: [{ content: { parts: [
+          { text: 'Breakdown one.' },
+          { inlineData: { data: Buffer.from(csv1, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+        ] } }] }
+      })
+      .mockResolvedValueOnce({
+        data: { candidates: [{ content: { parts: [
+          { text: 'Breakdown two.' },
+          { inlineData: { data: Buffer.from(csv2, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+        ] } }] }
+      });
+
+    const instruction = 'Break down Q3 performance by ad group.';
+    const first = await (service as any).performDataAnalysis([], instruction, 'user-1');
+    const second = await (service as any).performDataAnalysis([], instruction, 'user-2');
+
+    expect(first.success).toBe(true);
+    expect(second.success).toBe(true);
+  });
+
+  test('appends a provenance stub with rows_in/rows_out/distinct grouping-key values alongside generated CSV data', async () => {
+    mockedAxiosGet.mockResolvedValueOnce({
+      data: Buffer.from(JSON.stringify({ results: [{ id: 1 }, { id: 2 }, { id: 3 }] })),
+      headers: { 'content-type': 'application/json' }
+    });
+
+    const csv = 'ad_group,impressions\nBrand Terms,100\nCompetitor Terms,50';
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [
+        { text: 'Breakdown.' },
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] } }
+    );
+
+    const result = await (service as any).performDataAnalysis(['https://files.test/data.json'], 'Break down by ad group.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.analysis).toContain('**Provenance:**');
+    expect(result.analysis).toContain('rows_in: 3');
+    expect(result.analysis).toContain('rows_out: 2');
+    expect(result.analysis).toContain('distinct grouping-key values (2): Brand Terms, Competitor Terms');
+  });
+
+  test('returns a distinct invalid_argument error for a raw Gemini 400 that is not a payload-size rejection', async () => {
+    const badRequestError: any = new Error('Request failed with status code 400');
+    badRequestError.response = { status: 400 };
+    mockedAxiosPost.mockRejectedValueOnce(badRequestError);
+
+    const result = await (service as any).performDataAnalysis([], 'Analyze the dataset.', 'user-1');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('invalid_argument');
+    expect(result.message).toContain('HTTP 400');
   });
 });
 
