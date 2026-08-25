@@ -98,10 +98,20 @@ export function normalizeWorkPlanSteps(steps: any[]): NormalizedWorkPlanSteps {
         warnings.push(`step ${i + 1}: ignored expectedAssetCountTools — expected an array`);
         keepAssetCountTools = false;
       } else {
-        usableAssetCountTools = assetCountTools.filter((entry: unknown) => typeof entry === 'string' && entry !== '');
+        // CodeRabbit (ENG-1331 follow-up): `entry !== ''` alone let a
+        // whitespace-only string (e.g. " ") through as a "valid" tool name —
+        // it can never match a real tool call, so a step scoped to only that
+        // name could never reach expectedAssetCount. Trim before filtering
+        // (and store the trimmed form: leading/trailing whitespace on an
+        // otherwise-real name would equally never match a call). "invalid",
+        // not "non-string", since a trimmed-empty string IS a string.
+        usableAssetCountTools = assetCountTools
+          .filter((entry: unknown): entry is string => typeof entry === 'string')
+          .map((entry) => entry.trim())
+          .filter((entry) => entry !== '');
         if (usableAssetCountTools.length !== assetCountTools.length) {
           warnings.push(
-            `step ${i + 1}: dropped ${assetCountTools.length - usableAssetCountTools.length} non-string entries from expectedAssetCountTools`,
+            `step ${i + 1}: dropped ${assetCountTools.length - usableAssetCountTools.length} invalid entries from expectedAssetCountTools`,
           );
         }
       }

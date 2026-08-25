@@ -148,18 +148,26 @@ export function planExpectedAssetCountUpdates(
       detail: `expectedAssetCount ${step.expectedAssetCount ?? "(unset)"} -> ${target.count}` +
         (target.tools ? `, expectedAssetCountTools ${JSON.stringify(step.expectedAssetCountTools ?? null)} -> ${JSON.stringify(target.tools)}` : ""),
     });
-    return {
-      ...step,
-      expectedAssetCount: target.count,
-      ...(target.tools ? { expectedAssetCountTools: target.tools } : {}),
-    };
+    // CodeRabbit (ENG-1331 follow-up): a plain conditional spread only ever ADDS
+    // expectedAssetCountTools, never removes it — a step with a target that has
+    // no tools (step 4) but a pre-existing/stale expectedAssetCountTools value
+    // would keep that stale value forever instead of falling back to the
+    // intended max-based default. Not triggered by the current live template
+    // (step 4 never had a value), but latent — explicit delete closes it.
+    const updatedStep: PlanStepLike = { ...step, expectedAssetCount: target.count };
+    if (target.tools) {
+      updatedStep.expectedAssetCountTools = target.tools;
+    } else {
+      delete updatedStep.expectedAssetCountTools;
+    }
+    return updatedStep;
   });
   return { updatedSteps, results };
 }
 
 const APPLY = process.argv.includes("--apply");
 
-async function main() {
+export async function main() {
   console.log("ENG-1331 expectedAssetCount backfill", {
     planTitle: PLAN_TITLE,
     mode: APPLY ? "APPLY (will write)" : "DRY RUN (no writes — pass --apply to write)",
@@ -228,11 +236,29 @@ async function main() {
   console.log(`\nApplied. ${toWrite.length} step(s) updated. New steps_rev: ${newRev}`);
 }
 
+/**
+ * CodeRabbit (ENG-1331 follow-up): the previous fix for the exit-code-masking bug
+ * (`process.exit(process.exitCode ?? 0)`) was only provable by testing `main()`
+ * directly and inferring the runner would respect `process.exitCode` — main()
+ * itself never called `process.exit`, so no test actually exercised the runner's
+ * own exit-code selection. Extracted here as a pure-ish (no direct process.exit)
+ * async function so a test can invoke the FULL CLI flow — main() plus the exact
+ * exit-code logic the real CLI entry point uses — and assert on its return value
+ * instead of on `process.exit`/`process.exitCode` side effects.
+ */
+export async function runCli(): Promise<number> {
+  try {
+    await main();
+    // Node types process.exitCode as string | number | undefined (it accepts a
+    // numeric string too); this script only ever sets it to the literal number
+    // 1, but coerce defensively rather than assume.
+    return Number(process.exitCode ?? 0);
+  } catch (err) {
+    console.error("Fatal:", err);
+    return 1;
+  }
+}
+
 if (require.main === module) {
-  main()
-    .then(() => process.exit(0))
-    .catch((err) => {
-      console.error("Fatal:", err);
-      process.exit(1);
-    });
+  runCli().then((code) => process.exit(code));
 }

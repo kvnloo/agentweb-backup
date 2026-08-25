@@ -436,17 +436,70 @@ const ASSET_PRODUCING_TOOL_NAMES = new Set([
 const STEP_BOUNDARY_TOOL_NAME = 'set_work_plan_status';
 
 /**
- * Slices `toolCalls` down to calls made AFTER the most recent successful
- * `set_work_plan_status` call, so a claim about the step/variant currently being
- * closed is never checked against an earlier step's already-counted assets. With no
- * such boundary in the ledger (a single-step turn, or a turn with no work plan at
- * all) the whole ledger is the current step's, matching prior behavior exactly.
+ * True for a successful, actually-executed (not errored, not reported-failed,
+ * not a same-turn duplicate) step-boundary call.
+ *
+ * CodeRabbit (ENG-1331 follow-up): a `set_work_plan_status` call the dispatcher
+ * collapsed as a duplicate of an earlier identical one (`duplicateOf` set) never
+ * ran — the call it points at is the real boundary and is its own ledger entry.
+ * Counting the duplicate too could point `sinceLastStepBoundary` at a boundary
+ * that only APPEARS to be the last one in array order, double-counting or
+ * mis-scoping around it. Mirrors `tallyExecutedActions`' existing `duplicateOf`
+ * exclusion elsewhere in this file — same rule, same reason.
+ */
+function isSuccessfulBoundary(call: ExecutedToolCall | undefined): boolean {
+  if (!call || call.name !== STEP_BOUNDARY_TOOL_NAME) return false;
+  if ('error' in call || isReportedFailure(call)) return false;
+  if (call.duplicateOf !== undefined && call.duplicateOf !== null) return false;
+  return true;
+}
+
+/**
+ * Slices `toolCalls` down to the assets that back a claim about the step/variant
+ * the CLOSING SYNTHESIS is describing.
+ *
+ * Two distinct shapes reach this function, and they need opposite scoping:
+ *
+ *  - A not-yet-closed step still being described (e.g. "12 sizes for Variant 4"
+ *    written before Variant 4's own set_work_plan_status call, or never followed
+ *    by one at all): the last successful boundary belongs to an EARLIER,
+ *    already-closed step, so its own preceding assets must be excluded — scope to
+ *    AFTER that boundary. This is the original ENG-1188 masking-prevention case:
+ *    an earlier variant's 40 successful renders must never paper over a later
+ *    variant's shortfall.
+ *
+ *  - A step that just closed ITSELF in this same turn (the last ledger entry IS
+ *    the successful set_work_plan_status call, with nothing after it): the
+ *    closing synthesis is necessarily describing the work THAT call just closed,
+ *    so THOSE preceding assets are exactly what the claim is about — scope to
+ *    AFTER the boundary BEFORE that one instead (or the whole ledger, if this is
+ *    the only boundary). Getting this wrong made a step that genuinely finished
+ *    all N assets and validly closed itself read as producing zero — a live
+ *    false-UNDERCLAIM bug (CodeRabbit, ENG-1331 follow-up) on top of the
+ *    over-claim bug this module was built to catch in the first place.
+ *
+ * "Nothing after it" is what distinguishes the two — but "nothing" means no
+ * MEANINGFUL call, not literally no ledger entries. A same-turn duplicate of the
+ * boundary itself (the model re-emits an identical set_work_plan_status; the
+ * dispatcher collapses the second one with `duplicateOf` set) trailing the real
+ * close is not new work — it never ran — so it must not make a genuinely
+ * self-closing step look like it has "a not-yet-closed step's" shape and get
+ * mis-scoped back to empty (CodeRabbit, ENG-1331 follow-up, second pass: found by
+ * live-tracing the first duplicateOf fix rather than trusting it).
  */
 function sinceLastStepBoundary(toolCalls: ExecutedToolCall[]): ExecutedToolCall[] {
+  const isDuplicateEntry = (call: ExecutedToolCall | undefined): boolean =>
+    !!call && call.duplicateOf !== undefined && call.duplicateOf !== null;
+
   for (let i = toolCalls.length - 1; i >= 0; i--) {
-    const call = toolCalls[i];
-    if (!call || call.name !== STEP_BOUNDARY_TOOL_NAME) continue;
-    if ('error' in call || isReportedFailure(call)) continue;
+    if (!isSuccessfulBoundary(toolCalls[i])) continue;
+    if (toolCalls.slice(i + 1).every(isDuplicateEntry)) {
+      for (let j = i - 1; j >= 0; j--) {
+        if (!isSuccessfulBoundary(toolCalls[j])) continue;
+        return toolCalls.slice(j + 1);
+      }
+      return toolCalls;
+    }
     return toolCalls.slice(i + 1);
   }
   return toolCalls;
