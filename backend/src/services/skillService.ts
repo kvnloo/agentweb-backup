@@ -342,6 +342,13 @@ export class SkillService {
         Item: skillItem,
       }).promise();
 
+      // ENG-1222: only invalidate when the sync wrote to THIS environment's own
+      // table (this.tableName) — getPublishedSkills only ever reads that one, so
+      // a sync writing to the other environment's table has nothing to invalidate.
+      if (targetTable === this.tableName) {
+        this.invalidatePublishedSkillsCache();
+      }
+
       return skill;
     } catch (error) {
       console.error(`Error syncing skill ${skillId} (${direction}):`, error);

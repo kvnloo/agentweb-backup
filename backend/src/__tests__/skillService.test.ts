@@ -582,6 +582,46 @@ describe('SkillService', () => {
       expect(mockPut).not.toHaveBeenCalled();
     });
 
+    // ENG-1222 (CodeRabbit): syncSkill writes directly via dynamodb.put and,
+    // unlike createSkill/updateSkill/deleteSkill, was not invalidating the
+    // published-skills cache — a synced skill's stale toolNames/prompt could
+    // be served for up to the TTL after the sync. Only a write to THIS
+    // environment's own table (this.tableName) can invalidate anything this
+    // cache reads.
+    it('invalidates the published-skills cache when the sync targets this environment\'s own table', async () => {
+      mockPromise.mockResolvedValueOnce({ Items: [mockSkill] });
+      await skillService.getPublishedSkills();
+      expect(mockScan).toHaveBeenCalledTimes(1);
+
+      mockPromise
+        .mockResolvedValueOnce({ Item: mockSkill })
+        .mockResolvedValueOnce({});
+      // dev-to-prod writes to 'AW-Skills', which is this.tableName outside
+      // NODE_ENV=development (the environment these tests run in).
+      await skillService.syncSkill('skill-1', 'dev-to-prod');
+
+      mockPromise.mockResolvedValueOnce({ Items: [] });
+      await skillService.getPublishedSkills();
+      expect(mockScan).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not invalidate the cache when the sync targets the other environment\'s table', async () => {
+      mockPromise.mockResolvedValueOnce({ Items: [mockSkill] });
+      await skillService.getPublishedSkills();
+      expect(mockScan).toHaveBeenCalledTimes(1);
+
+      mockPromise
+        .mockResolvedValueOnce({ Item: mockSkill })
+        .mockResolvedValueOnce({});
+      // prod-to-dev writes to 'Dev-AW-Skills' — not this.tableName here, so
+      // nothing this cache reads was actually changed.
+      await skillService.syncSkill('skill-1', 'prod-to-dev');
+
+      const cached = await skillService.getPublishedSkills();
+      expect(mockScan).toHaveBeenCalledTimes(1);
+      expect(cached).toHaveLength(1);
+    });
+
     it('should convert DynamoDB Set toolNames when writing to target', async () => {
       const skillWithSet = {
         ...mockSkill,
