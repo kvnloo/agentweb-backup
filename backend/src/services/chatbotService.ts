@@ -4726,8 +4726,12 @@ export async function generateChatResponse(
             userId ? getAllowedSkills(userId) : getPublicAllowedSkills(),
           ]);
           userAllowedSkillIdsForGate = userAllowedSkillIds;
-          skillAllowlistResolved = true;
+          // Set only after buildSkillContext itself succeeds — if it throws, the
+          // catch block below must still see skillAllowlistResolved === false, or
+          // the hard gate would misreport a context-construction bug as "your
+          // subscription doesn't include this skill".
           skillContext = agentModeService.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionSkillIds, !!isDelegatedAdmin);
+          skillAllowlistResolved = true;
         } else {
           skillContext = agentModeService.buildSkillContext([], [], [], [], !!isDelegatedAdmin);
         }
@@ -4991,7 +4995,12 @@ export async function generateChatResponse(
     // Fail explicitly instead of letting the model free-text an answer it has no
     // real capability to back up — this is the failure mode that produced the P0
     // ("I don't have the capability to..." for a session that actually did).
-    if (sessionHasInstalledSkills && toolDefinitions.length === 0) {
+    // toolDefinitions also carries customer/page/work-plan tools unrelated to the
+    // installed skill (e.g. a CRM-page turn on a customer session), so a nonzero
+    // toolDefinitions.length doesn't prove the skill's own tools bound. Gate on
+    // the subset that actually came from the skill/foundation resolution instead.
+    const skillToolDefinitions = toolDefinitions.filter((t: any) => skillContext.allowedToolNames.has(t.function.name));
+    if (sessionHasInstalledSkills && skillToolDefinitions.length === 0) {
       // ENG-1222: subscription-tier gating (now enforced here via buildSkillContext,
       // where before this path ignored it) correctly excludes a skill's tools when
       // the caller's plan doesn't include it — that isn't a bug to apologize for or
@@ -5209,7 +5218,17 @@ export async function generateChatResponse(
     // toolCalls (see the catch block above), so toolCalls.length alone isn't
     // "something really executed" — it must have at least one call that didn't
     // error and didn't report an explicit { success: false } result.
-    const hasSuccessfulToolCall = toolCalls.some((tc) => !tc.error && (tc.result as any)?.success !== false);
+    const isFailedToolResult = (result: any): boolean => {
+      // Tool results aren't always objects — some handlers return a JSON string
+      // (see toolContent above). A string result with success:false must count
+      // as a failure too, or a serialized error slips past the `.success`
+      // property check (undefined on a string, so `!== false` is trivially true).
+      const parsed = typeof result === 'string'
+        ? (() => { try { return JSON.parse(result); } catch { return undefined; } })()
+        : result;
+      return parsed?.success === false;
+    };
+    const hasSuccessfulToolCall = toolCalls.some((tc) => !tc.error && !isFailedToolResult(tc.result));
     if (
       !hasSuccessfulToolCall
       && CLAIMS_REAL_TOOL_OUTPUT.test(finalAssistantMessage)
