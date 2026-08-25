@@ -840,6 +840,35 @@ createTestAccount().then(async () => {
         console.error('[renewalIntegrationHealthCron] Failed to initialize:', error);
       }
 
+      // CRM Auto-Enrichment (ENG-88) — runs every 15 minutes.
+      // Ray's manual campaign-monitoring routine included clicking "renew"
+      // (the enrich-v3 engine) on managed-campaign lead lists by hand a
+      // couple of times. With Ray leaving, this keeps it happening without
+      // a human clicking anything — but ONLY for a list whose saved
+      // enrichmentConfig has explicitly opted in (`autoEnrich: true`, set
+      // via the existing PUT /lists/:listId/enrichment-config). Every
+      // other list's behavior is unchanged; nothing runs until a human
+      // flips that flag for a specific list.
+      try {
+        const { runCrmAutoEnrichmentCheck } = await import('./cron/crmAutoEnrichmentCron');
+        const CRM_AUTO_ENRICHMENT_INTERVAL_MS = 15 * 60 * 1000;
+        // Guard the initial run too, matching the interval callback below —
+        // a disabled-cron environment must not enrich real leads once on
+        // startup just because the guard was only on the recurring path.
+        if (isCronEnabled()) {
+          cronJobRegistry.track('crmAutoEnrichmentCron', runCrmAutoEnrichmentCheck())
+            .catch(e => console.error('[crmAutoEnrichmentCron] Error on first run:', e));
+        }
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('crmAutoEnrichmentCron', runCrmAutoEnrichmentCheck())
+            .catch(e => console.error('[crmAutoEnrichmentCron] Error:', e));
+        }, CRM_AUTO_ENRICHMENT_INTERVAL_MS);
+        console.log('[crmAutoEnrichmentCron] Initialized — running every 15 minutes (opt-in per list, default off)');
+      } catch (error) {
+        console.error('[crmAutoEnrichmentCron] Failed to initialize:', error);
+      }
+
       // Skill Review Queue Digest (ENG-932) — runs daily.
       // "Submit for Review" fires no notification at all (ENG-149 correctly
       // killed the old per-submission oncall page as noise, but that left the
