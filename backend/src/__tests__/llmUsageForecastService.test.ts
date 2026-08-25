@@ -335,8 +335,33 @@ describe("assessForecastAccuracy — forecast vs actual (ENG-1215 AC4)", () => {
     const honest = assess({ dailyCostMicroUsd: rows, costUsedMicroUsd: 50 * USD });
     const inflated = assess({ dailyCostMicroUsd: rows, costUsedMicroUsd: 149 * USD });
 
+    // Burn is ledger-only, so it cannot move at all.
     expect(inflated!.burnRatio).toBeCloseTo(honest!.burnRatio as number, 5);
-    expect(inflated!.predictedOnTrack).toBe(honest!.predictedOnTrack);
+    // The remaining allowance at the split is reconstructed by subtracting the
+    // days since from today's figure, so an account that has genuinely spent
+    // more by today HAD spent more at the split too — the on-track call is
+    // allowed to differ. What must not happen is the past forecast being handed
+    // today's total as though it were the split's.
+    expect(inflated!.observedDaysAtForecast).toBe(honest!.observedDaysAtForecast);
+  });
+
+  it("gives the past forecast the allowance it had AT the split, not the full ceiling", () => {
+    // Pins the basis itself, which the leak test above does not: mutation
+    // testing showed `spentAtSplit = 0` passed every other case here. The
+    // numbers are chosen so the two bases disagree on the on-track CALL, not
+    // just on a hidden intermediate.
+    //
+    // $5/day for the first 5 days, $20/day for the next 5, $125 spent of a $150
+    // ceiling. At the split the account had spent $25, leaving $125 at $5/day =
+    // 25 days — one short of the 26 to reset, so the honest answer is "not on
+    // track". Handed the FULL $150 it would have read 30 days and said yes.
+    const r = assess({
+      dailyCostMicroUsd: [...daysFrom(1, 5, 5), ...daysFrom(6, 10, 20)],
+      costUsedMicroUsd: 125 * USD,
+      hardThresholdMicroUsd: 150 * USD,
+    });
+
+    expect(r!.predictedOnTrack).toBe(false);
   });
 
   it("returns null for a cycle too short to hold both a forecast and an outcome", () => {
@@ -345,20 +370,52 @@ describe("assessForecastAccuracy — forecast vs actual (ENG-1215 AC4)", () => {
     expect(assess({ dailyCostMicroUsd: [], today: "2026-08-01" })).toBeNull();
   });
 
-  it("reports no burn ratio when the earlier forecast declined to predict", () => {
+  it("returns null outright when the earlier forecast declined to predict", () => {
     // A cycle too quiet to forecast produced no prediction, so there is nothing
-    // to be right or wrong about. Inventing an error figure for a forecast that
-    // was never made would be a fabricated number in the one place whose job is
-    // measuring whether our numbers are fabricated.
+    // to be right or wrong about. My first cut returned an OBJECT of nulls here,
+    // which still emitted a telemetry row — a row that scores nothing pollutes
+    // the very metric meant to measure accuracy (CodeRabbit). Silence is the
+    // only honest answer.
     const r = assess({
       dailyCostMicroUsd: [...daysFrom(1, 5, 0), ...daysFrom(6, 10, 5)],
       costUsedMicroUsd: 25 * USD,
     });
 
-    expect(r).not.toBeNull();
-    expect(r!.burnRatio).toBeNull();
-    expect(r!.predictedOnTrack).toBeNull();
-    expect(r!.onTrackAgrees).toBeNull();
+    expect(r).toBeNull();
+  });
+
+  it("declines to score the on-track call when credits moved the ceiling", () => {
+    // CodeRabbit: the allowance moves with credits, and credits are stored as
+    // month totals with no per-day timeline — so the ceiling that applied at the
+    // split is not reconstructable. Scoring the earlier call against today's
+    // adjusted ceiling would mark a CORRECT forecast wrong because someone
+    // bought a top-up afterwards.
+    const rows = evenDays(10, 5);
+    const withCredits = assessForecastAccuracy(
+      base({ dailyCostMicroUsd: rows, costUsedMicroUsd: 50 * USD }),
+      computeUsageRunway(base({ dailyCostMicroUsd: rows, costUsedMicroUsd: 50 * USD })),
+      { creditsApplied: true },
+    );
+
+    expect(withCredits).not.toBeNull();
+    expect(withCredits!.predictedOnTrack).toBeNull();
+    expect(withCredits!.actualOnTrack).toBeNull();
+    expect(withCredits!.onTrackAgrees).toBeNull();
+  });
+
+  it("still reports the burn ratio on a credited cycle — credits never touch the ledger", () => {
+    // The half that must NOT be thrown away with the on-track call. Burn is
+    // computed from ledger rows alone, so a top-up changes nothing about how
+    // fast the account is spending.
+    const rows = evenDays(10, 5);
+    const input = base({ dailyCostMicroUsd: rows, costUsedMicroUsd: 50 * USD });
+    const plain = assessForecastAccuracy(input, computeUsageRunway(input));
+    const credited = assessForecastAccuracy(input, computeUsageRunway(input), {
+      creditsApplied: true,
+    });
+
+    expect(credited!.burnRatio).toBeCloseTo(plain!.burnRatio as number, 5);
+    expect(credited!.burnRatio).toBeCloseTo(1, 5);
   });
 
   it("records whether the earlier on-track call still stands", () => {

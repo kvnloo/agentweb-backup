@@ -298,6 +298,7 @@ const MIN_DAYS_PER_SIDE = 2;
 export function assessForecastAccuracy(
   input: UsageRunwayInput,
   current: UsageRunway,
+  options: { creditsApplied?: boolean } = {},
 ): ForecastAccuracy | null {
   const startMs = toUtcDay(input.cycleStartDate);
   const todayMs = toUtcDay(input.today);
@@ -315,29 +316,45 @@ export function assessForecastAccuracy(
   // Spend strictly BEFORE the split is what the earlier forecast could see.
   // Re-using today's `costUsedMicroUsd` would hand the past forecast a
   // remaining allowance it did not have, which is the classic backtest leak.
-  let spentBefore = 0;
   let spentSince = 0;
   for (const row of input.dailyCostMicroUsd) {
     const dayMs = toUtcDay(row.date);
-    if (dayMs < startMs || dayMs >= todayMs) continue;
-    const cost = Math.max(0, row.costMicroUsd || 0);
-    if (dayMs < asOfMs) spentBefore += cost;
-    else spentSince += cost;
+    if (dayMs < asOfMs || dayMs >= todayMs) continue;
+    spentSince += Math.max(0, row.costMicroUsd || 0);
   }
+
+  // Spend as of the split on the SAME basis as the threshold it is measured
+  // against (CodeRabbit). `costUsedMicroUsd` is credit-adjusted while a raw
+  // ledger sum is not, so subtracting the days since keeps both sides in one
+  // currency — an adjusted ceiling minus a raw spend is not a remaining
+  // allowance, it is two different numbers subtracted.
+  const spentAtSplit = Math.max(0, input.costUsedMicroUsd - spentSince);
 
   const past = computeUsageRunway({
     ...input,
     today: asOfDate,
-    costUsedMicroUsd: spentBefore,
+    costUsedMicroUsd: spentAtSplit,
   });
 
   const predictedBurn = past.diagnostics.forecastBurnMicroUsdPerDay;
-  const actualBurn = spentSince / daysSince;
-  const burnRatio =
-    predictedBurn !== null && predictedBurn > 0 ? actualBurn / predictedBurn : null;
+  // No forecast was made then, so there is nothing to be right or wrong about.
+  // Returning an object of nulls would still emit a telemetry row, and a row
+  // that scores nothing pollutes the very metric meant to measure accuracy.
+  if (predictedBurn === null || predictedBurn <= 0) return null;
 
-  const predictedOnTrack = past.onTrack;
-  const actualOnTrack = current.onTrack;
+  const actualBurn = spentSince / daysSince;
+  const burnRatio = actualBurn / predictedBurn;
+
+  // On-track compares two REMAINING-ALLOWANCE calls, and the allowance moves
+  // with credits. Credits are stored as month totals with no per-day timeline,
+  // so the ceiling that applied at the split is not reconstructable — scoring
+  // the earlier call against today's adjusted ceiling would mark a correct
+  // forecast wrong because someone bought a top-up afterwards. The burn ratio
+  // is unaffected: it is computed from ledger rows alone, which credits never
+  // touch.
+  const reconstructable = options.creditsApplied !== true;
+  const predictedOnTrack = reconstructable ? past.onTrack : null;
+  const actualOnTrack = reconstructable ? current.onTrack : null;
   const onTrackAgrees =
     predictedOnTrack === null || actualOnTrack === null
       ? null

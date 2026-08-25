@@ -183,7 +183,9 @@ export async function resolveUsageRunway(
   // for a cycle too short to hold both a forecast and an outcome — in which
   // case nothing is emitted rather than a zero that would read as a perfect
   // score.
-  const accuracy = assessForecastAccuracy(forecastInput, runway);
+  const accuracy = assessForecastAccuracy(forecastInput, runway, {
+    creditsApplied: usage.creditsApplied,
+  });
   if (accuracy) {
     await recordUsageTelemetry(usage.billingUserId, USAGE_TELEMETRY_EVENTS.forecastAccuracy, {
       version: runway.version,

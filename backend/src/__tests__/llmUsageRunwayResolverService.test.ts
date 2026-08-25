@@ -424,6 +424,39 @@ describe("resolveUsageRunway — forecast accuracy telemetry (ENG-1215 AC4)", ()
     expect(emitted(USAGE_TELEMETRY_EVENTS.forecastAccuracy)).toHaveLength(0);
   });
 
+  it("emits NOTHING when the earlier forecast declined to predict", async () => {
+    // CodeRabbit: an accuracy row that scores nothing pollutes the metric it
+    // exists to measure. A quiet first half means no forecast was made then.
+    mockQuery.mockResolvedValue([
+      ...ledgerDays(5, 0),
+      ...Array.from({ length: 5 }, (_, i) => ({
+        userId: "billing-root",
+        date: `2026-08-${String(i + 6).padStart(2, "0")}`,
+        model: "anthropic.claude-opus-5",
+        feature: "agent_task",
+        costMicroUsd: 5 * USD,
+        callCount: 1,
+        billingUserId: "billing-root",
+      })),
+    ]);
+
+    await resolveUsageRunway("billing-root", { today: "2026-08-11" });
+
+    expect(emitted(USAGE_TELEMETRY_EVENTS.forecastAccuracy)).toHaveLength(0);
+  });
+
+  it("does not score the on-track call for a cycle where credits applied", async () => {
+    mockPolicy.mockResolvedValue(policyFor({ creditsApplied: true }));
+    mockQuery.mockResolvedValue(ledgerDays(10, 5));
+
+    await resolveUsageRunway("billing-root", { today: "2026-08-11" });
+
+    const dims = emitted(USAGE_TELEMETRY_EVENTS.forecastAccuracy)[0][2];
+    expect(dims.onTrackAgrees).toBeNull();
+    // The burn ratio survives: credits never touch the ledger rows it is built from.
+    expect(dims.burnRatio).toBeCloseTo(1, 5);
+  });
+
   it("carries no internal dollars into the sink (AC4)", async () => {
     mockQuery.mockResolvedValue(ledgerDays(10, 5));
 
