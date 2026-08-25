@@ -1020,7 +1020,10 @@ export class LinkedInOutreachService {
    * matching `*_id`, this method calls UnipileSearchParamService.resolveTopId()
    * to look up the LinkedIn entity ID. Resolver miss (null) or resolver error
    * → fall back to the original `advanced_keywords` free-text behavior so the
-   * search never blocks on resolution failures.
+   * search never blocks on resolution failures. When that happens, the result
+   * carries `degraded: true` and `droppedFacets` (the facet names that
+   * couldn't be resolved to a structured ID) so callers get a deterministic
+   * signal instead of having to infer degradation themselves (ENG-1299).
    */
   async searchPeople(accountId: string, params: {
     keywords?: string;
@@ -1049,6 +1052,12 @@ export class LinkedInOutreachService {
       const client = await this.getClient();
 
       let body: any;
+      // Facet names whose free-text couldn't be resolved to an ID and fell
+      // back to `advanced_keywords` (keyword-only matching for that facet,
+      // not a true structured filter). Surfaced on the result as `degraded`
+      // so the caller has a deterministic signal instead of having to infer
+      // degradation from the request shape (ENG-1299).
+      let droppedFacets: string[] = [];
 
       if (cursor) {
         // Pagination: cursor wins over url because the cursor payload already
@@ -1108,6 +1117,7 @@ export class LinkedInOutreachService {
         if (Object.keys(advanced).length > 0) {
           body.advanced_keywords = advanced;
         }
+        droppedFacets = Object.keys(advanced).filter((key) => key !== 'title');
       }
 
       const result = await client.request.send({
@@ -1118,6 +1128,9 @@ export class LinkedInOutreachService {
         body
       });
       this.log(`Search returned results`, { result });
+      if (droppedFacets.length > 0 && result && typeof result === 'object' && !Array.isArray(result)) {
+        return { ...result, degraded: true, droppedFacets };
+      }
       return result;
     } catch (error: any) {
       return this.handleError(error, 'searchPeople');
