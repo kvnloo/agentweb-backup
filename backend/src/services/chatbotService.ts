@@ -199,6 +199,12 @@ export interface ChatSession {
       // step (e.g. "Generate 3 Images Per Hook — 18 total") from being marked done with
       // only a fraction generated (the xCures incident). Unset = no asset-count gate.
       expectedAssetCount?: number;
+      // ENG-1331: which tool name(s) count toward expectedAssetCount, when a step's
+      // deliverable spans multiple asset-producing tools that aren't interchangeable
+      // (see synthesisResidue.ts's countProducedAssets for the full rationale). Unset
+      // = the gate falls back to the max succeeded count across every known
+      // asset-producing tool.
+      expectedAssetCountTools?: string[];
       inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
     }>;
     createdAt: string;
@@ -3198,6 +3204,8 @@ export class ChatbotDB {
         requiredFunctionCalls?: string[];
         skillIds?: string[];
         expectedAssetCount?: number;
+        /** ENG-1331: see the matching field on the read-side workPlan type above. */
+        expectedAssetCountTools?: string[];
         inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
       }>;
       createdAt: string;

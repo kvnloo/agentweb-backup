@@ -11884,7 +11884,15 @@ export const agentModeController = {
           completedAt: undefined,
           notes: undefined,
           requiredFunctionCalls: step.requiredFunctionCalls,
-          skillIds: step.skillIds
+          skillIds: step.skillIds,
+          // ENG-1331: this route never carried expectedAssetCount from the template
+          // into the session, unlike its sibling instantiation path
+          // (agentModeService.ts applyPredefinedWorkPlan) — so the step-completion
+          // gate had nothing to enforce even once the template had it set. This is
+          // the exact route the production incident session was created through
+          // (its pageIdentifier `plan-${planTitle}` matches only this path).
+          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
+          ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
         })),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()

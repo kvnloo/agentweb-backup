@@ -370,6 +370,246 @@ function countsInclude(
 }
 
 /**
+ * ENG-1331: a work-plan session generated and screenshot-exported only 4 of 12
+ * requested display-ad sizes, then closed with "all 12 sizes have been rendered,
+ * QA'd, and saved" — fluent, well-formed prose, not the junk `isUnusableSynthesis`
+ * above exists to catch. The closing message was built from INTENT ("render all
+ * 12") rather than from what actually ran, so a claim like this reads as a normal
+ * answer and ships straight to the user.
+ *
+ * `detectFalseCompletionClaim` is the orthogonal truth check: instead of judging
+ * whether the text looks like an answer, it parses any explicit numeric completion
+ * claim ("all N <asset noun>", "N of N", "N/N") out of the content and compares it
+ * against the ledger's actual count of succeeded asset-producing tool calls.
+ *
+ * `toolCalls` holds every call made THIS TURN, but "this turn" is not "this step":
+ * in an AUTOCOMPLETE-mode work-plan session the whole loop — including every
+ * `set_work_plan_status` call between steps/variants — runs inside one turn, so a
+ * multi-variant turn can carry several steps' worth of successful assets in one
+ * ledger. Comparing a claim about the LATEST step/variant ("all 12 sizes for
+ * Variant 4") against the WHOLE ledger reproduces the exact ENG-1188 masking bug on
+ * this new mechanism: variants 1-3's already-succeeded renders paper over variant
+ * 4's shortfall, and the guard built to catch that shortfall goes silent on it.
+ * `sinceLastStepBoundary` below scopes the count to calls made after the last
+ * completed/skipped `set_work_plan_status` in the ledger, mirroring the `sinceIso`
+ * cutoff agentModeService.ts already uses for the `expectedAssetCount` gate — same
+ * idea, expressed as a ledger-index cut since this pure module only ever sees one
+ * turn's tool-call array in call order, not the session messages `sinceIso` reads
+ * timestamps from.
+ */
+const ASSET_NOUN = '(?:sizes?|images?|banners?|ads?|assets?|variants?|creatives?|renders?|screenshots?|photos?|videos?|templates?|graphics?)';
+
+/**
+ * Appends the same "an asset noun follows within a few words" requirement
+ * `ALL_N_NOUN_PATTERN` already used, onto any other numeric-claim core pattern. Live
+ * repro: without this, N_OF_N/N_SLASH_N matched an unrelated same-number ratio —
+ * "10 of 10 pages", "3/3 of the brief" — and misread it as an asset-completion
+ * claim. `ALL_N_NOUN_PATTERN` never had that hole because it always required a noun;
+ * the other two patterns need the identical suffix, not a separate ad-hoc check.
+ */
+function withNounProximity(coreSource: string): string {
+  return `${coreSource}(?:\\s+\\S+){0,6}?\\s+${ASSET_NOUN}\\b`;
+}
+
+/** "all 12 sizes", "all 12 of the requested display sizes" (up to 6 words between). */
+const ALL_N_NOUN_PATTERN = new RegExp(withNounProximity('\\ball\\s+(\\d+)'), 'gi');
+/** "12 of 12 banners" — the backreference requires the SAME number twice, so "4 of 12" never matches. */
+const N_OF_N_PATTERN = new RegExp(withNounProximity('\\b(\\d+)\\s+of\\s+\\1'), 'gi');
+/** "12/12 images". */
+const N_SLASH_N_PATTERN = new RegExp(withNounProximity('\\b(\\d+)\\s*\\/\\s*\\1'), 'gi');
+
+const ASSET_PRODUCING_TOOL_NAMES = new Set([
+  'generate_image',
+  'generate_video',
+  'generate_voiceover',
+  'create_html_file',
+  'create_html_from_template',
+  'save_file',
+  'playwright_browser_take_screenshot',
+]);
+
+/**
+ * The tool that closes a work-plan step/variant (`set_work_plan_status`) is
+ * recorded in this same per-turn ledger, so a completed/skipped call to it is a
+ * real boundary between "the previous step's work" and "this step's work".
+ */
+const STEP_BOUNDARY_TOOL_NAME = 'set_work_plan_status';
+
+/**
+ * Slices `toolCalls` down to calls made AFTER the most recent successful
+ * `set_work_plan_status` call, so a claim about the step/variant currently being
+ * closed is never checked against an earlier step's already-counted assets. With no
+ * such boundary in the ledger (a single-step turn, or a turn with no work plan at
+ * all) the whole ledger is the current step's, matching prior behavior exactly.
+ */
+function sinceLastStepBoundary(toolCalls: ExecutedToolCall[]): ExecutedToolCall[] {
+  for (let i = toolCalls.length - 1; i >= 0; i--) {
+    const call = toolCalls[i];
+    if (!call || call.name !== STEP_BOUNDARY_TOOL_NAME) continue;
+    if ('error' in call || isReportedFailure(call)) continue;
+    return toolCalls.slice(i + 1);
+  }
+  return toolCalls;
+}
+
+/**
+ * Without `tools`: the largest succeeded-call count among the known
+ * asset-producing tools in the ledger — NOT a sum across tool names. A step like
+ * "Render the Full Size Matrix" (requiredFunctionCalls: create_html_file +
+ * playwright_browser_take_screenshot) builds a FEW reusable HTML templates and
+ * takes MANY per-size screenshots from them; both tools are legitimately part of
+ * "this step's work", but they are not interchangeable units of the same
+ * deliverable. Summing them would let, e.g., 5 create_html_file calls + 7
+ * screenshots satisfy an expectedAssetCount of 12 while only 7 of the 12 requested
+ * sizes were actually rendered — the same "claimed count met by padding across
+ * unrelated calls" failure this module exists to catch, just introduced by ITS OWN
+ * counting instead of the model's prose. Max still correctly reports 12 when a
+ * step genuinely produces 12 of its primary deliverable, whichever single tool
+ * that turns out to be — the safe default for a step that hasn't said which tool
+ * is "the N things".
+ *
+ * With `tools`: sums successes across exactly those tool names instead. The step
+ * author has already resolved the ambiguity max exists to guard against — e.g. a
+ * step whose N deliverables are genuinely split across two tools (some images,
+ * some videos) — so summing the ones they named is correct, not padding.
+ */
+function countProducedAssets(toolCalls: ExecutedToolCall[], tools?: ReadonlySet<string>): number {
+  const counts = tallyExecutedActions(toolCalls);
+  if (tools) {
+    let sum = 0;
+    for (const [name, { ok }] of counts) {
+      if (tools.has(name)) sum += ok;
+    }
+    return sum;
+  }
+  let max = 0;
+  for (const [name, { ok }] of counts) {
+    if (ASSET_PRODUCING_TOOL_NAMES.has(name)) max = Math.max(max, ok);
+  }
+  return max;
+}
+
+/** Minimal shape of a persisted assistant message this reads — mirrors the
+ * identical local interface `seedMediaCallKeysFromHistory` (toolDispatch.ts) already
+ * uses to reconstruct tool calls from `session.messages`. */
+interface HistoryMessageLike {
+  role?: string;
+  timestamp?: string;
+  metadata?: {
+    timestamp?: string;
+    toolCalls?: ExecutedToolCall[];
+  } | null;
+}
+
+/**
+ * ENG-1331: the work-plan step completion gate's asset counter
+ * (`AgentModeService.extractGeneratedImageFilenames`) only recognizes the
+ * system-message marker `generate_image` emits — a step whose deliverable is
+ * Playwright-rendered screenshots (`create_html_file` +
+ * `playwright_browser_take_screenshot`, no `generate_image` call at all) can never
+ * satisfy it, so the ENG-1188 xCures completion gate stays silently blind to
+ * exactly the failure mode production hit here (4 of 12 screenshots rendered, the
+ * step still marked completed). This counts every `ASSET_PRODUCING_TOOL_NAMES`
+ * success across `session.messages` instead of one tool's marker — the same ledger
+ * this module already reads for the synthesis-claim check above, so both
+ * mechanisms agree on what "an asset was produced" means.
+ *
+ * Scoped by `sinceIso` exactly like `extractGeneratedImageFilenames`: only calls
+ * from a message timestamped at or after the cutoff count, so an earlier step's
+ * assets never satisfy a later step's requirement. Per-message granularity (not
+ * per-call) matches `seedMediaCallKeysFromHistory`'s existing precedent for reading
+ * this same persisted shape.
+ *
+ * `tools` (ENG-1331), when the caller has one (a work-plan step's
+ * `expectedAssetCountTools`), is forwarded to `countProducedAssets` as-is — sum
+ * those specific tools instead of taking the max across every producing tool.
+ * Omit it to keep the safe max-based default.
+ */
+export function extractProducedAssetCount(
+  messages: HistoryMessageLike[] | undefined | null,
+  sinceIso?: string,
+  tools?: readonly string[],
+): number {
+  if (!Array.isArray(messages)) return 0;
+  const toolSet = tools && tools.length > 0 ? new Set(tools) : undefined;
+  let total = 0;
+  for (const message of messages) {
+    if (!message || message.role !== 'assistant') continue;
+    const toolCalls = message.metadata?.toolCalls;
+    if (!Array.isArray(toolCalls) || toolCalls.length === 0) continue;
+    const timestamp = message.timestamp || message.metadata?.timestamp;
+    if (sinceIso && timestamp && timestamp < sinceIso) continue;
+    total += countProducedAssets(toolCalls, toolSet);
+  }
+  return total;
+}
+
+export interface FalseCompletionClaim {
+  /** The largest numeric completion claim found in the content. */
+  claimed: number;
+  /** The ledger's actual count of succeeded asset-producing tool calls. */
+  actual: number;
+}
+
+/**
+ * Returns the claim/actual mismatch when `content` asserts a numeric completion
+ * ("all 12 sizes", "12 of 12", "12/12") that the ledger cannot back up, or `null`
+ * when there is no such claim or the ledger meets or exceeds it. A claim that
+ * already admits a shortfall (e.g. "4 of the 12 requested sizes") does not match
+ * any of these patterns, so an honest partial report is never flagged.
+ */
+export function detectFalseCompletionClaim(
+  content: unknown,
+  toolCalls: ExecutedToolCall[],
+): FalseCompletionClaim | null {
+  if (typeof content !== 'string' || !content.trim()) return null;
+
+  const claims = new Set<number>();
+  for (const pattern of [ALL_N_NOUN_PATTERN, N_OF_N_PATTERN, N_SLASH_N_PATTERN]) {
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(content)) !== null) {
+      const n = parseInt(match[1], 10);
+      if (Number.isFinite(n) && n > 0) claims.add(n);
+    }
+  }
+  if (claims.size === 0) return null;
+
+  const claimed = Math.max(...claims);
+  const actual = countProducedAssets(sinceLastStepBoundary(toolCalls));
+  if (actual >= claimed) return null;
+  return { claimed, actual };
+}
+
+/**
+ * Correction to APPEND when `detectFalseCompletionClaim` finds a claim the ledger
+ * cannot back up. Keeps the model's original prose (it may still hold other real,
+ * useful detail) but states the real count and the named shortfall right underneath
+ * it, so the user is never left believing more happened than actually did.
+ *
+ * Scoped to the same `sinceLastStepBoundary` slice `detectFalseCompletionClaim`
+ * used to compute `claim.actual` — showing a wider ledger here would contradict the
+ * very count the correction is stating (e.g. "only 4 of 12" next to a list that
+ * includes 40 unrelated successes from earlier steps).
+ */
+export function buildFalseClaimCorrectionFooter(
+  claim: FalseCompletionClaim,
+  toolCalls: ExecutedToolCall[],
+): string {
+  const counts = tallyExecutedActions(sinceLastStepBoundary(toolCalls));
+  const ledgerLines = counts.size > 0 ? renderLedgerLines(counts) : '(No assets were actually produced.)';
+
+  return [
+    '---',
+    `⚠️ *Correction: the "${claim.claimed}" figure above is not accurate — only ${claim.actual} of ${claim.claimed} were actually produced this turn; the rest were never generated.* Here is what actually ran:`,
+    '',
+    ledgerLines,
+    '',
+    COUNT_BASIS_NOTE,
+  ].join('\n').trim();
+}
+
+/**
  * Render a truthful recap of what the run actually executed, for use when the model
  * could not produce a written synthesis at all. It reports only tool names and
  * outcome counts — never invented results — so it cannot manufacture a false success.

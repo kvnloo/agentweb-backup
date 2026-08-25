@@ -31,7 +31,7 @@ import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoAssetUrl,
@@ -3392,6 +3392,14 @@ export class AgentModeService {
       // seam. Off restores the exact pre-ENG-1054 behaviour.
       const synthesisResidueGuardEnabled = process.env.AGENT_SYNTHESIS_RESIDUE_GUARD !== 'false';
 
+      // ENG-1331 kill switch — ON by default; set AGENT_FALSE_CLAIM_GUARD=false to
+      // disable just the false-completion-claim correction below. Deliberately its
+      // OWN flag, not AGENT_SYNTHESIS_RESIDUE_GUARD: that guard discards junk-shaped
+      // output (isUnusableSynthesis), an orthogonal check from this one, which
+      // corrects a fluent but numerically false claim. Sharing a flag would mean
+      // standing down one guard silently disables the other.
+      const falseClaimGuardEnabled = process.env.AGENT_FALSE_CLAIM_GUARD !== 'false';
+
       let wasCancelled = false;
       // ENG-244: set true when the loop exits because the step budget (maxIterations)
       // was exhausted. This is the deterministic signal a long data-gathering
@@ -3918,6 +3926,24 @@ export class AgentModeService {
               }
             }
             if (responseMessage) responseMessage.content = content;
+          }
+
+          // ENG-1331: independent of the residue guard above — this catches a
+          // FLUENT final answer that falsely claims more assets were completed
+          // than the ledger shows (production case: "all 12 sizes have been
+          // rendered, QA'd, and saved" when only 4 screenshots succeeded). It reads
+          // as a normal answer, so `isUnusableSynthesis` never flags it; this checks
+          // the claim's numbers against `toolCalls` instead of the text's shape.
+          if (falseClaimGuardEnabled && content) {
+            const falseClaim = detectFalseCompletionClaim(content, toolCalls);
+            if (falseClaim) {
+              console.warn(
+                `AgentMode: Final synthesis claims ${falseClaim.claimed} completed but the ledger shows only ` +
+                `${falseClaim.actual} succeeded asset-producing call(s) in session ${sessionId} — appending a correction`
+              );
+              content = `${content}\n\n${buildFalseClaimCorrectionFooter(falseClaim, toolCalls)}`;
+              if (responseMessage) responseMessage.content = content;
+            }
           }
 
           if (requireWorkPlanDisposition) {
@@ -29312,7 +29338,7 @@ ${strippedHtml}`;
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number }>, sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -29337,7 +29363,8 @@ ${strippedHtml}`;
           notes: undefined,
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds,
-          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount })
+          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
+          ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools })
         })),
         autocomplete: autocomplete || false,
         createdAt: new Date().toISOString(),
@@ -29432,6 +29459,7 @@ ${strippedHtml}`;
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds,
           ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
+          ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
         autocomplete: predefinedPlan.autocomplete || false,
@@ -29624,7 +29652,7 @@ ${strippedHtml}`;
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -29660,8 +29688,10 @@ ${strippedHtml}`;
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
             // Allow scope changes: an explicit expectedAssetCount overrides (including 0
             // to clear the asset gate when the user approves a smaller set); omitting it
-            // preserves the existing value.
-            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount
+            // preserves the existing value. Same override-or-preserve semantics for
+            // expectedAssetCountTools (ENG-1331).
+            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount,
+            expectedAssetCountTools: newStep.expectedAssetCountTools !== undefined ? newStep.expectedAssetCountTools : workPlan.steps[existingIndex].expectedAssetCountTools
           };
         } else {
           // Add new step (stepCount will be fixed by updateSessionWorkPlan)
@@ -29675,7 +29705,8 @@ ${strippedHtml}`;
             notes: undefined,
             requiredFunctionCalls: newStep.requiredFunctionCalls,
             skillIds: newStep.skillIds,
-            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount })
+            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount }),
+            ...(newStep.expectedAssetCountTools !== undefined && { expectedAssetCountTools: newStep.expectedAssetCountTools })
           });
         }
       }
@@ -29887,7 +29918,27 @@ ${strippedHtml}`;
               if (live?.resolvedAt) { sinceIso = live.resolvedAt; break; }
             }
           }
-          const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length;
+          // ENG-1331: extractGeneratedImageFilenames only recognizes generate_image's
+          // own marker, so a step whose deliverable is Playwright-rendered
+          // screenshots (no generate_image call at all) would always read 0 there.
+          // extractProducedAssetCount reads the same persisted toolCalls ledger for
+          // every known asset-producing tool.
+          //
+          // When the step names its own expectedAssetCountTools, trust that
+          // explicitly and skip the max-with-legacy-signal blend below: the whole
+          // point of naming the tool(s) is precision, and blending in
+          // extractGeneratedImageFilenames' generate_image count would reopen the
+          // exact ambiguity the author resolved by naming their tool(s) at all (e.g.
+          // an unrelated generate_image call elsewhere in the step inflating a
+          // screenshot-only count). Without a declared list, take the max of both
+          // signals so neither detection path can pull the count DOWN relative to
+          // the other — the safe default for a step that hasn't disambiguated.
+          const producedAssetCount = step.expectedAssetCountTools?.length
+            ? extractProducedAssetCount(session.messages, sinceIso, step.expectedAssetCountTools)
+            : Math.max(
+                AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
+                extractProducedAssetCount(session.messages, sinceIso),
+              );
           if (producedAssetCount < step.expectedAssetCount) {
             insufficientAssets.push({
               stepCount: update.stepCount,
