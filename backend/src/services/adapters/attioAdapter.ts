@@ -6,6 +6,19 @@ import { buildSyncedMetadataBase, buildFailedMetadata } from '../../utils/leadSy
 import { validateEmail } from '../../utils/validation';
 
 /**
+ * System list-identity mapping, mirroring HUBSPOT_LIST_IDENTITY_MAPPING
+ * (hubspotAdapter.ts) exactly. Push-only (the values are owned by Emma).
+ * pushLeads injects these at push time when a stored config doesn't already
+ * carry them, so lists connected before this feature shipped sync the fields
+ * without a manual re-save. An explicit config entry (re-mapped or disabled
+ * in the dialog) always wins.
+ */
+export const ATTIO_LIST_IDENTITY_MAPPING: FieldMapping[] = [
+    { agentwebField: 'listName', crmProperty: 'lead_list_name', direction: 'push', enabled: true },
+    { agentwebField: 'listId', crmProperty: 'lead_list_id', direction: 'push', enabled: true },
+];
+
+/**
  * Attio CRM Adapter
  *
  * Thin orchestration + field-mapping layer on top of AttioService.
@@ -20,6 +33,25 @@ import { validateEmail } from '../../utils/validation';
  * The resolved token is cached on the instance for the lifetime of the operation.
  */
 export class AttioAdapter implements CrmAdapter {
+
+    /** agentwebFields that carry only source-list identity, not lead content. */
+    private static readonly LIST_IDENTITY_FIELDS = new Set(
+        ATTIO_LIST_IDENTITY_MAPPING.map(m => m.agentwebField)
+    );
+
+    /**
+     * Returns the custom mapping with the system list-identity mappings
+     * (listName/listId) appended for any agentwebField the config doesn't already
+     * define. An existing entry — whether the user re-mapped its Attio attribute
+     * or disabled it — is left untouched so explicit configuration always wins.
+     * Lets lists connected before this feature shipped sync listName/listId
+     * without a manual re-save. Mirrors hubspotAdapter.ts's identical method.
+     */
+    private withListIdentityMappings(customMapping: FieldMapping[]): FieldMapping[] {
+        const present = new Set(customMapping.map(m => m.agentwebField));
+        const missing = ATTIO_LIST_IDENTITY_MAPPING.filter(m => !present.has(m.agentwebField));
+        return missing.length > 0 ? [...customMapping, ...missing] : customMapping;
+    }
 
     // ─── Auth ──────────────────────────────────────────────────────────────────
 
@@ -50,13 +82,36 @@ export class AttioAdapter implements CrmAdapter {
         const result: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
         const svc = await this.getSvc(auth);
 
+        // Resolve the source list's display name once so leads can be enriched
+        // with listName/listId before mapping. Mirrors hubspotAdapter.ts's
+        // identical resolution — falls back to config.listName, then undefined,
+        // so a failed/absent lookup never aborts the push.
+        let resolvedListName = config.listName;
+        try {
+            const list = await crmDb.getLeadListById(config.listId);
+            if ((list as any)?.name) resolvedListName = (list as any).name;
+        } catch (err: any) {
+            console.warn(`[AttioAdapter] failed to resolve list name for ${config.listId}: ${err?.message}`);
+        }
+
+        // Ensure the system list-identity mappings (listName/listId) are present.
+        // Configs created before this feature shipped don't carry them in their
+        // stored customFieldMapping, so inject them here unless the config
+        // already has an explicit entry for that agentwebField.
+        const effectiveCustomMapping = this.withListIdentityMappings(config.customFieldMapping);
+
         // Load person-level attribute types first.
         // ── 1. Load person-level attribute types ─────────────────────────────────
         const attrCache = await svc.loadAttributeTypes('people');
 
-        const customPersonMappings = config.customFieldMapping.filter(
+        const customPersonMappings = effectiveCustomMapping.filter(
             m => m.enabled && m.direction !== 'pull'
         );
+        // Attio attribute slugs (post-ensure) that carry only list identity — used
+        // to decide whether a lead has any real content worth syncing (see the
+        // hasRealProps guard below). Populated once the ensure loop below resolves
+        // each mapping's final slug.
+        const listIdentitySlugs = new Set<string>();
         const ensuredSlugs = new Set<string>();
         const resolvedSlugs = new Map<string, string>();
         for (const m of customPersonMappings) {
@@ -72,6 +127,9 @@ export class AttioAdapter implements CrmAdapter {
                     ensuredSlugs.add(finalSlug);
                     if (!attrCache.has(`object:people:${finalSlug}`)) {
                         attrCache.set(`object:people:${finalSlug}`, type);
+                    }
+                    if (AttioAdapter.LIST_IDENTITY_FIELDS.has(m.agentwebField)) {
+                        listIdentitySlugs.add(finalSlug);
                     }
                 })
                 .catch((e: any) => {
@@ -138,10 +196,20 @@ export class AttioAdapter implements CrmAdapter {
                     continue;
                 }
 
+                // Enrich with the source lead-list identity so listName/listId
+                // mappings resolve. listId is already on the lead; listName is not,
+                // so we graft the resolved name on (without persisting it back).
+                // Mirrors hubspotAdapter.ts's identical enrichment.
+                const enrichedLead = {
+                    ...lead,
+                    listId: lead.listId ?? config.listId,
+                    listName: lead.listName ?? resolvedListName,
+                };
+
                 // Determine if we need to resolve a company relationship
                 let companyId: string | undefined;
                 const companyMapping = config.contactFieldMapping.find(m => m.enabled && m.direction !== 'pull' && m.crmProperty === 'company');
-                const companyName = companyMapping ? this.getNestedValue(lead, companyMapping.agentwebField) : undefined;
+                const companyName = companyMapping ? this.getNestedValue(enrichedLead, companyMapping.agentwebField) : undefined;
 
                 if (companyName) {
                     const existingCompany = await svc.findCompanyByName(companyName);
@@ -154,9 +222,9 @@ export class AttioAdapter implements CrmAdapter {
                 }
 
                 // Build person values including custom mapped person attributes.
-                const personValues = this.buildPersonValues(lead, config.contactFieldMapping, attrCache, companyId);
+                const personValues = this.buildPersonValues(enrichedLead, config.contactFieldMapping, attrCache, companyId);
                 for (const m of customPersonMappings) {
-                    const value = this.getNestedValue(lead, m.agentwebField) ?? lead.customFields?.[m.agentwebField];
+                    const value = this.getNestedValue(enrichedLead, m.agentwebField) ?? enrichedLead.customFields?.[m.agentwebField];
                     if (value != null && String(value).trim() !== '') {
                         const finalSlug = resolvedSlugs.get(m.crmProperty);
                         if (!finalSlug) continue;
@@ -173,6 +241,14 @@ export class AttioAdapter implements CrmAdapter {
                         personValues[finalSlug] = [this.formatAttioValue(finalValue, type)];
                     }
                 }
+
+                // Skip leads with no real content. List identity is injected onto
+                // every lead, so a lead carrying ONLY list-identity attributes (e.g.
+                // an empty email-less lead) has nothing worth syncing — pushing it
+                // would create a junk Attio Person tagged with just a list. Mirrors
+                // hubspotAdapter.ts's identical hasRealProps guard.
+                const hasRealProps = Object.keys(personValues).some(k => !listIdentitySlugs.has(k));
+                if (!hasRealProps) continue;
 
                 let personId: string | undefined;
                 // Tracks whether this lead was counted as new or updated, so a
