@@ -3401,8 +3401,11 @@ mcpToolRegistry.register({
     // 'inactive' told a currently-paying-and-unblocked Pro customer their
     // subscription was inactive. A paid, non-Free plan with no persisted status
     // means "active but never synced", not "inactive".
+    // `||`, not `??`: auth.ts's own sync trigger (`!user.subscription_status`)
+    // already treats an empty string as missing, so this has to match or a
+    // stray '' would pass through unresolved instead of deriving a real status.
     const subscriptionStatus =
-      me?.subscription_status ??
+      me?.subscription_status ||
       (me?.subscriptionType && me.subscriptionType !== 'Free' ? 'active' : 'inactive');
     return jsonResult({
       email: me?.email ?? null,
