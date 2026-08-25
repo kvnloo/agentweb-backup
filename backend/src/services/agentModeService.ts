@@ -40,7 +40,7 @@ import {
   promptCreatesLogo,
   promptRequestsLogo,
 } from './agentMode/brandLogo';
-import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory } from './agentMode/core/toolDispatch';
+import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
@@ -3299,6 +3299,12 @@ export class AgentModeService {
       // coincidentally-identical request is never mistaken for a duplicate.
       const mediaCallKeysThisRun = seedMediaCallKeysFromHistory(sessionHistory as any, Date.now() - 60 * 60 * 1000);
 
+      // ENG-426: session-wide search-call budget. Seeded from the WHOLE persisted session
+      // history (not time-bounded — a new session already starts this at 0, which is
+      // AgentMode's equivalent of Claude Code's `/clear`) and accumulated across this run's
+      // iterations below, mirroring the media-asset run-total pattern just above.
+      let searchCallCountThisRun = seedSearchCallCountFromHistory(sessionHistory as any);
+
       // ENG-907: whole-turn WALL-CLOCK budget — the analogue of the step budget below.
       // A broad research turn can stay far under `maxIterations` and still burn the whole
       // 10-minute controller cap issuing discovery calls; when the cap fires the run is
@@ -4110,6 +4116,7 @@ export class AgentModeService {
           longestMediaCallMsThisRun,
           priorMediaCallKeys: mediaCallKeysThisRun,
           approvedRevisionImageSources,
+          priorSearchCallCount: searchCallCountThisRun,
           ports: {
             evaluateAgentToolPolicy,
             validateAndRepairToolArgs,
@@ -4149,6 +4156,9 @@ export class AgentModeService {
         // Carry the running per-run media-asset total forward so the next iteration's
         // budget decision knows whether this run has already produced ≥1 asset.
         mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
+        // ENG-426: carry the run-wide search-call count forward so the next iteration's
+        // budget check sees calls made earlier THIS turn, on top of prior-turn history.
+        searchCallCountThisRun += dispatchResult.searchCallsThisIteration;
         // ENG-510: carry the run-wide longest media-call latency forward so the next
         // iteration's adaptive hard-cap reserve uses real observed durations.
         longestMediaCallMsThisRun = Math.max(longestMediaCallMsThisRun, dispatchResult.longestMediaCallMs ?? 0);
