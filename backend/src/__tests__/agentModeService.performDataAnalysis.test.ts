@@ -1007,6 +1007,93 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(result.error).toBe('invalid_argument');
     expect(result.message).toContain('HTTP 400');
   });
+
+  // ─── ENG-1295 hardening: intra-CSV id/name collision, grounding, narrative caveat ─
+
+  test('rejects the result when the generated CSV maps the same id to two different names', async () => {
+    const csv = 'ad_group_id,ad_group_name,impressions\n199836788398,Product Analytics Platform,100\n199836788398,Game Analytics Platform,50';
+
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [
+        { text: 'Breakdown by ad group.' },
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Break down by ad group id and name.', 'user-1');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('internal_inconsistency');
+    expect(result.message).toContain('199836788398');
+    expect(result.message).toContain('Product Analytics Platform');
+    expect(result.message).toContain('Game Analytics Platform');
+  });
+
+  test('does not flag a CSV where each id consistently maps to exactly one name', async () => {
+    const csv = 'ad_group_id,ad_group_name,impressions\n111,Brand Terms,100\n222,Competitor Terms,50';
+
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [
+        { text: 'Breakdown by ad group.' },
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Break down by ad group id and name.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.error).toBeUndefined();
+  });
+
+  test('flags unverified ids in the provenance stub when they cannot be found in the raw source', async () => {
+    mockedAxiosGet.mockResolvedValueOnce({
+      data: Buffer.from(JSON.stringify({ results: [{ id: '111', name: 'Brand Terms' }] })),
+      headers: { 'content-type': 'application/json' }
+    });
+
+    const csv = 'ad_group_id,ad_group_name,impressions\n111,Brand Terms,100\n999,Fabricated Group,50';
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [
+        { text: 'Breakdown by ad group.' },
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis(['https://files.test/data.json'], 'Break down by ad group id and name.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.analysis).toContain('1 of 2 id(s)');
+    expect(result.analysis).toContain('could not be found in the raw source');
+  });
+
+  test('appends an explicit caveat that the narrative prose is unverified when both text and CSV data are present', async () => {
+    const csv = 'ad_group,impressions\nBrand Terms,100';
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [
+        { text: 'Breakdown by ad group.' },
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Break down by ad group.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.analysis).toContain('has not been independently verified');
+  });
+
+  test('does not append the unverified-narrative caveat when there is no narrative text part', async () => {
+    const csv = 'ad_group,impressions\nBrand Terms,100';
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Break down by ad group.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.analysis).not.toContain('has not been independently verified');
+  });
 });
 
 describe('perform_data_analysis in DEFAULT_FOUNDATION_TOOLS', () => {
