@@ -137,13 +137,41 @@ describe('AttioAdapter.pushLeads — deal list sync', () => {
     expect(mockAddPersonToList).not.toHaveBeenCalled();
   });
 
-  it('does not fail a lead whose deal-entry push throws, given its Person record synced fine', async () => {
+  // Live-caught gap: a deal-entry failure used to be swallowed with just a
+  // console.error, leaving the lead reported as a clean success even though
+  // its deal never landed. Now demotes it to an error (mirrors
+  // hubspotAdapter.ts's demote() pattern for its own deal-sync stage).
+  it('demotes a lead to an error when its deal-entry push throws, even though its Person record synced fine', async () => {
     mockAddPersonToList.mockRejectedValue(new Error('list entry rejected'));
 
     const result = await adapter.pushLeads(auth, [makeLead()], makeConfig({ dealFieldMapping: dealMapping }));
 
-    expect(result.successCount).toBe(1);
-    expect(result.errorCount).toBe(0);
+    expect(result.successCount).toBe(0);
+    expect(result.errorCount).toBe(1);
+    expect(result.newCount).toBe(0); // the person-creation increment is rolled back
+    expect(result.errors[0]).toMatch(/deal sync failed/);
+  });
+
+  it('stamps failed sync metadata (not synced) when the deal-entry push throws', async () => {
+    mockAddPersonToList.mockRejectedValue(new Error('list entry rejected'));
+
+    await adapter.pushLeads(auth, [makeLead()], makeConfig({ dealFieldMapping: dealMapping }));
+
+    const failedCall = (crmDb.updateLead as jest.Mock).mock.calls.find(
+      call => call[2]?.syncMetadata?.syncStatus === 'sync_failed'
+    );
+    expect(failedCall).toBeDefined();
+  });
+
+  it('demotes an updated (not new) lead correctly — decrements updatedCount, not newCount', async () => {
+    mockUpsertPersonByValues.mockResolvedValue({ recordId: 'person_1', isNew: false });
+    mockAddPersonToList.mockRejectedValue(new Error('list entry rejected'));
+
+    const result = await adapter.pushLeads(auth, [makeLead()], makeConfig({ dealFieldMapping: dealMapping }));
+
+    expect(result.errorCount).toBe(1);
+    expect(result.newCount).toBe(0);
+    expect(result.updatedCount).toBe(0);
   });
 
   // ─── Idempotency ───────────────────────────────────────────────────────────
