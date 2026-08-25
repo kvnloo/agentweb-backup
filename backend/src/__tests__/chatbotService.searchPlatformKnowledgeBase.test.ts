@@ -77,6 +77,11 @@ function vertexResult(content: string) {
 describe('searchPlatformKnowledgeBase — content length capping', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // clearAllMocks() clears call history but not a mock's queued/default
+    // implementation — without this, the never-resolving implementation set by
+    // the timeout-guard test below would survive as searchMock's default for
+    // every later test, which would then hang on it instead of failing fast.
+    searchMock.mockReset();
   });
 
   it('truncates a public-KB result over 5000 chars with a truncation marker', async () => {
@@ -155,6 +160,11 @@ describe('searchPlatformKnowledgeBase — content length capping', () => {
 describe('searchPlatformKnowledgeBase — ENG-1222 timeout guard', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // clearAllMocks() clears call history but not a mock's queued/default
+    // implementation — without this, the never-resolving implementation set by
+    // the timeout-guard test below would survive as searchMock's default for
+    // every later test, which would then hang on it instead of failing fast.
+    searchMock.mockReset();
   });
 
   afterEach(() => {
