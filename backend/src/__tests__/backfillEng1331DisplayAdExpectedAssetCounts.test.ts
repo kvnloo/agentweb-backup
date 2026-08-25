@@ -107,4 +107,108 @@ describe("backfill-eng1331-display-ad-expected-asset-counts — planExpectedAsse
     const { updatedSteps } = planExpectedAssetCountUpdates(steps);
     expect(updatedSteps.find((s) => s.stepCount === 3)?.expectedAssetCount).toBe(8);
   });
+
+  // CodeRabbit (ENG-1331 follow-up): a plain conditional spread
+  // (`...(target.tools ? {expectedAssetCountTools: target.tools} : {})`) only ever
+  // ADDS the field — it never removes a pre-existing value when the target for that
+  // step has no tools list (step 4). A stale allowlist would then silently survive
+  // every future run of this idempotent script, permanently narrowing step 4's count
+  // to a tool it was never meant to be scoped to instead of falling back to the
+  // intended max-based default.
+  it("clears a stale expectedAssetCountTools when the target for that step has none", () => {
+    const steps = liveSteps.map((s) =>
+      s.stepCount === 4 ? { ...s, expectedAssetCountTools: ["some_stale_tool"] } : s,
+    );
+    const { updatedSteps } = planExpectedAssetCountUpdates(steps);
+    const step4 = updatedSteps.find((s) => s.stepCount === 4);
+    expect(step4?.expectedAssetCount).toBe(1);
+    expect("expectedAssetCountTools" in (step4 as object)).toBe(false);
+  });
+});
+
+describe("backfill-eng1331-display-ad-expected-asset-counts — main() exit code", () => {
+  // CodeRabbit (ENG-1331 follow-up): main() set process.exitCode = 1 on the
+  // candidates.length !== 1 abort path, but the CLI runner called
+  // process.exit(0) unconditionally, which overrides any previously-set
+  // exitCode — so the abort was invisible to anything checking the exit
+  // status, even though it wrote nothing. main() itself doesn't call
+  // process.exit (only the require.main===module runner block does, which
+  // this test doesn't invoke), so this pins the exitCode CONTRACT main() must
+  // uphold for that runner-level fix (`process.exit(process.exitCode ?? 0)`)
+  // to actually work.
+  const workPlanServicePath = "../services/workPlanService";
+
+  beforeEach(() => {
+    // The top of this file statically imports the script (for
+    // planExpectedAssetCountUpdates above), which caches a module instance
+    // wired to the REAL workPlanService. Reset the module registry before
+    // each test's doMock so the dynamic import() below picks up a fresh
+    // instance wired to THIS test's mock instead of the cached real one.
+    jest.resetModules();
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    process.exitCode = undefined;
+  });
+
+  it("sets process.exitCode = 1 when zero matching plans are found", async () => {
+    jest.doMock(workPlanServicePath, () => ({
+      workPlanService: { getPublicPlansForAgentMode: jest.fn().mockResolvedValue([]) },
+    }));
+    const { main } = await import("../scripts/backfill-eng1331-display-ad-expected-asset-counts");
+    jest.spyOn(console, "error").mockImplementation(() => {});
+    jest.spyOn(console, "log").mockImplementation(() => {});
+
+    process.exitCode = undefined;
+    await main();
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("sets process.exitCode = 1 when more than one matching plan is found", async () => {
+    jest.doMock(workPlanServicePath, () => ({
+      workPlanService: {
+        getPublicPlansForAgentMode: jest.fn().mockResolvedValue([
+          { planId: "a", title: "Display Ad Set Production — One Master, Every Size", steps: [] },
+          { planId: "b", title: "Display Ad Set Production — One Master, Every Size", steps: [] },
+        ]),
+      },
+    }));
+    const { main } = await import("../scripts/backfill-eng1331-display-ad-expected-asset-counts");
+    jest.spyOn(console, "error").mockImplementation(() => {});
+    jest.spyOn(console, "log").mockImplementation(() => {});
+
+    process.exitCode = undefined;
+    await main();
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("leaves process.exitCode unset on a normal (non-abort) run", async () => {
+    jest.doMock(workPlanServicePath, () => ({
+      workPlanService: {
+        getPublicPlansForAgentMode: jest.fn().mockResolvedValue([
+          {
+            planId: "a",
+            title: "Display Ad Set Production — One Master, Every Size",
+            steps_rev: "rev-1",
+            steps: [
+              { stepCount: 1, title: "Intake & Master Deconstruction" },
+              { stepCount: 2, title: "Copy Ladder & Token Sheet Approval" },
+              { stepCount: 3, title: "Render the Full Size Matrix" },
+              { stepCount: 4, title: "QA, Contact Sheet & Delivery" },
+              { stepCount: 5, title: "Optional: Variant Run" },
+            ],
+          },
+        ]),
+      },
+    }));
+    const { main } = await import("../scripts/backfill-eng1331-display-ad-expected-asset-counts");
+    jest.spyOn(console, "error").mockImplementation(() => {});
+    jest.spyOn(console, "log").mockImplementation(() => {});
+    jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    process.exitCode = undefined;
+    await main(); // dry run (no --apply in argv) — never touches workPlanService.updateWorkPlan
+    expect(process.exitCode).toBeUndefined();
+  });
 });

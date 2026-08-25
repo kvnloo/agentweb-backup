@@ -148,18 +148,26 @@ export function planExpectedAssetCountUpdates(
       detail: `expectedAssetCount ${step.expectedAssetCount ?? "(unset)"} -> ${target.count}` +
         (target.tools ? `, expectedAssetCountTools ${JSON.stringify(step.expectedAssetCountTools ?? null)} -> ${JSON.stringify(target.tools)}` : ""),
     });
-    return {
-      ...step,
-      expectedAssetCount: target.count,
-      ...(target.tools ? { expectedAssetCountTools: target.tools } : {}),
-    };
+    // CodeRabbit (ENG-1331 follow-up): a plain conditional spread only ever ADDS
+    // expectedAssetCountTools, never removes it — a step with a target that has
+    // no tools (step 4) but a pre-existing/stale expectedAssetCountTools value
+    // would keep that stale value forever instead of falling back to the
+    // intended max-based default. Not triggered by the current live template
+    // (step 4 never had a value), but latent — explicit delete closes it.
+    const updatedStep: PlanStepLike = { ...step, expectedAssetCount: target.count };
+    if (target.tools) {
+      updatedStep.expectedAssetCountTools = target.tools;
+    } else {
+      delete updatedStep.expectedAssetCountTools;
+    }
+    return updatedStep;
   });
   return { updatedSteps, results };
 }
 
 const APPLY = process.argv.includes("--apply");
 
-async function main() {
+export async function main() {
   console.log("ENG-1331 expectedAssetCount backfill", {
     planTitle: PLAN_TITLE,
     mode: APPLY ? "APPLY (will write)" : "DRY RUN (no writes — pass --apply to write)",
@@ -230,7 +238,12 @@ async function main() {
 
 if (require.main === module) {
   main()
-    .then(() => process.exit(0))
+    // CodeRabbit (ENG-1331 follow-up): process.exit(0) unconditionally overrode
+    // the process.exitCode = 1 the candidates.length !== 1 abort path sets, so
+    // this script always reported success even when it aborted and wrote
+    // nothing. Automation checking the exit status (the entire point of a
+    // script instead of a manual API call) could not detect that abort.
+    .then(() => process.exit(process.exitCode ?? 0))
     .catch((err) => {
       console.error("Fatal:", err);
       process.exit(1);
