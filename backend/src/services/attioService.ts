@@ -6,6 +6,25 @@ import { getAccountsByUserId, getAccountById } from './connectedAccountsDb';
 const _created = axios.create?.({ timeout: 15000 });
 const axiosInstance: typeof axios = (_created ?? axios) as typeof axios;
 
+// Retry once on 429 — respect Retry-After header, default 10s. Mirrors
+// hubspotService.ts's identical interceptor.
+if (_created) {
+  _created.interceptors.response.use(
+    (res) => res,
+    async (err) => {
+      const config = err?.config as any;
+      if (err?.response?.status === 429 && config && !config.__attioRetried) {
+        config.__attioRetried = true;
+        const parsed = parseInt(err.response.headers?.['retry-after'] ?? '10', 10);
+        const retryAfter = Math.min(isNaN(parsed) ? 10 : parsed, 60);
+        await new Promise(r => setTimeout(r, retryAfter * 1000));
+        return _created.request(config);
+      }
+      throw err;
+    }
+  );
+}
+
 const ATTIO_API_BASE = 'https://api.attio.com/v2';
 
 export interface AttioPerson {
@@ -526,7 +545,7 @@ export class AttioService {
     const found = existing.find(a => this.toSlug(a.api_slug) === slug);
     if (found) return found.api_slug;
 
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/people/attributes`,
       {
         data: {
@@ -702,7 +721,7 @@ export class AttioService {
   // ─── Generic Records ──────────────────────────────────────────────────────
 
   async createRecord(objectSlug: string, values: Record<string, any>): Promise<string> {
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/${objectSlug}/records`,
       { data: { values } },
       { headers: this.headers() }
@@ -711,7 +730,7 @@ export class AttioService {
   }
 
   async updateRecord(objectSlug: string, recordId: string, values: Record<string, any>): Promise<void> {
-    await axios.patch(
+    await axiosInstance.patch(
       `${this.baseUrl}/objects/${objectSlug}/records/${recordId}`,
       { data: { values } },
       { headers: this.headers() }
@@ -719,7 +738,7 @@ export class AttioService {
   }
 
   async getRecordValues(objectSlug: string, recordId: string): Promise<Record<string, any>> {
-    const res = await axios.get(
+    const res = await axiosInstance.get(
       `${this.baseUrl}/objects/${objectSlug}/records/${recordId}`,
       { headers: this.headers() }
     );
@@ -727,7 +746,7 @@ export class AttioService {
   }
 
   async deleteRecord(objectSlug: string, recordId: string): Promise<void> {
-    await axios.delete(
+    await axiosInstance.delete(
       `${this.baseUrl}/objects/${objectSlug}/records/${recordId}`,
       { headers: this.headers() }
     );
@@ -738,7 +757,7 @@ export class AttioService {
     filter: Record<string, any>,
     limit: number = 50
   ): Promise<any[]> {
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/${objectSlug}/records/query`,
       { filter, limit },
       { headers: this.headers() }
@@ -749,7 +768,7 @@ export class AttioService {
 
 
   async getAllObjectAttributes(objectSlug: string): Promise<Array<{ api_slug: string; title: string; type: string; is_system_attribute: boolean; attribute_id: string }>> {
-    const res = await axios.get(
+    const res = await axiosInstance.get(
       `${this.baseUrl}/objects/${objectSlug}/attributes`,
       { headers: this.headers() }
     );
@@ -774,7 +793,7 @@ export class AttioService {
     const found = existing.find(a => this.toSlug(a.api_slug) === slug);
     if (found) return found.api_slug;
 
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/${objectSlug}/attributes`,
       {
         data: {
@@ -796,7 +815,7 @@ export class AttioService {
   // ─── Attribute Statuses ───────────────────────────────────────────────────
 
   async listAttributeStatuses(objectSlug: string, attributeSlug: string): Promise<Array<{ id: string; title: string }>> {
-    const res = await axios.get(
+    const res = await axiosInstance.get(
       `${this.baseUrl}/objects/${objectSlug}/attributes/${attributeSlug}/statuses`,
       { headers: this.headers() }
     );
@@ -813,7 +832,7 @@ export class AttioService {
     if (found) return found.title;
 
     // Create the status if it doesn't exist
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/${objectSlug}/attributes/${attributeSlug}/statuses`,
       {
         data: {
