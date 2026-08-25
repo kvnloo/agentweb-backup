@@ -729,6 +729,8 @@ export type AccountConfigMutation =
   | ((freshConfig: Record<string, any>) => {
       updates: Record<string, any>;
       unset?: string[];
+      /** Return without writing when the fresh state declines the mutation. */
+      skip?: boolean;
     });
 
 export const updateAccountConfig = async (
@@ -768,9 +770,11 @@ export const updateAccountConfig = async (
     const existingAccount = accounts[accountIndex];
 
     const isDerived = typeof configUpdates === 'function';
-    const { updates, unset } = isDerived
+    const mutation = isDerived
       ? configUpdates(existingAccount.config || {})
       : { updates: configUpdates, unset: options?.unset };
+    if (mutation.skip) return;
+    const { updates, unset } = mutation;
 
     const mergedConfig: Record<string, any> = {
       ...existingAccount.config,

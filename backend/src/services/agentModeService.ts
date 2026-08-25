@@ -32008,8 +32008,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // the account still needs to be the caller's own account) but is deliberately
     // NOT in PACED_WRITE_ACTIONS — it doesn't touch LinkedIn at all, so none of
     // the burst/hourly/daily send-pacing below applies to it.
-    let configuredDailyInviteCap: number | null | undefined;
-    let dailyVolumeState: import('./linkedInWritePacer').DailyVolumeState | null | undefined;
+    let accountOwnerUserId = userId;
     if (PACED_WRITE_ACTIONS.has(action) || action === 'set-daily-invite-cap') {
       const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
       const userAccounts = await getAccountsByUserIdIncludingOrgShared(userId);
@@ -32017,8 +32016,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (!matchedAccount) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
       }
-      configuredDailyInviteCap = (matchedAccount as any)?.config?.daily_invite_cap;
-      dailyVolumeState = (matchedAccount as any)?.config?.daily_volume;
+      // getAccountsByUserIdIncludingOrgShared is typed for display callers, but
+      // delegates to the owner-aware lookup and retains this runtime field. A
+      // shared account must always write its owner's record, never grow a copy
+      // under the acting org member.
+      accountOwnerUserId = (matchedAccount as any).userId || userId;
     }
 
     // For read-only actions (get-profile, search-people, get-company), fall back to
@@ -32122,13 +32124,64 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const paceWrite = async (): Promise<{ refusal: any } | null> => {
       if (!PACED_WRITE_ACTIONS.has(action)) return null;
 
+      const slot = await reserveWriteSlot(account_id);
+      if (!slot.allowed) {
+        console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by write pacer — ${slot.reason}`);
+        return {
+          refusal: {
+            success: false,
+            message: 'LinkedIn write actions are being paced',
+            error: [
+              slot.reason,
+              '',
+              'This is a deliberate safety limit on our side, not a LinkedIn rejection: sending or',
+              'withdrawing too quickly is what causes LinkedIn to revoke the account\'s session, which',
+              'blocks ALL outreach until the account owner manually reconnects.',
+              '',
+              'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
+            ].join('\n'),
+          },
+        };
+      }
+
       // Daily volume ceiling first — a hard stop for the day, cheaper to check
       // than the hourly/burst pacer, and a call over budget for the day should
       // not also spend a pacing gap before being refused. Persisted to the
       // account's own config (not module memory — see linkedInWritePacer.ts's
       // module doc comment on DailyVolumeState) so a backend restart mid-day
       // can't reset an account's daily count to zero.
-      const dailySlot = reserveDailyVolumeSlot(action, configuredDailyInviteCap, dailyVolumeState);
+      let dailySlot: ReturnType<typeof reserveDailyVolumeSlot> | undefined;
+      try {
+        const { updateAccountConfig: persistDailyVolume } = await import('./connectedAccountsDb');
+        await persistDailyVolume(accountOwnerUserId, 'unipile', account_id, (freshConfig) => {
+          dailySlot = reserveDailyVolumeSlot(
+            action,
+            freshConfig.daily_invite_cap,
+            freshConfig.daily_volume,
+          );
+          return dailySlot.allowed
+            ? { updates: { daily_volume: dailySlot.nextState } }
+            : { updates: {}, skip: true };
+        });
+      } catch (error) {
+        console.error(`[AgentMode] linkedinOutreach: unable to securely reserve daily volume for ${account_id}:`, error);
+        return {
+          refusal: {
+            success: false,
+            message: 'LinkedIn daily volume limit unavailable',
+            error: 'The daily safety limit could not be recorded, so this LinkedIn write was not sent. Try again after the account store recovers.',
+          },
+        };
+      }
+      if (!dailySlot) {
+        return {
+          refusal: {
+            success: false,
+            message: 'LinkedIn daily volume limit unavailable',
+            error: 'The daily safety limit could not be evaluated, so this LinkedIn write was not sent.',
+          },
+        };
+      }
       if (!dailySlot.allowed) {
         console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by daily volume cap — ${dailySlot.reason}`);
         return {
@@ -32145,38 +32198,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           },
         };
       }
-      // Persist the reservation optimistically, at grant time — matching the
-      // hourly/burst pacer's own philosophy below, which also records before the
-      // Unipile call rather than after a confirmed success. A plain merge, not a
-      // read-fresh-and-CAS: two genuinely concurrent calls could both read the
-      // same base count and both write the same incremented value (undercounting
-      // by one in a rare burst, never overcounting), which is the same class of
-      // per-process imprecision this file already accepts for the hourly ceiling
-      // — a distributed lock would be cost without a matching risk here either.
-      dailyVolumeState = dailySlot.nextState;
-      const { updateAccountConfig: persistDailyVolume } = await import('./connectedAccountsDb');
-      await persistDailyVolume(userId, 'unipile', account_id, { daily_volume: dailySlot.nextState }).catch((err) =>
-        console.error(`[AgentMode] linkedinOutreach: failed to persist daily volume state for ${account_id}:`, err),
-      );
-
-      const slot = await reserveWriteSlot(account_id);
-      if (slot.allowed) return null;
-      console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by write pacer — ${slot.reason}`);
-      return {
-        refusal: {
-          success: false,
-          message: 'LinkedIn write actions are being paced',
-          error: [
-            slot.reason,
-            '',
-            'This is a deliberate safety limit on our side, not a LinkedIn rejection: sending or',
-            'withdrawing too quickly is what causes LinkedIn to revoke the account\'s session, which',
-            'blocks ALL outreach until the account owner manually reconnects.',
-            '',
-            'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
-          ].join('\n'),
-        },
-      };
+      return null;
     };
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
@@ -32981,7 +33003,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             ? Math.min(parsedCap, absoluteMax)
             : parsedCap;
           const { updateAccountConfig } = await import('./connectedAccountsDb');
-          await updateAccountConfig(userId, 'unipile', account_id, { daily_invite_cap: clampedCap });
+          await updateAccountConfig(accountOwnerUserId, 'unipile', account_id, { daily_invite_cap: clampedCap });
           return {
             success: true,
             data: {

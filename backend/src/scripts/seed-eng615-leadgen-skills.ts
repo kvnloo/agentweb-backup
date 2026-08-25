@@ -298,6 +298,7 @@ export function buildSpeedToLeadSkill(): Skill {
       'The moment a new inbound lead arrives, enrich it, score it against your ICP, route it, and send a personalized first-touch within ~5 minutes — runs unattended with hard volume ceilings and a full completion ledger.',
     toolNames: [
       'manage_scheduled_chat',
+      'linkedin_outreach',
       'analyze_crm_data',
       'enrich_leads_execute',
       'get_hot_leads',
