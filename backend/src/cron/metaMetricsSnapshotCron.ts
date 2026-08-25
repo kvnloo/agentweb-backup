@@ -1,6 +1,11 @@
 import { userDb, crmDb } from "../services/db";
 import { getMetaAccountCredentials } from "../services/metaAccountCredentials";
-import { metaAdsMetricsDb } from "../services/metaAdsMetricsDb";
+import {
+  adsMetricsDb,
+  buildEntityKey,
+  ACCOUNT_DAY_SENTINEL,
+  AdsPlatform,
+} from "../services/adsMetricsDb";
 import { META_GRAPH_TIMEOUT_MS } from "../utils/metaApiFetch";
 
 // ENG-916: Haven only, deliberately. Every.io's Meta CAPI gap (ENG-993) means its
@@ -11,6 +16,15 @@ import { META_GRAPH_TIMEOUT_MS } from "../utils/metaApiFetch";
 const HAVEN_USER_ID = "a3917669-1c7d-45ed-8ef9-f454de109b6f";
 
 const META_API_VERSION = process.env.META_API_VERSION || "v25.0";
+
+/**
+ * This cron is the Meta ADAPTER. The store it writes to is shared with Google Ads and LinkedIn Ads,
+ * but the ingestion deliberately is NOT: the three disagree on units (decimal string vs micros vs
+ * local-currency string), pagination (cursor vs page token vs none at all), retention, and — most
+ * importantly — how long a reported figure keeps moving. Meta settles at 28 days; Google keeps
+ * attributing for up to 90. One cron with one settling window would be wrong for two of the three.
+ */
+const PLATFORM: AdsPlatform = "meta";
 
 // How many days back from "yesterday" to re-pull and overwrite each run.
 //
@@ -117,11 +131,47 @@ export interface ResolvedMetaCredentials {
   accessToken: string;
 }
 
+/**
+ * Per-account facts that must be RECORDED on every row rather than inferred later.
+ * Resolved once per run with a single Graph call, not per day.
+ */
+export interface MetaAccountContext {
+  currency: string;
+  reportingTimezone: string | null;
+}
+
+/**
+ * One Graph read for the two things the insights response does not carry.
+ *
+ * `currency` genuinely varies between accounts of the SAME user (mvarma holds Meta accounts in INR
+ * and USD), and a mis-stated currency is an ~80x silent error, so it is read from Meta rather than
+ * assumed. `timezone_name` is what Meta buckets `date` in — ours are UTC, so without recording it a
+ * cross-platform comparison silently mixes different 24-hour windows.
+ */
+export async function fetchMetaAccountContext(
+  accountId: string,
+  accessToken: string
+): Promise<MetaAccountContext> {
+  const url =
+    `https://graph.facebook.com/${META_API_VERSION}/act_${accountId}` +
+    `?fields=currency,timezone_name&access_token=${accessToken}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(META_GRAPH_TIMEOUT_MS) });
+  const body: any = await res.json();
+  if (!res.ok || body?.error) {
+    throw new Error(`[ENG-916] Meta account context failed: ${body?.error?.message || res.status}`);
+  }
+  return {
+    currency: String(body.currency || ""),
+    reportingTimezone: body.timezone_name ? String(body.timezone_name) : null,
+  };
+}
+
 export async function snapshotMetaMetricsForDate(
   userId: string,
   dateStr: string,
   resolvedCredentials?: ResolvedMetaCredentials,
-  leadsByDate?: Map<string, any[]>
+  leadsByDate?: Map<string, any[]>,
+  accountContext?: MetaAccountContext
 ): Promise<SnapshotResult> {
   // Credentials are resolved ONCE PER RUN by runMetaMetricsSnapshot and passed in, because
   // getMetaAccountCredentials reads the user record and can refresh + PERSIST the Meta token
@@ -148,6 +198,9 @@ export async function snapshotMetaMetricsForDate(
   // iterating accounts here, not just changing HAVEN_USER_ID.
     ({ accountId, accessToken } = await getMetaAccountCredentials(user, userId));
   }
+
+  // Resolved once per run by the caller; the fallback keeps this function usable standalone.
+  const context = accountContext ?? (await fetchMetaAccountContext(accountId, accessToken));
 
   // No campaign filter — this IS the dynamic-discovery step. Meta's level=campaign
   // insights query returns one row per campaign that had any activity in the window,
@@ -216,35 +269,72 @@ export async function snapshotMetaMetricsForDate(
   const capturedAt = new Date().toISOString();
   for (const c of campaignRows) {
     const campaignId = String(c.campaign_id);
-    await metaAdsMetricsDb.putSnapshot({
-      campaignId,
+    await adsMetricsDb.putSnapshot({
+      entityKey: buildEntityKey(PLATFORM, accountId, campaignId),
       date: dateStr,
+      rowType: "campaign",
+      platform: PLATFORM,
+      campaignId,
       accountId,
+      // Meta has no manager-account hierarchy; Google does (login_customer_id) and fills this.
+      parentAccountId: null,
+      currency: context.currency,
+      reportingTimezone: context.reportingTimezone,
+      dataQuality: "exact",
       userId,
       campaignName: c.campaign_name || "",
       spend: parseFloat(c.spend) || 0,
       impressions: parseInt(c.impressions, 10) || 0,
       clicks: parseInt(c.clicks, 10) || 0,
-      ctr: parseFloat(c.ctr) || 0,
-      cpm: parseFloat(c.cpm) || 0,
-      frequency: parseFloat(c.frequency) || 0,
       leadCount: leadCountByCampaign.get(campaignId) || 0,
-      // Account-wide for the date, not per-campaign — the same total is stamped on every
-      // campaign row for this date/user since there's no campaign-less place to persist it.
-      // Previously hardcoded to 0, which made a real lost-attribution count indistinguishable
-      // from a genuine zero (ENG-916 Greptile P1 #3); the value now survives past the cron's
-      // own log line.
-      //
-      // ⚠ CONSUMERS MUST NOT SUM THIS ACROSS CAMPAIGNS. It is one account-wide figure repeated
-      // on each row, so summing N campaign rows reports N x the real number. Read it from any
-      // single row for the date, or take MAX across the date's rows — never SUM. This is the
-      // same shape as the spendDuringAbsence over-count in the tracking monitor, where three
-      // families over five $200 days reported $3,000 against $1,000 actually spent.
-      unattributedLeadCount,
+      // Meta-only rate metrics. Google reports averageCpc instead of cpm and has no frequency at
+      // all; LinkedIn reports neither. They live in the bag rather than as columns because the
+      // three platforms do not agree on them and never will.
+      platformMetrics: {
+        ctr: parseFloat(c.ctr) || 0,
+        cpm: parseFloat(c.cpm) || 0,
+        frequency: parseFloat(c.frequency) || 0,
+      },
       snapshotSource: "daily",
       capturedAt,
     });
   }
+
+  // ⚠ ALWAYS WRITTEN — including when campaignRows is EMPTY. That is the whole point.
+  //
+  // Previously the per-campaign loop above was the only write, so a date on which Meta reported no
+  // campaign activity produced NO ROW AT ALL, and a gap in the series was indistinguishable from
+  // "the cron never ran for this date" (Greptile P1). A row saying campaignsReported: 0 is a
+  // measurement; no row is an absence, and the store exists precisely so a consumer can tell those
+  // apart.
+  //
+  // It also gives unattributedLeadCount a real home. It used to be stamped on EVERY campaign row
+  // because there was no campaign-less place to put it, which meant summing N campaign rows
+  // reported N x the true figure — the same over-count shape as spendDuringAbsence in the tracking
+  // monitor. One row per account per date, so there is nothing left to sum wrongly.
+  await adsMetricsDb.putSnapshot({
+    entityKey: buildEntityKey(PLATFORM, accountId, ACCOUNT_DAY_SENTINEL),
+    date: dateStr,
+    rowType: "account_day",
+    platform: PLATFORM,
+    accountId,
+    parentAccountId: null,
+    userId,
+    currency: context.currency,
+    reportingTimezone: context.reportingTimezone,
+    dataQuality: "exact",
+    campaignId: null,
+    campaignName: "",
+    spend: 0,
+    impressions: 0,
+    clicks: 0,
+    totalLeadCount,
+    unattributedLeadCount,
+    campaignsReported: campaignRows.length,
+    platformMetrics: {},
+    snapshotSource: "daily",
+    capturedAt,
+  });
 
   return {
     success: true,
@@ -265,15 +355,17 @@ export async function runMetaMetricsSnapshot(): Promise<void> {
   // Resolve credentials once for the whole run. If they cannot be resolved, NO day can succeed,
   // so fail fast with one clear line rather than repeating the same error once per day.
   let credentials: ResolvedMetaCredentials;
+  let accountContext: MetaAccountContext;
   try {
     const user = await userDb.getUserById(HAVEN_USER_ID);
     if (!user) {
       throw new Error(`[ENG-916] User ${HAVEN_USER_ID} not found`);
     }
     credentials = await getMetaAccountCredentials(user, HAVEN_USER_ID);
+    accountContext = await fetchMetaAccountContext(credentials.accountId, credentials.accessToken);
   } catch (error) {
     console.error(
-      "[MetaMetricsSnapshotCron] CRITICAL ERROR resolving Meta credentials — no days attempted:",
+      "[MetaMetricsSnapshotCron] CRITICAL ERROR resolving Meta credentials/account context — no days attempted:",
       error
     );
     return;
@@ -299,7 +391,7 @@ export async function runMetaMetricsSnapshot(): Promise<void> {
     const dateStr = toDateStr(target);
 
     try {
-      const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, dateStr, credentials, leadsByDate);
+      const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, dateStr, credentials, leadsByDate, accountContext);
       console.log(
         `[MetaMetricsSnapshotCron] ${dateStr}: wrote ${result.rowsWritten} campaign rows, ` +
           `${result.leadCount} attributed leads, ${result.unattributedLeadCount} unattributed`
