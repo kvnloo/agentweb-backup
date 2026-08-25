@@ -3945,7 +3945,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
     });
 
-    it('should render a cost-based block message when the cost cap is the cause and tokens are unlimited', async () => {
+    it('should render a percentage-only block message when the cost cap is the cause — never the raw dollar spend (ENG-1566)', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
         warning: false,
@@ -3972,9 +3972,47 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       const result = await runScheduledChat(scheduleWithEmails, mockUserId, true);
 
       expect(mockEmailService.sendScheduledChatTokenLimitEmail).toHaveBeenCalled();
-      expect(result.actualResponse).toContain('Monthly cost limit reached');
-      expect(result.actualResponse).toContain('$42.50 / $40.00 spent this month');
+      expect(result.actualResponse).toContain('monthly usage limit');
+      expect(result.actualResponse).toContain('106% used');
+      // ENG-1566: the raw dollar spend/allowance and the "cost" vs "token" dimension
+      // name must never reach the customer — only a percentage of "monthly usage".
+      expect(result.actualResponse).not.toContain('$');
+      expect(result.actualResponse).not.toContain('cost limit');
       expect(result.actualResponse).not.toContain('tokens used');
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('should render a percentage-only block message when the token cap is the cause — never the raw token count (ENG-1566)', async () => {
+      mockedCheckTokenUsage.mockResolvedValueOnce({
+        allowed: false,
+        warning: false,
+        used: 1050000,
+        allowance: 1000000,
+        percentUsed: 105,
+        effectiveAllowance: 1000000,
+        bonus: 0,
+        month: '2026-04',
+        costUsed: 0,
+        costAllowance: null,
+        costPercentUsed: 0,
+        costEnforced: false,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
+      });
+
+      const scheduleWithEmails = {
+        ...baseSchedule,
+        requiredFunctionCalls: [],
+        emailNotifications: ['owner@example.com'],
+      };
+
+      const result = await runScheduledChat(scheduleWithEmails, mockUserId, true);
+
+      expect(result.actualResponse).toContain('monthly usage limit');
+      expect(result.actualResponse).toContain('105% used');
+      expect(result.actualResponse).not.toContain('$');
+      expect(result.actualResponse).not.toContain('token limit');
+      expect(result.actualResponse).not.toContain('1,050,000');
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
     });
 

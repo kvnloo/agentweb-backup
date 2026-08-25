@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
 import { parse as parseCsv } from 'csv-parse/sync';
 import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
@@ -30,9 +31,10 @@ import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
+  getPersistedBrandLogoAssetUrl,
   getPersistedBrandLogoUrlForUser,
   missingBrandLogoToolResult,
   promptCreatesLogo,
@@ -1207,6 +1209,9 @@ function linkedInPublicIdFromUrl(url: string | undefined | null): string | null 
   return match ? match[1] : null;
 }
 
+
+/** Narrow local shape of a stored google_ads config (ENG-1362). */
+type GoogleAdsConfigShape = { customer_id: string; currency?: string; test_account?: boolean };
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
@@ -3387,6 +3392,14 @@ export class AgentModeService {
       // seam. Off restores the exact pre-ENG-1054 behaviour.
       const synthesisResidueGuardEnabled = process.env.AGENT_SYNTHESIS_RESIDUE_GUARD !== 'false';
 
+      // ENG-1331 kill switch — ON by default; set AGENT_FALSE_CLAIM_GUARD=false to
+      // disable just the false-completion-claim correction below. Deliberately its
+      // OWN flag, not AGENT_SYNTHESIS_RESIDUE_GUARD: that guard discards junk-shaped
+      // output (isUnusableSynthesis), an orthogonal check from this one, which
+      // corrects a fluent but numerically false claim. Sharing a flag would mean
+      // standing down one guard silently disables the other.
+      const falseClaimGuardEnabled = process.env.AGENT_FALSE_CLAIM_GUARD !== 'false';
+
       let wasCancelled = false;
       // ENG-244: set true when the loop exits because the step budget (maxIterations)
       // was exhausted. This is the deterministic signal a long data-gathering
@@ -3913,6 +3926,45 @@ export class AgentModeService {
               }
             }
             if (responseMessage) responseMessage.content = content;
+          } else if (synthesisResidueGuardEnabled && !turnHadUsableText && toolCalls.length > 0) {
+            // Same failure family as the residue case above (a synthesis the run could
+            // not produce), just without residue text to detect: the bounded
+            // empty-synthesis nudge (MAX_EMPTY_SYNTHESIS_RETRIES) above already asked
+            // the model once more and it STILL came back with no text in every
+            // iteration of this turn — not junk, just nothing. Left alone this ships a
+            // blank, fully-timestamped assistant message with no explanation (observed
+            // live: an auto-continuation turn that rendered 7 real assets and then said
+            // nothing at all). Reuses the same truthful, tool-call-only recap and the
+            // same kill switch as the residue fallback, since both exist to guarantee a
+            // turn that did real work never reaches the user empty-handed.
+            //
+            // Gated on turnHadUsableText (this iteration's own text), not `content`
+            // (CodeRabbit, this PR): `content` is the sticky cross-turn accumulator —
+            // an earlier iteration's narration alongside its tool calls would leave it
+            // non-empty for the rest of the turn even though the iteration actually
+            // terminating here came back with nothing, silently disarming this fallback
+            // and shipping the stale narration as if it answered the empty turn.
+            console.warn(`AgentMode: Terminating turn stayed empty after ${emptySynthesisRetries} nudge retr${emptySynthesisRetries === 1 ? 'y' : 'ies'} in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
+            content = buildExecutedActionsFallback(toolCalls);
+            if (responseMessage) responseMessage.content = content;
+          }
+
+          // ENG-1331: independent of the residue guard above — this catches a
+          // FLUENT final answer that falsely claims more assets were completed
+          // than the ledger shows (production case: "all 12 sizes have been
+          // rendered, QA'd, and saved" when only 4 screenshots succeeded). It reads
+          // as a normal answer, so `isUnusableSynthesis` never flags it; this checks
+          // the claim's numbers against `toolCalls` instead of the text's shape.
+          if (falseClaimGuardEnabled && content) {
+            const falseClaim = detectFalseCompletionClaim(content, toolCalls);
+            if (falseClaim) {
+              console.warn(
+                `AgentMode: Final synthesis claims ${falseClaim.claimed} completed but the ledger shows only ` +
+                `${falseClaim.actual} succeeded asset-producing call(s) in session ${sessionId} — appending a correction`
+              );
+              content = `${content}\n\n${buildFalseClaimCorrectionFooter(falseClaim, toolCalls)}`;
+              if (responseMessage) responseMessage.content = content;
+            }
           }
 
           if (requireWorkPlanDisposition) {
@@ -5653,7 +5705,17 @@ export class AgentModeService {
     }
   }
 
-  private buildSkillContext(
+  /**
+   * ENG-1222: the single source of truth for "which tools + skill-context text
+   * does a session with these installed skills get". Was private to Agent Mode
+   * until chatbotService.generateChatResponse (the Emma-widget path) started
+   * independently hand-rolling the same policy and drifting from it — a skill
+   * session reached through that path could get tools without the skill's own
+   * systemPrompt, or bypass subscription-tier skill gating entirely. Public so
+   * both pipelines resolve tool access through the same, tested logic; each
+   * still looks up tool *definitions* from its own appropriate registry.
+   */
+  public buildSkillContext(
     associatedSkills: any[],
     userAllowedSkillIds: string[],
     publishedSkills: any[],
@@ -5854,6 +5916,60 @@ export class AgentModeService {
       return base;
     }
 
+    // ENG-1523. Preserve a REFUSED launch for ANY tool, for the same reason the
+    // confirmation gate above is preserved: the per-tool minimizers below drop unknown
+    // fields and everything unrecognised falls through to `return {}`. There is no
+    // `call_google_ads_api` branch, so a RULE 7.5 block arrived at the browser as an
+    // empty object — and a block is a RETURNED value, not a throw, so `toolCall.error`
+    // stays unset and the frontend's status ternary resolves it to 'completed'. The
+    // user was shown a green success tick on a launch the backend had just refused.
+    //
+    // Tool-agnostic on purpose: metaLaunchGate returns this exact shape in five places,
+    // so the same erasure was happening to Meta launch blocks. Keyed on the payload,
+    // not the tool name, so a future gate is covered without another branch here.
+    //
+    // A refusal the operator never sees is indistinguishable from one that never
+    // happened, which is the failure the gate exists to prevent.
+    if (result && result.blocked === true) {
+      return {
+        success: false,
+        blocked: true,
+        reason: result.reason,
+        error: result.error,
+        ...(result.trackingCheck ? { trackingCheck: result.trackingCheck } : {}),
+      };
+    }
+
+    // ENG-1523 / ENG-1358. The launch was PERMITTED, but the page proves only that some
+    // Google tag is present — not that an Ads conversion can be recorded. The gate
+    // already computes this warning and its callers deliberately relay it rather than
+    // swallow it; without this branch the minimizer discards it one layer later, which
+    // is the same outcome by a longer route.
+    //
+    // The identifier has to come with it. Two of the four producers return one —
+    // AD CREATE (`adResourceName`) and ASSET_GROUP CREATE (`assetGroupResourceName`) —
+    // and dropping it would leave the persisted toolCalls ledger describing a resource
+    // that was created without saying which, so neither the UI nor any later
+    // reconciliation could find it. Warning the operator while losing the thing the
+    // warning is ABOUT is its own bug.
+    //
+    // Carried by suffix rather than a fixed list so a future producer is covered, and
+    // restricted to top-level strings so this stays a minimizer: no array or nested
+    // object can ride along on the back of a warning.
+    if (result && typeof result.trackingWarning === 'string' && result.trackingWarning) {
+      const identifiers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(result)) {
+        if (k.endsWith('ResourceName') && typeof v === 'string') identifiers[k] = v;
+      }
+      return {
+        success: result.success !== false,
+        trackingWarning: result.trackingWarning,
+        ...(typeof result.message === 'string' ? { message: result.message } : {}),
+        ...identifiers,
+      };
+    }
+
+
     // ENG-1131: preserve the ENG-975 people-search-outage marker. Both tools that
     // can raise it (`linkedin_outreach` search-people/search-parameters and the
     // `find_leads` top-up loop) fall through to the `{}` default at the bottom of
@@ -5868,6 +5984,17 @@ export class AgentModeService {
     // query has confirmed the outage, so it can never fire on an honest empty.
     if (result && result.searchUnavailable === true) {
       return { searchUnavailable: true, message: 'LinkedIn people search is unavailable for this account' };
+    }
+
+    // ENG-1299 follow-up: same problem as the searchUnavailable marker above —
+    // linkedin_outreach has no branch below, so its stored tool-ledger result is
+    // the `{}` default, which erases the degraded/droppedFacets signal
+    // (searchPeople sets it when a resolver miss falls a facet back to
+    // keyword-only matching). Preserve it so post-hoc reconciliation can tell a
+    // search was filter-degraded, not just look at the live turn where the
+    // agent already sees the full spread result.
+    if (toolName === 'linkedin_outreach' && result?.data?.degraded === true) {
+      return { success: result?.success, degraded: true, droppedFacets: result.data.droppedFacets };
     }
 
     // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
@@ -13396,41 +13523,165 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         return asset;
       };
 
+      // ENG-933 follow-up: this method is the ONE place every brand write
+      // funnels through — Emma's `update_brand_guidelines` chat tool included,
+      // not just the onboarding backstop (ensureBrandLogoPersisted) that only
+      // guards the one-time onboarding flow. Emma has a documented history
+      // (ENG-792, ENG-933) of calling this tool with only brandData.logoUrl
+      // and no brandAssets entry, which leaves `attachments` empty — the
+      // Brand Guidelines "Logo & Assets" card renders `attachments`, so the
+      // account shows "No logos uploaded" even though Emma "found" a logo.
+      // Auto-pin it here so that gap can't reopen through this call
+      // regardless of when or how it's invoked. Best-effort: any failure
+      // here must never break the underlying write (matches the onboarding
+      // backstop's own never-throws contract).
+      let autoLogoAsset: { type: string; url: string; filename: string; key: string } | null = null;
+      // Replaces the CALLER's own logo asset entry with a pinned/rasterised
+      // one when its URL isn't safe to trust as-is (see the third branch
+      // below). Distinct from autoLogoAsset, which is appended fresh when no
+      // asset was supplied at all.
+      let callerLogoAssetOverride: { type: string; url: string; filename: string; key: string } | null = null;
+      // Surfaced (not swallowed) when the fetch/rasterise attempt didn't land
+      // an asset — see the failure branch below for why this must not read
+      // as silent success.
+      let logoAutoPinIssue: string | null = null;
+      const incomingLogoUrl =
+        typeof (brandData as any)?.logoUrl === 'string' ? (brandData as any).logoUrl.trim() : '';
+      const normalizedBrandAssets: any[] = Array.isArray(brandAssets)
+        ? brandAssets
+        : brandAssets !== undefined && typeof brandAssets === 'object' && brandAssets !== null
+          ? [brandAssets]
+          : [];
+      const callerLogoAsset = normalizedBrandAssets.find((a: any) => a?.type === 'logo');
+      const callerSuppliedLogoAsset = !!callerLogoAsset;
+      const existingLogoAssetUrl = getPersistedBrandLogoAssetUrl({
+        attachments: existingBrand.attachments,
+      });
+      const alreadyHasLogoAsset = !!existingLogoAssetUrl;
+      if (incomingLogoUrl && !callerSuppliedLogoAsset && !alreadyHasLogoAsset) {
+        try {
+          const outcome = await downloadBrandLogoToS3(incomingLogoUrl, userId);
+          if (outcome.status === 'svg') {
+            // brandData.logoUrl keeps the raw incoming URL, exactly like this
+            // call behaved before this change — never worse than today. But
+            // the write must not silently report full success while no asset
+            // actually landed; the caller (Emma) needs to know so she can
+            // tell the user or retry, instead of believing the Logo & Assets
+            // card is populated when it isn't.
+            logoAutoPinIssue =
+              'The logo URL is an SVG that could not be rasterised — it was not stored as a Logo & Assets attachment. Ask the user to upload a PNG/JPEG/GIF/WEBP version instead.';
+          } else if (outcome.status !== 'uploaded') {
+            const detailSuffix = outcome.detail ? `: ${outcome.detail}` : '';
+            logoAutoPinIssue =
+              `Could not fetch/store the logo from that URL (${outcome.status}${detailSuffix}) — brandData.logoUrl was saved, but no Logo & Assets attachment was created. Retrying later (or asking the user to upload the logo directly) may be needed.`;
+          } else if (outcome.url) {
+            const filename = outcome.url.split('/').filter(Boolean).pop() || 'logo.png';
+            autoLogoAsset = {
+              type: 'logo',
+              url: outcome.url,
+              filename,
+              key: `auto-logo-${Date.now()}`,
+            };
+            // Point brandData.logoUrl at the pinned S3 copy too — never
+            // something an external host can take down or an image model
+            // invents later (ENG-326/ENG-933).
+            updatedBrandData.logoUrl = outcome.url;
+          }
+        } catch (e: any) {
+          console.warn('[brandLogo] auto-pin on update_brand_guidelines failed', {
+            userId,
+            error: e?.message ?? String(e),
+          });
+          logoAutoPinIssue =
+            'Could not fetch/store the logo from that URL (unexpected error) — brandData.logoUrl was saved, but no Logo & Assets attachment was created.';
+        }
+      } else if (incomingLogoUrl && !callerSuppliedLogoAsset && alreadyHasLogoAsset) {
+        // A real asset already exists and this call isn't replacing it (no
+        // fresh brandAssets entry) — keep brandData.logoUrl in sync with what
+        // is ACTUALLY displayed rather than letting it drift to whatever raw
+        // URL this call happens to carry (e.g. Emma re-sending the original
+        // scraped URL after the asset was already pinned on an earlier call).
+        // Without this, the Logo & Assets card would keep showing the correct
+        // pinned logo while brandData.logoUrl silently pointed somewhere else.
+        updatedBrandData.logoUrl = existingLogoAssetUrl;
+      } else if (
+        callerSuppliedLogoAsset &&
+        typeof callerLogoAsset?.url === 'string' &&
+        callerLogoAsset.url.trim()
+      ) {
+        // ENG-933 live-verification finding: Emma's `update_brand_guidelines`
+        // tool lets her supply brandAssets directly, and when explicitly
+        // asked to save a logo she constructs her OWN asset object from
+        // whatever URL she has — bypassing the auto-pin above entirely
+        // (which only fires when brandAssets is absent) and storing the raw
+        // site URL (e.g. a .ico) unrasterised and unpinned. Never trust a
+        // caller-supplied logo URL blindly: run it through the same
+        // rasterise/pin pipeline unless it's already one of our own S3
+        // assets (the onboarding backstop's own call already looks like
+        // this, and re-fetching it would be pure waste).
+        const rawCallerLogoUrl = callerLogoAsset.url.trim();
+        try {
+          const { isS3Url } = await import('../utils/s3Utils');
+          if (!isS3Url(rawCallerLogoUrl)) {
+            const outcome = await downloadBrandLogoToS3(rawCallerLogoUrl, userId);
+            if (outcome.status === 'svg') {
+              logoAutoPinIssue =
+                'The provided logo asset URL is an SVG that could not be rasterised — it was stored as provided, which brand guidelines normally rejects. Ask the user to upload a PNG/JPEG/GIF/WEBP version instead.';
+            } else if (outcome.status !== 'uploaded') {
+              const detailSuffix = outcome.detail ? `: ${outcome.detail}` : '';
+              logoAutoPinIssue =
+                `Could not pin the provided logo asset URL (${outcome.status}${detailSuffix}) — it was stored as provided, which may not render reliably in every browser and isn't hosted on our own storage.`;
+            } else if (outcome.url) {
+              const filename = outcome.url.split('/').filter(Boolean).pop() || 'logo.png';
+              callerLogoAssetOverride = {
+                type: 'logo',
+                url: outcome.url,
+                filename,
+                // Preserve the caller's own key if it supplied one (keeps a
+                // stable React list key / delete-asset target), else mint a
+                // fresh one matching the auto-pin's own convention.
+                key:
+                  typeof callerLogoAsset.key === 'string' && callerLogoAsset.key
+                    ? callerLogoAsset.key
+                    : `auto-logo-${Date.now()}`,
+              };
+              updatedBrandData.logoUrl = outcome.url;
+            }
+          }
+        } catch (e: any) {
+          console.warn('[brandLogo] pinning a caller-supplied logo asset failed', {
+            userId,
+            error: e?.message ?? String(e),
+          });
+          logoAutoPinIssue =
+            'Could not pin the provided logo asset URL (unexpected error) — it was stored as provided.';
+        }
+      }
+
       // Handle brandAssets update - merge by type to preserve existing assets
       let updatedAttachments = [...(existingBrand.attachments || [])];
       const updatedAssets: any[] = []; // Track which assets were actually updated
 
-      if (brandAssets !== undefined) {
-        if (Array.isArray(brandAssets)) {
-          // Merge by type: replace assets of the same type, keep others
-          brandAssets.forEach(rawAsset => {
-            const newAsset = normalizeBrandGuideAsset(rawAsset);
-            const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
-            if (existingIndex >= 0) {
-              // Replace existing asset of the same type
-              updatedAttachments[existingIndex] = newAsset;
-              updatedAssets.push(newAsset); // Track as updated
-            } else {
-              // Add new asset type
-              updatedAttachments.push(newAsset);
-              updatedAssets.push(newAsset); // Track as added
-            }
-          });
-        } else if (typeof brandAssets === 'object' && brandAssets !== null) {
-          // Single asset - merge by type
-          const newAsset = normalizeBrandGuideAsset(brandAssets);
-          const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
-          if (existingIndex >= 0) {
-            // Replace existing asset of the same type
-            updatedAttachments[existingIndex] = newAsset;
-            updatedAssets.push(newAsset); // Track as updated
-          } else {
-            // Add new asset type
-            updatedAttachments.push(newAsset);
-            updatedAssets.push(newAsset); // Track as added
-          }
-        }
+      const assetsToMerge: any[] = normalizedBrandAssets.map((a: any) =>
+        callerLogoAssetOverride && a?.type === 'logo' ? callerLogoAssetOverride : a
+      );
+      if (autoLogoAsset) {
+        assetsToMerge.push(autoLogoAsset);
       }
+
+      assetsToMerge.forEach(rawAsset => {
+        const newAsset = normalizeBrandGuideAsset(rawAsset);
+        const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
+        if (existingIndex >= 0) {
+          // Replace existing asset of the same type
+          updatedAttachments[existingIndex] = newAsset;
+          updatedAssets.push(newAsset); // Track as updated
+        } else {
+          // Add new asset type
+          updatedAttachments.push(newAsset);
+          updatedAssets.push(newAsset); // Track as added
+        }
+      });
 
       // Update org-level or personal brand guidelines
       const updatedGuidelines = {
@@ -13465,7 +13716,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
 
       const updatedFields = [];
       if (brandData) updatedFields.push(...Object.keys(brandData));
-      if (brandAssets !== undefined) updatedFields.push('brandAssets');
+      if (assetsToMerge.length > 0) updatedFields.push('brandAssets');
       updatedFields.push(...Object.keys(otherFields));
 
       // Format the update result for LLM consumption
@@ -13475,7 +13726,8 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         updatedFields,
         brandData: updatedBrandData,
         attachments: updatedAttachments,
-        updatedAssets: updatedAssets
+        updatedAssets: updatedAssets,
+        ...(logoAutoPinIssue ? { logoAutoPinIssue } : {}),
       });
 
       return {
@@ -13497,6 +13749,11 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
             }
           }
           : {}),
+        // ENG-933 follow-up: the write always succeeds even when the logo
+        // fetch/rasterise attempt didn't land an asset — this field is how
+        // that partial outcome reaches Emma instead of reading as full
+        // success while the Logo & Assets card stays empty.
+        ...(logoAutoPinIssue ? { logoAutoPinIssue } : {}),
         formattedContent
       };
     } catch (error) {
@@ -21100,6 +21357,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               q: `(${parentClauses}) and fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
               fields: 'files(id, name, mimeType, parents)',
               pageSize: limitedMaxResults,
+              supportsAllDrives: true,
+              includeItemsFromAllDrives: true,
             });
 
             const driveFiles = driveResponse.data.files || [];
@@ -21555,6 +21814,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 fields: 'files(id, name, mimeType, size, modifiedTime)',
                 orderBy: 'modifiedTime desc',
                 pageSize: Math.min(driveOffset + driveLimit, 1000),
+                supportsAllDrives: true,
+                includeItemsFromAllDrives: true,
               });
 
               const allFiles = (response.data.files || []).map((f) => ({
@@ -21907,7 +22168,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       content = Buffer.from(res.data);
     } else {
       // Binary files — download directly
-      const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
+      const res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'arraybuffer' });
       content = Buffer.from(res.data);
     }
 
@@ -22130,6 +22391,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         q: `'${folderId}' in parents and name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
         fields: 'files(id, name, mimeType, size, modifiedTime)',
         pageSize: 1,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
       });
 
       const files = listResponse.data.files || [];
@@ -22366,7 +22629,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     const readWithDrive = async (driveClient: any) => {
-      const meta = await driveClient.files.get({ fileId, fields: 'id,name,mimeType,modifiedTime' });
+      const meta = await driveClient.files.get({ fileId, fields: 'id,name,mimeType,modifiedTime', supportsAllDrives: true });
       const { name, mimeType, modifiedTime } = meta.data;
       const isGoogleNative =
         mimeType === 'application/vnd.google-apps.document' ||
@@ -22464,6 +22727,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         fields: 'files(id,name,mimeType,modifiedTime,webViewLink),nextPageToken',
         orderBy: 'name',
         pageSize: 100,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
       });
 
       const files = resp.data.files || [];
@@ -22546,6 +22811,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         fields: 'files(id,name,mimeType,webViewLink,parents)',
         orderBy: 'modifiedTime desc',
         pageSize: 20,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
       });
 
       const files = resp.data.files || [];
@@ -24124,6 +24391,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           }
         }
       });
+    }
+
+    if (updateResult.logoAutoPinIssue) {
+      formattedSummary += `<br><strong>⚠️ Logo not stored as an asset:</strong> ${updateResult.logoAutoPinIssue}<br>`;
     }
 
     formattedSummary += `<br><em>💡 You can view the latest brand guidelines at the <a href="/brand-guidelines">Brand Guidelines page</a>.</em>`;
@@ -29119,7 +29390,7 @@ ${strippedHtml}`;
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number }>, sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -29144,7 +29415,8 @@ ${strippedHtml}`;
           notes: undefined,
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds,
-          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount })
+          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
+          ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools })
         })),
         autocomplete: autocomplete || false,
         createdAt: new Date().toISOString(),
@@ -29239,6 +29511,7 @@ ${strippedHtml}`;
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds,
           ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
+          ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
         autocomplete: predefinedPlan.autocomplete || false,
@@ -29431,7 +29704,7 @@ ${strippedHtml}`;
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -29467,8 +29740,10 @@ ${strippedHtml}`;
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
             // Allow scope changes: an explicit expectedAssetCount overrides (including 0
             // to clear the asset gate when the user approves a smaller set); omitting it
-            // preserves the existing value.
-            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount
+            // preserves the existing value. Same override-or-preserve semantics for
+            // expectedAssetCountTools (ENG-1331).
+            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount,
+            expectedAssetCountTools: newStep.expectedAssetCountTools !== undefined ? newStep.expectedAssetCountTools : workPlan.steps[existingIndex].expectedAssetCountTools
           };
         } else {
           // Add new step (stepCount will be fixed by updateSessionWorkPlan)
@@ -29482,7 +29757,8 @@ ${strippedHtml}`;
             notes: undefined,
             requiredFunctionCalls: newStep.requiredFunctionCalls,
             skillIds: newStep.skillIds,
-            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount })
+            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount }),
+            ...(newStep.expectedAssetCountTools !== undefined && { expectedAssetCountTools: newStep.expectedAssetCountTools })
           });
         }
       }
@@ -29694,7 +29970,27 @@ ${strippedHtml}`;
               if (live?.resolvedAt) { sinceIso = live.resolvedAt; break; }
             }
           }
-          const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length;
+          // ENG-1331: extractGeneratedImageFilenames only recognizes generate_image's
+          // own marker, so a step whose deliverable is Playwright-rendered
+          // screenshots (no generate_image call at all) would always read 0 there.
+          // extractProducedAssetCount reads the same persisted toolCalls ledger for
+          // every known asset-producing tool.
+          //
+          // When the step names its own expectedAssetCountTools, trust that
+          // explicitly and skip the max-with-legacy-signal blend below: the whole
+          // point of naming the tool(s) is precision, and blending in
+          // extractGeneratedImageFilenames' generate_image count would reopen the
+          // exact ambiguity the author resolved by naming their tool(s) at all (e.g.
+          // an unrelated generate_image call elsewhere in the step inflating a
+          // screenshot-only count). Without a declared list, take the max of both
+          // signals so neither detection path can pull the count DOWN relative to
+          // the other — the safe default for a step that hasn't disambiguated.
+          const producedAssetCount = step.expectedAssetCountTools?.length
+            ? extractProducedAssetCount(session.messages, sinceIso, step.expectedAssetCountTools)
+            : Math.max(
+                AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
+                extractProducedAssetCount(session.messages, sinceIso),
+              );
           if (producedAssetCount < step.expectedAssetCount) {
             insufficientAssets.push({
               stepCount: update.stepCount,
@@ -30803,6 +31099,42 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     return describeMetaAdsCapability(acc);
   }
 
+  /**
+   * ENG-1362. What an agent needs to know before choosing a Google Ads account to act on.
+   *
+   * `is_active` and `account_name` were the whole of it, which meant the only signal for
+   * "is this safe to experiment in" was the NAME — and a name guarantees nothing. There is
+   * a real, billable, ENABLED account on this platform whose descriptive name is literally
+   * "Test". An agent asked to "use the test account" would pick it on the strength of that
+   * string and spend real money.
+   *
+   * Google's own mechanism is `customer.test_account`: when true, the account CANNOT serve
+   * ads and CANNOT spend. That is the fact worth surfacing, so it is surfaced.
+   *
+   * `can_spend` is derived here rather than left to each caller, and derived so that only
+   * an affirmative `test_account: true` clears it. `false` and unknown both mean real
+   * money. Making every consumer re-derive that is how "we never recorded it" quietly
+   * becomes "it's fine".
+   */
+  private async describeGoogleAdsAccount(
+    userId: string,
+    config: GoogleAdsConfigShape,
+  ): Promise<Record<string, unknown>> {
+    const customerId = config.customer_id;
+    // Recorded at connect time for anything connected since ENG-1362; resolved live (and
+    // process-cached) for older records, so the answer is never simply missing.
+    const testAccount = typeof config.test_account === 'boolean'
+      ? config.test_account
+      : await googleAdsService.isTestAccount(userId, customerId);
+    return {
+      customer_id: customerId,
+      currency: config.currency || 'USD',
+      // Same single rule the connected-accounts route uses. Two copies of "does true mean
+      // safe" is how one of them eventually stops meaning it.
+      ...describeGoogleAdsSpendRisk({ test_account: testAccount }),
+    };
+  }
+
   async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
     try {
       const { getAccountsByUserIdIncludingOrgShared, isTokenValid } = await import('./connectedAccountsDb');
@@ -30864,10 +31196,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             ? unipileStatusMap.get(acc.account_id) === 'OK'
             : await isTokenValid(acc),
           ...(acc.platform === 'google_ads' && (acc.config as { customer_id?: string })?.customer_id
-            ? {
-                customer_id: (acc.config as { customer_id: string }).customer_id,
-                currency: (acc.config as { currency?: string }).currency || 'USD',
-              }
+            ? await this.describeGoogleAdsAccount(userId, acc.config as GoogleAdsConfigShape)
             : {}),
           // A Meta ad account can be connected and unexpired yet unable to read ads
           // data because the owner never granted ads_read/ads_management. Without
@@ -33961,6 +34290,134 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * to a PAUSED/DRAFT campaign are not gated here; they are re-checked when that
    * campaign is later enabled/resumed.
    */
+  /**
+   * ENG-1527. Resolve the parent campaign's status and run the creative-addition gate,
+   * failing CLOSED when the answer cannot be established.
+   *
+   * Both call sites used to swallow every failure and proceed, on this rationale:
+   *
+   *   "defence-in-depth (the RESUME / UPDATE→ENABLED gate is the hard guarantee), so a
+   *    transient parent-status lookup failure must NOT break an otherwise-valid create"
+   *
+   * That is exactly backwards for the case this gate exists to cover. The gate only ever
+   * matters when the parent is ALREADY ENABLED — and an already-enabled campaign has no
+   * future RESUME or UPDATE→ENABLED for the "hard guarantee" to fire on. The creative IS
+   * the launch, it serves paid traffic the moment it is created, and this gate is the only
+   * thing standing in front of it. Calling it defence-in-depth described a second layer
+   * that, in this specific situation, does not exist.
+   *
+   * Three ways the old code proceeded without ever checking anything, all silent:
+   *   - the parent lookup threw;
+   *   - the parent lookup returned nothing, so the gate call was skipped entirely;
+   *   - the gate itself threw while fetching the landing page.
+   *
+   * Now: a status we could not determine is treated as possibly-ENABLED and refused. A
+   * status we DID determine to be anything other than ENABLED still proceeds untouched —
+   * there is no launch to guard, so a flaky lookup must not block ordinary staging work.
+   * An approved override still wins, because it is a user's disclosed decision to accept
+   * exactly this risk, and it keeps the refusal from being a dead end.
+   */
+  private async guardCreativeAddition(opts: {
+    customerId: string;
+    action: string;
+    override: boolean;
+    sessionId?: string;
+    finalUrls: Array<string | undefined>;
+    resolveParent: () => Promise<{ campaignResourceName: string; campaignStatus: string | null } | null>;
+  }): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
+    /**
+     * `overridable` is FALSE for every parent-status failure, and that is deliberate.
+     *
+     * The approval the user actually saw says: "this launch will SKIP the tracking
+     * pre-flight check. Paid delivery may start at a destination that cannot report
+     * conversions." It discloses one risk — an unverified destination. It says nothing
+     * about "we could not establish whether this campaign is even live", which is a
+     * different and undisclosed risk. ENG-941 already settled this principle for Meta:
+     * an override the user was not told about is not user-granted, whatever else it was
+     * attached to. So the override only spends against the risk it named.
+     *
+     * That leaves no override path for an unresolved status, which is correct: a lookup
+     * failure is either transient (retry) or a wrong resource name (fix it). Neither is
+     * something to wave through.
+     */
+    const refuse = async (
+      why: string,
+      campaignResourceName: string,
+      opts2: { overridable: boolean; advice: string },
+      err?: unknown,
+    ) => {
+      const urls = opts.finalUrls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
+      // Same per-URL detail in the response as in the run record. Recording richer data
+      // than we return means the caller is told less than we know, and the run record was
+      // the only place this detail survived.
+      const urlResults = urls.map(url => ({ url, status: 'unknown', mechanisms: [] as string[], error: why }));
+
+      if (opts2.overridable && opts.override) {
+        // Recorded, not just logged. The non-override path writes a run record, so leaving
+        // this one to a console line would put a hole in the audit trail at exactly the
+        // point where a human made a deliberate decision.
+        await chatbotDb.recordGoogleAdsMeasurementCheck(opts.sessionId || '', {
+          customerId: opts.customerId, campaignResourceName, action: opts.action,
+          outcome: 'overridden', urlResults, checkedAt: new Date().toISOString(),
+        });
+        console.error(`[ENG-1527] ${opts.action} creative-addition gate unresolved (${why}); proceeding on an approved override:`, err);
+        return { proceed: true };
+      }
+
+      console.error(`[ENG-1527] ${opts.action} creative-addition gate unresolved (${why}); refusing:`, err);
+      await chatbotDb.recordGoogleAdsMeasurementCheck(opts.sessionId || '', {
+        customerId: opts.customerId, campaignResourceName, action: opts.action,
+        outcome: 'blocked', urlResults, checkedAt: new Date().toISOString(),
+      });
+      return {
+        proceed: false,
+        blockResult: {
+          success: false,
+          blocked: true,
+          reason: 'tracking_preflight_unresolved',
+          error: `Cannot confirm this creative is safe to add: ${why}. If the parent campaign is already ENABLED the creative starts serving paid traffic immediately, so refusing is the safe answer rather than adding it unchecked. ${opts2.advice} Nothing was created.`,
+          trackingCheck: { measured: false, urlResults },
+        },
+      };
+    };
+
+    let parent: { campaignResourceName: string; campaignStatus: string | null } | null;
+    try {
+      parent = await opts.resolveParent();
+    } catch (err) {
+      return refuse(
+        'the parent campaign\'s status could not be read from Google Ads', '',
+        { overridable: false, advice: 'Retry — a read failure here is usually transient.' }, err,
+      );
+    }
+    if (!parent || !parent.campaignStatus) {
+      // Deliberately NOT described as transient: the usual cause is a stale or wrong
+      // ad_group_resource_name, and telling the agent to retry a permanent failure just
+      // buys a retry loop.
+      return refuse(
+        'the parent campaign was not found, or returned no status',
+        parent?.campaignResourceName || '',
+        { overridable: false, advice: 'Check the resource name is current — a campaign that does not resolve will not resolve on a retry either.' },
+      );
+    }
+    // Not a launch: nothing to guard, so a gate failure here cannot cost anything.
+    if (parent.campaignStatus !== 'ENABLED') return { proceed: true };
+
+    try {
+      return await this.enforceGoogleAdsCreativeAdditionGate(
+        opts.customerId, parent.campaignResourceName, parent.campaignStatus,
+        opts.action, opts.override, opts.sessionId, opts.finalUrls,
+      );
+    } catch (err) {
+      // The ONE overridable case: this is the tracking pre-flight failing to run, which is
+      // exactly the risk the override's confirmation text discloses.
+      return refuse(
+        'the landing page tracking check could not be completed', parent.campaignResourceName,
+        { overridable: true, advice: 'Retry — a landing-page fetch failure is usually transient.' }, err,
+      );
+    }
+  }
+
   private async enforceGoogleAdsCreativeAdditionGate(
     customerId: string,
     campaignResourceName: string,
@@ -34041,7 +34498,66 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }, opts?: { sessionId?: string }): Promise<any> {
     try {
       const { customer_id, entity_type, action } = args;
-      const overrideTrackingCheck = args.override_tracking_check === true;
+      /*
+       * ENG-1526. The override is bound to a disclosed approval, exactly as Meta's is.
+       *
+       * This used to be `args.override_tracking_check === true` and nothing else: the model
+       * could set it on its own, and the only thing standing against that was a sentence in
+       * the tool description ("Never set it on your own"). ENG-941 wrote the threat model
+       * down for the Meta path and dismissed precisely that defence — "an override the model
+       * can introduce after approval is not user-granted, whatever the tool description
+       * says" — then hardened Meta and left Google on the sentence.
+       *
+       * Reusing ENG-941's helpers rather than writing a second mechanism: HMAC over the
+       * exact call, keyed with a server-only secret so the caller cannot mint one, and
+       * key-order-independent so a re-emitted argument object still matches.
+       * `stableStringify` excludes the gate-only flags, so the replay carrying the token
+       * digests identically to the preview that issued it.
+       *
+       * A claimed-but-unapproved override does not fail — it HALTS and discloses, then
+       * issues the matching token. The path is a loop, not a dead end. A call that waives
+       * nothing is untouched: no token is ever required.
+       *
+       * Deliberately narrower than Meta's gate: this halts only when an override is
+       * claimed. Google Ads writes still have no general confirmation step — that is a
+       * bigger change and its own ticket (ENG-1527), and conflating the two would put an
+       * unrelated behaviour change inside a security fix.
+       */
+      const overrideClaimed = args.override_tracking_check === true;
+      const overrideDigest = overrideClaimed
+        ? computeTrackingOverrideDigest(getJwtSecret(), { customer_id, entity_type, action, args })
+        : '';
+      const overrideApproved =
+        overrideClaimed && trackingOverrideTokenMatches(args.tracking_override_token, overrideDigest);
+
+      if (overrideClaimed && !overrideApproved) {
+        const target = [entity_type, action, customer_id].filter(Boolean).join(' ');
+        return {
+          success: true,
+          requiresConfirmation: true,
+          awaitingUserConfirmation: true,
+          summary: `Waive the tracking pre-flight check for ${target}`,
+          confirmationPrompt:
+            `This Google Ads call would WAIVE the pre-flight tracking check.\n\n` +
+            `That check is what stops a campaign spending on pages that cannot report a ` +
+            `conversion. Waiving it means accepting that this launch may be unmeasurable — ` +
+            `you would be paying for traffic you cannot evaluate.\n\n` +
+            `Target: ${target}\n\n` +
+            `Reply "yes" / "confirm" to waive the check and proceed, or tell me to fix the ` +
+            `tracking first.`,
+          confirmationDetail: `Waive the tracking pre-flight check for ${target}`,
+          message:
+            `This call sets override_tracking_check, which waives the deterministic ` +
+            `pre-flight measurement check for ${target}. Show the user the warning above and ` +
+            `get explicit approval. Once approved, call call_google_ads_api again with the ` +
+            `same arguments PLUS tracking_override_token exactly as returned here — without ` +
+            `it the override will not apply and the gate will run normally.`,
+          // Only issued when an override was actually described in this halt, so it can
+          // only ever approve a waiver the user was shown.
+          tracking_override_token: overrideDigest,
+        } as any;
+      }
+      const overrideTrackingCheck = overrideApproved;
 
       if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
         const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
@@ -34362,6 +34878,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             campaignResourceName: args.campaign_resource_name,
             type: args.type,
             cpcBidMicros: args.cpc_bid_micros,
+            // ENG-1514. ENG-1293 taught createAdGroup to accept a status; this call
+            // site never sent one, so `params.status ?? 'ENABLED'` fired and an
+            // explicit PAUSED was dropped behind a success response. Defaulting to
+            // PAUSED (not ENABLED) matches CAMPAIGN CREATE above and RULE 11.
+            status: args.status || 'PAUSED',
           });
           return { success: true, adGroupResourceName: adGroup.resourceName };
         }
@@ -34393,7 +34914,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'ADD') {
           if (!args.ad_group_resource_name || !args.keywords) return { success: false, error: 'ad_group_resource_name and keywords array are required' };
-          await googleAdsService.addKeywords(userId, customer_id, args.ad_group_resource_name, args.keywords);
+          // ENG-1527: forward the caller's status. Same shape as the CAMPAIGN/AD_GROUP/AD
+          // creates — the argument the schema advertises has to reach the service.
+          await googleAdsService.addKeywords(userId, customer_id, args.ad_group_resource_name, args.keywords, args.status || 'PAUSED');
           return { success: true, message: `Added ${args.keywords.length} keyword(s)` };
         }
         if (action === 'ADD_NEGATIVE') {
@@ -34440,23 +34963,21 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           }
           // ENG-335: an ad added to an already-live campaign serves paid traffic
           // instantly — gate its final_url like a launch when the parent is ENABLED.
-          // Fail-open on a lookup/gate error: this is defence-in-depth (the RESUME /
-          // UPDATE→ENABLED gate is the hard guarantee), so a transient parent-status
-          // lookup failure must NOT break an otherwise-valid ad creation.
           // ENG-1358: adding a creative to an already-ENABLED campaign is a launch too. The
           // gate already computes the warning; relaying it here is what stops it being
           // computed and discarded — the exact failure this ticket's own comment names.
-          let creativeTrackingWarning: string | undefined;
-          try {
-            const parent = await googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name);
-            if (parent) {
-              const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, parent.campaignResourceName, parent.campaignStatus, 'AD_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
-              if (!gate.proceed) return gate.blockResult;
-              creativeTrackingWarning = gate.warning;
-            }
-          } catch (gateErr) {
-            console.error('[ENG-335] AD_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
-          }
+          // ENG-1527: fails CLOSED when the parent's status cannot be established — see
+          // guardCreativeAddition for why "the RESUME gate still guards it" was inverted.
+          const adGate = await this.guardCreativeAddition({
+            customerId: customer_id,
+            action: 'AD_CREATE',
+            override: overrideTrackingCheck,
+            sessionId: opts?.sessionId,
+            finalUrls: [args.final_url],
+            resolveParent: () => googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name),
+          });
+          if (!adGate.proceed) return adGate.blockResult;
+          const creativeTrackingWarning = adGate.warning;
           let adType = args.type as string;
           if (adType === 'SEARCH') adType = 'RESPONSIVE_SEARCH_AD';
           else if (adType === 'DISPLAY') adType = 'RESPONSIVE_DISPLAY_AD';
@@ -34467,6 +34988,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             descriptions: args.descriptions,
             finalUrl: args.final_url,
             imageAssetResourceNames: args.image_asset_resource_names,
+            // ENG-1514, same as the AD_GROUP CREATE above: the status the caller
+            // asked for has to reach the service, or a staged ad goes live the
+            // moment its campaign is enabled.
+            status: args.status || 'PAUSED',
           });
           return { success: true, adResourceName: ad.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
         }
@@ -34525,18 +35050,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         // ENG-335: a PMax asset group added to an already-live campaign serves paid
         // traffic instantly — gate its final_url like a launch when the parent is ENABLED.
-        // Fail-open on a lookup/gate error (see AD_CREATE above): defence-in-depth, so a
-        // transient campaign-status lookup failure must NOT break a valid asset-group create.
-        // Same relay as AD CREATE — a PMax asset group on an ENABLED campaign is a launch.
-        let creativeTrackingWarning: string | undefined;
-        try {
-          const campaignStatus = await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name);
-          const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, args.campaign_resource_name, campaignStatus, 'ASSET_GROUP_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
-          if (!gate.proceed) return gate.blockResult;
-          creativeTrackingWarning = gate.warning;
-        } catch (gateErr) {
-          console.error('[ENG-335] ASSET_GROUP_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
-        }
+        // Same relay as AD CREATE — a PMax asset group on an ENABLED campaign is a launch —
+        // and the same ENG-1527 fail-closed treatment, through the same helper so the two
+        // call sites cannot drift apart.
+        const assetGroupGate = await this.guardCreativeAddition({
+          customerId: customer_id,
+          action: 'ASSET_GROUP_CREATE',
+          override: overrideTrackingCheck,
+          sessionId: opts?.sessionId,
+          finalUrls: [args.final_url],
+          resolveParent: async () => ({
+            campaignResourceName: args.campaign_resource_name,
+            campaignStatus: await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name),
+          }),
+        });
+        if (!assetGroupGate.proceed) return assetGroupGate.blockResult;
+        const creativeTrackingWarning = assetGroupGate.warning;
         const assetGroup = await googleAdsService.createAssetGroup(userId, customer_id, {
           name: args.name,
           campaignResourceName: args.campaign_resource_name,

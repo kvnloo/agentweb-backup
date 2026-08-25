@@ -1009,14 +1009,21 @@ export class LinkedInOutreachService {
    *
    * Structured ID filters (`company_id`, `location_id`, `industry_id`,
    * `school_id`) are forwarded as top-level body keys per Unipile's classic
-   * people-search schema (arrays of numeric IDs; `industry` is an object with
-   * include/exclude arrays). See https://developer.unipile.com/docs/linkedin-search.
+   * people-search schema — all four as flat arrays of numeric ID strings,
+   * `industry` included (ENG-1299: an earlier `{ include, exclude }` object
+   * shape for industry 400'd every structured search with "Expected union
+   * value", silently degrading to a keyword-only search that drops the
+   * industry/location constraints). See
+   * https://developer.unipile.com/docs/linkedin-search.
    *
    * When the caller passes free-text (e.g. `company: 'Microsoft'`) without the
    * matching `*_id`, this method calls UnipileSearchParamService.resolveTopId()
    * to look up the LinkedIn entity ID. Resolver miss (null) or resolver error
    * → fall back to the original `advanced_keywords` free-text behavior so the
-   * search never blocks on resolution failures.
+   * search never blocks on resolution failures. When that happens, the result
+   * carries `degraded: true` and `droppedFacets` (the facet names that
+   * couldn't be resolved to a structured ID) so callers get a deterministic
+   * signal instead of having to infer degradation themselves (ENG-1299).
    */
   async searchPeople(accountId: string, params: {
     keywords?: string;
@@ -1045,6 +1052,12 @@ export class LinkedInOutreachService {
       const client = await this.getClient();
 
       let body: any;
+      // Facet names whose free-text couldn't be resolved to an ID and fell
+      // back to `advanced_keywords` (keyword-only matching for that facet,
+      // not a true structured filter). Surfaced on the result as `degraded`
+      // so the caller has a deterministic signal instead of having to infer
+      // degradation from the request shape (ENG-1299).
+      let droppedFacets: string[] = [];
 
       if (cursor) {
         // Pagination: cursor wins over url because the cursor payload already
@@ -1089,7 +1102,7 @@ export class LinkedInOutreachService {
 
         if (resolvedCompanyId) body.company = [resolvedCompanyId];
         if (resolvedLocationId) body.location = [resolvedLocationId];
-        if (resolvedIndustryId) body.industry = { include: [resolvedIndustryId], exclude: [] };
+        if (resolvedIndustryId) body.industry = [resolvedIndustryId];
         if (resolvedSchoolId) body.school = [resolvedSchoolId];
 
         // Free-text fallback for anything that didn't resolve (and for title
@@ -1104,6 +1117,7 @@ export class LinkedInOutreachService {
         if (Object.keys(advanced).length > 0) {
           body.advanced_keywords = advanced;
         }
+        droppedFacets = Object.keys(advanced).filter((key) => key !== 'title');
       }
 
       const result = await client.request.send({
@@ -1114,6 +1128,9 @@ export class LinkedInOutreachService {
         body
       });
       this.log(`Search returned results`, { result });
+      if (droppedFacets.length > 0 && result && typeof result === 'object' && !Array.isArray(result)) {
+        return { ...result, degraded: true, droppedFacets };
+      }
       return result;
     } catch (error: any) {
       return this.handleError(error, 'searchPeople');

@@ -4438,15 +4438,17 @@ export async function runScheduledChat(
       }
 
       // A block can be caused by either the token-count cap or the dollar cost
-      // cap (ENG-200). When the cost cap is the trigger — which is the only reason
-      // a user with an unlimited token allowance can be blocked — render a
-      // cost-based message so it doesn't misleadingly read "0 tokens used".
+      // cap (ENG-200). Which dimension gated only picks which percentage to read —
+      // never the wording: the raw figures and the "cost" vs "token" dimension
+      // name are never surfaced to the customer, matching the in-app UsageMeter
+      // policy of a percentage of "monthly usage" only (ENG-1566).
       const { blockedByCost } = deriveBlockedByCost(usageStatus);
+      const limitPercent = Math.round(
+        blockedByCost ? (usageStatus.costPercentUsed ?? 100) : (usageStatus.percentUsed ?? 100)
+      );
       const blockMessage = usageStatus.usageMode === 'paused'
         ? 'Scheduled chat cannot run: AI usage is paused until the next reset or additional usage is added.'
-        : blockedByCost
-        ? `Scheduled chat cannot run: Monthly cost limit reached ($${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month).`
-        : `Scheduled chat cannot run: Monthly token limit reached (${usageStatus.used?.toLocaleString() ?? 0} / ${usageStatus.allowance?.toLocaleString() ?? 0} tokens used).`;
+        : `Scheduled chat cannot run: you've reached your monthly usage limit (${limitPercent}% used).`;
 
       const tokenLimitResult = {
         scheduleId: schedule.scheduleId,
@@ -10833,23 +10835,34 @@ export const agentModeController = {
   /**
    * POST /api/agent-mode/scheduled-chats/:scheduleId/publish-consent
    *
-   * ENG-827 (Greptile): a REVOKE-ONLY lever for a schedule's unattended publishing.
+   * ENG-827: sets or clears a schedule's standing unattended-publish consent
+   * (`authorized: true` grants, `authorized: false` revokes). The function name
+   * predates the grant direction being added and is now inaccurate — kept as-is
+   * to avoid an unrelated rename in a docs-only fix; the body below is current.
    *
-   * The setting itself is not writable from the generic update body or the MCP
-   * allowlist, because a model that could GRANT it would be manufacturing standing
-   * consent to post under the owner's name. Revoking is the opposite: it can only ever
-   * make a schedule safer, and it is what lets an owner (or Emma acting on their spoken
-   * instruction — "stop auto-posting on this one") stop future unattended publishing
-   * without hunting through the schedule form.
+   * The setting is still NOT writable from the generic update body or the MCP
+   * allowlist — only this dedicated endpoint can touch it — because a model that
+   * could grant it that way would be manufacturing standing consent to post under
+   * the owner's name with none of the checks below. Those checks are what make the
+   * grant direction safe to expose here at all:
    *
-   * The asymmetry is enforced here rather than trusted to the caller: `authorized: true`
-   * is REJECTED outright. There is no request shape that turns publishing on.
+   *   - Never from a delegated/admin session — only the account owner's own
+   *     authenticated request may grant (revoke stays open to delegation; it only
+   *     ever makes a schedule safer, matching ENG-803's original concern that a
+   *     model able to switch the hold ON could quietly stop a schedule publishing
+   *     and truthfully cite the block).
+   *   - Scope is derived from the schedule's own `requiredFunctionCalls` (or, for
+   *     the one legacy backfill, an explicit ENG-1245 `tools=` line) — never
+   *     inferred or left open-ended. No designated publish tool means nothing to
+   *     authorize, and the request is rejected rather than silently granting
+   *     everything or nothing.
+   *   - The write is optimistic-locked to the exact tools/consent-state read a
+   *     moment earlier, so a schedule edited mid-request 409s instead of
+   *     authorizing a scope the owner never actually saw.
    *
-   * ENG-803's concern is real and is why this stays revoke-only: a model able to switch
-   * the hold ON could quietly stop a schedule publishing and then truthfully cite the
-   * block, recreating that ticket's bug through a legitimate mechanism. That failure is
-   * visible, durable and reversible by the owner — a stray grant would be an
-   * irreversible public post — so the two directions do not deserve the same treatment.
+   * See `agentModeController.revokePublishConsent.test.ts` for the full contract
+   * (both directions, the delegation block, the tool-scope requirement, and the
+   * optimistic-lock behavior on concurrent edits).
    */
   async revokeScheduledChatPublishConsent(req: Request, res: Response) {
     try {
@@ -11884,7 +11897,15 @@ export const agentModeController = {
           completedAt: undefined,
           notes: undefined,
           requiredFunctionCalls: step.requiredFunctionCalls,
-          skillIds: step.skillIds
+          skillIds: step.skillIds,
+          // ENG-1331: this route never carried expectedAssetCount from the template
+          // into the session, unlike its sibling instantiation path
+          // (agentModeService.ts applyPredefinedWorkPlan) — so the step-completion
+          // gate had nothing to enforce even once the template had it set. This is
+          // the exact route the production incident session was created through
+          // (its pageIdentifier `plan-${planTitle}` matches only this path).
+          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
+          ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
         })),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()

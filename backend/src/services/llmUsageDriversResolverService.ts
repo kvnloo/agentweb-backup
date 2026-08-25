@@ -25,6 +25,7 @@
  */
 
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
+import { contentAuthorityOver } from "./orgContentAuthority";
 import {
   readBilledLedgerRows,
   resolvePooledLedgerUserIds,
@@ -47,6 +48,36 @@ import { computeUsageRunway, TRAILING_WINDOW_DAYS } from "./llmUsageForecastServ
  * and not the other.
  */
 const LEDGER_COMPLETENESS_TOLERANCE = 0.95;
+
+/**
+ * ENG-1563 — how large an AA Intelligence Index `qualityScore` gap (0-100
+ * scale) must be before a candidate model is called `benchmark_lower`
+ * instead of `benchmark_comparable`.
+ *
+ * The issue did not hand down an exact number, so this is a judgment call,
+ * documented rather than left as a magic number buried in `qualityFor`.
+ * Reasoning, from the real scores already in `agentModeService`'s registry
+ * (`llmModels`, AA Index v4.1.1, snapshot 2026-08-19):
+ *
+ *   - Same-generation / minor-version deltas cluster small: GPT-5.4 -> 5.5 is
+ *     3 points, Gemini 3.5 Flash -> 3.7 Flash is 4 points. These read as "the
+ *     same tier of model, slightly refreshed."
+ *   - Cross-tier / cross-generation deltas start meaningfully larger: Claude
+ *     Opus 5 -> Sonnet 5 is 8 points, Sonnet 4.5 -> 4.6 is 11 points. These
+ *     read as genuinely different capability, not noise.
+ *
+ * 5 sits between those two clusters: it comfortably covers the observed
+ * same-tier refreshes (3-4 pts) as "comparable" while still calling an
+ * 8+ point cross-tier gap "lower". Given ENG-1200 (a founder account silently
+ * defaulted to an inferior model with false confidence), the bias here is
+ * deliberately toward the SMALLER threshold — erring toward `benchmark_lower`
+ * more readily than toward `benchmark_comparable` — because a false
+ * "comparable" is the exact failure mode this system exists to prevent, while
+ * an over-cautious "lower" is merely conservative, not misleading.
+ *
+ * Revisit if the AA Index's own scale or methodology changes materially.
+ */
+export const BENCHMARK_COMPARABLE_MAX_DELTA = 5;
 
 /**
  * Is this ledger a complete picture of what was billed to the subject?
@@ -90,17 +121,39 @@ export interface UsageRecommendationAlternative {
 export type RecommendationConfidence = "insufficient_data" | "low" | "medium" | "high";
 
 /**
- * What we know about the cheaper model doing the same job (ENG-1217 AC5).
+ * What we know about the cheaper model doing the same job (ENG-1217 AC5,
+ * grounded in a real signal by ENG-1563).
  *
- * `status` is a closed set with one member today, and that is the point. AC5
- * forbids representing a cheaper model as equivalent in quality without
- * task-specific evaluation evidence, and no eval harness exists yet (open
- * question `OQ:okareo`). Modelling it as a field rather than omitting it forces
- * the UI to render "quality: unknown" instead of silently implying parity, and
- * gives the eventual harness a slot to fill rather than a schema change.
+ * AC5 forbids representing a cheaper model as equivalent in quality WITHOUT
+ * task-specific evaluation evidence. It does not forbid citing a general
+ * benchmark signal, as long as it is labeled honestly as exactly that — so
+ * `status` carries its own `source`, and the two are never allowed to read as
+ * the same kind of claim:
+ *
+ * - `benchmark_comparable` / `benchmark_lower` (`source: "artificial_analysis"`)
+ *   — derived from the AA Intelligence Index `qualityScore` every model
+ *   already carries (see `agentModeService.getSupportedModelsWithMetadata`,
+ *   the same source powering the picker's meters and the dominance filter).
+ *   The copy always names the benchmark and disclaims task-specific
+ *   verification (ENG-1200: a confident-looking number nobody can trace to
+ *   "was this tested for you" is the exact incident this system exists to
+ *   prevent).
+ * - `unknown` (`source: "none"`) — the true no-data case: AA has not scored
+ *   one or both sides of the pair. This is still the ONLY status this file
+ *   is entitled to emit for a pair with no AA data, and it stays that way.
+ * - `task_verified` (`source: "task_eval"`) — TYPE SLOT RESERVED for a future
+ *   Okareo-backed eval harness (open question `OQ:okareo`). Nothing in this
+ *   file sets it; see the follow-up issue linked from ENG-1563.
+ *
+ * HARD INVARIANT: an AA-derived value and a task-eval-derived value are never
+ * blended into one number or one status — each tier renders its own explicit
+ * provenance via `source`, always. Do not add a numeric field here that both
+ * branches could feed; if that instinct ever comes up, stop and re-read this
+ * comment.
  */
 export interface RecommendationQuality {
-  status: "unknown";
+  status: "unknown" | "benchmark_comparable" | "benchmark_lower" | "task_verified";
+  source: "none" | "artificial_analysis" | "task_eval";
   reason: string;
 }
 
@@ -173,6 +226,21 @@ export interface ScheduleDriver {
   recommendedModel: string | null;
   estimatedDaysRecovered: number | null;
   confidence: RecommendationConfidence | null;
+  /**
+   * Whether THIS caller can actually change this schedule's model (ENG-1533).
+   *
+   * Schedules are pooled across every org member, so this list routinely shows
+   * a caller a colleague's work. `llmModelChangeService` correctly refuses a
+   * plain member's write on it — which meant the UI offered a Confirm button
+   * whose only possible outcome was an error. Answering the authority question
+   * here, with the SAME predicate the write path uses, is what lets the UI stop
+   * offering an action that cannot succeed.
+   *
+   * The row itself stays visible either way: the spend is real and was billed
+   * to this account, and hiding it would recreate the blind spot ENG-1440
+   * closed. What changes is whether an action is offered on it.
+   */
+  switchable: boolean;
   /** INTERNAL — stripped before reaching a customer. */
   costMicroUsd: number;
 }
@@ -311,6 +379,11 @@ export async function previewUsageRunway(
     cacheWriteTokens: r.cacheWriteTokens,
     costMicroUsd: r.costMicroUsd || 0,
     callCount: r.callCount,
+    // ENG-1519: carried through so attribution can tell a per-unit vendor call
+    // from a token-priced model call. Without them every vendor row was
+    // aggregated as a model.
+    provider: r.provider,
+    unit: r.unit,
   }));
 
   const observedByDate = new Map<string, number>();
@@ -431,6 +504,11 @@ export async function resolveUsageDrivers(
     cacheWriteTokens: r.cacheWriteTokens,
     costMicroUsd: r.costMicroUsd || 0,
     callCount: r.callCount,
+    // ENG-1519: carried through so attribution can tell a per-unit vendor call
+    // from a token-priced model call. Without them every vendor row was
+    // aggregated as a model.
+    provider: r.provider,
+    unit: r.unit,
   }));
 
   const attribution = attributeCosts(ledger);
@@ -511,15 +589,63 @@ export async function resolveUsageDrivers(
     return RANK[own] <= RANK[forecastCap] ? own : forecastCap;
   };
 
+  // ENG-1563: same source of truth the model picker's meters and the
+  // cost/quality dominance filter already read — never a second hand-rolled
+  // path to the AA Index data. `true` so the lookup covers the full
+  // registry (admin-only + legacy models a historical `fromModel` may be),
+  // since this is a metadata READ, not an entitlement decision — entitlement
+  // for `toModel` is already enforced above via `catalog`.
+  const qualityScoreById = new Map<string, number>(
+    (typeof agentModeService.getSupportedModelsWithMetadata === "function"
+      ? (await agentModeService.getSupportedModelsWithMetadata(true)) ?? []
+      : []
+    )
+      .filter((m): m is typeof m & { qualityScore: number } => typeof m.qualityScore === "number")
+      .map((m) => [m.id, m.qualityScore]),
+  );
+
   /**
-   * AC5. One value, deliberately: we have no task-specific evaluation evidence
-   * for any of these targets, so `unknown` is the only claim we are entitled to
-   * make. The wording avoids "similar"/"equivalent" for the same reason.
+   * ENG-1563 — derive one recommendation's `RecommendationQuality` from the AA
+   * `qualityScore` delta between `fromModel` and `toModel`.
+   *
+   * Falls back to `{ status: "unknown", source: "none" }` (AC3) whenever
+   * either side is missing from `qualityScoreById` — that is the only honest
+   * answer when AA has no benchmark for one or both models. Otherwise
+   * resolves to `benchmark_comparable` or `benchmark_lower` (AC1/AC2) per
+   * `BENCHMARK_COMPARABLE_MAX_DELTA`, never `task_verified` (AC5 — that
+   * status is reserved for a future task-eval harness, out of scope here).
    */
-  const UNKNOWN_QUALITY: RecommendationQuality = {
-    status: "unknown",
-    reason:
-      "No task-specific evaluation evidence exists for this model on your work, so its output quality is unknown.",
+  const qualityFor = (fromModel: string, toModel: string): RecommendationQuality => {
+    const fromScore = qualityScoreById.get(fromModel);
+    const toScore = qualityScoreById.get(toModel);
+    if (typeof fromScore !== "number" || typeof toScore !== "number") {
+      // AC5's true no-data case: neither this file nor the copy is entitled to
+      // make any claim, benchmark or otherwise.
+      return {
+        status: "unknown",
+        source: "none",
+        reason:
+          "No task-specific evaluation evidence exists for this model on your work, so its output quality is unknown.",
+      };
+    }
+    // Positive => toModel scores lower than fromModel. A tie or a HIGHER
+    // toModel score is "comparable" too — there is no third "better" status,
+    // and a higher-scoring target was never the case AC5 was worried about.
+    const delta = fromScore - toScore;
+    if (delta <= BENCHMARK_COMPARABLE_MAX_DELTA) {
+      return {
+        status: "benchmark_comparable",
+        source: "artificial_analysis",
+        reason:
+          "Generally rated similar on independent benchmarks — not yet tested on your specific work.",
+      };
+    }
+    return {
+      status: "benchmark_lower",
+      source: "artificial_analysis",
+      reason:
+        "Generally rated lower on independent benchmarks — not yet tested on your specific work.",
+    };
   };
 
   const recommendations: UsageRecommendation[] = [];
@@ -571,7 +697,7 @@ export async function resolveUsageDrivers(
         completeDaysObserved: baseline.completeDaysElapsed,
         confidence:
           estimatedDaysRecovered === null ? "insufficient_data" : confidenceFor(driver.callCount),
-        quality: UNKNOWN_QUALITY,
+        quality: qualityFor(driver.key, candidate),
         isEstimate: true,
         requiresConfirmation: true,
         basis: est.basis,
@@ -639,10 +765,31 @@ export async function resolveUsageDrivers(
     // — defeating AC6, whose whole point is that the customer can see WHICH named
     // task is spending their allowance. The optional property is why nothing
     // caught it: reading an absent optional field is not a type error.
-    const byId = new Map<string, { scheduleName?: string; frequency?: string }>();
-    for (const sched of lists.flat()) {
-      if (sched?.scheduleId) byId.set(sched.scheduleId, sched);
-    }
+    // ENG-1533: the OWNER travels with the record. `lists` is per pooled user,
+    // so ownership is known here and was being flattened away — and without it
+    // there is no way to ask whether this caller may act on the row.
+    const byId = new Map<
+      string,
+      { scheduleName?: string; frequency?: string; ownerUserId: string }
+    >();
+    lists.forEach((list, i) => {
+      const ownerUserId = pooledUserIds[i];
+      for (const sched of list ?? []) {
+        if (sched?.scheduleId) byId.set(sched.scheduleId, { ...sched, ownerUserId });
+      }
+    });
+
+    // One authority lookup per distinct OWNER, not per row: an org has a
+    // handful of members and a cycle can have dozens of schedules, so asking
+    // per row would multiply DB reads for an answer that cannot differ within
+    // an owner.
+    const authorityByOwner = new Map<string, boolean>();
+    await Promise.all(
+      [...new Set([...byId.values()].map((m) => m.ownerUserId))].map(async (ownerUserId) => {
+        const { permitted } = await contentAuthorityOver(userId, ownerUserId);
+        authorityByOwner.set(ownerUserId, permitted);
+      }),
+    );
     // Inheriting schedules run the platform default, so resolving it once is
     // what lets a per-schedule row carry a confirmable recommendation at all.
     // Without it, two thirds of schedules would show spend and no action.
@@ -684,6 +831,10 @@ export async function resolveUsageDrivers(
         // than described as behaviour that exists.
         title: meta?.scheduleName ?? null,
         scheduleExists,
+        // A schedule whose record is gone cannot be switched by anyone, so the
+        // authority question does not even arise — `false` here is "no action
+        // is possible", which is exactly what the UI needs to know.
+        switchable: meta ? (authorityByOwner.get(meta.ownerUserId) ?? false) : false,
         frequency: meta?.frequency ?? null,
         shareOfTotal: d.shareOfTotal,
         callCount: d.callCount,
@@ -756,6 +907,13 @@ export function toCustomerDrivers(resolved: ResolvedUsageDrivers) {
     drivers: resolved.attribution
       ? {
           byModel: toShares(resolved.attribution.byModel),
+          // ENG-1519: per-unit vendor spend IS attributed — to a vendor rather
+          // than to a model — and this boundary was dropping it. Removing it
+          // from `byModel` without naming it anywhere left the model list
+          // covering less than the cycle with no sentence saying why, which
+          // trades a wrong row for a silent gap. null when the cycle bought
+          // nothing per-unit, so a UI states absence instead of rendering zero.
+          byVendor: resolved.attribution.byVendor ? toShares(resolved.attribution.byVendor) : null,
           byFeature: toShares(resolved.attribution.byFeature),
           // null until the metering tag has produced at least one row this cycle.
           bySource: resolved.attribution.bySource ? toShares(resolved.attribution.bySource) : null,
@@ -777,6 +935,10 @@ export function toCustomerDrivers(resolved: ResolvedUsageDrivers) {
       // the named work still exists — and without it the UI cannot tell a deleted task
       // from an unnamed one, which is the whole defect.
       scheduleExists: d.scheduleExists,
+      // ENG-1533: crosses the boundary because the UI cannot otherwise tell an
+      // actionable row from one whose Confirm button is guaranteed to fail. It
+      // carries no economics — only whether THIS caller may act.
+      switchable: d.switchable,
       frequency: d.frequency,
       shareOfTotal: d.shareOfTotal,
       callCount: d.callCount,

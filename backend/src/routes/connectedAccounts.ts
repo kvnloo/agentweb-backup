@@ -1,4 +1,5 @@
 import express from 'express';
+import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
 import axios from 'axios';
 import { authenticateToken } from '../middleware/auth';
 import { getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, getAccountById, updateAccountConfig, FathomConfig, CalendlyConfig } from '../services/connectedAccountsDb';
@@ -237,6 +238,52 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
       }
     }));
 
+    /*
+     * ENG-1362. Resolve the Google Ads test_account flag for rows that predate it being
+     * recorded, so this endpoint and the agent's list_connected_accounts give the same
+     * answer about the same account. Batched up front into a map, matching how this
+     * handler already resolves Unipile and Fathom status.
+     *
+     * Resolved against the account's OWNER (acc.userId), not the caller: an org-shared
+     * row belongs to a teammate, and the credentials for it are theirs. Best-effort —
+     * `isTestAccount` returns null on failure, which flows through as billable.
+     */
+    const googleAdsNeedingLookup = accounts.filter(
+      acc => acc.platform === 'google_ads'
+        && typeof (acc.config as any)?.test_account !== 'boolean'
+        && (acc.config as any)?.customer_id,
+    );
+    const testAccountMap = new Map<string, boolean | null>();
+    if (googleAdsNeedingLookup.length > 0) {
+      try {
+        // Imported lazily, not at module scope: googleAdsService pulls in secretsManager,
+        // which constructs an AWS client the moment it loads, so a top-level import makes
+        // merely REQUIRING this route file do that.
+        const { googleAdsService } = await import('../services/googleAdsService');
+        await Promise.all(googleAdsNeedingLookup.map(async acc => {
+          const customerId = (acc.config as any).customer_id as string;
+          testAccountMap.set(
+            acc.account_id,
+            await googleAdsService.isTestAccount((acc as any).userId || userId, customerId),
+          );
+        }));
+      } catch (err: any) {
+        // Enrichment only. This endpoint lists every connected account a customer has,
+        // and a Google Ads credential or Secrets Manager problem must not blank the whole
+        // page — the rows still render, the flag just reads as unresolved, which
+        // describeGoogleAdsSpendRisk already treats as billable.
+        //
+        // Recorded as null rather than left absent: we DID attempt these. null is the
+        // documented "checked, could not tell" state and undefined is "never recorded",
+        // and collapsing the two would have this endpoint report a lookup it ran as one
+        // it never ran.
+        for (const acc of googleAdsNeedingLookup) {
+          if (!testAccountMap.has(acc.account_id)) testAccountMap.set(acc.account_id, null);
+        }
+        console.warn('[ENG-1362] could not resolve Google Ads test_account flags:', err?.message || err);
+      }
+    }
+
     const accountsWithStatus = accounts.map(acc => {
       let status: string;
       let expiryMessage: string;
@@ -314,6 +361,30 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // data, plus the actionable reason when it cannot. Absent entirely for
         // every other account, and for Meta records whose grant we cannot prove.
         ...adsCapability,
+        /*
+         * Google Ads only (ENG-1362). Whether this account can spend real money.
+         *
+         * `test_account: true` is Google's own guarantee that the account cannot serve
+         * ads and cannot spend; `false` is a real billable account; `undefined` means it
+         * was connected before we recorded the flag. `can_spend` folds all three into the
+         * answer the reader actually needs, and clears ONLY on an affirmative true — so
+         * "we never recorded it" can never render as "safe".
+         *
+         * Surfaced because the account NAME is not a safety property, though it reads
+         * like one: a real, billable, ENABLED account descriptively named "Test" is
+         * connected on this platform right now, and both a human skimming this list and
+         * an agent reasoning over it would otherwise have only that string to go on.
+         */
+        ...(acc.platform === 'google_ads'
+          ? describeGoogleAdsSpendRisk({
+              // No `?? undefined`: the map already distinguishes a resolved boolean, a
+              // failed lookup (null) and an account never looked up (key absent, so
+              // `get` yields undefined). Coalescing would erase the middle one.
+              test_account: typeof (acc.config as any)?.test_account === 'boolean'
+                ? (acc.config as any).test_account
+                : testAccountMap.get(acc.account_id),
+            })
+          : {}),
         // Calendly only (ENG-1141): which Meta pixel/ad account bookings attribute to —
         // explicitly chosen, or undefined until the customer picks one (the frontend
         // defaults the picker's display to the first connected account/pixel, matching

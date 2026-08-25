@@ -283,7 +283,10 @@ function sanitizeConnectedAccountForOrgResponse(account: any): any {
  * were not named in the ENG-953 report; they are the same disclosure class and
  * are covered here rather than left for a second incident.
  */
-function projectOrgForMemberResponse(org: any): Record<string, any> {
+function projectOrgForMemberResponse(
+  org: any,
+  includeDomainJoinRequestToken: boolean,
+): Record<string, any> {
   return {
     orgId: org.orgId,
     name: org.name,
@@ -352,6 +355,10 @@ function projectOrgForMemberResponse(org: any): Record<string, any> {
           userId: r?.userId,
           email: r?.email,
           requestedAt: r?.requestedAt,
+          // The settings UI needs this value to call the already-authorized
+          // approve/reject endpoints. It remains absent for ordinary members:
+          // only callers with `org:members:manage` can receive or use it.
+          ...(includeDomainJoinRequestToken ? { requestToken: r?.requestToken } : {}),
         }))
       : undefined,
 
@@ -454,11 +461,13 @@ router.get("/me", async (req: Request, res: Response) => {
     //
     // An explicit allowlist rather than a denylist, so a future Organization
     // field is absent here until someone deliberately adds it.
-    const callerRole = roleOf({ userId, orgId: user.orgId, orgRole: user.orgRole }, org);
+    const caller = { userId, orgId: user.orgId, orgRole: user.orgRole };
+    const callerRole = roleOf(caller, org);
+    const canManageMembers = can(caller, org, "org:members:manage");
     return res.json({
       success: true,
       data: {
-...projectOrgForMemberResponse(org),
+        ...projectOrgForMemberResponse(org, canManageMembers),
         members: safeMembers,
         // Server-computed capabilities. Clients must gate on these rather than
         // comparing orgRole themselves — that comparison is exactly what has to
@@ -466,11 +475,11 @@ router.get("/me", async (req: Request, res: Response) => {
         // portal would silently render an admin as a plain member.
         callerRole,
         capabilities: {
-          canManageOrg: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:configure"),
-          canManageMembers: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:members:manage"),
-          canManageContent: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:content:manage"),
-          canSeeAllAccounts: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:accounts:read"),
-          canDeleteOrg: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:delete"),
+          canManageOrg: can(caller, org, "org:configure"),
+          canManageMembers,
+          canManageContent: can(caller, org, "org:content:manage"),
+          canSeeAllAccounts: can(caller, org, "org:accounts:read"),
+          canDeleteOrg: can(caller, org, "org:delete"),
         },
       },
     });

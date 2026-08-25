@@ -10,12 +10,18 @@
  *
  * This scans active-subscription users whose renewal falls within the
  * lookahead window and raises a deduped oncall alert only for customers who
- * selected paid ads as a goal. A missing ad connection is not evidence that
+ * selected paid ads as a goal AND whose subscription plan actually permits
+ * connecting an ad platform. A missing ad connection is not evidence that
  * ads are part of a customer's plan (for example, LinkedIn-outreach-only
- * customers), so it must not create a renewal-risk alert.
+ * customers, or a customer's plan that never included ad integration —
+ * ENG-1541, the TFAConnect false positive: her onboarding-time "paid ads"
+ * intent was stale relative to a plan that doesn't allow it), so neither
+ * condition alone may create a renewal-risk alert.
  * Detection is intentionally cheap and synchronous (timestamp-only expiry
  * checks) — no live third-party API calls — so it can run frequently without
- * external dependency risk.
+ * external dependency risk. The one async step is the entitlement lookup
+ * (`subscriptionService.getAllowedConnectedAccounts`), which only runs for
+ * users who already cleared the cheap sync checks.
  *
  * Registered in server.ts to run daily.
  */
@@ -24,6 +30,7 @@ import { userDb } from '../services/db';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { PlatformType } from '../services/connectedAccountsDb';
 import { isTokenNotExpired } from '../services/connectedAccountsDb';
+import { getAllowedConnectedAccounts } from '../services/subscriptionService';
 
 const TAG = '[renewalIntegrationHealthCron]';
 
@@ -67,9 +74,27 @@ function hasPaidAdsIntent(user: any): boolean {
 }
 
 /**
+ * True when the user's subscription plan permits connecting at least one ad
+ * platform (meta / google_ads / linkedin_ads). Consults the same entitlement
+ * mechanism that gates the connected-accounts UI
+ * (`subscriptionService.getAllowedConnectedAccounts`) so this cron never
+ * flags a customer whose plan never included ad integration in the first
+ * place, independent of onboarding-time intent (ENG-1541). Unrestricted
+ * plans (`allowedConnectedAccounts` undefined or `['*']`) resolve through
+ * `getAllowedConnectedAccounts` to the full platform list, which includes
+ * `meta` and `google_ads` — so an unrestricted plan is always entitled here,
+ * preserving today's behavior exactly.
+ */
+async function hasAdIntegrationEntitlement(userId: string): Promise<boolean> {
+  const allowed = await getAllowedConnectedAccounts(userId);
+  return allowed.some((platform) => AD_PLATFORMS.has(platform as PlatformType));
+}
+
+/**
  * Scan users with an active subscription renewing within `RENEWAL_LOOKAHEAD_DAYS`
- * and flag paid-ads customers whose ad integration is missing or expired. Resilient:
- * a failure sending one user's alert is logged and never aborts the rest of the run.
+ * and flag paid-ads customers, whose plan actually permits ad integration,
+ * whose ad integration is missing or expired. Resilient: a failure sending
+ * one user's alert is logged and never aborts the rest of the run.
  */
 export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegrationHealthSummary> {
   const summary: RenewalIntegrationHealthSummary = {
@@ -97,6 +122,7 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
     summary.scannedUsers++;
 
     if (!hasPaidAdsIntent(user) || hasHealthyAdIntegration(user)) continue;
+    if (!(await hasAdIntegrationEntitlement(user.userId))) continue;
 
     summary.flagged++;
     try {

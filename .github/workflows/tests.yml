@@ -34,7 +34,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - id: filter
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           filters: |
@@ -143,6 +143,7 @@ jobs:
           bash .github/scripts/deploy-failure-alert.test.sh
           bash .github/scripts/eb-config-conflict.test.sh
           bash .github/scripts/pipefail-hygiene.test.sh
+          bash .github/scripts/paths-filter-hygiene.test.sh
 
   # ENG-1377: local-agent-relay and remotion-lambda had no CI of any kind.
   # Under ENG-1463, GitHub Actions proves buildability, not correctness, so

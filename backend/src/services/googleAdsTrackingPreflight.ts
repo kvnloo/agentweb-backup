@@ -73,6 +73,42 @@ export const TRACKING_MECHANISMS: string[] = [
  * Inspect served HTML for Google measurement mechanisms. Pure and side-effect-free.
  * Returns a de-duplicated list of labelled matches (empty ⇒ no tracking detected).
  */
+/**
+ * Everything in a document that could carry a tag, with rendered prose removed (ENG-1527).
+ *
+ * Keeps two things and drops the rest:
+ *   - `<script>` and `<noscript>` bodies, so inline `gtag('config','AW-…')` and the GTM
+ *     noscript iframe both survive
+ *   - every tag's markup, so `src=`, `href=` and `data-` attributes survive — which matters
+ *     more than it looks: on a real Next.js page the GA4 id appears in a
+ *     `<link rel="preload" href="…gtag/js?id=G-…">` and inside the hydration payload, NOT
+ *     only in a classic `<script src>`. Narrowing to script tags alone would have started
+ *     false-blocking correctly tagged pages.
+ *
+ * What it drops is text nodes — the one place an id is definitely not doing anything.
+ *
+ * Verified against the live `www.agentweb.pro` document before shipping: identical id set
+ * before and after narrowing, while a prose-only page goes from "measured" to "unmeasured".
+ * Deliberately a lexical pass, not a parser: this runs on untrusted third-party HTML, and a
+ * scan that cannot throw is worth more here than one that understands nesting.
+ */
+function markupOnly(html: string): string {
+  const kept: string[] = [];
+  for (const m of html.match(/<(script|noscript)\b[\s\S]*?<\/(?:script|noscript)\s*>/gi) || []) {
+    kept.push(m);
+  }
+  for (const m of html.match(/<[^>]+>/g) || []) {
+    kept.push(m);
+  }
+  // A response with no markup at all is not an HTML document — a bare script body, a JSON
+  // payload, a redirect stub. Narrowing it to nothing would report "no tag" for a response
+  // that might carry one, which is the wrong direction for a gate whose job is to refuse
+  // launches it cannot vouch for. Fall back to the raw text; a prose page always has markup,
+  // so this cannot resurrect the false positive above.
+  if (kept.length === 0) return html;
+  return kept.join('\n');
+}
+
 export function detectTrackingSnippets(html: string): string[] {
   if (!html || typeof html !== 'string') return [];
   const found = new Set<string>();
@@ -100,16 +136,23 @@ export function detectTrackingSnippets(html: string): string[] {
    * rather than toward silent spend.
    */
 
+  // ENG-1527. Scanned over MARKUP ONLY, not the whole document. An id sitting in rendered
+  // body text is prose, not a tag: "Ask your rep for conversion id AW-11112222333" used to
+  // read as a working Google Ads tag and pass a page that fires nothing — the same class of
+  // false positive as the `ai-gtm-agent` slug ENG-1358 closed, arriving through the AW door
+  // instead, and the one error this gate exists to prevent.
+  const scannable = markupOnly(html);
+
   // GA4 measurement ID: G-XXXXXXXXXX (also matches googletagmanager.com/gtag/js?id=G-…)
-  for (const m of html.match(/\bG-[A-Z0-9]{6,}\b/g) || []) {
+  for (const m of scannable.match(/\bG-[A-Z0-9]{6,}\b/g) || []) {
     found.add(`GA4:${m}`);
   }
   // GTM container: GTM-XXXXXXX (also matches gtm.js?id=GTM-… and the ns.html noscript iframe)
-  for (const m of html.match(/\bGTM-[A-Z0-9]{4,}\b/g) || []) {
+  for (const m of scannable.match(/\bGTM-[A-Z0-9]{4,}\b/g) || []) {
     found.add(`GTM:${m}`);
   }
   // Google Ads conversion / remarketing tag: AW-123456789
-  for (const m of html.match(/\bAW-[0-9]{6,}\b/g) || []) {
+  for (const m of scannable.match(/\bAW-[0-9]{6,}\b/g) || []) {
     found.add(`AW:${m}`);
   }
 

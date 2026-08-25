@@ -38,6 +38,13 @@ export interface UserPayload {
     targetUserId: string;
     targetEmail: string;
   };
+  /**
+   * Delegate-token epoch (ENG-1506). Stamped from the TARGET user's
+   * `delegateTokenEpoch` at mint time and compared against the stored value on
+   * every request, so an admin can cut off outstanding support access without
+   * waiting for the token to expire. Absent = 0.
+   */
+  dte?: number;
 }
 
 // Common function to extract user from request token (returns null if no token or invalid)
@@ -80,6 +87,29 @@ export async function getUserFromToken(req: Request): Promise<{
           return { user: null };
         }
       } else if (!isAdmin && !isContractor) {
+        return { user: null };
+      }
+
+      // ENG-1506. Two independent kill switches for a delegate token, because
+      // until now there were none: the only thing standing between a leaked
+      // support token and the customer's account was the clock.
+      //
+      // Same `<` (token behind server) comparison as the sessionVersion check
+      // below, and for the same eventual-consistency reason: getUserById reads
+      // an eventually-consistent GSI, so a freshly-minted token can legitimately
+      // carry a value the read has not caught up to yet. A strict `!==` would
+      // reject the token the admin just created.
+      //
+      // 1. delegateTokenEpoch — revokes support access on demand, without
+      //    logging the customer out of their own devices.
+      if ((decoded.dte ?? 0) < (targetUser.delegateTokenEpoch ?? 0)) {
+        return { user: null };
+      }
+      // 2. the TARGET user's sessionVersion — a customer changing their password
+      //    should end delegate sessions too. This branch used to return before
+      //    reaching the sessionVersion check further down, so a delegate token
+      //    outlived the password change that was supposed to kill every session.
+      if ((decoded.sv ?? 0) < (targetUser.sessionVersion ?? 0)) {
         return { user: null };
       }
 
