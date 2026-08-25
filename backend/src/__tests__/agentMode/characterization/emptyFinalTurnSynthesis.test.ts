@@ -142,7 +142,11 @@ describe('ENG-946 — the terminating turn, not the accumulator, decides whether
     // the stale narration as if it answered is exactly the "turn did real work
     // but the response doesn't reflect it" failure this whole file characterizes.
     // The fallback below now correctly replaces it with the truthful ledger.
-    expect(result.content).not.toBe(NARRATION);
+    // not.toContain (not not.toBe, CodeRabbit): the fallback must REPLACE the
+    // narration, not merely produce a content string that happens not to equal
+    // it verbatim (e.g. narration + ledger concatenated would pass not.toBe but
+    // still leak the stale text).
+    expect(result.content).not.toContain(NARRATION);
     expect(result.content).toContain('built directly from the actions I actually ran');
     expect(result.content).toContain('you_search_web');
   });
@@ -204,7 +208,9 @@ describe('ENG-946 — the terminating turn, not the accumulator, decides whether
     ]);
 
     expect(llmCalls).toBe(3);
-    expect(result.content).not.toBe("I'll start rendering now.");
+    // not.toContain (not not.toBe, CodeRabbit): must actually be replaced, not
+    // just fail to be byte-identical to the stale narration.
+    expect(result.content).not.toContain("I'll start rendering now.");
     expect(result.content).toContain('built directly from the actions I actually ran');
     expect(result.content).toContain('playwright_browser_take_screenshot');
   });
