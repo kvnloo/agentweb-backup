@@ -123,7 +123,11 @@ describe("planSkillChange", () => {
       addTools: ["list_connected_accounts"],
     });
     expect(res.appended).toEqual(["safety"]);
-    expect(res.addedTools).toEqual(["list_connected_accounts"]);
+    // safety.requiredTools now also carries linkedin_outreach (CodeRabbit finding,
+    // 2026-08-25): the block's own text instructs calling it for
+    // set-daily-invite-cap, so a skill applying this block needs the tool
+    // auto-added the same way list_connected_accounts already was.
+    expect([...res.addedTools].sort()).toEqual(["linkedin_outreach", "list_connected_accounts"].sort());
     expect(res.skill.systemPrompt).toContain(BLOCKS.safety.marker);
   });
 });

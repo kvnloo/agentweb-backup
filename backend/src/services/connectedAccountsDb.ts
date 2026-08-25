@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { userDb, User } from './db';
 import { invalidateCachedPixels } from './metaPixelsCache';
+import type { DailyVolumeState } from './linkedInWritePacer';
 
 // ============================================
 // Type Definitions
@@ -64,6 +65,23 @@ export interface LinkedInOutreachConfig {
   // Premium LinkedIn accounts allow 300-char invitation notes (free accounts: 200).
   // User-set in Settings → Connected accounts. Absent/false = free tier.
   is_premium?: boolean;
+  /**
+   * Self-reported daily LinkedIn connection-request ceiling (linkedInWritePacer.ts).
+   * Set directly by the user in Settings, or by Emma via the linkedin_outreach
+   * `set-daily-invite-cap` action after asking whether the account has LinkedIn
+   * Premium. Deliberately NOT auto-detected — see the pacer's module doc comment.
+   * Unset defaults to the conservative free-tier number; the pacer clamps any
+   * value to its own absolute system-wide ceiling regardless of what's stored here.
+   */
+  daily_invite_cap?: number;
+  /**
+   * Durable daily-volume counters (linkedInWritePacer.ts). Persisted here —
+   * not in process memory — specifically so a backend restart (which happens
+   * on every merge to `main`) can't reset an account's daily send count to
+   * zero mid-day. Written by the pacer's caller, never read/written directly
+   * anywhere else.
+   */
+  daily_volume?: DailyVolumeState;
   /**
    * Persisted session health (ENG-1197).
    *

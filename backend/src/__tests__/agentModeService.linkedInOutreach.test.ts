@@ -17,9 +17,15 @@ jest.mock('../utils/secretsManager', () => ({
 // Mock connectedAccountsDb
 const mockGetAccountsByUserId = jest.fn();
 const mockGetAccountsByUserIdIncludingOrgShared = jest.fn();
+// Resolves by default (daily-volume persistence, ENG-1197 durability follow-up)
+// so existing tests that don't care about it don't have to mock it explicitly —
+// the pacer's write is best-effort/caught, but an unresolved mock would still
+// hang the call.
+const mockUpdateAccountConfig = jest.fn().mockResolvedValue(undefined);
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: (...args: any[]) => mockGetAccountsByUserId(...args),
   getAccountsByUserIdIncludingOrgShared: (...args: any[]) => mockGetAccountsByUserIdIncludingOrgShared(...args),
+  updateAccountConfig: (...args: any[]) => mockUpdateAccountConfig(...args),
 }));
 
 // Mock linkedInOutreachService
