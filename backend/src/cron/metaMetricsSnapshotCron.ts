@@ -250,7 +250,10 @@ export async function snapshotMetaMetricsForDate(
   }
 
   const knownCampaignIds = new Set(campaignRows.map((c) => String(c.campaign_id)));
-  let totalLeadCount = 0;
+  // Named for what it actually is. It counts leads MATCHED to a campaign the platform reported —
+  // it is not the day's total, and calling it that made the account_day row able to claim
+  // `totalLeadCount: 0` alongside `unattributedLeadCount: 1` (CodeRabbit Major).
+  let attributedLeadCount = 0;
   let unattributedLeadCount = 0;
   const leadCountByCampaign = new Map<string, number>();
 
@@ -258,7 +261,7 @@ export async function snapshotMetaMetricsForDate(
     const campaign = lead.firstTouch?.utm?.campaign;
     if (campaign && knownCampaignIds.has(String(campaign))) {
       leadCountByCampaign.set(String(campaign), (leadCountByCampaign.get(String(campaign)) || 0) + 1);
-      totalLeadCount++;
+      attributedLeadCount++;
     } else {
       // Not silently dropped — a future UTM-convention drift must be visible, not
       // invisible undercounting.
@@ -328,7 +331,11 @@ export async function snapshotMetaMetricsForDate(
     spend: 0,
     impressions: 0,
     clicks: 0,
-    totalLeadCount,
+    // Every lead the account received that date, attributed or not. Attributed is derivable as
+    // totalLeadCount - unattributedLeadCount, so nothing is lost by storing the honest total —
+    // whereas storing only the matched subset under this name silently undercounts the day by
+    // exactly the population the store exists to watch for drift in.
+    totalLeadCount: attributedLeadCount + unattributedLeadCount,
     unattributedLeadCount,
     campaignsReported: campaignRows.length,
     platformMetrics: {},
@@ -339,7 +346,9 @@ export async function snapshotMetaMetricsForDate(
   return {
     success: true,
     rowsWritten: campaignRows.length,
-    leadCount: totalLeadCount,
+    // Deliberately the ATTRIBUTED count — the cron's log line already reads "N attributed leads",
+    // and the honest day total lives on the account_day row.
+    leadCount: attributedLeadCount,
     unattributedLeadCount,
   };
 }

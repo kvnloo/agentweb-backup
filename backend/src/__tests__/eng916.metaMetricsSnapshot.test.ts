@@ -293,6 +293,8 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
     expect(accountDayRows()[0]).toEqual(
       expect.objectContaining({ rowType: 'account_day', unattributedLeadCount: 2, campaignId: null })
     );
+    // 1 matched + 2 unmatched = 3 leads that day. Attributed stays derivable as total - unattributed.
+    expect(accountDayRows()[0].totalLeadCount).toBe(3);
     for (const r of campaignRows()) {
       expect(r.unattributedLeadCount).toBeUndefined();
     }
@@ -319,6 +321,9 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
     // A row saying zero is a measurement; no row is an absence. That is the whole distinction.
     expect(accountDayRows()[0].campaignsReported).toBe(0);
     expect(accountDayRows()[0].unattributedLeadCount).toBe(1);
+    // totalLeadCount is the day's TOTAL, not the matched subset — a lead that matched no reported
+    // campaign still happened, and a row claiming 0 leads beside 1 unattributed lead is incoherent.
+    expect(accountDayRows()[0].totalLeadCount).toBe(1);
   });
 
   it('records currency and reporting timezone on every row rather than leaving them inferable', async () => {
