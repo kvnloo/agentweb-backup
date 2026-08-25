@@ -149,4 +149,29 @@ describe('ENG-946 — the terminating turn, not the accumulator, decides whether
     expect(llmCalls).toBe(2);
     expect(result.content).toBe(REPORT);
   });
+
+  // Production case (found live-testing ENG-1331 on gemini-3.1-pro-preview): a
+  // work-plan run that never narrates ANYTHING, in any iteration — every turn is
+  // tool-only. The 'keeps the nudge bounded' case above still has NARRATION sitting
+  // in the accumulator from turn 1 to fall back on; this scenario has nothing, so it
+  // is the one case the residue guard's own comment (synthesisResidue.ts) says is NOT
+  // its job ("Empty/whitespace content returns FALSE on purpose: that case already
+  // has its own bounded handling in the termination ladder") — except the ladder's
+  // "own bounded handling" was just the one nudge, with no fallback once it's
+  // exhausted. Left unfixed this ships a blank, fully-timestamped assistant message
+  // after real tool calls ran, with zero explanation.
+  it('falls back to the executed-action ledger when EVERY turn is empty, not just the last one', async () => {
+    const { result, llmCalls } = await runScriptedLoop([
+      {
+        content: '',
+        tool_calls: [{ id: 'c1', name: 'playwright_browser_take_screenshot', arguments: '{}' }],
+      },
+      { content: '' }, // the one nudge retry also comes back empty
+    ]);
+
+    expect(llmCalls).toBe(3);
+    expect(result.content).not.toBe('');
+    expect(result.content).toContain('built directly from the actions I actually ran');
+    expect(result.content).toContain('playwright_browser_take_screenshot');
+  });
 });
