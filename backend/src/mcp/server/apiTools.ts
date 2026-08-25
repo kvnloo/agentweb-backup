@@ -1387,7 +1387,7 @@ GOOGLE ADS SPEND RISK (ENG-1362). google_ads rows carry test_account and can_spe
   test_account: false = real, billable.
   test_account absent = never recorded; treat as billable.
   can_spend = false ONLY when test_account is true.
-Never infer this from account_name — a fully billable account can be named "Test", and one is connected here.`,
+Never infer this from account_name — a fully billable account can be named "Test".`,
     inputSchema: {
       type: 'object',
       properties: {
