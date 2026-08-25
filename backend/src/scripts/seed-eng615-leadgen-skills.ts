@@ -44,12 +44,6 @@ const SAFETY_VOLUME_LIMITS = `## SAFETY & VOLUME LIMITS (apply in ALL modes, inc
   call itself refuses with a clear reason once the account's daily cap is
   reached. On that refusal, STOP sending on this account and queue the rest for
   a later run — do not retry and do not switch to a different account.
-- The invite cap is SELF-REPORTED, not detected. If this account's cap has
-  never been confirmed and you're in a live/interactive turn, ASK the user
-  whether their connected LinkedIn account has Premium, then call
-  linkedin_outreach action set-daily-invite-cap (30 if yes, 10 if no — never
-  guess). In an unattended/scheduled run there's no one to ask — proceed at
-  whatever is already configured (defaults to 10) and say so in the ledger.
 - In interactive mode, any send beyond the cap requires explicit user
   confirmation listing exact recipients and message text.
 - NEVER delete leads, lists, or drafts in an unattended run under any
