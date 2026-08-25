@@ -54,18 +54,30 @@ reviews:
         Flag components rendering unbounded lists without a key or virtualization above ~100 items,
         and any dangerouslySetInnerHTML usage without visible sanitization.
 
+    - path: "backend/src/**/*.ts"
+      instructions: >
+        When generating or reviewing unit tests: use Jest with `supertest` for route/controller
+        tests, matching this repo's existing convention (see backend/src/__tests__/ for examples).
+        Mock the auth middleware explicitly (set req.user with userId/isAdmin rather than bypassing
+        auth entirely) and mock external services (DynamoDB, settingsService, subscriptionService,
+        etc.) at the module boundary via jest.mock — never hit real AWS or a live third-party API.
+        Cover: the happy path, an unauthenticated/unauthorized request, a missing-required-field
+        request, and one boundary/empty-input case. Prefer asserting on response status + body over
+        asserting on internal mock call counts alone.
+
+  # Phase 1 of the test-ownership shift agreed on the 2026-08-24/25 CodeRabbit calls — see
+  # rules/coderabbit-test-ownership.md (global) for the full phased plan and Phase 2 criteria.
   finishing_touches:
     unit_tests:
-      # Left OFF deliberately: whether CodeRabbit generates/owns tests vs. AgentWeb's own
-      # agent-authored test suite was raised on the 2026-08-25 call but NOT decided — Harsha and
-      # Chris agreed to work through it together once CodeRabbit's example YAMLs land. Do not flip
-      # this on without that decision being made explicit.
-      enabled: false
+      enabled: true
 
-  # pre_merge_checks (e.g. gating merge on CodeRabbit re-running the test suite) was floated on the
-  # 2026-08-25 call as a way to stop burning GitHub Actions minutes on agent fix-and-retry loops,
-  # but it directly conflicts with the merge-gate hardening from 2026-08-17/18 (dropping Greptile as
-  # a required check specifically so no single review vendor can hard-block merges — see
-  # reference-greptile-retired-coderabbit-gate.md). Making CodeRabbit the test gate reintroduces
-  # that same single-point-of-failure risk. NOT implemented here — needs an explicit decision, not a
-  # silent config flip.
+  pre_merge_checks:
+    custom_checks:
+      - name: "Existing test standards followed"
+        mode: "warning"
+        instructions: >
+          Verify this PR's changes are consistent with the existing test suite's conventions
+          (Jest + supertest, mocked auth/external services, happy-path + auth-failure +
+          missing-field + boundary coverage). This is a WARNING-only signal for now, not a merge
+          block — GitHub Actions' Jest suite remains the actual required gate. Do not report this
+          as a merge-blocking failure; report it as a note for the author to review.

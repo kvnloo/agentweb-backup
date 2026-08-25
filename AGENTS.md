@@ -59,6 +59,12 @@ instructions narrow and operational.
   from the PR-stage review, so a pass or two here catches issues without
   spending PR-stage quota or triggering a CI re-run. This is a recommendation,
   not a gate — CodeRabbit remains advisory only (see above).
+- Test ownership is mid-shift toward CodeRabbit (Phase 1: it generates/reviews
+  unit tests and runs a warning-only pre-merge check; Phase 2, gated on proof,
+  would make it a real merge gate and drop Jest from required checks — not
+  done yet). Global doctrine + Phase 2 criteria: `~/.claude/rules/coderabbit-
+  test-ownership.md`. Do not treat this repo's `.coderabbit.yaml` as already
+  in Phase 2 — GitHub Actions' Jest suite is still the real gate.
 
 ## Business execution
 
