@@ -54,6 +54,24 @@ instructions narrow and operational.
 - Merging to `main` triggers the path-filtered production deployment. Observe
   the deployment and run the PR's post-deploy smoke. Agents never set Linear
   `Done`; customer-communication state remains human-controlled.
+- Prefer `coderabbit review` locally (CLI, authenticated, see `.coderabbit.yaml`)
+  before opening a PR. Local review draws from a separate rate-limit bucket
+  from the PR-stage review, so a pass or two here catches issues without
+  spending PR-stage quota or triggering a CI re-run. This is a recommendation,
+  not a gate — CodeRabbit remains advisory only (see above).
+- Test ownership is mid-shift toward CodeRabbit, phased, not a hard cutover:
+  **Phase 1 (live)** — `.coderabbit.yaml` has it generate/review unit tests
+  and run a `pre_merge_checks` entry in `mode: "warning"`; this is a signal
+  only, nothing required changes. **Phase 2 (not started)** — flip that check
+  to `mode: "error"` and drop Jest from GitHub Actions' required checks, only
+  once warning-mode has been shown to agree with real Jest results across a
+  meaningful PR sample (zero false-negatives), recorded as a dated decision,
+  never inferred from silence or from this file going quiet on the topic.
+  Until that record exists, GitHub Actions' Jest suite is still the real,
+  required gate — do not treat `.coderabbit.yaml`'s current settings as
+  Phase 2. (Harsha's personal Claude Code / Codex configs carry a longer
+  version of this doctrine for cross-repo consistency; this paragraph is the
+  authoritative in-repo copy — if they ever disagree, this one wins here.)
 
 ## Business execution
 
