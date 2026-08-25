@@ -270,6 +270,18 @@ export class AttioAdapter implements CrmAdapter {
         const pullCustomMappings = config.customFieldMapping.filter(
             m => m.enabled && m.direction !== 'push'
         );
+        // Attio-only, pull-only (not wired into the webhook auto-sync — a Company
+        // record change never touches the linked Person's own attributes, so
+        // there's no reliable real-time trigger; this rides on Pull re-resolving
+        // each person's company fresh every run). Attribute types loaded once per
+        // run, only when actually configured, to avoid an extra API call for the
+        // common case where no company fields are mapped.
+        const pullCompanyMappings = (config.companyFieldMapping || []).filter(
+            m => m.enabled && m.direction !== 'push'
+        );
+        const companiesAttrCache = pullCompanyMappings.length > 0
+            ? await svc.loadAttributeTypes('companies')
+            : new Map<string, string>();
         const pullDealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'push');
         const standardEntryFields = ['company'];
         const nativeDealFields = ['status', 'dealValue', 'dealCurrency'];
@@ -343,6 +355,30 @@ export class AttioAdapter implements CrmAdapter {
                         const val = this.extractAttioValue(personValues[slug], type);
                         if (val != null && val !== '') {
                             customFields[m.agentwebField] = val;
+                        }
+                    }
+
+                    // Company field mapping — a separate fetch from the company-name
+                    // resolution above (getCompanyById), only made when the user has
+                    // actually mapped additional Company attributes. One extra API
+                    // call per person with a linked company, but only when opted in
+                    // (default empty mapping = zero extra calls for existing users).
+                    if (pullCompanyMappings.length > 0) {
+                        const companyRef = personValues['company']?.[0]?.target_record_id;
+                        if (companyRef) {
+                            try {
+                                const companyValues = await svc.getCompanyValues(companyRef);
+                                for (const m of pullCompanyMappings) {
+                                    const slug = m.crmProperty;
+                                    const type = companiesAttrCache.get(`object:companies:${slug}`) || 'text';
+                                    const val = this.extractAttioValue(companyValues[slug], type);
+                                    if (val != null && val !== '') {
+                                        customFields[m.agentwebField] = val;
+                                    }
+                                }
+                            } catch (e: any) {
+                                console.error(`[Attio-Pull] Failed to fetch company values for companyRef ${companyRef} (non-critical):`, e.message);
+                            }
                         }
                     }
 

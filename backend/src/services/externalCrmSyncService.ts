@@ -61,6 +61,10 @@ export interface ExternalCrmSyncConfig {
   contactFieldMapping: FieldMapping[];
   dealFieldMapping: FieldMapping[];
   customFieldMapping: FieldMapping[];
+  // Attio-only, pull-only (see DEFAULT_ATTIO_COMPANY_MAPPING for why).
+  // Optional — configs saved before this field existed won't have it;
+  // readers must treat a missing value as an empty mapping.
+  companyFieldMapping?: FieldMapping[];
   // Delete sync options
   deleteOnPush?: boolean;   // Delete CRM record when a local lead is deleted
   deleteOnPull?: boolean;   // Mark local lead as removed when CRM record is deleted
@@ -202,6 +206,17 @@ export const DEFAULT_ATTIO_CUSTOM_MAPPING: FieldMapping[] = [
   ...ATTRIBUTION_FIELD_MAPPING,
 ];
 
+// Attio-only: maps a Person's linked Attio Company record's own attributes
+// (industry, employee range, ARR, custom company attributes, etc.) into lead
+// custom fields. Pull-only by design — company field mapping is not wired
+// into the real-time webhook auto-sync (a Company record change never fires
+// an event on the linked Person, so there's no reliable real-time trigger;
+// this rides on the same manual/periodic Pull that already re-resolves each
+// person's company fresh on every run). Opt-in — empty by default, same as
+// DEFAULT_ATTIO_DEAL_MAPPING. HubSpot has no equivalent: its "company" is a
+// flat string property directly on the Contact, not a separate object.
+export const DEFAULT_ATTIO_COMPANY_MAPPING: FieldMapping[] = [];
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 // ─── Service ──────────────────────────────────────────────────────────────────
@@ -260,6 +275,7 @@ export class ExternalCrmSyncService {
       contactFieldMapping?: FieldMapping[];
       dealFieldMapping?: FieldMapping[];
       customFieldMapping?: FieldMapping[];
+      companyFieldMapping?: FieldMapping[];
       deleteOnPush?: boolean;
       deleteOnPull?: boolean;
       webhookEnabled?: boolean;
@@ -290,6 +306,8 @@ export class ExternalCrmSyncService {
       ?? (isHubspot ? DEFAULT_HUBSPOT_DEAL_MAPPING : DEFAULT_ATTIO_DEAL_MAPPING);
     const nextCustomFieldMapping = updates.customFieldMapping ?? existing?.customFieldMapping
       ?? (isHubspot ? DEFAULT_HUBSPOT_CUSTOM_MAPPING : DEFAULT_ATTIO_CUSTOM_MAPPING);
+    const nextCompanyFieldMapping = updates.companyFieldMapping ?? existing?.companyFieldMapping
+      ?? (isHubspot ? [] : DEFAULT_ATTIO_COMPANY_MAPPING);
 
     // HubSpot per-contact push constant. A non-CRM provider never carries it.
     // `null` is an explicit clear (→ undefined); `undefined` (key absent) preserves
@@ -342,6 +360,7 @@ export class ExternalCrmSyncService {
         ?? (isHubspot ? DEFAULT_HUBSPOT_CONTACT_MAPPING : DEFAULT_ATTIO_CONTACT_MAPPING),
       dealFieldMapping: nextDealFieldMapping,
       customFieldMapping: nextCustomFieldMapping,
+      companyFieldMapping: nextCompanyFieldMapping,
       deleteOnPush: updates.deleteOnPush ?? existing?.deleteOnPush ?? false,
       deleteOnPull: updates.deleteOnPull ?? existing?.deleteOnPull ?? false,
       webhookEnabled: updates.webhookEnabled ?? existing?.webhookEnabled ?? true,
@@ -443,6 +462,7 @@ export class ExternalCrmSyncService {
     contactFieldMapping: FieldMapping[];
     dealFieldMapping: FieldMapping[];
     customFieldMapping: FieldMapping[];
+    companyFieldMapping: FieldMapping[];
   }> {
     const isHubspot = provider === 'hubspot';
     if (isHubspot) {
@@ -450,12 +470,14 @@ export class ExternalCrmSyncService {
         contactFieldMapping: DEFAULT_HUBSPOT_CONTACT_MAPPING,
         dealFieldMapping: DEFAULT_HUBSPOT_DEAL_MAPPING,
         customFieldMapping: DEFAULT_HUBSPOT_CUSTOM_MAPPING,
+        companyFieldMapping: [],
       };
     } else {
       return {
         contactFieldMapping: DEFAULT_ATTIO_CONTACT_MAPPING,
         dealFieldMapping: DEFAULT_ATTIO_DEAL_MAPPING,
         customFieldMapping: DEFAULT_ATTIO_CUSTOM_MAPPING,
+        companyFieldMapping: DEFAULT_ATTIO_COMPANY_MAPPING,
       };
     }
   }
@@ -651,7 +673,7 @@ export class ExternalCrmSyncService {
     userId: string,
     listId: string,
     provider: string,
-    options: { objectType?: 'contact' | 'deal'; accountId?: string; apiKey?: string }
+    options: { objectType?: 'contact' | 'deal' | 'company'; accountId?: string; apiKey?: string }
   ): Promise<{ properties: CrmProperty[] }> {
     if (!['hubspot', 'attio'].includes(provider)) {
       throw new Error(`Unsupported provider: "${provider}". Supported: hubspot, attio`);
@@ -698,6 +720,15 @@ export class ExternalCrmSyncService {
       const attrs = await svc.listListAttributes(dealListId);
       return {
         properties: attrs.map((a: any) => ({ name: a.api_slug, label: a.title, type: a.type })),
+      };
+    }
+
+    // Attio-only Company object attributes — powers the Company Field Mapping
+    // section (pull-only; see DEFAULT_ATTIO_COMPANY_MAPPING for why).
+    if (options.objectType === 'company') {
+      const attrs = await svc.getAllObjectAttributes('companies');
+      return {
+        properties: attrs.map(a => ({ name: a.api_slug, label: a.title, type: a.type })),
       };
     }
 

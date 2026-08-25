@@ -693,6 +693,10 @@ export class AttioService {
     return this.getRecordValues('people', recordId);
   }
 
+  async getCompanyValues(recordId: string): Promise<Record<string, any>> {
+    return this.getRecordValues('companies', recordId);
+  }
+
 
 
   // ─── Generic Records ──────────────────────────────────────────────────────

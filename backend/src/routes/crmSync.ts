@@ -141,6 +141,7 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       contactFieldMapping: config.contactFieldMapping,
       dealFieldMapping: config.dealFieldMapping,
       customFieldMapping: config.customFieldMapping,
+      companyFieldMapping: config.companyFieldMapping ?? [],
       deleteOnPush: config.deleteOnPush ?? false,
       deleteOnPull: config.deleteOnPull ?? false,
       webhookEnabled: config.webhookEnabled ?? true,
@@ -182,7 +183,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
 
     const {
       accountId, apiKey, autoSyncEnabled,
-      contactFieldMapping, dealFieldMapping, customFieldMapping,
+      contactFieldMapping, dealFieldMapping, customFieldMapping, companyFieldMapping,
       deleteOnPush, deleteOnPull, webhookEnabled,
       externalPipelineId, listName,
       hubspotLifecycleStage, hubspotMarkAsNonMarketing,
@@ -213,7 +214,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
 
     const config = await externalCrmSyncService.saveConfig(userId, listId, provider, {
       accountId, apiKey, autoSyncEnabled,
-      contactFieldMapping, dealFieldMapping, customFieldMapping,
+      contactFieldMapping, dealFieldMapping, customFieldMapping, companyFieldMapping,
       deleteOnPush, deleteOnPull, webhookEnabled,
       externalPipelineId, listName,
       hubspotLifecycleStage, hubspotMarkAsNonMarketing,
@@ -247,6 +248,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       contactFieldMapping: config.contactFieldMapping,
       dealFieldMapping: config.dealFieldMapping,
       customFieldMapping: config.customFieldMapping,
+      companyFieldMapping: config.companyFieldMapping ?? [],
       deleteOnPush: config.deleteOnPush ?? false,
       deleteOnPull: config.deleteOnPull ?? false,
       webhookEnabled: config.webhookEnabled ?? true,
@@ -307,8 +309,9 @@ router.delete('/config/:listId/:provider', async (req: any, res) => {
 
 // ─── External property discovery ─────────────────────────────────────────────
 
-// GET /api/crm-sync/external-properties/:listId/:provider?objectType=contact|deal
+// GET /api/crm-sync/external-properties/:listId/:provider?objectType=contact|deal|company
 // Returns CRM properties/attributes for use in the mapping dropdowns.
+// objectType=company is Attio-only (see companyFieldMapping's doc comment).
 router.get('/external-properties/:listId/:provider', async (req: any, res) => {
   try {
     const userId = req.user?.userId;
@@ -323,7 +326,7 @@ router.get('/external-properties/:listId/:provider', async (req: any, res) => {
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const { objectType, accountId, apiKey } = req.query as {
-      objectType?: 'contact' | 'deal';
+      objectType?: 'contact' | 'deal' | 'company';
       accountId?: string;
       apiKey?: string;
     };
