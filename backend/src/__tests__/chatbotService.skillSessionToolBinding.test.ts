@@ -60,7 +60,7 @@ const mockAgentModeService = {
 jest.mock('../services/agentModeService', () => {
   const AgentModeService = jest.fn().mockImplementation(() => mockAgentModeService);
   Object.assign(AgentModeService, {
-    FOUNDATION_TOOLS: ['send_notification'],
+    FOUNDATION_TOOLS: new Set(['send_notification']),
     buildWorkPlanContextMessages: jest.fn().mockReturnValue([]),
   });
   return { AgentModeService, agentModeService: mockAgentModeService };
@@ -591,10 +591,16 @@ describe('generateChatResponse — ENG-1222 risk-hardening: perf, anonymous user
     seedSession({ associatedSkills: ['google-ads-skill'] });
     mockGetAllowedSkills.mockResolvedValue(['*']);
     // allowedToolNames names a tool that isn't registered anywhere — the exact
-    // "unregistered tool name" failure mode the gate exists to catch — while
-    // read_page_source (a customer-context default, unrelated to this skill)
-    // resolves to a real definition via the mocked registry.
-    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(['unregistered_skill_tool']), installedSkillContextMsg: '' });
+    // "unregistered tool name" failure mode the gate exists to catch — plus
+    // send_notification, a FOUNDATION_TOOL that buildSkillContext unions into
+    // every session's allowedToolNames unconditionally (real behavior, not
+    // specific to this skill). Both it and read_page_source (a customer-context
+    // default) resolve to real definitions via the mocked registry, but neither
+    // proves the *skill's* own tool bound — the gate must still fire.
+    mockBuildSkillContext.mockReturnValue({
+      allowedToolNames: new Set(['unregistered_skill_tool', 'send_notification']),
+      installedSkillContextMsg: '',
+    });
 
     const response = await generateChatResponse('sess-1', 'Run list_connected_accounts', {
       portalType: 'customer',
