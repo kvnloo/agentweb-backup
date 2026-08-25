@@ -149,6 +149,7 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       hubspotLifecycleStage: config.hubspotLifecycleStage,
       hubspotMarkAsNonMarketing: config.hubspotMarkAsNonMarketing ?? false,
       externalPipelineId: config.externalPipelineId,
+      attioDealListId: config.attioDealListId,
       lastPushSyncAt: config.lastPushSyncAt,
       lastPullSyncAt: config.lastPullSyncAt,
       lastSyncStatus: config.lastSyncStatus,
@@ -185,7 +186,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       accountId, apiKey, autoSyncEnabled,
       contactFieldMapping, dealFieldMapping, customFieldMapping, companyFieldMapping,
       deleteOnPush, deleteOnPull, webhookEnabled,
-      externalPipelineId, listName,
+      externalPipelineId, attioDealListId, listName,
       hubspotLifecycleStage, hubspotMarkAsNonMarketing,
     } = req.body;
 
@@ -216,7 +217,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       accountId, apiKey, autoSyncEnabled,
       contactFieldMapping, dealFieldMapping, customFieldMapping, companyFieldMapping,
       deleteOnPush, deleteOnPull, webhookEnabled,
-      externalPipelineId, listName,
+      externalPipelineId, attioDealListId, listName,
       hubspotLifecycleStage, hubspotMarkAsNonMarketing,
     });
 
@@ -256,6 +257,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       hubspotLifecycleStage: config.hubspotLifecycleStage,
       hubspotMarkAsNonMarketing: config.hubspotMarkAsNonMarketing ?? false,
       externalPipelineId: config.externalPipelineId,
+      attioDealListId: config.attioDealListId,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
       // Webhook URL — secret embedded as query param so HubSpot/Attio can call it with no custom headers
@@ -418,17 +420,18 @@ router.get('/external-pipelines/:listId/:provider', async (req: any, res) => {
 });
 
 // PUT /api/crm-sync/config/:listId/:provider/pipeline
-// Re-points a HubSpot list to a different deal pipeline AFTER the first sync
-// (the normal config save locks the pipeline once synced). The client then
-// triggers a push (POST /push/...) to migrate existing deals into the new pipeline.
+// Re-points a list to a different deal pipeline (HubSpot) or deal list
+// (Attio) AFTER the first sync (the normal config save locks it once
+// synced). The client then triggers a push (POST /push/...) to migrate
+// existing deals into the new pipeline/list.
 router.put('/config/:listId/:provider/pipeline', async (req: any, res) => {
   try {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const { listId, provider } = req.params;
-    if (provider !== 'hubspot') {
-      return res.status(400).json({ error: 'Changing the deal pipeline is only supported for HubSpot.' });
+    if (!['hubspot', 'attio'].includes(provider)) {
+      return res.status(400).json({ error: 'Changing the deal pipeline/list is only supported for HubSpot and Attio.' });
     }
 
     const ownership = await verifyListOwnership(userId, listId);

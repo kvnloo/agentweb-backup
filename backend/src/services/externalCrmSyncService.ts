@@ -279,8 +279,9 @@ export class ExternalCrmSyncService {
       deleteOnPush?: boolean;
       deleteOnPull?: boolean;
       webhookEnabled?: boolean;
-      // Pipeline selection — only honoured before first sync (server enforces the lock)
+      // Pipeline/list selection — only honoured before first sync (server enforces the lock)
       externalPipelineId?: string;   // HubSpot: chosen deal pipeline ID
+      attioDealListId?: string;      // Attio: chosen deal-list ID
       listName?: string;
       // HubSpot push constant applied to every synced contact
       hubspotLifecycleStage?: string | null;     // null/'' clears the override
@@ -339,12 +340,15 @@ export class ExternalCrmSyncService {
       ? existing?.externalPipelineId
       : (isHubspot ? (updates.externalPipelineId ?? existing?.externalPipelineId) : undefined);
 
-    // Attio deal-list ID — resolved/cached by attioAdapter.pushLeads on first push,
-    // not settable via saveConfig updates. Once a sync has happened, preserve it
-    // unconditionally (same lock as the HubSpot pipeline above); before that,
-    // carry forward whatever was already cached (there's nothing else to source it
-    // from here — saveConfig never creates the Attio list itself).
-    const resolvedAttioDealListId = existing?.attioDealListId;
+    // Attio deal-list ID. Pre-sync, the user can pre-select an existing Attio
+    // list from the picker (mirrors HubSpot's externalPipelineId pattern above)
+    // — otherwise it's resolved/created lazily by attioAdapter.pushLeads on
+    // first push. Once a sync has happened, it's locked (same lock as the
+    // HubSpot pipeline above); re-pointing post-sync goes through
+    // changePipeline instead, not a normal saveConfig update.
+    const resolvedAttioDealListId = alreadySynced
+      ? existing?.attioDealListId
+      : (!isHubspot ? (updates.attioDealListId ?? existing?.attioDealListId) : undefined);
 
     const config: ExternalCrmSyncConfig = {
       provider: provider as 'hubspot' | 'attio',
@@ -623,11 +627,11 @@ export class ExternalCrmSyncService {
     provider: string,
     newPipelineId: string
   ): Promise<ExternalCrmSyncConfig> {
-    if (provider !== 'hubspot') {
-      throw new Error('Changing the deal pipeline is only supported for HubSpot.');
+    if (provider !== 'hubspot' && provider !== 'attio') {
+      throw new Error('Changing the deal pipeline/list is only supported for HubSpot and Attio.');
     }
     if (!newPipelineId) {
-      throw new Error('A target pipeline is required.');
+      throw new Error('A target pipeline/list is required.');
     }
 
     const config = await this.getConfig(userId, listId, provider);
@@ -636,22 +640,63 @@ export class ExternalCrmSyncService {
       throw new Error('No authentication configured for this list.');
     }
 
-    // Validate the target pipeline exists in the connected HubSpot account.
-    const svc = await this.getHubSpotService(this.resolveAuth(config));
-    const pipelines = await svc.listDealPipelines();
-    if (!pipelines.some(p => p.id === newPipelineId)) {
-      throw new Error(`Pipeline not found in HubSpot: ${newPipelineId}`);
+    if (provider === 'hubspot') {
+      // Validate the target pipeline exists in the connected HubSpot account.
+      const svc = await this.getHubSpotService(this.resolveAuth(config));
+      const pipelines = await svc.listDealPipelines();
+      if (!pipelines.some(p => p.id === newPipelineId)) {
+        throw new Error(`Pipeline not found in HubSpot: ${newPipelineId}`);
+      }
+
+      // Bypass the saveConfig "locked after sync" guard: write the new pipeline and
+      // clear the stale stage map so the next push recomputes it for the new pipeline.
+      const updated: ExternalCrmSyncConfig = {
+        ...config,
+        externalPipelineId: newPipelineId,
+        hubspotDealStageMap: undefined,
+        updatedAt: new Date().toISOString(),
+      };
+      await crmDb.setLeadListCrmSyncConfig(listId, provider, updated as any);
+      return updated;
     }
 
-    // Bypass the saveConfig "locked after sync" guard: write the new pipeline and
-    // clear the stale stage map so the next push recomputes it for the new pipeline.
+    // provider === 'attio'
+    const auth = this.resolveAuth(config);
+    const svc = auth.type === 'token' ? AttioService.fromToken(auth.apiKey!) : await AttioService.create(auth.userId!, auth.accountId!);
+    const lists = await svc.getAllLists();
+    if (!lists.some(l => l.id === newPipelineId)) {
+      throw new Error(`List not found in Attio: ${newPipelineId}`);
+    }
+
+    // Bypass the saveConfig "locked after sync" guard: write the new list.
     const updated: ExternalCrmSyncConfig = {
       ...config,
-      externalPipelineId: newPipelineId,
-      hubspotDealStageMap: undefined,
+      attioDealListId: newPipelineId,
       updatedAt: new Date().toISOString(),
     };
     await crmDb.setLeadListCrmSyncConfig(listId, provider, updated as any);
+
+    // Leads already synced to the OLD list carry a stale attio_list_entry_id
+    // pointing at an entry in that list. A re-push's updateListEntry would
+    // then reference an entry id that doesn't exist in the NEW list. Clear
+    // that pointer for every lead in this AgentWeb list — the next push's
+    // findListEntry/addPersonToList fallback recreates the entry fresh in
+    // the new list from the lead's own fields (the same source of truth a
+    // push already uses), rather than needing a bespoke migration copier.
+    // Same shape as markRemovedLeads' existing every-lead-in-a-list write.
+    let cursor: any;
+    do {
+      const page = await crmDb.getLeadsByListId(listId, 500, cursor);
+      for (const lead of page.items) {
+        if (lead.syncMetadata?.attio_list_entry_id) {
+          const syncMetadata = { ...lead.syncMetadata };
+          delete syncMetadata.attio_list_entry_id;
+          await crmDb.updateLead(listId, lead.leadId, { syncMetadata }).catch(() => {});
+        }
+      }
+      cursor = page.lastEvaluatedKey;
+    } while (cursor);
+
     return updated;
   }
 
