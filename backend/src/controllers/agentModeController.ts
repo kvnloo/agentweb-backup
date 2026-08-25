@@ -3,6 +3,7 @@ import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
+import { computeSessionModelAttribution } from '../utils/sessionModelAttribution';
 import { scheduleDb, userDb, taskDb, scheduleTemplateDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
@@ -7088,11 +7089,23 @@ export const agentModeController = {
       }
 
       // Filter out tool messages and assistant messages with tool calls for user display
+      // ENG-892/ENG-1313 follow-on: session.llmModel/llmUsagePolicyDecision are only the
+      // model PICKER's last selection, not provenance — a session can run on one model,
+      // hit a hard stop, and continue on a different one without either field ever
+      // reflecting the switch (see ENG-1565/ENG-1579 incident: llmModel and
+      // llmUsagePolicyDecision.effectiveModel both reported gemini-3.7-flash "honored"
+      // for a session whose transcript shows it actually ran on GLM the entire time it
+      // was spiraling). get_chat_history already computes the correct transcript-derived
+      // attribution for the aggregate report; this single-session view previously did
+      // not expose it at all, so reading a session's own detail page — the natural place
+      // to investigate one incident — silently trusted the misleading field.
+      const modelAttribution = computeSessionModelAttribution(session.messages, session.llmModel || null);
       const filteredSession = {
         ...session,
         messages: filterMessagesForClient(session.messages),
         hasActiveProgress: progressActive,
-        skills
+        skills,
+        ...modelAttribution,
       };
 
       res.json(filteredSession);
