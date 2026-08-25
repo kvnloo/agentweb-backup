@@ -242,6 +242,10 @@ function deriveDomainFromEmail(email: string): string | undefined {
 
 function sanitizeConnectedAccountForOrgResponse(account: any): any {
   const safeConfig: Record<string, any> = {};
+  // Daily outreach limits are account-activity data, not org-shared connection
+  // metadata. The owner-facing account endpoint has its own explicit contract;
+  // this member-visible projection must not expose the cap, count, or window.
+  const privateOperationalKeys = new Set(['daily_invite_cap', 'daily_volume']);
   for (const [key, value] of Object.entries(account.config || {})) {
     const normalizedKey = key.toLowerCase();
     const looksCredentialLike =
@@ -251,7 +255,7 @@ function sanitizeConnectedAccountForOrgResponse(account: any): any {
       normalizedKey.includes("secret") ||
       normalizedKey === "api_key" ||
       normalizedKey === "apikey";
-    if (!looksCredentialLike) {
+    if (!looksCredentialLike && !privateOperationalKeys.has(normalizedKey)) {
       safeConfig[key] = value;
     }
   }
