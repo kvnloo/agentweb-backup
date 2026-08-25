@@ -15,7 +15,12 @@ tone_instructions: >
 knowledge_base:
   automatic_repository_linking: true # flag breaking changes to agentweb-customer-portal / landing-page
   code_guidelines:
-    filePatterns: ["**/*.md"] # ground reviews in CLAUDE.md/AGENTS.md/dev.md, not just the diff
+    # Explicit allowlist, NOT "**/*.md" — CodeRabbit applies every matched file as review
+    # criteria, so a blanket glob would let a PR edit README.md (or any other doc) and have
+    # that edit change its own review guidance. CodeRabbit flagged this on the sibling portal
+    # PR (#1115) and the same risk applies here. Only these named, deliberately-maintained
+    # policy docs count.
+    filePatterns: ["CLAUDE.md", "AGENTS.md", "dev.md", "backend/docs/**/*.md"]
 
 chat:
   auto_reply: true
@@ -52,10 +57,14 @@ reviews:
   auto_review:
     enabled: true
     auto_incremental_review: true
-    # Re-review after every 5 commits instead of on every push — agreed with CodeRabbit CS
-    # (Chris Hester, Sara Weiss) on the 2026-08-24/25 rate-limit calls. AgentWeb's agent-driven
-    # workflow pushes many small commits per PR; per-push review was burning both the PR-stage
-    # rate limit and the GitHub Actions bill re-running CI on each CodeRabbit round-trip.
+    # NOT "batching" — auto_incremental_review reviews each eligible push normally, and once 5
+    # commits have been reviewed this way, automatic review PAUSES entirely for the rest of the
+    # PR until someone runs `@coderabbitai review` manually (CodeRabbit caught an earlier,
+    # inaccurate version of this comment on agentweb#2630). That pause is still the behavior we
+    # want: AgentWeb's agent-driven workflow pushes many small commits per PR, and unattended
+    # per-push review was burning both the PR-stage rate limit and the GitHub Actions bill
+    # re-running CI on each CodeRabbit round-trip — this just stops it outright past 5 rather
+    # than spacing it out. Agreed with CodeRabbit CS (Chris Hester, Sara Weiss), 2026-08-24/25.
     auto_pause_after_reviewed_commits: 5
     # Deliberately NOT drafts: true — draft PRs skip review here on purpose. The whole point of
     # the local CLI workflow (AGENTS.md, coderabbit-test-ownership.md) is: iterate locally while
@@ -68,11 +77,15 @@ reviews:
 
   # Test/mock/generated files add PR-review noise without much signal — reviewing agent-authored
   # test scaffolding was flagged as wasted review budget on the call. Excluded from review, not
-  # from the repo — CI still runs them.
+  # from the repo — CI still runs them. This governs line-by-line REVIEW scope only; it's a
+  # separate mechanism from finishing_touches.unit_tests (generation) and the test-authorship
+  # path_instructions below (which conventions to follow when generating) — excluding a file from
+  # review doesn't stop CodeRabbit from generating a new one that follows those conventions.
   path_filters:
     - "!**/*.test.ts"
     - "!**/*.test.tsx"
     - "!**/*.spec.ts"
+    - "!**/*.spec.tsx"
     - "!**/__tests__/**"
     - "!**/__mocks__/**"
     - "!**/node_modules/**"
@@ -147,9 +160,8 @@ reviews:
         instructions: >
           Verify this PR's changes are consistent with the existing test suite's conventions
           (Jest + supertest, mocked auth/external services, happy-path + auth-failure +
-          missing-field + boundary coverage). This is a WARNING-only signal for now, not a merge
-          block — GitHub Actions' Jest suite remains the actual required gate. Do not report this
-          as a merge-blocking failure; report it as a note for the author to review.
+          missing-field + boundary coverage). This is a WARNING-only signal — report it as a note
+          for the author to review, never as a merge-blocking failure, regardless of what it finds.
       # From the enterprise example — AgentWeb handles customer data, ad-account/CRM
       # connections, and has an open path-traversal investigation on file. All warning-only.
       - name: "Sensitive Data Protection and Privacy"
