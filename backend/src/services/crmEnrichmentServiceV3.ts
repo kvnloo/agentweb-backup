@@ -97,6 +97,17 @@ export interface EnrichmentConfig {
   schemaVersion: 1;
   updatedAt: string;
   updatedBy: string;
+  /**
+   * Opt-in for the CRM auto-enrichment cron (ENG-88). When `true`, the cron
+   * (`cron/crmAutoEnrichmentCron.ts`) periodically enriches this list's
+   * un-enriched leads through this same saved config — no human clicking
+   * "renew". Defaults to `false`/unset: automation only ever runs for a list
+   * where a human has explicitly opted in via this saved config (PUT
+   * /lists/:listId/enrichment-config), so every existing list's behavior is
+   * unchanged until someone deliberately flips it. Deliberately NOT part of
+   * `buildDefaultConfig` — an unsaved (default) config is never auto-enriched.
+   */
+  autoEnrich?: boolean;
 }
 
 export interface RunEnrichmentInput {

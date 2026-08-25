@@ -4,6 +4,12 @@
  * "external" for the rest of the process lifetime.
  */
 
+// Force module scope (no other import/export in this file) — without it, TS
+// treats this as a global script and its top-level `const mockUsersInfo`
+// collides with the same name in slackService.resolveSlackMentions.test.ts
+// (TS2451).
+export {};
+
 const mockUsersInfo = jest.fn();
 const mockAuthTest = jest.fn();
 

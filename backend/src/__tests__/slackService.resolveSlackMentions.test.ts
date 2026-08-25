@@ -3,11 +3,16 @@
  * Uses jest.isolateModules so SLACK_BOT_TOKEN is set before the module initializes.
  */
 
-const mockResolveMentionsUsersInfo = jest.fn();
+// Force module scope (no other import/export in this file) — without it, TS
+// treats this as a global script and its top-level `const mockUsersInfo`
+// collides with the same name in slackService.teamIdCache.test.ts (TS2451).
+export {};
+
+const mockUsersInfo = jest.fn();
 
 jest.mock('@slack/web-api', () => ({
   WebClient: jest.fn().mockImplementation(() => ({
-    users: { info: mockResolveMentionsUsersInfo },
+    users: { info: mockUsersInfo },
   })),
 }));
 
@@ -31,7 +36,7 @@ describe('resolveSlackMentionsInText', () => {
   });
 
   it('resolves a single user mention to display name', async () => {
-    mockResolveMentionsUsersInfo.mockResolvedValue({
+    mockUsersInfo.mockResolvedValue({
       ok: true,
       user: { profile: { display_name: 'Fangfang Li', real_name: 'Fangfang Li' }, real_name: 'Fangfang Li' },
     });
@@ -41,7 +46,7 @@ describe('resolveSlackMentionsInText', () => {
   });
 
   it('resolves multiple distinct user mentions', async () => {
-    mockResolveMentionsUsersInfo.mockImplementation(({ user }: { user: string }) => {
+    mockUsersInfo.mockImplementation(({ user }: { user: string }) => {
       const names: Record<string, string> = { U111: 'Alice', U222: 'Bob' };
       return Promise.resolve({
         ok: true,
@@ -54,25 +59,25 @@ describe('resolveSlackMentionsInText', () => {
   });
 
   it('deduplicates API calls for repeated mentions of the same user', async () => {
-    mockResolveMentionsUsersInfo.mockResolvedValue({
+    mockUsersInfo.mockResolvedValue({
       ok: true,
       user: { profile: { display_name: 'Carol', real_name: 'Carol' }, real_name: 'Carol' },
     });
 
     const result = await resolveSlackMentionsInText('<@UCAROL> said hi, and then <@UCAROL> said bye');
     expect(result).toBe('@Carol said hi, and then @Carol said bye');
-    expect(mockResolveMentionsUsersInfo).toHaveBeenCalledTimes(1);
+    expect(mockUsersInfo).toHaveBeenCalledTimes(1);
   });
 
   it('falls back to raw user ID when Slack API call fails', async () => {
-    mockResolveMentionsUsersInfo.mockRejectedValue(new Error('Slack API error'));
+    mockUsersInfo.mockRejectedValue(new Error('Slack API error'));
 
     const result = await resolveSlackMentionsInText('Please ask <@UUNKNOWN> for details');
     expect(result).toBe('Please ask @UUNKNOWN for details');
   });
 
   it('preserves surrounding text unchanged', async () => {
-    mockResolveMentionsUsersInfo.mockResolvedValue({
+    mockUsersInfo.mockResolvedValue({
       ok: true,
       user: { profile: { display_name: 'Dave', real_name: 'Dave' }, real_name: 'Dave' },
     });

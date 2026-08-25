@@ -35,6 +35,7 @@ import {
   updateLandingPageContext,
   updateLandingPageLeadList,
   syncLeadCaptureFilesToRepo,
+  NO_CAPTURE_LAYER,
   recordLandingPagePublish,
   markLandingPagePublishReverted,
   INTEGRATIONS,
@@ -407,6 +408,27 @@ router.get("/site", async (req: Request, res: Response) => {
       vercelProjectId: site.vercelProjectId,
       githubRepoUrl: site.githubRepoUrl,
       gtmContainerId: site.gtmContainerId,
+      /*
+       * ENG-1527. The site's Google Ads conversion tag, alongside the GTM container it
+       * sits next to on the record.
+       *
+       * The record has carried these since the tag work landed; this endpoint projected a
+       * fixed five fields and dropped them, so the only way to see whether a site's
+       * conversion tag exists was to read DynamoDB. That is the same class of gap as a
+       * warning computed and discarded: the data is right there and nobody can see it.
+       *
+       * `googleAdsTrackingInstalled` is the one that matters most and is deliberately
+       * normalised to a boolean rather than passed through as possibly-undefined. Undefined
+       * means "we never recorded an outcome", which a UI would render the same as `false`
+       * anyway; collapsing it here keeps every consumer from having to decide. It carries
+       * more weight than its Meta sibling because Google has no server-side leg until
+       * ENG-1325 — false means the lander shipped with NO Google measurement at all, which
+       * is exactly what RULE 7.5 refuses a launch over.
+       */
+      googleAdsConversionId: site.googleAdsConversionId,
+      googleAdsConversionLabel: site.googleAdsConversionLabel,
+      googleAdsCustomerId: site.googleAdsCustomerId,
+      googleAdsTrackingInstalled: site.googleAdsTrackingInstalled === true,
       deployStatus,
     });
   } catch (err) {
@@ -2612,7 +2634,11 @@ router.post("/generated/:id/google-ads", editRateLimiter, async (req, res: Respo
       ? "Base tag installed, but no conversion label was provided — conversions cannot be attributed until one is set."
       : undefined;
 
-    await saveGoogleAdsForPage(page, conversionId, label, googleAdsCustomerId?.trim() || undefined);
+    // ENG-1525: `|| undefined` collapsed an explicit `""` (clear this) into "not
+    // mentioned", which is the distinction updateLandingPageGoogleAds now relies on.
+    // Same shape as `label` two lines up.
+    const customerId = typeof googleAdsCustomerId === "string" ? googleAdsCustomerId.trim() : undefined;
+    await saveGoogleAdsForPage(page, conversionId, label, customerId);
 
     res.json({
       success: true,
@@ -2642,7 +2668,7 @@ async function saveMetaPixelForPage(
   page: GeneratedLandingPage,
   pixelId: string,
   accountId?: string,
-): Promise<void> {
+): Promise<string | undefined> {
   if (!page.githubRepoUrl) throw new Error("Landing page has no GitHub repository");
 
   const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
@@ -2725,7 +2751,35 @@ async function saveMetaPixelForPage(
     }
     return listByPath;
   };
-  await syncLeadCaptureFilesToRepo(repoFullName, buildListByPath, pixelId || undefined, pixelId ? accountId : undefined);
+  const captureSync = await syncLeadCaptureFilesToRepo(
+    repoFullName,
+    buildListByPath,
+    pixelId || undefined,
+    pixelId ? accountId : undefined,
+  );
+  // The base pixel snippet goes into the layout regardless, but the SERVER-side half lives in
+  // the capture route — and on a repo the platform does not own we refuse to write it. Saying
+  // "Meta Pixel injected" here would report full tracking while CAPI was never configured.
+  // ⚠ `!committed &&` is load-bearing, not defensive noise: a successful sync carries
+  // `reason: undefined`, and in any suite that mocks v0Service with an object literal the
+  // imported NO_CAPTURE_LAYER is ALSO undefined — so a bare equality would fire this warning
+  // on every successful pixel install under test.
+  // ⚠ Two distinct silent-partials, and `committed` alone catches neither:
+  //   - the floor refused the repo outright (NO_CAPTURE_LAYER, committed:false)
+  //   - the commit landed but deliberately EXCLUDED the capture route (captureRouteSkipped)
+  // Either way the requested pixel is not in the capture route, so "Meta Pixel injected" on
+  // its own would claim server-side tracking that does not exist.
+  const verb = pixelId ? "updated" : "removed";
+  const captureWarning =
+    !captureSync.committed && captureSync.reason === NO_CAPTURE_LAYER
+      ? `The browser pixel was ${verb}, but this site does not use the platform's lead-capture ` +
+        "code, so server-side conversion tracking was not configured for it. Wire it in the " +
+        "site's own repository."
+      : captureSync.captureRouteSkipped
+        ? `The browser pixel was ${verb}, but this site's lead-capture route could not be read, ` +
+          "so it was left exactly as deployed and does not carry this change. Fix the route in " +
+          "the site's repository."
+        : undefined;
 
   // 3. Persist metaPixelId/metaAdAccountId on this record.
   await updateLandingPageMetaPixel(page.id, page.userId, pixelId, accountId);
@@ -2760,6 +2814,8 @@ async function saveMetaPixelForPage(
       console.warn(`[LP GENERATION] Could not trigger Vercel re-deploy after Meta Pixel inject: ${deployErr.message}`);
     }
   }
+
+  return captureWarning;
 }
 
 // ---------------------------------------------------------------------------
@@ -2785,7 +2841,7 @@ router.post("/generated/:id/meta-pixel", editRateLimiter, async (req, res: Respo
       return res.status(400).json({ error: "Invalid Meta pixel id. Expected a numeric id." });
     }
 
-    await saveMetaPixelForPage(page, trimmed, accountId);
+    const captureWarning = await saveMetaPixelForPage(page, trimmed, accountId);
 
     res.json({
       success: true,
@@ -2793,6 +2849,7 @@ router.post("/generated/:id/meta-pixel", editRateLimiter, async (req, res: Respo
       message: trimmed
         ? `Meta Pixel ${trimmed} injected. Your site will redeploy shortly.`
         : "Meta Pixel removed. Your site will redeploy shortly.",
+      ...(captureWarning ? { warnings: [captureWarning] } : {}),
     });
   } catch (error: any) {
     console.error("[LP GENERATION] Error injecting Meta Pixel:", error);
@@ -3068,7 +3125,17 @@ async function syncLeadCaptureForPage(
       rootRecord?.metaAdAccountId,
     );
     if (result.committed || result.reason === "up-to-date") return undefined;
-    return `Lead list saved, but the live site was not updated (${result.reason}). It will be applied on the next deploy or retry.`;
+    // Attaching and DETACHING both come through here; "saved" is wrong for a removal.
+    const lead = leadListId === null ? "Lead list removed" : "Lead list saved";
+    // Not transient: no retry or redeploy installs a capture layer we refuse to install, so
+    // this must not borrow the "applied on the next deploy" wording below.
+    if (result.reason === NO_CAPTURE_LAYER) {
+      return (
+        `${lead}, but this page's site does not use the platform's lead-capture code, ` +
+        "so its form was not changed. Wire the form up in the site's own repository."
+      );
+    }
+    return `${lead}, but the live site was not updated (${result.reason}). It will be applied on the next deploy or retry.`;
   } catch (err: any) {
     // syncLeadCaptureFilesToRepo does not throw, so this is a sibling-fetch failure.
     console.error(`[LP GENERATION] ENG-310: lead-capture sync failed for page ${page.id}:`, err?.message || err);

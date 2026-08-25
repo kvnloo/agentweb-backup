@@ -2115,6 +2115,48 @@ const createSocialEngagementTrackingTable = async () => {
   }
 };
 
+// ENG-916: per-campaign, per-day Meta ad metrics + CRM lead-count snapshots.
+// New, empty, additive-only table — doesn't touch or migrate any existing data.
+// campaignId+date is the full key; the daily cron overwrites the last few days
+// each run (attribution-window settling), which is a deliberate idempotent
+// overwrite, not a duplicate-prevention concern.
+const createMetaAdsMetricsSnapshotsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-MetaAdsMetricsSnapshots`,
+    AttributeDefinitions: [
+      { AttributeName: 'campaignId', AttributeType: 'S' },
+      { AttributeName: 'date', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'campaignId', KeyType: 'HASH' },
+      { AttributeName: 'date', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'userId-date-index',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'date', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const createBrowserCookiesTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-BrowserCookies`,
@@ -2499,6 +2541,7 @@ const main = async () => {
     await createAccountMemoryTable();
     await createOrgMemoryTable();
     await createSocialEngagementTrackingTable();
+    await createMetaAdsMetricsSnapshotsTable();
     await createBrowserCookiesTable();
     await createOrganizationsTable();
     await createScheduleTemplatesTable();

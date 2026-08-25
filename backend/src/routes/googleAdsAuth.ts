@@ -244,6 +244,9 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
           customer_id: leaf.customerId,
           currency: leaf.currency || 'USD',
           login_customer_id: leaf.loginCustomerId,
+          // ENG-1362: recorded at connect time from the discovery query, so nothing
+          // downstream has to infer spend risk from the account name.
+          test_account: leaf.testAccount === true,
           access_token: session.tokens.access_token,
           refresh_token: session.tokens.refresh_token,
           token_expires_at: tokenExpiresAt,

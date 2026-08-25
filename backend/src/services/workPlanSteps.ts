@@ -20,6 +20,11 @@ const WORK_PLAN_STEP_FIELDS = new Set([
   'requiredFunctionCalls',
   'skillIds',
   'expectedAssetCount',
+  // ENG-1331: added alongside expectedAssetCount specifically so it can never
+  // repeat that exact ENG-889 history — this list is the ONLY thing standing
+  // between a field and being silently dropped on the very next admin edit of
+  // any field on the step, however unrelated.
+  'expectedAssetCountTools',
   'inputRequest',
 ]);
 
@@ -81,6 +86,27 @@ export function normalizeWorkPlanSteps(steps: any[]): NormalizedWorkPlanSteps {
       keepAssetCount = false;
     }
 
+    // ENG-1331: same "only include if explicitly supplied and valid" shape as
+    // expectedAssetCount above — an unset field is omitted entirely (so a merge
+    // preserves whatever was there), but an EXPLICIT empty array is kept as-is
+    // (a real "count across every producing tool" instruction, not "no opinion").
+    const assetCountTools = s.expectedAssetCountTools;
+    let keepAssetCountTools = assetCountTools !== undefined;
+    let usableAssetCountTools: string[] = [];
+    if (assetCountTools !== undefined) {
+      if (!Array.isArray(assetCountTools)) {
+        warnings.push(`step ${i + 1}: ignored expectedAssetCountTools — expected an array`);
+        keepAssetCountTools = false;
+      } else {
+        usableAssetCountTools = assetCountTools.filter((entry: unknown) => typeof entry === 'string' && entry !== '');
+        if (usableAssetCountTools.length !== assetCountTools.length) {
+          warnings.push(
+            `step ${i + 1}: dropped ${assetCountTools.length - usableAssetCountTools.length} non-string entries from expectedAssetCountTools`,
+          );
+        }
+      }
+    }
+
     return {
       stepCount: s.stepCount || i + 1,
       title: s.title || `Step ${i + 1}`,
@@ -89,6 +115,7 @@ export function normalizeWorkPlanSteps(steps: any[]): NormalizedWorkPlanSteps {
       requiredFunctionCalls: listOf('requiredFunctionCalls'),
       skillIds: listOf('skillIds'),
       ...(keepAssetCount && { expectedAssetCount: assetCount }),
+      ...(keepAssetCountTools && { expectedAssetCountTools: usableAssetCountTools }),
       ...(s.inputRequest !== undefined && { inputRequest: s.inputRequest }),
     };
   });
@@ -125,6 +152,7 @@ const STEP_CONTENT_FIELDS = [
   'skillIds',
   'userInstructions',
   'expectedAssetCount',
+  'expectedAssetCountTools',
   'inputRequest',
 ] as const;
 

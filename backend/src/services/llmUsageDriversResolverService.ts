@@ -25,6 +25,7 @@
  */
 
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
+import { contentAuthorityOver } from "./orgContentAuthority";
 import {
   readBilledLedgerRows,
   resolvePooledLedgerUserIds,
@@ -173,6 +174,21 @@ export interface ScheduleDriver {
   recommendedModel: string | null;
   estimatedDaysRecovered: number | null;
   confidence: RecommendationConfidence | null;
+  /**
+   * Whether THIS caller can actually change this schedule's model (ENG-1533).
+   *
+   * Schedules are pooled across every org member, so this list routinely shows
+   * a caller a colleague's work. `llmModelChangeService` correctly refuses a
+   * plain member's write on it — which meant the UI offered a Confirm button
+   * whose only possible outcome was an error. Answering the authority question
+   * here, with the SAME predicate the write path uses, is what lets the UI stop
+   * offering an action that cannot succeed.
+   *
+   * The row itself stays visible either way: the spend is real and was billed
+   * to this account, and hiding it would recreate the blind spot ENG-1440
+   * closed. What changes is whether an action is offered on it.
+   */
+  switchable: boolean;
   /** INTERNAL — stripped before reaching a customer. */
   costMicroUsd: number;
 }
@@ -311,6 +327,11 @@ export async function previewUsageRunway(
     cacheWriteTokens: r.cacheWriteTokens,
     costMicroUsd: r.costMicroUsd || 0,
     callCount: r.callCount,
+    // ENG-1519: carried through so attribution can tell a per-unit vendor call
+    // from a token-priced model call. Without them every vendor row was
+    // aggregated as a model.
+    provider: r.provider,
+    unit: r.unit,
   }));
 
   const observedByDate = new Map<string, number>();
@@ -431,6 +452,11 @@ export async function resolveUsageDrivers(
     cacheWriteTokens: r.cacheWriteTokens,
     costMicroUsd: r.costMicroUsd || 0,
     callCount: r.callCount,
+    // ENG-1519: carried through so attribution can tell a per-unit vendor call
+    // from a token-priced model call. Without them every vendor row was
+    // aggregated as a model.
+    provider: r.provider,
+    unit: r.unit,
   }));
 
   const attribution = attributeCosts(ledger);
@@ -639,10 +665,31 @@ export async function resolveUsageDrivers(
     // — defeating AC6, whose whole point is that the customer can see WHICH named
     // task is spending their allowance. The optional property is why nothing
     // caught it: reading an absent optional field is not a type error.
-    const byId = new Map<string, { scheduleName?: string; frequency?: string }>();
-    for (const sched of lists.flat()) {
-      if (sched?.scheduleId) byId.set(sched.scheduleId, sched);
-    }
+    // ENG-1533: the OWNER travels with the record. `lists` is per pooled user,
+    // so ownership is known here and was being flattened away — and without it
+    // there is no way to ask whether this caller may act on the row.
+    const byId = new Map<
+      string,
+      { scheduleName?: string; frequency?: string; ownerUserId: string }
+    >();
+    lists.forEach((list, i) => {
+      const ownerUserId = pooledUserIds[i];
+      for (const sched of list ?? []) {
+        if (sched?.scheduleId) byId.set(sched.scheduleId, { ...sched, ownerUserId });
+      }
+    });
+
+    // One authority lookup per distinct OWNER, not per row: an org has a
+    // handful of members and a cycle can have dozens of schedules, so asking
+    // per row would multiply DB reads for an answer that cannot differ within
+    // an owner.
+    const authorityByOwner = new Map<string, boolean>();
+    await Promise.all(
+      [...new Set([...byId.values()].map((m) => m.ownerUserId))].map(async (ownerUserId) => {
+        const { permitted } = await contentAuthorityOver(userId, ownerUserId);
+        authorityByOwner.set(ownerUserId, permitted);
+      }),
+    );
     // Inheriting schedules run the platform default, so resolving it once is
     // what lets a per-schedule row carry a confirmable recommendation at all.
     // Without it, two thirds of schedules would show spend and no action.
@@ -684,6 +731,10 @@ export async function resolveUsageDrivers(
         // than described as behaviour that exists.
         title: meta?.scheduleName ?? null,
         scheduleExists,
+        // A schedule whose record is gone cannot be switched by anyone, so the
+        // authority question does not even arise — `false` here is "no action
+        // is possible", which is exactly what the UI needs to know.
+        switchable: meta ? (authorityByOwner.get(meta.ownerUserId) ?? false) : false,
         frequency: meta?.frequency ?? null,
         shareOfTotal: d.shareOfTotal,
         callCount: d.callCount,
@@ -756,6 +807,13 @@ export function toCustomerDrivers(resolved: ResolvedUsageDrivers) {
     drivers: resolved.attribution
       ? {
           byModel: toShares(resolved.attribution.byModel),
+          // ENG-1519: per-unit vendor spend IS attributed — to a vendor rather
+          // than to a model — and this boundary was dropping it. Removing it
+          // from `byModel` without naming it anywhere left the model list
+          // covering less than the cycle with no sentence saying why, which
+          // trades a wrong row for a silent gap. null when the cycle bought
+          // nothing per-unit, so a UI states absence instead of rendering zero.
+          byVendor: resolved.attribution.byVendor ? toShares(resolved.attribution.byVendor) : null,
           byFeature: toShares(resolved.attribution.byFeature),
           // null until the metering tag has produced at least one row this cycle.
           bySource: resolved.attribution.bySource ? toShares(resolved.attribution.bySource) : null,
@@ -777,6 +835,10 @@ export function toCustomerDrivers(resolved: ResolvedUsageDrivers) {
       // the named work still exists — and without it the UI cannot tell a deleted task
       // from an unnamed one, which is the whole defect.
       scheduleExists: d.scheduleExists,
+      // ENG-1533: crosses the boundary because the UI cannot otherwise tell an
+      // actionable row from one whose Confirm button is guaranteed to fail. It
+      // carries no economics — only whether THIS caller may act.
+      switchable: d.switchable,
       frequency: d.frequency,
       shareOfTotal: d.shareOfTotal,
       callCount: d.callCount,
