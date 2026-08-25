@@ -604,6 +604,17 @@ export async function resolveUsageDrivers(
       .map((m) => [m.id, m.qualityScore]),
   );
 
+  /**
+   * ENG-1563 — derive one recommendation's `RecommendationQuality` from the AA
+   * `qualityScore` delta between `fromModel` and `toModel`.
+   *
+   * Falls back to `{ status: "unknown", source: "none" }` (AC3) whenever
+   * either side is missing from `qualityScoreById` — that is the only honest
+   * answer when AA has no benchmark for one or both models. Otherwise
+   * resolves to `benchmark_comparable` or `benchmark_lower` (AC1/AC2) per
+   * `BENCHMARK_COMPARABLE_MAX_DELTA`, never `task_verified` (AC5 — that
+   * status is reserved for a future task-eval harness, out of scope here).
+   */
   const qualityFor = (fromModel: string, toModel: string): RecommendationQuality => {
     const fromScore = qualityScoreById.get(fromModel);
     const toScore = qualityScoreById.get(toModel);
