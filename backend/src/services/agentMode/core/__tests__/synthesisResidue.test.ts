@@ -443,6 +443,55 @@ describe('detectFalseCompletionClaim', () => {
     expect(claim).toBeNull();
   });
 
+  // CodeRabbit (ENG-1331 follow-up), confirmed live against production: when a
+  // step's OWN assets are immediately followed by its OWN successful
+  // set_work_plan_status close (the normal shape in an AUTOCOMPLETE turn — the
+  // step finishes and closes itself before the closing synthesis is written),
+  // the OLD "since the last successful boundary" rule sliced to nothing (the
+  // boundary was the last ledger entry), so a step that genuinely produced all
+  // 12 assets and validly closed itself read as actual=0 — a false
+  // UNDER-claim slapped onto a truthful message. This is the opposite failure
+  // from the masking case above, on the same mechanism.
+  it('counts a step\'s own assets when its own successful close is the last ledger entry', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved.",
+      [
+        ...Array.from({ length: 12 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/${i + 1}.png` },
+        })),
+        { name: 'set_work_plan_status', result: { success: true } },
+      ],
+    );
+    expect(claim).toBeNull(); // truthful — must NOT be flagged
+  });
+
+  it('still catches a shortfall when the step closes itself anyway (self-close does not launder a false claim)', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved.",
+      [...fourScreenshots, { name: 'set_work_plan_status', result: { success: true } }],
+    );
+    expect(claim).toEqual({ claimed: 12, actual: 4 });
+  });
+
+  it('excludes an EARLIER step\'s assets even when the current step self-closes with nothing after it', () => {
+    // Two self-closing steps in sequence: step 1 (40 assets, closes itself),
+    // step 2 (4 assets, closes itself) — the claim is about step 2 only.
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved for Variant 4.",
+      [
+        ...Array.from({ length: 40 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/earlier-${i + 1}.png` },
+        })),
+        { name: 'set_work_plan_status', result: { success: true } },
+        ...fourScreenshots,
+        { name: 'set_work_plan_status', result: { success: true } },
+      ],
+    );
+    expect(claim).toEqual({ claimed: 12, actual: 4 });
+  });
+
   it('takes the largest claim when multiple numeric completion claims appear', () => {
     const claim = detectFalseCompletionClaim(
       'All 4 sizes for the first variant and all 12 sizes for the second variant were rendered.',
