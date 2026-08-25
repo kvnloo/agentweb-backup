@@ -302,7 +302,6 @@ export function assessForecastAccuracy(
 ): ForecastAccuracy | null {
   const startMs = toUtcDay(input.cycleStartDate);
   const todayMs = toUtcDay(input.today);
-  const resetMs = toUtcDay(input.cycleResetDate);
   const completeDays = Math.max(0, Math.round((todayMs - startMs) / MS_PER_DAY));
   if (completeDays < MIN_DAYS_PER_SIDE * 2) return null;
 
@@ -332,7 +331,11 @@ export function assessForecastAccuracy(
   let spentSinceWithToday = 0;
   for (const row of input.dailyCostMicroUsd) {
     const dayMs = toUtcDay(row.date);
-    if (dayMs < asOfMs || dayMs >= resetMs) continue;
+    // Through TODAY, never past it (CodeRabbit). A future-dated row inside the
+    // cycle is not in `costUsedMicroUsd` — that counter is spend so far — so
+    // subtracting one would shrink the split balance for spend that has not
+    // happened, handing the past forecast an allowance nobody had.
+    if (dayMs < asOfMs || dayMs > todayMs) continue;
     const cost = Math.max(0, row.costMicroUsd || 0);
     spentSinceWithToday += cost;
     if (dayMs < todayMs) spentSinceComplete += cost;

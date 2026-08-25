@@ -391,6 +391,30 @@ describe("assessForecastAccuracy — forecast vs actual (ENG-1215 AC4)", () => {
     expect(r!.burnRatio).toBeCloseTo(1, 5);
   });
 
+  it("ignores a future-dated row inside the cycle", () => {
+    // CodeRabbit. The upper bound was the reset date, which admits rows dated
+    // after today. Such a row is not in `costUsedMicroUsd` — that counter is
+    // spend SO FAR — so subtracting it shrank the split balance for spend that
+    // had not happened, handing the past forecast an allowance nobody had.
+    //
+    // $5/day throughout with $50 today: the split balance is $25, leaving $125
+    // at $5/day = 25 days, one short of the 26 to reset. A stray $40 dated
+    // 2026-08-15 would zero the balance and flip that to a comfortable yes.
+    const r = assess({
+      dailyCostMicroUsd: [
+        ...daysFrom(1, 10, 5),
+        { date: "2026-08-11", costMicroUsd: 50 * USD },
+        { date: "2026-08-15", costMicroUsd: 40 * USD },
+      ],
+      costUsedMicroUsd: 100 * USD,
+      hardThresholdMicroUsd: 150 * USD,
+    });
+
+    expect(r!.predictedOnTrack).toBe(false);
+    // And it must not reach the rate either.
+    expect(r!.burnRatio).toBeCloseTo(1, 5);
+  });
+
   it("returns null for a cycle too short to hold both a forecast and an outcome", () => {
     // Silence, not a zero. A zero here would read as a perfect score.
     expect(assess({ dailyCostMicroUsd: evenDays(3, 5), today: "2026-08-04" })).toBeNull();
