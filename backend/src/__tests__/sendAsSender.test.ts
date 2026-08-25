@@ -18,7 +18,18 @@ jest.mock('../services/emailProviderService', () => ({
   bootstrapEmailProviders: (...args: any[]) => mockBootstrapEmailProviders(...args),
 }));
 
+const mockCheckQuota = jest.fn();
+const mockRecordSend = jest.fn();
+jest.mock('../services/senderUsageTrackerFactory', () => ({
+  senderUsageTracker: {
+    checkQuota: (...args: any[]) => mockCheckQuota(...args),
+    recordSend: (...args: any[]) => mockRecordSend(...args),
+    getUsage: jest.fn(),
+  },
+}));
+
 import { sendAsSender, SenderSendError } from '../services/sendAsSender';
+import { SenderDailyLimitExceededError } from '../services/senderUsageTracker';
 import { CrmSender } from '../services/crmSenderTypes';
 
 const resendSender: CrmSender = {
@@ -47,6 +58,8 @@ const outlookSender: CrmSender = {
 beforeEach(() => {
   jest.clearAllMocks();
   mockBootstrapEmailProviders.mockResolvedValue(undefined);
+  mockCheckQuota.mockResolvedValue(undefined);
+  mockRecordSend.mockResolvedValue(undefined);
 });
 
 describe('sendAsSender — FAIL cases', () => {
@@ -195,5 +208,74 @@ describe('sendAsSender — SUCCESS cases', () => {
 
     expect(setTimeoutSpy).toHaveBeenCalled();
     setTimeoutSpy.mockRestore();
+  });
+});
+
+describe('sendAsSender — daily cap / warmup (ENG-265)', () => {
+  it('does not touch the usage tracker at all for a sender with no cap configured', async () => {
+    mockResendSendEmail.mockResolvedValue({ id: 'resend-msg' });
+    await sendAsSender('u1', resendSender, { to: 'a@b.com', subject: 's', html: 'h' });
+    expect(mockCheckQuota).not.toHaveBeenCalled();
+    expect(mockRecordSend).not.toHaveBeenCalled();
+  });
+
+  it('checks quota before sending, using the sender id and its effective limit', async () => {
+    mockResendSendEmail.mockResolvedValue({ id: 'resend-msg' });
+    const capped: CrmSender = { ...resendSender, dailyLimit: 25 };
+
+    await sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' });
+
+    expect(mockCheckQuota).toHaveBeenCalledWith('u1', 's1', 25);
+  });
+
+  it('refuses to send when the sender is at its daily limit, without calling the provider', async () => {
+    mockCheckQuota.mockRejectedValue(new SenderDailyLimitExceededError('s1', 25));
+    const capped: CrmSender = { ...resendSender, dailyLimit: 25 };
+
+    await expect(
+      sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' }),
+    ).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
+    expect(mockResendSendEmail).not.toHaveBeenCalled();
+    expect(mockRecordSend).not.toHaveBeenCalled();
+  });
+
+  it('records the send only after Resend confirms success', async () => {
+    mockResendSendEmail.mockResolvedValue({ id: 'resend-msg' });
+    const capped: CrmSender = { ...resendSender, dailyLimit: 25 };
+
+    await sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' });
+
+    expect(mockRecordSend).toHaveBeenCalledWith('u1', 's1');
+  });
+
+  it('does NOT record a send when the Resend provider call fails (quota only spent on real sends)', async () => {
+    mockResendSendEmail.mockResolvedValue(null); // Resend "failed" signal
+    const capped: CrmSender = { ...resendSender, dailyLimit: 25 };
+
+    await expect(
+      sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' }),
+    ).rejects.toThrow(SenderSendError);
+    expect(mockRecordSend).not.toHaveBeenCalled();
+  });
+
+  it('applies the same cap check/record to a mailbox (Gmail) sender', async () => {
+    const mockSendEmail = jest.fn().mockResolvedValue({ messageId: 'gm-1', threadId: '' });
+    mockGetEmailProvider.mockReturnValue({ sendEmail: mockSendEmail });
+    const capped: CrmSender = { ...gmailSender, dailyLimit: 10 };
+
+    await sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' });
+
+    expect(mockCheckQuota).toHaveBeenCalledWith('u1', 's2', 10);
+    expect(mockRecordSend).toHaveBeenCalledWith('u1', 's2');
+  });
+
+  it('a warming-up sender is checked against its ramped limit, not its eventual dailyLimit', async () => {
+    mockResendSendEmail.mockResolvedValue({ id: 'resend-msg' });
+    const warmingUp: CrmSender = { ...resendSender, dailyLimit: 200, warmupStartedAt: new Date().toISOString() };
+
+    await sendAsSender('u1', warmingUp, { to: 'a@b.com', subject: 's', html: 'h' });
+
+    // Day 1 of warmup caps at 10 (see senderUsageTracker.effectiveDailyLimit), not 200.
+    expect(mockCheckQuota).toHaveBeenCalledWith('u1', 's1', 10);
   });
 });

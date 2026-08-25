@@ -24,6 +24,8 @@ import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import { settingsService } from '../services/settingsService';
 import { io } from '../server';
+import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
+import { SenderDailyLimitExceededError } from '../services/senderUsageTracker';
 import router from '../routes/crm';
 
 jest.mock('../services/db', () => ({
@@ -72,6 +74,14 @@ jest.mock('../services/settingsService', () => ({
   settingsService: {
     getSetting: jest.fn(),
     setSetting: jest.fn(),
+  },
+}));
+
+jest.mock('../services/senderUsageTrackerFactory', () => ({
+  senderUsageTracker: {
+    checkQuota: jest.fn().mockResolvedValue(undefined),
+    recordSend: jest.fn().mockResolvedValue(undefined),
+    getUsage: jest.fn(),
   },
 }));
 
@@ -515,6 +525,56 @@ describe('CRM Group Email Endpoints', () => {
         const response = (mockRes.json as jest.Mock).mock.calls[0][0];
         expect(response.sent).toBe(1);
         expect(response.failed).toBe(0);
+      });
+    });
+
+    describe('ENG-265 — stops cleanly when the sender hits its daily limit', () => {
+      const cappedSenderConfig = () =>
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify({
+            senders: [{ id: 'r-1', email: 'me@test.com', fromName: 'Me', dailyLimit: 2 }],
+          }),
+        });
+
+      it('stops the batch at the limit instead of attempting (and failing) every remaining lead', async () => {
+        cappedSenderConfig();
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+          items: [
+            { leadId: '1', email: 'a@test.com' },
+            { leadId: '2', email: 'b@test.com' },
+            { leadId: '3', email: 'c@test.com' },
+            { leadId: '4', email: 'd@test.com' },
+            { leadId: '5', email: 'e@test.com' },
+          ],
+          lastEvaluatedKey: undefined,
+        });
+        (resendService.sendEmail as jest.Mock)
+          .mockResolvedValueOnce({ id: 'msg-1' })
+          .mockResolvedValueOnce({ id: 'msg-2' });
+        (senderUsageTracker.checkQuota as jest.Mock)
+          .mockResolvedValueOnce(undefined) // lead a — ok
+          .mockResolvedValueOnce(undefined) // lead b — ok
+          .mockRejectedValueOnce(new SenderDailyLimitExceededError('r-1', 2)); // lead c — over the cap
+
+        mockReq.body = {
+          senderId: 'r-1',
+          senderEmail: 'me@test.com',
+          senderName: 'Me',
+          subject: 'Hi',
+          htmlContent: '<p>Hello</p>',
+        };
+
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        // Only the first 2 leads (under the cap) were attempted at all.
+        expect(resendService.sendEmail).toHaveBeenCalledTimes(2);
+        const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+        expect(response.sent).toBe(2);
+        expect(response.failed).toBe(0); // hitting the cap is not counted as a per-lead failure
+        expect(response.skippedDueToLimit).toBe(3); // c, d, e never attempted
+        expect(response.stoppedEarlyReason).toMatch(/daily sending limit/);
       });
     });
   });
