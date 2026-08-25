@@ -21367,6 +21367,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               q: `(${parentClauses}) and fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
               fields: 'files(id, name, mimeType, parents)',
               pageSize: limitedMaxResults,
+              supportsAllDrives: true,
+              includeItemsFromAllDrives: true,
             });
 
             const driveFiles = driveResponse.data.files || [];
@@ -21822,6 +21824,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 fields: 'files(id, name, mimeType, size, modifiedTime)',
                 orderBy: 'modifiedTime desc',
                 pageSize: Math.min(driveOffset + driveLimit, 1000),
+                supportsAllDrives: true,
+                includeItemsFromAllDrives: true,
               });
 
               const allFiles = (response.data.files || []).map((f) => ({
@@ -22174,7 +22178,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       content = Buffer.from(res.data);
     } else {
       // Binary files — download directly
-      const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
+      const res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'arraybuffer' });
       content = Buffer.from(res.data);
     }
 
@@ -22397,6 +22401,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         q: `'${folderId}' in parents and name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
         fields: 'files(id, name, mimeType, size, modifiedTime)',
         pageSize: 1,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
       });
 
       const files = listResponse.data.files || [];
@@ -22633,7 +22639,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     const readWithDrive = async (driveClient: any) => {
-      const meta = await driveClient.files.get({ fileId, fields: 'id,name,mimeType,modifiedTime' });
+      const meta = await driveClient.files.get({ fileId, fields: 'id,name,mimeType,modifiedTime', supportsAllDrives: true });
       const { name, mimeType, modifiedTime } = meta.data;
       const isGoogleNative =
         mimeType === 'application/vnd.google-apps.document' ||
@@ -22731,6 +22737,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         fields: 'files(id,name,mimeType,modifiedTime,webViewLink),nextPageToken',
         orderBy: 'name',
         pageSize: 100,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
       });
 
       const files = resp.data.files || [];
@@ -22813,6 +22821,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         fields: 'files(id,name,mimeType,webViewLink,parents)',
         orderBy: 'modifiedTime desc',
         pageSize: 20,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
       });
 
       const files = resp.data.files || [];

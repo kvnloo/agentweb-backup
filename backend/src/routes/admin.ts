@@ -1565,6 +1565,8 @@ router.get("/google-drive-folders", async (req, res) => {
       fields: "files(id, name)",
       orderBy: "name",
       pageSize: 100,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
     });
 
     const folders = (response.data.files || []).map((f) => ({
