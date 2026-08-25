@@ -3391,10 +3391,23 @@ mcpToolRegistry.register({
 
     // Curate a stable, minimal shape. Never echo the raw /me payload — it carries
     // sensitive fields (stripe ids, tokens, internal flags).
+    //
+    // ENG-1540: `subscription_status` is only ever populated on the org OWNER's
+    // record by a live Stripe subscription sync — an owner whose paid access
+    // was granted out-of-band (admin/manual comp, no Stripe subscription object)
+    // never gets the field set at all, org members riding that owner's billing
+    // inherit the same gap, and it stays unset indefinitely (no ongoing owner
+    // -side sync ever revisits it). Defaulting that absence to the literal
+    // 'inactive' told a currently-paying-and-unblocked Pro customer their
+    // subscription was inactive. A paid, non-Free plan with no persisted status
+    // means "active but never synced", not "inactive".
+    const subscriptionStatus =
+      me?.subscription_status ??
+      (me?.subscriptionType && me.subscriptionType !== 'Free' ? 'active' : 'inactive');
     return jsonResult({
       email: me?.email ?? null,
       subscription_plan: me?.subscriptionType ?? 'Free',
-      subscription_status: me?.subscription_status ?? 'inactive',
+      subscription_status: subscriptionStatus,
       current_period_end: me?.current_period_end ?? null,
       allowed_features: Array.isArray(me?.allowedPages) ? me.allowedPages : [],
       api_key_count: apiKeyCount,
