@@ -263,4 +263,67 @@ describe('summarizeSessionIfNeeded', () => {
 
     expect(result!.evaluatedMessageIndex).toBe(3); // derived from messages.length
   });
+
+  // ENG-1331 follow-up: found live-testing the ENG-1331 fix on production. This
+  // free-text summarizer has no access to the tool-call ledger, so it can
+  // hallucinate completion the same way a fluent final synthesis can — reproduced
+  // live when it claimed "rendered all 12 sizes... completed QA and a final
+  // contact sheet" mid-run, while only ~10 of 12 existed. The `account_summary`
+  // Emma tool serves this text verbatim, so the hallucination is as customer-facing
+  // as the original ENG-1331 bug, just via a different generator.
+  function toolCallMessage(calls: Array<{ name: string; result?: any }>) {
+    return {
+      role: 'assistant',
+      content: '',
+      metadata: { toolCalls: calls.map((c, i) => ({ id: `c${i}`, name: c.name, arguments: {}, result: c.result ?? { success: true } })) },
+    };
+  }
+
+  test('replaces a hallucinated completion claim with a ledger-grounded summary', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse('Rendered all 12 sizes for the display ad set, with completed QA and a final contact sheet.')
+    );
+
+    const session = makeSession({
+      sessionId: 'sess-hallucinated',
+      messageCount: 4,
+      messages: [
+        { role: 'user', content: 'Render all 12 IAB sizes' },
+        toolCallMessage([
+          { name: 'playwright_browser_take_screenshot' },
+          { name: 'playwright_browser_take_screenshot' },
+          { name: 'playwright_browser_take_screenshot' },
+        ]),
+      ],
+    });
+
+    const result = await summarizeSessionIfNeeded(session);
+
+    expect(result!.summary).not.toContain('all 12');
+    expect(result!.summary).toContain('3 of 12');
+    expect(mockUpdateSessionSummary).toHaveBeenCalledWith('sess-hallucinated', expect.objectContaining({
+      summary: expect.stringContaining('3 of 12'),
+    }));
+  });
+
+  test('leaves a truthful completion claim unchanged when the ledger backs it up', async () => {
+    mockCallLLM.mockResolvedValue(makeLLMResponse('Rendered all 3 sizes for the display ad set.'));
+
+    const session = makeSession({
+      sessionId: 'sess-truthful',
+      messageCount: 4,
+      messages: [
+        { role: 'user', content: 'Render all 3 sizes' },
+        toolCallMessage([
+          { name: 'playwright_browser_take_screenshot' },
+          { name: 'playwright_browser_take_screenshot' },
+          { name: 'playwright_browser_take_screenshot' },
+        ]),
+      ],
+    });
+
+    const result = await summarizeSessionIfNeeded(session);
+
+    expect(result!.summary).toBe('Rendered all 3 sizes for the display ad set.');
+  });
 });
