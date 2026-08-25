@@ -1,9 +1,11 @@
 /**
- * Tests for agentModeService.handleAttioApi — the read-only lead-count tool
- * (LIST_ENTRIES COUNT) that lets Emma read Attio lead counts back for
- * CPL/attribution reporting. Deliberately narrower than call_hubspot_api:
- * Attio has no marketing-asset concepts (emails, landing pages, workflows...)
- * to expose, so this tool only covers what the ticket actually asked for.
+ * Tests for agentModeService.handleAttioApi — lets Emma read Attio lead
+ * counts back for CPL/attribution reporting, and manage Attio lists
+ * (create/delete/enumerate) and list membership (add/remove entries),
+ * mirroring call_hubspot_api's CONTACT_LIST actions. Deliberately narrower
+ * than call_hubspot_api in scope: Attio has no marketing-asset concepts
+ * (emails, landing pages, workflows...) to expose, so this tool only covers
+ * lists and list entries.
  */
 
 process.env.JWT_SECRET = 'test-secret';
@@ -11,8 +13,20 @@ process.env.JWT_SECRET = 'test-secret';
 // ── Mock AttioService before imports ──────────────────────────────────────────
 
 const mockCountListEntries = jest.fn();
+const mockGetAllLists = jest.fn();
+const mockCreateList = jest.fn();
+const mockDeleteList = jest.fn();
+const mockAddPersonToList = jest.fn();
+const mockFindListEntry = jest.fn();
+const mockDeleteListEntry = jest.fn();
 const mockSvcInstance = {
   countListEntries: mockCountListEntries,
+  getAllLists: mockGetAllLists,
+  createList: mockCreateList,
+  deleteList: mockDeleteList,
+  addPersonToList: mockAddPersonToList,
+  findListEntry: mockFindListEntry,
+  deleteListEntry: mockDeleteListEntry,
 };
 
 const mockAttioCreate = jest.fn();
@@ -130,6 +144,149 @@ describe('LIST_ENTRIES COUNT', () => {
     const result = await at({ entity_type: 'LIST_ENTRIES', action: 'COUNT', list_id: LIST_ID });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/Not Found/);
+  });
+});
+
+// ─── LIST_ENTRIES ADD_ENTRIES / REMOVE_ENTRIES ─────────────────────────────
+
+describe('LIST_ENTRIES ADD_ENTRIES', () => {
+  it('returns error when list_id missing', async () => {
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'ADD_ENTRIES', record_ids: ['p1'] });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/list_id/i);
+  });
+
+  it('returns error when record_ids missing or empty', async () => {
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'ADD_ENTRIES', list_id: LIST_ID });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/record_ids/i);
+    expect(mockAddPersonToList).not.toHaveBeenCalled();
+  });
+
+  it('adds each record id and reports per-record results', async () => {
+    mockAddPersonToList
+      .mockResolvedValueOnce('entry_1')
+      .mockRejectedValueOnce(new Error('already in list'));
+
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'ADD_ENTRIES', list_id: LIST_ID, record_ids: ['p1', 'p2'] });
+
+    expect(mockAddPersonToList).toHaveBeenCalledWith(LIST_ID, 'p1');
+    expect(mockAddPersonToList).toHaveBeenCalledWith(LIST_ID, 'p2');
+    expect(result.success).toBe(true);
+    expect(result.results).toEqual([
+      { recordId: 'p1', success: true, entryId: 'entry_1' },
+      { recordId: 'p2', success: false, error: 'already in list' },
+    ]);
+  });
+});
+
+describe('LIST_ENTRIES REMOVE_ENTRIES', () => {
+  it('returns error when list_id missing', async () => {
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'REMOVE_ENTRIES', record_ids: ['p1'] });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/list_id/i);
+  });
+
+  it('returns error when record_ids missing or empty', async () => {
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'REMOVE_ENTRIES', list_id: LIST_ID });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/record_ids/i);
+    expect(mockFindListEntry).not.toHaveBeenCalled();
+  });
+
+  it('resolves each record to its entry then deletes it', async () => {
+    mockFindListEntry.mockResolvedValue('entry_1');
+    mockDeleteListEntry.mockResolvedValue(undefined);
+
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'REMOVE_ENTRIES', list_id: LIST_ID, record_ids: ['p1'] });
+
+    expect(mockFindListEntry).toHaveBeenCalledWith(LIST_ID, 'p1');
+    expect(mockDeleteListEntry).toHaveBeenCalledWith(LIST_ID, 'entry_1');
+    expect(result.success).toBe(true);
+    expect(result.results).toEqual([{ recordId: 'p1', success: true }]);
+  });
+
+  it('reports a per-record failure when no entry is found, without throwing', async () => {
+    mockFindListEntry.mockResolvedValue(null);
+
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'REMOVE_ENTRIES', list_id: LIST_ID, record_ids: ['p1'] });
+
+    expect(mockDeleteListEntry).not.toHaveBeenCalled();
+    expect(result.success).toBe(true);
+    expect(result.results).toEqual([{ recordId: 'p1', success: false, error: 'No list entry found for this record.' }]);
+  });
+});
+
+// ─── LISTS ──────────────────────────────────────────────────────────────────
+
+describe('LISTS LIST', () => {
+  it('returns every list in the workspace', async () => {
+    mockGetAllLists.mockResolvedValue([{ id: 'l1', name: 'Deals' }, { id: 'l2', name: 'VIPs' }]);
+    const result = await at({ entity_type: 'LISTS', action: 'LIST' });
+    expect(result.success).toBe(true);
+    expect(result.lists).toEqual([{ id: 'l1', name: 'Deals' }, { id: 'l2', name: 'VIPs' }]);
+  });
+});
+
+describe('LISTS GET', () => {
+  it('returns error when list_id missing', async () => {
+    const result = await at({ entity_type: 'LISTS', action: 'GET' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/list_id/i);
+  });
+
+  it('returns the matching list', async () => {
+    mockGetAllLists.mockResolvedValue([{ id: 'l1', name: 'Deals' }]);
+    const result = await at({ entity_type: 'LISTS', action: 'GET', list_id: 'l1' });
+    expect(result.success).toBe(true);
+    expect(result.list).toEqual({ id: 'l1', name: 'Deals' });
+  });
+
+  it('returns a clear error when the list does not exist', async () => {
+    mockGetAllLists.mockResolvedValue([]);
+    const result = await at({ entity_type: 'LISTS', action: 'GET', list_id: 'nonexistent' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/not found/i);
+  });
+});
+
+describe('LISTS CREATE', () => {
+  it('returns error when name missing', async () => {
+    const result = await at({ entity_type: 'LISTS', action: 'CREATE' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/name/i);
+    expect(mockCreateList).not.toHaveBeenCalled();
+  });
+
+  it('creates a people list by default', async () => {
+    mockCreateList.mockResolvedValue('new_list_id');
+    const result = await at({ entity_type: 'LISTS', action: 'CREATE', name: 'My New List' });
+    expect(mockCreateList).toHaveBeenCalledWith('My New List', 'people');
+    expect(result.success).toBe(true);
+    expect(result.list_id).toBe('new_list_id');
+  });
+
+  it('creates a companies list when object_type is companies', async () => {
+    mockCreateList.mockResolvedValue('new_list_id');
+    await at({ entity_type: 'LISTS', action: 'CREATE', name: 'Accounts', object_type: 'companies' });
+    expect(mockCreateList).toHaveBeenCalledWith('Accounts', 'companies');
+  });
+});
+
+describe('LISTS DELETE', () => {
+  it('returns error when list_id missing', async () => {
+    const result = await at({ entity_type: 'LISTS', action: 'DELETE' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/list_id/i);
+    expect(mockDeleteList).not.toHaveBeenCalled();
+  });
+
+  it('deletes the list', async () => {
+    mockDeleteList.mockResolvedValue(undefined);
+    const result = await at({ entity_type: 'LISTS', action: 'DELETE', list_id: 'l1' });
+    expect(mockDeleteList).toHaveBeenCalledWith('l1');
+    expect(result.success).toBe(true);
+    expect(result.deleted).toBe('l1');
   });
 });
 

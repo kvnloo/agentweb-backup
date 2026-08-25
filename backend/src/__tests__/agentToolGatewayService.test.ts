@@ -1205,13 +1205,58 @@ describe('agentToolGatewayService', () => {
   });
 
   describe('call_attio_api effect classification', () => {
-    it('classifies as read/low-risk (read-only tool, no write actions)', () => {
+    it('classifies COUNT as read/low-risk', () => {
       const decision = evaluateAgentToolPolicy({
         toolName: 'call_attio_api',
         args: { entity_type: 'LIST_ENTRIES', action: 'COUNT' },
       });
       expect(decision.effect).toBe('read');
       expect(decision.risk).toBe('low');
+    });
+
+    it('classifies LISTS LIST/GET as read/low-risk', () => {
+      const decision = evaluateAgentToolPolicy({
+        toolName: 'call_attio_api',
+        args: { entity_type: 'LISTS', action: 'LIST' },
+      });
+      expect(decision.effect).toBe('read');
+      expect(decision.risk).toBe('low');
+    });
+
+    it('classifies LISTS CREATE as internal_write/medium-risk', () => {
+      const decision = evaluateAgentToolPolicy({
+        toolName: 'call_attio_api',
+        args: { entity_type: 'LISTS', action: 'CREATE' },
+      });
+      expect(decision.effect).toBe('internal_write');
+      expect(decision.risk).toBe('medium');
+    });
+
+    it('classifies LIST_ENTRIES ADD_ENTRIES as internal_write/medium-risk', () => {
+      const decision = evaluateAgentToolPolicy({
+        toolName: 'call_attio_api',
+        args: { entity_type: 'LIST_ENTRIES', action: 'ADD_ENTRIES' },
+      });
+      expect(decision.effect).toBe('internal_write');
+      expect(decision.risk).toBe('medium');
+    });
+
+    it('classifies LISTS DELETE as destructive/high-risk', () => {
+      const decision = evaluateAgentToolPolicy({
+        toolName: 'call_attio_api',
+        args: { entity_type: 'LISTS', action: 'DELETE' },
+      });
+      expect(decision.effect).toBe('destructive');
+      expect(decision.risk).toBe('high');
+    });
+
+    it('classifies LIST_ENTRIES REMOVE_ENTRIES as destructive/high-risk', () => {
+      const decision = evaluateAgentToolPolicy({
+        toolName: 'call_attio_api',
+        args: { entity_type: 'LIST_ENTRIES', action: 'REMOVE_ENTRIES' },
+      });
+      expect(decision.effect).toBe('destructive');
+      expect(decision.risk).toBe('high');
     });
   });
 
