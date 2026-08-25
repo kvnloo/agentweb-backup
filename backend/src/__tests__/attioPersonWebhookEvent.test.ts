@@ -38,8 +38,9 @@ const OUR_CLIENT_ID = 'our-app-client-id';
 
 const baseConfig: any = { deleteOnPull: true };
 
-const makeSvc = (personValues: Record<string, any>) => ({
+const makeSvc = (personValues: Record<string, any>, objectSlugsById: Record<string, string> = {}) => ({
   getPersonValues: jest.fn().mockResolvedValue(personValues),
+  getObjectSlug: jest.fn((id: string) => Promise.resolve(objectSlugsById[id] ?? null)),
 });
 
 beforeEach(() => {
@@ -57,7 +58,7 @@ describe('applyAttioPersonEvent', () => {
     expect(svc.getPersonValues).not.toHaveBeenCalled();
   });
 
-  it('ignores Company object events (People only, matching HubSpot\'s own scope)', async () => {
+  it('ignores Company object events when a slug is directly present on the payload', async () => {
     const svc = makeSvc({});
     await applyAttioPersonEvent('list-1', baseConfig, svc as any, {
       event_type: 'record.updated',
@@ -65,6 +66,45 @@ describe('applyAttioPersonEvent', () => {
       data: { object: { slug: 'companies' } },
     });
     expect(svc.getPersonValues).not.toHaveBeenCalled();
+    expect(svc.getObjectSlug).not.toHaveBeenCalled(); // direct slug short-circuits the lookup
+  });
+
+  // Live-caught bug (ENG-1380): real Attio deliveries never carry object.slug
+  // directly — only id.object_id, a UUID — so the filter must resolve it via
+  // AttioService.getObjectSlug before it can do anything at all.
+  it('resolves object_id to a slug via AttioService.getObjectSlug and ignores Company events (real payload shape)', async () => {
+    const svc = makeSvc({}, { 'company-object-uuid': 'companies' });
+    await applyAttioPersonEvent('list-1', baseConfig, svc as any, {
+      event_type: 'record.updated',
+      id: { record_id: 'rec-1', object_id: 'company-object-uuid' },
+    });
+    expect(svc.getObjectSlug).toHaveBeenCalledWith('company-object-uuid');
+    expect(svc.getPersonValues).not.toHaveBeenCalled();
+  });
+
+  it('processes a People event resolved via object_id (real payload shape)', async () => {
+    const svc = makeSvc(
+      { email_addresses: [{ email_address: 'a@b.com' }] },
+      { 'people-object-uuid': 'people' },
+    );
+    mockGetLeadByEmail.mockResolvedValue(null);
+    await applyAttioPersonEvent('list-1', baseConfig, svc as any, {
+      event_type: 'record.updated',
+      id: { record_id: 'rec-1', object_id: 'people-object-uuid' },
+    });
+    expect(svc.getObjectSlug).toHaveBeenCalledWith('people-object-uuid');
+    expect(mockCreateLead).toHaveBeenCalled();
+  });
+
+  it('does not fail when getObjectSlug resolution fails — proceeds unfiltered rather than dropping the event', async () => {
+    const svc = makeSvc({ email_addresses: [{ email_address: 'a@b.com' }] });
+    svc.getObjectSlug = jest.fn().mockRejectedValue(new Error('network error'));
+    mockGetLeadByEmail.mockResolvedValue(null);
+    await applyAttioPersonEvent('list-1', baseConfig, svc as any, {
+      event_type: 'record.updated',
+      id: { record_id: 'rec-1', object_id: 'some-uuid' },
+    });
+    expect(mockCreateLead).toHaveBeenCalled();
   });
 
   it('skips a self-authored event (actor.type=app, actor.id === our own client_id)', async () => {
