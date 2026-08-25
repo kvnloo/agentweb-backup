@@ -155,6 +155,10 @@ export class AttioAdapter implements CrmAdapter {
                 }
 
                 let personId: string | undefined;
+                // Tracks whether this lead was counted as new or updated, so a
+                // later deal-entry failure can demote the count it already
+                // incremented (mirrors hubspotAdapter.ts's demote() pattern).
+                let personWasNew = false;
 
                 // Only treat as email if it looks like a real address (not a placeholder like "unknown").
                 const hasEmail = lead.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(lead.email);
@@ -162,6 +166,7 @@ export class AttioAdapter implements CrmAdapter {
                 if (hasEmail) {
                     const { recordId, isNew } = await svc.upsertPersonByValues(personValues);
                     personId = recordId;
+                    personWasNew = isNew;
                     if (isNew) result.newCount++; else result.updatedCount++;
                 } else if (lead.syncMetadata?.attio_record_id || lead.customFields?.attio_record_id || lead.attioRecordId) {
                     const existingId = lead.syncMetadata?.attio_record_id || lead.customFields?.attio_record_id || lead.attioRecordId;
@@ -176,6 +181,7 @@ export class AttioAdapter implements CrmAdapter {
                         if (status === 404) {
                             // Record was deleted from Attio — create a new one
                             personId = await svc.createPersonByValues(personValues);
+                            personWasNew = true;
                             result.newCount++;
                             // Clear stale record ID so it gets overwritten below
                             lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_record_id: undefined };
@@ -185,6 +191,7 @@ export class AttioAdapter implements CrmAdapter {
                     }
                 } else {
                     personId = await svc.createPersonByValues(personValues);
+                    personWasNew = true;
                     result.newCount++;
                 }
 
@@ -202,8 +209,10 @@ export class AttioAdapter implements CrmAdapter {
                     lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_record_id: personId };
                 }
 
-                // Deal-list entry sync (non-critical — a failure here doesn't fail
-                // the lead, since its Person record already synced successfully).
+                // Deal-list entry sync. A failure here demotes the lead to an
+                // error (mirrors hubspotAdapter.ts's demote() pattern) — the
+                // Person record synced, but the lead as a whole didn't fully
+                // sync, so it must not be counted or reported as success.
                 if (dealListId) {
                     try {
                         const entryValues = this.buildDealEntryValues(lead, dealMappings, dealSlugs, dealTypes);
@@ -229,7 +238,15 @@ export class AttioAdapter implements CrmAdapter {
                             lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId };
                         }
                     } catch (e: any) {
-                        console.error(`[AttioAdapter] Deal-list sync failed for lead ${lead.leadId} (non-critical):`, e.response?.data?.message || e.message);
+                        const msg = e.response?.data?.message || e.message || 'Unknown error';
+                        console.error(`[AttioAdapter] Deal-list sync failed for lead ${lead.leadId}:`, msg);
+                        result.errorCount++;
+                        if (personWasNew) result.newCount--; else result.updatedCount--;
+                        result.errors.push(`${lead.email || lead.leadId}: deal sync failed - ${msg}`);
+                        await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+                            syncMetadata: buildFailedMetadata(lead.syncMetadata, msg),
+                        }).catch((updateErr: any) => { });
+                        continue;
                     }
                 }
 
