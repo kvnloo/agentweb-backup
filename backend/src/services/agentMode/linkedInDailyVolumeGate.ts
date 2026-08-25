@@ -28,6 +28,25 @@
  *    that never actually reached LinkedIn. Both checks now run before either
  *    is committed: daily check (cheap, no I/O) -> hourly/burst check (may
  *    sleep) -> only on both passing, persist the daily increment.
+ *
+ * Scope, stated honestly (a further CodeRabbit finding, same review): the
+ * daily reservation is check-then-write, not a single atomic conditional
+ * update. Two truly concurrent calls on the SAME account from DIFFERENT
+ * backend instances could both read count N and both persist N+1 — the
+ * account would then be under-counted by one for that day, not over its
+ * limit by an unbounded amount. This is the IDENTICAL scope limitation
+ * `linkedInWritePacer.ts` already documents and ships for the hourly/burst
+ * ceiling ("the gate is per-process... a distributed lease would be cost
+ * without a matching risk"), for the same reason: the observed failure mode
+ * driving both pacers is ONE session's parallel tool calls within a single
+ * process, not two processes racing the same account. A fully durable,
+ * serialized reservation (recomputed inside a DynamoDB conditional-update
+ * retry loop) would close this gap but is real added complexity for a risk
+ * this codebase already accepts elsewhere — revisit both together if writes
+ * ever fan out across instances in a way that makes the race routine rather
+ * than theoretical. Persistence failure is logged loudly
+ * (`[linkedInDailyVolumeGate] failed to persist...`) rather than blocking the
+ * write, matching the same best-effort philosophy as the hourly pacer.
  */
 
 import { getAccountsWithOwnerIncludingOrgShared, updateAccountConfig } from '../connectedAccountsDb';
