@@ -88,6 +88,24 @@ describe("POST /api/onboarding/outreach/preview-prospects", () => {
     expect(res.body.message).toContain("rate limited");
   });
 
+  // ENG-1559: distinct from unipile_error (a raw API failure) — this is our
+  // own probeSearchCapability guard confirming the account can't search at
+  // all, so a new user during onboarding gets an honest "temporarily
+  // unavailable" instead of an empty list indistinguishable from "no
+  // prospects match your ICP".
+  it("503s with code='search_unavailable' when the account's search capability is degraded", async () => {
+    searchProspectsPreview.mockResolvedValue({
+      ok: false,
+      error: "search_unavailable",
+    });
+    const res = await request(app)
+      .post("/api/onboarding/outreach/preview-prospects")
+      .send({ icp: "Founders", specifications: "B2B SaaS" });
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe("search_unavailable");
+    expect(res.body.message).toMatch(/temporarily unavailable/i);
+  });
+
   it("returns 200 with mapped items + linkedinConnected on success", async () => {
     searchProspectsPreview.mockResolvedValue({
       ok: true,
