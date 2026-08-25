@@ -8523,26 +8523,86 @@ export class AgentModeService {
 
   /**
    * ENG-1295 provenance/consistency helper: parses a generated CSV block into its
-   * data-row count and the distinct values of its first column — the grouping-key
-   * convention this tool's prompts ask the model to use (see the per-ad-group /
-   * per-user breakdown instructions in the callers of this tool). Used both to
-   * append a cheap-to-verify provenance stub and to diff repeat calls for
-   * self-consistency.
+   * header, rows, data-row count, and the distinct values of its first column —
+   * the grouping-key convention this tool's prompts ask the model to use (see the
+   * per-ad-group / per-user breakdown instructions in the callers of this tool).
+   * Used to append a cheap-to-verify provenance stub, to diff repeat calls for
+   * self-consistency, and to check the CSV's own internal id/name consistency.
    */
-  private parseCsvProvenance(csvText: string): { rowsOut: number; groupingKeyValues: string[] } | null {
+  private parseCsvProvenance(csvText: string): { rowsOut: number; groupingKeyValues: string[]; header: string[]; rows: string[][] } | null {
     const lines = csvText.split('\n').map(l => l.trimEnd()).filter(l => l.trim().length > 0);
     if (lines.length === 0) return null;
-    const dataLines = lines.slice(1); // first line is assumed to be the header
+    const splitRow = (line: string): string[] => line.split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+    const header = splitRow(lines[0]);
+    const rows = lines.slice(1).map(splitRow); // first line is assumed to be the header
     const groupingKeyValues: string[] = [];
     const seen = new Set<string>();
-    for (const line of dataLines) {
-      const firstCol = line.split(',')[0]?.trim().replace(/^"|"$/g, '');
+    for (const row of rows) {
+      const firstCol = row[0];
       if (firstCol && !seen.has(firstCol)) {
         seen.add(firstCol);
         groupingKeyValues.push(firstCol);
       }
     }
-    return { rowsOut: dataLines.length, groupingKeyValues };
+    return { rowsOut: rows.length, groupingKeyValues, header, rows };
+  }
+
+  /** ENG-1295: splits a CSV header cell into lowercase word tokens (camelCase- and separator-aware) for id/name column detection. */
+  private tokenizeCsvHeaderCell(cell: string): string[] {
+    return cell
+      .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+      .split(/[^a-zA-Z0-9]+/)
+      .map(t => t.toLowerCase())
+      .filter(Boolean);
+  }
+
+  /**
+   * ENG-1295 intra-response hard guard: detects the exact failure pattern that
+   * produced the prod hallucination — the SAME id mapped to two DIFFERENT names
+   * within one generated CSV (e.g. id 199836788398 as both "Product Analytics
+   * Platform" and "Game Analytics Platform"). This requires no narrative parsing:
+   * an id resolving to more than one name in the same result is an objective
+   * data-integrity violation regardless of subject matter. Only applies when the
+   * CSV actually has both an id-like and a name-like column (per-entity
+   * breakdowns commonly do; a plain metrics CSV with no id column is unaffected).
+   */
+  private findCsvIdNameCollision(header: string[], rows: string[][]): { id: string; names: string[] } | null {
+    const idIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('id'));
+    const nameIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('name'));
+    if (idIdx === -1 || nameIdx === -1 || idIdx === nameIdx) return null;
+    const idToNames = new Map<string, Set<string>>();
+    for (const row of rows) {
+      const id = row[idIdx];
+      const name = row[nameIdx];
+      if (!id || !name) continue;
+      if (!idToNames.has(id)) idToNames.set(id, new Set());
+      idToNames.get(id)!.add(name);
+    }
+    for (const [id, names] of idToNames) {
+      if (names.size > 1) {
+        return { id, names: [...names] };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * ENG-1295 grounding check: for a CSV with an id-like column, verifies each
+   * distinct id actually occurs somewhere in the raw source file(s) that were
+   * sent to the sandbox — the same objective technique the agent used manually
+   * (search_tool_response) to catch the fabricated name in prod session
+   * d789c175. Informational only (not a hard reject): a substring miss can also
+   * mean the model reformatted the id, so this is surfaced as a provenance
+   * caveat rather than blocking a possibly-correct result.
+   */
+  private checkCsvIdGrounding(header: string[], rows: string[][], fileRawContents: string[]): { checked: number; unverified: number } | null {
+    const idIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('id'));
+    if (idIdx === -1 || fileRawContents.length === 0) return null;
+    const distinctIds = [...new Set(rows.map(r => r[idIdx]).filter(Boolean))];
+    if (distinctIds.length === 0) return null;
+    const combinedSource = fileRawContents.join('\n');
+    const unverified = distinctIds.filter(id => !combinedSource.includes(id)).length;
+    return { checked: distinctIds.length, unverified };
   }
 
   /**
@@ -9117,13 +9177,33 @@ export class AgentModeService {
         };
       }
 
-      // ENG-1295 hardening: self-consistency check + provenance stub for generated
-      // CSV data. Both key off the CSV's first column as the grouping-key
-      // convention this tool's prompts ask the model to use for per-entity
-      // breakdowns.
+      // ENG-1295 hardening: intra-CSV consistency, cross-call self-consistency,
+      // and a provenance stub for generated CSV data.
       if (generatedCsvText) {
         const provenance = this.parseCsvProvenance(generatedCsvText);
         if (provenance) {
+          // 1. Intra-CSV check: the SAME id mapped to different names within this
+          // one response — the exact pattern that produced the prod hallucination.
+          // No cross-call state needed, so check this before touching the cache.
+          const collision = this.findCsvIdNameCollision(provenance.header, provenance.rows);
+          if (collision) {
+            console.warn(
+              `AgentMode: performDataAnalysis intra-CSV id/name collision (userId=${userId}): ` +
+              `id=${collision.id} names=[${collision.names.join(', ')}]`
+            );
+            return {
+              success: false,
+              message:
+                `The generated data contradicts itself: id "${collision.id}" is associated with more than one name ` +
+                `(${collision.names.join(', ')}) within the same result. An id must map to exactly one name — this indicates ` +
+                'the analysis model fabricated or corrupted at least one row. Do NOT trust this result. Retry with an ' +
+                'instruction that groups strictly by id and explicitly forbids inventing or varying the name for a given id.',
+              error: 'internal_inconsistency'
+            };
+          }
+
+          // 2. Cross-call self-consistency: an exact repeat call whose grouping-key
+          // set changed since its last run.
           const cacheKey = this.buildDataAnalysisCacheKey(userId, urlsToProcess, analysisInstruction);
           const prior = this.dataAnalysisConsistencyCache.get(cacheKey);
           if (prior) {
@@ -9150,21 +9230,39 @@ export class AgentModeService {
           this.dataAnalysisConsistencyCache.set(cacheKey, { groupingKeyValues: provenance.groupingKeyValues, timestamp: Date.now() });
           this.pruneDataAnalysisConsistencyCache();
 
-          // Provenance stub: cheap-to-verify rows_in / rows_out / distinct
+          // 3. Provenance stub: cheap-to-verify rows_in / rows_out / distinct
           // grouping-key values, so the caller doesn't have to trust the narrative
-          // summary about what the tool actually computed.
+          // summary about what the tool actually computed. Includes an id-grounding
+          // caveat when a distinct id in the CSV can't be found anywhere in the raw
+          // source file(s) — informational, not a hard reject (a substring miss can
+          // also mean the model reformatted the id).
           const rowsInPerFile = fileRawContents.map(c => this.estimateRowsIn(c)).filter((n): n is number => n !== null);
           const rowsIn = rowsInPerFile.length > 0 ? rowsInPerFile.reduce((a, b) => a + b, 0) : null;
           const MAX_DISTINCT_VALUES_SHOWN = 25;
           const distinctPreview = provenance.groupingKeyValues.slice(0, MAX_DISTINCT_VALUES_SHOWN);
           const moreCount = provenance.groupingKeyValues.length - distinctPreview.length;
+          const grounding = this.checkCsvIdGrounding(provenance.header, provenance.rows, fileRawContents);
           resultParts.push(
             `**Provenance:**\n` +
             `rows_in: ${rowsIn !== null ? rowsIn : 'unknown (no parsable input file)'}\n` +
             `rows_out: ${provenance.rowsOut}\n` +
             `distinct grouping-key values (${provenance.groupingKeyValues.length}): ${distinctPreview.join(', ')}` +
-            (moreCount > 0 ? ` … (+${moreCount} more)` : '')
+            (moreCount > 0 ? ` … (+${moreCount} more)` : '') +
+            (grounding && grounding.unverified > 0
+              ? `\n⚠️ ${grounding.unverified} of ${grounding.checked} id(s) in this result could not be found in the raw source file(s) — treat those rows as unverified.`
+              : '')
           );
+
+          // 4. Explicit untrusted-narrative caveat: make it part of the tool's own
+          // contract that the free-form prose has not been cross-checked, rather
+          // than relying on the calling agent to know to verify it independently
+          // (the ad-hoc behavior that happened to save prod session d789c175).
+          if (hasNarrativeText) {
+            resultParts.push(
+              '**Note:** The prose above has not been independently verified. Treat **Computed Data** and **Provenance** as ' +
+              'the trusted, verified source — cross-check any names, ids, or counts mentioned in the prose against them before repeating them.'
+            );
+          }
         }
       }
 
