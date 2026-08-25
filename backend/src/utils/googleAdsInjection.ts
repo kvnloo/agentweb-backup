@@ -17,6 +17,8 @@
  * been defined, and unblocking one test lander took a hand-written PR from a fork.
  */
 
+import * as ts from 'typescript';
+
 /**
  * Same bail-out rationale as its two siblings: a real Next.js layout.tsx is a few KB.
  * There is no legitimate layout this large; bail out before running any regex against
@@ -64,21 +66,58 @@ const CONVERSION_ID = /^AW-[0-9]{6,}$/;
  * Matches the same shape RULE 7.5's detector looks for, so "a tag the gate would see" and
  * "a tag we consider present" cannot disagree.
  */
-function foreignGoogleAdsIds(content: string): string[] {
-  const withoutOurs = content.replace(
+function stripOurBlock(content: string): string {
+  return content.replace(
     /\{\/\* Google Ads Tag \*\/\}[\s\S]*?\{\/\* End Google Ads Tag \*\/\}/g,
     '',
   );
-  // Scoped to <script> elements, not the whole file. An id in prose is not a tag — v0
-  // writes marketing copy, and a page whose body happens to quote a gtag URL must not
-  // read as tracked, or RULE 7.5 would pass a page that fires nothing. Conversely a
-  // hand-written loader or config call inside a script IS a live tag, whoever wrote it.
+}
+
+/**
+ * ENG-1527. The WIDE half: every AW id anywhere in the source, prose included.
+ *
+ * Used only to REFUSE TO WRITE. The old rule scoped this to <script> elements, reasoning
+ * that an id in prose is not a tag. That reasoning belongs to RULE 7.5's detector, which
+ * reads SERVED HTML, where a text node really is inert. This reads layout.tsx SOURCE,
+ * where the same characters are code:
+ *
+ *     const GA_ADS_ID = "AW-11112222333";
+ *     <Script src={`https://www.googletagmanager.com/gtag/js?id=${GA_ADS_ID}`} />
+ *
+ * an ordinary App Router shape with the id nowhere near a <script> literal. The guard saw
+ * nothing, injection proceeded, and two distinct AW ids shipped on one page — the ENG-910
+ * double-count this guard exists to prevent, walked past a second time.
+ *
+ * Wide is the safe direction HERE and only here: a false positive costs a visible 422
+ * telling a human to clean the layout; a miss costs a silently double-counted conversion.
+ */
+function foreignGoogleAdsIdsAnywhere(content: string): string[] {
+  const ids = new Set<string>();
+  // Case-sensitive: RULE 7.5's detector matches upper case only (a lower-case `gtm-agent`
+  // slug was reading as a container — see the comment on detectTrackingSnippets), so
+  // matching case-insensitively would let the two disagree about the very same page.
+  for (const id of stripOurBlock(content).match(/\bAW-[0-9]{6,}\b/g) || []) ids.add(id);
+  return [...ids];
+}
+
+/**
+ * ENG-1527. The NARROW half: AW ids sitting in an executable position.
+ *
+ * Used only to answer "does a conversion actually fire against this id". Widening this to
+ * match the guard above was a real regression, caught by the marketing-copy test: an AW id
+ * inside <title>We load …gtag/js?id=AW-99999999 for you</title> is copy, and reporting it
+ * as installed would hand RULE 7.5 a pass for a page that fires nothing — the exact failure
+ * the gate exists to prevent, arrived at from the other side.
+ *
+ * So the two are deliberately asymmetric, and the asymmetry is load-bearing. A page whose
+ * id lives in a const reads as NOT installed here, which is the safe answer: we then try to
+ * inject, the wide guard above refuses with a 422, and a human looks at it. Nothing is
+ * double-counted and nothing is silently blessed.
+ */
+function foreignGoogleAdsIdsInCode(content: string): string[] {
+  const withoutOurs = stripOurBlock(content);
   const ids = new Set<string>();
   for (const script of withoutOurs.match(/<script[\s\S]*?(?:\/>|<\/script>)/gi) || []) {
-    // Case-sensitive, to hold the invariant above: RULE 7.5's detector matches upper case
-    // only (a lower-case `gtm-agent` slug was reading as a container — see the comment on
-    // detectTrackingSnippets), so matching case-insensitively here would let the two
-    // disagree about whether the very same page carries a tag.
     for (const id of script.match(/\bAW-[0-9]{6,}\b/g) || []) ids.add(id);
   }
   return [...ids];
@@ -102,7 +141,7 @@ export function injectGoogleAdsIntoLayout(currentContent: string, conversionId: 
   // A tag someone else put here — hand-written, or installed by another tool — is still a
   // tag, and we cannot safely rewrite markup we did not author.
   if (conversionId !== '') {
-    const foreign = foreignGoogleAdsIds(currentContent);
+    const foreign = foreignGoogleAdsIdsAnywhere(currentContent);
     if (foreign.length > 0) {
       if (foreign.length === 1 && foreign[0] === conversionId.toUpperCase()) {
         // Already carrying exactly the id we were asked to install. The page IS
@@ -175,6 +214,153 @@ function extractGoogleAdsBlocks(content: string): string[] {
  * `conversionId` non-empty => exactly one block, carrying that exact id in both halves.
  * `conversionId` "" (removal) => zero blocks remain.
  */
+/**
+ * The script elements a browser would actually render, taken from a JSX PARSE of the
+ * layout source rather than from a regex over its characters.
+ *
+ * Scanning the raw text cannot tell an element from a description of one. Both of these
+ * used to report a working tag on a page that has none:
+ *
+ *     {/* old approach, removed:
+ *         <script src="…/gtag/js?id=AW-…"></script>
+ *         <script>gtag('config', 'AW-…');</script>
+ *     *​/}
+ *
+ *     // <script src="…/gtag/js?id=AW-…"></script>
+ *
+ * A developer commenting out an old tag block is ordinary, and the consequence was not:
+ * verify reported the page as already tagged, we skipped writing the tag, and the lander
+ * shipped measuring nothing. Comments cannot be stripped by regex here either — the loader
+ * URL contains `//`, so the obvious line-comment pattern eats the very thing being looked
+ * for. Parsing removes the whole class instead of another special case, and it settles the
+ * self-closing and attribute-boundary questions for free: the parser already knows where a
+ * tag ends, `>` inside a JSX expression and all.
+ *
+ * Both `script` and Next's `Script` count — the second is what App Router layouts use.
+ */
+function scriptElements(source: string): Array<{ attrs: string; body: string }> {
+  const out: Array<{ attrs: string; body: string }> = [];
+  // setParentNodes: true — getText() walks to the source file through the parent chain.
+  const sf = ts.createSourceFile('layout.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const isScriptTag = (name: string): boolean => name === 'script' || name === 'Script';
+  const text = (node: ts.Node): string => {
+    try {
+      return node.getText(sf);
+    } catch {
+      return '';
+    }
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isJsxSelfClosingElement(node) && isScriptTag(text(node.tagName))) {
+      out.push({ attrs: text(node.attributes), body: '' });
+    } else if (ts.isJsxElement(node) && isScriptTag(text(node.openingElement.tagName))) {
+      out.push({
+        attrs: text(node.openingElement.attributes),
+        body: node.children.map(text).join(''),
+      });
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sf, visit);
+  return out;
+}
+
+/**
+ * Does the browser execute this script element as JavaScript?
+ *
+ * A `type` the browser does not recognise as JS makes the element inert data — the
+ * classic case being `application/json` or `application/ld+json`, whose contents are never
+ * run. Treating those as code is how a config call quoted inside a JSON blob reads as a
+ * live tag.
+ */
+function isExecutableScript(attrs: string): boolean {
+  const type = attrs.match(/\btype\s*=\s*["']([^"']*)["']/i)?.[1]?.trim().toLowerCase();
+  if (!type) return true; // no type attribute = classic JavaScript
+  return ['text/javascript', 'application/javascript', 'text/ecmascript', 'application/ecmascript', 'module']
+    .includes(type);
+}
+
+/**
+ * Is there a real `gtag('config', '<conversionId>')` CALL in this JavaScript?
+ *
+ * Parsed, not string-matched. String matching cannot tell a call from the same characters
+ * sitting in a comment or inside a string literal, and both read as a working tag:
+ *
+ *     // gtag('config', 'AW-99999999') — TODO, ask marketing for the real id
+ *     const example = "gtag('config','AW-99999999')";
+ *
+ * Reporting either as installed makes us skip writing the tag that would actually have
+ * fired. TypeScript is already a runtime dependency, so its parser does this properly and
+ * for free — and it removes the regex built from a variable that the previous version used.
+ *
+ * The parser is error-tolerant, so malformed or non-JS content yields no match rather than
+ * throwing. That is the safe direction here: a false negative means we try to inject, the
+ * wide guard sees the foreign id and refuses, and a human looks.
+ */
+function hasGtagConfigCall(code: string, conversionId: string): boolean {
+  if (!code.trim()) return false;
+  let found = false;
+  const sf = ts.createSourceFile('inline.js', code, ts.ScriptTarget.Latest, false, ts.ScriptKind.JS);
+  const literal = (n: ts.Node | undefined): string | undefined => {
+    if (!n) return undefined;
+    if (ts.isStringLiteral(n)) return n.text;
+    if (ts.isNoSubstitutionTemplateLiteral(n)) return n.text;
+    return undefined;
+  };
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'gtag') {
+      const [first, second] = node.arguments;
+      if (literal(first)?.toLowerCase() === 'config' && literal(second) === conversionId) {
+        found = true;
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sf, visit);
+  return found;
+}
+
+/**
+ * Does a hand-written tag actually initialise this conversion id?
+ *
+ * Two parts have to be present, the same two our own block writes:
+ *
+ *   - a gtag.js loader, taken from a real `src` ATTRIBUTE rather than from anywhere the
+ *     URL happens to appear as text. Its id is NOT required to be the Ads id: loading
+ *     gtag.js once for GA4 (`gtag/js?id=G-…`) and then adding `gtag('config','AW-…')` is a
+ *     normal, working setup, and demanding `gtag/js?id=AW-…` would report those correctly
+ *     tagged pages as untagged.
+ *   - a real `gtag('config', '<this id>')` CALL. This is the part that registers the id;
+ *     without it the loader sits there measuring nothing for Ads.
+ *
+ * Both are looked for only in scripts the browser will actually execute.
+ */
+function handWrittenTagFires(content: string, conversionId: string): boolean {
+  const elements = scriptElements(stripOurBlock(content)).filter(el => isExecutableScript(el.attrs));
+
+  // The src VALUE, in any of the forms JSX writes it: a plain quoted string, or a brace
+  // expression wrapping a template literal — `src={`…/gtag/js?id=${ID}`}` is the shape our
+  // own injector emits, and the previous pattern could not cross the backtick, so a
+  // hand-written App Router loader read as no loader at all.
+  const hasLoader = elements.some(el => {
+    const src = el.attrs.match(/\bsrc\s*=\s*(\{[\s\S]*?\}|"[^"]*"|'[^']*'|`[^`]*`)/i)?.[1] ?? '';
+    return /googletagmanager\.com\/gtag\/js\?id=/i.test(src);
+  });
+
+  const hasConfig = elements.some(el => {
+    if (hasGtagConfigCall(el.body, conversionId)) return true;
+    // Next.js writes inline script bodies through dangerouslySetInnerHTML, so the code
+    // lives in the ATTRIBUTES rather than between the tags. Parse that content too, or
+    // every App Router tag reads as loader-only.
+    const html = el.attrs.match(/__html\s*:\s*(`[\s\S]*?`|"[\s\S]*?"|'[\s\S]*?')/)?.[1];
+    return html ? hasGtagConfigCall(html.slice(1, -1), conversionId) : false;
+  });
+
+  return hasLoader && hasConfig;
+}
+
 export function verifyGoogleAdsInjection(content: string, conversionId: string): boolean {
   const blocks = extractGoogleAdsBlocks(content);
 
@@ -189,9 +375,17 @@ export function verifyGoogleAdsInjection(content: string, conversionId: string):
 
   // A hand-written tag carrying this exact id counts as installed: the question this
   // answers is "will a conversion fire against this id", not "did we write it".
+  //
+  // But it has to be a WORKING tag, held to the same standard as our own block below —
+  // which requires the loader AND the config call. This path used to accept the id's mere
+  // presence inside any <script>, so a loader with no gtag('config') — or even
+  // `var note = "AW-99999999 is our id"` — reported the page as installed, and we skipped
+  // writing the tag that would actually have fired. Reporting success while conversion
+  // tracking is silently absent is the one outcome this whole module exists to prevent.
   if (blocks.length === 0) {
-    const foreign = foreignGoogleAdsIds(content);
-    return foreign.length === 1 && foreign[0] === conversionId.toUpperCase();
+    const foreign = foreignGoogleAdsIdsInCode(content);
+    if (foreign.length !== 1 || foreign[0] !== conversionId.toUpperCase()) return false;
+    return handWrittenTagFires(content, conversionId);
   }
 
   return (
