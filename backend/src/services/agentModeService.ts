@@ -5986,6 +5986,17 @@ export class AgentModeService {
       return { searchUnavailable: true, message: 'LinkedIn people search is unavailable for this account' };
     }
 
+    // ENG-1299 follow-up: same problem as the searchUnavailable marker above —
+    // linkedin_outreach has no branch below, so its stored tool-ledger result is
+    // the `{}` default, which erases the degraded/droppedFacets signal
+    // (searchPeople sets it when a resolver miss falls a facet back to
+    // keyword-only matching). Preserve it so post-hoc reconciliation can tell a
+    // search was filter-degraded, not just look at the live turn where the
+    // agent already sees the full spread result.
+    if (toolName === 'linkedin_outreach' && result?.data?.degraded === true) {
+      return { success: result?.success, degraded: true, droppedFacets: result.data.droppedFacets };
+    }
+
     // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
     // completion gate can (a) tell an enrichable preview (processedCount > 0) from an
     // unenrichable one and (b) pair previews to executes per list. The large `samples`
