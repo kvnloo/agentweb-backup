@@ -22,9 +22,11 @@ const mockGetAccountsByUserIdIncludingOrgShared = jest.fn();
 // the pacer's write is best-effort/caught, but an unresolved mock would still
 // hang the call.
 const mockUpdateAccountConfig = jest.fn().mockResolvedValue(undefined);
+const mockGetAccountsWithOwnerIncludingOrgShared = jest.fn();
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: (...args: any[]) => mockGetAccountsByUserId(...args),
   getAccountsByUserIdIncludingOrgShared: (...args: any[]) => mockGetAccountsByUserIdIncludingOrgShared(...args),
+  getAccountsWithOwnerIncludingOrgShared: (...args: any[]) => mockGetAccountsWithOwnerIncludingOrgShared(...args),
   updateAccountConfig: (...args: any[]) => mockUpdateAccountConfig(...args),
 }));
 
@@ -135,6 +137,9 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     // Default: user owns the account (or it is org-shared)
     mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
       { platform: 'unipile', account_id: 'test-account-id' },
+    ]);
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'test-account-id', userId: 'user-1' },
     ]);
 
     // Default: the Unipile session is live. clearAllMocks() does not reset
@@ -337,6 +342,9 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     it('returns error when account is not owned or org-shared', async () => {
       mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
         { platform: 'unipile', account_id: 'different-account' },
+      ]);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'different-account', userId: 'user-1' },
       ]);
 
       const result = await service.linkedinOutreach('user-1', validArgs);
@@ -603,6 +611,9 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     it('returns error when account is not owned or org-shared', async () => {
       mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
         { platform: 'unipile', account_id: 'different-account' },
+      ]);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'different-account', userId: 'user-1' },
       ]);
 
       const result = await service.linkedinOutreach('user-1', validArgs);
@@ -1618,6 +1629,9 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
     service = new AgentModeService();
     mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
       { platform: 'unipile', account_id: 'test-account-id' },
+    ]);
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'test-account-id', userId: 'user-1' },
     ]);
     mockIsAccountConnected.mockResolvedValue(true);
     mockProbeAccountSession.mockResolvedValue('connected');

@@ -316,7 +316,13 @@ import {
   usableProfileUrl,
   withoutFabricatedProfileFields,
 } from '../utils/linkedInAnonymizedProfile';
-import { PACED_WRITE_ACTIONS, reserveDailyVolumeSlot, reserveWriteSlot } from './linkedInWritePacer';
+import { PACED_WRITE_ACTIONS } from './linkedInWritePacer';
+import {
+  paceLinkedInWrite,
+  resolveLinkedInAccountForWrite,
+  setDailyInviteCap,
+  type ResolvedLinkedInAccount,
+} from './agentMode/linkedInDailyVolumeGate';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -31997,28 +32003,26 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // sixth write action added to one list and not the other would be either
     // silently unpaced or silently unauthorized.
     //
-    // Also resolves daily_invite_cap here, from the account record this lookup
-    // already fetches — the daily volume cap below needs it and this avoids a
-    // second DB read. This is self-reported (set directly by the user in
-    // Settings, or by Emma via the set-daily-invite-cap action after asking
+    // Also resolves the account's owner + daily-cap config here (via
+    // resolveLinkedInAccountForWrite — services/agentMode/linkedInDailyVolumeGate.ts),
+    // from the same lookup this authorization check already needs, avoiding a
+    // second DB read. The daily cap is self-reported (set directly by the user
+    // in Settings, or by Emma via the set-daily-invite-cap action after asking
     // about Premium status), never auto-detected — see linkedInWritePacer.ts's
     // module doc comment for why. Unset defaults to the conservative free-tier
-    // number, never to the Premium max.
+    // number, never to the Premium max. The resolved owner may differ from the
+    // calling user for an org-shared account — writes below go through the
+    // owner's record, not the caller's.
     // set-daily-invite-cap shares this same ownership check (a config write on
-    // the account still needs to be the caller's own account) but is deliberately
-    // NOT in PACED_WRITE_ACTIONS — it doesn't touch LinkedIn at all, so none of
-    // the burst/hourly/daily send-pacing below applies to it.
-    let configuredDailyInviteCap: number | null | undefined;
-    let dailyVolumeState: import('./linkedInWritePacer').DailyVolumeState | null | undefined;
+    // the account still needs to be the caller's own/shared account) but is
+    // deliberately NOT in PACED_WRITE_ACTIONS — it doesn't touch LinkedIn at
+    // all, so none of the burst/hourly/daily send-pacing below applies to it.
+    let resolvedLinkedInAccount: ResolvedLinkedInAccount | null = null;
     if (PACED_WRITE_ACTIONS.has(action) || action === 'set-daily-invite-cap') {
-      const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
-      const userAccounts = await getAccountsByUserIdIncludingOrgShared(userId);
-      const matchedAccount = userAccounts.find((a: any) => a.platform === 'unipile' && a.account_id === account_id);
-      if (!matchedAccount) {
+      resolvedLinkedInAccount = await resolveLinkedInAccountForWrite(userId, account_id);
+      if (!resolvedLinkedInAccount) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
       }
-      configuredDailyInviteCap = (matchedAccount as any)?.config?.daily_invite_cap;
-      dailyVolumeState = (matchedAccount as any)?.config?.daily_volume;
     }
 
     // For read-only actions (get-profile, search-people, get-company), fall back to
@@ -32119,64 +32123,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // batch of already-invited leads would both crawl and eat the hourly ceiling
     // that the genuinely-new invites later in the same run need. Each case below
     // therefore calls this immediately before its own Unipile write.
+    // Daily-volume + hourly/burst pacing lives in
+    // services/agentMode/linkedInDailyVolumeGate.ts — see that module's doc
+    // comment for the ownership and check-ordering fixes it encodes.
     const paceWrite = async (): Promise<{ refusal: any } | null> => {
       if (!PACED_WRITE_ACTIONS.has(action)) return null;
-
-      // Daily volume ceiling first — a hard stop for the day, cheaper to check
-      // than the hourly/burst pacer, and a call over budget for the day should
-      // not also spend a pacing gap before being refused. Persisted to the
-      // account's own config (not module memory — see linkedInWritePacer.ts's
-      // module doc comment on DailyVolumeState) so a backend restart mid-day
-      // can't reset an account's daily count to zero.
-      const dailySlot = reserveDailyVolumeSlot(action, configuredDailyInviteCap, dailyVolumeState);
-      if (!dailySlot.allowed) {
-        console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by daily volume cap — ${dailySlot.reason}`);
-        return {
-          refusal: {
-            success: false,
-            message: 'LinkedIn daily volume limit reached',
-            error: [
-              dailySlot.reason,
-              '',
-              'This is a deliberate daily safety limit on our side, not a LinkedIn rejection.',
-              '',
-              'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
-            ].join('\n'),
-          },
-        };
-      }
-      // Persist the reservation optimistically, at grant time — matching the
-      // hourly/burst pacer's own philosophy below, which also records before the
-      // Unipile call rather than after a confirmed success. A plain merge, not a
-      // read-fresh-and-CAS: two genuinely concurrent calls could both read the
-      // same base count and both write the same incremented value (undercounting
-      // by one in a rare burst, never overcounting), which is the same class of
-      // per-process imprecision this file already accepts for the hourly ceiling
-      // — a distributed lock would be cost without a matching risk here either.
-      dailyVolumeState = dailySlot.nextState;
-      const { updateAccountConfig: persistDailyVolume } = await import('./connectedAccountsDb');
-      await persistDailyVolume(userId, 'unipile', account_id, { daily_volume: dailySlot.nextState }).catch((err) =>
-        console.error(`[AgentMode] linkedinOutreach: failed to persist daily volume state for ${account_id}:`, err),
-      );
-
-      const slot = await reserveWriteSlot(account_id);
-      if (slot.allowed) return null;
-      console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by write pacer — ${slot.reason}`);
-      return {
-        refusal: {
-          success: false,
-          message: 'LinkedIn write actions are being paced',
-          error: [
-            slot.reason,
-            '',
-            'This is a deliberate safety limit on our side, not a LinkedIn rejection: sending or',
-            'withdrawing too quickly is what causes LinkedIn to revoke the account\'s session, which',
-            'blocks ALL outreach until the account owner manually reconnects.',
-            '',
-            'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
-          ].join('\n'),
-        },
-      };
+      const result = await paceLinkedInWrite(action, resolvedLinkedInAccount!, account_id);
+      return result.refusal ? { refusal: result.refusal } : null;
     };
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
@@ -32980,8 +32933,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const clampedCap = Number.isFinite(absoluteMax) && absoluteMax > 0
             ? Math.min(parsedCap, absoluteMax)
             : parsedCap;
-          const { updateAccountConfig } = await import('./connectedAccountsDb');
-          await updateAccountConfig(userId, 'unipile', account_id, { daily_invite_cap: clampedCap });
+          // Writes through the account OWNER's record, not necessarily the
+          // caller's — see linkedInDailyVolumeGate.ts's module doc comment.
+          await setDailyInviteCap(resolvedLinkedInAccount!, account_id, clampedCap);
           return {
             success: true,
             data: {
