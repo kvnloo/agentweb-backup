@@ -4695,6 +4695,12 @@ export async function generateChatResponse(
     // Exposed for the ENG-1222 hard gate below, so it can tell "subscription
     // correctly doesn't include this skill" apart from "tool resolution failed".
     let userAllowedSkillIdsForGate: string[] = [];
+    // getSkillsByIds/getPublishedSkills/getAllowedSkills can all reject (e.g. a
+    // transient DynamoDB error) — without tracking that separately from "resolved
+    // to an empty allowlist", the hard gate below would misreport a backend
+    // failure as "this skill isn't in your plan" to a paying customer whose
+    // subscription was never actually checked.
+    let skillAllowlistResolved = false;
     if (skillToolGateOpen) {
       try {
         await agentModeService.initialize();
@@ -4717,6 +4723,7 @@ export async function generateChatResponse(
             userId ? getAllowedSkills(userId) : getPublicAllowedSkills(),
           ]);
           userAllowedSkillIdsForGate = userAllowedSkillIds;
+          skillAllowlistResolved = true;
           skillContext = agentModeService.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionSkillIds, !!isDelegatedAdmin);
         } else {
           skillContext = agentModeService.buildSkillContext([], [], [], [], !!isDelegatedAdmin);
@@ -4988,7 +4995,11 @@ export async function generateChatResponse(
       // ask the user to retry. Tell them the real reason instead of the generic
       // "configuration issue" message, which would be actively misleading here.
       const isWildcardAllowed = userAllowedSkillIdsForGate.includes('*');
-      const isSubscriptionGated = !isWildcardAllowed && sessionSkillIds.length > 0
+      // skillAllowlistResolved guards this: an unresolved allowlist (the
+      // Promise.all above rejected) must never be classified as "subscription
+      // doesn't include this skill" — that's only a real conclusion once the
+      // allowlist was actually fetched.
+      const isSubscriptionGated = skillAllowlistResolved && !isWildcardAllowed && sessionSkillIds.length > 0
         && sessionSkillIds.every((id) => !userAllowedSkillIdsForGate.includes(id));
       console.error('[generateChatResponse] ENG-1222 hard gate: skill session resolved to zero tools', {
         sessionId,
@@ -5183,7 +5194,20 @@ export async function generateChatResponse(
     // without weakening the check against the actual incident pattern.
     const CLAIMS_REAL_TOOL_OUTPUT = /\bactual(?:ly)?\s+(?:returned|return|results?|rows?|data|account\s+(?:names?|ids?))\b|\breal\s+(?:api|account|customer)\s+data\b/i;
     const LOOKS_LIKE_TOOL_SHAPED_DATA = /\d{3,}|(?:^|\n)\s*[-*•]\s|(?:^|\n)\s*\d+[.)]\s/;
-    if (toolCalls.length === 0 && CLAIMS_REAL_TOOL_OUTPUT.test(finalAssistantMessage) && LOOKS_LIKE_TOOL_SHAPED_DATA.test(finalAssistantMessage)) {
+    // An honest refusal ("I can't reach your actual data, but here's how to
+    // check it yourself:" followed by a bulleted list) satisfies both patterns
+    // above on a zero-tool turn. Scoped to a denial word immediately followed by
+    // an access verb, not any negation within reach of "actual" — "I don't know
+    // why, but here are the actual returned rows" is genuine fabrication and
+    // must still be caught, so a bare "don't"/"can't" elsewhere in the sentence
+    // doesn't exempt it.
+    const DENIES_REAL_TOOL_ACCESS = /\b(?:can(?:'|’)?t|cannot|don(?:'|’)?t|unable to|without)\s+(?:access(?:ing)?|reach(?:ing)?|retriev(?:e|ing)|get(?:ting)?|provid(?:e|ing)|check(?:ing)?|pull(?:ing)?|fetch(?:ing)?|see(?:ing)?)\b[^.!?]{0,30}\bactual\b/i;
+    if (
+      toolCalls.length === 0
+      && CLAIMS_REAL_TOOL_OUTPUT.test(finalAssistantMessage)
+      && LOOKS_LIKE_TOOL_SHAPED_DATA.test(finalAssistantMessage)
+      && !DENIES_REAL_TOOL_ACCESS.test(finalAssistantMessage)
+    ) {
       console.error('[generateChatResponse] Blocked a zero-tool-call response claiming real tool-derived data', { sessionId, portalType });
       finalAssistantMessage = "I wasn't able to actually run the tools needed to get real data for this, so I don't have genuine results to share. Please try again, and let us know if this keeps happening.";
     }

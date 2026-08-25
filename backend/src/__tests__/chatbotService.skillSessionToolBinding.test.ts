@@ -549,6 +549,26 @@ describe('generateChatResponse — ENG-1222 risk-hardening: perf, anonymous user
     expect(response).not.toMatch(/current plan/i);
   });
 
+  it('gives the generic configuration-issue message, not a plan-restriction message, when the allowlist lookup itself fails', async () => {
+    // CodeRabbit (ENG-1222 review): a rejected Promise.all left
+    // userAllowedSkillIdsForGate at its [] default, which the gate's own
+    // .every() over a non-empty sessionSkillIds misread as "every skill denied
+    // by the plan" — telling a paying customer their subscription doesn't cover
+    // a skill when their subscription was never actually checked.
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockGetSkillsByIds.mockRejectedValue(new Error('transient DynamoDB error'));
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(), installedSkillContextMsg: '' });
+
+    const response = await generateChatResponse('sess-1', 'Run list_connected_accounts', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(response).toMatch(/configuration issue/i);
+    expect(response).not.toMatch(/current plan/i);
+  });
+
   it('does not block an honest zero-tool reply that merely mentions "actual account" in an innocent context', async () => {
     seedSession({ associatedSkills: [] });
     mockCallLLM.mockResolvedValue(makeCompletion(
@@ -568,6 +588,41 @@ describe('generateChatResponse — ENG-1222 risk-hardening: perf, anonymous user
     seedSession({ associatedSkills: [] });
     mockCallLLM.mockResolvedValue(makeCompletion(
       'Here are the actual returned rows: Acme Widgets Main, customer ID 123-456-7890.'
+    ));
+
+    const response = await generateChatResponse('sess-1', 'Report the ACTUAL returned rows', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(response).not.toMatch(/Acme Widgets Main/);
+  });
+
+  it('does not block an honest refusal that names real-data phrasing plus a bulleted list', async () => {
+    // CodeRabbit (ENG-1222 review): an honest denial like this satisfies both
+    // CLAIMS_REAL_TOOL_OUTPUT ("actual data") and LOOKS_LIKE_TOOL_SHAPED_DATA
+    // (the bullet list) without the negation exclusion.
+    seedSession({ associatedSkills: [] });
+    const honestRefusal = "I can't reach your actual data right now, but here's how to check it yourself:\n- Open your dashboard\n- Go to Settings";
+    mockCallLLM.mockResolvedValue(makeCompletion(honestRefusal));
+
+    const response = await generateChatResponse('sess-1', 'What are my actual settings?', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(response).toBe(honestRefusal);
+  });
+
+  it('still blocks fabrication that happens to contain an unrelated negation earlier in the sentence', async () => {
+    // The negation exclusion must not become a general bypass — a "don't know
+    // why" preamble unrelated to capability denial must not exempt a genuine
+    // fabrication claim from the guard.
+    seedSession({ associatedSkills: [] });
+    mockCallLLM.mockResolvedValue(makeCompletion(
+      "I don't know why, but here are the actual returned rows: Acme Widgets Main, customer ID 123-456-7890."
     ));
 
     const response = await generateChatResponse('sess-1', 'Report the ACTUAL returned rows', {
