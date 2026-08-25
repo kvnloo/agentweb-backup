@@ -221,7 +221,9 @@ import {
   normalizeSender,
 } from '../services/crmSenderService';
 import { MAILBOX_PROVIDERS, CrmSender, isMailboxSender } from '../services/crmSenderTypes';
-import { sendAsSender } from '../services/sendAsSender';
+import { sendAsSender, SenderDailyLimitExceededError } from '../services/sendAsSender';
+import { effectiveDailyLimit } from '../services/senderUsageTracker';
+import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
 router.use(apolloSubRouter);
 
 const normalizeAlertEvents = (alertEvents: any) => {
@@ -5026,10 +5028,19 @@ router.get('/sender-emails', async (req: Request, res: Response) => {
 
     // Emit both shapes: the legacy keys (senderType / gmailAccountId) so the
     // current portal keeps rendering, and the neutral ones the new UI reads.
-    const senders = config.senders.map((s) => ({
-      ...serializeSender(s),
-      senderProvider: s.senderProvider,
-      connectedAccountId: s.connectedAccountId,
+    // Also attach today's send usage against each sender's effective cap
+    // (ENG-265) so the settings UI can show "warming up" / "N/limit today"
+    // without a second round trip.
+    const senders = await Promise.all(config.senders.map(async (s) => {
+      const limit = effectiveDailyLimit(s);
+      const usage = limit !== null ? await senderUsageTracker.getUsage(userId, s.id) : null;
+      return {
+        ...serializeSender(s),
+        senderProvider: s.senderProvider,
+        connectedAccountId: s.connectedAccountId,
+        effectiveDailyLimit: limit,
+        sentToday: usage?.sentCount ?? 0,
+      };
     }));
 
     res.json({
@@ -5140,6 +5151,8 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
           notes: s.notes ? s.notes.trim() : undefined,
           senderProvider: s.senderProvider ?? s.senderType ?? 'resend',
           connectedAccountId: s.connectedAccountId ?? s.gmailAccountId,
+          dailyLimit: typeof s.dailyLimit === 'number' ? s.dailyLimit : undefined,
+          warmupStartedAt: typeof s.warmupStartedAt === 'string' ? s.warmupStartedAt : undefined,
         }),
       ),
       defaultSenderId: defaultSenderId || (senders.length > 0 ? senders[0].id || '0' : null),
@@ -6194,6 +6207,10 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     let failed = 0;
     const failedEmails: string[] = [];
     const failureReasons: Array<{ email: string; reason: string }> = [];
+    // ENG-265: once the sender hits its daily cap, every remaining send would
+    // fail the same way — stop the batch instead of burning through the rest
+    // of the list generating identical failures, and report why.
+    let stoppedEarlyReason: string | null = null;
 
     for (const lead of eligibleLeads) {
       try {
@@ -6222,6 +6239,10 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         });
         sent++;
       } catch (err: any) {
+        if (err instanceof SenderDailyLimitExceededError) {
+          stoppedEarlyReason = err.message;
+          break;
+        }
         const reason = err.message || String(err);
         console.error(`Failed to send group email to ${lead.email}:`, reason);
         failed++;
@@ -6235,6 +6256,8 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       }
     }
 
+    const skippedDueToLimit = stoppedEarlyReason ? total - sent - failed : 0;
+
     return res.json({
       total,
       sent,
@@ -6245,6 +6268,8 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedDoNotContact,
       skippedMissingVars,
       skippedUndeliverable,
+      skippedDueToLimit,
+      stoppedEarlyReason,
     });
   } catch (error) {
     console.error('Error sending group email:', error);
@@ -6322,6 +6347,7 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
     let failedCount = 0;
     const failedEmails: string[] = [];
     const failureReasons: Array<{ email: string; reason: string }> = [];
+    let stoppedEarlyReason: string | null = null;
 
     for (const email of validEmails) {
       try {
@@ -6333,6 +6359,10 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
         });
         sent++;
       } catch (err: any) {
+        if (err instanceof SenderDailyLimitExceededError) {
+          stoppedEarlyReason = err.message;
+          break;
+        }
         const reason = err.message || String(err);
         console.error(`Failed to send test group email to ${email}:`, reason);
         failedCount++;
@@ -6347,6 +6377,8 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
       sent,
       failed: failedCount,
       failedEmails,
+      skippedDueToLimit: stoppedEarlyReason ? validEmails.length - sent - failedCount : 0,
+      stoppedEarlyReason,
     });
   } catch (error) {
     console.error('Error sending test group email:', error);

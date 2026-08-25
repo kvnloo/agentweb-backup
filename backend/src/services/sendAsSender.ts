@@ -14,6 +14,10 @@
 import { resendService } from './resendService';
 import { getEmailProvider, bootstrapEmailProviders, type SentEmailResult } from './emailProviderService';
 import { CrmSender, SenderProvider, PROVIDER_TO_PLATFORM } from './crmSenderTypes';
+import { effectiveDailyLimit, SenderDailyLimitExceededError } from './senderUsageTracker';
+import { senderUsageTracker } from './senderUsageTrackerFactory';
+
+export { SenderDailyLimitExceededError };
 
 export interface SendAsSenderParams {
   to: string | string[];
@@ -66,6 +70,15 @@ export async function sendAsSender(
   sender: CrmSender,
   params: SendAsSenderParams,
 ): Promise<SendAsSenderResult> {
+  // ENG-265: daily-cap/warmup check. `limit === null` means the sender has no
+  // cap configured — unchanged legacy behavior, no tracker read at all. Quota
+  // is only consumed by a send that actually succeeds (recorded after each
+  // branch below), so a failed provider call doesn't burn the day's budget.
+  const limit = effectiveDailyLimit(sender);
+  if (limit !== null) {
+    await senderUsageTracker.checkQuota(userId, sender.id, limit);
+  }
+
   if (sender.senderProvider === 'resend') {
     // resendService has never supported bcc (checked as of this branch: neither the
     // service nor any pre-existing caller ever wired it up) — fail loud instead of
@@ -85,6 +98,9 @@ export async function sendAsSender(
     });
     if (!result || !result.id) {
       throw new SenderSendError(sender, 'Resend did not return a message id — the send may have failed.');
+    }
+    if (limit !== null) {
+      await senderUsageTracker.recordSend(userId, sender.id);
     }
     return { provider: 'resend', messageId: result.id };
   }
@@ -111,5 +127,8 @@ export async function sendAsSender(
     replyToMessageId: params.replyToMessageId,
   });
 
+  if (limit !== null) {
+    await senderUsageTracker.recordSend(userId, sender.id);
+  }
   return { provider: sender.senderProvider, messageId: result.messageId, threadId: result.threadId };
 }

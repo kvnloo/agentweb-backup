@@ -57,6 +57,8 @@ export function normalizeSender(raw: any): CrmSender {
     senderProvider,
     // `gmailAccountId` is the pre-Outlook key. Prefer the neutral one when both exist.
     connectedAccountId: raw?.connectedAccountId ?? raw?.gmailAccountId,
+    dailyLimit: typeof raw?.dailyLimit === 'number' ? raw.dailyLimit : undefined,
+    warmupStartedAt: typeof raw?.warmupStartedAt === 'string' ? raw.warmupStartedAt : undefined,
   };
 }
 
@@ -83,6 +85,8 @@ export function serializeSender(sender: CrmSender): any {
     email: sender.email,
     fromName: sender.fromName,
     notes: sender.notes,
+    dailyLimit: sender.dailyLimit,
+    warmupStartedAt: sender.warmupStartedAt,
   };
 
   if (!isMailboxSender(sender)) {
@@ -116,6 +120,16 @@ export function validateSender(raw: any, connectedAccounts: any[]): SenderValida
 
   if (provider !== undefined && !ALL_PROVIDERS.includes(provider)) {
     return { ok: false, error: `Invalid senderType: ${provider}` };
+  }
+
+  if (raw?.dailyLimit !== undefined && (typeof raw.dailyLimit !== 'number' || !Number.isFinite(raw.dailyLimit) || raw.dailyLimit < 1)) {
+    return { ok: false, error: 'dailyLimit must be a positive number' };
+  }
+
+  if (raw?.warmupStartedAt !== undefined) {
+    if (typeof raw.warmupStartedAt !== 'string' || Number.isNaN(new Date(raw.warmupStartedAt).getTime())) {
+      return { ok: false, error: 'warmupStartedAt must be a valid ISO date string' };
+    }
   }
 
   if (provider === undefined || provider === 'resend') {
