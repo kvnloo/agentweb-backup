@@ -1,4 +1,5 @@
 import express from 'express';
+import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
 import axios from 'axios';
 import { authenticateToken } from '../middleware/auth';
 import { getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, getAccountById, updateAccountConfig, FathomConfig, CalendlyConfig } from '../services/connectedAccountsDb';
@@ -314,6 +315,21 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // data, plus the actionable reason when it cannot. Absent entirely for
         // every other account, and for Meta records whose grant we cannot prove.
         ...adsCapability,
+        /*
+         * Google Ads only (ENG-1362). Whether this account can spend real money.
+         *
+         * `test_account: true` is Google's own guarantee that the account cannot serve
+         * ads and cannot spend; `false` is a real billable account; `undefined` means it
+         * was connected before we recorded the flag. `can_spend` folds all three into the
+         * answer the reader actually needs, and clears ONLY on an affirmative true — so
+         * "we never recorded it" can never render as "safe".
+         *
+         * Surfaced because the account NAME is not a safety property, though it reads
+         * like one: a real, billable, ENABLED account descriptively named "Test" is
+         * connected on this platform right now, and both a human skimming this list and
+         * an agent reasoning over it would otherwise have only that string to go on.
+         */
+        ...(acc.platform === 'google_ads' ? describeGoogleAdsSpendRisk(acc.config as any) : {}),
         // Calendly only (ENG-1141): which Meta pixel/ad account bookings attribute to —
         // explicitly chosen, or undefined until the customer picks one (the frontend
         // defaults the picker's display to the first connected account/pixel, matching
