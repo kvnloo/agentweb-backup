@@ -3,6 +3,7 @@ import { ExternalCrmSyncConfig, FieldMapping, SyncResult } from '../externalCrmS
 import { AttioService } from '../attioService';
 import { crmDb } from '../db';
 import { buildSyncedMetadataBase, buildFailedMetadata } from '../../utils/leadSyncStatus';
+import { validateEmail } from '../../utils/validation';
 
 /**
  * Attio CRM Adapter
@@ -118,6 +119,25 @@ export class AttioAdapter implements CrmAdapter {
         // ── 4. Sync each lead ───────────────────────────────────────────────────
         for (const lead of leads) {
             try {
+                // Guard against non-email values (e.g. a social/profile URL landing
+                // in the email field). An invalid email used to fall through to the
+                // update/create-by-id branches silently — the record still synced,
+                // but with no email at all, and the lead was reported a clean
+                // success. Surface it as a per-lead error instead, mirroring
+                // hubspotAdapter.ts's identical guard. An empty email is allowed —
+                // those push via create/update-by-id below, unaffected.
+                const trimmedEmail = typeof lead.email === 'string' ? lead.email.trim() : '';
+                if (trimmedEmail && !validateEmail(trimmedEmail)) {
+                    result.errorCount++;
+                    const msg = `Invalid email "${trimmedEmail}" — skipped (not a valid email address)`;
+                    console.warn(`[AttioAdapter] ${msg} for lead=${lead.leadId}`);
+                    result.errors.push(`${trimmedEmail}: ${msg}`);
+                    await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+                        syncMetadata: buildFailedMetadata(lead.syncMetadata, msg),
+                    }).catch((updateErr: any) => { });
+                    continue;
+                }
+
                 // Determine if we need to resolve a company relationship
                 let companyId: string | undefined;
                 const companyMapping = config.contactFieldMapping.find(m => m.enabled && m.direction !== 'pull' && m.crmProperty === 'company');
@@ -161,7 +181,9 @@ export class AttioAdapter implements CrmAdapter {
                 let personWasNew = false;
 
                 // Only treat as email if it looks like a real address (not a placeholder like "unknown").
-                const hasEmail = lead.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(lead.email);
+                // Invalid emails already handled (and skipped) by the guard above,
+                // so an email present here is either valid or absent.
+                const hasEmail = trimmedEmail && validateEmail(trimmedEmail);
 
                 if (hasEmail) {
                     const { recordId, isNew } = await svc.upsertPersonByValues(personValues);
