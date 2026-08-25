@@ -326,4 +326,36 @@ describe('summarizeSessionIfNeeded', () => {
 
     expect(result!.summary).toBe('Rendered all 3 sizes for the display ad set.');
   });
+
+  // CodeRabbit (this PR): detectFalseCompletionClaim's default scoping restricts
+  // the ledger to activity SINCE the last set_work_plan_status call — correct for
+  // a single closing turn, but wrong for a whole-session summary. A render step
+  // that closes itself (nothing after its own boundary call) is already handled
+  // by sinceLastStepBoundary's self-closing case, so this needs a SECOND,
+  // immediately-following step boundary (e.g. an approval step that closes with
+  // no assets of its own) to actually exercise the exclusion: that second
+  // boundary scopes the ledger down to "since the approval step opened", which
+  // has zero assets, even though the earlier render step truthfully produced 3.
+  test('does not flag a truthful claim whose assets were produced before the last step boundary', async () => {
+    mockCallLLM.mockResolvedValue(makeLLMResponse('Rendered all 3 sizes for the display ad set.'));
+
+    const session = makeSession({
+      sessionId: 'sess-truthful-earlier-step',
+      messageCount: 4,
+      messages: [
+        { role: 'user', content: 'Render all 3 sizes, then move on to approval' },
+        toolCallMessage([
+          { name: 'playwright_browser_take_screenshot' },
+          { name: 'playwright_browser_take_screenshot' },
+          { name: 'playwright_browser_take_screenshot' },
+          { name: 'set_work_plan_status' }, // closes the render step
+          { name: 'set_work_plan_status' }, // immediately closes the (assetless) approval step
+        ]),
+      ],
+    });
+
+    const result = await summarizeSessionIfNeeded(session);
+
+    expect(result!.summary).toBe('Rendered all 3 sizes for the display ad set.');
+  });
 });

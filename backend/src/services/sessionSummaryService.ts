@@ -113,7 +113,13 @@ export async function summarizeSessionIfNeeded(
 
   let summaryText = result.summary;
   const toolCallLedger = flattenSessionToolCalls(session.messages);
-  const falseClaim = detectFalseCompletionClaim(summaryText, toolCallLedger);
+  // scopeToLastStepBoundary=false (CodeRabbit, this PR): this summary spans the
+  // WHOLE session, potentially several already-closed work-plan steps. The default
+  // scoping restricts the ledger to activity since the last set_work_plan_status
+  // call, which is correct for a single closing turn but would misread a truthful
+  // claim about several completed steps' assets as false the moment the currently
+  // -open step hasn't produced anything of its own yet.
+  const falseClaim = detectFalseCompletionClaim(summaryText, toolCallLedger, false);
   if (falseClaim) {
     console.warn(
       `SessionSummary: generated summary for session ${session.sessionId} claims ${falseClaim.claimed} completed ` +
