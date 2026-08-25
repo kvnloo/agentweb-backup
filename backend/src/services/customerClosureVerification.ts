@@ -7,51 +7,40 @@ function field(body: string, name: string): string | null {
   return match?.[1]?.trim() || null;
 }
 
-// Trusted verifier identities. Deliberately an allowlist of exact, structured prefixes rather
-// than "any non-empty string" or "anyone other than the fix author" — the point of this gate is
-// that a claim of independence must come from an identity we can actually trust, not merely one
-// that isn't the implementer (a free-text human name, however genuine, is still an unstructured
-// claim the gate exists to distrust — ENG-1268 originally had no path for this at all, which
-// meant even Harsha reviewing and closing an issue himself, directly, in a live session, got
-// silently reverted with no way to satisfy the gate; that incident is this test's regression
-// fixture). `harsha-direct/<anything>` is Harsha's own explicit, deliberate sign-off — the one
-// human identity this contract already treats as authoritative everywhere else (comms decisions,
-// database/data-plane approval, external-copy review). Anyone else's name, however well-meaning,
-// stays rejected exactly as before.
-const TRUSTED_VERIFIER_PREFIX = /^(post-merge-verifier|harsha-direct)\/\S+$/i;
-
-// CodeRabbit finding on the PR that added `harsha-direct` (2026-08-24): the check above matches
-// comment TEXT only, so any workspace member with comment access on the issue could type either
-// trusted prefix themselves and force their own closure through — for `harsha-direct` specifically,
-// that would let the row's own owner impersonate the one identity this gate is supposed to defer
-// to, defeating its entire point. Binding to the actual comment author closes that: only a comment
-// authored by Harsha's own Linear account counts, for either prefix.
+// ENG-1556 (2026-08-25, Harsha, live directive): "i don't give a shit about that fix anymore
+// that no one can verify their own fixes, we do that all the time, remove that as a rule."
 //
-// This does not yet distinguish the real Harsha from the automation loop acting AS Harsha — both
-// currently authenticate to Linear as the same account ("the loop writes as Harsha until ENG-637",
-// see pm-guard.py's ATTRIBUTION section) — so it cannot tell a genuine live human decision from an
-// automated post-merge-verifier run typing `harsha-direct/` instead of its own prefix. That
-// narrower gap is exactly what ENG-637 (a dedicated Linear identity for the loop) closes; until
-// then, "authored by Harsha's account" is the correct and available boundary, and it is a strictly
-// smaller trust surface than "anyone who can comment," which is what CodeRabbit flagged.
-const HARSHA_LINEAR_USER_ID = '142fef82-4d45-4070-99be-c5debe565ac6';
+// This gate previously also required the Verifier field text to match a trusted-identity prefix
+// (`post-merge-verifier/…` or `harsha-direct/…`) AND the comment's authorId to equal Harsha's own
+// Linear account — together meaning only Harsha (or automation posting as him) could ever satisfy
+// the gate, and no engineer could self-certify their own tested fix. ENG-1465 hit this repeatedly:
+// Anurag verified his own fix thoroughly on prod and the Done transition kept bouncing back to
+// Verifying anyway. Harsha's ruling: self-verification by the implementer is normal, accepted
+// engineering practice. Both the trusted-prefix content check and the author-identity check are
+// removed; see `rules/autonomous-execution-and-merge.md` closure-gate item 5 (already updated) for
+// the policy this code now matches.
+//
+// What is deliberately NOT removed: the structured-evidence requirement. A merge/deploy claim
+// still cannot satisfy this contract — the comment must explicitly classify the evidence as a
+// customer-symptom check (not "looks fixed" / "merged") and record what and how it checked. Only
+// the WHO-posted-it restriction is gone; the WHAT-must-be-in-it requirement is unchanged.
 
 /**
  * A customer-bug closure record is deliberately structured and fail-closed.
  * A merge/deploy claim cannot satisfy this contract: the verifier must explicitly
- * classify the evidence as a customer-symptom check and record what and how it checked,
- * AND the comment itself must have been authored by the trusted Linear account.
+ * classify the evidence as a customer-symptom check and record what and how it checked.
+ * Any Linear user's comment can satisfy this — including the fix's own author/implementer
+ * (ENG-1556) — as long as the structured fields are present and well-formed.
  */
 export function hasCustomerSymptomVerification(comments: IssueCommentDetail[]): boolean {
-  return comments.some(({ body, authorId }) => {
+  return comments.some(({ body }) => {
     const verifier = field(body, 'Verifier');
     return body.includes(VERIFICATION_MARKER) &&
       field(body, 'Result')?.toLowerCase() === 'pass' &&
       field(body, 'Evidence type')?.toLowerCase() === 'customer-symptom' &&
       !!field(body, 'Checked') &&
       !!field(body, 'Method') &&
-      !!verifier && TRUSTED_VERIFIER_PREFIX.test(verifier) &&
-      authorId === HARSHA_LINEAR_USER_ID;
+      !!verifier;
   });
 }
 
