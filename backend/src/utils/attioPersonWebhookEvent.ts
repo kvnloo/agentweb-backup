@@ -100,8 +100,14 @@ export async function applyAttioPersonEvent(
   const pullContactMappings = config.contactFieldMapping.filter(m => m.enabled && m.direction !== 'push');
   const pullCustomMappings = config.customFieldMapping.filter(m => m.enabled && m.direction !== 'push');
   const attrCache = await svc.loadAttributeTypes('people');
+  // Mirrors attioAdapter.ts's pullContacts nativeFields allow-list exactly —
+  // a contactFieldMapping targeting any other agentwebField must route to
+  // customFields, since crmDb.createLead/updateLead silently drop anything
+  // outside this fixed whitelist of top-level lead columns.
+  const nativeFields = ['firstName', 'lastName', 'email', 'phone', 'company', 'title', 'linkedin', 'notes'];
 
   const leadData: Record<string, any> = {};
+  const customFields: Record<string, any> = {};
   for (const m of pullContactMappings) {
     const slug = m.crmProperty;
     let val: any;
@@ -118,10 +124,15 @@ export async function applyAttioPersonEvent(
       const type = attrCache.get(`object:people:${slug}`) || 'text';
       val = extractAttioValue(values[slug], type);
     }
-    if (val != null && val !== '') leadData[m.agentwebField] = val;
+    if (val != null && val !== '') {
+      if (nativeFields.includes(m.agentwebField)) {
+        leadData[m.agentwebField] = val;
+      } else {
+        customFields[m.agentwebField] = val;
+      }
+    }
   }
 
-  const customFields: Record<string, any> = {};
   for (const m of pullCustomMappings) {
     const slug = m.crmProperty;
     const type = attrCache.get(`object:people:${slug}`) || 'text';

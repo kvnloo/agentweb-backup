@@ -302,6 +302,12 @@ export class AttioAdapter implements CrmAdapter {
         const pullDealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'push');
         const standardEntryFields = ['company'];
         const nativeDealFields = ['status', 'dealValue', 'dealCurrency'];
+        // Mirrors hubspotAdapter.ts's pull-side nativeFields allow-list exactly.
+        // A contactFieldMapping targeting any other agentwebField must route to
+        // customFields — crmDb.batchCreateLeads/createLead/updateLead only write
+        // a fixed whitelist of top-level lead columns and silently drop anything
+        // else, so writing it to leadData[agentwebField] directly loses the data.
+        const nativeFields = ['firstName', 'lastName', 'email', 'phone', 'company', 'title', 'linkedin', 'notes'];
 
         // Bulk-prefetch the deal list's entries (Attio's Deal analog) once per
         // pull run, keyed by person id — avoids an API call per person, unlike
@@ -363,7 +369,13 @@ export class AttioAdapter implements CrmAdapter {
                             val = this.extractAttioValue(personValues[slug], type);
                         }
 
-                        if (val != null && val !== '') leadData[m.agentwebField] = val;
+                        if (val != null && val !== '') {
+                            if (nativeFields.includes(m.agentwebField)) {
+                                leadData[m.agentwebField] = val;
+                            } else {
+                                customFields[m.agentwebField] = val;
+                            }
+                        }
                     }
 
                     for (const m of pullCustomMappings) {
