@@ -245,6 +245,31 @@ describe('SkillService', () => {
       await skillService.getPublishedSkills();
       expect(mockScan).toHaveBeenCalledTimes(2);
     });
+
+    it('does not let a scan already in flight repopulate the cache after a concurrent invalidation', async () => {
+      // CodeRabbit (ENG-1222 review): a scan started before a mutation, but
+      // finishing after it invalidates the cache, would otherwise overwrite the
+      // null with its own now-stale result — silently reviving pre-edit data.
+      let resolveScan: (value: any) => void;
+      const deferredScan = new Promise((resolve) => { resolveScan = resolve; });
+      mockPromise.mockReturnValueOnce(deferredScan); // consumed by getPublishedSkills' scan call
+
+      const firstCall = skillService.getPublishedSkills(); // scan in flight, not yet resolved
+
+      // A concurrent mutation invalidates the cache while the scan above is still pending.
+      mockPromise.mockResolvedValueOnce({}); // updateSkill's own put
+      await skillService.updateSkill({ skillId: 'skill-1', name: 'Skill 1', description: '', toolNames: [], isPublished: true, createdAt: mockTimestamp, updatedAt: mockTimestamp });
+
+      // Now let the stale scan resolve, after the invalidation already happened.
+      resolveScan!({ Items: [{ skillId: 'skill-1', name: 'Skill 1', description: '', toolNames: [], isPublished: true, createdAt: mockTimestamp, updatedAt: mockTimestamp }] });
+      await firstCall;
+
+      expect((skillService as any).publishedSkillsCache).toBeNull();
+
+      mockPromise.mockResolvedValueOnce({ Items: [] });
+      await skillService.getPublishedSkills();
+      expect(mockScan).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe('getSkillsAvailableToUser', () => {
