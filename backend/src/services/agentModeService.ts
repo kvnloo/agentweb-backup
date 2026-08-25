@@ -35205,11 +35205,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
 
       // ─── LISTS ─────────────────────────────────────────────────────────────
-      // Whole-list actions (create/delete/enumerate a list itself). Deliberately
-      // NOT routed through resolveAttioListId — that helper exists specifically
-      // to disambiguate an entry-scoped id against one already-bound deal list,
-      // and applying it here (e.g. to a raw id returned by LIST/GET) risks
-      // silently resolving to an unrelated AgentWeb list's own deal-list id.
+      // Whole-list actions (create/enumerate a list itself). No DELETE action:
+      // live-verified against Attio's REST API (ENG-1380) that no delete-list
+      // endpoint exists at all — deleting a list is only possible through
+      // Attio's own UI. Deliberately NOT routed through resolveAttioListId —
+      // that helper exists specifically to disambiguate an entry-scoped id
+      // against one already-bound deal list, and applying it here (e.g. to a
+      // raw id returned by LIST/GET) risks silently resolving to an unrelated
+      // AgentWeb list's own deal-list id.
       if (entityType === 'LISTS') {
         switch (action) {
           case 'LIST': {
@@ -35230,13 +35233,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             const listId = await svc.createList(name.trim(), objectSlug);
             return { success: true, list_id: listId };
           }
-          case 'DELETE': {
-            if (!args?.list_id) return { success: false, error: 'list_id is required for LISTS DELETE.' };
-            await svc.deleteList(args.list_id);
-            return { success: true, deleted: args.list_id };
-          }
           default:
-            return { success: false, error: `Unknown action "${action}" for LISTS. Valid: LIST, GET, CREATE, DELETE.` };
+            return { success: false, error: `Unknown action "${action}" for LISTS. Valid: LIST, GET, CREATE. (Attio's API has no delete-list endpoint — remove a list from Attio's own UI.)` };
         }
       }
 

@@ -1241,15 +1241,6 @@ describe('agentToolGatewayService', () => {
       expect(decision.risk).toBe('medium');
     });
 
-    it('classifies LISTS DELETE as destructive/high-risk', () => {
-      const decision = evaluateAgentToolPolicy({
-        toolName: 'call_attio_api',
-        args: { entity_type: 'LISTS', action: 'DELETE' },
-      });
-      expect(decision.effect).toBe('destructive');
-      expect(decision.risk).toBe('high');
-    });
-
     it('classifies LIST_ENTRIES REMOVE_ENTRIES as destructive/high-risk', () => {
       const decision = evaluateAgentToolPolicy({
         toolName: 'call_attio_api',

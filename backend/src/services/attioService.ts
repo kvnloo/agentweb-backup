@@ -599,13 +599,10 @@ export class AttioService {
     );
   }
 
-  /** Deletes an entire Attio List (not just one entry). */
-  async deleteList(listId: string): Promise<void> {
-    await axiosInstance.delete(
-      `${this.baseUrl}/lists/${listId}`,
-      { headers: this.headers() }
-    );
-  }
+  // No deleteList() — live-verified against Attio's REST API (ENG-1380):
+  // there is no delete-list endpoint at all (List/Create/Get/Update exist,
+  // Delete doesn't), and update-a-list's fields have no archive/is_archived
+  // option either. Deleting a list is only possible through Attio's own UI.
 
   async addCompanyToList(listId: string, recordId: string): Promise<void> {
     await axiosInstance.post(

@@ -15,7 +15,6 @@ process.env.JWT_SECRET = 'test-secret';
 const mockCountListEntries = jest.fn();
 const mockGetAllLists = jest.fn();
 const mockCreateList = jest.fn();
-const mockDeleteList = jest.fn();
 const mockAddPersonToList = jest.fn();
 const mockFindListEntry = jest.fn();
 const mockDeleteListEntry = jest.fn();
@@ -23,7 +22,6 @@ const mockSvcInstance = {
   countListEntries: mockCountListEntries,
   getAllLists: mockGetAllLists,
   createList: mockCreateList,
-  deleteList: mockDeleteList,
   addPersonToList: mockAddPersonToList,
   findListEntry: mockFindListEntry,
   deleteListEntry: mockDeleteListEntry,
@@ -273,24 +271,13 @@ describe('LISTS CREATE', () => {
   });
 });
 
-describe('LISTS DELETE', () => {
-  it('returns error when list_id missing', async () => {
-    const result = await at({ entity_type: 'LISTS', action: 'DELETE' });
-    expect(result.success).toBe(false);
-    expect(result.error).toMatch(/list_id/i);
-    expect(mockDeleteList).not.toHaveBeenCalled();
-  });
-
-  it('deletes the list', async () => {
-    mockDeleteList.mockResolvedValue(undefined);
-    const result = await at({ entity_type: 'LISTS', action: 'DELETE', list_id: 'l1' });
-    expect(mockDeleteList).toHaveBeenCalledWith('l1');
-    expect(result.success).toBe(true);
-    expect(result.deleted).toBe('l1');
-  });
-});
-
 describe('unknown action / entity_type', () => {
+  it('returns error for DELETE under LISTS (no delete-list endpoint exists in Attio\'s API)', async () => {
+    const result = await at({ entity_type: 'LISTS', action: 'DELETE', list_id: 'l1' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/Unknown action/i);
+  });
+
   it('returns error for an unknown action under LIST_ENTRIES', async () => {
     const result = await at({ entity_type: 'LIST_ENTRIES', action: 'DELETE', list_id: LIST_ID });
     expect(result.success).toBe(false);

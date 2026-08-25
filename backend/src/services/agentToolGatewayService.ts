@@ -981,7 +981,7 @@ function classifyToolEffect(toolName: string, args: unknown): AgentToolEffect {
 
   if (toolName === 'call_attio_api') {
     const action = stringField(args, 'action').toUpperCase();
-    if (action === 'DELETE' || action === 'REMOVE_ENTRIES') return 'destructive';
+    if (action === 'REMOVE_ENTRIES') return 'destructive';
     if (action === 'CREATE' || action === 'ADD_ENTRIES') return 'internal_write';
     return 'read';
   }

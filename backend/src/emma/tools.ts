@@ -9061,17 +9061,18 @@ ENTITY_TYPE + ACTION MATRIX:
                REMOVE_ENTRIES removes Person record ids from the list (looks up
                each person's entry in the list and deletes it).
 
-  LISTS → LIST | GET (list_id) | CREATE (name, object_type?) | DELETE (list_id)
+  LISTS → LIST | GET (list_id) | CREATE (name, object_type?)
                Whole-list actions. LIST enumerates every list in the workspace.
                CREATE makes a new list (object_type: 'people' or 'companies',
-               defaults to 'people'). DELETE removes an entire list — ask for
-               confirmation before calling this, it cannot be undone.`,
+               defaults to 'people'). There is no DELETE action — Attio's API
+               has no delete-list endpoint; a list can only be removed through
+               Attio's own UI.`,
     inputSchema: {
       type: 'object',
       properties: {
         entity_type: { type: 'string', enum: ['LIST_ENTRIES', 'LISTS'], description: 'Attio resource to operate on.' },
-        action:      { type: 'string', enum: ['COUNT', 'ADD_ENTRIES', 'REMOVE_ENTRIES', 'LIST', 'GET', 'CREATE', 'DELETE'], description: 'Action to perform. See ACTION MATRIX.' },
-        list_id:     { type: 'string', description: 'Required for LIST_ENTRIES COUNT/ADD_ENTRIES/REMOVE_ENTRIES and LISTS GET/DELETE. For LIST_ENTRIES actions, pass the AgentWeb lead list\'s id (e.g. from get_lead_lists/get_lead_details) — it is automatically resolved to that list\'s connected Attio deal-list id; a raw Attio list id also works. For LISTS actions, always a raw Attio list id (e.g. from LISTS LIST) — never an AgentWeb list id.' },
+        action:      { type: 'string', enum: ['COUNT', 'ADD_ENTRIES', 'REMOVE_ENTRIES', 'LIST', 'GET', 'CREATE'], description: 'Action to perform. See ACTION MATRIX.' },
+        list_id:     { type: 'string', description: 'Required for LIST_ENTRIES COUNT/ADD_ENTRIES/REMOVE_ENTRIES and LISTS GET. For LIST_ENTRIES actions, pass the AgentWeb lead list\'s id (e.g. from get_lead_lists/get_lead_details) — it is automatically resolved to that list\'s connected Attio deal-list id; a raw Attio list id also works. For LISTS actions, always a raw Attio list id (e.g. from LISTS LIST) — never an AgentWeb list id.' },
         record_ids:  { type: 'array', items: { type: 'string' }, description: 'Attio Person record ids. Required for LIST_ENTRIES ADD_ENTRIES/REMOVE_ENTRIES.' },
         name:        { type: 'string', description: 'List display name. Required for LISTS CREATE.' },
         object_type: { type: 'string', enum: ['people', 'companies'], description: 'What kind of records the new list holds. LISTS CREATE only. Defaults to "people".' },
