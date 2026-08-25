@@ -1,0 +1,71 @@
+early_access: false
+
+reviews:
+  auto_review:
+    enabled: true
+    # Re-review after every 5 commits instead of on every push — agreed with CodeRabbit CS
+    # (Chris Hester, Sara Weiss) on the 2026-08-24/25 rate-limit calls. AgentWeb's agent-driven
+    # workflow pushes many small commits per PR; per-push review was burning both the PR-stage
+    # rate limit and the GitHub Actions bill re-running CI on each CodeRabbit round-trip.
+    auto_pause_after_reviewed_commits: 5
+    ignore_title_keywords:
+      - "[docs]"
+      - "[skip-review]"
+    labels:
+      - "!skip-review"
+
+  # Test/mock/generated files add PR-review noise without much signal — reviewing agent-authored
+  # test scaffolding was flagged as wasted review budget on the call. Excluded from review, not
+  # from the repo — CI still runs them.
+  path_filters:
+    - "!**/*.test.ts"
+    - "!**/*.test.tsx"
+    - "!**/*.spec.ts"
+    - "!**/__tests__/**"
+    - "!**/__mocks__/**"
+    - "!**/node_modules/**"
+    - "!**/dist/**"
+    - "!**/builds/**"
+    - "!package-lock.json"
+
+  path_instructions:
+    - path: "backend/src/loops/**"
+      instructions: >
+        This is the AgentMode core loop (see backend/docs/AGENTMODE_MIGRATION.md). Any change to
+        model-call, tool-dispatch, or termination logic must be behavior-preserving unless the PR
+        explicitly says otherwise — flag if the PR lacks a characterization test proving output is
+        unchanged, or if it changes AgentMode's observable behavior without calling that out.
+    - path: "backend/src/services/agentModeService.ts"
+      instructions: >
+        Part of the AgentMode monolith mid-restructure. Flag any change that grows this file rather
+        than extracting pure logic into backend/src/services/agentMode/*.ts, per the project's
+        subtraction-biased complexity policy.
+    - path: "backend/src/routes/**"
+      instructions: >
+        Flag any route handler missing auth/authz middleware, missing input validation on path or
+        query params, or resolving a user-controlled path/filename without sanitization (see
+        dev.investigation.path-traversal.md for prior findings in this class).
+    - path: "backend/src/controllers/**"
+      instructions: >
+        Check DynamoDB queries use a scoped keyCondition (not a full scan), and that any
+        destructive/bulk operation is behind an explicit confirmation or dry-run path.
+    - path: "**/*.tsx"
+      instructions: >
+        Flag components rendering unbounded lists without a key or virtualization above ~100 items,
+        and any dangerouslySetInnerHTML usage without visible sanitization.
+
+  finishing_touches:
+    unit_tests:
+      # Left OFF deliberately: whether CodeRabbit generates/owns tests vs. AgentWeb's own
+      # agent-authored test suite was raised on the 2026-08-25 call but NOT decided — Harsha and
+      # Chris agreed to work through it together once CodeRabbit's example YAMLs land. Do not flip
+      # this on without that decision being made explicit.
+      enabled: false
+
+  # pre_merge_checks (e.g. gating merge on CodeRabbit re-running the test suite) was floated on the
+  # 2026-08-25 call as a way to stop burning GitHub Actions minutes on agent fix-and-retry loops,
+  # but it directly conflicts with the merge-gate hardening from 2026-08-17/18 (dropping Greptile as
+  # a required check specifically so no single review vendor can hard-block merges — see
+  # reference-greptile-retired-coderabbit-gate.md). Making CodeRabbit the test gate reintroduces
+  # that same single-point-of-failure risk. NOT implemented here — needs an explicit decision, not a
+  # silent config flip.

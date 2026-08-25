@@ -54,6 +54,11 @@ instructions narrow and operational.
 - Merging to `main` triggers the path-filtered production deployment. Observe
   the deployment and run the PR's post-deploy smoke. Agents never set Linear
   `Done`; customer-communication state remains human-controlled.
+- Prefer `coderabbit review` locally (CLI, authenticated, see `.coderabbit.yaml`)
+  before opening a PR. Local review draws from a separate rate-limit bucket
+  from the PR-stage review, so a pass or two here catches issues without
+  spending PR-stage quota or triggering a CI re-run. This is a recommendation,
+  not a gate — CodeRabbit remains advisory only (see above).
 
 ## Business execution
 
