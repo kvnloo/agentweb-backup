@@ -256,6 +256,36 @@ describe('applyAttioPersonEvent', () => {
     expect(createdLead.title).toBeUndefined();
   });
 
+  // Live-caught gap: a contactFieldMapping targeting a non-native agentwebField
+  // used to write straight to leadData[agentwebField], which
+  // crmDb.createLead/updateLead silently drop (fixed whitelist of top-level
+  // lead columns). Mirrors attioAdapter.ts pullContacts's identical fix.
+  it('routes a non-native contactFieldMapping agentwebField to customFields via webhook auto-pull', async () => {
+    const config = {
+      ...baseConfig,
+      contactFieldMapping: [
+        ...DEFAULT_CONTACT_MAPPING,
+        { agentwebField: 'jobLevel', crmProperty: 'job_level', direction: 'both', enabled: true },
+      ],
+    };
+    const svc = makeSvc(
+      {
+        email_addresses: [{ email_address: 'new@example.com' }],
+        job_level: [{ value: 'Senior' }],
+      },
+    );
+    mockGetLeadByEmail.mockResolvedValue(null);
+
+    await applyAttioPersonEvent('list-1', config, svc as any, {
+      event_type: 'record.created',
+      id: { record_id: 'rec-1' },
+    });
+
+    const createdLead = mockCreateLead.mock.calls[0][1];
+    expect(createdLead.jobLevel).toBeUndefined();
+    expect(createdLead.customFields.jobLevel).toBe('Senior');
+  });
+
   it('syncs enabled custom fields on create', async () => {
     const config = {
       ...baseConfig,
