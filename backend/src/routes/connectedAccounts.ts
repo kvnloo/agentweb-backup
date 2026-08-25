@@ -272,6 +272,14 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // and a Google Ads credential or Secrets Manager problem must not blank the whole
         // page — the rows still render, the flag just reads as unresolved, which
         // describeGoogleAdsSpendRisk already treats as billable.
+        //
+        // Recorded as null rather than left absent: we DID attempt these. null is the
+        // documented "checked, could not tell" state and undefined is "never recorded",
+        // and collapsing the two would have this endpoint report a lookup it ran as one
+        // it never ran.
+        for (const acc of googleAdsNeedingLookup) {
+          if (!testAccountMap.has(acc.account_id)) testAccountMap.set(acc.account_id, null);
+        }
         console.warn('[ENG-1362] could not resolve Google Ads test_account flags:', err?.message || err);
       }
     }
@@ -369,9 +377,12 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
          */
         ...(acc.platform === 'google_ads'
           ? describeGoogleAdsSpendRisk({
+              // No `?? undefined`: the map already distinguishes a resolved boolean, a
+              // failed lookup (null) and an account never looked up (key absent, so
+              // `get` yields undefined). Coalescing would erase the middle one.
               test_account: typeof (acc.config as any)?.test_account === 'boolean'
                 ? (acc.config as any).test_account
-                : testAccountMap.get(acc.account_id) ?? undefined,
+                : testAccountMap.get(acc.account_id),
             })
           : {}),
         // Calendly only (ENG-1141): which Meta pixel/ad account bookings attribute to —
