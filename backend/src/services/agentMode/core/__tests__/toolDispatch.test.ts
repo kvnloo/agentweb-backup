@@ -1647,4 +1647,22 @@ describe('seedSearchCallCountFromHistory (ENG-426)', () => {
     ];
     expect(seedSearchCallCountFromHistory(msgs as any)).toBe(0);
   });
+
+  // CodeRabbit (PR #2633): appendSuppressedDuplicate persists a ledger entry for the
+  // COLLAPSED call too (name + duplicateOf), so the next LLM turn isn't left with an
+  // orphaned tool_call_id. That entry never actually dispatched — no network call, no
+  // budget spent — so a later turn reconstructing the count from this same history must
+  // not count it a second time for one real search.
+  it('does not double-count a same-turn suppressed duplicate persisted in history', () => {
+    const msg = {
+      role: 'assistant',
+      metadata: {
+        toolCalls: [
+          { id: 'a', name: 'you_search_web', arguments: { query: 'x' } },
+          { id: 'b', name: 'you_search_web', arguments: { query: 'x' }, duplicateOf: 'a' },
+        ],
+      },
+    };
+    expect(seedSearchCallCountFromHistory([msg])).toBe(1);
+  });
 });

@@ -150,7 +150,7 @@ interface HistoryMessageLike {
   timestamp?: string;
   metadata?: {
     timestamp?: string;
-    toolCalls?: Array<{ id?: string; name?: string; arguments?: unknown; result?: any; error?: string }>;
+    toolCalls?: Array<{ id?: string; name?: string; arguments?: unknown; result?: any; error?: string; duplicateOf?: string }>;
   } | null;
 }
 
@@ -237,6 +237,12 @@ export function seedSearchCallCountFromHistory(
     const toolCalls = message.metadata?.toolCalls;
     if (!Array.isArray(toolCalls)) continue;
     for (const tc of toolCalls) {
+      // CodeRabbit (PR #2633): appendSuppressedDuplicate ALSO pushes a ledger entry with
+      // the collapsed call's name and a `duplicateOf` id (see executePreparedTools below)
+      // so the next LLM turn isn't left with an orphaned tool_call_id — but that entry
+      // never actually dispatched (no network call, no budget spent). Counting it here
+      // would inflate a later turn's seeded count for a search that only ran once.
+      if (tc?.duplicateOf) continue;
       if (tc?.name && WEB_SEARCH_TOOL_NAMES.has(tc.name)) count++;
     }
   }
