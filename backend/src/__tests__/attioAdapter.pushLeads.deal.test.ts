@@ -17,6 +17,7 @@ jest.mock('../services/db', () => ({
 const mockLoadAttributeTypes = jest.fn();
 const mockEnsurePersonAttribute = jest.fn();
 const mockUpsertPersonByValues = jest.fn();
+const mockUpdatePersonByValues = jest.fn();
 const mockFindOrCreateList = jest.fn();
 const mockEnsureListAttribute = jest.fn();
 const mockFindListEntry = jest.fn();
@@ -29,6 +30,7 @@ const mockSvc = {
   loadAttributeTypes: mockLoadAttributeTypes,
   ensurePersonAttribute: mockEnsurePersonAttribute,
   upsertPersonByValues: mockUpsertPersonByValues,
+  updatePersonByValues: mockUpdatePersonByValues,
   findOrCreateList: mockFindOrCreateList,
   ensureListAttribute: mockEnsureListAttribute,
   findListEntry: mockFindListEntry,
@@ -97,6 +99,7 @@ describe('AttioAdapter.pushLeads — deal list sync', () => {
     mockLoadAttributeTypes.mockResolvedValue(new Map());
     mockEnsurePersonAttribute.mockResolvedValue('some_slug');
     mockUpsertPersonByValues.mockResolvedValue({ recordId: 'person_1', isNew: true });
+    mockUpdatePersonByValues.mockResolvedValue(undefined);
     mockFindOrCreateList.mockResolvedValue('deallist_1');
     mockEnsureListAttribute.mockImplementation((_listId: string, key: string) => Promise.resolve(key));
     mockFindListEntry.mockResolvedValue(null);
@@ -104,6 +107,37 @@ describe('AttioAdapter.pushLeads — deal list sync', () => {
     mockAddPersonToList.mockResolvedValue('entry_1');
     mockFindCompanyByName.mockResolvedValue(null);
     mockCreateCompany.mockResolvedValue({ recordId: 'company_1' });
+  });
+
+  // ─── Invalid email ──────────────────────────────────────────────────────────
+  // Live-caught gap: an invalid email used to fall through silently to the
+  // create/update-by-id branches, so the record still synced but with no
+  // email at all — reported a clean success. Now surfaced as a per-lead
+  // error, mirroring hubspotAdapter.ts's identical validateEmail guard.
+
+  it('reports an invalid email as a per-lead error instead of silently pushing without one', async () => {
+    const result = await adapter.pushLeads(
+      auth,
+      [makeLead({ email: 'not-an-email' })],
+      makeConfig({ dealFieldMapping: [] })
+    );
+
+    expect(result.errorCount).toBe(1);
+    expect(result.successCount).toBe(0);
+    expect(result.errors[0]).toMatch(/Invalid email/);
+    expect(mockUpsertPersonByValues).not.toHaveBeenCalled();
+    expect(mockFindCompanyByName).not.toHaveBeenCalled();
+  });
+
+  it('still pushes a lead with no email at all (unaffected by the invalid-email guard)', async () => {
+    const result = await adapter.pushLeads(
+      auth,
+      [makeLead({ email: undefined, syncMetadata: { attio_record_id: 'existing_1' } })],
+      makeConfig({ dealFieldMapping: [] })
+    );
+
+    expect(result.errorCount).toBe(0);
+    expect(result.successCount).toBe(1);
   });
 
   // ─── Gate ──────────────────────────────────────────────────────────────────
