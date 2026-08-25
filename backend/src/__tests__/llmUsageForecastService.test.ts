@@ -364,6 +364,33 @@ describe("assessForecastAccuracy — forecast vs actual (ENG-1215 AC4)", () => {
     expect(r!.predictedOnTrack).toBe(false);
   });
 
+  it("does not charge TODAY's spend to the split balance", () => {
+    // CodeRabbit. `costUsedMicroUsd` includes the in-progress day, but the
+    // spend-since sum that gets subtracted from it excluded that day — so
+    // today's spend stayed in the split balance, handing the past forecast a
+    // smaller allowance than it really had and biasing every reconstructed
+    // on-track call pessimistic.
+    //
+    // $4/day for ten complete days, then $80 today, against a $150 ceiling.
+    // At the split the account had spent $20, leaving $130 at $4/day = 32 days,
+    // comfortably past the 26 to reset — so the honest answer is "on track".
+    // Leaving today's $80 in the balance drops it to $50, reads 12 days, and
+    // says no.
+    const r = assess({
+      dailyCostMicroUsd: [
+        ...daysFrom(1, 10, 4),
+        { date: "2026-08-11", costMicroUsd: 80 * USD },
+      ],
+      costUsedMicroUsd: 120 * USD,
+      hardThresholdMicroUsd: 150 * USD,
+    });
+
+    expect(r!.predictedOnTrack).toBe(true);
+    // And the in-progress day still never feeds a RATE — the same rule
+    // `computeUsageRunway` follows. $80 today must not move the burn ratio.
+    expect(r!.burnRatio).toBeCloseTo(1, 5);
+  });
+
   it("returns null for a cycle too short to hold both a forecast and an outcome", () => {
     // Silence, not a zero. A zero here would read as a perfect score.
     expect(assess({ dailyCostMicroUsd: evenDays(3, 5), today: "2026-08-04" })).toBeNull();

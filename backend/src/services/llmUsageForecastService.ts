@@ -302,6 +302,7 @@ export function assessForecastAccuracy(
 ): ForecastAccuracy | null {
   const startMs = toUtcDay(input.cycleStartDate);
   const todayMs = toUtcDay(input.today);
+  const resetMs = toUtcDay(input.cycleResetDate);
   const completeDays = Math.max(0, Math.round((todayMs - startMs) / MS_PER_DAY));
   if (completeDays < MIN_DAYS_PER_SIDE * 2) return null;
 
@@ -316,19 +317,33 @@ export function assessForecastAccuracy(
   // Spend strictly BEFORE the split is what the earlier forecast could see.
   // Re-using today's `costUsedMicroUsd` would hand the past forecast a
   // remaining allowance it did not have, which is the classic backtest leak.
-  let spentSince = 0;
+  // Two sums, because they answer different questions (CodeRabbit).
+  //
+  // `spentSinceComplete` is COMPLETE days only — it becomes the actual burn
+  // rate, and the in-progress day must never feed a rate, which is the same
+  // rule `computeUsageRunway` follows.
+  //
+  // `spentSinceWithToday` also counts the in-progress day, because it is
+  // subtracted from `costUsedMicroUsd`, and THAT figure includes today's spend.
+  // Using the complete-day sum for both left today's spend sitting in the split
+  // balance, handing the past forecast a smaller allowance than it really had
+  // and biasing every reconstructed on-track call pessimistic.
+  let spentSinceComplete = 0;
+  let spentSinceWithToday = 0;
   for (const row of input.dailyCostMicroUsd) {
     const dayMs = toUtcDay(row.date);
-    if (dayMs < asOfMs || dayMs >= todayMs) continue;
-    spentSince += Math.max(0, row.costMicroUsd || 0);
+    if (dayMs < asOfMs || dayMs >= resetMs) continue;
+    const cost = Math.max(0, row.costMicroUsd || 0);
+    spentSinceWithToday += cost;
+    if (dayMs < todayMs) spentSinceComplete += cost;
   }
 
   // Spend as of the split on the SAME basis as the threshold it is measured
-  // against (CodeRabbit). `costUsedMicroUsd` is credit-adjusted while a raw
-  // ledger sum is not, so subtracting the days since keeps both sides in one
-  // currency — an adjusted ceiling minus a raw spend is not a remaining
-  // allowance, it is two different numbers subtracted.
-  const spentAtSplit = Math.max(0, input.costUsedMicroUsd - spentSince);
+  // against. `costUsedMicroUsd` is credit-adjusted while a raw ledger sum is
+  // not, so subtracting the spend since keeps both sides in one currency — an
+  // adjusted ceiling minus a raw spend is not a remaining allowance, it is two
+  // different numbers subtracted.
+  const spentAtSplit = Math.max(0, input.costUsedMicroUsd - spentSinceWithToday);
 
   const past = computeUsageRunway({
     ...input,
@@ -342,7 +357,7 @@ export function assessForecastAccuracy(
   // that scores nothing pollutes the very metric meant to measure accuracy.
   if (predictedBurn === null || predictedBurn <= 0) return null;
 
-  const actualBurn = spentSince / daysSince;
+  const actualBurn = spentSinceComplete / daysSince;
   const burnRatio = actualBurn / predictedBurn;
 
   // On-track compares two REMAINING-ALLOWANCE calls, and the allowance moves
