@@ -98,14 +98,26 @@ const NOTIFICATION_TOOL = {
   },
 };
 
+// A customer-context-only default tool (added by generateChatResponse for
+// portalType 'customer'/'emma-sidebar' regardless of the installed skill) —
+// used to prove the hard gate discriminates skill tools from this bucket.
+const PAGE_SOURCE_TOOL = {
+  definition: {
+    name: 'read_page_source',
+    description: 'Read the current page source',
+    inputSchema: { type: 'object', properties: {} },
+  },
+};
+
 jest.mock('../mcp/server/registry', () => ({
   mcpToolRegistry: {
     getTool: (name: string) => {
       if (name === 'list_connected_accounts') return GOOGLE_ADS_TOOL;
       if (name === 'send_notification') return NOTIFICATION_TOOL;
+      if (name === 'read_page_source') return PAGE_SOURCE_TOOL;
       return undefined;
     },
-    getToolNames: () => ['list_connected_accounts', 'send_notification'],
+    getToolNames: () => ['list_connected_accounts', 'send_notification', 'read_page_source'],
   },
 }));
 
@@ -392,6 +404,27 @@ describe('generateChatResponse — ENG-1222 attribution stamp + fabrication guar
     const content = typeof response === 'string' ? response : response.content;
     expect(content).toContain('Real Customer LLC');
   });
+
+  it('still blocks fabrication when the only tool call returned a serialized {success:false} string', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(['list_connected_accounts']), installedSkillContextMsg: '' });
+    // A string result with success:false must count as a failed call, not a
+    // successful one — otherwise `.success` on the (unparsed) string is
+    // undefined, `!== false` is trivially true, and the guard never fires.
+    mockExecuteTool.mockResolvedValue(JSON.stringify({ success: false, error: 'account not connected' }));
+    mockCallLLM
+      .mockResolvedValueOnce(makeToolCallCompletion('list_connected_accounts'))
+      .mockResolvedValueOnce(makeCompletion('Here are the actual returned rows: Acme Widgets Main, ID 123-456-7890.'));
+
+    const response = await generateChatResponse('sess-1', 'Run list_connected_accounts', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    const content = typeof response === 'string' ? response : response.content;
+    expect(content).not.toMatch(/Acme Widgets Main/);
+  });
 });
 
 describe('generateChatResponse — ENG-1222 hard gate, retry, and skill-prompt injection', () => {
@@ -538,6 +571,50 @@ describe('generateChatResponse — ENG-1222 risk-hardening: perf, anonymous user
     seedSession({ associatedSkills: ['google-ads-skill'] });
     mockGetAllowedSkills.mockResolvedValue(['*']); // wildcard: not a subscription restriction
     mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(), installedSkillContextMsg: '' });
+
+    const response = await generateChatResponse('sess-1', 'Run list_connected_accounts', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(response).toMatch(/configuration issue/i);
+    expect(response).not.toMatch(/current plan/i);
+  });
+
+  it('still fires the hard gate when unrelated customer/page tools resolve but the skill itself contributed zero tools', async () => {
+    // CodeRabbit (ENG-1222 review): toolDefinitions also carries customer/page
+    // defaults (e.g. read_page_source), so a nonzero toolDefinitions.length
+    // doesn't prove the *skill's* tools bound. A customer-portal session with
+    // an installed skill that fails to resolve any tool must still trip the
+    // gate, even though the page default resolves fine.
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockGetAllowedSkills.mockResolvedValue(['*']);
+    // allowedToolNames names a tool that isn't registered anywhere — the exact
+    // "unregistered tool name" failure mode the gate exists to catch — while
+    // read_page_source (a customer-context default, unrelated to this skill)
+    // resolves to a real definition via the mocked registry.
+    mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(['unregistered_skill_tool']), installedSkillContextMsg: '' });
+
+    const response = await generateChatResponse('sess-1', 'Run list_connected_accounts', {
+      portalType: 'customer',
+      userId: 'user-1',
+      model: 'anthropic.claude-opus-5',
+    });
+
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(response).toMatch(/configuration issue/i);
+  });
+
+  it('does not misreport a buildSkillContext crash as subscription gating', async () => {
+    // CodeRabbit (ENG-1222 review): skillAllowlistResolved was set to true
+    // right before calling buildSkillContext, not after it succeeded — so a
+    // throw from buildSkillContext itself (not the allowlist fetch) still left
+    // the flag true, and the gate could then blame "your plan doesn't include
+    // this" for what was actually a code bug.
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockGetAllowedSkills.mockResolvedValue(['some-other-skill']); // would look "denied" if misclassified
+    mockBuildSkillContext.mockImplementation(() => { throw new Error('boom'); });
 
     const response = await generateChatResponse('sess-1', 'Run list_connected_accounts', {
       portalType: 'partner',
