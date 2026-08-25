@@ -58,6 +58,21 @@ export interface WorkPlanStep {
    *  setWorkPlanStatus. Set this on multi-image steps (e.g. "Generate 18 images") so
    *  the step cannot be closed with only a fraction generated. */
   expectedAssetCount?: number;
+  /**
+   * ENG-1331: which tool name(s) count toward expectedAssetCount, when a step's
+   * deliverable isn't unambiguous from ASSET_PRODUCING_TOOL_NAMES alone. A step
+   * whose requiredFunctionCalls span multiple asset-producing tools with different
+   * roles (e.g. "Render the Full Size Matrix": a FEW reusable create_html_file
+   * templates plus ONE playwright_browser_take_screenshot per requested size) needs
+   * to say which one is actually "the N things" — otherwise the count either sums
+   * across unrelated tools (padding: 5 templates + 7 screenshots satisfies N=12
+   * while only 7 of 12 sizes exist) or takes the max across all of them (safe
+   * against padding, but would undercount a step that legitimately needs several
+   * DIFFERENT tools to jointly reach N). When set, only these tool(s)' successes
+   * are summed. When unset, the count falls back to the max across every producing
+   * tool in ASSET_PRODUCING_TOOL_NAMES — unambiguous templates need nothing here.
+   */
+  expectedAssetCountTools?: string[];
   inputRequest?: { title: string; prompt: string; fields: WorkPlanInputField[] };
 }
 
