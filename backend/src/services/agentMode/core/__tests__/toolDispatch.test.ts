@@ -17,6 +17,8 @@ import {
   executePreparedTools,
   stableStringify,
   seedMediaCallKeysFromHistory,
+  seedSearchCallCountFromHistory,
+  SEARCH_CALL_SESSION_CAP,
   type ExecutePreparedToolsInput,
   type ToolDispatchPorts,
 } from '../toolDispatch';
@@ -1476,5 +1478,191 @@ describe('seedMediaCallKeysFromHistory (ENG-1239)', () => {
       },
     }];
     expect(seedMediaCallKeysFromHistory(msgs, 0).size).toBe(0);
+  });
+});
+
+// ENG-426: prod incident — a research turn made 193 web-search calls (73 file reads, 503
+// retained messages, 17.4M prompt tokens, $8.68) before an outer time limit ended it. The
+// loop's exact-match anti-loop signature check never caught it because each search varied
+// its query text. This is a session-wide volume cap on WEB_SEARCH_TOOL_NAMES, mirroring
+// Claude Code's own fix for the identical failure mode (default-200-per-session WebSearch
+// cap) — every prior call counts regardless of arguments, so rephrasing can't outrun it.
+describe('search-call session budget (ENG-426)', () => {
+  const searchPorts = () =>
+    makePorts({
+      executePreparedAgentTool: async (_i: any) => ({ success: true, results: [] }),
+    });
+
+  it('allows a search call under the cap and counts it in searchCallsThisIteration', async () => {
+    const ports = searchPorts();
+    const input = makeInput([toolCall('a', 'you_search_web', '{"query":"AI readiness"}')], ports, {
+      priorSearchCallCount: 0,
+    });
+    const result = await executePreparedTools(input);
+    expect((ports as any).__execOrder).toEqual(['you_search_web']);
+    expect(result.searchCallsThisIteration).toBe(1);
+    expect(result.failedCounterUpdates).toEqual({});
+  });
+
+  it('rejects a search call once the prior count already meets the cap — does NOT execute it', async () => {
+    const ports = searchPorts();
+    const input = makeInput([toolCall('a', 'you_search_web', '{"query":"one more angle"}')], ports, {
+      priorSearchCallCount: SEARCH_CALL_SESSION_CAP,
+    });
+    const result = await executePreparedTools(input);
+
+    expect((ports as any).__execOrder).toEqual([]); // never dispatched to the gateway
+    expect(result.searchCallsThisIteration).toBe(0);
+    expect(result.failedCounterUpdates).toEqual({ you_search_web: 1 });
+
+    const msg = input.messages.find((m: any) => m.tool_call_id === 'a');
+    expect(msg.content).toContain('Search budget reached');
+    const ledgerEntry = input.toolCallsLedger.find((t: any) => t.id === 'a');
+    expect(ledgerEntry.error).toContain('Search budget reached');
+  });
+
+  it('shares ONE budget across the different search tools (you_search_web, google_search_web, you_search_news)', async () => {
+    const ports = searchPorts();
+    const input = makeInput(
+      [
+        toolCall('a', 'you_search_web', '{"query":"x"}'),
+        toolCall('b', 'google_search_web', '{"query":"y"}'),
+      ],
+      ports,
+      { priorSearchCallCount: SEARCH_CALL_SESSION_CAP - 1 },
+    );
+    const result = await executePreparedTools(input);
+
+    // "a" is the CAPth call this session — allowed. "b" would be CAP+1 — rejected.
+    expect((ports as any).__execOrder).toEqual(['you_search_web']);
+    expect(result.searchCallsThisIteration).toBe(1);
+    const rejected = input.messages.find((m: any) => m.tool_call_id === 'b');
+    expect(rejected.content).toContain('Search budget reached');
+  });
+
+  it('does NOT cap a non-search tool once the search budget is exhausted', async () => {
+    const ports = makePorts();
+    const input = makeInput([toolCall('a', 'create_lead', '{"email":"x@y.com"}')], ports, {
+      priorSearchCallCount: SEARCH_CALL_SESSION_CAP + 50,
+    });
+    const result = await executePreparedTools(input);
+    expect((ports as any).__execOrder).toEqual(['create_lead']);
+    expect(result.failedCounterUpdates).toEqual({});
+  });
+
+  it('accumulates searchCallsThisIteration across multiple allowed calls in one batch', async () => {
+    const ports = searchPorts();
+    const input = makeInput(
+      [
+        toolCall('a', 'you_search_web', '{"query":"x"}'),
+        toolCall('b', 'you_search_web', '{"query":"y"}'),
+        toolCall('c', 'you_search_web', '{"query":"z"}'),
+      ],
+      ports,
+      { priorSearchCallCount: 0 },
+    );
+    const result = await executePreparedTools(input);
+    expect(result.searchCallsThisIteration).toBe(3);
+  });
+
+  it('defaults priorSearchCallCount to 0 when the caller does not wire it (no behavior change for unmigrated callers)', async () => {
+    const ports = searchPorts();
+    const input = makeInput([toolCall('a', 'you_search_web', '{"query":"x"}')], ports);
+    const result = await executePreparedTools(input);
+    expect((ports as any).__execOrder).toEqual(['you_search_web']);
+  });
+
+  it('does not count an exact-duplicate search suppressed by same-turn dedupe toward the budget', async () => {
+    const ports = searchPorts();
+    const input = makeInput(
+      [
+        toolCall('a', 'you_search_web', '{"query":"same"}'),
+        toolCall('b', 'you_search_web', '{"query":"same"}'),
+      ],
+      ports,
+      { priorSearchCallCount: 0 },
+    );
+    const result = await executePreparedTools(input);
+    // Only one real dispatch (ENG-108 same-turn dedupe collapses the second).
+    expect((ports as any).__execOrder).toEqual(['you_search_web']);
+    expect(result.searchCallsThisIteration).toBe(1);
+  });
+});
+
+describe('seedSearchCallCountFromHistory (ENG-426)', () => {
+  const searchMsg = (name: string, query: string) => ({
+    role: 'assistant',
+    metadata: { toolCalls: [{ id: 'x', name, arguments: { query } }] },
+  });
+
+  it('returns 0 for non-array input', () => {
+    expect(seedSearchCallCountFromHistory(undefined)).toBe(0);
+    expect(seedSearchCallCountFromHistory(null)).toBe(0);
+  });
+
+  it('counts a you_search_web call', () => {
+    expect(seedSearchCallCountFromHistory([searchMsg('you_search_web', 'a')])).toBe(1);
+  });
+
+  it('counts google_search_web and you_search_news too — every WEB_SEARCH_TOOL_NAMES member shares one budget', () => {
+    const msgs = [
+      searchMsg('you_search_web', 'a'),
+      searchMsg('google_search_web', 'b'),
+      searchMsg('you_search_news', 'c'),
+    ];
+    expect(seedSearchCallCountFromHistory(msgs)).toBe(3);
+  });
+
+  it('counts multiple search calls within one assistant message', () => {
+    const msg = {
+      role: 'assistant',
+      metadata: { toolCalls: [
+        { id: 'x', name: 'you_search_web', arguments: { query: 'a' } },
+        { id: 'y', name: 'you_search_web', arguments: { query: 'b' } },
+      ] },
+    };
+    expect(seedSearchCallCountFromHistory([msg])).toBe(2);
+  });
+
+  it('counts a call regardless of success/failure — this is a volume cap, not a duplicate detector', () => {
+    const failed = {
+      role: 'assistant',
+      metadata: { toolCalls: [{ id: 'x', name: 'you_search_web', arguments: { query: 'a' }, error: 'timeout' }] },
+    };
+    expect(seedSearchCallCountFromHistory([failed])).toBe(1);
+  });
+
+  it('ignores a non-search tool call (e.g. send_email)', () => {
+    const msg = { role: 'assistant', metadata: { toolCalls: [{ id: 'x', name: 'send_email', arguments: {} }] } };
+    expect(seedSearchCallCountFromHistory([msg])).toBe(0);
+  });
+
+  it('ignores non-assistant messages and malformed entries', () => {
+    const msgs = [
+      null,
+      undefined,
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', metadata: {} },
+      { role: 'assistant', metadata: { toolCalls: [null, {}] } },
+    ];
+    expect(seedSearchCallCountFromHistory(msgs as any)).toBe(0);
+  });
+
+  // CodeRabbit (PR #2633): appendSuppressedDuplicate persists a ledger entry for the
+  // COLLAPSED call too (name + duplicateOf), so the next LLM turn isn't left with an
+  // orphaned tool_call_id. That entry never actually dispatched — no network call, no
+  // budget spent — so a later turn reconstructing the count from this same history must
+  // not count it a second time for one real search.
+  it('does not double-count a same-turn suppressed duplicate persisted in history', () => {
+    const msg = {
+      role: 'assistant',
+      metadata: {
+        toolCalls: [
+          { id: 'a', name: 'you_search_web', arguments: { query: 'x' } },
+          { id: 'b', name: 'you_search_web', arguments: { query: 'x' }, duplicateOf: 'a' },
+        ],
+      },
+    };
+    expect(seedSearchCallCountFromHistory([msg])).toBe(1);
   });
 });
