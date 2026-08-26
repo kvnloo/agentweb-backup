@@ -184,6 +184,7 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
       policy: null,
       costUsedMicroUsd: 0,
       tokenUsed: 1,
+      creditsApplied: false,
       mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
     });
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt' as any);
@@ -259,6 +260,7 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
       },
       costUsedMicroUsd: 80_000_000,
       tokenUsed: 300_000_000,
+      creditsApplied: false,
       mode: { usageMode: 'optimized', admissionAllowed: true, reason: 'optimization_threshold_reached' },
     });
 
@@ -321,6 +323,7 @@ describe('getModelOptions — authoritative model discovery', () => {
       },
       costUsedMicroUsd: 80_000_000,
       tokenUsed: 1,
+      creditsApplied: false,
       mode: { usageMode: 'optimized', admissionAllowed: true, reason: 'optimization_threshold_reached' },
     });
     const json = jest.fn();
@@ -408,6 +411,7 @@ describe('resolveScheduleBackup via updateScheduledChat (ENG-1211)', () => {
       },
       costUsedMicroUsd: 0,
       tokenUsed: 0,
+      creditsApplied: false,
       mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'hard_cap_only' },
     } as any);
   });

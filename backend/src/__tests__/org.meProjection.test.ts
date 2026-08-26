@@ -32,12 +32,28 @@ jest.mock('../services/db', () => ({
     getUserById: jest.fn((userId: string) => Promise.resolve(mockUsers[userId] || null)),
     getUserByEmail: jest.fn(() => Promise.resolve(null)),
     updateUser: jest.fn(() => Promise.resolve(null)),
+    joinOrg: jest.fn((userId: string, orgId: string, orgRole: string) => {
+      const user = mockUsers[userId];
+      if (!user || user.orgId) return Promise.resolve('already_in_org');
+      user.orgId = orgId;
+      user.orgRole = orgRole;
+      return Promise.resolve('joined');
+    }),
   },
   orgDb: {
     getOrgById: jest.fn((orgId: string) => Promise.resolve(mockOrgs[orgId] || null)),
     getOrgMembers: jest.fn((orgId: string) =>
       Promise.resolve(Object.values(mockUsers).filter((u: any) => u.orgId === orgId))
     ),
+    removeDomainJoinRequest: jest.fn((orgId: string, requestToken: string) => {
+      const org = mockOrgs[orgId];
+      if (!org || !Array.isArray(org.pendingDomainJoinRequests)) return Promise.resolve(false);
+      const before = org.pendingDomainJoinRequests.length;
+      org.pendingDomainJoinRequests = org.pendingDomainJoinRequests.filter(
+        (request: any) => request.requestToken !== requestToken,
+      );
+      return Promise.resolve(org.pendingDomainJoinRequests.length < before);
+    }),
     ORG_MAX_MEMBERS: 5,
   },
 }));
@@ -66,6 +82,8 @@ beforeEach(() => {
   mockUsers = {
     'user-1': { userId: 'user-1', email: 'owner@example.com', displayName: 'Owner', orgId: 'org-1', orgRole: 'owner' },
     'user-2': { userId: 'user-2', email: 'member@example.com', displayName: 'Member', orgId: 'org-1', orgRole: 'member' },
+    'user-3': { userId: 'user-3', email: 'admin@example.com', displayName: 'Admin', orgId: 'org-1', orgRole: 'admin' },
+    'user-9': { userId: 'user-9', email: 'joiner@acme.com', displayName: 'Joiner' },
   };
 
   mockOrgs = {
@@ -92,6 +110,8 @@ beforeEach(() => {
           config: {
             account_type: 'oauth',
             profile_id: 'p-1',
+            daily_invite_cap: 30,
+            daily_volume: { invite: { count: 4, windowStartedAt: 1760000000000 } },
             access_token: 'ya29.a0-super-secret-access-token',
             refresh_token: 'refresh-me-please',
             api_key: 'sk_live_51H0000000000',
@@ -138,6 +158,8 @@ describe('ENG-953 — GET /api/org/me projection', () => {
     expect(account.config.access_token).toBeUndefined();
     expect(account.config.refresh_token).toBeUndefined();
     expect(account.config.api_key).toBeUndefined();
+    expect(account.config.daily_invite_cap).toBeUndefined();
+    expect(account.config.daily_volume).toBeUndefined();
   });
 
   it('AC3: is an allowlist — an unknown org field does not appear', async () => {
@@ -171,10 +193,46 @@ describe('ENG-953 — GET /api/org/me projection', () => {
     }
   });
 
-  it('strips invite and domain-join bearer tokens', async () => {
+  it('keeps invite and domain-join action tokens absent for an ordinary member', async () => {
     const res = await request(app).get('/api/org/me');
     expect(res.body.data.pendingInvites[0].inviteToken).toBeUndefined();
     expect(res.body.data.pendingDomainJoinRequests[0].requestToken).toBeUndefined();
+  });
+
+  it('AC4: returns a domain-join action token to an owner who can act on it', async () => {
+    currentUserId = 'user-1';
+
+    const res = await request(app).get('/api/org/me');
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.pendingDomainJoinRequests[0]).toMatchObject({
+      userId: 'user-9',
+      email: 'joiner@acme.com',
+      requestedAt: '2026-01-04T00:00:00.000Z',
+      requestToken: 'domain-request-token-xyz789',
+    });
+  });
+
+  it('AC4: returns a domain-join action token to an admin who can act on it', async () => {
+    currentUserId = 'user-3';
+
+    const res = await request(app).get('/api/org/me');
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.pendingDomainJoinRequests[0].requestToken).toBe('domain-request-token-xyz789');
+  });
+
+  it('AC4: lets an owner use the action token returned by /me to approve the request', async () => {
+    currentUserId = 'user-1';
+    const me = await request(app).get('/api/org/me');
+    const requestToken = me.body.data.pendingDomainJoinRequests[0].requestToken;
+
+    const approved = await request(app)
+      .post(`/api/org/org-1/domain-requests/${requestToken}/approve`);
+
+    expect(approved.status).toBe(200);
+    expect(mockUsers['user-9']).toMatchObject({ orgId: 'org-1', orgRole: 'member' });
+    expect(mockOrgs['org-1'].pendingDomainJoinRequests).toEqual([]);
   });
 
   it('no seeded secret value appears anywhere in the serialized payload', async () => {

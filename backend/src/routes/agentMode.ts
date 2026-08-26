@@ -293,16 +293,18 @@ router.post('/scheduled-chats/:scheduleId/variables', asyncHandler(agentModeCont
 router.post('/scheduled-chats/:scheduleId/test', asyncHandler(agentModeController.testScheduledChat));
 
 // POST /api/agent-mode/scheduled-chats/:scheduleId/publish-consent
-// ENG-827: REVOKE-ONLY. Accepts { authorized: false } and nothing else — the grant
-// direction is deliberately unreachable from the API (see the controller).
+// ENG-827: sets a schedule's standing unattended-publish consent — accepts
+// { authorized: true } to grant or { authorized: false } to revoke. See the
+// controller (agentModeController.revokeScheduledChatPublishConsent — name
+// predates the grant direction, kept to avoid an unrelated rename) for the
+// full safety contract: owner-only for grants (delegation may only revoke),
+// scope bound to the schedule's designated publish tool, optimistic-locked
+// against concurrent edits.
 //
-// No portal control calls this yet, and that is deliberate rather than an oversight.
-// The default was NOT flipped to opt-in, so `autopublishAuthorized` is written only by
-// scripts/grant-schedule-autopublish.ts against a recorded owner confirmation. This is
-// how an owner takes such a grant back — needed the moment that migration runs, and the
-// reason the endpoint is not removed as unreachable. The visible control today is
-// ENG-803's `requirePublishApproval` hold, which works on granted and never-asked
-// schedules alike.
+// A grant requires `requiredFunctionCalls` to already name a publish tool
+// (schedules created before ENG-827, or backfilled via
+// scripts/grant-schedule-autopublish.ts's owner-confirmed allowlist, may
+// still need that migration path if they don't — see that script's header).
 router.post('/scheduled-chats/:scheduleId/publish-consent', asyncHandler(agentModeController.revokeScheduledChatPublishConsent));
 
 // PATCH /api/agent-mode/scheduled-chats/:scheduleId/toggle

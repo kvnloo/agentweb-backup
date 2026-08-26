@@ -230,6 +230,166 @@ export function computeUsageRunway(input: UsageRunwayInput): UsageRunway {
 }
 
 /**
+ * How a forecast made EARLIER this cycle compares with what actually happened
+ * since (ENG-1215 AC4).
+ *
+ * Ratios and day counts only. No micro-USD: AC4 asks that telemetry record
+ * forecast-versus-actual *without* internal dollars, and a burn rate is exactly
+ * the internal economics `toCustomerRunway` exists to strip. A ratio answers
+ * "was the forecast right" without carrying what the account spends.
+ */
+export interface ForecastAccuracy {
+  /** The earlier day the retrospective forecast was made as of, `YYYY-MM-DD`. */
+  asOfDate: string;
+  /** Complete days that retrospective forecast had to work from. */
+  observedDaysAtForecast: number;
+  /** Complete days of real spend it is being measured against. */
+  daysMeasuredSince: number;
+  /**
+   * `actual / predicted` daily burn. 1.0 is a perfect call, 2.0 means the
+   * account burned twice as fast as predicted, 0.5 half as fast.
+   *
+   * null when the retrospective forecast declined to predict — a cycle can be
+   * too quiet to forecast, and inventing an error figure for a forecast that
+   * was never made would be a made-up number in the one place measuring
+   * whether our numbers are made up.
+   */
+  burnRatio: number | null;
+  /** What that earlier forecast said about surviving the cycle. */
+  predictedOnTrack: boolean | null;
+  /** What the CURRENT forecast says, having seen the days since. */
+  actualOnTrack: boolean | null;
+  /**
+   * Whether the earlier call still stands. null when either side has no
+   * opinion — "we did not know then" is not a wrong answer, and scoring it as
+   * one would make the accuracy metric punish honesty.
+   */
+  onTrackAgrees: boolean | null;
+}
+
+/**
+ * Minimum complete days on EACH side of the split.
+ *
+ * Two, not one: a single day is indistinguishable from a spike, and the whole
+ * point of ENG-1210's spike scenario is that one day must not be read as a
+ * trend. Below this the honest answer is no measurement, not a noisy one.
+ */
+const MIN_DAYS_PER_SIDE = 2;
+
+/**
+ * Backtest the forecast against the cycle's own ledger (ENG-1215 AC4).
+ *
+ * ## Why this needs no stored forecast
+ *
+ * `computeUsageRunway` is pure over the ledger, so the forecast that WOULD have
+ * been made on an earlier day is recomputable exactly — and the days since are
+ * already in the same ledger as ground truth. Persisting a daily forecast
+ * snapshot would add a write path to a billing-adjacent table to store
+ * something already derivable, and a stored snapshot can drift from the code
+ * that produced it. Recomputing cannot.
+ *
+ * The split is the midpoint of complete days, chosen for determinism: the same
+ * ledger always produces the same measurement, so a change in the number means
+ * the forecast changed rather than the sampling did.
+ *
+ * Returns null rather than a fabricated figure whenever the cycle is too short
+ * to have both a forecast and an outcome to check it against.
+ */
+export function assessForecastAccuracy(
+  input: UsageRunwayInput,
+  current: UsageRunway,
+  options: { creditsApplied?: boolean } = {},
+): ForecastAccuracy | null {
+  const startMs = toUtcDay(input.cycleStartDate);
+  const todayMs = toUtcDay(input.today);
+  const completeDays = Math.max(0, Math.round((todayMs - startMs) / MS_PER_DAY));
+  if (completeDays < MIN_DAYS_PER_SIDE * 2) return null;
+
+  const observedDays = Math.floor(completeDays / 2);
+  if (observedDays < MIN_DAYS_PER_SIDE) return null;
+  const daysSince = completeDays - observedDays;
+  if (daysSince < MIN_DAYS_PER_SIDE) return null;
+
+  const asOfMs = startMs + observedDays * MS_PER_DAY;
+  const asOfDate = toIsoDay(asOfMs);
+
+  // Spend strictly BEFORE the split is what the earlier forecast could see.
+  // Re-using today's `costUsedMicroUsd` would hand the past forecast a
+  // remaining allowance it did not have, which is the classic backtest leak.
+  // Two sums, because they answer different questions (CodeRabbit).
+  //
+  // `spentSinceComplete` is COMPLETE days only — it becomes the actual burn
+  // rate, and the in-progress day must never feed a rate, which is the same
+  // rule `computeUsageRunway` follows.
+  //
+  // `spentSinceWithToday` also counts the in-progress day, because it is
+  // subtracted from `costUsedMicroUsd`, and THAT figure includes today's spend.
+  // Using the complete-day sum for both left today's spend sitting in the split
+  // balance, handing the past forecast a smaller allowance than it really had
+  // and biasing every reconstructed on-track call pessimistic.
+  let spentSinceComplete = 0;
+  let spentSinceWithToday = 0;
+  for (const row of input.dailyCostMicroUsd) {
+    const dayMs = toUtcDay(row.date);
+    // Through TODAY, never past it (CodeRabbit). A future-dated row inside the
+    // cycle is not in `costUsedMicroUsd` — that counter is spend so far — so
+    // subtracting one would shrink the split balance for spend that has not
+    // happened, handing the past forecast an allowance nobody had.
+    if (dayMs < asOfMs || dayMs > todayMs) continue;
+    const cost = Math.max(0, row.costMicroUsd || 0);
+    spentSinceWithToday += cost;
+    if (dayMs < todayMs) spentSinceComplete += cost;
+  }
+
+  // Spend as of the split on the SAME basis as the threshold it is measured
+  // against. `costUsedMicroUsd` is credit-adjusted while a raw ledger sum is
+  // not, so subtracting the spend since keeps both sides in one currency — an
+  // adjusted ceiling minus a raw spend is not a remaining allowance, it is two
+  // different numbers subtracted.
+  const spentAtSplit = Math.max(0, input.costUsedMicroUsd - spentSinceWithToday);
+
+  const past = computeUsageRunway({
+    ...input,
+    today: asOfDate,
+    costUsedMicroUsd: spentAtSplit,
+  });
+
+  const predictedBurn = past.diagnostics.forecastBurnMicroUsdPerDay;
+  // No forecast was made then, so there is nothing to be right or wrong about.
+  // Returning an object of nulls would still emit a telemetry row, and a row
+  // that scores nothing pollutes the very metric meant to measure accuracy.
+  if (predictedBurn === null || predictedBurn <= 0) return null;
+
+  const actualBurn = spentSinceComplete / daysSince;
+  const burnRatio = actualBurn / predictedBurn;
+
+  // On-track compares two REMAINING-ALLOWANCE calls, and the allowance moves
+  // with credits. Credits are stored as month totals with no per-day timeline,
+  // so the ceiling that applied at the split is not reconstructable — scoring
+  // the earlier call against today's adjusted ceiling would mark a correct
+  // forecast wrong because someone bought a top-up afterwards. The burn ratio
+  // is unaffected: it is computed from ledger rows alone, which credits never
+  // touch.
+  const reconstructable = options.creditsApplied !== true;
+  const predictedOnTrack = reconstructable ? past.onTrack : null;
+  const actualOnTrack = reconstructable ? current.onTrack : null;
+  const onTrackAgrees =
+    predictedOnTrack === null || actualOnTrack === null
+      ? null
+      : predictedOnTrack === actualOnTrack;
+
+  return {
+    asOfDate,
+    observedDaysAtForecast: observedDays,
+    daysMeasuredSince: daysSince,
+    burnRatio,
+    predictedOnTrack,
+    actualOnTrack,
+    onTrackAgrees,
+  };
+}
+
+/**
  * Strip everything a customer must not see (AC4). The API layer returns THIS,
  * never the raw runway — no internal dollar ceilings, no raw burn rates.
  */

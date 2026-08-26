@@ -36,6 +36,16 @@ export const USAGE_TELEMETRY_VERSION = "usage-telemetry-2026-08-v1";
 export const USAGE_TELEMETRY_EVENTS = {
   /** A runway forecast was produced and shown. Carries inputs + output version. */
   forecastComputed: "runway_forecast_computed",
+  /**
+   * How an EARLIER forecast this cycle compares with what actually happened
+   * (ENG-1215 AC4).
+   *
+   * Separate from `forecastComputed` because it answers a different question:
+   * that one records what a customer was shown, this one records whether it was
+   * right. Ratios and day counts only, never burn rates — the accuracy of a
+   * number is reportable without reporting the number.
+   */
+  forecastAccuracy: "runway_forecast_accuracy",
   /** A switch recommendation was surfaced to a customer. */
   recommendationShown: "runway_recommendation_shown",
   /** A customer previewed a combined set of switches (nothing persisted). */
