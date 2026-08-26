@@ -336,7 +336,7 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'GET',
       path: '/api/tasks',
-      context: await resolveClientScopedContext(context, args?.client_id)
+      context: await resolveClientScopedContext(context, args?.client_id, 'list_tasks')
     });
     return jsonResult(data);
   }
@@ -513,7 +513,7 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'GET',
       path: '/api/agent-mode/scheduled-chats',
-      context: await resolveClientScopedContext(context, args?.client_id)
+      context: await resolveClientScopedContext(context, args?.client_id, 'list_scheduled_chats')
     });
     return jsonResult(data);
   }
@@ -896,7 +896,7 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'GET',
       path: '/api/crm/lists',
-      context: await resolveClientScopedContext(context, args?.client_id)
+      context: await resolveClientScopedContext(context, args?.client_id, 'list_lead_lists')
     });
     return jsonResult(data);
   }
@@ -948,7 +948,7 @@ mcpToolRegistry.register({
   name: 'manage_leads',
   definition: {
     name: 'manage_leads',
-    description: 'Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list". Admin-only: pass client_id to operate on a specific client\'s list instead of the caller\'s own.',
+    description: 'Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list". Admin-only: pass client_id to read a specific client\'s list ("list"/"get" actions only) instead of the caller\'s own. Not supported for "add"/"update"/"delete" — cross-account mutation is pending a separate authorization review (ENG-1557).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -960,14 +960,28 @@ mcpToolRegistry.register({
         updates: { type: 'object', description: 'Fields to update (for update action)' },
         limit: { type: 'number', description: 'Max leads to return (list action)' },
         last_key: { type: 'string', description: 'Pagination key (list action)' },
-        client_id: CLIENT_ID_SCHEMA_PROPERTY
+        client_id: {
+          type: 'string',
+          description: "Admin-only, read actions only ('list'/'get'). Scope to a specific client's list instead of the caller's own — accepts the client's email or userId. Rejected for 'add'/'update'/'delete' (ENG-1557: cross-account writes need a separate authorization review).",
+        },
       },
       required: ['action', 'list_id']
     }
   },
   execute: async (args: any, context: any) => {
-    const c = await resolveClientScopedContext(context, args.client_id);
     const listId = args.list_id;
+    const isWriteAction = args.action === 'add' || args.action === 'update' || args.action === 'delete';
+    const hasClientId = typeof args.client_id === 'string' && args.client_id.trim() !== '';
+    if (isWriteAction && hasClientId) {
+      // ENG-1557: cross-account mutation via client_id needs its own authorization
+      // contract (staff roles, attribution, audit) before it ships — reads
+      // (list/get) don't carry that risk and are unaffected. Fail loud rather
+      // than silently writing to the caller's own list instead of the client's.
+      throw new Error(
+        `client_id is not supported for manage_leads action "${args.action}" — cross-account writes are pending ENG-1557's authorization review. Only "list" and "get" support client_id today.`
+      );
+    }
+    const c = isWriteAction ? ctx(context) : await resolveClientScopedContext(context, args.client_id, 'manage_leads');
     switch (args.action) {
       case 'list': {
         const qp: Record<string, string> = {};
@@ -1038,7 +1052,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: '/api/emma/search-leads', context: await resolveClientScopedContext(context, args.client_id),
+      method: 'POST', path: '/api/emma/search-leads', context: await resolveClientScopedContext(context, args.client_id, 'search_leads'),
       body: { list_id: args.list_id, filters: args.filters, limit: args.limit }
     });
     return jsonResult(data);
@@ -1438,7 +1452,7 @@ Admin-only: pass client_id to list a specific client's connected accounts instea
     const data = await mcpFetch({
       method: 'GET',
       path: '/api/oauth/connected-accounts',
-      context: await resolveClientScopedContext(context, args.client_id),
+      context: await resolveClientScopedContext(context, args.client_id, 'list_connected_accounts'),
       queryParams: qp
     });
     return jsonResult(data);
@@ -3418,7 +3432,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const c = await resolveClientScopedContext(context, args?.client_id);
+    const c = await resolveClientScopedContext(context, args?.client_id, 'get_account_status');
 
     // Plan/status comes from /api/auth/me. Let auth errors propagate — if we can't
     // resolve the account, returning a fake "status" would be misleading.

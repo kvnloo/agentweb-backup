@@ -6,7 +6,8 @@
  * context (100% backward compatible); client_id present → caller must be a
  * server-verified admin (DB lookup, never trusted from the caller-supplied
  * context) and the target must be a real customer account, or it throws
- * loudly rather than silently falling back to the caller's own data.
+ * loudly rather than silently falling back to the caller's own data. Every
+ * successful resolution also writes an admin-audit record (ENG-1557 area #3).
  */
 
 jest.mock('../services/db', () => ({
@@ -20,12 +21,18 @@ jest.mock('../services/delegateAccessToken', () => ({
   mintDelegateToken: jest.fn().mockReturnValue('minted-delegate-token'),
 }));
 
+jest.mock('../services/adminAuditLog', () => ({
+  recordAdminAudit: jest.fn(),
+}));
+
 import { resolveClientScopedContext } from '../mcp/server/adminClientScope';
 import { userDb } from '../services/db';
 import { mintDelegateToken } from '../services/delegateAccessToken';
+import { recordAdminAudit } from '../services/adminAuditLog';
 
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockMintDelegateToken = mintDelegateToken as jest.Mock;
+const mockRecordAdminAudit = recordAdminAudit as jest.Mock;
 
 describe('resolveClientScopedContext', () => {
   beforeEach(() => {
@@ -35,38 +42,42 @@ describe('resolveClientScopedContext', () => {
 
   it('passes through unchanged when client_id is absent', async () => {
     const context = { userId: 'admin-1', sessionId: 'sess-1' };
-    const result = await resolveClientScopedContext(context, undefined);
+    const result = await resolveClientScopedContext(context, undefined, 'list_tasks');
 
     expect(result).toEqual({ userId: 'admin-1', agentUserId: undefined, isDelegatedAccess: undefined, sessionId: 'sess-1' });
     expect(mockUserDb.getUserById).not.toHaveBeenCalled();
     expect(mockMintDelegateToken).not.toHaveBeenCalled();
+    expect(mockRecordAdminAudit).not.toHaveBeenCalled();
   });
 
   it('passes through unchanged for an empty-string client_id', async () => {
     const context = { userId: 'admin-1' };
-    const result = await resolveClientScopedContext(context, '   ');
+    const result = await resolveClientScopedContext(context, '   ', 'list_tasks');
 
     expect(result.overrideToken).toBeUndefined();
     expect(mockUserDb.getUserById).not.toHaveBeenCalled();
+    expect(mockRecordAdminAudit).not.toHaveBeenCalled();
   });
 
   it('rejects a non-admin caller before ever resolving the target', async () => {
     mockUserDb.getUserById.mockResolvedValue({ userId: 'caller-1', isAdmin: false } as any);
 
     await expect(
-      resolveClientScopedContext({ userId: 'caller-1' }, 'client@example.com')
+      resolveClientScopedContext({ userId: 'caller-1' }, 'client@example.com', 'list_tasks')
     ).rejects.toThrow('client_id is admin-only');
 
     expect(mockUserDb.getUserByEmail).not.toHaveBeenCalled();
     expect(mockMintDelegateToken).not.toHaveBeenCalled();
+    expect(mockRecordAdminAudit).not.toHaveBeenCalled();
   });
 
   it('rejects when there is no authenticated caller at all', async () => {
     await expect(
-      resolveClientScopedContext({}, 'client@example.com')
+      resolveClientScopedContext({}, 'client@example.com', 'list_tasks')
     ).rejects.toThrow('client_id requires an authenticated caller');
 
     expect(mockUserDb.getUserById).not.toHaveBeenCalled();
+    expect(mockRecordAdminAudit).not.toHaveBeenCalled();
   });
 
   it('rejects an unknown client_id (email) with a specific error, not a silent fallback', async () => {
@@ -74,10 +85,11 @@ describe('resolveClientScopedContext', () => {
     mockUserDb.getUserByEmail.mockResolvedValue(undefined as any);
 
     await expect(
-      resolveClientScopedContext({ userId: 'admin-1' }, 'ghost@example.com')
+      resolveClientScopedContext({ userId: 'admin-1' }, 'ghost@example.com', 'list_tasks')
     ).rejects.toThrow('No client account found for "ghost@example.com"');
 
     expect(mockMintDelegateToken).not.toHaveBeenCalled();
+    expect(mockRecordAdminAudit).not.toHaveBeenCalled();
   });
 
   it('rejects an unknown client_id (userId form, no @) via getUserById', async () => {
@@ -86,10 +98,11 @@ describe('resolveClientScopedContext', () => {
       .mockResolvedValueOnce(undefined as any); // target lookup
 
     await expect(
-      resolveClientScopedContext({ userId: 'admin-1' }, 'ghost-user-id')
+      resolveClientScopedContext({ userId: 'admin-1' }, 'ghost-user-id', 'list_tasks')
     ).rejects.toThrow('No client account found for "ghost-user-id"');
 
     expect(mockUserDb.getUserByEmail).not.toHaveBeenCalled();
+    expect(mockRecordAdminAudit).not.toHaveBeenCalled();
   });
 
   it('rejects a resolved target with no customer-portal access', async () => {
@@ -97,10 +110,11 @@ describe('resolveClientScopedContext', () => {
     mockUserDb.getUserByEmail.mockResolvedValue({ userId: 'partner-1', roles: ['partner'] } as any);
 
     await expect(
-      resolveClientScopedContext({ userId: 'admin-1' }, 'partner@example.com')
+      resolveClientScopedContext({ userId: 'admin-1' }, 'partner@example.com', 'list_tasks')
     ).rejects.toThrow('does not have customer portal access');
 
     expect(mockMintDelegateToken).not.toHaveBeenCalled();
+    expect(mockRecordAdminAudit).not.toHaveBeenCalled();
   });
 
   it('mints a delegate token and returns it as overrideToken for a real admin + valid customer target', async () => {
@@ -109,7 +123,7 @@ describe('resolveClientScopedContext', () => {
     mockUserDb.getUserById.mockResolvedValue(caller as any);
     mockUserDb.getUserByEmail.mockResolvedValue(target as any);
 
-    const result = await resolveClientScopedContext({ userId: 'admin-1' }, 'customer@example.com');
+    const result = await resolveClientScopedContext({ userId: 'admin-1' }, 'customer@example.com', 'list_tasks');
 
     expect(mockMintDelegateToken).toHaveBeenCalledWith(
       { userId: 'admin-1', email: 'admin@example.com' },
@@ -124,7 +138,7 @@ describe('resolveClientScopedContext', () => {
       .mockResolvedValueOnce({ userId: 'admin-1', email: 'admin@example.com', isAdmin: true } as any)
       .mockResolvedValueOnce({ userId: 'target-1', email: 'customer@example.com', roles: ['customer'] } as any);
 
-    const result = await resolveClientScopedContext({ userId: 'admin-1' }, 'target-1');
+    const result = await resolveClientScopedContext({ userId: 'admin-1' }, 'target-1', 'list_tasks');
 
     expect(mockUserDb.getUserByEmail).not.toHaveBeenCalled();
     expect(result.overrideToken).toBe('minted-delegate-token');
@@ -134,7 +148,7 @@ describe('resolveClientScopedContext', () => {
     mockUserDb.getUserById.mockResolvedValue({ userId: 'admin-1', isAdmin: false } as any);
 
     await expect(
-      resolveClientScopedContext({ userId: 'admin-1' }, 'client@example.com')
+      resolveClientScopedContext({ userId: 'admin-1' }, 'client@example.com', 'list_tasks')
     ).rejects.toThrow('client_id is admin-only');
 
     expect(mockUserDb.getUserById).toHaveBeenCalledWith('admin-1');
@@ -148,10 +162,44 @@ describe('resolveClientScopedContext', () => {
     mockUserDb.getUserById.mockResolvedValue({ userId: 'agent-1', isAdmin: false } as any);
 
     await expect(
-      resolveClientScopedContext({ userId: 'someone-else', agentUserId: 'agent-1' }, 'client@example.com')
+      resolveClientScopedContext({ userId: 'someone-else', agentUserId: 'agent-1' }, 'client@example.com', 'list_tasks')
     ).rejects.toThrow('client_id is admin-only');
 
     expect(mockUserDb.getUserById).toHaveBeenCalledWith('agent-1');
     expect(mockUserDb.getUserById).not.toHaveBeenCalledWith('someone-else');
+  });
+
+  // ENG-1557 area #3 (audit trail): every successful scope resolution — the
+  // only kind of event that actually grants cross-account access — must leave
+  // a record of who did it, to whom, and via which tool.
+  describe('audit trail (ENG-1557)', () => {
+    it('records an admin-audit event on successful resolution', async () => {
+      const caller = { userId: 'admin-1', email: 'admin@example.com', isAdmin: true };
+      const target = { userId: 'target-1', email: 'customer@example.com', roles: ['customer'] };
+      mockUserDb.getUserById.mockResolvedValue(caller as any);
+      mockUserDb.getUserByEmail.mockResolvedValue(target as any);
+
+      await resolveClientScopedContext({ userId: 'admin-1' }, 'customer@example.com', 'list_tasks');
+
+      expect(mockRecordAdminAudit).toHaveBeenCalledWith({
+        actorUserId: 'admin-1',
+        actorEmail: 'admin@example.com',
+        action: 'mcp_client_id_scope',
+        tool: 'list_tasks',
+        targetUserId: 'target-1',
+        targetEmail: 'customer@example.com',
+      });
+    });
+
+    it('names the specific tool in the audit record, not a generic label', async () => {
+      const caller = { userId: 'admin-1', email: 'admin@example.com', isAdmin: true };
+      const target = { userId: 'target-1', email: 'customer@example.com', roles: ['customer'] };
+      mockUserDb.getUserById.mockResolvedValue(caller as any);
+      mockUserDb.getUserByEmail.mockResolvedValue(target as any);
+
+      await resolveClientScopedContext({ userId: 'admin-1' }, 'customer@example.com', 'search_leads');
+
+      expect(mockRecordAdminAudit).toHaveBeenCalledWith(expect.objectContaining({ tool: 'search_leads' }));
+    });
   });
 });

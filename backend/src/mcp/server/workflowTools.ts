@@ -244,7 +244,7 @@ mcpToolRegistry.register({
     },
   },
   execute: async (args: any, context: any) => {
-    const me: any = await mcpFetch({ method: 'GET', path: '/api/auth/me', context: await resolveClientScopedContext(context, args?.client_id) });
+    const me: any = await mcpFetch({ method: 'GET', path: '/api/auth/me', context: await resolveClientScopedContext(context, args?.client_id, 'emma_get_account_status') });
     return jsonResult({
       email: me?.email,
       plan: me?.subscriptionType ?? me?.plan ?? null,

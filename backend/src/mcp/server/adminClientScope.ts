@@ -29,8 +29,15 @@ interface ClientScopedContext {
  * client via `clientId` (an email or userId). Admin-only: throws loudly rather
  * than silently falling back to the caller's own data when the caller isn't a
  * real admin, or when `clientId` doesn't resolve to a real customer account.
+ *
+ * `toolName` identifies the calling tool for the audit trail (ENG-1557 area
+ * #3) — every successful scope resolution is a real admin looking at (never
+ * yet mutating — writes are out of scope pending ENG-1557's authorization
+ * contract) a specific customer's data, and that needs a record of who did
+ * it, to whom, via which tool, same as the existing admin cross-account audit
+ * trail (adminAuditLog.ts, ENG-721).
  */
-export async function resolveClientScopedContext(context: any, clientId: unknown): Promise<ClientScopedContext> {
+export async function resolveClientScopedContext(context: any, clientId: unknown, toolName: string): Promise<ClientScopedContext> {
   const base = ctx(context);
   if (typeof clientId !== 'string' || !clientId.trim()) {
     return base;
@@ -73,6 +80,16 @@ export async function resolveClientScopedContext(context: any, clientId: unknown
     target,
     CLIENT_SCOPE_TOKEN_TTL_SECONDS,
   );
+
+  const { recordAdminAudit } = await import('../../services/adminAuditLog');
+  recordAdminAudit({
+    actorUserId: caller.userId,
+    actorEmail: caller.email,
+    action: 'mcp_client_id_scope',
+    tool: toolName,
+    targetUserId: target.userId,
+    targetEmail: target.email,
+  });
 
   return { ...base, overrideToken };
 }
