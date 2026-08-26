@@ -1222,6 +1222,14 @@ type GoogleAdsConfigShape = { customer_id: string; currency?: string; test_accou
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
+  // ENG-1295 hardening: self-consistency cache for perform_data_analysis. Keyed by
+  // userId + a hash of the exact (file_urls, analysis_instruction) pair, so a
+  // literal repeat of the same call can be checked against its own prior grouping-
+  // key result instead of silently returning a contradictory answer. Bounded size
+  // and TTL since this lives on the long-running singleton service instance.
+  private dataAnalysisConsistencyCache: Map<string, { groupingKeyValues: string[]; timestamp: number }> = new Map();
+  private readonly DATA_ANALYSIS_CONSISTENCY_CACHE_MAX = 500;
+  private readonly DATA_ANALYSIS_CONSISTENCY_TTL_MS = 30 * 60 * 1000; // 30 minutes
   // ENG-475: deterministic browser-session persistence (auto load-at-start /
   // save-as-you-go around browser automation tools, so an intermittent login
   // success is captured without depending on the model calling the cookie tools).
@@ -8610,6 +8618,143 @@ export class AgentModeService {
     return { cleanedText, links };
   }
 
+  /**
+   * ENG-1295 provenance/consistency helper: parses a generated CSV block into its
+   * header, rows, data-row count, and the distinct values of its first column —
+   * the grouping-key convention this tool's prompts ask the model to use (see the
+   * per-ad-group / per-user breakdown instructions in the callers of this tool).
+   * Used to append a cheap-to-verify provenance stub, to diff repeat calls for
+   * self-consistency, and to check the CSV's own internal id/name consistency.
+   */
+  private parseCsvProvenance(csvText: string): { rowsOut: number; groupingKeyValues: string[]; header: string[]; rows: string[][] } | null {
+    const lines = csvText.split('\n').map(l => l.trimEnd()).filter(l => l.trim().length > 0);
+    if (lines.length === 0) return null;
+    const splitRow = (line: string): string[] => line.split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+    const header = splitRow(lines[0]);
+    const rows = lines.slice(1).map(splitRow); // first line is assumed to be the header
+    const groupingKeyValues: string[] = [];
+    const seen = new Set<string>();
+    for (const row of rows) {
+      const firstCol = row[0];
+      if (firstCol && !seen.has(firstCol)) {
+        seen.add(firstCol);
+        groupingKeyValues.push(firstCol);
+      }
+    }
+    return { rowsOut: rows.length, groupingKeyValues, header, rows };
+  }
+
+  /** ENG-1295: splits a CSV header cell into lowercase word tokens (camelCase- and separator-aware) for id/name column detection. */
+  private tokenizeCsvHeaderCell(cell: string): string[] {
+    return cell
+      .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+      .split(/[^a-zA-Z0-9]+/)
+      .map(t => t.toLowerCase())
+      .filter(Boolean);
+  }
+
+  /**
+   * ENG-1295 intra-response check: detects the exact failure pattern that
+   * produced the prod hallucination — the SAME id mapped to more than one
+   * DIFFERENT name within one generated CSV (e.g. id 199836788398 as both
+   * "Product Analytics Platform" and "Game Analytics Platform"). This requires
+   * no narrative parsing. Informational only, NOT a hard reject: a real entity
+   * (an ad group, a CRM lead's company, etc.) can legitimately be renamed
+   * within a query's date window, which would produce this exact shape from
+   * genuinely correct source data — we can't tell "renamed" apart from
+   * "fabricated" using the CSV alone, so this is surfaced in Provenance for the
+   * caller to judge rather than blocking a possibly-correct result. Only
+   * applies when the CSV actually has both an id-like and a name-like column.
+   */
+  private findCsvIdNameCollisions(header: string[], rows: string[][]): { id: string; names: string[] }[] {
+    const idIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('id'));
+    const nameIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('name'));
+    if (idIdx === -1 || nameIdx === -1 || idIdx === nameIdx) return [];
+    const idToNames = new Map<string, Set<string>>();
+    for (const row of rows) {
+      const id = row[idIdx];
+      const name = row[nameIdx];
+      if (!id || !name) continue;
+      if (!idToNames.has(id)) idToNames.set(id, new Set());
+      idToNames.get(id)!.add(name);
+    }
+    const collisions: { id: string; names: string[] }[] = [];
+    for (const [id, names] of idToNames) {
+      if (names.size > 1) {
+        collisions.push({ id, names: [...names] });
+      }
+    }
+    return collisions;
+  }
+
+  /**
+   * ENG-1295 grounding check: for a CSV with an id-like column, verifies each
+   * distinct id actually occurs somewhere in the raw source file(s) that were
+   * sent to the sandbox — the same objective technique the agent used manually
+   * (search_tool_response) to catch the fabricated name in prod session
+   * d789c175. Informational only (not a hard reject): a substring miss can also
+   * mean the model reformatted the id, so this is surfaced as a provenance
+   * caveat rather than blocking a possibly-correct result.
+   */
+  private checkCsvIdGrounding(header: string[], rows: string[][], fileRawContents: string[]): { checked: number; unverified: number } | null {
+    const idIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('id'));
+    if (idIdx === -1 || fileRawContents.length === 0) return null;
+    const distinctIds = [...new Set(rows.map(r => r[idIdx]).filter(Boolean))];
+    if (distinctIds.length === 0) return null;
+    const combinedSource = fileRawContents.join('\n');
+    const unverified = distinctIds.filter(id => !combinedSource.includes(id)).length;
+    return { checked: distinctIds.length, unverified };
+  }
+
+  /**
+   * ENG-1295 provenance helper: best-effort input row count for a source file, so
+   * the caller can cheaply sanity-check rows_out against rows_in. Counts elements
+   * of the largest JSON array found (top-level array, or the largest array
+   * property for the common `{ results: [...] }` / `{ sessions: [...] }` API-
+   * response shape used throughout this codebase), falling back to a non-empty
+   * line count for non-JSON content. This is a heuristic, not an exact parse of
+   * the analysis_instruction's semantics.
+   */
+  private estimateRowsIn(rawContent: string): number | null {
+    const trimmed = rawContent.trim();
+    if (!trimmed) return null;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed.length;
+      if (parsed && typeof parsed === 'object') {
+        let maxLen = -1;
+        for (const value of Object.values(parsed)) {
+          if (Array.isArray(value) && value.length > maxLen) maxLen = value.length;
+        }
+        if (maxLen >= 0) return maxLen;
+      }
+    } catch {
+      // Not JSON — fall through to a line-count approximation.
+    }
+    return trimmed.split('\n').filter(l => l.trim().length > 0).length;
+  }
+
+  /** ENG-1295: cache key for the self-consistency check — exact (userId, file_urls, analysis_instruction) match. */
+  private buildDataAnalysisCacheKey(userId: string, fileUrls: string[], analysisInstruction: string): string {
+    const hash = createHash('sha256').update(JSON.stringify(fileUrls) + ' ' + analysisInstruction).digest('hex');
+    return `${userId}:${hash}`;
+  }
+
+  /** ENG-1295: bound the self-consistency cache so the long-lived singleton doesn't grow unboundedly. */
+  private pruneDataAnalysisConsistencyCache(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.dataAnalysisConsistencyCache) {
+      if (now - entry.timestamp > this.DATA_ANALYSIS_CONSISTENCY_TTL_MS) {
+        this.dataAnalysisConsistencyCache.delete(key);
+      }
+    }
+    while (this.dataAnalysisConsistencyCache.size > this.DATA_ANALYSIS_CONSISTENCY_CACHE_MAX) {
+      const oldestKey = this.dataAnalysisConsistencyCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.dataAnalysisConsistencyCache.delete(oldestKey);
+    }
+  }
+
   public async performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
     try {
       const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
@@ -8728,6 +8873,9 @@ export class AgentModeService {
       // Human-readable source description per file, parallel to fileParts, used to
       // build the filename manifest in the prompt.
       const fileSources: string[] = [];
+      // Decoded raw content per file, parallel to fileSources — kept only for the
+      // ENG-1295 provenance stub's rows_in estimate, not sent anywhere else.
+      const fileRawContents: string[] = [];
       let totalSize = 0;
 
       for (const fileUrl of urlsToProcess) {
@@ -8771,6 +8919,7 @@ export class AgentModeService {
               }
             });
             fileSources.push(fileUrl);
+            fileRawContents.push(s3Content);
             continue;
           }
 
@@ -8809,6 +8958,7 @@ export class AgentModeService {
               }
             });
             fileSources.push(fileUrl);
+            fileRawContents.push(s3Content);
             continue;
           }
 
@@ -8831,7 +8981,8 @@ export class AgentModeService {
           // Send to Gemini as text/csv so the file materializes on the sandbox
           // filesystem (see SANDBOX_FILE_MIME note above). The actual content may
           // be CSV, JSON, or plain text — the model is told this in the prompt.
-          const base64Content = Buffer.from(fileData).toString('base64');
+          const fileBuffer = Buffer.from(fileData);
+          const base64Content = fileBuffer.toString('base64');
 
           fileParts.push({
             inlineData: {
@@ -8840,6 +8991,7 @@ export class AgentModeService {
             }
           });
           fileSources.push(fileUrl);
+          fileRawContents.push(fileBuffer.toString('utf-8'));
 
         } catch (error) {
           console.error(`Error processing file ${fileUrl}:`, error);
@@ -8923,6 +9075,9 @@ export class AgentModeService {
       // the post-loop block) — folding every intermediate code stdout into the
       // analysis would bury the real summary under print()-debugging noise.
       const codeExecOutputs: string[] = [];
+      // ENG-1295: the generated CSV text (if any), kept separately from resultParts
+      // so the provenance stub and self-consistency check below can parse it.
+      let generatedCsvText: string | null = null;
 
       // Extract parts from response
       const responseParts = candidates[0].content.parts || [];
@@ -8959,10 +9114,32 @@ export class AgentModeService {
         // Handle inline data (images/charts from code execution) (handle both camelCase and snake_case)
         if ((part as any).inlineData && (part as any).inlineData.data) {
           const mimeType = (part as any).inlineData.mimeType || 'image/png';
-          if (!mimeType.startsWith('image/')) {
+          if (mimeType === 'text/csv') {
+            // Gemini's code-execution sandbox returns generated tabular data (e.g. a
+            // df.to_csv() write) as an inlineData part with mimeType text/csv rather
+            // than through stdout/codeExecutionResult. Discarding this — as the old
+            // code did for every non-image inlineData — left the caller with only the
+            // model's separate narrative `text` summary, ungrounded by the real
+            // computed output. That is how perform_data_analysis reported hallucinated
+            // ad-group names and contradictory row counts (ENG-1295).
+            codeExecuted = true;
+            try {
+              const csvText = Buffer.from((part as any).inlineData.data, 'base64').toString('utf-8').trim();
+              if (csvText) {
+                resultParts.push(`**Computed Data:**\n${csvText}`);
+                generatedCsvText = csvText;
+              }
+            } catch (error) {
+              console.error('AgentMode: performDataAnalysis error decoding generated CSV inlineData:', error);
+            }
+          } else if (!mimeType.startsWith('image/')) {
             // Gemini returned non-image data (e.g. Vega-Lite JSON from altair) — skip it
             console.warn(`AgentMode: performDataAnalysis skipping non-image inlineData with mimeType=${mimeType}`);
           } else {
+            // A rendered chart image is itself proof that code actually ran in the
+            // sandbox (ENG-1295 hard guard below) — set this regardless of whether
+            // the subsequent S3 upload succeeds.
+            codeExecuted = true;
             try {
               const imageData = (part as any).inlineData.data;
 
@@ -8990,10 +9167,26 @@ export class AgentModeService {
         } else if ((part as any).inline_data && (part as any).inline_data.data) {
           // Handle snake_case format
           const mimeType = (part as any).inline_data.mimeType || (part as any).inline_data.mime_type || 'image/png';
-          if (!mimeType.startsWith('image/')) {
+          if (mimeType === 'text/csv') {
+            // See the camelCase inlineData branch above (ENG-1295): a generated CSV
+            // must be surfaced, not discarded, or the caller only sees the model's
+            // ungrounded narrative summary.
+            codeExecuted = true;
+            try {
+              const csvText = Buffer.from((part as any).inline_data.data, 'base64').toString('utf-8').trim();
+              if (csvText) {
+                resultParts.push(`**Computed Data:**\n${csvText}`);
+                generatedCsvText = csvText;
+              }
+            } catch (error) {
+              console.error('AgentMode: performDataAnalysis error decoding generated CSV inline_data (snake_case):', error);
+            }
+          } else if (!mimeType.startsWith('image/')) {
             // Gemini returned non-image data (e.g. Vega-Lite JSON from altair) — skip it
             console.warn(`AgentMode: performDataAnalysis skipping non-image inline_data with mimeType=${mimeType}`);
           } else {
+            // See the camelCase branch above — a rendered chart proves code executed.
+            codeExecuted = true;
             try {
               const imageData = (part as any).inline_data.data;
 
@@ -9019,6 +9212,30 @@ export class AgentModeService {
             }
           }
         }
+      }
+
+      // ENG-1295 hard guard: real external data was supplied (file_urls resolved to
+      // at least one sandbox file) but nothing in the response shows code actually
+      // executing over it — no generated CSV, no rendered image, no codeExecutionResult
+      // stdout. A bare narrative `text` part in this case is unverifiable prose about
+      // data the model never touched — exactly how perform_data_analysis reported
+      // hallucinated ad-group names and contradictory counts in prod session d789c175.
+      // Reject rather than pass it off as computed output. Calls with no file_urls are
+      // unaffected: there is no external tabular data to hallucinate about, so
+      // inline-only summarization remains a legitimate use of this tool.
+      if (fileParts.length > 0 && !codeExecuted) {
+        console.warn(
+          `AgentMode: performDataAnalysis got narrative text with no verified code execution over ${fileParts.length} supplied file(s) (model=${modelName})`
+        );
+        return {
+          success: false,
+          message:
+            'The analysis model returned a narrative summary without any verified code execution over the supplied file_urls — ' +
+            'this cannot be trusted as computed output and was not returned. Retry with a more explicit instruction that forces ' +
+            'Python code execution over the file(s) (e.g. "You MUST read and parse the file(s) with Python and print exact ' +
+            'computed values — do not summarize without computing").',
+          error: 'execution_failed'
+        };
       }
 
       // Fallback narrative: the model produced executed-code output but no
@@ -9061,6 +9278,97 @@ export class AgentModeService {
         };
       }
 
+      // ENG-1295 hardening: cross-call self-consistency and a provenance stub
+      // (including intra-CSV id/name collision and source-grounding checks) for
+      // generated CSV data.
+      if (generatedCsvText) {
+        const provenance = this.parseCsvProvenance(generatedCsvText);
+        if (provenance) {
+          // 1. Cross-call self-consistency: an exact repeat call whose grouping-key
+          // set changed since its last run.
+          const cacheKey = this.buildDataAnalysisCacheKey(userId, urlsToProcess, analysisInstruction);
+          const prior = this.dataAnalysisConsistencyCache.get(cacheKey);
+          if (prior) {
+            const priorSet = new Set(prior.groupingKeyValues);
+            const currentSet = new Set(provenance.groupingKeyValues);
+            const isConsistent = priorSet.size === currentSet.size &&
+              [...priorSet].every(v => currentSet.has(v));
+            if (!isConsistent) {
+              console.warn(
+                `AgentMode: performDataAnalysis inconsistent result on an identical repeat call (userId=${userId}): ` +
+                `prior grouping keys=[${prior.groupingKeyValues.join(', ')}] vs current=[${provenance.groupingKeyValues.join(', ')}]`
+              );
+              return {
+                success: false,
+                message:
+                  'This exact analysis call (identical file_urls and analysis_instruction) previously returned a DIFFERENT set of ' +
+                  'result names than this run — the data-analysis model is not consistently computing over the real data, so ' +
+                  'neither result can be trusted. Do NOT retry with the identical arguments. Instead, re-run grouping strictly by ' +
+                  'a stable ID field (not a name) so the result is verifiable against the source data.',
+                error: 'inconsistent_result'
+              };
+            }
+          }
+          this.dataAnalysisConsistencyCache.set(cacheKey, { groupingKeyValues: provenance.groupingKeyValues, timestamp: Date.now() });
+          this.pruneDataAnalysisConsistencyCache();
+
+          // 2. Provenance stub: cheap-to-verify rows_in / rows_out / distinct
+          // grouping-key values, so the caller doesn't have to trust the narrative
+          // summary about what the tool actually computed. Includes two
+          // informational (not hard-reject) caveats:
+          // - id grounding: a distinct id in the CSV that can't be found anywhere
+          //   in the raw source file(s) — a substring miss can also mean the
+          //   model reformatted the id, so this doesn't block a possibly-correct
+          //   result.
+          // - id/name collisions: the same id mapped to more than one name within
+          //   this CSV (the exact shape of the prod hallucination). Deliberately
+          //   NOT a hard reject — a real entity (an ad group, a CRM lead's
+          //   company) can legitimately be renamed within a query's date window,
+          //   which produces this same shape from genuinely correct data. We
+          //   can't tell "renamed" apart from "fabricated" from the CSV alone, so
+          //   this is surfaced for the caller to judge rather than risking a hard
+          //   failure on a correct result.
+          const rowsInPerFile = fileRawContents.map(c => this.estimateRowsIn(c)).filter((n): n is number => n !== null);
+          const rowsIn = rowsInPerFile.length > 0 ? rowsInPerFile.reduce((a, b) => a + b, 0) : null;
+          const MAX_DISTINCT_VALUES_SHOWN = 25;
+          const distinctPreview = provenance.groupingKeyValues.slice(0, MAX_DISTINCT_VALUES_SHOWN);
+          const moreCount = provenance.groupingKeyValues.length - distinctPreview.length;
+          const grounding = this.checkCsvIdGrounding(provenance.header, provenance.rows, fileRawContents);
+          const collisions = this.findCsvIdNameCollisions(provenance.header, provenance.rows);
+          if (collisions.length > 0) {
+            console.warn(
+              `AgentMode: performDataAnalysis intra-CSV id/name collision (userId=${userId}, informational): ` +
+              collisions.map(c => `id=${c.id} names=[${c.names.join(', ')}]`).join('; ')
+            );
+          }
+          resultParts.push(
+            `**Provenance:**\n` +
+            `rows_in: ${rowsIn !== null ? rowsIn : 'unknown (no parsable input file)'}\n` +
+            `rows_out: ${provenance.rowsOut}\n` +
+            `distinct grouping-key values (${provenance.groupingKeyValues.length}): ${distinctPreview.join(', ')}` +
+            (moreCount > 0 ? ` … (+${moreCount} more)` : '') +
+            (grounding && grounding.unverified > 0
+              ? `\n⚠️ ${grounding.unverified} of ${grounding.checked} id(s) in this result could not be found in the raw source file(s) — treat those rows as unverified.`
+              : '') +
+            (collisions.length > 0
+              ? `\n⚠️ ${collisions.length} id(s) map to more than one name within this result — e.g. id "${collisions[0].id}" as [${collisions[0].names.join(', ')}]. ` +
+                'This can mean the source entity was renamed during the query window, or that a row was fabricated/corrupted — verify before trusting these names.'
+              : '')
+          );
+
+          // 3. Explicit untrusted-narrative caveat: make it part of the tool's own
+          // contract that the free-form prose has not been cross-checked, rather
+          // than relying on the calling agent to know to verify it independently
+          // (the ad-hoc behavior that happened to save prod session d789c175).
+          if (hasNarrativeText) {
+            resultParts.push(
+              '**Note:** The prose above has not been independently verified. Treat **Computed Data** and **Provenance** as ' +
+              'the trusted, verified source — cross-check any names, ids, or counts mentioned in the prose against them before repeating them.'
+            );
+          }
+        }
+      }
+
       // Combine all results
       const analysisResult = resultParts.join('\n\n');
 
@@ -9081,6 +9389,13 @@ export class AgentModeService {
         /payload size exceeds|request too large|too large|exceeds.*limit/i.test(errorMessage);
       const isTimeout = (error as any)?.code === 'ECONNABORTED' ||
         /timeout|timed out|ETIMEDOUT/i.test(errorMessage);
+      // ENG-1295 (recommendation #4): a raw Gemini 400/422 that ISN'T already
+      // classified as payload-too-large is an invalid-argument rejection (e.g. a
+      // malformed file_urls entry, an unfetchable reference, or a request the
+      // sandbox otherwise refused). Previously this fell through to the generic
+      // "check that the file URLs are accessible" message with no distinct error
+      // code — the exact ambiguous failure hit in prod session 97a28948.
+      const isInvalidArgument = !isPayloadTooLarge && (statusCode === 400 || statusCode === 422);
       if (isPayloadTooLarge) {
         return {
           success: false,
@@ -9093,6 +9408,13 @@ export class AgentModeService {
           success: false,
           message: `The data analysis timed out — the dataset or analysis task is too large for a single call. Break it into smaller pieces: (1) split the data into smaller subsets, (2) call perform_data_analysis separately for each subset with a focused analysis_instruction, then (3) synthesize the individual results into a final summary.`,
           error: errorMessage
+        };
+      }
+      if (isInvalidArgument) {
+        return {
+          success: false,
+          message: `The data analysis request was rejected as invalid by the model API (HTTP ${statusCode}). This usually means a file_urls entry could not be read or parsed, or the request violated a sandbox limit. Verify each file_urls entry is a real, fetchable S3 URL or tool-response key, and that analysis_instruction does not reference unsupported content. Do NOT blindly retry the identical call — fix the arguments first.`,
+          error: 'invalid_argument'
         };
       }
       return {
