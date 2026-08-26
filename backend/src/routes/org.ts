@@ -6,7 +6,7 @@ import { callerCan, can, roleOf } from "../services/orgAuthz";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
-import { getUserSubscriptionType } from "../services/subscriptionService";
+import { getUserSubscriptionResolution } from "../services/subscriptionService";
 
 const router = Router();
 
@@ -403,7 +403,12 @@ router.post("/", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Organization name is required" });
     }
 
-    const subscriptionType = await getUserSubscriptionType(userId);
+    const { subscriptionType, resolved } = await getUserSubscriptionResolution(userId);
+    if (!resolved) {
+      return res.status(503).json({
+        error: "Subscription status is temporarily unavailable. Please try again.",
+      });
+    }
     if (!ORGANIZATION_CREATION_TIERS.has(subscriptionType.trim().toLowerCase())) {
       return res.status(403).json({
         error: "A Starter plan or higher is required to create an organization.",

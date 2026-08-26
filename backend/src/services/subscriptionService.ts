@@ -151,7 +151,15 @@ async function resolveUserSubscriptionType(userId: string): Promise<{
 }
 
 export async function getUserSubscriptionType(userId: string): Promise<string> {
-  return (await resolveUserSubscriptionType(userId)).subscriptionType;
+  return (await getUserSubscriptionResolution(userId)).subscriptionType;
+}
+
+/** Resolve the effective subscription and whether the lookup completed successfully. */
+export async function getUserSubscriptionResolution(userId: string): Promise<{
+  subscriptionType: string;
+  resolved: boolean;
+}> {
+  return resolveUserSubscriptionType(userId);
 }
 
 /** Return product features for the user's effective, org-aware subscription. */
