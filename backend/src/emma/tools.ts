@@ -502,7 +502,7 @@ Actions:
 - send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
 - cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
-- accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations. CRM ATTRIBUTION: also pass list_id (the CRM list this contact belongs to) plus profile_url or provider_id, and first_name/last_name/company/title when known — all obtainable from the list-received-invitations/get-profile response for this same person. This mirrors the accepted connection into that CRM list as a lead (created if absent) so it stays findable by name later. Omitting these still accepts the connection, but the person then exists ONLY on LinkedIn, not in the CRM — a later search by name for them will fail.
+- accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations. CRM ATTRIBUTION: also pass list_id (the CRM list this contact belongs to) — the connection's identity is looked up automatically from LinkedIn's own record of this invitation (not from anything else you pass), so list_id is the only extra thing needed to mirror it into that CRM list as a lead. Omitting list_id still accepts the connection, but the person then exists ONLY on LinkedIn, not in the CRM — a later search by name for them will fail.
 - update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
 - search-parameters: Resolve a free-text query (company name, location, industry, school, service) to LinkedIn entity IDs via Unipile's parameter search. Required: type (one of COMPANY, LOCATION, INDUSTRY, SCHOOL, SERVICE) and keywords. Optional limit. Returns ranked candidates with id/title/subtitle plus fromCache and source metadata. Use the returned id with the matching *_id field on search-people for precise structured filtering.
 - set-daily-invite-cap: Set this account's daily LinkedIn connection-request limit. Requires daily_invite_cap (a number, up to the system-wide maximum — a higher value you pass is clamped automatically, so 30 always works as "the Premium number" without needing to know the exact ceiling). SELF-REPORTED, NEVER DETECTED: call this ONLY after asking the user directly, in THIS conversation, whether their connected LinkedIn account has Premium — never guess, never infer it from anything else about the account. If they say yes, call this with daily_invite_cap=30 (or their stated preference, if lower); if no, call it with daily_invite_cap=10. Before running any LinkedIn outreach for an account you haven't confirmed this for, ask first — a live/interactive turn is the only place you CAN ask, since an unattended/scheduled run has no one to answer. If a scheduled run reaches this point with the cap still unconfirmed, do NOT call this action from that run — proceed at whatever cap is already configured (defaults to the conservative 10 until someone answers) and say so plainly in the completion ledger, rather than guessing Premium.
@@ -511,7 +511,7 @@ SHARED-ACCOUNT FALLBACK: search-people, get-profile, get-company, and search-par
 
 ANONYMIZED RESULTS: LinkedIn hides out-of-network people behind a placeholder profile. Those are dropped from search-people results, and the count is reported as anonymizedFiltered. If items is empty but anonymizedFiltered is greater than zero, the search WORKED and the niche is NOT empty — everyone matching was simply out of reach of the account used. Do not report that as "no results found" and do not escalate it as a broken search; broaden the query or use an account whose network reaches these people. On get-profile the row cannot be dropped, so it comes back with anonymized:true and no profile URL.
 
-For target person identification (send-invite, send-message, get-profile, update-conversation-history, accept-invitation), pass EITHER:
+For target person identification (send-invite, send-message, get-profile, update-conversation-history), pass EITHER:
 - profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/)
 - provider_id: the Unipile provider_id directly if you already have it`,
     inputSchema: {
@@ -532,11 +532,11 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         profile_url: {
           type: 'string',
-          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). For send-invite, send-message, update-conversation-history, and (optionally, for CRM attribution) accept-invitation. Provide this OR provider_id.'
+          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). For send-invite, send-message, update-conversation-history. Provide this OR provider_id. (Not used by accept-invitation — that action resolves the invitee\'s identity itself from the invitation record.)'
         },
         provider_id: {
           type: 'string',
-          description: 'The Unipile provider_id for the target LinkedIn user. For send-invite, send-message, get-profile, update-conversation-history, and (optionally, for CRM attribution) accept-invitation. Provide this OR profile_url.'
+          description: 'The Unipile provider_id for the target LinkedIn user. For send-invite, send-message, get-profile, update-conversation-history. Provide this OR profile_url. (Not used by accept-invitation — that action resolves the invitee\'s identity itself from the invitation record.)'
         },
         message: {
           type: 'string',
@@ -557,15 +557,15 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         lead_id: {
           type: 'string',
-          description: 'CRM lead ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate. Optional for send-invite and accept-invitation — pass it when you already know the CRM lead so the invite/accept is attributed to it directly.'
+          description: 'CRM lead ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate. Optional for send-invite and accept-invitation — pass it when you already know the CRM lead so the invite/accept is attributed to it directly (still verified server-side against the invitee\'s actual LinkedIn URL before being trusted).'
         },
         first_name: {
           type: 'string',
-          description: 'The target person\'s first name. Pass with send-invite or accept-invitation (alongside list_id) so a lead created for CRM attribution carries their name.'
+          description: 'The target person\'s first name. Pass with send-invite (alongside list_id) so a lead created for CRM attribution carries their name. Not used by accept-invitation — that action derives the name itself from the invitation record.'
         },
         last_name: {
           type: 'string',
-          description: 'The target person\'s last name. Pass with send-invite or accept-invitation (alongside list_id) so a lead created for CRM attribution carries their name.'
+          description: 'The target person\'s last name. Pass with send-invite (alongside list_id) so a lead created for CRM attribution carries their name. Not used by accept-invitation — that action derives the name itself from the invitation record.'
         },
         keywords: {
           type: 'string',
@@ -577,11 +577,11 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         title: {
           type: 'string',
-          description: 'For search-people: job title FILTER (e.g. "CTO"). For send-invite/accept-invitation: the invitee\'s ACTUAL job title, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite/accept-invitation; omit it if you do not know the person\'s real title.'
+          description: 'For search-people: job title FILTER (e.g. "CTO"). For send-invite: the invitee\'s ACTUAL job title, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite; omit it if you do not know the person\'s real title. Not used by accept-invitation.'
         },
         company: {
           type: 'string',
-          description: 'For search-people: company name FILTER — free text, auto-resolved to a LinkedIn company id if no company_id is provided. For send-invite/accept-invitation: the invitee\'s ACTUAL employer, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite/accept-invitation; omit it if you do not know the person\'s real employer.'
+          description: 'For search-people: company name FILTER — free text, auto-resolved to a LinkedIn company id if no company_id is provided. For send-invite: the invitee\'s ACTUAL employer, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite; omit it if you do not know the person\'s real employer. Not used by accept-invitation.'
         },
         company_id: {
           type: 'string',

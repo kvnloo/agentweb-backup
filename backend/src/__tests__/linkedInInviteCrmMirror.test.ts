@@ -239,6 +239,49 @@ describe('mirrorLinkedInInviteToCrm', () => {
       }), expect.anything());
     });
 
+    it('stamps linkedInInviteSentAt (never linkedInInviteAcceptedAt) for a SENT mirror', async () => {
+      await mirrorLinkedInInviteToCrm({
+        listId: LIST,
+        linkedinUrl: 'https://www.linkedin.com/in/david-yao',
+        sentAt: '2026-08-01T00:00:00.000Z',
+      });
+      const call = updateLead.mock.calls[0];
+      expect(call[2]).toHaveProperty('linkedInInviteSentAt', '2026-08-01T00:00:00.000Z');
+      expect(call[2]).not.toHaveProperty('linkedInInviteAcceptedAt');
+    });
+
+    it('stamps linkedInInviteAcceptedAt (never linkedInInviteSentAt) for an ACCEPTED mirror — an accepted inbound connection must never be recorded as an outbound send', async () => {
+      await mirrorLinkedInInviteToCrm({
+        listId: LIST,
+        linkedinUrl: 'https://www.linkedin.com/in/david-yao',
+        eventType: 'linkedin.invite.accepted',
+        sentAt: '2026-08-01T00:00:00.000Z',
+      });
+      const call = updateLead.mock.calls[0];
+      expect(call[2]).toHaveProperty('linkedInInviteAcceptedAt', '2026-08-01T00:00:00.000Z');
+      expect(call[2]).not.toHaveProperty('linkedInInviteSentAt');
+    });
+
+    it('does not overwrite an existing linkedInInviteSentAt when mirroring a later ACCEPTED event for the same lead', async () => {
+      findLeadByLinkedinInList.mockResolvedValue({
+        leadId: 'lead_existing',
+        listId: LIST,
+        status: 'contacted',
+        linkedInInviteSentAt: '2026-07-01T00:00:00.000Z',
+        updatedAt: '2026-07-01T00:00:00.000Z',
+      });
+      await mirrorLinkedInInviteToCrm({
+        listId: LIST,
+        linkedinUrl: 'https://www.linkedin.com/in/david-yao',
+        eventType: 'linkedin.invite.accepted',
+      });
+      const call = updateLead.mock.calls[0];
+      // The update only ever SETS the accepted field — it never touches
+      // linkedInInviteSentAt, so a real prior outbound timestamp survives.
+      expect(call[2]).not.toHaveProperty('linkedInInviteSentAt');
+      expect(call[2]).toHaveProperty('linkedInInviteAcceptedAt');
+    });
+
     it('logs linkedin.invite.accepted when the caller mirrors an accepted inbound connection', async () => {
       await mirrorLinkedInInviteToCrm({
         listId: LIST,
