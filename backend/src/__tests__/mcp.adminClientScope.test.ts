@@ -130,13 +130,28 @@ describe('resolveClientScopedContext', () => {
     expect(result.overrideToken).toBe('minted-delegate-token');
   });
 
-  it('falls back to agentUserId for the caller identity, like ctx() does', async () => {
+  it('falls back to userId when agentUserId is absent', async () => {
+    mockUserDb.getUserById.mockResolvedValue({ userId: 'admin-1', isAdmin: false } as any);
+
+    await expect(
+      resolveClientScopedContext({ userId: 'admin-1' }, 'client@example.com')
+    ).rejects.toThrow('client_id is admin-only');
+
+    expect(mockUserDb.getUserById).toHaveBeenCalledWith('admin-1');
+  });
+
+  // CodeRabbit (PR #2651) + dev.md's stated convention: "External clients (API
+  // keys, OAuth) always use the authenticated agentUserId." When both fields
+  // are present, agentUserId must win — never the (potentially less trustworthy)
+  // userId.
+  it('prefers agentUserId over userId as the caller identity when both are present', async () => {
     mockUserDb.getUserById.mockResolvedValue({ userId: 'agent-1', isAdmin: false } as any);
 
     await expect(
-      resolveClientScopedContext({ agentUserId: 'agent-1' }, 'client@example.com')
+      resolveClientScopedContext({ userId: 'someone-else', agentUserId: 'agent-1' }, 'client@example.com')
     ).rejects.toThrow('client_id is admin-only');
 
     expect(mockUserDb.getUserById).toHaveBeenCalledWith('agent-1');
+    expect(mockUserDb.getUserById).not.toHaveBeenCalledWith('someone-else');
   });
 });

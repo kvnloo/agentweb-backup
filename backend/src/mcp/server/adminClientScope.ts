@@ -36,7 +36,16 @@ export async function resolveClientScopedContext(context: any, clientId: unknown
     return base;
   }
 
-  const callerId = context?.userId || context?.agentUserId;
+  // CodeRabbit (PR #2651): prefer agentUserId, per dev.md's stated convention —
+  // "External clients (API keys, OAuth) always use the authenticated
+  // agentUserId" (the ENG-… IDOR fix in mcpServerCore.ts). For the calls this
+  // gate actually sees today the two fields already coincide (mcpServerCore.ts
+  // sets both to the same value for external callers; the in-app dispatch never
+  // sets agentUserId at all, so it falls through to userId either way) — this
+  // is defense-in-depth: identity resolution for an admin-privilege check
+  // should read the same authoritative field the rest of the codebase does,
+  // not happen to agree with it by coincidence.
+  const callerId = context?.agentUserId || context?.userId;
   if (!callerId) {
     throw new Error('client_id requires an authenticated caller.');
   }

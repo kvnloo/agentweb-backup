@@ -7269,12 +7269,21 @@ for (const toolName of bridgedToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);
   if (handler) {
     const selfOnly = SELF_ONLY_BRIDGE_DEFINITIONS[toolName];
+    // CodeRabbit (PR #2651): the schema swap above keeps client_id out of what
+    // the model is TOLD about, but the underlying execute is the same function
+    // the admin external-MCP surface uses — it would still honor a client_id
+    // that slipped through anyway (e.g. a hallucinated arg, or an admin's own
+    // in-app chat). Strip it here, unconditionally, for every in-app caller
+    // (admin or not) — the in-app bridge stays self-scoped, full stop.
+    const execute = selfOnly
+      ? (args: any, context: any) => handler.execute({ ...args, client_id: undefined }, context)
+      : handler.execute;
     emmaToolRegistry.register({
       name: handler.name,
       definition: selfOnly
         ? { ...handler.definition, description: selfOnly.description, inputSchema: selfOnly.inputSchema }
         : handler.definition,
-      execute: handler.execute,
+      execute,
     });
   } else {
     console.warn(`[emma/tools] Failed to bridge tool "${toolName}" — not found in mcpToolRegistry`);
