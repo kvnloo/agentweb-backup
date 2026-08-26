@@ -32589,6 +32589,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             keywords, search_url, title, company, cursor,
             company_id, location, location_id,
             industry, industry_id, school, school_id,
+            company_size_min, company_size_max,
           } = args;
           // Unipile classic search needs at least one of keywords/search_url/cursor.
           // The downstream linkedInOutreachService.searchPeople synthesizes keywords
@@ -32632,7 +32633,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // count has to be reported, or the agent is left guessing which of three
             // very different situations it is in.
             const anonymizedFiltered = searchResult.items.length - usableItems.length;
-            const trimmedItems = usableItems.map((item: any) => {
+            // ENG-1558: Unipile has no native headcount filter for people search
+            // (only for its Companies category), so a company-size ask is applied
+            // as a post-filter here — resolve each candidate's current employer
+            // and drop those outside the requested range (or unverifiable). No-op
+            // (zero extra Unipile calls) when the caller didn't ask for it.
+            const { items: sizedItems, excludedUnverifiable: companySizeFiltered } =
+              await linkedInOutreachService.filterByCompanySize(
+                usableItems,
+                { min: company_size_min, max: company_size_max },
+                account_id,
+              );
+            const trimmedItems = sizedItems.map((item: any) => {
               const trimmed: any = {
                 provider_id: item.provider_id,
                 public_identifier: item.public_identifier,
@@ -32658,6 +32670,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               ...searchResult,
               items: trimmedItems,
               ...(anonymizedFiltered > 0 ? { anonymizedFiltered } : {}),
+              ...(companySizeFiltered > 0 ? { companySizeFiltered } : {}),
             });
             if (trimmedItems.length === 0 && anonymizedFiltered > 0) {
               // Say plainly what happened, so this does not get reported to the
@@ -32668,6 +32681,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                   `All ${anonymizedFiltered} result(s) were anonymized by LinkedIn (out-of-network), so none are usable. ` +
                   `The search itself worked — this is a reach limit, not an outage and not an empty niche. ` +
                   `Broaden the query, or search from an account whose network covers these people.`,
+                data: searchData,
+              };
+            }
+            if (trimmedItems.length === 0 && companySizeFiltered > 0) {
+              // Same transparency principle as the anonymized case above: a
+              // company-size ask that excluded every real candidate is a
+              // narrow-niche result, not an empty search and not an outage.
+              return {
+                success: true,
+                message:
+                  `Found candidates, but excluded all ${companySizeFiltered} of them because their employer's size ` +
+                  `either fell outside the requested range or couldn't be verified. The search itself worked — ` +
+                  `try widening the company_size range, or drop it to see the unfiltered results.`,
                 data: searchData,
               };
             }
@@ -34419,11 +34445,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
      *  lead back to the persona that sourced it. Distinct from the
      *  `lead.icpMatch` scoring field (post-import scoring). */
     icpSource?: string;
+    /** ENG-1558: post-filter on each lead's resolved employer headcount —
+     *  same semantics as search-people's company_size_min/max. Applied AFTER
+     *  the 4-tier company-resolution chain below (not on raw work_experience
+     *  alone), so a lead whose company only resolved via title-parse/LLM/
+     *  profile fallback is still correctly sized instead of excluded early. */
+    company_size_min?: number;
+    company_size_max?: number;
   }): Promise<any> {
     const {
       listId, keywords, search_url, title, company, company_id,
       location, location_id, industry, industry_id, school, school_id,
       cursor, limit = 20, auto_enrich = false, icpSource,
+      company_size_min, company_size_max,
     } = args;
 
     if (!listId) return { success: false, error: 'listId is required' };
@@ -34518,6 +34552,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const allCreated: Array<{ leadId: string; email?: string; lead?: any }> = [];
     // Out-of-network "LinkedIn Member" hits dropped before the write.
     let anonymizedSkipped = 0;
+    // ENG-1558: leads dropped by the company_size_min/max post-filter
+    // (outside the requested range, or an unverifiable employer).
+    let companySizeFiltered = 0;
+    // ENG-1558 follow-up: consecutive pages the size filter emptied
+    // completely. A narrow company_size range against a market where it's
+    // genuinely rare could otherwise burn all MAX_ITERATIONS pages — each
+    // costing a full searchPeople call plus per-employer lookups — before
+    // giving up. Bail out well before that once the filter has clearly
+    // proven unproductive, rather than paying the full cap's cost every time.
+    let consecutiveEmptiedBySizeFilter = 0;
+    const SIZE_FILTER_EARLY_EXIT_AFTER = 3;
+    let earlyExitOnSizeFilter = false;
 
     while (iterationCount < MAX_ITERATIONS) {
       iterationCount++;
@@ -34639,7 +34685,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         candidates.push({ lead: leads[i], item: items[i] });
       }
-      const importable: any[] = candidates.map((c) => c.lead);
+      let importable: any[] = candidates.map((c) => c.lead);
       if (importable.length === 0) {
         if (!nextCursor) break;
         continue;
@@ -34683,6 +34729,49 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           console.warn('[importLeadsFromSearch] getProfile fallback failed:', e?.message ?? String(e));
         }
       }));
+
+      // Phase 3.5 (ENG-1558): company-size post-filter, run AFTER every
+      // resolution tier above so lead.company reflects the best available
+      // employer name — filtering on Tier-1 (work_experience) alone, like
+      // search-people does, would wrongly exclude leads whose company only
+      // resolved via title-parse/LLM/profile fallback. Adapts each lead's
+      // flat `.company` string into the work_experience shape
+      // filterByCompanySize expects, tagging each with its array index so
+      // the kept subset can be mapped back without disturbing `importable`'s
+      // order (batchCreateLeads' returned sourceIndex must match).
+      if (company_size_min != null || company_size_max != null) {
+        const preFilterCount = importable.length;
+        const sizableItems = importable.map((lead: any, idx: number) => ({
+          __idx: idx,
+          work_experience: lead.company ? [{ company: lead.company, current: true }] : [],
+        }));
+        const { items: kept } = await linkedInOutreachService.filterByCompanySize(
+          sizableItems,
+          { min: company_size_min, max: company_size_max },
+          accountId,
+        );
+        const keepIdx = new Set(kept.map((it: any) => it.__idx));
+        companySizeFiltered += importable.length - keepIdx.size;
+        importable = importable.filter((_: any, i: number) => keepIdx.has(i));
+
+        if (preFilterCount > 0 && importable.length === 0) {
+          consecutiveEmptiedBySizeFilter++;
+          if (consecutiveEmptiedBySizeFilter >= SIZE_FILTER_EARLY_EXIT_AFTER) {
+            // The filter has proven unproductive several pages running —
+            // stop paying for more searchPeople + per-employer lookup calls
+            // rather than grinding to MAX_ITERATIONS on a range that's
+            // clearly not matching this market.
+            earlyExitOnSizeFilter = true;
+            break;
+          }
+        } else {
+          consecutiveEmptiedBySizeFilter = 0;
+        }
+      }
+      if (importable.length === 0) {
+        if (!nextCursor) break;
+        continue;
+      }
 
       const result = await crmDb.batchCreateLeads(listId, importable);
       cumulativeNew += result.newCount ?? 0;
@@ -34763,14 +34852,29 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       iterations: iterationCount,
       trimmed: trimmedCount,
       anonymizedSkipped,
+      companySizeFiltered,
       safetyCapHit,
     };
     if (searchError) response.searchError = searchError;
     if (searchUnavailable) response.searchUnavailable = true;
+    if (earlyExitOnSizeFilter) response.earlyExitOnSizeFilter = true;
     if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
       response.message = 'No results found for the given search criteria.';
+    } else if (earlyExitOnSizeFilter) {
+      // ENG-1558 follow-up: distinct from (and takes priority over) the
+      // generic "excluded all, search exhausted normally" message below —
+      // this stopped BEFORE exhausting, so there may be more matches the
+      // cursor can still reach.
+      response.message = cumulativeNew > 0
+        ? `Imported ${cumulativeNew} lead(s), then stopped early after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where the company_size filter excluded every result. There may be more matches — resume from the returned cursor, or widen the range.`
+        : `Stopped after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where every result was excluded by the company_size filter (out of range, or an unverifiable employer) — this looks like a narrow niche for this market, not an empty search. Widen the company_size range, or drop it to import the unfiltered results.`;
     } else if (cumulativeNew === 0 && anonymizedSkipped > 0 && !searchError) {
       response.message = `${anonymizedSkipped} search result(s) were out-of-network LinkedIn profiles with no name or profile URL and were not imported. Widen the search or connect a LinkedIn account with closer network reach.`;
+    } else if (cumulativeNew === 0 && companySizeFiltered > 0 && !searchError) {
+      // ENG-1558: same transparency principle as the anonymized-skip case
+      // above — a company-size ask that excluded every candidate is a
+      // narrow-niche result, not an empty search and not an outage.
+      response.message = `${companySizeFiltered} search result(s) were excluded because their employer's size either fell outside the requested range or couldn't be verified. Widen the company_size range, or drop it to import the unfiltered results.`;
     }
     // Preview strictly the records that were written and survived trimming.
     response.importedLeads = allCreated.slice(0, 5).map((c) => c.lead).filter(Boolean);

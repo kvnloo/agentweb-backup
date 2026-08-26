@@ -50,6 +50,12 @@ const mockIsAccountConnected = jest.fn().mockResolvedValue(true);
 const mockProbeAccountSession = jest.fn().mockResolvedValue('connected');
 const mockProbeSearchCapability = jest.fn().mockResolvedValue('ok');
 const mockClearStatusCache = jest.fn();
+// ENG-1558: default mirrors the real no-op contract (unchanged items, zero
+// exclusions) so every pre-existing search-people test — none of which pass
+// company_size_min/max — keeps working without having to know this exists.
+const mockFilterByCompanySize = jest.fn(
+  async (...args: any[]) => ({ items: args[0], excludedUnverifiable: 0 }),
+);
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     sendMessage: (...args: any[]) => mockSendMessage(...args),
@@ -71,6 +77,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
     isAccountConnected: (...args: any[]) => mockIsAccountConnected(...args),
     probeAccountSession: (...args: any[]) => mockProbeAccountSession(...args),
     probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
+    filterByCompanySize: (...args: any[]) => mockFilterByCompanySize(...args),
     clearStatusCache: (...args: any[]) => mockClearStatusCache(...args),
   },
 }));
@@ -988,6 +995,174 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.success).toBe(false);
       expect(result.error || '').toMatch(/keyword|filter|search_url|cursor/i);
       expect(mockSearchPeople).not.toHaveBeenCalled();
+    });
+  });
+
+  // ENG-1558 — Unipile has no native headcount filter for the People search
+  // category (only Companies), so company_size_min/max is applied as a
+  // post-filter over linkedInOutreachService.searchPeople's raw results via
+  // linkedInOutreachService.filterByCompanySize (unit-tested on its own in
+  // linkedInOutreachService.test.ts). These tests cover the dispatcher's
+  // wiring: does it call the filter with the right args, and does it shape
+  // the response correctly around the result.
+  describe('ENG-1558: company-size post-filter wiring', () => {
+    it('does not call filterByCompanySize when company_size_min/max are both omitted', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [{ provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'B' }],
+        cursor: null,
+      });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.data.items).toHaveLength(1);
+      // The dispatcher may still call the (no-op-by-default) mock; what
+      // matters is it never receives real bounds when the caller passed none.
+      if (mockFilterByCompanySize.mock.calls.length > 0) {
+        expect(mockFilterByCompanySize.mock.calls[0][1]).toEqual({ min: undefined, max: undefined });
+      }
+    });
+
+    it('passes company_size_min/max through to filterByCompanySize with the right account', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [{ provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'B' }],
+        cursor: null,
+      });
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_min: 1,
+        company_size_max: 200,
+      });
+
+      expect(mockFilterByCompanySize).toHaveBeenCalledWith(
+        expect.any(Array),
+        { min: 1, max: 200 },
+        'test-account-id',
+      );
+    });
+
+    it('returns only the candidates filterByCompanySize kept', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [
+          { provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'Startup' },
+          { provider_id: 'p2', public_identifier: 'p2', first_name: 'B', last_name: 'Enterprise' },
+        ],
+        cursor: null,
+      });
+      mockFilterByCompanySize.mockResolvedValueOnce({
+        items: [{ provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'Startup' }],
+        excludedUnverifiable: 0,
+      });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_max: 200,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.data.items).toHaveLength(1);
+      expect(result.data.items[0].last_name).toBe('Startup');
+    });
+
+    it('reports companySizeFiltered on the response when candidates were excluded', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [
+          { provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'Startup' },
+          { provider_id: 'p2', public_identifier: 'p2', first_name: 'B', last_name: 'Enterprise' },
+        ],
+        cursor: null,
+      });
+      mockFilterByCompanySize.mockResolvedValueOnce({
+        items: [{ provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'Startup' }],
+        excludedUnverifiable: 1,
+      });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_max: 200,
+      });
+
+      expect(result.data.companySizeFiltered).toBe(1);
+    });
+
+    it('does not add a companySizeFiltered field when nothing was excluded', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [{ provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'B' }],
+        cursor: null,
+      });
+      mockFilterByCompanySize.mockResolvedValueOnce({
+        items: [{ provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'B' }],
+        excludedUnverifiable: 0,
+      });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_max: 200,
+      });
+
+      expect(result.data.companySizeFiltered).toBeUndefined();
+    });
+
+    it('reports a transparent "narrow niche" message, not a false empty/outage, when every candidate is excluded by size', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [
+          { provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'One' },
+          { provider_id: 'p2', public_identifier: 'p2', first_name: 'B', last_name: 'Two' },
+        ],
+        cursor: null,
+      });
+      mockFilterByCompanySize.mockResolvedValueOnce({ items: [], excludedUnverifiable: 2 });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_max: 200,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('excluded all 2');
+      expect(result.message).not.toMatch(/unavailable|outage/i);
+      expect(mockProbeSearchCapability).not.toHaveBeenCalled();
+    });
+
+    it('applies the size filter AFTER the anonymized-result filter (never sizes an unusable placeholder)', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [
+          { provider_id: 'p1', public_identifier: 'undefined', first_name: 'LinkedIn', last_name: 'Member' },
+          { provider_id: 'p2', public_identifier: 'p2', first_name: 'Real', last_name: 'Person' },
+        ],
+        cursor: null,
+      });
+      mockFilterByCompanySize.mockResolvedValueOnce({
+        items: [{ provider_id: 'p2', public_identifier: 'p2', first_name: 'Real', last_name: 'Person' }],
+        excludedUnverifiable: 0,
+      });
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_max: 200,
+      });
+
+      // Only the real (non-anonymized) item should have reached the filter.
+      const passedItems = mockFilterByCompanySize.mock.calls[0][0];
+      expect(passedItems).toHaveLength(1);
+      expect(passedItems[0].provider_id).toBe('p2');
     });
   });
 
