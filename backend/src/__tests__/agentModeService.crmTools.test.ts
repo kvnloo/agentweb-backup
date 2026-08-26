@@ -2053,7 +2053,7 @@ describe('AgentModeService - CRM Tools', () => {
       const result = await service.sendEmailToLead(listId, leadId, userId);
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('Email send failed');
+      expect(result.message).toContain('Failed to send email');
     });
 
     it('should send via Gmail when senderType is gmail', async () => {
@@ -2541,7 +2541,7 @@ describe('AgentModeService - CRM Tools', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('Email send failed');
+      expect(result.message).toContain('Custom domain send failed');
     });
 
     it('should return error when gmail-type sender is missing gmailAccountId', async () => {
