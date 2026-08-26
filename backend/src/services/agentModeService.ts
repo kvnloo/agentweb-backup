@@ -32904,12 +32904,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // search silently misses a real, legitimate contact (the reported symptom).
           // No-ops cleanly when identity couldn't be verified or list can't be
           // resolved — mirrors nothing rather than guessing or trusting the caller.
+          //
+          // Deliberately NOT falling back to resolveListIdForAccount here (unlike
+          // send-invite). Sending an invite is always a deliberate targeting action —
+          // the account-bound list is a safe default. Accepting an inbound request is
+          // not: it could be a genuine prospect or an unrelated personal connection,
+          // and the account owner never decided "every accept is a lead." Only mirror
+          // when the caller explicitly names a list_id — i.e. when the task driving
+          // this run has actually judged this specific person relevant.
           try {
             const publicId = acceptedSenderProfile?.public_id;
             const mirrorProfileUrl = publicId ? `https://www.linkedin.com/in/${publicId}/` : null;
             if (mirrorProfileUrl) {
-              const { resolveListIdForAccount, mirrorLinkedInInviteToCrm, splitInvitedUserName, INVITE_ACCEPTED_EVENT } = await import('./linkedInInviteCrmMirror');
-              const mirrorListId = args.list_id || (await resolveListIdForAccount(userId, account_id));
+              const { mirrorLinkedInInviteToCrm, splitInvitedUserName, INVITE_ACCEPTED_EVENT } = await import('./linkedInInviteCrmMirror');
+              const mirrorListId = args.list_id;
               if (mirrorListId) {
                 const { crmDb } = await import('./db');
                 const mirrorList = await crmDb.getLeadListById(mirrorListId);
