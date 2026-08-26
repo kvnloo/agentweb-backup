@@ -37,9 +37,24 @@ interface AttributableMessage {
 const MODEL_CHANGE_REQUEST_PATTERN =
   /\b(?:reassess|switch|change|try|use|pick|select)\b[^.!?\n]{0,40}\b(?:a\s+|an\s+)?(?:new|different|another|other)\s+models?\b|\b(?:switch|change)\s+models\b/i;
 
+/**
+ * CodeRabbit (PR #2642): the base pattern alone matches "Do not switch to a
+ * different model" and "What does it mean to switch to a different model?" —
+ * neither is a request. Same precision-over-recall bias as the base pattern:
+ * reject rather than guess.
+ */
+const NEGATION_PATTERN =
+  /\b(?:don't|do not|doesn't|does not|didn't|did not|never|won't|will not|wouldn't|would not|shouldn't|should not|can't|cannot|no need to)\b/i;
+
+const EXPLANATORY_QUESTION_PATTERN =
+  /\b(?:what does|what is|what would|why would|how does|how would|can you explain|explain what|what happens)\b[^.!]*\?/i;
+
 export function looksLikeModelChangeRequest(messageContent: string | null | undefined): boolean {
   if (!messageContent || typeof messageContent !== 'string') return false;
-  return MODEL_CHANGE_REQUEST_PATTERN.test(messageContent);
+  if (!MODEL_CHANGE_REQUEST_PATTERN.test(messageContent)) return false;
+  if (NEGATION_PATTERN.test(messageContent)) return false;
+  if (EXPLANATORY_QUESTION_PATTERN.test(messageContent)) return false;
+  return true;
 }
 
 /**

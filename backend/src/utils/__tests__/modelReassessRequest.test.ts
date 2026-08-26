@@ -35,6 +35,13 @@ describe('looksLikeModelChangeRequest', () => {
     'write me a haiku',
     'can you use sonnet for a poem',
     'change the report format',
+    // CodeRabbit (PR #2642): negation and explanatory questions are not requests.
+    'Do not switch to a different model',
+    "please don't try another model",
+    'never switch to a different model without asking me first',
+    'What does it mean to switch to a different model?',
+    'What is a different model in this context?',
+    'Why would I switch to a different model?',
     '',
     null,
     undefined,
