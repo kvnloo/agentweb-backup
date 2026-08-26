@@ -222,6 +222,7 @@ import {
 } from '../services/crmSenderService';
 import { MAILBOX_PROVIDERS, CrmSender, isMailboxSender } from '../services/crmSenderTypes';
 import { sendAsSender, SenderDailyLimitExceededError } from '../services/sendAsSender';
+import { claimEmailDomain, releaseEmailDomainClaim, EmailDomainAlreadyClaimedError } from '../services/emailDomainClaimService';
 import { effectiveDailyLimit } from '../services/senderUsageTracker';
 import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
 router.use(apolloSubRouter);
@@ -5438,79 +5439,112 @@ router.post('/email-domains', async (req: Request, res: Response) => {
       return res.status(409).json({ message: 'You have already registered this domain', domain: alreadyOwned });
     }
 
-    // Check if another user already has this domain (legacy scalar or emailDomains[])
+    // GET /email-domains fans out one resendService.getDomain() call per entry — bound the
+    // array so that stays a handful of requests, not an unbounded fan-out.
+    const MAX_EMAIL_DOMAINS_PER_ACCOUNT = 20;
+    if (existingDomains.length >= MAX_EMAIL_DOMAINS_PER_ACCOUNT) {
+      return res.status(400).json({
+        message: `You've reached the limit of ${MAX_EMAIL_DOMAINS_PER_ACCOUNT} sending domains per account. Remove one before adding another.`,
+        code: 'EMAIL_DOMAIN_CAP_EXCEEDED',
+      });
+    }
+
+    // Check if another user already has this domain (legacy scalar or emailDomains[]).
+    // This is a fast-fail UX check only (eventually-consistent scan, TOCTOU-prone on its
+    // own) — claimEmailDomain() below is the actual cross-user correctness guarantee.
     const usersWithDomain = await userDb.getUsersByEmailDomain(normalizedDomain);
     const otherUserWithDomain = usersWithDomain.find(u => u.userId !== userId);
     if (otherUserWithDomain) {
       return res.status(409).json({ message: 'This domain is already in use by another account' });
     }
 
-    // Check if domain already exists in Resend
-    const resendDomains = await resendService.listDomains();
-    const existingResendDomain = resendDomains.find(d => d.name === normalizedDomain);
-
-    let domainResult: { id: string; name: string; status: string; records: any[] } | null;
-    let alreadyExists = false;
-    if (existingResendDomain) {
-      domainResult = await resendService.getDomain(existingResendDomain.id);
-      alreadyExists = true;
-    } else {
-      domainResult = await resendService.createDomain(normalizedDomain);
-    }
-
-    if (!domainResult) {
-      return res.status(500).json({ message: 'Failed to register domain in Resend' });
-    }
-
-    const newEntry = {
-      id: domainResult.id,
-      domain: normalizedDomain,
-      status: domainResult.status,
-      addedAt: new Date().toISOString(),
-    };
-
-    // ENG-265: emailDomains[] is read-modify-write. Guard against a lost update from a
-    // concurrent request for the same user (double-click, two tabs) by conditioning the
-    // write on the array being unchanged since we read it; on a race, re-read once and
-    // retry rather than surfacing a spurious 500/409 for what's usually a double-click.
-    let domainsToWrite: SenderDomainEntry[] = [...existingDomains, newEntry];
-    let expectedSize = existingDomains.length;
-    for (let attempt = 0; ; attempt++) {
-      try {
-        await userDb.updateUser(userId, {
-          emailDomains: domainsToWrite,
-          emailDomainList: domainsToWrite.map(d => d.domain),
-        }, {
-          condition: {
-            expression: expectedSize === 0
-              ? 'attribute_not_exists(#emailDomains) OR size(#emailDomains) = :expectedSize'
-              : 'size(#emailDomains) = :expectedSize',
-            names: { '#emailDomains': 'emailDomains' },
-            values: { ':expectedSize': expectedSize },
-          },
-        });
-        break;
-      } catch (writeError: any) {
-        if (writeError?.code !== 'ConditionalCheckFailedException' || attempt >= 1) {
-          throw writeError;
-        }
-        const freshUser = await userDb.getUserById(userId);
-        const freshDomains: SenderDomainEntry[] = freshUser?.emailDomains || [];
-        if (freshDomains.some((d: SenderDomainEntry) => d.domain === normalizedDomain)) {
-          return res.status(409).json({ message: 'You have already registered this domain' });
-        }
-        domainsToWrite = [...freshDomains, newEntry];
-        expectedSize = freshDomains.length;
+    // ENG-265: atomic global claim — makes cross-user "first writer wins" actually hold even
+    // when two different users' requests race past the scan check above at the same time.
+    try {
+      await claimEmailDomain(userId, normalizedDomain);
+    } catch (claimError: any) {
+      if (claimError instanceof EmailDomainAlreadyClaimedError) {
+        return res.status(409).json({ message: 'This domain is already in use by another account' });
       }
+      throw claimError;
     }
 
-    res.json({
-      message: alreadyExists
-        ? 'Domain already registered in Resend'
-        : 'Domain created successfully. Add the DNS records below to verify.',
-      domain: domainResult,
-      alreadyExists,
-    });
+    try {
+      // Check if domain already exists in Resend
+      const resendDomains = await resendService.listDomains();
+      const existingResendDomain = resendDomains.find(d => d.name === normalizedDomain);
+
+      let domainResult: { id: string; name: string; status: string; records: any[] } | null;
+      let alreadyExists = false;
+      if (existingResendDomain) {
+        domainResult = await resendService.getDomain(existingResendDomain.id);
+        alreadyExists = true;
+      } else {
+        domainResult = await resendService.createDomain(normalizedDomain);
+      }
+
+      if (!domainResult) {
+        await releaseEmailDomainClaim(normalizedDomain);
+        return res.status(500).json({ message: 'Failed to register domain in Resend' });
+      }
+
+      const newEntry = {
+        id: domainResult.id,
+        domain: normalizedDomain,
+        status: domainResult.status,
+        addedAt: new Date().toISOString(),
+      };
+
+      // emailDomains[] is read-modify-write. Guard against a lost update from a concurrent
+      // request for the same user (double-click, two tabs) by conditioning the write on the
+      // array being unchanged since we read it; on a race, re-read once and retry rather
+      // than surfacing a spurious 500/409 for what's usually a double-click.
+      let domainsToWrite: SenderDomainEntry[] = [...existingDomains, newEntry];
+      let expectedSize = existingDomains.length;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await userDb.updateUser(userId, {
+            emailDomains: domainsToWrite,
+            emailDomainList: domainsToWrite.map(d => d.domain),
+          }, {
+            condition: {
+              expression: expectedSize === 0
+                ? 'attribute_not_exists(#emailDomains) OR size(#emailDomains) = :expectedSize'
+                : 'size(#emailDomains) = :expectedSize',
+              names: { '#emailDomains': 'emailDomains' },
+              values: { ':expectedSize': expectedSize },
+            },
+          });
+          break;
+        } catch (writeError: any) {
+          if (writeError?.code !== 'ConditionalCheckFailedException' || attempt >= 1) {
+            throw writeError;
+          }
+          const freshUser = await userDb.getUserById(userId);
+          const freshDomains: SenderDomainEntry[] = freshUser?.emailDomains || [];
+          if (freshDomains.some((d: SenderDomainEntry) => d.domain === normalizedDomain)) {
+            // We already hold the claim, so this can only be our own retry/duplicate
+            // submission, not another user — nothing to release, the entry is already there.
+            return res.status(409).json({ message: 'You have already registered this domain' });
+          }
+          domainsToWrite = [...freshDomains, newEntry];
+          expectedSize = freshDomains.length;
+        }
+      }
+
+      res.json({
+        message: alreadyExists
+          ? 'Domain already registered in Resend'
+          : 'Domain created successfully. Add the DNS records below to verify.',
+        domain: domainResult,
+        alreadyExists,
+      });
+    } catch (innerError) {
+      // The claim succeeded but a later step didn't — release it so the domain isn't
+      // permanently stuck unclaimable by anyone.
+      await releaseEmailDomainClaim(normalizedDomain).catch(() => {});
+      throw innerError;
+    }
   } catch (error: any) {
     console.error('Error creating email domain:', error);
     res.status(500).json({ message: error.message || 'Failed to create email domain' });
@@ -5571,7 +5605,8 @@ router.delete('/email-domains/:domainId', async (req: Request, res: Response) =>
     const { domainId } = req.params;
     const user = await userDb.getUserById(userId);
     const existingDomains: SenderDomainEntry[] = user?.emailDomains || [];
-    if (!existingDomains.some((d: SenderDomainEntry) => d.id === domainId)) {
+    const removedEntry = existingDomains.find((d: SenderDomainEntry) => d.id === domainId);
+    if (!removedEntry) {
       return res.status(404).json({ message: 'Domain not found' });
     }
 
@@ -5606,6 +5641,9 @@ router.delete('/email-domains/:domainId', async (req: Request, res: Response) =>
         expectedSize = freshDomains.length;
       }
     }
+
+    // Free the domain up for any account to claim, now that this one no longer holds it.
+    await releaseEmailDomainClaim(removedEntry.domain).catch(() => {});
 
     res.json({ message: 'Domain removed.' });
   } catch (error: any) {
