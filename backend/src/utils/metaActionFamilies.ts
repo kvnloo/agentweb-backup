@@ -299,6 +299,38 @@ function applyCost(target: any, field: string, proposed: number | null): void {
 }
 
 /**
+ * Derive `totalLeads` and the per-surface costs once both surfaces are fully accumulated.
+ *
+ * ⚠ The spend fallback must stay BOUNDED. Before this change `formLeads` was zeroed whenever
+ * `websiteLeads > 0`, so the two fallbacks were mutually exclusive. Removing that suppression
+ * makes both reachable, and dividing the FULL spend by each surface independently attributes
+ * more money than was spent: 100 website + 50 Instant Form on $3,000 would report $30 and $60,
+ * i.e. $6,000 against $3,000.
+ *
+ * So: a surface that is the only one with leads carries all the spend, exactly as before. When
+ * BOTH have leads, spend cannot be split per surface — Meta does not tell us — and both take the
+ * blended rate, which keeps `website * cpwl + form * cpfl === spend`. A per-family figure Meta
+ * actually reported always wins over either derivation.
+ */
+export function finalizeLeadCosts(target: any): void {
+  const website = target.websiteLeads || 0;
+  const form = target.formLeads || 0;
+  const spend = target.spend || 0;
+  const total = website + form;
+
+  target.totalLeads = total;
+  if (total > 0) target.costPerLead = spend / total;
+
+  const blended = total > 0 ? spend / total : 0;
+  if (website > 0 && !target.costPerWebsiteLead) {
+    target.costPerWebsiteLead = form > 0 ? blended : spend / website;
+  }
+  if (form > 0 && !target.costPerFormLead) {
+    target.costPerFormLead = website > 0 ? blended : spend / form;
+  }
+}
+
+/**
  * Meta reports a cost per action_type, and the same conversion appears under several of them.
  * The previous implementation assigned on every match, so the surviving value was whichever
  * alias Meta happened to return LAST — array order, which Meta does not guarantee. Two runs

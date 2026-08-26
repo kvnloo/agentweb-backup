@@ -2,7 +2,7 @@ import express from "express";
 import { authenticateToken } from "../middleware/auth";
 import { userDb, taskDb } from "../services/db";
 import { getMetaAccessToken } from "../utils/secretsManager";
-import { applyLeadMetrics } from "../utils/metaActionFamilies";
+import { applyLeadMetrics, finalizeLeadCosts } from "../utils/metaActionFamilies";
 
 const router = express.Router();
 
@@ -355,16 +355,7 @@ async function processCampaignData(campaigns: any, insights: any, adSets: any): 
       campaign.frequency = campaign.impressions / campaign.reach;
     }
     // Derived
-    if (campaign.websiteLeads > 0) {
-      campaign.costPerWebsiteLead = campaign.costPerWebsiteLead || (campaign.spend / campaign.websiteLeads);
-    }
-    if (campaign.formLeads > 0) {
-      campaign.costPerFormLead = campaign.costPerFormLead || (campaign.spend / campaign.formLeads);
-    }
-    campaign.totalLeads = (campaign.websiteLeads || 0) + (campaign.formLeads || 0);
-    if (campaign.totalLeads > 0) {
-      campaign.costPerLead = campaign.spend / campaign.totalLeads;
-    }
+    finalizeLeadCosts(campaign);
   }
   
   // Return all campaigns regardless of activity
@@ -445,10 +436,7 @@ async function processAdSetsData(adSets: any, insights: any, campaigns: any): Pr
       adSet.frequency = parseFloat(insight.frequency) || 0;
       applyLeadMetrics(adSet, insight);
       // Derived
-      if (adSet.websiteLeads > 0) adSet.costPerWebsiteLead = adSet.costPerWebsiteLead || (adSet.spend / adSet.websiteLeads);
-      if (adSet.formLeads > 0) adSet.costPerFormLead = adSet.costPerFormLead || (adSet.spend / adSet.formLeads);
-      adSet.totalLeads = (adSet.websiteLeads || 0) + (adSet.formLeads || 0);
-      if (adSet.totalLeads > 0) adSet.costPerLead = adSet.spend / adSet.totalLeads;
+      finalizeLeadCosts(adSet);
       console.log(`Updated adset ${adSetId} with spend: ${adSet.spend}`);
     } else {
       console.log(`Adset ${adSetId} not found in adSetsMap`);
@@ -515,10 +503,7 @@ async function processAdsData(ads: any, insights: any, adSets: any, campaigns: a
       ad.reach = parseInt(insight.reach) || 0;
       ad.frequency = parseFloat(insight.frequency) || 0;
       applyLeadMetrics(ad, insight);
-      if (ad.websiteLeads > 0) ad.costPerWebsiteLead = ad.costPerWebsiteLead || (ad.spend / ad.websiteLeads);
-      if (ad.formLeads > 0) ad.costPerFormLead = ad.costPerFormLead || (ad.spend / ad.formLeads);
-      ad.totalLeads = (ad.websiteLeads || 0) + (ad.formLeads || 0);
-      if (ad.totalLeads > 0) ad.costPerLead = ad.spend / ad.totalLeads;
+      finalizeLeadCosts(ad);
     }
   }
   

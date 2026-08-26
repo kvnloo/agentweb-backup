@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
-import { applyLeadMetrics } from '../utils/metaActionFamilies';
+import { applyLeadMetrics, finalizeLeadCosts } from '../utils/metaActionFamilies';
 import { parse as parseCsv } from 'csv-parse/sync';
 import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
@@ -20871,17 +20871,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
       // longer need to suppress form leads. That suppression is what reported every Instant
       // Form lead as a website lead on any account that also had website conversions.
-      if (campaign.websiteLeads > 0) {
-        campaign.costPerWebsiteLead = campaign.costPerWebsiteLead || (campaign.spend / campaign.websiteLeads);
-      }
-      if (campaign.formLeads > 0) {
-        campaign.costPerFormLead = campaign.costPerFormLead || (campaign.spend / campaign.formLeads);
-      }
-
-      campaign.totalLeads = (campaign.websiteLeads || 0) + (campaign.formLeads || 0);
-      if (campaign.totalLeads > 0) {
-        campaign.costPerLead = campaign.spend / campaign.totalLeads;
-      }
+      finalizeLeadCosts(campaign);
     }
 
     // Return all campaigns regardless of activity
@@ -20954,17 +20944,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
       // longer need to suppress form leads. That suppression is what reported every Instant
       // Form lead as a website lead on any account that also had website conversions.
-      if (adSet.websiteLeads > 0) {
-        adSet.costPerWebsiteLead = adSet.costPerWebsiteLead || (adSet.spend / adSet.websiteLeads);
-      }
-      if (adSet.formLeads > 0) {
-        adSet.costPerFormLead = adSet.costPerFormLead || (adSet.spend / adSet.formLeads);
-      }
-
-      adSet.totalLeads = (adSet.websiteLeads || 0) + (adSet.formLeads || 0);
-      if (adSet.totalLeads > 0) {
-        adSet.costPerLead = adSet.spend / adSet.totalLeads;
-      }
+      finalizeLeadCosts(adSet);
     }
 
     // Return all ad sets regardless of activity
@@ -21046,17 +21026,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
       // longer need to suppress form leads. That suppression is what reported every Instant
       // Form lead as a website lead on any account that also had website conversions.
-      if (ad.websiteLeads > 0) {
-        ad.costPerWebsiteLead = ad.costPerWebsiteLead || (ad.spend / ad.websiteLeads);
-      }
-      if (ad.formLeads > 0) {
-        ad.costPerFormLead = ad.costPerFormLead || (ad.spend / ad.formLeads);
-      }
-
-      ad.totalLeads = (ad.websiteLeads || 0) + (ad.formLeads || 0);
-      if (ad.totalLeads > 0) {
-        ad.costPerLead = ad.spend / ad.totalLeads;
-      }
+      finalizeLeadCosts(ad);
     }
 
     // Return all ads regardless of activity

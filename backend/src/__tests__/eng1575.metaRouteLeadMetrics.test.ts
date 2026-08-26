@@ -1,4 +1,4 @@
-import { applyLeadMetrics } from '../utils/metaActionFamilies';
+import { applyLeadMetrics, finalizeLeadCosts } from '../utils/metaActionFamilies';
 
 /**
  * ENG-1575 — /api/meta/ad-performance guard.
@@ -142,5 +142,44 @@ describe('ENG-1575 routes/meta applyLeadMetrics', () => {
     applyLeadMetrics(t, {});
     applyLeadMetrics(t, { actions: null });
     expect(totalOf(t)).toBe(0);
+  });
+});
+
+describe('ENG-1575 finalizeLeadCosts — the spend fallback must stay bounded', () => {
+  it('never attributes more than the spend when BOTH surfaces have leads', () => {
+    // CodeRabbit: removing the formLeads suppression made both fallbacks reachable at once.
+    // Dividing full spend by each surface independently reported $30 and $60 on $3,000 spend
+    // for 100 + 50 leads -- $6,000 attributed against $3,000.
+    const t: any = { spend: 3000, websiteLeads: 100, formLeads: 50 };
+    finalizeLeadCosts(t);
+    expect(t.totalLeads).toBe(150);
+    expect(t.costPerLead).toBeCloseTo(20, 9);
+    const attributed = t.websiteLeads * t.costPerWebsiteLead + t.formLeads * t.costPerFormLead;
+    expect(attributed).toBeCloseTo(3000, 6);   // exactly the spend, never more
+  });
+
+  it('gives a lone surface the whole spend, exactly as before', () => {
+    const w: any = { spend: 3000, websiteLeads: 100, formLeads: 0 };
+    finalizeLeadCosts(w);
+    expect(w.costPerWebsiteLead).toBeCloseTo(30, 9);
+    expect(w.costPerFormLead).toBeUndefined();
+
+    const f: any = { spend: 1000, websiteLeads: 0, formLeads: 50 };
+    finalizeLeadCosts(f);
+    expect(f.costPerFormLead).toBeCloseTo(20, 9);
+  });
+
+  it("prefers Meta's own reported cost over any derivation", () => {
+    const t: any = { spend: 3000, websiteLeads: 100, formLeads: 50, costPerWebsiteLead: 12 };
+    finalizeLeadCosts(t);
+    expect(t.costPerWebsiteLead).toBe(12);
+  });
+
+  it('handles zero leads and zero spend without dividing by zero', () => {
+    const t: any = { spend: 0, websiteLeads: 0, formLeads: 0 };
+    finalizeLeadCosts(t);
+    expect(t.totalLeads).toBe(0);
+    expect(t.costPerLead).toBeUndefined();
+    expect(Number.isNaN(t.costPerWebsiteLead)).toBe(false);
   });
 });
