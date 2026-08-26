@@ -65,7 +65,7 @@ describe('resolveClientScopedContext', () => {
   it('rejects a non-string, non-null/undefined client_id instead of silently treating it as absent', async () => {
     await expect(
       resolveClientScopedContext({ userId: 'admin-1' }, 12345, 'list_tasks')
-    ).rejects.toThrow('client_id must be a string');
+    ).rejects.toThrow('client_id must be a non-blank string');
 
     expect(mockUserDb.getUserById).not.toHaveBeenCalled();
     expect(mockRecordAdminAudit).not.toHaveBeenCalled();
@@ -74,16 +74,26 @@ describe('resolveClientScopedContext', () => {
   it('rejects an object client_id the same way', async () => {
     await expect(
       resolveClientScopedContext({ userId: 'admin-1' }, { evil: true }, 'list_tasks')
-    ).rejects.toThrow('client_id must be a string');
+    ).rejects.toThrow('client_id must be a non-blank string');
   });
 
-  it('passes through unchanged for an empty-string client_id', async () => {
-    const context = { userId: 'admin-1' };
-    const result = await resolveClientScopedContext(context, '   ', 'list_tasks');
+  // CodeRabbit (PR #2651, second pass): a BLANK string is present, not omitted —
+  // it was silently treated the same as undefined/null, running the call as
+  // the admin's own identity while looking, to the caller, like client_id had
+  // been honored. Only undefined/null legitimately mean "no scoping requested."
+  it('rejects a blank/whitespace-only client_id instead of silently treating it as absent', async () => {
+    await expect(
+      resolveClientScopedContext({ userId: 'admin-1' }, '   ', 'list_tasks')
+    ).rejects.toThrow('client_id must be a non-blank string');
 
-    expect(result.overrideToken).toBeUndefined();
     expect(mockUserDb.getUserById).not.toHaveBeenCalled();
     expect(mockRecordAdminAudit).not.toHaveBeenCalled();
+  });
+
+  it('rejects an empty string client_id the same way', async () => {
+    await expect(
+      resolveClientScopedContext({ userId: 'admin-1' }, '', 'list_tasks')
+    ).rejects.toThrow('client_id must be a non-blank string');
   });
 
   it('rejects a non-admin caller before ever resolving the target', async () => {

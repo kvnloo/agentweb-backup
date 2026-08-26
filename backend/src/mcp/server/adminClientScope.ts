@@ -40,19 +40,19 @@ interface ClientScopedContext {
 export async function resolveClientScopedContext(context: any, clientId: unknown, toolName: string): Promise<ClientScopedContext> {
   const base = ctx(context);
   // Omitted (undefined/null) means "no scoping requested" — pass through
-  // unscoped, same as always. A PRESENT but non-string value (a number,
-  // object, boolean, array — a caller mistake, not an absent argument) must
-  // not silently degrade to the same "unscoped" outcome: that would run the
-  // call as the admin's own identity while looking, to the caller, like their
-  // client_id was honored. CodeRabbit (PR #2651).
+  // unscoped, same as always. Anything else PRESENT — a non-string value
+  // (caller mistake) or a blank/whitespace-only string (CodeRabbit, PR #2651:
+  // "client_id: '   '" was silently treated the same as omitted) — must not
+  // silently degrade to the same "unscoped" outcome: that would run the call
+  // as the admin's own identity while looking, to the caller, like their
+  // client_id was honored.
   if (clientId === undefined || clientId === null) {
     return base;
   }
-  if (typeof clientId !== 'string') {
-    throw new Error(`client_id must be a string (email or userId); received ${typeof clientId}.`);
-  }
-  if (!clientId.trim()) {
-    return base;
+  if (typeof clientId !== 'string' || !clientId.trim()) {
+    throw new Error(
+      `client_id must be a non-blank string (email or userId); received ${typeof clientId === 'string' ? 'a blank string' : typeof clientId}.`
+    );
   }
 
   // CodeRabbit (PR #2651): prefer agentUserId, per dev.md's stated convention —
