@@ -5546,7 +5546,7 @@ emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
-    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp doc entries start with "clickup:" and include a docId field — use docId as parent_doc_id in write_clickup_doc to nest content inside that doc. ClickUp folder entries start with "clickup-folder:" (these are task-hierarchy folders, for reference only — not writable doc parents). Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date. NOTE: the Google Drive entries here are READ-ONLY shared folders — CREATING or EDITING Google Docs/Sheets is a SEPARATE capability; discover and install the skill that provides Google Docs/Sheets create/edit tools via list_available_skills.',
+    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp doc entries start with "clickup:" and include a docId field — use docId as parent_doc_id in write_clickup_doc to nest content inside that doc. ClickUp folder entries start with "clickup-folder:" (these are task-hierarchy folders, for reference only — not writable doc parents). Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date. NOTE: the Google Drive entries here are READ-ONLY shared folders — CREATING or EDITING Google Docs/Sheets is a SEPARATE capability; discover and install the skill that provides Google Docs/Sheets create/edit tools via list_available_skills. For an IMAGE or VIDEO file found here that you need to actually USE (e.g. as ad creative), do NOT use read_knowledge_base_files — use materialize_knowledge_base_asset instead.',
     inputSchema: {
       type: "object",
       properties: {
@@ -5590,7 +5590,7 @@ emmaToolRegistry.register({
   name: "read_knowledge_base_files",
   definition: {
     name: "read_knowledge_base_files",
-    description: 'Read one or more knowledge base files. Each entry requires a knowledge base identifier (kb_identifier) and a file name (file_name). For Google Drive shared folders, use the identifier from list_knowledge_base_files (e.g., "gdrive:FOLDER_ID") and the file name. For ClickUp docs, use the identifier (e.g., "clickup:WORKSPACE_ID") and the doc name. Public knowledge base files can be accessed by any user, while private files require ownership. Returns the content for each requested file.',
+    description: 'Read one or more knowledge base files. Each entry requires a knowledge base identifier (kb_identifier) and a file name (file_name). For Google Drive shared folders, use the identifier from list_knowledge_base_files (e.g., "gdrive:FOLDER_ID") and the file name. For ClickUp docs, use the identifier (e.g., "clickup:WORKSPACE_ID") and the doc name. Public knowledge base files can be accessed by any user, while private files require ownership. Returns the content for each requested file. WARNING: for an image or video file this returns raw bytes as a base64 string, capped and silently truncated at 1,000,000 characters — truncated base64 does not decode, so any real image/video will come back corrupted. Never use this tool for image/video files you intend to actually use (e.g. as ad creative) — use materialize_knowledge_base_asset instead, which returns a real hosted URL. Only use this tool for images/video if you genuinely just need to inspect/describe them and corruption from truncation is acceptable.',
     inputSchema: {
       type: "object",
       properties: {
@@ -5618,6 +5618,31 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.readKnowledgeBaseFiles(args.files, context?.userId);
+  }
+});
+
+emmaToolRegistry.register({
+  name: "materialize_knowledge_base_asset",
+  definition: {
+    name: "materialize_knowledge_base_asset",
+    description: 'Turn an IMAGE or VIDEO file from a connected Google Drive knowledge base folder into a real, hosted asset with a usable URL — e.g. to pass as image_url to AD_CREATIVE CREATE, or to a video upload tool. read_knowledge_base_files is for TEXT/DOCUMENT content only (Docs, Sheets, PDFs, etc.) — for images/videos it returns raw bytes as base64 text capped at 1,000,000 characters, which silently truncates and corrupts anything but a tiny file, and nothing downstream can consume that base64 anyway. Use THIS tool whenever you need to actually USE a Drive-sourced image or video, not just inspect it. Get kb_identifier and file_name from list_knowledge_base_files. Currently only supports Google Drive sources (kb_identifier starting with "gdrive:").',
+    inputSchema: {
+      type: "object",
+      properties: {
+        kb_identifier: {
+          type: 'string',
+          description: 'Google Drive knowledge base identifier, e.g. "gdrive:FOLDER_ID" — from list_knowledge_base_files'
+        },
+        file_name: {
+          type: 'string',
+          description: 'Exact file name of the image/video inside that folder, from list_knowledge_base_files'
+        }
+      },
+      required: ["kb_identifier", "file_name"]
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.materializeKnowledgeBaseAsset(args.kb_identifier, args.file_name, context?.userId);
   }
 });
 

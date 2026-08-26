@@ -128,6 +128,10 @@ jest.mock('../config/integrations', () => ({
   getLinkedInScopesForType: jest.fn().mockReturnValue([]),
 }));
 
+jest.mock('../utils/s3Utils', () => ({
+  uploadFileToS3: jest.fn(),
+}));
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const FAKE_ACCOUNT = {
@@ -852,6 +856,175 @@ describe('AgentModeService - Google Drive methods', () => {
       // Comments section should be included in content
       expect(result.content).toMatch(/COMMENTS & FEEDBACK/);
       expect(result.content).toMatch(/Alice/);
+    });
+  });
+
+  // ── materializeKnowledgeBaseAsset (ENG-1580) ───────────────────────────────
+  //
+  // read_knowledge_base_files / readGoogleDriveFileContent is text-oriented:
+  // a binary (image/video) file falls through to `content.toString('base64')`
+  // inside a response capped at 1,000,000 characters, silently truncating
+  // (and corrupting) anything but a tiny file, with no downstream tool able
+  // to consume that base64 anyway. materializeKnowledgeBaseAsset bypasses
+  // that path: download raw bytes -> upload to S3 -> return a real URL.
+
+  describe('materializeKnowledgeBaseAsset', () => {
+    const { userDb } = require('../services/db');
+    const s3Utils = require('../utils/s3Utils');
+
+    beforeEach(() => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: USER_ID,
+        googleDriveFolders: [{ folderId: 'folder-1', name: 'Ad Creatives' }],
+      });
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue({
+        success: true,
+        url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user-123/files/123/abc/ad.png',
+        key: 'users/user-123/files/123/abc/ad.png',
+      });
+    });
+
+    it('returns an error when kb_identifier or file_name is missing', async () => {
+      const result = await service.materializeKnowledgeBaseAsset('', 'ad.png', USER_ID);
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/required/i);
+    });
+
+    it('rejects non-gdrive kb_identifier sources', async () => {
+      const result = await service.materializeKnowledgeBaseAsset('clickup:workspace-1', 'ad.png', USER_ID);
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/google drive/i);
+    });
+
+    it('returns not-authorized when the folder is not on the user/org account', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: USER_ID, googleDriveFolders: [] });
+      const result = await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'ad.png', USER_ID);
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/not authorized/i);
+      expect(mockDriveFiles.list).not.toHaveBeenCalled();
+    });
+
+    it('returns not-found when no file with that name exists in the folder', async () => {
+      mockDriveFiles.list.mockResolvedValue({ data: { files: [] } });
+      const result = await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'missing.png', USER_ID);
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/not found/i);
+    });
+
+    it('passes supportsAllDrives and includeItemsFromAllDrives on the folder lookup', async () => {
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [{ id: 'file-1', name: 'ad.png', mimeType: 'image/png', size: '1024' }] },
+      });
+      mockDriveFiles.get.mockResolvedValue({ data: Buffer.from('fake-png-bytes') });
+
+      await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'ad.png', USER_ID);
+
+      expect(mockDriveFiles.list).toHaveBeenCalledWith(
+        expect.objectContaining({ supportsAllDrives: true, includeItemsFromAllDrives: true })
+      );
+    });
+
+    it('rejects non-image/video mimetypes without downloading or uploading', async () => {
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [{ id: 'file-1', name: 'brief.pdf', mimeType: 'application/pdf', size: '1024' }] },
+      });
+      const result = await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'brief.pdf', USER_ID);
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/read_knowledge_base_files/);
+      expect(mockDriveFiles.get).not.toHaveBeenCalled();
+      expect((s3Utils.uploadFileToS3 as jest.Mock)).not.toHaveBeenCalled();
+    });
+
+    it('rejects a file over the size ceiling without downloading', async () => {
+      const oversized = 300 * 1024 * 1024; // 300MB > 200MB ceiling
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [{ id: 'file-1', name: 'huge.mp4', mimeType: 'video/mp4', size: String(oversized) }] },
+      });
+      const result = await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'huge.mp4', USER_ID);
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/limit/i);
+      expect(mockDriveFiles.get).not.toHaveBeenCalled();
+    });
+
+    it('rejects an oversized file even when Drive metadata under-reports size (e.g. 0 mid virus-scan)', async () => {
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [{ id: 'file-1', name: 'huge.png', mimeType: 'image/png', size: '0' }] },
+      });
+      const oversizedBuffer = Buffer.alloc(201 * 1024 * 1024); // 201MB > 200MB ceiling
+      mockDriveFiles.get.mockResolvedValue({ data: oversizedBuffer });
+
+      const result = await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'huge.png', USER_ID);
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/limit/i);
+      expect((s3Utils.uploadFileToS3 as jest.Mock)).not.toHaveBeenCalled();
+    });
+
+    it('downloads the binary via alt:media with supportsAllDrives and uploads to S3', async () => {
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [{ id: 'file-1', name: 'ad.png', mimeType: 'image/png', size: '2048' }] },
+      });
+      mockDriveFiles.get.mockResolvedValue({ data: Buffer.from('fake-png-bytes') });
+
+      const result = await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'ad.png', USER_ID);
+
+      expect(mockDriveFiles.get).toHaveBeenCalledWith(
+        expect.objectContaining({ fileId: 'file-1', alt: 'media', supportsAllDrives: true }),
+        expect.objectContaining({ responseType: 'arraybuffer' })
+      );
+      expect(s3Utils.uploadFileToS3).toHaveBeenCalledWith(
+        expect.any(Buffer), 'ad.png', USER_ID, 'image/png'
+      );
+      expect(result.success).toBe(true);
+      expect(result.url).toBe('https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user-123/files/123/abc/ad.png');
+      expect(result.mime_type).toBe('image/png');
+    });
+
+    it('accepts video mimetypes the same way as images', async () => {
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [{ id: 'file-2', name: 'ad.mp4', mimeType: 'video/mp4', size: '4096' }] },
+      });
+      mockDriveFiles.get.mockResolvedValue({ data: Buffer.from('fake-mp4-bytes') });
+
+      const result = await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'ad.mp4', USER_ID);
+      expect(result.success).toBe(true);
+      expect(s3Utils.uploadFileToS3).toHaveBeenCalledWith(
+        expect.any(Buffer), 'ad.mp4', USER_ID, 'video/mp4'
+      );
+    });
+
+    it('returns a failure (not a throw) when the S3 upload fails', async () => {
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [{ id: 'file-1', name: 'ad.png', mimeType: 'image/png', size: '2048' }] },
+      });
+      mockDriveFiles.get.mockResolvedValue({ data: Buffer.from('fake-png-bytes') });
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue({ success: false, error: 's3_down' });
+
+      const result = await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'ad.png', USER_ID);
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('s3_down');
+    });
+
+    it('returns a friendly message on a 404 from Drive', async () => {
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [{ id: 'file-1', name: 'ad.png', mimeType: 'image/png', size: '2048' }] },
+      });
+      mockDriveFiles.get.mockRejectedValue(makeApiError(404));
+      const result = await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'ad.png', USER_ID);
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/not found|not accessible/i);
+    });
+
+    it('never routes through the text-truncating readGoogleDriveFileContent path', async () => {
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [{ id: 'file-1', name: 'ad.png', mimeType: 'image/png', size: '2048' }] },
+      });
+      mockDriveFiles.get.mockResolvedValue({ data: Buffer.from('fake-png-bytes') });
+      const readContentSpy = jest.spyOn(service as any, 'readGoogleDriveFileContent');
+
+      await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'ad.png', USER_ID);
+
+      expect(readContentSpy).not.toHaveBeenCalled();
+      readContentSpy.mockRestore();
     });
   });
 
