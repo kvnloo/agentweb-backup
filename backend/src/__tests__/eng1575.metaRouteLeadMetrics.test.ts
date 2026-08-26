@@ -8,9 +8,8 @@ import { applyLeadMetrics, finalizeLeadCosts } from '../utils/metaActionFamilies
  * ROUTE's contract — specifically that the field the portal renders does not move.
  *
  * This route had its OWN copy of the action-type sets and, unlike agentModeService, NO
- * suppression — so `totalLeads` came back at 2x. Verified against a live account using the
- * route's own query params: it reported exactly double the real lead count at both 7d and 30d,
- * with costPerLead correspondingly halved.
+ * suppression — so `totalLeads` came back at 2x, with costPerLead correspondingly halved.
+ * Values below are synthetic; what is pinned is the alias shape and the invariant.
  *
  * No customer saw it: the portal renders `websiteLeads`, never `totalLeads`. These tests
  * pin BOTH — the field that was wrong is now right, and the field the portal actually
@@ -41,14 +40,14 @@ describe('ENG-1575 routes/meta applyLeadMetrics', () => {
   it('never counts a custom pixel conversion as a lead', () => {
     const t = blank();
     applyLeadMetrics(t, {
-      actions: [act('lead', 630), act('offsite_conversion.fb_pixel_lead', 630), act('offsite_conversion.fb_pixel_custom', 952)],
+      actions: [act('lead', 300), act('offsite_conversion.fb_pixel_lead', 300), act('offsite_conversion.fb_pixel_custom', 700)],
     });
-    expect(totalOf(t)).toBe(630);
-    expect(t.websiteLeads).toBe(630);
+    expect(totalOf(t)).toBe(300);
+    expect(t.websiteLeads).toBe(300);
   });
 
-  it('keeps the portal-rendered websiteLeads unchanged for every measured account', () => {
-    for (const [n, leads] of [['A', 790], ['B', 419], ['C', 630], ['D', 255]] as const) {
+  it('keeps the portal-rendered websiteLeads unchanged across alias shapes', () => {
+    for (const [n, leads] of [['A', 100], ['B', 200], ['C', 300], ['D', 400]] as const) {
       const t = blank();
       applyLeadMetrics(t, { actions: [act('lead', leads), act('offsite_conversion.fb_pixel_lead', leads)] });
       expect({ account: n, websiteLeads: t.websiteLeads }).toEqual({ account: n, websiteLeads: leads });
@@ -82,9 +81,8 @@ describe('ENG-1575 routes/meta applyLeadMetrics', () => {
 
   it('keeps cost deterministic across multiple rows regardless of order', () => {
     // CodeRabbit: cost was last-wins, so a multi-row result made the reported figure depend on
-    // the order Meta returned rows in. Now first-wins. (Measured: action_breakdowns=action_type
-    // never returns >1 row per entity — campaign 2/2, adset 4/4, ad 10/10 — but time_increment
-    // and breakdowns do, and this must not depend on ordering there either.)
+    // the order Meta returned rows in. Now first-wins. (action_breakdowns=action_type returns one row
+    // per entity, but time_increment and breakdowns do not, and ordering must not matter there.)
     const rowA = { actions: [act('lead', 5)], cost_per_action_type: [act('lead', 40)] };
     const rowB = { actions: [act('lead', 7)], cost_per_action_type: [act('lead', 90)] };
     const fwd = blank(); applyLeadMetrics(fwd, rowA); applyLeadMetrics(fwd, rowB);
@@ -109,7 +107,7 @@ describe('ENG-1575 routes/meta applyLeadMetrics', () => {
 
   it('locks a disputed cost across EVERY ordering of three disagreeing rows', () => {
     // CodeRabbit: writing 0 on conflict made the cleared value read as "unset" on the next row,
-    // so 40/90/60 ended at 60 while 60/90/40 ended at 0 — the order dependence this removes.
+    // so the reported cost depended on which row arrived first. This pins that it cannot.
     const rows = [40, 90, 60].map((c, i) => ({
       actions: [act('lead', i + 1)],
       cost_per_action_type: [act('lead', c)],

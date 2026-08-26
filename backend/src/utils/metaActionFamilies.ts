@@ -112,7 +112,10 @@ export function surfaceOf(actionType: string): ConversionSurface {
   if (actionType.startsWith('offsite_conversion.fb_pixel_')) return 'website';
   if (actionType.startsWith('onsite_web_')) return 'website';
   if (actionType.startsWith('offsite_')) return 'website';
-  if (actionType === 'website_lead') return 'website';
+  // Generic, to match `familyOf`'s `website_${family}` alias. Recognising only `website_lead`
+  // left `website_purchase` classified as family=purchase but surface=unknown, so it fell into
+  // the rollup-only branch and was attributed by default rather than by its own name.
+  if (actionType.startsWith('website_')) return 'website';
   // Bare `lead`, `omni_lead` etc. are rollups spanning both surfaces and naming neither.
   return 'unknown';
 }

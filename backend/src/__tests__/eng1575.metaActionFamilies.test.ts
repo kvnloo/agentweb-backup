@@ -80,6 +80,27 @@ describe('ENG-1575 surfaceOf', () => {
     expect(surfaceOf('onsite_conversion.lead_form')).toBe('instant_form');
   });
 
+  it('classifies the generic website_ alias for NON-lead families too', () => {
+    // CodeRabbit: familyOf accepted the generic `website_${family}` while surfaceOf recognised
+    // only `website_lead`, so `website_purchase` came back family=purchase / surface=unknown and
+    // fell into the rollup-only branch — attributed by default rather than by its own name.
+    expect(familyOf('website_purchase')).toBe('purchase');
+    expect(surfaceOf('website_purchase')).toBe('website');
+    expect(familyOf('website_complete_registration')).toBe('complete_registration');
+    expect(surfaceOf('website_complete_registration')).toBe('website');
+  });
+
+  it('splits a non-lead family by surface rather than defaulting it', () => {
+    const byFamily = collapseActions([
+      { action_type: 'purchase', value: '40' },
+      { action_type: 'website_purchase', value: '40' },
+    ]);
+    const p = byFamily.get('purchase')!;
+    expect(p.total).toBe(40);          // aliases collapse, not sum
+    expect(p.website).toBe(40);        // attributed by name, not by fallback
+    expect(p.instantForm).toBe(0);
+  });
+
   it('leaves the bare rollup unattributed — it names no surface', () => {
     expect(surfaceOf('lead')).toBe('unknown');
     expect(surfaceOf('omni_lead')).toBe('unknown');
