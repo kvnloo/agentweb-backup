@@ -317,8 +317,12 @@ function leadDetailsFailureScope(args: unknown): string {
   // pairs must never collapse into the same breaker bucket just because they
   // share a long common prefix — a truncated slice could otherwise merge
   // unrelated targets and reintroduce the exact cross-lead blocking this scope
-  // exists to prevent.
-  return createHash('sha256').update(`${listId}|${leadId}`).digest('hex');
+  // exists to prevent. JSON-encode the pair rather than joining with a plain
+  // "|" delimiter: list_id/lead_id are caller-controlled strings, so a literal
+  // "|" inside one could make two DIFFERENT pairs (e.g. ("a|b","c") and
+  // ("a","b|c")) hash identically — JSON.stringify's quoting makes the
+  // boundary between the two values unambiguous regardless of content.
+  return createHash('sha256').update(JSON.stringify([listId, leadId])).digest('hex');
 }
 
 function failureScope(toolName: string, args: unknown): string {

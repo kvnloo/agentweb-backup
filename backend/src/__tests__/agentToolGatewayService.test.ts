@@ -1941,6 +1941,41 @@ describe('agentToolGatewayService', () => {
       expect(execute).not.toHaveBeenCalled();
     });
 
+    it('ENG-969: a "|" inside list_id/lead_id does not make two DIFFERENT pairs share a breaker bucket (CodeRabbit, PR #2611)', async () => {
+      // ("a|b", "c") and ("a", "b|c") both join to the string "a|b|c" — a plain
+      // delimiter-joined hash input would collapse these into one bucket. The
+      // JSON-encoded hash keeps them distinct.
+      const runId = 'run-eng969-delimiter';
+      const notFound = () => Promise.resolve({
+        success: false,
+        message: 'Lead not found',
+        error: 'The specified lead does not exist in this list',
+      });
+
+      for (let i = 0; i < 3; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_lead_details',
+          args: { list_id: 'a|b', lead_id: 'c' },
+          runId,
+          execute: notFound,
+        });
+        expect(outcome.status).toBe('success');
+      }
+
+      // A DIFFERENT pair that happens to join to the identical delimited string
+      // must NOT be blocked by the three failures above.
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_lead_details',
+        args: { list_id: 'a', lead_id: 'b|c' },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
     // ENG-291: the Daily Satisfaction Score Report calls get_chat_history over a
     // 24h window with sync=true (on-the-fly score generation). That heavy request
     // timed out twice, tripping the SESSION-scoped timeout aggregate at threshold
