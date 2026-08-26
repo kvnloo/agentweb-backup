@@ -193,7 +193,6 @@ const ADMIN_USER_LIST_FIELDS = [
   "fromName",
   "slackChannel",
   "slackChannels",
-  "slackSuggestedRepliesDisabled",
   "seoDomains",
   "googleAnalyticsPropertyId",
   "googleAnalyticsProperties",
@@ -1363,37 +1362,6 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
   } catch (error) {
     console.error("Error updating user slack channels:", error);
     res.status(500).json({ message: "Error updating slack channels" });
-  }
-});
-
-// Toggle Slack suggested-reply (slack-triggered) monitoring for a user.
-// Body: { enabled: boolean } — true = opt IN to auto-listen on untagged messages, false = stay on
-// the default (tag-gated only, Emma must be @-mentioned).
-// Persisted as the inverse `slackSuggestedRepliesDisabled` flag: enabled:true -> disabled:false
-// (opted in); enabled:false -> disabled:true (default). ENG-1613: absent/true is now the default
-// (disabled) — only an explicit disabled:false opts a customer into auto-listen.
-// Non-boolean `enabled` is coerced via `!enabled` rather than rejected (pre-existing behavior,
-// predating ENG-1613, covered by admin.slackSuggestedReplies.test.ts — a missing field defaults
-// to disabled, a truthy value like the string "true" is treated as enabled). Left unchanged here
-// deliberately: tightening it to a strict boolean check is a real, separately-scoped fix that
-// would also need to touch those existing tests, not a same-day cost-burn stopgap.
-router.put("/users/:userId/slack-suggested-replies", async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { enabled } = req.body;
-
-    const user = await userDb.getUserById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    const updatedUser = await userDb.updateUser(userId, {
-      slackSuggestedRepliesDisabled: !enabled,
-    });
-    res.json(updatedUser);
-  } catch (error) {
-    console.error("Error updating slack suggested replies setting:", error);
-    res.status(500).json({ message: "Error updating slack suggested replies setting" });
   }
 });
 
