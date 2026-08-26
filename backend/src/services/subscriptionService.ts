@@ -86,6 +86,9 @@ async function resolveUserSubscriptionType(userId: string): Promise<{
 }> {
   try {
     const user = await userDb.getUserById(userId);
+    if (!user) {
+      return { subscriptionType: "Free", resolved: false };
+    }
     const ownSubscriptionType = user?.subscriptionType || "Free";
     // Org members inherit the org owner's tier dynamically — the org's effective
     // tier is whatever the owner currently holds (orgs carry no tier field).
