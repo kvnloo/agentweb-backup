@@ -1164,6 +1164,34 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(passedItems).toHaveLength(1);
       expect(passedItems[0].provider_id).toBe('p2');
     });
+
+    // ENG-1558 follow-up: live production testing after this feature shipped
+    // found company_size_max excluded 10/10 candidates at every bound tried,
+    // including a bound wide enough that it should have been a no-op. Root
+    // cause: classic search-people items don't carry `work_experience` (only
+    // `headline`), so filterByCompanySize's employer lookup found nothing to
+    // resolve and marked every candidate unverifiable. The fix resolves an
+    // employer name from the headline (mirroring importLeadsFromSearch's own
+    // tiered resolution) before handing items to filterByCompanySize.
+    it('resolves an employer from headline (no work_experience on the raw item) before filtering by size', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [
+          { provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'One', headline: 'Product Manager at Foo Inc' },
+        ],
+        cursor: null,
+      });
+      mockFilterByCompanySize.mockResolvedValueOnce({ items: [], excludedUnverifiable: 1 });
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_max: 200,
+      });
+
+      const passedItems = mockFilterByCompanySize.mock.calls[0][0];
+      expect(passedItems[0].work_experience).toEqual([{ company: 'Foo Inc', current: true }]);
+    });
   });
 
   // ENG-975 — a people search that returns zero because the ACCOUNT can no
