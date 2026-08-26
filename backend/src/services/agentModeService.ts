@@ -9022,6 +9022,10 @@ export class AgentModeService {
                 resultParts.push(`**Computed Data:**\n${csvText}`);
                 generatedCsvText = csvText;
                 generatedCsvPartCount++;
+                // ENG-1295 follow-up: this Gemini response shape is rare and non-deterministic, so it
+                // could not be re-triggered on demand to confirm the fix still fires in real traffic.
+                // A positive signal here means the next organic occurrence shows up in CloudWatch.
+                console.log('AgentMode: performDataAnalysis surfaced generated CSV via inlineData (mimeType=text/csv)');
               }
             } catch (error) {
               console.error('AgentMode: performDataAnalysis error decoding generated CSV inlineData:', error);
@@ -9072,6 +9076,9 @@ export class AgentModeService {
                 resultParts.push(`**Computed Data:**\n${csvText}`);
                 generatedCsvText = csvText;
                 generatedCsvPartCount++;
+                // ENG-1295 follow-up: snake_case variant of the same rare shape — logged separately
+                // so the two branches are distinguishable in CloudWatch.
+                console.log('AgentMode: performDataAnalysis surfaced generated CSV via inline_data (mimeType=text/csv)');
               }
             } catch (error) {
               console.error('AgentMode: performDataAnalysis error decoding generated CSV inline_data (snake_case):', error);
