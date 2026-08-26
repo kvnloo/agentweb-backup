@@ -17,9 +17,17 @@ jest.mock('../utils/secretsManager', () => ({
 // Mock connectedAccountsDb
 const mockGetAccountsByUserId = jest.fn();
 const mockGetAccountsByUserIdIncludingOrgShared = jest.fn();
+// Resolves by default (daily-volume persistence, ENG-1197 durability follow-up)
+// so existing tests that don't care about it don't have to mock it explicitly —
+// the pacer's write is best-effort/caught, but an unresolved mock would still
+// hang the call.
+const mockUpdateAccountConfig = jest.fn().mockResolvedValue(undefined);
+const mockGetAccountsWithOwnerIncludingOrgShared = jest.fn();
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: (...args: any[]) => mockGetAccountsByUserId(...args),
   getAccountsByUserIdIncludingOrgShared: (...args: any[]) => mockGetAccountsByUserIdIncludingOrgShared(...args),
+  getAccountsWithOwnerIncludingOrgShared: (...args: any[]) => mockGetAccountsWithOwnerIncludingOrgShared(...args),
+  updateAccountConfig: (...args: any[]) => mockUpdateAccountConfig(...args),
 }));
 
 // Mock linkedInOutreachService
@@ -125,10 +133,17 @@ describe('AgentModeService - LinkedIn Outreach', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     service = new AgentModeService();
+    mockUpdateAccountConfig.mockImplementation(async (...args: any[]) => {
+      const mutation = args[3];
+      if (typeof mutation === 'function') mutation({});
+    });
 
     // Default: user owns the account (or it is org-shared)
     mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
       { platform: 'unipile', account_id: 'test-account-id' },
+    ]);
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'test-account-id', userId: 'user-1' },
     ]);
 
     // Default: the Unipile session is live. clearAllMocks() does not reset
@@ -331,6 +346,9 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     it('returns error when account is not owned or org-shared', async () => {
       mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
         { platform: 'unipile', account_id: 'different-account' },
+      ]);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'different-account', userId: 'user-1' },
       ]);
 
       const result = await service.linkedinOutreach('user-1', validArgs);
@@ -597,6 +615,9 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     it('returns error when account is not owned or org-shared', async () => {
       mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
         { platform: 'unipile', account_id: 'different-account' },
+      ]);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'different-account', userId: 'user-1' },
       ]);
 
       const result = await service.linkedinOutreach('user-1', validArgs);
@@ -1613,6 +1634,9 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
     mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
       { platform: 'unipile', account_id: 'test-account-id' },
     ]);
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'test-account-id', userId: 'user-1' },
+    ]);
     mockIsAccountConnected.mockResolvedValue(true);
     mockProbeAccountSession.mockResolvedValue('connected');
     mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
@@ -1828,6 +1852,8 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
     afterEach(() => {
       delete process.env.LINKEDIN_WRITE_MIN_GAP_MS;
       delete process.env.LINKEDIN_WRITE_MAX_PER_HOUR;
+      delete process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX;
+      delete process.env.LINKEDIN_DAILY_MESSAGE_CAP;
       __resetWritePacerForTests();
     });
 
@@ -1920,5 +1946,20 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
       expect(second.message).toBe('LinkedIn write actions are being paced');
       expect(mockSendInvitation).toHaveBeenCalledTimes(1);
     });
+
+    it('does not reserve daily volume when the hourly pacer refuses the write', async () => {
+      process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX = '10';
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockSendInvitation.mockResolvedValue({ id: 'inv-hourly' });
+
+      const first = await service.linkedinOutreach('user-1', inviteArgs);
+      const second = await service.linkedinOutreach('user-1', inviteArgs);
+
+      expect(first.success).toBe(true);
+      expect(second.success).toBe(false);
+      expect(second.message).toBe('LinkedIn write actions are being paced');
+      expect(mockUpdateAccountConfig).toHaveBeenCalledTimes(1);
+    });
+
   });
 });
