@@ -132,4 +132,28 @@ describe('GET /api/crm/sender-emails — usage surfacing (ENG-265)', () => {
     // Day 1 of warmup caps at 10, not the sender's eventual dailyLimit of 200.
     expect(jsonCall.senders[0].effectiveDailyLimit).toBe(10);
   });
+
+  it('one sender\'s usage lookup failing does not blank the whole sender list (CodeRabbit)', async () => {
+    (settingsService.getSetting as jest.Mock).mockResolvedValue({
+      settingValue: JSON.stringify({
+        senders: [
+          { id: '1', email: 'a@b.com', fromName: 'A', dailyLimit: 50 },
+          { id: '2', email: 'c@d.com', fromName: 'C', dailyLimit: 50 },
+        ],
+        defaultSenderId: '1',
+      }),
+    });
+    (senderUsageTracker.getUsage as jest.Mock)
+      .mockRejectedValueOnce(new Error('DynamoDB timed out'))
+      .mockResolvedValueOnce({ date: '2026-08-25', sentCount: 7 });
+
+    const handle = getHandler('/sender-emails', 'get');
+    await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+    expect(mockResponse.status).not.toHaveBeenCalledWith(500);
+    const jsonCall = (mockResponse.json as jest.Mock).mock.calls[0][0];
+    expect(jsonCall.senders).toHaveLength(2);
+    expect(jsonCall.senders[0].sentToday).toBe(0); // fell back on the failed lookup
+    expect(jsonCall.senders[1].sentToday).toBe(7); // unaffected by sender 1's failure
+  });
 });

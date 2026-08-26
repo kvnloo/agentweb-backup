@@ -5035,7 +5035,16 @@ router.get('/sender-emails', async (req: Request, res: Response) => {
     // without a second round trip.
     const senders = await Promise.all(config.senders.map(async (s) => {
       const limit = effectiveDailyLimit(s);
-      const usage = limit !== null ? await senderUsageTracker.getUsage(userId, s.id) : null;
+      // A rejected usage read must not blank the whole sender list — none of the rest of this
+      // response (senders, default sender, connected accounts) depends on usage counts. Same
+      // defensive-fallback pattern already used for connected_accounts above and
+      // resendService.getDomain in GET /email-domains.
+      const usage = limit !== null
+        ? await senderUsageTracker.getUsage(userId, s.id).catch((err: any) => {
+            console.warn(`[crm] getUsage failed for sender ${s.id}:`, err?.message || err);
+            return null;
+          })
+        : null;
       return {
         ...serializeSender(s),
         senderProvider: s.senderProvider,
@@ -5680,13 +5689,22 @@ router.delete('/email-domains/:domainId', async (req: Request, res: Response) =>
       return res.status(404).json({ message: 'Domain not found' });
     }
 
+    // Release the claim BEFORE touching the user record, and let a genuine failure here
+    // propagate as the normal 500 instead of being swallowed. This claim is confirmed, so it
+    // never expires via claimEmailDomain's staleness window — a release failure silently
+    // eaten after the user record already shows "removed" would leave the domain permanently
+    // unclaimable by anyone, including this owner on retry. Releasing first is the safer
+    // direction to fail in: the delete is conditioned on still owning the claim (idempotent —
+    // ConditionalCheckFailedException is already treated as a no-op inside the service), so a
+    // retry after a real failure here is always safe, whereas the reverse order risks a
+    // permanent lockout with nothing to retry against.
+    await releaseEmailDomainClaim(removedEntry.domain, userId);
+
     // The removed entry can be a legacy scalar-field domain that was never actually persisted
     // in emailDomains[] — there's no array element to filter out. Clear the scalar fields
     // directly instead (same as the singular DELETE /email-domain route).
     if (!existingDomains.some((d: SenderDomainEntry) => d.id === domainId)) {
       await userDb.updateUser(userId, { emailDomain: '', resendDomainId: '' });
-      await releaseEmailDomainClaim(removedEntry.domain, userId).catch((e) =>
-        console.error(`Failed to release email domain claim for "${removedEntry.domain}" after removal:`, e));
       return res.json({ message: 'Domain removed.' });
     }
 
@@ -5721,10 +5739,6 @@ router.delete('/email-domains/:domainId', async (req: Request, res: Response) =>
         expectedSize = freshDomains.length;
       }
     }
-
-    // Free the domain up for any account to claim, now that this one no longer holds it.
-    await releaseEmailDomainClaim(removedEntry.domain, userId).catch((e) =>
-      console.error(`Failed to release email domain claim for "${removedEntry.domain}" after removal:`, e));
 
     res.json({ message: 'Domain removed.' });
   } catch (error: any) {

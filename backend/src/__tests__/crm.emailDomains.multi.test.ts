@@ -19,7 +19,13 @@ jest.mock('../controllers/templates', () => ({
 import { Request, Response } from 'express';
 import { userDb } from '../services/db';
 import { resendService } from '../services/resendService';
+import { releaseEmailDomainClaim } from '../services/emailDomainClaimService';
 import router from '../routes/crm';
+
+jest.mock('../services/emailDomainClaimService', () => ({
+  ...jest.requireActual('../services/emailDomainClaimService'),
+  releaseEmailDomainClaim: jest.fn().mockResolvedValue(undefined),
+}));
 
 jest.mock('../services/db', () => ({
   crmDb: {
@@ -387,6 +393,37 @@ describe('CRM multi-domain endpoints (ENG-265)', () => {
 
       expect(userDb.updateUser).toHaveBeenCalledWith('test-user-id', { emailDomain: '', resendDomainId: '' });
       expect(mockResponse.json).toHaveBeenCalledWith({ message: 'Domain removed.' });
+    });
+
+    it('releases the claim BEFORE clearing the user record, and propagates a genuine release failure as a 500 instead of swallowing it (CodeRabbit)', async () => {
+      const keep = { id: 'keep', domain: 'keep.com', status: 'verified', addedAt: '2026-01-01T00:00:00.000Z' };
+      const remove = { id: 'remove', domain: 'remove.com', status: 'verified', addedAt: '2026-01-02T00:00:00.000Z' };
+      mockRequest.params = { domainId: 'remove' };
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user-id', emailDomains: [keep, remove] });
+      (releaseEmailDomainClaim as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+
+      const handle = getHandler('/email-domains/:domainId', 'delete');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      // This is a confirmed claim that never expires on its own — silently clearing the user
+      // record here would leave it permanently unclaimable by anyone, including this user on
+      // retry, with no error surfaced anywhere.
+      expect(mockResponse.status).toHaveBeenCalledWith(500);
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it('releases a legacy scalar-only domain claim before clearing the scalar fields too', async () => {
+      mockRequest.params = { domainId: 'legacy-id' };
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id', emailDomain: 'legacy.com', resendDomainId: 'legacy-id',
+      });
+      (releaseEmailDomainClaim as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+
+      const handle = getHandler('/email-domains/:domainId', 'delete');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(mockResponse.status).toHaveBeenCalledWith(500);
+      expect(userDb.updateUser).not.toHaveBeenCalled();
     });
   });
 
