@@ -336,9 +336,13 @@ async function processCampaignData(campaigns: any, insights: any, adSets: any): 
           // is logged here — and it is strictly more auditable, because it records what was
           // actually COUNTED after alias collapsing rather than each raw alias seen. No token
           // or credential is included.
+          // Records THAT lead metrics were computed and from how many action types, without
+          // the counts themselves: the audit question is whether the collapse ran, and the
+          // values are customer metrics that do not belong in application logs. Strictly less
+          // than the two logs this replaced, which emitted the campaign NAME and each raw value.
           console.log(
-            `[meta/ad-performance] lead metrics campaign=${campaign.id} website=${campaign.websiteLeads} ` +
-            `instantForm=${campaign.formLeads} actionTypes=${(insight.actions || []).length}`
+            `[meta/ad-performance] lead metrics computed campaign=${campaign.id} ` +
+            `actionTypes=${(insight.actions || []).length}`
           );
     }
   }

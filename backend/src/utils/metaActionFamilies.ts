@@ -192,10 +192,11 @@ export function collapseActions(actions: MetaAction[] | undefined | null): Map<C
       // Logged rather than left silent: if it ever fires we find out from a log line instead
       // of from a number nobody can explain.
       const remainder = total - website - instantForm;
+      // Deliberately reports only the CONDITION, not the counts: this is a "which branch ran"
+      // signal, and the values are customer metrics that do not belong in application logs.
       console.warn(
-        `[metaActionFamilies] rollup exceeds named surfaces for family=${family}: ` +
-        `total=${total} website=${website} instantForm=${instantForm} remainder=${remainder}. ` +
-        `Total is authoritative; the surface split is heuristic.`
+        `[metaActionFamilies] rollup exceeds named surfaces for family=${family}; ` +
+        `total is authoritative, surface split is heuristic.`
       );
       if (instantForm > website) instantForm += remainder;
       else website += remainder;
@@ -208,9 +209,8 @@ export function collapseActions(actions: MetaAction[] | undefined | null): Map<C
       // Also unobserved in production (it needs an account running both surfaces with no bare
       // rollup), so it is logged for the same reason as the branch above.
       console.warn(
-        `[metaActionFamilies] surfaces exceed rollup for family=${family}: ` +
-        `rollupMax=${total} website=${website} instantForm=${instantForm}. ` +
-        `Treating the surfaces as distinct conversions.`
+        `[metaActionFamilies] surfaces exceed rollup for family=${family}; ` +
+        `treating the surfaces as distinct conversions.`
       );
       total = website + instantForm;
     }
@@ -288,7 +288,7 @@ function applyCost(target: any, field: string, proposed: number | null): void {
     // can disagree. Reachable via `time_increment` / `breakdowns`. Logged so a first occurrence
     // is visible rather than silently changing a reported cost.
     console.warn(
-      `[metaActionFamilies] conflicting ${field} across insight rows (${current} vs ${proposed}); ` +
+      `[metaActionFamilies] conflicting ${field} across insight rows; ` +
       `clearing so the caller derives it from spend / leads.`
     );
     target[field] = 0; // disagreement -> let the caller derive it from spend / leads

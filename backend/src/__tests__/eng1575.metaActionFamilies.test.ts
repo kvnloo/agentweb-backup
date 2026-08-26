@@ -48,7 +48,7 @@ describe('ENG-1575 familyOf', () => {
   });
 
   it('does NOT treat a custom pixel conversion as a lead', () => {
-    // One production account carried ~1.5x as many of these as real leads. Counting them overstates it.
+    // A custom conversion can be defined as anything; counting it as a lead overstates the account.
     expect(familyOf('offsite_conversion.fb_pixel_custom')).toBeNull();
   });
 
@@ -123,8 +123,8 @@ describe('ENG-1575 the two heuristic branches — behaviour pinned and announced
   });
 
   it('stays silent on the ordinary shape every production account produces', () => {
-    const t = leadTotals([a('lead', 790), a('offsite_conversion.fb_pixel_lead', 790)]);
-    expect(t.total).toBe(790);
+    const t = leadTotals([a('lead', 100), a('offsite_conversion.fb_pixel_lead', 100)]);
+    expect(t.total).toBe(100);
     expect(warn).not.toHaveBeenCalled();              // no log spam on the common path
   });
 });
@@ -201,11 +201,11 @@ describe('ENG-1575 collapseActions — counts each family once, by its maximum',
 
   it('excludes custom pixel conversions from the lead total', () => {
     const totals = leadTotals([
-      a('lead', 630),
-      a('offsite_conversion.fb_pixel_lead', 630),
-      a('offsite_conversion.fb_pixel_custom', 952),
+      a('lead', 300),
+      a('offsite_conversion.fb_pixel_lead', 300),
+      a('offsite_conversion.fb_pixel_custom', 700),
     ]);
-    expect(totals.total).toBe(630);
+    expect(totals.total).toBe(300);
   });
 
   it('separates families rather than merging them', () => {
@@ -232,55 +232,49 @@ describe('ENG-1575 collapseActions — counts each family once, by its maximum',
 });
 
 /**
- * REGRESSION GUARD.
+ * REGRESSION GUARD — the collapsed count must not move.
  *
- * These action shapes and values are taken from real production insights payloads (180-day
- * windows) and are the numbers the shipped code reported for them. The fix MUST leave every one
- * unchanged — that is what makes this deployable without any customer seeing their lead count
- * move.
- *
- * Account identities, ad-account IDs and spend are deliberately omitted: the ALIAS SHAPE and the
- * resulting count are what the code has to get right, and committing customer performance data
- * would leak it through the repo and every review surface. The mapping from case to account is
- * held outside the repo.
+ * Synthetic values exercising the alias shapes these processors actually receive. What is pinned
+ * is the invariant, not the magnitudes: one conversion reported under several names is counted
+ * once, and custom pixel conversions never join the lead family. Real production figures were
+ * verified out-of-band and are deliberately not committed.
  */
-describe('ENG-1575 regression guard — live production accounts must not move', () => {
+describe('ENG-1575 regression guard — collapsed counts must not move', () => {
   const cases: Array<{ account: string; actions: ReturnType<typeof a>[]; expected: number }> = [
     {
-      account: 'account A (pixel-only, high volume)',
-      actions: [a('lead', 790), a('offsite_conversion.fb_pixel_lead', 790)],
-      expected: 790,
+      account: 'case A: rollup + pixel alias',
+      actions: [a('lead', 100), a('offsite_conversion.fb_pixel_lead', 100)],
+      expected: 100,
     },
     {
-      account: 'account B (pixel-only)',
-      actions: [a('lead', 419), a('offsite_conversion.fb_pixel_lead', 419)],
-      expected: 419,
+      account: 'case B: rollup + pixel alias',
+      actions: [a('lead', 200), a('offsite_conversion.fb_pixel_lead', 200)],
+      expected: 200,
     },
     {
-      account: 'account C (pixel-only + many custom conversions)',
+      account: 'case C: rollup + pixel alias + custom conversions',
       actions: [
-        a('lead', 630),
-        a('offsite_conversion.fb_pixel_lead', 630),
-        a('offsite_conversion.fb_pixel_custom', 952),
+        a('lead', 300),
+        a('offsite_conversion.fb_pixel_lead', 300),
+        a('offsite_conversion.fb_pixel_custom', 700),
       ],
-      expected: 630,
+      expected: 300,
     },
     {
-      account: 'account D (pixel-only + few custom)',
+      account: 'case D: rollup + pixel alias + one custom',
       actions: [
-        a('lead', 255),
-        a('offsite_conversion.fb_pixel_lead', 255),
+        a('lead', 400),
+        a('offsite_conversion.fb_pixel_lead', 400),
         a('offsite_conversion.fb_pixel_custom', 2),
       ],
-      expected: 255,
+      expected: 400,
     },
   ];
 
   it.each(cases)('$account reports exactly $expected leads', ({ actions, expected }) => {
     const totals = leadTotals(actions);
     expect(totals.total).toBe(expected);
-    // Every one is pixel-only: no Instant Form activity existed anywhere in production when
-    // this was measured, across every account with a connected Meta ad account.
+    // None of these cases carries an Instant Form spelling, so that surface must stay zero.
     expect(totals.instantForm).toBe(0);
     expect(totals.website).toBe(expected);
   });

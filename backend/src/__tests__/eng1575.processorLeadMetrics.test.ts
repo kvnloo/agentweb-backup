@@ -5,11 +5,12 @@ import { agentModeService } from '../services/agentModeService';
  *
  * The util suite proves `leadTotals` in isolation. That is NOT the same as proving the four
  * processors behave identically to the shipped code, and no pre-existing test exercised any of
- * them with an `actions` payload at all. These do, using the real action payloads returned by
- * live production ad accounts on 2026-08-25 (180-day windows) and the numbers the OLD code
- * reported for them.
+ * them with an `actions` payload at all. These do.
  *
- * If any of these move, a paying customer's lead count moves.
+ * Values are SYNTHETIC. What the regression guard actually pins is the alias SHAPE and the
+ * invariant — one conversion reported under several names must be counted once, and the number
+ * must not move. Real production figures were verified out-of-band and are deliberately not
+ * committed; the property holds for any N.
  */
 
 const act = (action_type: string, value: number) => ({ action_type, value: String(value) });
@@ -24,39 +25,39 @@ const runCampaigns = (insights: any[]) =>
 describe('ENG-1575 processCampaignData — live accounts must report exactly as before', () => {
   const cases = [
     {
-      name: 'account A (pixel-only, high volume)',
-      spend: 29334,
-      actions: [act('lead', 790), act('offsite_conversion.fb_pixel_lead', 790)],
-      expectedTotal: 790,
+      name: 'case A: rollup + pixel alias',
+      spend: 1000,
+      actions: [act('lead', 100), act('offsite_conversion.fb_pixel_lead', 100)],
+      expectedTotal: 100,
     },
     {
-      name: 'account B (pixel-only)',
-      spend: 57527,
-      actions: [act('lead', 419), act('offsite_conversion.fb_pixel_lead', 419)],
-      expectedTotal: 419,
+      name: 'case B: rollup + pixel alias',
+      spend: 2000,
+      actions: [act('lead', 200), act('offsite_conversion.fb_pixel_lead', 200)],
+      expectedTotal: 200,
     },
     {
-      // 952 custom pixel conversions alongside 630 real leads. The old code accumulated them
+      // 700 custom pixel conversions alongside 300 real leads. The old code accumulated them
       // into formLeads (1582 raw) and then discarded the bucket wholesale; the new code never
       // counts a custom conversion as a lead in the first place. Same answer, different reason.
-      name: 'account C (pixel-only + many custom conversions)',
-      spend: 119938,
+      name: 'case C: rollup + pixel alias + custom conversions',
+      spend: 3000,
       actions: [
-        act('lead', 630),
-        act('offsite_conversion.fb_pixel_lead', 630),
-        act('offsite_conversion.fb_pixel_custom', 952),
+        act('lead', 300),
+        act('offsite_conversion.fb_pixel_lead', 300),
+        act('offsite_conversion.fb_pixel_custom', 700),
       ],
-      expectedTotal: 630,
+      expectedTotal: 300,
     },
     {
-      name: 'account D (pixel-only + few custom)',
-      spend: 5202,
+      name: 'case D: rollup + pixel alias + one custom',
+      spend: 4000,
       actions: [
-        act('lead', 255),
-        act('offsite_conversion.fb_pixel_lead', 255),
+        act('lead', 400),
+        act('offsite_conversion.fb_pixel_lead', 400),
         act('offsite_conversion.fb_pixel_custom', 2),
       ],
-      expectedTotal: 255,
+      expectedTotal: 400,
     },
   ];
 
@@ -65,7 +66,7 @@ describe('ENG-1575 processCampaignData — live accounts must report exactly as 
 
     expect(c.totalLeads).toBe(expectedTotal);
     expect(c.websiteLeads).toBe(expectedTotal);
-    // No Instant Form activity existed anywhere in production when this was measured.
+    // These cases carry no Instant Form spellings, so the Instant Form surface must stay zero.
     expect(c.formLeads).toBe(0);
     expect(c.costPerFormLead).toBe(0);
     expect(c.costPerLead).toBeCloseTo(spend / expectedTotal, 6);
@@ -73,11 +74,11 @@ describe('ENG-1575 processCampaignData — live accounts must report exactly as 
 
   it('falls back to spend / leads when Meta reports no cost_per_action_type', () => {
     const c = runCampaigns([
-      { campaign_id: 'c1', impressions: 1000, clicks: 100, spend: '19910.48', reach: 900, actions: [act('lead', 330)] },
+      { campaign_id: 'c1', impressions: 1000, clicks: 100, spend: '5000', reach: 900, actions: [act('lead', 330)] },
     ]);
     expect(c.totalLeads).toBe(330);
-    expect(c.costPerLead).toBeCloseTo(19910.48 / 330, 6);
-    expect(c.costPerWebsiteLead).toBeCloseTo(19910.48 / 330, 6);
+    expect(c.costPerLead).toBeCloseTo(5000 / 330, 6);
+    expect(c.costPerWebsiteLead).toBeCloseTo(5000 / 330, 6);
   });
 });
 
@@ -141,12 +142,12 @@ describe('ENG-1575 processCampaignData — the defect this fixes', () => {
   });
 
   it('never counts a custom pixel conversion as a lead even with no other lead events', () => {
-    // The reachable trap: with no `lead` event the old suppression never fired, so 952 custom
-    // conversions would have been reported as 952 leads.
+    // The reachable trap: with no `lead` event the old suppression never fired, so 700 custom
+    // conversions would have been reported as 700 leads.
     const c = runCampaigns([
       {
         campaign_id: 'c1', impressions: 10000, clicks: 500, spend: '5000', reach: 9000,
-        actions: [act('offsite_conversion.fb_pixel_custom', 952)],
+        actions: [act('offsite_conversion.fb_pixel_custom', 700)],
       },
     ]);
     expect(c.totalLeads).toBe(0);
