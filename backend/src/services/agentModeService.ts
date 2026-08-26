@@ -8557,19 +8557,22 @@ export class AgentModeService {
   }
 
   /**
-   * ENG-1295 intra-response hard guard: detects the exact failure pattern that
-   * produced the prod hallucination — the SAME id mapped to two DIFFERENT names
-   * within one generated CSV (e.g. id 199836788398 as both "Product Analytics
-   * Platform" and "Game Analytics Platform"). This requires no narrative parsing:
-   * an id resolving to more than one name in the same result is an objective
-   * data-integrity violation regardless of subject matter. Only applies when the
-   * CSV actually has both an id-like and a name-like column (per-entity
-   * breakdowns commonly do; a plain metrics CSV with no id column is unaffected).
+   * ENG-1295 intra-response check: detects the exact failure pattern that
+   * produced the prod hallucination — the SAME id mapped to more than one
+   * DIFFERENT name within one generated CSV (e.g. id 199836788398 as both
+   * "Product Analytics Platform" and "Game Analytics Platform"). This requires
+   * no narrative parsing. Informational only, NOT a hard reject: a real entity
+   * (an ad group, a CRM lead's company, etc.) can legitimately be renamed
+   * within a query's date window, which would produce this exact shape from
+   * genuinely correct source data — we can't tell "renamed" apart from
+   * "fabricated" using the CSV alone, so this is surfaced in Provenance for the
+   * caller to judge rather than blocking a possibly-correct result. Only
+   * applies when the CSV actually has both an id-like and a name-like column.
    */
-  private findCsvIdNameCollision(header: string[], rows: string[][]): { id: string; names: string[] } | null {
+  private findCsvIdNameCollisions(header: string[], rows: string[][]): { id: string; names: string[] }[] {
     const idIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('id'));
     const nameIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('name'));
-    if (idIdx === -1 || nameIdx === -1 || idIdx === nameIdx) return null;
+    if (idIdx === -1 || nameIdx === -1 || idIdx === nameIdx) return [];
     const idToNames = new Map<string, Set<string>>();
     for (const row of rows) {
       const id = row[idIdx];
@@ -8578,12 +8581,13 @@ export class AgentModeService {
       if (!idToNames.has(id)) idToNames.set(id, new Set());
       idToNames.get(id)!.add(name);
     }
+    const collisions: { id: string; names: string[] }[] = [];
     for (const [id, names] of idToNames) {
       if (names.size > 1) {
-        return { id, names: [...names] };
+        collisions.push({ id, names: [...names] });
       }
     }
-    return null;
+    return collisions;
   }
 
   /**
@@ -9177,32 +9181,13 @@ export class AgentModeService {
         };
       }
 
-      // ENG-1295 hardening: intra-CSV consistency, cross-call self-consistency,
-      // and a provenance stub for generated CSV data.
+      // ENG-1295 hardening: cross-call self-consistency and a provenance stub
+      // (including intra-CSV id/name collision and source-grounding checks) for
+      // generated CSV data.
       if (generatedCsvText) {
         const provenance = this.parseCsvProvenance(generatedCsvText);
         if (provenance) {
-          // 1. Intra-CSV check: the SAME id mapped to different names within this
-          // one response — the exact pattern that produced the prod hallucination.
-          // No cross-call state needed, so check this before touching the cache.
-          const collision = this.findCsvIdNameCollision(provenance.header, provenance.rows);
-          if (collision) {
-            console.warn(
-              `AgentMode: performDataAnalysis intra-CSV id/name collision (userId=${userId}): ` +
-              `id=${collision.id} names=[${collision.names.join(', ')}]`
-            );
-            return {
-              success: false,
-              message:
-                `The generated data contradicts itself: id "${collision.id}" is associated with more than one name ` +
-                `(${collision.names.join(', ')}) within the same result. An id must map to exactly one name — this indicates ` +
-                'the analysis model fabricated or corrupted at least one row. Do NOT trust this result. Retry with an ' +
-                'instruction that groups strictly by id and explicitly forbids inventing or varying the name for a given id.',
-              error: 'internal_inconsistency'
-            };
-          }
-
-          // 2. Cross-call self-consistency: an exact repeat call whose grouping-key
+          // 1. Cross-call self-consistency: an exact repeat call whose grouping-key
           // set changed since its last run.
           const cacheKey = this.buildDataAnalysisCacheKey(userId, urlsToProcess, analysisInstruction);
           const prior = this.dataAnalysisConsistencyCache.get(cacheKey);
@@ -9230,18 +9215,35 @@ export class AgentModeService {
           this.dataAnalysisConsistencyCache.set(cacheKey, { groupingKeyValues: provenance.groupingKeyValues, timestamp: Date.now() });
           this.pruneDataAnalysisConsistencyCache();
 
-          // 3. Provenance stub: cheap-to-verify rows_in / rows_out / distinct
+          // 2. Provenance stub: cheap-to-verify rows_in / rows_out / distinct
           // grouping-key values, so the caller doesn't have to trust the narrative
-          // summary about what the tool actually computed. Includes an id-grounding
-          // caveat when a distinct id in the CSV can't be found anywhere in the raw
-          // source file(s) — informational, not a hard reject (a substring miss can
-          // also mean the model reformatted the id).
+          // summary about what the tool actually computed. Includes two
+          // informational (not hard-reject) caveats:
+          // - id grounding: a distinct id in the CSV that can't be found anywhere
+          //   in the raw source file(s) — a substring miss can also mean the
+          //   model reformatted the id, so this doesn't block a possibly-correct
+          //   result.
+          // - id/name collisions: the same id mapped to more than one name within
+          //   this CSV (the exact shape of the prod hallucination). Deliberately
+          //   NOT a hard reject — a real entity (an ad group, a CRM lead's
+          //   company) can legitimately be renamed within a query's date window,
+          //   which produces this same shape from genuinely correct data. We
+          //   can't tell "renamed" apart from "fabricated" from the CSV alone, so
+          //   this is surfaced for the caller to judge rather than risking a hard
+          //   failure on a correct result.
           const rowsInPerFile = fileRawContents.map(c => this.estimateRowsIn(c)).filter((n): n is number => n !== null);
           const rowsIn = rowsInPerFile.length > 0 ? rowsInPerFile.reduce((a, b) => a + b, 0) : null;
           const MAX_DISTINCT_VALUES_SHOWN = 25;
           const distinctPreview = provenance.groupingKeyValues.slice(0, MAX_DISTINCT_VALUES_SHOWN);
           const moreCount = provenance.groupingKeyValues.length - distinctPreview.length;
           const grounding = this.checkCsvIdGrounding(provenance.header, provenance.rows, fileRawContents);
+          const collisions = this.findCsvIdNameCollisions(provenance.header, provenance.rows);
+          if (collisions.length > 0) {
+            console.warn(
+              `AgentMode: performDataAnalysis intra-CSV id/name collision (userId=${userId}, informational): ` +
+              collisions.map(c => `id=${c.id} names=[${c.names.join(', ')}]`).join('; ')
+            );
+          }
           resultParts.push(
             `**Provenance:**\n` +
             `rows_in: ${rowsIn !== null ? rowsIn : 'unknown (no parsable input file)'}\n` +
@@ -9250,10 +9252,14 @@ export class AgentModeService {
             (moreCount > 0 ? ` … (+${moreCount} more)` : '') +
             (grounding && grounding.unverified > 0
               ? `\n⚠️ ${grounding.unverified} of ${grounding.checked} id(s) in this result could not be found in the raw source file(s) — treat those rows as unverified.`
+              : '') +
+            (collisions.length > 0
+              ? `\n⚠️ ${collisions.length} id(s) map to more than one name within this result — e.g. id "${collisions[0].id}" as [${collisions[0].names.join(', ')}]. ` +
+                'This can mean the source entity was renamed during the query window, or that a row was fabricated/corrupted — verify before trusting these names.'
               : '')
           );
 
-          // 4. Explicit untrusted-narrative caveat: make it part of the tool's own
+          // 3. Explicit untrusted-narrative caveat: make it part of the tool's own
           // contract that the free-form prose has not been cross-checked, rather
           // than relying on the calling agent to know to verify it independently
           // (the ad-hoc behavior that happened to save prod session d789c175).
