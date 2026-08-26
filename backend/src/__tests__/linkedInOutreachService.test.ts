@@ -1330,6 +1330,97 @@ describe('LinkedInOutreachService', () => {
         expect(maxInFlight).toBeGreaterThan(1);
         expect(mockResolveTopId).toHaveBeenCalledTimes(uniqueCompanyCount);
       });
+
+      // CodeRabbit: min > max would otherwise silently exclude every
+      // verifiable candidate (fails both comparisons for any real count)
+      // with no signal to the caller about why.
+      describe('bounds validation', () => {
+        it('rejects min > max without making any resolver/company calls', async () => {
+          const items = [itemWithCompany('Acme')];
+          await expect(
+            linkedInOutreachService.filterByCompanySize(items, { min: 500, max: 100 }, 'account-1'),
+          ).rejects.toThrow(/min.*must not exceed max|non-negative/i);
+          expect(mockResolveTopId).not.toHaveBeenCalled();
+          expect(mockGetCompany).not.toHaveBeenCalled();
+        });
+
+        it('rejects a negative min', async () => {
+          const items = [itemWithCompany('Acme')];
+          await expect(
+            linkedInOutreachService.filterByCompanySize(items, { min: -5 }, 'account-1'),
+          ).rejects.toThrow(/non-negative/i);
+        });
+
+        it('rejects a negative max', async () => {
+          const items = [itemWithCompany('Acme')];
+          await expect(
+            linkedInOutreachService.filterByCompanySize(items, { max: -1 }, 'account-1'),
+          ).rejects.toThrow(/non-negative/i);
+        });
+
+        it('accepts min === max as a valid (exact) range', async () => {
+          mockResolveTopId.mockResolvedValue('company-id-1');
+          mockGetCompany.mockResolvedValue({ rawData: { employee_count: 100 } });
+          const items = [itemWithCompany('Acme')];
+          const result = await linkedInOutreachService.filterByCompanySize(
+            items, { min: 100, max: 100 }, 'account-1',
+          );
+          expect(result.items).toEqual(items);
+        });
+      });
+
+      // CodeRabbit: getCompanyProfile has no timeout of its own — a hung
+      // Unipile request would otherwise stall the whole lookup batch
+      // (Promise.all never settles until every member does).
+      describe('company-profile lookup timeout', () => {
+        const TIMEOUT_MS = 30_000;
+        const hang = () => new Promise(() => {}); // never resolves
+
+        afterEach(() => {
+          jest.useRealTimers();
+        });
+
+        it('treats a hung company-profile lookup as unverifiable instead of hanging forever', async () => {
+          jest.useFakeTimers();
+          mockResolveTopId.mockResolvedValue('company-id-1');
+          mockGetCompany.mockImplementation(() => hang());
+
+          const items = [itemWithCompany('Stuck Co')];
+          const resultPromise = linkedInOutreachService.filterByCompanySize(
+            items, { max: 200 }, 'account-1',
+          );
+          await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+
+          const result = await resultPromise;
+          expect(result.items).toEqual([]);
+          expect(result.excludedUnverifiable).toBe(1);
+        });
+
+        it('does not let one hung lookup block a different employer in the same batch', async () => {
+          jest.useFakeTimers();
+          mockResolveTopId.mockImplementation((_accountId: string, params: any) =>
+            Promise.resolve(params.keywords === 'Stuck Co' ? 'company-id-stuck' : 'company-id-fine'),
+          );
+          mockGetCompany.mockImplementation((companyId: string) =>
+            companyId === 'company-id-stuck' ? hang() : Promise.resolve({ rawData: { employee_count: 50 } }),
+          );
+
+          const items = [
+            itemWithCompany('Stuck Co', { provider_id: 'p-stuck' }),
+            itemWithCompany('Fine Co', { provider_id: 'p-fine' }),
+          ];
+          const resultPromise = linkedInOutreachService.filterByCompanySize(
+            items, { max: 200 }, 'account-1',
+          );
+          await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+          const result = await resultPromise;
+
+          // The hung lookup resolves to unverifiable (excluded); the other
+          // employer's own lookup was unaffected and its candidate survives.
+          expect(result.excludedUnverifiable).toBe(1);
+          expect(result.items).toEqual([items[1]]);
+        });
+      });
     });
 
     // ─── Auto-injected keywords (Unipile classic search rejects calls without
