@@ -7,6 +7,7 @@ import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
+import { mintDelegateToken } from "../services/delegateAccessToken";
 import { linkedInOutreachService } from "../services/linkedInOutreachService";
 import { deleteAccountById, createAccount } from "../services/connectedAccountsDb";
 import { waitlistDb } from "../services/waitlistDb";
@@ -1900,25 +1901,13 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
     // from the TARGET user and compared on every request by the auth middleware —
     // bumping either one rejects this token immediately. Without them the only
     // limit on a leaked support token was its expiry.
-    const delegatePayload = {
-      userId: targetUser.userId, // This will be the active user in the token
-      email: targetUser.email,
-      roles: targetUser.roles,
-      isAdmin: false, // Target user permissions
-      dte: targetUser.delegateTokenEpoch ?? 0,
-      sv: targetUser.sessionVersion ?? 0,
-      delegateAccess: {
-        adminUserId: adminReq.user.userId,
-        adminEmail: adminReq.user.email,
-        targetUserId: targetUser.userId,
-        targetEmail: targetUser.email
-      }
-    };
-
-    const delegateToken = jwt.sign(
-      delegatePayload,
-      getJwtSecret(),
-      { expiresIn: DELEGATE_TOKEN_TTL }
+    //
+    // ENG-1596: minting extracted to delegateAccessToken.ts so the MCP tool layer
+    // (apiTools.ts) can mint the same shape of token internally, per tool call.
+    const delegateToken = mintDelegateToken(
+      { userId: adminReq.user.userId, email: adminReq.user.email },
+      targetUser,
+      DELEGATE_TOKEN_TTL,
     );
 
     // Return the delegate token and customer portal URL
