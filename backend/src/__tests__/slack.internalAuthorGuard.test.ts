@@ -134,6 +134,11 @@ describe('Slack internal-author guard (ENG-1263)', () => {
       userId: 'user-123',
       email: 'customer@example.com',
       slackChannels: ['C12345'],
+      // ENG-1613: the auto-trigger pipeline now defaults to disabled (tag-gated only) unless
+      // explicitly opted in. This file tests the internal-vs-external author guard, which is
+      // orthogonal to that default — pin the flag to the explicit opt-in state so these tests
+      // keep exercising the author guard rather than incidentally re-testing the new default.
+      slackSuggestedRepliesDisabled: false,
     });
     // Defaults: our own workspace resolves fine; a given author's team_id is unresolved unless a
     // test says otherwise, so pre-existing email-only test cases are unaffected by this signal.

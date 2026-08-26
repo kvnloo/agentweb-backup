@@ -2,6 +2,14 @@ import request from 'supertest';
 import express from 'express';
 import slackRouter from '../routes/slack';
 
+// ENG-1613 (2026-08-26): the default for `slackSuggestedRepliesDisabled` flipped. The pipeline
+// used to run by default (absent = enabled) and required an explicit opt-out; a customer (Phoenix
+// Tech) burned ~$197 of real LLM inference on untagged messages before anyone opted out. The new
+// default is DISABLED (tag-gated only via app_mention) — only an explicit `false` (opted in via
+// PUT /admin/users/:userId/slack-suggested-replies with { enabled: true }) runs the old flow. The
+// two "absent" cases below were updated to assert the new default; every other case (explicit
+// true/false) is unchanged. See slack.autoTriggerDefault.test.ts for the fuller regression suite.
+
 // --- Mocks -----------------------------------------------------------------
 
 jest.mock('../services/db', () => ({
@@ -127,7 +135,7 @@ describe('Slack suggested-reply gating (slackSuggestedRepliesDisabled)', () => {
     expect(mockSendSlackTriggeredSessionEmail).not.toHaveBeenCalled();
   });
 
-  it('triages and emails the suggested reply when the flag is absent (default enabled)', async () => {
+  it('does NOT triage or email when the flag is absent (ENG-1613: default is now disabled/tag-gated)', async () => {
     userDb.getUserById.mockResolvedValue({
       userId: 'user-123',
       email: 'customer@example.com',
@@ -138,11 +146,9 @@ describe('Slack suggested-reply gating (slackSuggestedRepliesDisabled)', () => {
     expect(res.status).toBe(200);
     await flushAsync();
 
-    expect(mockTriage).toHaveBeenCalledWith('Hey, can someone help with my campaign?');
-    expect(mockSendSlackTriggeredSessionEmail).toHaveBeenCalledWith(
-      'founders@agentweb.pro',
-      expect.objectContaining({ sessionId: 'session-123', userEmail: 'customer@example.com' })
-    );
+    expect(mockTriage).not.toHaveBeenCalled();
+    expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
+    expect(mockSendSlackTriggeredSessionEmail).not.toHaveBeenCalled();
   });
 
   it('triages and emails when the flag is explicitly false (enabled)', async () => {
@@ -201,7 +207,7 @@ describe('Slack suggested-reply gating (slackSuggestedRepliesDisabled)', () => {
       expect(mockSendSlackTriggeredSessionEmail).not.toHaveBeenCalled();
     });
 
-    it('generates a response and emails when enabled', async () => {
+    it('does NOT generate a response or email when the flag is absent (ENG-1613: default is now disabled/tag-gated)', async () => {
       userDb.getUserById.mockResolvedValue({
         userId: 'user-123',
         email: 'customer@example.com',
@@ -212,8 +218,8 @@ describe('Slack suggested-reply gating (slackSuggestedRepliesDisabled)', () => {
       expect(res.status).toBe(200);
       await flushAsync();
 
-      expect(generateSessionResponse).toHaveBeenCalled();
-      expect(mockSendSlackTriggeredSessionEmail).toHaveBeenCalled();
+      expect(generateSessionResponse).not.toHaveBeenCalled();
+      expect(mockSendSlackTriggeredSessionEmail).not.toHaveBeenCalled();
     });
   });
 });

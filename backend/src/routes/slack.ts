@@ -233,9 +233,10 @@ async function handleSlackTriggeredSession(params: {
       return;
     }
 
-    // Respect the per-user opt-out: when suggested replies are disabled, skip the whole flow
-    // (no triage, no session, no email) so we don't generate suggestions for this customer.
-    if (user.slackSuggestedRepliesDisabled) {
+    // ENG-1613: default is now DISABLED (tag-gated only) — absent/true skips the whole flow (no
+    // triage, no session, no email). Only an explicit `false` (opted in via
+    // PUT /admin/users/:userId/slack-suggested-replies with { enabled: true }) runs it.
+    if (user.slackSuggestedRepliesDisabled !== false) {
       console.log(`📨 [slack-triggered] suggested replies disabled for user ${user.userId}, skipping`);
       return;
     }
@@ -1014,9 +1015,10 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                   return;
                 }
 
-                // Respect the per-user opt-out before generating a response or sending email.
+                // ENG-1613: default is now DISABLED (tag-gated only) — see the matching check in
+                // handleSlackTriggeredSession above for the full rationale.
                 const user = await userDb.getUserById(userId);
-                if (user?.slackSuggestedRepliesDisabled) {
+                if (user?.slackSuggestedRepliesDisabled !== false) {
                   console.log(`📨 [slack-triggered] suggested replies disabled for user ${userId}, skipping thread reply`);
                   return;
                 }

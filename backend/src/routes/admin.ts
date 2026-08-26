@@ -1367,8 +1367,11 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
 });
 
 // Toggle Slack suggested-reply (slack-triggered) monitoring for a user.
-// Body: { enabled: boolean } — true = suggestions on (default), false = suppress.
-// Persisted as the inverse `slackSuggestedRepliesDisabled` flag so absent = enabled.
+// Body: { enabled: boolean } — true = opt IN to auto-listen on untagged messages, false = stay on
+// the default (tag-gated only, Emma must be @-mentioned).
+// Persisted as the inverse `slackSuggestedRepliesDisabled` flag: enabled:true -> disabled:false
+// (opted in); enabled:false -> disabled:true (default). ENG-1613: absent/true is now the default
+// (disabled) — only an explicit disabled:false opts a customer into auto-listen.
 router.put("/users/:userId/slack-suggested-replies", async (req, res) => {
   try {
     const { userId } = req.params;
