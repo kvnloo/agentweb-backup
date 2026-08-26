@@ -5414,15 +5414,22 @@ export async function runScheduledChat(
 
     // An account-wide cooldown/pacing refusal is not a successful send. The
     // verifier historically counted every non-publish call by name, so correct
-    // the persisted requirement evidence for the one send action we can prove
-    // did not happen. This avoids the false-success state without widening
-    // outcome requirements for reads and other non-send tools.
+    // the persisted requirement evidence only when no successful non-invite
+    // LinkedIn action has already satisfied the schedule's generic tool-name
+    // requirement. Schedules currently contract by tool name, not action: a
+    // successful read must remain valid evidence for `linkedin_outreach`.
+    const genericLinkedInRequirementAlreadyMet = [...resumePriorToolCalls, ...result.toolCalls].some(
+      (call: any) => call?.name === 'linkedin_outreach'
+        && linkedInOutreachAction(call) !== 'send-invite'
+        && toolCallSucceeded(call),
+    );
     const linkedInInviteSendRequirementMissed = Boolean(
       linkedInInviteSendBlock
       && heldToFunctionNames.includes('linkedin_outreach')
+      && !genericLinkedInRequirementAlreadyMet
       && linkedInInviteSendBlock.successfulInviteSends < (functionCallMinCalls.linkedin_outreach || 1),
     );
-    if (linkedInInviteSendBlock && heldToFunctionNames.includes('linkedin_outreach')) {
+    if (linkedInInviteSendRequirementMissed) {
       finalFunctionCallDetails.linkedin_outreach = {
         actual: linkedInInviteSendBlock.successfulInviteSends,
         required: functionCallMinCalls.linkedin_outreach || 1,

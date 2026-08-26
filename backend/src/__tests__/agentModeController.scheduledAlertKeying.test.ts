@@ -337,6 +337,35 @@ describe('runScheduledChat — oncall-alert keying (ENG-145/146 class)', () => {
     expect(result).toEqual(expect.objectContaining({ status: 'success', passed: true }));
   }, 30000);
 
+  it('keeps a generic LinkedIn requirement satisfied by a successful non-invite action', async () => {
+    mockWorker.runInWorker.mockResolvedValue({
+      ...okResponse,
+      toolCalls: [
+        { name: 'linkedin_outreach', arguments: { action: 'search-people' }, result: { success: true } },
+        {
+          name: 'linkedin_outreach',
+          arguments: { action: 'send-invite' },
+          result: { success: false, error: 'Cannot resend yet — account invitation limit reached.' },
+        },
+      ],
+    } as any);
+
+    const result = await runScheduledChat(
+      { ...baseSchedule, requiredFunctionCalls: ['linkedin_outreach'] },
+      mockUserId,
+      true,
+      'run-linkedin-read-plus-blocked-invite',
+    );
+
+    expect(result).toEqual(expect.objectContaining({
+      status: 'success',
+      passed: true,
+      functionCallMatches: ['linkedin_outreach'],
+      functionCallMisses: [],
+      functionCallDetails: { linkedin_outreach: { actual: 2, required: 1 } },
+    }));
+  }, 30000);
+
   it('validation-fail site keys the oncall alert per (user, schedule, errorClass) with a 1h window; the incident filing carries no dedupeKey', async () => {
     const schedule = { ...baseSchedule, keywords: ['nevermatches'] };
     mockWorker.runInWorker.mockResolvedValue({ ...okResponse, content: 'nope' } as any);
