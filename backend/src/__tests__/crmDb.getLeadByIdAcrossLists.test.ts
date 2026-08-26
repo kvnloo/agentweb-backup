@@ -104,4 +104,53 @@ describe('crmDb.getLeadByIdAcrossLists', () => {
     await expect(crmDb.getLeadByIdAcrossLists(listIds, LEAD_ID)).rejects.toThrow();
     expect(batchGetSpy).toHaveBeenCalledTimes(1);
   });
+
+  it('retries UnprocessedKeys and finds the match on the retry (CodeRabbit, PR #2611)', async () => {
+    // A partial BatchGetItem response can defer the exact key holding the match
+    // into UnprocessedKeys — ignoring it would report an existing lead as missing.
+    batchGetPromiseMock
+      .mockResolvedValueOnce({
+        Responses: { ['AW-Leads']: [] },
+        UnprocessedKeys: { ['AW-Leads']: { Keys: [{ listId: 'list-b', leadId: LEAD_ID }] } },
+      })
+      .mockResolvedValueOnce({
+        Responses: { ['AW-Leads']: [{ listId: 'list-b', leadId: LEAD_ID, email: 'a@x.com' }] },
+      });
+
+    const result = await crmDb.getLeadByIdAcrossLists(['list-a', 'list-b'], LEAD_ID);
+
+    expect(batchGetSpy).toHaveBeenCalledTimes(2);
+    // The retry re-requests only the unprocessed key, not the whole original batch.
+    expect(batchGetSpy.mock.calls[1][0].RequestItems['AW-Leads'].Keys).toEqual([
+      { listId: 'list-b', leadId: LEAD_ID },
+    ]);
+    expect(result).toEqual({ listId: 'list-b', leadId: LEAD_ID, email: 'a@x.com' });
+  });
+
+  it('gives up on a batch after repeated UnprocessedKeys and moves to the next batch', async () => {
+    const listIds = Array.from({ length: 30 }, (_, i) => `list-${i + 1}`);
+    // First batch (list-1..list-25): every attempt comes back fully unprocessed.
+    // Second batch (list-26..list-30): a clean miss.
+    // Note: batchGetSpy(params) IS given params; the `.promise` it returns is
+    // called with zero arguments (matches the real AWS SDK), so params must be
+    // read here, not inside the `.promise` implementation.
+    batchGetSpy.mockImplementation((params: any) => {
+      const keys = params.RequestItems['AW-Leads'].Keys;
+      const stillUnprocessed = keys.some((k: any) => k.listId.startsWith('list-') && Number(k.listId.slice(5)) <= 25);
+      return {
+        promise: () =>
+          Promise.resolve(
+            stillUnprocessed
+              ? { Responses: { ['AW-Leads']: [] }, UnprocessedKeys: { ['AW-Leads']: { Keys: keys } } }
+              : { Responses: { ['AW-Leads']: [] } }
+          ),
+      };
+    });
+
+    const result = await crmDb.getLeadByIdAcrossLists(listIds, LEAD_ID);
+
+    expect(result).toBeNull();
+    // First batch: 1 initial + 3 retries (MAX_UNPROCESSED_RETRIES) = 4 calls, then the second batch: 1 call.
+    expect(batchGetSpy).toHaveBeenCalledTimes(5);
+  });
 });

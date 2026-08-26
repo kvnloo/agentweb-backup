@@ -6413,25 +6413,45 @@ export const crmDb = {
     if (candidateListIds.length === 0) return null;
     const MAX_CANDIDATE_LISTS = 200;
     const BATCH_SIZE = 25;
+    // BatchGetItem can partially succeed and return the requested key in
+    // UnprocessedKeys (capacity limits, internal retries) — AWS's own docs
+    // require retrying those, with backoff, or a genuinely-existing lead can
+    // read as "not found" here. Bounded so contention degrades gracefully
+    // instead of retrying forever.
+    const MAX_UNPROCESSED_RETRIES = 3;
     const tableName = `${TABLE_PREFIX}AW-Leads`;
     const listIds = candidateListIds.slice(0, MAX_CANDIDATE_LISTS);
 
     for (let i = 0; i < listIds.length; i += BATCH_SIZE) {
-      const batch = listIds.slice(i, i + BATCH_SIZE);
-      const params = {
-        RequestItems: {
-          [tableName]: {
-            Keys: batch.map(listId => ({ listId, leadId })),
+      let keys: Array<{ listId: string; leadId: string }> = listIds
+        .slice(i, i + BATCH_SIZE)
+        .map(listId => ({ listId, leadId }));
+      let unprocessedAttempt = 0;
+
+      while (keys.length > 0) {
+        const params = {
+          RequestItems: {
+            [tableName]: { Keys: keys },
           },
-        },
-      };
-      try {
-        const result = await dynamodb.batchGet(params).promise();
-        const items = (result.Responses?.[tableName] as any[]) || [];
-        if (items.length > 0) return items[0];
-      } catch (error) {
-        handleDynamoDbError(error, "getLeadByIdAcrossLists");
-        throw error;
+        };
+        try {
+          const result = await dynamodb.batchGet(params).promise();
+          const items = (result.Responses?.[tableName] as any[]) || [];
+          if (items.length > 0) return items[0];
+
+          const unprocessed = result.UnprocessedKeys?.[tableName]?.Keys as
+            | Array<{ listId: string; leadId: string }>
+            | undefined;
+          if (!unprocessed || unprocessed.length === 0) break; // batch genuinely done, no match
+
+          unprocessedAttempt += 1;
+          if (unprocessedAttempt > MAX_UNPROCESSED_RETRIES) break; // give up on this batch's remainder
+          await new Promise(resolve => setTimeout(resolve, 50 * 2 ** (unprocessedAttempt - 1)));
+          keys = unprocessed;
+        } catch (error) {
+          handleDynamoDbError(error, "getLeadByIdAcrossLists");
+          throw error;
+        }
       }
     }
     return null;

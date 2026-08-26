@@ -51,6 +51,7 @@ import {
 } from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
+import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
@@ -11732,54 +11733,14 @@ export class AgentModeService {
       let lead = await crmDb.getLeadById(listId, leadId);
       let correctedListId: string | null = null;
       if (!lead) {
-        // ENG-969 follow-up: the requested list_id may just be stale/wrong rather
-        // than the lead not existing at all — see getLeadByIdAcrossLists. Only search
-        // lists this user already has access to, so this can't leak a lead the caller
-        // couldn't otherwise see.
-        //
-        // Tiered on purpose: try the caller's OWN lists first — one cheap query,
-        // no fan-out — since the production case this fixes (session
-        // 6082779b-f9f1-4e38-a8eb-34abbc3da419) was always a same-user list mixup.
-        // Only fall back to the full org-wide getLeadListsForUser (which queries
-        // once per org member) when the lead isn't among the caller's own lists.
-        const attemptRecovery = async (): Promise<any> => {
-          const ownLists = await crmDb.getLeadListsByUserId(userId);
-          const ownListIds = ownLists
-            .map((ownList: any) => ownList.listId)
-            .filter((ownListId: string) => ownListId && ownListId !== requestedListId);
-          const foundInOwnLists = await crmDb.getLeadByIdAcrossLists(ownListIds, leadId);
-          if (foundInOwnLists) return foundInOwnLists;
-          const accessibleLists = await crmDb.getLeadListsForUser(userId);
-          const otherListIds = accessibleLists
-            .map((otherList: any) => otherList.listId)
-            .filter((otherListId: string) => otherListId && otherListId !== requestedListId && !ownListIds.includes(otherListId));
-          return crmDb.getLeadByIdAcrossLists(otherListIds, leadId);
-        };
-        // AW-LeadLists runs on fixed provisioned capacity in production, so this
-        // best-effort recovery must never make a caller worse off than before it
-        // existed. The AWS SDK already retries an individual throttled DynamoDB
-        // call a few times internally — a throw here means that already failed,
-        // so blindly retrying again immediately would just pile more load onto
-        // an already-contended table. Instead: wait past a likely short burst,
-        // retry the WHOLE recovery exactly once, and if that also fails, swallow
-        // and fall through to the plain not-found below, unchanged from pre-fix
-        // behavior — never a new or amplified failure mode.
-        try {
-          let found;
-          try {
-            found = await attemptRecovery();
-          } catch {
-            await new Promise((resolve) => setTimeout(resolve, 300));
-            found = await attemptRecovery();
-          }
-          if (found) {
-            lead = found;
-            listId = found.listId;
-            correctedListId = found.listId;
-          }
-        } catch {
-          // Recovery failed twice — fall through to the ordinary not-found
-          // response below, exactly like before this fix existed.
+        // ENG-969 follow-up: the requested list_id may just be stale/wrong
+        // rather than the lead not existing at all. See leadRecovery.ts for
+        // the full rationale (tiering, retry, and why it always fails safe).
+        const found = await recoverLeadFromWrongList(crmDb, userId, requestedListId, leadId);
+        if (found) {
+          lead = found;
+          listId = found.listId;
+          correctedListId = found.listId;
         }
       }
       if (!lead) {

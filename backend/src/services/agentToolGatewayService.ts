@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { toolResultError } from '../utils/toolResultError';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { isFastTripErrorClass } from './agentMode/core/errorRetryability';
@@ -312,7 +313,12 @@ function leadDetailsFailureScope(args: unknown): string {
   const record = args as Record<string, unknown>;
   const listId = typeof record.list_id === 'string' ? record.list_id.trim() : '';
   const leadId = typeof record.lead_id === 'string' ? record.lead_id.trim() : '';
-  return `${listId}|${leadId}`.slice(0, ERROR_KEY_LENGTH);
+  // Hash rather than slice to ERROR_KEY_LENGTH: two DIFFERENT (list_id, lead_id)
+  // pairs must never collapse into the same breaker bucket just because they
+  // share a long common prefix — a truncated slice could otherwise merge
+  // unrelated targets and reintroduce the exact cross-lead blocking this scope
+  // exists to prevent.
+  return createHash('sha256').update(`${listId}|${leadId}`).digest('hex');
 }
 
 function failureScope(toolName: string, args: unknown): string {
