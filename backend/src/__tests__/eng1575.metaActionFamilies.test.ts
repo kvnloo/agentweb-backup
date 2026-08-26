@@ -86,6 +86,49 @@ describe('ENG-1575 surfaceOf', () => {
   });
 });
 
+describe('ENG-1575 the two heuristic branches — behaviour pinned and announced', () => {
+  // Neither shape occurs on any production account, so they are the least-evidenced paths in
+  // this file. Pinned here, and each warns at runtime so a first real occurrence is visible
+  // rather than silently producing a number nobody can account for.
+  let warn: jest.SpyInstance;
+  beforeEach(() => { warn = jest.spyOn(console, 'warn').mockImplementation(() => {}); });
+  afterEach(() => warn.mockRestore());
+
+  it('rollup above the named surfaces: total stays authoritative, split is announced', () => {
+    const t = leadTotals([
+      a('lead', 100),                                 // rollup says 100
+      a('offsite_conversion.fb_pixel_lead', 60),      // only 60 attributable
+    ]);
+    expect(t.total).toBe(100);                        // never drop the remainder
+    expect(t.website + t.instantForm).toBe(100);      // invariant holds
+    expect(t.website).toBe(100);                      // remainder to the dominant surface
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('rollup exceeds named surfaces'));
+  });
+
+  it('remainder goes to Instant Form when that surface dominates', () => {
+    const t = leadTotals([a('lead', 100), a('onsite_conversion.lead_form', 60), a('offsite_conversion.fb_pixel_lead', 10)]);
+    expect(t.total).toBe(100);
+    expect(t.instantForm).toBe(90);
+    expect(t.website).toBe(10);
+    expect(t.website + t.instantForm).toBe(t.total);
+  });
+
+  it('surfaces above the rollup: sum wins and is announced', () => {
+    const t = leadTotals([
+      a('offsite_conversion.fb_pixel_lead', 100),
+      a('onsite_conversion.lead_form', 50),
+    ]);
+    expect(t.total).toBe(150);                        // max alone would have undercounted
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('surfaces exceed rollup'));
+  });
+
+  it('stays silent on the ordinary shape every production account produces', () => {
+    const t = leadTotals([a('lead', 790), a('offsite_conversion.fb_pixel_lead', 790)]);
+    expect(t.total).toBe(790);
+    expect(warn).not.toHaveBeenCalled();              // no log spam on the common path
+  });
+});
+
 describe('ENG-1575 collapseActions — counts each family once, by its maximum', () => {
   it('does not sum aliases of the same conversion', () => {
     const totals = leadTotals([

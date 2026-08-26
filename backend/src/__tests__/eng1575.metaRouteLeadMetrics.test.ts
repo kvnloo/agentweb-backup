@@ -98,6 +98,15 @@ describe('ENG-1575 routes/meta applyLeadMetrics', () => {
     expect(fwd.costPerWebsiteLead).toBe(0);
   });
 
+  it('announces a cost conflict rather than changing the number silently', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const t = blank();
+    applyLeadMetrics(t, { actions: [act('lead', 5)], cost_per_action_type: [act('lead', 40)] });
+    applyLeadMetrics(t, { actions: [act('lead', 7)], cost_per_action_type: [act('lead', 90)] });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('conflicting costPerWebsiteLead'));
+    warn.mockRestore();
+  });
+
   it('locks a disputed cost across EVERY ordering of three disagreeing rows', () => {
     // CodeRabbit: writing 0 on conflict made the cleared value read as "unset" on the next row,
     // so 40/90/60 ended at 60 while 60/90/40 ended at 0 — the order dependence this removes.

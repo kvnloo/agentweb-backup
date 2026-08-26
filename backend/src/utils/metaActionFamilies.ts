@@ -186,7 +186,17 @@ export function collapseActions(actions: MetaAction[] | undefined | null): Map<C
       // The rollup counts more than the surfaces we could name. Never drop the difference:
       // keep the rollup authoritative and attribute the remainder to the dominant surface,
       // so `website + instantForm === total` still holds.
+      //
+      // ⚠ This split is a HEURISTIC — the total is right, the attribution is a guess. No
+      // production account produces this shape today, so it is untested against real data.
+      // Logged rather than left silent: if it ever fires we find out from a log line instead
+      // of from a number nobody can explain.
       const remainder = total - website - instantForm;
+      console.warn(
+        `[metaActionFamilies] rollup exceeds named surfaces for family=${family}: ` +
+        `total=${total} website=${website} instantForm=${instantForm} remainder=${remainder}. ` +
+        `Total is authoritative; the surface split is heuristic.`
+      );
       if (instantForm > website) instantForm += remainder;
       else website += remainder;
     } else if (website + instantForm > total) {
@@ -194,6 +204,14 @@ export function collapseActions(actions: MetaAction[] | undefined | null): Map<C
       // account running both Instant Forms and website conversions where Meta emits no bare
       // `lead`, so `max` only ever saw one surface. The two surfaces are genuinely distinct
       // conversions here, so the sum is the truth and the max was an undercount.
+      //
+      // Also unobserved in production (it needs an account running both surfaces with no bare
+      // rollup), so it is logged for the same reason as the branch above.
+      console.warn(
+        `[metaActionFamilies] surfaces exceed rollup for family=${family}: ` +
+        `rollupMax=${total} website=${website} instantForm=${instantForm}. ` +
+        `Treating the surfaces as distinct conversions.`
+      );
       total = website + instantForm;
     }
 
@@ -266,6 +284,13 @@ function applyCost(target: any, field: string, proposed: number | null): void {
   if (!current) {
     target[field] = proposed;
   } else if (current !== proposed) {
+    // Unobserved today: `action_breakdowns=action_type` returns one row per entity, so nothing
+    // can disagree. Reachable via `time_increment` / `breakdowns`. Logged so a first occurrence
+    // is visible rather than silently changing a reported cost.
+    console.warn(
+      `[metaActionFamilies] conflicting ${field} across insight rows (${current} vs ${proposed}); ` +
+      `clearing so the caller derives it from spend / leads.`
+    );
     target[field] = 0; // disagreement -> let the caller derive it from spend / leads
     const fields = disputedCosts.get(target) ?? new Set<string>();
     fields.add(field);
