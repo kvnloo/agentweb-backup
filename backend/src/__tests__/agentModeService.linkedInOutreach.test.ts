@@ -35,6 +35,8 @@ const mockSendMessage = jest.fn();
 const mockGetLinkedInProfile = jest.fn();
 const mockSendInMail = jest.fn();
 const mockSendInvitation = jest.fn();
+const mockAcceptInvitation = jest.fn();
+const mockGetProfile = jest.fn();
 const mockIsUnderInvitationCooldown = jest.fn((..._args: any[]) => false);
 const mockGetMessagesWithContact = jest.fn();
 const mockResolveProviderId = jest.fn();
@@ -53,6 +55,8 @@ jest.mock('../services/linkedInOutreachService', () => ({
     getLinkedInProfile: (...args: any[]) => mockGetLinkedInProfile(...args),
     sendInMail: (...args: any[]) => mockSendInMail(...args),
     sendInvitation: (...args: any[]) => mockSendInvitation(...args),
+    acceptInvitation: (...args: any[]) => mockAcceptInvitation(...args),
+    getProfile: (...args: any[]) => mockGetProfile(...args),
     // ENG-126 breaker check — must be present or send-invite throws before pacing.
     isUnderInvitationCooldown: (...args: any[]) => mockIsUnderInvitationCooldown(...args),
     getMessagesWithContact: (...args: any[]) => mockGetMessagesWithContact(...args),
@@ -108,6 +112,8 @@ const mockResolveListIdForAccount = jest.fn().mockResolvedValue(null);
 jest.mock('../services/linkedInInviteCrmMirror', () => ({
   mirrorLinkedInInviteToCrm: (...args: any[]) => mockMirrorLinkedInInviteToCrm(...args),
   resolveListIdForAccount: (...args: any[]) => mockResolveListIdForAccount(...args),
+  INVITE_SENT_EVENT: 'linkedin.invite.sent',
+  INVITE_ACCEPTED_EVENT: 'linkedin.invite.accepted',
 }));
 
 // Mock unipileSentInvitationsDb (ENG-182 pre-invite dedup cache). The pre-check
@@ -1570,6 +1576,101 @@ describe('AgentModeService - LinkedIn Outreach', () => {
           linkedinUrl: 'https://www.linkedin.com/in/jane-doe/',
           sentAt: '2026-07-01T00:00:00.000Z',
         }),
+      );
+    });
+  });
+
+  describe('accept-invitation CRM mirror (ENG-1595)', () => {
+    const acceptArgs = {
+      action: 'accept-invitation',
+      account_id: 'test-account-id',
+      invitation_id: 'inv-123',
+      shared_secret: 'secret-abc',
+      profile_url: 'https://www.linkedin.com/in/jane-doe/',
+      list_id: 'list_owned',
+      first_name: 'Jane',
+      last_name: 'Doe',
+    };
+
+    beforeEach(() => {
+      mockAcceptInvitation.mockResolvedValue({ object: 'InvitationAccepted' });
+    });
+
+    it('accepts the invitation and mirrors the now-accepted connection into CRM as linkedin.invite.accepted', async () => {
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
+
+      const result = await service.linkedinOutreach('user-1', acceptArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockAcceptInvitation).toHaveBeenCalledWith('inv-123', 'test-account-id', 'secret-abc');
+      expect(mockGetLeadListById).toHaveBeenCalledWith('list_owned');
+      expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'user-1',
+          listId: 'list_owned',
+          linkedinUrl: 'https://www.linkedin.com/in/jane-doe/',
+          firstName: 'Jane',
+          lastName: 'Doe',
+          invitationId: 'inv-123',
+          eventType: 'linkedin.invite.accepted',
+        }),
+      );
+    });
+
+    it('still accepts successfully when no list_id/identity is given — mirrors nothing rather than guessing', async () => {
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'accept-invitation',
+        account_id: 'test-account-id',
+        invitation_id: 'inv-1',
+        shared_secret: 'sec',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
+    });
+
+    it('falls back to the list bound to the sending account when list_id is omitted', async () => {
+      const { list_id, ...withoutListId } = acceptArgs as any;
+      mockResolveListIdForAccount.mockResolvedValue('list_bound');
+      mockGetLeadListById.mockResolvedValue({ id: 'list_bound', userId: 'user-1' });
+
+      await service.linkedinOutreach('user-1', withoutListId);
+
+      expect(mockResolveListIdForAccount).toHaveBeenCalledWith('user-1', 'test-account-id');
+      expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
+        expect.objectContaining({ listId: 'list_bound' }),
+      );
+    });
+
+    it('skips the mirror (no cross-tenant write) when the resolved list is foreign', async () => {
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'someone-else' });
+
+      const result = await service.linkedinOutreach('user-1', acceptArgs);
+
+      // The accept still succeeds (Unipile already confirmed it); only the CRM write is skipped.
+      expect(result.success).toBe(true);
+      expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
+    });
+
+    it('never fails the accept when the CRM mirror throws', async () => {
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
+      mockMirrorLinkedInInviteToCrm.mockRejectedValueOnce(new Error('dynamo down'));
+
+      const result = await service.linkedinOutreach('user-1', acceptArgs);
+
+      expect(result.success).toBe(true);
+    });
+
+    it('resolves identity via getProfile when only provider_id is given (no profile_url)', async () => {
+      const { profile_url, ...rest } = acceptArgs as any;
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
+      mockGetProfile.mockResolvedValue({ public_identifier: 'jane-doe' });
+
+      await service.linkedinOutreach('user-1', { ...rest, provider_id: 'prov-1' });
+
+      expect(mockGetProfile).toHaveBeenCalledWith('prov-1', 'test-account-id');
+      expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
+        expect.objectContaining({ linkedinUrl: 'https://www.linkedin.com/in/jane-doe/' }),
       );
     });
   });
