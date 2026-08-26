@@ -50,6 +50,33 @@ describe('resolveClientScopedContext', () => {
     expect(mockRecordAdminAudit).not.toHaveBeenCalled();
   });
 
+  it('passes through unchanged for a null client_id', async () => {
+    const result = await resolveClientScopedContext({ userId: 'admin-1' }, null, 'list_tasks');
+
+    expect(result.overrideToken).toBeUndefined();
+    expect(mockUserDb.getUserById).not.toHaveBeenCalled();
+  });
+
+  // CodeRabbit (PR #2651): a PRESENT but malformed client_id (caller passed a
+  // number/object/boolean by mistake) must not silently degrade to "unscoped" —
+  // that would run the call as the admin's own identity while looking, to the
+  // caller, like client_id was honored. Distinct from omitted (undefined/null),
+  // which legitimately means "no scoping requested."
+  it('rejects a non-string, non-null/undefined client_id instead of silently treating it as absent', async () => {
+    await expect(
+      resolveClientScopedContext({ userId: 'admin-1' }, 12345, 'list_tasks')
+    ).rejects.toThrow('client_id must be a string');
+
+    expect(mockUserDb.getUserById).not.toHaveBeenCalled();
+    expect(mockRecordAdminAudit).not.toHaveBeenCalled();
+  });
+
+  it('rejects an object client_id the same way', async () => {
+    await expect(
+      resolveClientScopedContext({ userId: 'admin-1' }, { evil: true }, 'list_tasks')
+    ).rejects.toThrow('client_id must be a string');
+  });
+
   it('passes through unchanged for an empty-string client_id', async () => {
     const context = { userId: 'admin-1' };
     const result = await resolveClientScopedContext(context, '   ', 'list_tasks');
