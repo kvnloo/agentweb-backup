@@ -248,6 +248,30 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(elapsedMs).toBeLessThanOrEqual(CAP_MS);
   });
 
+  it('falls back to the time-limit message, not the ledger recap, when the forced synthesis returns residue (ENG-1576)', async () => {
+    // Same failure family as the empty-content case above, but reached via the
+    // residue guard (ENG-1054) instead: the forced-final-synthesis turn comes back
+    // with structural JSON debris ("}]") rather than nothing. isUnusableSynthesis
+    // flags it and synthesisResidueDropped becomes true — before this fix, that
+    // branch set `content` to the generic executed-action ledger unconditionally,
+    // pre-empting the dedicated time-limit message exactly like the plain-empty
+    // case above, just reached via a different trigger (CodeRabbit finding, PR #2639).
+    const { result, elapsedMs, finalSynthesisPerCall } = await runRealLoop((call, isFinalSynthesis) =>
+      isFinalSynthesis
+        ? { content: '}]' }
+        : {
+            content: '',
+            tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
+          },
+    );
+
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/time limit/i);
+    expect(result.content).not.toMatch(/built directly from the actions I actually ran/);
+    expect(finalSynthesisPerCall.filter(Boolean)).toHaveLength(1);
+    expect(elapsedMs).toBeLessThanOrEqual(CAP_MS);
+  });
+
   it('delivers a token-truncated synthesis as-is instead of spending the reserve on a continuation', async () => {
     // Same hazard from the other continuation ladder: a synthesis that stops on
     // max_tokens normally gets a "keep going" round trip. Inside the reserve there is no
