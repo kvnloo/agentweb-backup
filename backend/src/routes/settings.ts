@@ -952,6 +952,7 @@ router.post('/google-drive/folders', authenticateToken, async (req, res) => {
       const fileResponse = await drive.files.get({
         fileId: trimmedFolderId,
         fields: 'id, name, mimeType',
+        supportsAllDrives: true,
       });
 
       if (fileResponse.data.mimeType !== 'application/vnd.google-apps.folder') {
@@ -1104,6 +1105,8 @@ router.get('/google-drive/folders/:folderId/files', authenticateToken, async (re
       fields: 'files(id, name, mimeType, size, modifiedTime)',
       orderBy: 'name',
       pageSize: 100,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
     });
 
     const files = (response.data.files || []).map((f) => ({

@@ -7,11 +7,16 @@
  */
 
 import {
+  DEFAULT_DAILY_INVITE_CAP,
   PACED_WRITE_ACTIONS,
   __resetWritePacerForTests,
+  dailyInviteAbsoluteMax,
+  dailyMessageCap,
   maxQueueWaitMs,
   minGapMs,
+  reserveDailyVolumeSlot,
   reserveWriteSlot,
+  resolveDailyInviteCap,
 } from '../services/linkedInWritePacer';
 
 const ACCOUNT = 'tMgX8uZJTZWTG_mFY1aI2A';
@@ -42,12 +47,18 @@ beforeEach(() => {
   process.env.LINKEDIN_WRITE_MIN_GAP_MS = '5000';
   process.env.LINKEDIN_WRITE_MAX_PER_HOUR = '30';
   process.env.LINKEDIN_WRITE_MAX_QUEUE_WAIT_MS = '60000';
+  // Daily caps are off (0) by default under Jest, same as the two above — opt back
+  // in here to the real production values so this suite exercises the mechanism.
+  process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX = '30';
+  process.env.LINKEDIN_DAILY_MESSAGE_CAP = '20';
 });
 
 afterEach(() => {
   delete process.env.LINKEDIN_WRITE_MIN_GAP_MS;
   delete process.env.LINKEDIN_WRITE_MAX_PER_HOUR;
   delete process.env.LINKEDIN_WRITE_MAX_QUEUE_WAIT_MS;
+  delete process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX;
+  delete process.env.LINKEDIN_DAILY_MESSAGE_CAP;
 });
 
 describe('which actions are paced', () => {
@@ -261,6 +272,194 @@ describe('resilience', () => {
     process.env.LINKEDIN_WRITE_MIN_GAP_MS = '2500';
     expect(minGapMs()).toBe(2500);
 
+  });
+});
+
+describe('daily volume caps — self-reported, not detected (ENG-1197 follow-up)', () => {
+  // Env vars (LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX=30, LINKEDIN_DAILY_MESSAGE_CAP=20)
+  // are set in the file-level beforeEach above and cleaned up in the file-level
+  // afterEach — no additional setup needed here.
+
+  describe('resolveDailyInviteCap — the configured-cap resolution, no detection involved', () => {
+    it('defaults to 10 when nothing has ever been configured', () => {
+      expect(resolveDailyInviteCap(undefined)).toBe(DEFAULT_DAILY_INVITE_CAP);
+      expect(resolveDailyInviteCap(null)).toBe(DEFAULT_DAILY_INVITE_CAP);
+      expect(DEFAULT_DAILY_INVITE_CAP).toBe(10);
+    });
+
+    it('honors whatever the account self-reported, up to the absolute max', () => {
+      expect(resolveDailyInviteCap(30)).toBe(30);
+      expect(resolveDailyInviteCap(15)).toBe(15);
+    });
+
+    it('clamps a configured value above the absolute max — the ceiling always wins', () => {
+      expect(resolveDailyInviteCap(9999)).toBe(30);
+    });
+
+    it('treats a user-configured 0 as a real "send nothing", not "unlimited"', () => {
+      // This is the exact collision the first draft of this cap got wrong: the
+      // operator env-var convention elsewhere in this file treats 0 as "disabled
+      // entirely." A user typing 0 into their own daily cap means the opposite —
+      // stop sending — and must not be silently reinterpreted as no limit.
+      expect(resolveDailyInviteCap(0)).toBe(0);
+    });
+
+    it('is disabled system-wide only via the operator env var, never via the per-account value', () => {
+      process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX = '0';
+      expect(resolveDailyInviteCap(5)).toBe(Infinity);
+      expect(resolveDailyInviteCap(undefined)).toBe(Infinity);
+    });
+
+    it('ignores garbage input and falls back to the safe default', () => {
+      expect(resolveDailyInviteCap(-5)).toBe(DEFAULT_DAILY_INVITE_CAP);
+      expect(resolveDailyInviteCap(NaN)).toBe(DEFAULT_DAILY_INVITE_CAP);
+    });
+  });
+
+  it('defaults the message cap to 20/day — flat, not self-reported', () => {
+    expect(dailyMessageCap()).toBe(20);
+  });
+
+  it('is env-tunable, same convention as every other threshold in this file', () => {
+    process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX = '50';
+    process.env.LINKEDIN_DAILY_MESSAGE_CAP = '15';
+    expect(resolveDailyInviteCap(50)).toBe(50);
+    expect(dailyMessageCap()).toBe(15);
+  });
+
+  /**
+   * State is caller-owned now (persisted by agentModeService.ts, not module
+   * memory — the CodeRabbit durability fix), so tests thread it through
+   * explicitly the same way the real caller does: each call's `nextState`
+   * becomes the next call's `persistedState`. This helper does that threading
+   * for a run of N identical calls and returns the FINAL slot.
+   */
+  function sendN(times: number, action: string, cap: number | undefined, clock: ReturnType<typeof makeClock>) {
+    let state: import('../services/linkedInWritePacer').DailyVolumeState | undefined;
+    let last: ReturnType<typeof reserveDailyVolumeSlot> = { allowed: true, nextState: {} };
+    for (let i = 0; i < times; i++) {
+      last = reserveDailyVolumeSlot(action, cap, state, clock);
+      if (last.allowed) state = last.nextState;
+    }
+    return { last, state };
+  }
+
+  it('allows an account with no configured cap up to 10 invites/day, then refuses the 11th', () => {
+    const clock = makeClock();
+    const { last: tenth, state } = sendN(10, 'send-invite', undefined, clock);
+    expect(tenth.allowed).toBe(true);
+
+    const slot = reserveDailyVolumeSlot('send-invite', undefined, state, clock);
+
+    expect(slot.allowed).toBe(false);
+    if (!slot.allowed) {
+      expect(slot.reason).toContain('10 LinkedIn connection requests');
+      expect(slot.reason).toContain('ceiling of 10');
+      expect(slot.reason).toContain('configured daily cap');
+      expect(slot.retryAfterMs).toBeGreaterThan(0);
+    }
+  });
+
+  it('allows an account configured for 30/day to send past where the unconfigured default would refuse', () => {
+    const clock = makeClock();
+    const { last: thirtieth, state } = sendN(30, 'send-invite', 30, clock);
+    expect(thirtieth.allowed).toBe(true);
+
+    const slot = reserveDailyVolumeSlot('send-invite', 30, state, clock);
+
+    expect(slot.allowed).toBe(false);
+    if (!slot.allowed) expect(slot.reason).toContain('the system-wide maximum');
+  });
+
+  it('blocks every invite for an account that configured a cap of 0', () => {
+    const clock = makeClock();
+
+    const slot = reserveDailyVolumeSlot('send-invite', 0, undefined, clock);
+
+    expect(slot.allowed).toBe(false);
+  });
+
+  it('shares one 20/day budget across send-message and send-inmail, independent of the invite cap', () => {
+    const clock = makeClock();
+    let state: import('../services/linkedInWritePacer').DailyVolumeState | undefined;
+    for (let i = 0; i < 10; i++) {
+      const slot = reserveDailyVolumeSlot('send-message', 30, state, clock);
+      expect(slot.allowed).toBe(true);
+      if (slot.allowed) state = slot.nextState;
+    }
+    for (let i = 0; i < 10; i++) {
+      const slot = reserveDailyVolumeSlot('send-inmail', 30, state, clock);
+      expect(slot.allowed).toBe(true);
+      if (slot.allowed) state = slot.nextState;
+    }
+
+    const slot = reserveDailyVolumeSlot('send-message', 30, state, clock);
+
+    expect(slot.allowed).toBe(false);
+    if (!slot.allowed) expect(slot.reason).toContain('LinkedIn message');
+  });
+
+  it('tracks invites and messages independently — hitting one cap does not block the other', () => {
+    const clock = makeClock();
+    const { last: tenth, state } = sendN(10, 'send-invite', undefined, clock);
+    expect(tenth.allowed).toBe(true);
+    expect(reserveDailyVolumeSlot('send-invite', undefined, state, clock).allowed).toBe(false);
+
+    expect(reserveDailyVolumeSlot('send-message', undefined, state, clock).allowed).toBe(true);
+  });
+
+  it('never lets one account\'s state leak into another\'s — the caller keys state per account, this module doesn\'t', () => {
+    // There's no shared module state to leak from anymore (that's the whole
+    // fix), so this just pins that undefined/fresh state for a different
+    // account is unaffected by another account's exhausted state object.
+    const clock = makeClock();
+    const { state: exhaustedAccountState } = sendN(10, 'send-invite', undefined, clock);
+    expect(reserveDailyVolumeSlot('send-invite', undefined, exhaustedAccountState, clock).allowed).toBe(false);
+
+    expect(reserveDailyVolumeSlot('send-invite', undefined, undefined, clock).allowed).toBe(true);
+  });
+
+  it('recovers once the window (anchored at the first send) passes', () => {
+    const clock = makeClock();
+    const { last: tenth, state } = sendN(10, 'send-invite', undefined, clock);
+    expect(tenth.allowed).toBe(true);
+    expect(reserveDailyVolumeSlot('send-invite', undefined, state, clock).allowed).toBe(false);
+
+    clock.advance(24 * 60 * 60 * 1000 + 1);
+
+    expect(reserveDailyVolumeSlot('send-invite', undefined, state, clock).allowed).toBe(true);
+  });
+
+  it('exempts cancel-invitation and accept-invitation — account maintenance, not send volume', () => {
+    const clock = makeClock();
+    for (let i = 0; i < 100; i++) {
+      expect(reserveDailyVolumeSlot('cancel-invitation', undefined, undefined, clock).allowed).toBe(true);
+      expect(reserveDailyVolumeSlot('accept-invitation', undefined, undefined, clock).allowed).toBe(true);
+    }
+  });
+
+  it('the operator escape hatch (absolute max = 0) disables the check entirely, for any configured value', () => {
+    process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX = '0';
+    const clock = makeClock();
+
+    const { last } = sendN(50, 'send-invite', undefined, clock);
+    expect(last.allowed).toBe(true);
+  });
+
+  it('surviving a restart is the whole point: fresh state in, correct decision out — no memory required', () => {
+    // The regression this exists to prevent: a process restart used to wipe
+    // module-level state, silently resetting an exhausted account back to 0.
+    // Simulate a "restart" between calls by literally not sharing any module
+    // state — pass the exact persisted object back in, as agentModeService.ts
+    // would after reading it fresh from the account's config post-restart.
+    const clock = makeClock();
+    const { last: tenth, state: persistedAfterTen } = sendN(10, 'send-invite', undefined, clock);
+    expect(tenth.allowed).toBe(true);
+
+    // "Restart": a brand-new call site, only the persisted state carried over.
+    const postRestartSlot = reserveDailyVolumeSlot('send-invite', undefined, persistedAfterTen, clock);
+
+    expect(postRestartSlot.allowed).toBe(false);
   });
 });
 
