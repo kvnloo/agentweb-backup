@@ -5571,7 +5571,8 @@ router.post('/email-domains', async (req: Request, res: Response) => {
           // Re-check the cap against the fresh count, not just the value read at the top of the
           // request — two requests can each start under the cap, race the write, and both retry
           // against a fresh array that's now one bigger, pushing the account over the limit.
-          if (freshDomains.length >= MAX_EMAIL_DOMAINS_PER_ACCOUNT) {
+          // Effective (not just stored) count, so a legacy scalar-field domain is still counted.
+          if (getEffectiveDomains(freshUser).length >= MAX_EMAIL_DOMAINS_PER_ACCOUNT) {
             await releaseEmailDomainClaim(normalizedDomain, userId).catch((e) =>
               console.error(`Failed to release email domain claim for "${normalizedDomain}" after hitting the cap on retry:`, e));
             return res.status(400).json({

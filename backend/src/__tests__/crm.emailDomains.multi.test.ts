@@ -250,6 +250,35 @@ describe('CRM multi-domain endpoints (ENG-265)', () => {
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
     });
 
+    it('counts the legacy scalar domain too when re-checking the cap on a retry (CodeRabbit)', async () => {
+      // 18 stored + 1 legacy scalar domain = 19 effective, under the cap — but a concurrent
+      // request pushes the stored array to 19 real entries (still 20 effective with the
+      // legacy one) before the retry's fresh read. Appending a 21st effective domain on top
+      // must be rejected — a check against the fresh STORED count alone (19) would wrongly
+      // allow it.
+      const eighteen = Array.from({ length: 18 }, (_, i) => ({
+        id: `d${i}`, domain: `d${i}.com`, status: 'verified', addedAt: '2026-01-01T00:00:00.000Z',
+      }));
+      const nineteenStored = [...eighteen, { id: 'd18', domain: 'd18.com', status: 'verified', addedAt: '2026-01-01T00:00:01.000Z' }];
+      mockRequest.body = { domain: 'onemore.com' };
+      (userDb.getUserById as jest.Mock)
+        .mockResolvedValueOnce({ userId: 'test-user-id', emailDomains: eighteen, emailDomain: 'legacy.com', resendDomainId: 'legacy-id' })
+        .mockResolvedValueOnce({ userId: 'test-user-id', emailDomains: nineteenStored, emailDomain: 'legacy.com', resendDomainId: 'legacy-id' });
+      (userDb.getUsersByEmailDomain as jest.Mock).mockResolvedValue([]);
+      (resendService.listDomains as jest.Mock).mockResolvedValue([]);
+      (resendService.createDomain as jest.Mock).mockResolvedValue({
+        id: 'd-new', name: 'onemore.com', status: 'not_started', records: [],
+      });
+      (userDb.updateUser as jest.Mock).mockRejectedValueOnce({ code: 'ConditionalCheckFailedException' });
+
+      const handle = getHandler('/email-domains', 'post');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'EMAIL_DOMAIN_CAP_EXCEEDED' }));
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    });
+
     it('counts a legacy scalar-only domain toward the cap/duplicate check without breaking the CAS write (CodeRabbit)', async () => {
       // A user who registered before ENG-265 has emailDomain/resendDomainId set but no
       // emailDomains[] array at all — the new domain being added is still distinct, so this
