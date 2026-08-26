@@ -65,7 +65,7 @@ jest.mock('../config/aws', () => ({ dynamodb: { query: jest.fn().mockReturnValue
 jest.mock('../utils/leadContactStatus', () => ({ isDoNotContact: jest.fn().mockReturnValue(false) }));
 
 jest.mock('../services/senderUsageTrackerFactory', () => ({
-  senderUsageTracker: { getUsage: jest.fn(), checkQuota: jest.fn(), recordSend: jest.fn() },
+  senderUsageTracker: { getUsage: jest.fn(), reserveSend: jest.fn(), releaseSend: jest.fn() },
 }));
 
 function getHandler(path: string, method: string) {

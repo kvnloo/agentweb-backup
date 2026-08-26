@@ -70,65 +70,71 @@ export async function sendAsSender(
   sender: CrmSender,
   params: SendAsSenderParams,
 ): Promise<SendAsSenderResult> {
-  // ENG-265: daily-cap/warmup check. `limit === null` means the sender has no
-  // cap configured — unchanged legacy behavior, no tracker read at all. Quota
-  // is only consumed by a send that actually succeeds (recorded after each
-  // branch below), so a failed provider call doesn't burn the day's budget.
+  // ENG-265: daily-cap/warmup check. `limit === null` means the sender has no cap
+  // configured — unchanged legacy behavior, no tracker call at all. reserveSend()
+  // atomically checks the limit AND consumes the slot in one operation (not a
+  // separate check-then-record pair, which would let concurrent sends all pass the
+  // check before any of them records); releaseSend() below undoes the reservation
+  // if the provider call then definitively fails, so quota is still only consumed
+  // by a send that actually went out.
   const limit = effectiveDailyLimit(sender);
   if (limit !== null) {
-    await senderUsageTracker.checkQuota(userId, sender.id, limit);
+    await senderUsageTracker.reserveSend(userId, sender.id, limit);
   }
 
-  if (sender.senderProvider === 'resend') {
-    // resendService has never supported bcc (checked as of this branch: neither the
-    // service nor any pre-existing caller ever wired it up) — fail loud instead of
-    // silently dropping recipients a caller believed were bcc'd.
-    if (params.bcc) {
-      throw new SenderSendError(sender, 'This Resend sender does not support bcc.');
+  try {
+    if (sender.senderProvider === 'resend') {
+      // resendService has never supported bcc (checked as of this branch: neither the
+      // service nor any pre-existing caller ever wired it up) — fail loud instead of
+      // silently dropping recipients a caller believed were bcc'd.
+      if (params.bcc) {
+        throw new SenderSendError(sender, 'This Resend sender does not support bcc.');
+      }
+      const from = sender.fromName ? `${sender.fromName} <${sender.email}>` : sender.email;
+      const result = await resendService.sendEmail({
+        from,
+        to: params.to,
+        subject: params.subject,
+        html: params.html,
+        text: params.text,
+        cc: params.cc,
+        inReplyTo: params.replyToMessageId,
+      });
+      if (!result || !result.id) {
+        throw new SenderSendError(sender, 'Resend did not return a message id — the send may have failed.');
+      }
+      return { provider: 'resend', messageId: result.id };
     }
-    const from = sender.fromName ? `${sender.fromName} <${sender.email}>` : sender.email;
-    const result = await resendService.sendEmail({
-      from,
+
+    const platform = PROVIDER_TO_PLATFORM[sender.senderProvider];
+    if (!platform) {
+      throw new SenderSendError(sender, `Unsupported sender provider: ${sender.senderProvider}`);
+    }
+    if (!sender.connectedAccountId) {
+      throw new SenderSendError(sender, `${sender.senderProvider} sender is missing its connected account id.`);
+    }
+
+    await bootstrapEmailProviders();
+    await waitForMailboxSendWindow();
+
+    const provider = getEmailProvider(platform);
+    const result: SentEmailResult = await provider.sendEmail(userId, sender.connectedAccountId, {
       to: params.to,
       subject: params.subject,
-      html: params.html,
-      text: params.text,
+      body: params.html ?? params.text ?? '',
+      isHtml: params.html != null,
       cc: params.cc,
-      inReplyTo: params.replyToMessageId,
+      bcc: params.bcc,
+      replyToMessageId: params.replyToMessageId,
     });
-    if (!result || !result.id) {
-      throw new SenderSendError(sender, 'Resend did not return a message id — the send may have failed.');
-    }
+
+    return { provider: sender.senderProvider, messageId: result.messageId, threadId: result.threadId };
+  } catch (error) {
+    // Release a reservation we actually made — SenderDailyLimitExceededError itself
+    // never reaches here, since reserveSend() throws it before this try block starts.
     if (limit !== null) {
-      await senderUsageTracker.recordSend(userId, sender.id);
+      await senderUsageTracker.releaseSend(userId, sender.id).catch(() => {});
     }
-    return { provider: 'resend', messageId: result.id };
+    throw error;
   }
-
-  const platform = PROVIDER_TO_PLATFORM[sender.senderProvider];
-  if (!platform) {
-    throw new SenderSendError(sender, `Unsupported sender provider: ${sender.senderProvider}`);
-  }
-  if (!sender.connectedAccountId) {
-    throw new SenderSendError(sender, `${sender.senderProvider} sender is missing its connected account id.`);
-  }
-
-  await bootstrapEmailProviders();
-  await waitForMailboxSendWindow();
-
-  const provider = getEmailProvider(platform);
-  const result: SentEmailResult = await provider.sendEmail(userId, sender.connectedAccountId, {
-    to: params.to,
-    subject: params.subject,
-    body: params.html ?? params.text ?? '',
-    isHtml: params.html != null,
-    cc: params.cc,
-    bcc: params.bcc,
-    replyToMessageId: params.replyToMessageId,
-  });
-
-  if (limit !== null) {
-    await senderUsageTracker.recordSend(userId, sender.id);
-  }
-  return { provider: sender.senderProvider, messageId: result.messageId, threadId: result.threadId };
 }

@@ -15,24 +15,26 @@ beforeEach(() => {
   jest.useRealTimers();
 });
 
-describe('InMemorySenderUsageTracker.checkQuota', () => {
-  it('does not throw when sender is below its daily cap', async () => {
+describe('InMemorySenderUsageTracker.reserveSend', () => {
+  it('does not throw and consumes one slot when the sender is below its daily cap', async () => {
     const t = new InMemorySenderUsageTracker();
-    await expect(t.checkQuota('u1', 's1', 5)).resolves.toBeUndefined();
+    await expect(t.reserveSend('u1', 's1', 5)).resolves.toBeUndefined();
+    expect((await t.getUsage('u1', 's1')).sentCount).toBe(1);
   });
 
-  it('throws SenderDailyLimitExceededError once the sender is at its cap', async () => {
+  it('throws SenderDailyLimitExceededError once the sender is at its cap, without over-consuming', async () => {
     const t = new InMemorySenderUsageTracker();
-    await t.recordSend('u1', 's1');
-    await t.recordSend('u1', 's1');
-    await expect(t.checkQuota('u1', 's1', 2)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
+    await t.reserveSend('u1', 's1', 2);
+    await t.reserveSend('u1', 's1', 2);
+    await expect(t.reserveSend('u1', 's1', 2)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
+    expect((await t.getUsage('u1', 's1')).sentCount).toBe(2);
   });
 
   it('error carries the senderId and limit for a clear caller-facing message', async () => {
     const t = new InMemorySenderUsageTracker();
-    await t.recordSend('u1', 's1');
+    await t.reserveSend('u1', 's1', 1);
     try {
-      await t.checkQuota('u1', 's1', 1);
+      await t.reserveSend('u1', 's1', 1);
       throw new Error('expected to throw');
     } catch (err: any) {
       expect(err).toBeInstanceOf(SenderDailyLimitExceededError);
@@ -44,31 +46,40 @@ describe('InMemorySenderUsageTracker.checkQuota', () => {
 
   it('counters are tracked independently per sender', async () => {
     const t = new InMemorySenderUsageTracker();
-    await t.recordSend('u1', 's1');
-    await expect(t.checkQuota('u1', 's1', 1)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
-    await expect(t.checkQuota('u1', 's2', 1)).resolves.toBeUndefined();
+    await t.reserveSend('u1', 's1', 1);
+    await expect(t.reserveSend('u1', 's1', 1)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
+    await expect(t.reserveSend('u1', 's2', 1)).resolves.toBeUndefined();
   });
 
   it('counters are tracked independently per user even for the same senderId', async () => {
     const t = new InMemorySenderUsageTracker();
-    await t.recordSend('u1', 's1');
-    await expect(t.checkQuota('u1', 's1', 1)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
-    await expect(t.checkQuota('u2', 's1', 1)).resolves.toBeUndefined();
+    await t.reserveSend('u1', 's1', 1);
+    await expect(t.reserveSend('u1', 's1', 1)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
+    await expect(t.reserveSend('u2', 's1', 1)).resolves.toBeUndefined();
   });
 
   it('resets at the start of a new UTC day', async () => {
     const t = new InMemorySenderUsageTracker({ now: () => new Date('2026-05-04T23:59:00Z') });
-    await t.recordSend('u1', 's1');
-    await expect(t.checkQuota('u1', 's1', 1)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
+    await t.reserveSend('u1', 's1', 1);
+    await expect(t.reserveSend('u1', 's1', 1)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
 
     (t as any)._now = () => new Date('2026-05-05T00:01:00Z');
-    await expect(t.checkQuota('u1', 's1', 1)).resolves.toBeUndefined();
+    await expect(t.reserveSend('u1', 's1', 1)).resolves.toBeUndefined();
+  });
+});
+
+describe('InMemorySenderUsageTracker.releaseSend', () => {
+  it('a failed send that releases its reservation does not permanently consume quota', async () => {
+    const t = new InMemorySenderUsageTracker();
+    await t.reserveSend('u1', 's1', 1); // reserve, then simulate the provider call failing
+    await t.releaseSend('u1', 's1');
+    expect((await t.getUsage('u1', 's1')).sentCount).toBe(0);
+    await expect(t.reserveSend('u1', 's1', 1)).resolves.toBeUndefined();
   });
 
-  it('a failed send that never calls recordSend does not consume quota', async () => {
+  it('never goes negative when released with nothing reserved', async () => {
     const t = new InMemorySenderUsageTracker();
-    await t.checkQuota('u1', 's1', 1); // simulate provider call failing after the check
-    await expect(t.checkQuota('u1', 's1', 1)).resolves.toBeUndefined();
+    await t.releaseSend('u1', 's1');
     expect((await t.getUsage('u1', 's1')).sentCount).toBe(0);
   });
 });
@@ -81,9 +92,9 @@ describe('InMemorySenderUsageTracker.getUsage', () => {
     expect(usage.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
   });
 
-  it('accumulates across multiple recordSend calls', async () => {
+  it('accumulates across multiple reserveSend calls', async () => {
     const t = new InMemorySenderUsageTracker();
-    for (let i = 0; i < 4; i++) await t.recordSend('u1', 's1');
+    for (let i = 0; i < 4; i++) await t.reserveSend('u1', 's1', 10);
     expect((await t.getUsage('u1', 's1')).sentCount).toBe(4);
   });
 });
@@ -98,20 +109,24 @@ describe('DynamoSenderUsageTracker', () => {
   function makeTracker(opts: {
     initialRow?: SenderUsageRow | null;
     today?: string;
-    incrementUsage?: jest.Mock;
+    reserveUsage?: jest.Mock;
+    releaseUsage?: jest.Mock;
   } = {}) {
     const today = opts.today ?? '2026-05-04';
-    const incrementUsage = opts.incrementUsage ?? jest.fn().mockResolvedValue(undefined);
+    const reserveUsage = opts.reserveUsage ?? jest.fn().mockResolvedValue(undefined);
+    const releaseUsage = opts.releaseUsage ?? jest.fn().mockResolvedValue(undefined);
     const row = opts.initialRow ?? null;
     return {
       tracker: new DynamoSenderUsageTracker(
         {
           readUsage: jest.fn(async () => row),
-          incrementUsage,
+          reserveUsage,
+          releaseUsage,
         },
         () => new Date(`${today}T12:00:00Z`),
       ),
-      incrementUsage,
+      reserveUsage,
+      releaseUsage,
     };
   }
 
@@ -123,19 +138,28 @@ describe('DynamoSenderUsageTracker', () => {
 
   it('treats a stale row (different date) as zero — quota does not carry over to a new day', async () => {
     const { tracker } = makeTracker({ initialRow: { date: '2026-05-03', sentCount: 40 } });
-    await expect(tracker.checkQuota('u1', 's1', 5)).resolves.toBeUndefined();
+    const usage = await tracker.getUsage('u1', 's1');
+    expect(usage.sentCount).toBe(0);
   });
 
-  it('throws when the same-day count is at the limit', async () => {
-    const { tracker } = makeTracker({ initialRow: { date: '2026-05-04', sentCount: 5 } });
-    await expect(tracker.checkQuota('u1', 's1', 5)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
+  it('delegates reserveSend to the deps-injected reserveUsage with today\'s date and the limit', async () => {
+    const reserveUsage = jest.fn().mockResolvedValue(undefined);
+    const { tracker } = makeTracker({ reserveUsage });
+    await tracker.reserveSend('u1', 's1', 5);
+    expect(reserveUsage).toHaveBeenCalledWith('u1', 's1', '2026-05-04', 5);
   });
 
-  it('delegates recordSend to incrementUsage with today\'s date', async () => {
-    const incrementUsage = jest.fn().mockResolvedValue(undefined);
-    const { tracker } = makeTracker({ incrementUsage });
-    await tracker.recordSend('u1', 's1');
-    expect(incrementUsage).toHaveBeenCalledWith('u1', 's1', '2026-05-04');
+  it('propagates SenderDailyLimitExceededError thrown by reserveUsage (the atomic check-and-reserve)', async () => {
+    const reserveUsage = jest.fn().mockRejectedValue(new SenderDailyLimitExceededError('s1', 5));
+    const { tracker } = makeTracker({ reserveUsage });
+    await expect(tracker.reserveSend('u1', 's1', 5)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
+  });
+
+  it('delegates releaseSend to the deps-injected releaseUsage with today\'s date', async () => {
+    const releaseUsage = jest.fn().mockResolvedValue(undefined);
+    const { tracker } = makeTracker({ releaseUsage });
+    await tracker.releaseSend('u1', 's1');
+    expect(releaseUsage).toHaveBeenCalledWith('u1', 's1', '2026-05-04');
   });
 });
 
@@ -175,5 +199,18 @@ describe('effectiveDailyLimit', () => {
   it('clamps a warmupStartedAt in the future to day 1 rather than a negative/zero day', () => {
     const start = '2026-06-01T00:00:00.000Z';
     expect(effectiveDailyLimit({ warmupStartedAt: start }, new Date('2026-05-01T12:00:00Z'))).toBe(10);
+  });
+
+  it('never exceeds a configured dailyLimit during warmup, even on an early ramp step', () => {
+    const start = '2026-05-01T00:00:00.000Z';
+    // Warmup day 1-3 would normally offer 10/day, but dailyLimit: 5 is a hard cap.
+    expect(effectiveDailyLimit({ warmupStartedAt: start, dailyLimit: 5 }, new Date('2026-05-01T12:00:00Z'))).toBe(5);
+    // Once the ramp step exceeds dailyLimit, dailyLimit keeps winning through later steps too.
+    expect(effectiveDailyLimit({ warmupStartedAt: start, dailyLimit: 5 }, new Date('2026-05-05T12:00:00Z'))).toBe(5);
+  });
+
+  it('uses the ramp step when it is lower than a generous configured dailyLimit', () => {
+    const start = '2026-05-01T00:00:00.000Z';
+    expect(effectiveDailyLimit({ warmupStartedAt: start, dailyLimit: 1000 }, new Date('2026-05-01T12:00:00Z'))).toBe(10);
   });
 });

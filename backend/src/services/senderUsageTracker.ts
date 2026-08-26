@@ -7,15 +7,19 @@
  * day-rollover, race-safe-increment shape as those trackers, and reuses the
  * existing AW-Configs table rather than provisioning a new one.
  *
- * checkQuota() and recordSend() are separate calls, not one atomic
- * check-and-record — mirrors Apollo/enrich.so's semantics of "quota is only
- * consumed by a send that actually happened," so a failed provider call
- * doesn't burn a day's budget. The caller (sendAsSender.ts) checks before
- * dispatching and records only after the provider confirms the send.
+ * reserveSend() atomically checks the limit AND consumes one send in a single
+ * operation — not a separate check-then-record pair, which would let N
+ * concurrent sends all pass the check before any of them records, exceeding
+ * the cap by up to N-1 sends. releaseSend() undoes a reservation when the
+ * provider call definitively fails afterwards, so quota is still only
+ * consumed by a send that actually went out — same end intent as
+ * Apollo/enrich.so's "quota only consumed on success," just made atomic
+ * instead of split across two round-trips.
  *
- * Kept free of AWS imports so unit tests for the check/record logic don't
- * need to mock aws-sdk — the DynamoDB wiring lives in sendAsSender.ts, the
- * sole caller, mirroring how apolloServiceFactory.ts wires apolloQuota.ts.
+ * Kept free of AWS imports so unit tests for the reserve/release logic don't
+ * need to mock aws-sdk — the DynamoDB wiring lives in
+ * senderUsageTrackerFactory.ts, mirroring how apolloServiceFactory.ts wires
+ * apolloQuota.ts.
  */
 
 export interface SenderUsageRow {
@@ -31,8 +35,10 @@ export class SenderDailyLimitExceededError extends Error {
 }
 
 export interface SenderUsageTracker {
-  checkQuota(userId: string, senderId: string, limit: number): Promise<void>;
-  recordSend(userId: string, senderId: string): Promise<void>;
+  /** Atomically checks the limit and reserves one send. Throws SenderDailyLimitExceededError if already at/over limit. */
+  reserveSend(userId: string, senderId: string, limit: number): Promise<void>;
+  /** Undoes a reservation — call only when the provider call definitively failed after a successful reserveSend. */
+  releaseSend(userId: string, senderId: string): Promise<void>;
   getUsage(userId: string, senderId: string): Promise<SenderUsageRow>;
 }
 
@@ -72,7 +78,12 @@ export function effectiveDailyLimit(
   const start = new Date(sender.warmupStartedAt);
   const dayNumber = Math.max(1, Math.floor((now.getTime() - start.getTime()) / (24 * 60 * 60 * 1000)) + 1);
   const step = WARMUP_RAMP.find((s) => dayNumber <= s.throughDay);
-  if (step) return step.limit;
+  if (step) {
+    // A configured dailyLimit is a hard cap, not just a post-warmup default — the ramp
+    // must never exceed it (e.g. dailyLimit: 5 should stay 5/day even on ramp day 1-3,
+    // where the step would otherwise offer 10/day).
+    return sender.dailyLimit != null ? Math.min(step.limit, sender.dailyLimit) : step.limit;
+  }
   return sender.dailyLimit ?? DEFAULT_POST_WARMUP_DAILY_LIMIT;
 }
 
@@ -96,16 +107,19 @@ export class InMemorySenderUsageTracker implements SenderUsageTracker {
     return fresh;
   }
 
-  async checkQuota(userId: string, senderId: string, limit: number): Promise<void> {
+  async reserveSend(userId: string, senderId: string, limit: number): Promise<void> {
     const row = this.getOrInit(userId, senderId);
     if (row.sentCount >= limit) {
       throw new SenderDailyLimitExceededError(senderId, limit);
     }
+    row.sentCount += 1;
   }
 
-  async recordSend(userId: string, senderId: string): Promise<void> {
+  async releaseSend(userId: string, senderId: string): Promise<void> {
     const row = this.getOrInit(userId, senderId);
-    row.sentCount += 1;
+    if (row.sentCount > 0) {
+      row.sentCount -= 1;
+    }
   }
 
   async getUsage(userId: string, senderId: string): Promise<SenderUsageRow> {
@@ -119,7 +133,9 @@ export class DynamoSenderUsageTracker implements SenderUsageTracker {
   constructor(
     private deps: {
       readUsage(userId: string, senderId: string): Promise<SenderUsageRow | null>;
-      incrementUsage(userId: string, senderId: string, today: string): Promise<void>;
+      /** Atomic: increments sentCount only if today's row is under limit (or creates it at 1). Throws SenderDailyLimitExceededError otherwise. */
+      reserveUsage(userId: string, senderId: string, today: string, limit: number): Promise<void>;
+      releaseUsage(userId: string, senderId: string, today: string): Promise<void>;
     },
     private now: () => Date = () => new Date(),
   ) {}
@@ -133,15 +149,12 @@ export class DynamoSenderUsageTracker implements SenderUsageTracker {
     return row;
   }
 
-  async checkQuota(userId: string, senderId: string, limit: number): Promise<void> {
-    const row = await this.getOrZero(userId, senderId);
-    if (row.sentCount >= limit) {
-      throw new SenderDailyLimitExceededError(senderId, limit);
-    }
+  async reserveSend(userId: string, senderId: string, limit: number): Promise<void> {
+    await this.deps.reserveUsage(userId, senderId, todayUtc(this.now()), limit);
   }
 
-  async recordSend(userId: string, senderId: string): Promise<void> {
-    await this.deps.incrementUsage(userId, senderId, todayUtc(this.now()));
+  async releaseSend(userId: string, senderId: string): Promise<void> {
+    await this.deps.releaseUsage(userId, senderId, todayUtc(this.now()));
   }
 
   async getUsage(userId: string, senderId: string): Promise<SenderUsageRow> {

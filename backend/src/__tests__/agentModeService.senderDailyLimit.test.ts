@@ -28,12 +28,12 @@ jest.mock('../services/emailProviderService', () => ({
 // Real senderUsageTracker/sendAsSender run for real — only their DynamoDB deps
 // are mocked, so this exercises the actual routing + cap-check wiring end to
 // end rather than asserting against a mocked sendAsSender.
-const mockCheckQuota = jest.fn();
-const mockRecordSend = jest.fn();
+const mockReserveSend = jest.fn();
+const mockReleaseSend = jest.fn();
 jest.mock('../services/senderUsageTrackerFactory', () => ({
   senderUsageTracker: {
-    checkQuota: (...args: any[]) => mockCheckQuota(...args),
-    recordSend: (...args: any[]) => mockRecordSend(...args),
+    reserveSend: (...args: any[]) => mockReserveSend(...args),
+    releaseSend: (...args: any[]) => mockReleaseSend(...args),
     getUsage: jest.fn(),
   },
 }));
@@ -92,7 +92,7 @@ beforeEach(() => {
     }
     return null;
   });
-  mockCheckQuota.mockRejectedValue(new SenderDailyLimitExceededError(CAPPED_SENDER_ID, 5));
+  mockReserveSend.mockRejectedValue(new SenderDailyLimitExceededError(CAPPED_SENDER_ID, 5));
 });
 
 describe('sendEmailToLead — daily-cap enforcement (ENG-265)', () => {
@@ -104,19 +104,20 @@ describe('sendEmailToLead — daily-cap enforcement (ENG-265)', () => {
     expect(result.error).toContain('daily sending limit');
     expect(mockResendSendEmail).not.toHaveBeenCalled();
     expect(mockProviderSendEmail).not.toHaveBeenCalled();
-    expect(mockCheckQuota).toHaveBeenCalledWith(OWNER, CAPPED_SENDER_ID, 5);
-    expect(mockRecordSend).not.toHaveBeenCalled();
+    expect(mockReserveSend).toHaveBeenCalledWith(OWNER, CAPPED_SENDER_ID, 5);
+    expect(mockReleaseSend).not.toHaveBeenCalled();
   });
 
   it('sends normally when the sender is under its cap', async () => {
-    mockCheckQuota.mockResolvedValue(undefined);
+    mockReserveSend.mockResolvedValue(undefined);
     mockResendSendEmail.mockResolvedValue({ id: 'email-1' });
 
     const result = await (agentModeService as any).sendEmailToLead('list-1', 'lead-1', OWNER);
 
     expect(result.success).toBe(true);
     expect(mockResendSendEmail).toHaveBeenCalledTimes(1);
-    expect(mockRecordSend).toHaveBeenCalledWith(OWNER, CAPPED_SENDER_ID);
+    expect(mockReserveSend).toHaveBeenCalledWith(OWNER, CAPPED_SENDER_ID, 5);
+    expect(mockReleaseSend).not.toHaveBeenCalled();
   });
 });
 
@@ -132,11 +133,11 @@ describe('sendEmailFromConfiguredSender — daily-cap enforcement (ENG-265)', ()
     expect(result.message).toBe('Daily sending limit reached');
     expect(mockResendSendEmail).not.toHaveBeenCalled();
     expect(mockProviderSendEmail).not.toHaveBeenCalled();
-    expect(mockRecordSend).not.toHaveBeenCalled();
+    expect(mockReleaseSend).not.toHaveBeenCalled();
   });
 
   it('sends normally when the sender is under its cap', async () => {
-    mockCheckQuota.mockResolvedValue(undefined);
+    mockReserveSend.mockResolvedValue(undefined);
     mockResendSendEmail.mockResolvedValue({ id: 'email-2' });
 
     const result = await (agentModeService as any).sendEmailFromConfiguredSender(OWNER, {
@@ -147,6 +148,7 @@ describe('sendEmailFromConfiguredSender — daily-cap enforcement (ENG-265)', ()
 
     expect(result.success).toBe(true);
     expect(mockResendSendEmail).toHaveBeenCalledTimes(1);
-    expect(mockRecordSend).toHaveBeenCalledWith(OWNER, CAPPED_SENDER_ID);
+    expect(mockReserveSend).toHaveBeenCalledWith(OWNER, CAPPED_SENDER_ID, 5);
+    expect(mockReleaseSend).not.toHaveBeenCalled();
   });
 });

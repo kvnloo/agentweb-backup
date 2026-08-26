@@ -79,8 +79,8 @@ jest.mock('../services/settingsService', () => ({
 
 jest.mock('../services/senderUsageTrackerFactory', () => ({
   senderUsageTracker: {
-    checkQuota: jest.fn().mockResolvedValue(undefined),
-    recordSend: jest.fn().mockResolvedValue(undefined),
+    reserveSend: jest.fn().mockResolvedValue(undefined),
+    releaseSend: jest.fn().mockResolvedValue(undefined),
     getUsage: jest.fn(),
   },
 }));
@@ -552,7 +552,7 @@ describe('CRM Group Email Endpoints', () => {
         (resendService.sendEmail as jest.Mock)
           .mockResolvedValueOnce({ id: 'msg-1' })
           .mockResolvedValueOnce({ id: 'msg-2' });
-        (senderUsageTracker.checkQuota as jest.Mock)
+        (senderUsageTracker.reserveSend as jest.Mock)
           .mockResolvedValueOnce(undefined) // lead a — ok
           .mockResolvedValueOnce(undefined) // lead b — ok
           .mockRejectedValueOnce(new SenderDailyLimitExceededError('r-1', 2)); // lead c — over the cap
