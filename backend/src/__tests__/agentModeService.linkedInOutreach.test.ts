@@ -1850,9 +1850,8 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
     });
 
-    it('still accepts successfully when list_id is omitted and no account-bound list resolves — mirrors nothing rather than guessing', async () => {
+    it('still accepts successfully when list_id is omitted — mirrors nothing rather than guessing', async () => {
       const { list_id, ...withoutListId } = acceptArgs as any;
-      mockResolveListIdForAccount.mockResolvedValue(null);
 
       const result = await service.linkedinOutreach('user-1', withoutListId);
 
@@ -1860,17 +1859,21 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
     });
 
-    it('falls back to the list bound to the sending account when list_id is omitted', async () => {
+    // ENG-1595 follow-up: unlike send-invite, accept-invitation must NEVER fall back
+    // to the account's bound list when list_id is omitted. Sending an invite is
+    // always a deliberate targeting action; accepting one is not — the account
+    // owner never decided "every accepted connection is a lead" just by having a
+    // list configured. Only an explicit list_id (i.e. the task actually judged this
+    // person relevant) may trigger a mirror.
+    it('does NOT fall back to the account-bound list when list_id is omitted, even if one is configured', async () => {
       const { list_id, ...withoutListId } = acceptArgs as any;
       mockResolveListIdForAccount.mockResolvedValue('list_bound');
-      mockGetLeadListById.mockResolvedValue({ id: 'list_bound', userId: 'user-1' });
 
-      await service.linkedinOutreach('user-1', withoutListId);
+      const result = await service.linkedinOutreach('user-1', withoutListId);
 
-      expect(mockResolveListIdForAccount).toHaveBeenCalledWith('user-1', 'test-account-id');
-      expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
-        expect.objectContaining({ listId: 'list_bound' }),
-      );
+      expect(result.success).toBe(true);
+      expect(mockResolveListIdForAccount).not.toHaveBeenCalled();
+      expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
     });
 
     it('skips the mirror (no cross-tenant write) when the resolved list is foreign', async () => {
