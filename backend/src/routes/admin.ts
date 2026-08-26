@@ -1372,6 +1372,11 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
 // Persisted as the inverse `slackSuggestedRepliesDisabled` flag: enabled:true -> disabled:false
 // (opted in); enabled:false -> disabled:true (default). ENG-1613: absent/true is now the default
 // (disabled) — only an explicit disabled:false opts a customer into auto-listen.
+// Non-boolean `enabled` is coerced via `!enabled` rather than rejected (pre-existing behavior,
+// predating ENG-1613, covered by admin.slackSuggestedReplies.test.ts — a missing field defaults
+// to disabled, a truthy value like the string "true" is treated as enabled). Left unchanged here
+// deliberately: tightening it to a strict boolean check is a real, separately-scoped fix that
+// would also need to touch those existing tests, not a same-day cost-burn stopgap.
 router.put("/users/:userId/slack-suggested-replies", async (req, res) => {
   try {
     const { userId } = req.params;
