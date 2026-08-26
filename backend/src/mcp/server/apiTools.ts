@@ -19,6 +19,13 @@ import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService
 // share them instead of keeping a second copy. Behaviour unchanged.
 import { ctx, jsonResult } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
+import { resolveClientScopedContext } from './adminClientScope';
+
+const CLIENT_ID_SCHEMA_PROPERTY = {
+  type: 'string' as const,
+  description:
+    "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected.",
+};
 
 function normalizeSkillQuery(value: unknown): string {
   return String(value ?? '')
@@ -318,11 +325,19 @@ mcpToolRegistry.register({
   name: 'list_tasks',
   definition: {
     name: 'list_tasks',
-    description: 'List all tasks owned by the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List all tasks owned by the authenticated user, or a specific client (admin-only, via client_id).',
+    inputSchema: {
+      type: 'object',
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/tasks', context: ctx(context) });
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/tasks',
+      context: await resolveClientScopedContext(context, args?.client_id)
+    });
     return jsonResult(data);
   }
 });
@@ -487,11 +502,19 @@ mcpToolRegistry.register({
   name: 'list_scheduled_chats',
   definition: {
     name: 'list_scheduled_chats',
-    description: 'List all scheduled chats for the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List all scheduled chats for the authenticated user, or a specific client (admin-only, via client_id).',
+    inputSchema: {
+      type: 'object',
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/agent-mode/scheduled-chats', context: ctx(context) });
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/agent-mode/scheduled-chats',
+      context: await resolveClientScopedContext(context, args?.client_id)
+    });
     return jsonResult(data);
   }
 });
@@ -862,11 +885,19 @@ mcpToolRegistry.register({
   name: 'list_lead_lists',
   definition: {
     name: 'list_lead_lists',
-    description: 'List all lead lists for the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List all lead lists for the authenticated user, or for a specific client (admin-only, via client_id).',
+    inputSchema: {
+      type: 'object',
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/crm/lists', context: ctx(context) });
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/crm/lists',
+      context: await resolveClientScopedContext(context, args?.client_id)
+    });
     return jsonResult(data);
   }
 });
@@ -917,7 +948,7 @@ mcpToolRegistry.register({
   name: 'manage_leads',
   definition: {
     name: 'manage_leads',
-    description: 'Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list".',
+    description: 'Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list". Admin-only: pass client_id to operate on a specific client\'s list instead of the caller\'s own.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -928,13 +959,14 @@ mcpToolRegistry.register({
         lead_ids: { type: 'array', items: { type: 'string' }, description: 'Lead IDs to delete (for delete action)' },
         updates: { type: 'object', description: 'Fields to update (for update action)' },
         limit: { type: 'number', description: 'Max leads to return (list action)' },
-        last_key: { type: 'string', description: 'Pagination key (list action)' }
+        last_key: { type: 'string', description: 'Pagination key (list action)' },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY
       },
       required: ['action', 'list_id']
     }
   },
   execute: async (args: any, context: any) => {
-    const c = ctx(context);
+    const c = await resolveClientScopedContext(context, args.client_id);
     const listId = args.list_id;
     switch (args.action) {
       case 'list': {
@@ -980,7 +1012,7 @@ mcpToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Search leads across lists using structured filters.',
+    description: 'Search leads across lists using structured filters. Admin-only: pass client_id to search a specific client\'s leads instead of the caller\'s own.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -998,14 +1030,15 @@ mcpToolRegistry.register({
           },
           description: 'Array of filter conditions'
         },
-        limit: { type: 'number', description: 'Max results (default 20, max 50)' }
+        limit: { type: 'number', description: 'Max results (default 20, max 50)' },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY
       },
       required: ['list_id', 'filters']
     }
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: '/api/emma/search-leads', context: ctx(context),
+      method: 'POST', path: '/api/emma/search-leads', context: await resolveClientScopedContext(context, args.client_id),
       body: { list_id: args.list_id, filters: args.filters, limit: args.limit }
     });
     return jsonResult(data);
@@ -1387,11 +1420,14 @@ GOOGLE ADS SPEND RISK (ENG-1362). google_ads rows carry test_account and can_spe
   test_account: false = real, billable.
   test_account absent = never recorded; treat as billable.
   can_spend = false ONLY when test_account is true.
-Never infer this from account_name — a fully billable account can be named "Test".`,
+Never infer this from account_name — a fully billable account can be named "Test".
+
+Admin-only: pass client_id to list a specific client's connected accounts instead of the caller's own.`,
     inputSchema: {
       type: 'object',
       properties: {
-        platform: { type: 'string', description: 'Filter by platform (e.g., "linkedin", "meta", "unipile")' }
+        platform: { type: 'string', description: 'Filter by platform (e.g., "linkedin", "meta", "unipile")' },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY
       },
       required: []
     }
@@ -1399,7 +1435,12 @@ Never infer this from account_name — a fully billable account can be named "Te
   execute: async (args: any, context: any) => {
     const qp: Record<string, string> = {};
     if (args.platform) qp.platform = args.platform;
-    const data = await mcpFetch({ method: 'GET', path: '/api/oauth/connected-accounts', context: ctx(context), queryParams: qp });
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/oauth/connected-accounts',
+      context: await resolveClientScopedContext(context, args.client_id),
+      queryParams: qp
+    });
     return jsonResult(data);
   }
 });
@@ -3369,11 +3410,15 @@ mcpToolRegistry.register({
   name: 'get_account_status',
   definition: {
     name: 'get_account_status',
-    description: "Get the current user's account status, subscription plan, and usage.",
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: "Get the current user's account status, subscription plan, and usage. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
+    inputSchema: {
+      type: 'object',
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const c = ctx(context);
+  execute: async (args: any, context: any) => {
+    const c = await resolveClientScopedContext(context, args?.client_id);
 
     // Plan/status comes from /api/auth/me. Let auth errors propagate — if we can't
     // resolve the account, returning a fake "status" would be misleading.

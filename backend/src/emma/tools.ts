@@ -7245,12 +7245,35 @@ const adminToolNames = [
   'get_landing_page_effective_view',
 ];
 
+// ENG-1596 added an admin-only `client_id` param to these tools' mcpToolRegistry
+// definitions (external MCP admin surface), so an admin's own MCP session can
+// scope the call to a specific client. That param must NOT leak into the
+// in-app bridge below: every logged-in customer (not just admins) gets these
+// as self-serve tools, and `resolveClientScopedContext` treats client_id as
+// admin-only regardless — so a non-admin customer could never use it, it would
+// just be confusing schema noise (exactly the "asked me for my email instead
+// of reporting my own account" bug this bridge already guards against, see
+// mcpGetAccountStatusExposure.test.ts). Same `execute`, self-only schema.
+const SELF_ONLY_BRIDGE_DEFINITIONS: Record<string, { description: string; inputSchema: any }> = {
+  get_account_status: {
+    description: "Get the current user's account status, subscription plan, and usage.",
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  list_scheduled_chats: {
+    description: 'List all scheduled chats for the authenticated user.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+};
+
 for (const toolName of bridgedToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);
   if (handler) {
+    const selfOnly = SELF_ONLY_BRIDGE_DEFINITIONS[toolName];
     emmaToolRegistry.register({
       name: handler.name,
-      definition: handler.definition,
+      definition: selfOnly
+        ? { ...handler.definition, description: selfOnly.description, inputSchema: selfOnly.inputSchema }
+        : handler.definition,
       execute: handler.execute,
     });
   } else {

@@ -28,7 +28,20 @@ interface UserRecord {
 interface McpFetchOptions {
   method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   path: string;
-  context: { userId?: string; agentUserId?: string; isDelegatedAccess?: boolean; sessionId?: string };
+  context: {
+    userId?: string;
+    agentUserId?: string;
+    isDelegatedAccess?: boolean;
+    sessionId?: string;
+    /**
+     * A pre-minted JWT to use as the Bearer token instead of self-call token
+     * generation (ENG-1596). Set by adminClientScope.ts's
+     * `resolveClientScopedContext` when an admin tool call is scoped to a
+     * different client via `client_id` — the token already carries that
+     * client's identity, so no self-call minting is needed here.
+     */
+    overrideToken?: string;
+  };
   body?: Record<string, unknown>;
   queryParams?: Record<string, string>;
   /** Override the default 5-minute timeout (in ms). Use for long-running calls like v0 generation. */
@@ -85,16 +98,23 @@ function getBaseUrl(): string {
 export async function mcpFetch(options: McpFetchOptions): Promise<any> {
   const { method, path, context, body, queryParams } = options;
 
-  const userId = context.userId || context.agentUserId;
-  if (!userId) {
-    throw new Error('Authentication required: no userId in context');
-  }
+  let token: string;
+  if (context.overrideToken) {
+    // ENG-1596: a client-scoped call already carries a fully-formed delegate
+    // token for the target client — skip self-call minting entirely.
+    token = context.overrideToken;
+  } else {
+    const userId = context.userId || context.agentUserId;
+    if (!userId) {
+      throw new Error('Authentication required: no userId in context');
+    }
 
-  const user = await lookupUser(userId);
-  // When called via admin delegated access, mint the token with isAdmin:true so
-  // admin REST routes (requireAdmin middleware) accept the self-call.
-  const tokenUser = context.isDelegatedAccess ? { ...user, isAdmin: true } : user;
-  const token = generateSelfCallToken(tokenUser);
+    const user = await lookupUser(userId);
+    // When called via admin delegated access, mint the token with isAdmin:true so
+    // admin REST routes (requireAdmin middleware) accept the self-call.
+    const tokenUser = context.isDelegatedAccess ? { ...user, isAdmin: true } : user;
+    token = generateSelfCallToken(tokenUser);
+  }
 
   // Build URL with query params
   let url = `${getBaseUrl()}${path}`;
