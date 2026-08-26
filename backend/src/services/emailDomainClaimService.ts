@@ -90,25 +90,39 @@ export async function claimEmailDomain(userId: string, normalizedDomain: string)
  * Promote a claim to confirmed once the caller's emailDomains[] write has actually landed, so
  * the abandoned-claim staleness window in claimEmailDomain no longer applies to it. Conditioned
  * on the caller still being the current owner (mirrors releaseEmailDomainClaim) — a failed
- * condition means this claim was already superseded, which is a no-op, not an error.
+ * condition means this claim was already superseded (extremely unlikely: confirmation runs
+ * synchronously right after the claim, seconds at most into a 10-minute staleness window), so
+ * it's still a no-op, not an error, and isn't retried.
+ *
+ * Retries transient AWS errors a couple of times before giving up — this call sits between two
+ * otherwise-independent writes (the caller's emailDomains[] update and this one), and the
+ * caller has no way to make them atomic without materially heavier infrastructure (a lease/
+ * fencing token, or a cross-item transaction) for what is, given the retry, a very rare residual
+ * failure mode. Callers must still treat a thrown error here as informational, not fatal to the
+ * registration that already succeeded — see crm.ts's call site.
  */
 export async function confirmEmailDomainClaim(normalizedDomain: string, ownerUserId: string): Promise<void> {
-  try {
-    await client()
-      .update({
-        TableName: CONFIGS_TABLE,
-        Key: { userId: CLAIM_PARTITION, configId: claimConfigId(normalizedDomain) },
-        UpdateExpression: 'SET confirmed = :true, confirmedAt = :now',
-        ConditionExpression: 'ownerUserId = :ownerUserId',
-        ExpressionAttributeValues: {
-          ':true': true,
-          ':now': new Date().toISOString(),
-          ':ownerUserId': ownerUserId,
-        },
-      })
-      .promise();
-  } catch (err: any) {
-    if (err?.code !== 'ConditionalCheckFailedException') throw err;
+  const CONFIRM_ATTEMPTS = 3;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await client()
+        .update({
+          TableName: CONFIGS_TABLE,
+          Key: { userId: CLAIM_PARTITION, configId: claimConfigId(normalizedDomain) },
+          UpdateExpression: 'SET confirmed = :true, confirmedAt = :now',
+          ConditionExpression: 'ownerUserId = :ownerUserId',
+          ExpressionAttributeValues: {
+            ':true': true,
+            ':now': new Date().toISOString(),
+            ':ownerUserId': ownerUserId,
+          },
+        })
+        .promise();
+      return;
+    } catch (err: any) {
+      if (err?.code === 'ConditionalCheckFailedException') return;
+      if (attempt >= CONFIRM_ATTEMPTS) throw err;
+    }
   }
 }
 

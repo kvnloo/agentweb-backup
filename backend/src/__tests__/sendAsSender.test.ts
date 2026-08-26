@@ -290,6 +290,16 @@ describe('sendAsSender — daily cap / warmup (ENG-265)', () => {
     expect(mockReleaseSend).not.toHaveBeenCalled();
   });
 
+  it('never reserves quota when bootstrapEmailProviders/getEmailProvider fails for a mailbox sender (pre-flight, not dispatch)', async () => {
+    mockBootstrapEmailProviders.mockRejectedValue(new Error('provider registry init failed'));
+    const capped: CrmSender = { ...gmailSender, dailyLimit: 10 };
+
+    await expect(
+      sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' }),
+    ).rejects.toThrow('provider registry init failed');
+    expect(mockReserveSend).not.toHaveBeenCalled();
+  });
+
   it('never reserves quota for a pre-flight validation failure (bcc on Resend, missing connectedAccountId)', async () => {
     const cappedResend: CrmSender = { ...resendSender, dailyLimit: 25 };
     await expect(

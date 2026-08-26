@@ -12,7 +12,7 @@
  */
 
 import { resendService } from './resendService';
-import { getEmailProvider, bootstrapEmailProviders, type SentEmailResult } from './emailProviderService';
+import { getEmailProvider, bootstrapEmailProviders, type IEmailService, type SentEmailResult } from './emailProviderService';
 import { CrmSender, SenderProvider, PROVIDER_TO_PLATFORM } from './crmSenderTypes';
 import { effectiveDailyLimit, SenderDailyLimitExceededError } from './senderUsageTracker';
 import { senderUsageTracker } from './senderUsageTrackerFactory';
@@ -70,10 +70,12 @@ export async function sendAsSender(
   sender: CrmSender,
   params: SendAsSenderParams,
 ): Promise<SendAsSenderResult> {
-  // Pre-flight validation that never touches a provider — checked before reserving quota
-  // below, so a validation failure has nothing to release and can't be confused with an
-  // ambiguous dispatch-time failure.
-  let platform: string | null = null;
+  // Pre-flight: resolved/validated before reserving quota below, so none of it can be
+  // confused with an ambiguous dispatch-time failure. bootstrapEmailProviders() and
+  // getEmailProvider() belong here too, not just the sync checks — a registry-lookup or
+  // client-init failure proves just as little was dispatched as a missing connectedAccountId
+  // does, so it shouldn't needlessly consume a reservation either.
+  let mailboxProvider: IEmailService | null = null;
   if (sender.senderProvider === 'resend') {
     // resendService has never supported bcc (checked as of this branch: neither the
     // service nor any pre-existing caller ever wired it up) — fail loud instead of
@@ -82,7 +84,9 @@ export async function sendAsSender(
       throw new SenderSendError(sender, 'This Resend sender does not support bcc.');
     }
   } else {
-    platform = resolvePlatform(sender);
+    const platform = resolvePlatform(sender);
+    await bootstrapEmailProviders();
+    mailboxProvider = getEmailProvider(platform);
   }
 
   // ENG-265: daily-cap/warmup check. `limit === null` means the sender has no cap
@@ -119,11 +123,9 @@ export async function sendAsSender(
     return { provider: 'resend', messageId: result.id };
   }
 
-  await bootstrapEmailProviders();
   await waitForMailboxSendWindow();
 
-  const provider = getEmailProvider(platform!);
-  const result: SentEmailResult = await provider.sendEmail(userId, sender.connectedAccountId!, {
+  const result: SentEmailResult = await mailboxProvider!.sendEmail(userId, sender.connectedAccountId!, {
     to: params.to,
     subject: params.subject,
     body: params.html ?? params.text ?? '',

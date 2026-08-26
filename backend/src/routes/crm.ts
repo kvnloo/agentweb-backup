@@ -5376,6 +5376,32 @@ router.get('/email-domain/status', async (req: Request, res: Response) => {
 type SenderDomainEntry = { id: string; domain: string; status: string; addedAt: string };
 
 /**
+ * A domain registered before ENG-265's multi-domain support only ever set the legacy scalar
+ * fields (emailDomain/resendDomainId), never emailDomains[]. Surface that legacy domain in the
+ * new plural endpoints too, via a synthesized entry — not a data migration — so an account that
+ * registered before this PR shipped doesn't lose visibility into (and the ability to manage)
+ * its existing domain just because it predates the array.
+ */
+function getEffectiveDomains(
+  user: { emailDomain?: string; resendDomainId?: string; emailDomains?: SenderDomainEntry[] } | null | undefined,
+): SenderDomainEntry[] {
+  const domains = user?.emailDomains || [];
+  if (
+    user?.emailDomain &&
+    user?.resendDomainId &&
+    !domains.some((d) => d.id === user.resendDomainId || d.domain === user.emailDomain)
+  ) {
+    return [...domains, {
+      id: user.resendDomainId,
+      domain: user.emailDomain,
+      status: 'unknown', // re-fetched live from Resend on every GET regardless of this placeholder
+      addedAt: new Date(0).toISOString(), // registration predates this field — no real timestamp to recover
+    }];
+  }
+  return domains;
+}
+
+/**
  * @route GET /api/crm/email-domains
  * @desc List every sending domain registered by the authenticated user, each enriched with live Resend status/records
  * @access Private
@@ -5389,10 +5415,17 @@ router.get('/email-domains', async (req: Request, res: Response) => {
     }
 
     const user = await userDb.getUserById(userId);
-    const domains: SenderDomainEntry[] = user?.emailDomains || [];
+    const domains: SenderDomainEntry[] = getEffectiveDomains(user);
 
     const enriched = await Promise.all(domains.map(async (d: SenderDomainEntry) => {
-      const details = await resendService.getDomain(d.id);
+      // A transient failure on ONE domain's live-status lookup must not blank the whole list —
+      // Promise.all rejects on the first rejection, and with up to MAX_EMAIL_DOMAINS_PER_ACCOUNT
+      // (20) outbound Resend calls per page load, some transient failure is not unlikely. Fall
+      // back to the last-known stored status for that one entry instead of failing the request.
+      const details = await resendService.getDomain(d.id).catch((err: any) => {
+        console.warn(`[crm] getDomain failed for ${d.domain}:`, err?.message || err);
+        return null;
+      });
       return {
         id: d.id,
         domain: d.domain,
@@ -5433,9 +5466,16 @@ router.post('/email-domains', async (req: Request, res: Response) => {
     }
 
     const user = await userDb.getUserById(userId);
+    // Real, stored array — this (not the effective one below) is what the CAS write further
+    // down is based on and conditioned against; the synthesized legacy entry was never actually
+    // persisted in emailDomains[], so including it in the expected-size check would make the
+    // conditional write fail against the real (smaller) stored array on every attempt.
     const existingDomains: SenderDomainEntry[] = user?.emailDomains || [];
+    // Includes a legacy scalar-field domain (if any) — cap/duplicate detection only, so it
+    // counts toward the cap and can't be "re-registered" as a spurious duplicate.
+    const effectiveDomains: SenderDomainEntry[] = getEffectiveDomains(user);
 
-    const alreadyOwned = existingDomains.find((d: SenderDomainEntry) => d.domain === normalizedDomain);
+    const alreadyOwned = effectiveDomains.find((d: SenderDomainEntry) => d.domain === normalizedDomain);
     if (alreadyOwned) {
       return res.status(409).json({ message: 'You have already registered this domain', domain: alreadyOwned });
     }
@@ -5443,7 +5483,7 @@ router.post('/email-domains', async (req: Request, res: Response) => {
     // GET /email-domains fans out one resendService.getDomain() call per entry — bound the
     // array so that stays a handful of requests, not an unbounded fan-out.
     const MAX_EMAIL_DOMAINS_PER_ACCOUNT = 20;
-    if (existingDomains.length >= MAX_EMAIL_DOMAINS_PER_ACCOUNT) {
+    if (effectiveDomains.length >= MAX_EMAIL_DOMAINS_PER_ACCOUNT) {
       return res.status(400).json({
         message: `You've reached the limit of ${MAX_EMAIL_DOMAINS_PER_ACCOUNT} sending domains per account. Remove one before adding another.`,
         code: 'EMAIL_DOMAIN_CAP_EXCEEDED',
@@ -5528,6 +5568,17 @@ router.post('/email-domains', async (req: Request, res: Response) => {
             // submission, not another user — nothing to release, the entry is already there.
             return res.status(409).json({ message: 'You have already registered this domain' });
           }
+          // Re-check the cap against the fresh count, not just the value read at the top of the
+          // request — two requests can each start under the cap, race the write, and both retry
+          // against a fresh array that's now one bigger, pushing the account over the limit.
+          if (freshDomains.length >= MAX_EMAIL_DOMAINS_PER_ACCOUNT) {
+            await releaseEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+              console.error(`Failed to release email domain claim for "${normalizedDomain}" after hitting the cap on retry:`, e));
+            return res.status(400).json({
+              message: `You've reached the limit of ${MAX_EMAIL_DOMAINS_PER_ACCOUNT} sending domains per account. Remove one before adding another.`,
+              code: 'EMAIL_DOMAIN_CAP_EXCEEDED',
+            });
+          }
           domainsToWrite = [...freshDomains, newEntry];
           expectedSize = freshDomains.length;
         }
@@ -5535,9 +5586,15 @@ router.post('/email-domains', async (req: Request, res: Response) => {
 
       // The emailDomains[] write landed — promote the claim to confirmed so the abandoned-claim
       // staleness window in claimEmailDomain no longer applies to it (a completed registration
-      // must never expire and become takeable by another account).
+      // must never expire and become takeable by another account). confirmEmailDomainClaim
+      // retries transient failures itself; if it still throws here, the domain IS registered
+      // and functional, so we log loudly (real signal for on-call, not routine noise) and still
+      // return success rather than fail an otherwise-successful registration — the residual risk
+      // is a claim that can be taken over by someone else 10 minutes from now despite this user
+      // legitimately owning the domain, which needs a lease/fencing mechanism to close fully
+      // and wasn't worth the added complexity for what the retry already makes a rare case.
       await confirmEmailDomainClaim(normalizedDomain, userId).catch((e) =>
-        console.error('Failed to confirm email domain claim:', e));
+        console.error(`CRITICAL: failed to confirm email domain claim for "${normalizedDomain}" (user ${userId}) after retries — claim may expire and be taken over:`, e));
 
       res.json({
         message: alreadyExists
@@ -5548,8 +5605,13 @@ router.post('/email-domains', async (req: Request, res: Response) => {
       });
     } catch (innerError) {
       // The claim succeeded but a later step didn't — release it so the domain isn't
-      // permanently stuck unclaimable by anyone.
-      await releaseEmailDomainClaim(normalizedDomain, userId).catch(() => {});
+      // permanently stuck unclaimable by anyone. releaseEmailDomainClaim already treats a
+      // superseded-claim conflict as a silent no-op internally, so anything that still throws
+      // here is a genuine unexpected failure (not routine) and worth surfacing: an unreleased
+      // claim after a failed registration leaves the domain unclaimable by anyone, including
+      // the user who just failed to register it, until the 10-minute staleness window passes.
+      await releaseEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+        console.error(`Failed to release email domain claim for "${normalizedDomain}" after a failed registration:`, e));
       throw innerError;
     }
   } catch (error: any) {
@@ -5573,7 +5635,7 @@ router.post('/email-domains/:domainId/verify', async (req: Request, res: Respons
 
     const { domainId } = req.params;
     const user = await userDb.getUserById(userId);
-    const entry = ((user?.emailDomains || []) as SenderDomainEntry[]).find((d: SenderDomainEntry) => d.id === domainId);
+    const entry = getEffectiveDomains(user).find((d: SenderDomainEntry) => d.id === domainId);
     if (!entry) {
       return res.status(404).json({ message: 'Domain not found' });
     }
@@ -5612,9 +5674,19 @@ router.delete('/email-domains/:domainId', async (req: Request, res: Response) =>
     const { domainId } = req.params;
     const user = await userDb.getUserById(userId);
     const existingDomains: SenderDomainEntry[] = user?.emailDomains || [];
-    const removedEntry = existingDomains.find((d: SenderDomainEntry) => d.id === domainId);
+    const removedEntry = getEffectiveDomains(user).find((d: SenderDomainEntry) => d.id === domainId);
     if (!removedEntry) {
       return res.status(404).json({ message: 'Domain not found' });
+    }
+
+    // The removed entry can be a legacy scalar-field domain that was never actually persisted
+    // in emailDomains[] — there's no array element to filter out. Clear the scalar fields
+    // directly instead (same as the singular DELETE /email-domain route).
+    if (!existingDomains.some((d: SenderDomainEntry) => d.id === domainId)) {
+      await userDb.updateUser(userId, { emailDomain: '', resendDomainId: '' });
+      await releaseEmailDomainClaim(removedEntry.domain, userId).catch((e) =>
+        console.error(`Failed to release email domain claim for "${removedEntry.domain}" after removal:`, e));
+      return res.json({ message: 'Domain removed.' });
     }
 
     // ENG-265: same lost-update guard as POST /email-domains — condition the write on the
@@ -5650,7 +5722,8 @@ router.delete('/email-domains/:domainId', async (req: Request, res: Response) =>
     }
 
     // Free the domain up for any account to claim, now that this one no longer holds it.
-    await releaseEmailDomainClaim(removedEntry.domain, userId).catch(() => {});
+    await releaseEmailDomainClaim(removedEntry.domain, userId).catch((e) =>
+      console.error(`Failed to release email domain claim for "${removedEntry.domain}" after removal:`, e));
 
     res.json({ message: 'Domain removed.' });
   } catch (error: any) {

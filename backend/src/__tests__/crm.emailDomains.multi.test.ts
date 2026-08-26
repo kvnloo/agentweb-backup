@@ -220,6 +220,79 @@ describe('CRM multi-domain endpoints (ENG-265)', () => {
       await handle(mockRequest as Request, mockResponse as Response, mockNext);
       expect(mockResponse.status).toHaveBeenCalledWith(400);
     });
+
+    it('re-checks the cap against the fresh read on a retry, not just the value from the top of the request (CodeRabbit)', async () => {
+      // 19 real domains at the top of the request — under the 20 cap — but a concurrent
+      // request landed the 20th between the read and the write, so the retry's fresh read
+      // shows 20. Appending a 21st on top of that must be rejected, not silently allowed.
+      const nineteen = Array.from({ length: 19 }, (_, i) => ({
+        id: `d${i}`, domain: `d${i}.com`, status: 'verified', addedAt: '2026-01-01T00:00:00.000Z',
+      }));
+      const twenty = [...nineteen, { id: 'd19', domain: 'd19.com', status: 'verified', addedAt: '2026-01-01T00:00:01.000Z' }];
+      mockRequest.body = { domain: 'onemore.com' };
+      (userDb.getUserById as jest.Mock)
+        .mockResolvedValueOnce({ userId: 'test-user-id', emailDomains: nineteen })
+        .mockResolvedValueOnce({ userId: 'test-user-id', emailDomains: twenty });
+      (userDb.getUsersByEmailDomain as jest.Mock).mockResolvedValue([]);
+      (resendService.listDomains as jest.Mock).mockResolvedValue([]);
+      (resendService.createDomain as jest.Mock).mockResolvedValue({
+        id: 'd-new', name: 'onemore.com', status: 'not_started', records: [],
+      });
+      (userDb.updateUser as jest.Mock).mockRejectedValueOnce({ code: 'ConditionalCheckFailedException' });
+
+      const handle = getHandler('/email-domains', 'post');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'EMAIL_DOMAIN_CAP_EXCEEDED' }));
+      // Only the one failed conditional write — no second write is attempted once the
+      // re-checked cap rejects the retry.
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    });
+
+    it('counts a legacy scalar-only domain toward the cap/duplicate check without breaking the CAS write (CodeRabbit)', async () => {
+      // A user who registered before ENG-265 has emailDomain/resendDomainId set but no
+      // emailDomains[] array at all — the new domain being added is still distinct, so this
+      // should succeed, and critically the conditional write must be keyed off the REAL
+      // (empty) array, not a count that silently includes the synthesized legacy entry.
+      mockRequest.body = { domain: 'second.com' };
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id', emailDomain: 'legacy.com', resendDomainId: 'legacy-id',
+      });
+      (userDb.getUsersByEmailDomain as jest.Mock).mockResolvedValue([]);
+      (resendService.listDomains as jest.Mock).mockResolvedValue([]);
+      (resendService.createDomain as jest.Mock).mockResolvedValue({
+        id: 'd2', name: 'second.com', status: 'not_started', records: [],
+      });
+      (userDb.updateUser as jest.Mock).mockResolvedValue({});
+
+      const handle = getHandler('/email-domains', 'post');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(userDb.updateUser).toHaveBeenCalledWith('test-user-id', {
+        emailDomains: [{ id: 'd2', domain: 'second.com', status: 'not_started', addedAt: expect.any(String) }],
+        emailDomainList: ['second.com'],
+      }, {
+        condition: {
+          expression: 'attribute_not_exists(#emailDomains) OR size(#emailDomains) = :expectedSize',
+          names: { '#emailDomains': 'emailDomains' },
+          values: { ':expectedSize': 0 },
+        },
+      });
+    });
+
+    it('rejects re-registering the legacy scalar domain itself as a spurious "new" domain', async () => {
+      mockRequest.body = { domain: 'legacy.com' };
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id', emailDomain: 'legacy.com', resendDomainId: 'legacy-id',
+      });
+
+      const handle = getHandler('/email-domains', 'post');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(mockResponse.status).toHaveBeenCalledWith(409);
+      expect(resendService.createDomain).not.toHaveBeenCalled();
+    });
   });
 
   describe('DELETE /email-domains/:domainId', () => {
@@ -272,6 +345,20 @@ describe('CRM multi-domain endpoints (ENG-265)', () => {
       expect(mockResponse.status).toHaveBeenCalledWith(404);
       expect(userDb.updateUser).not.toHaveBeenCalled();
     });
+
+    it('removes a legacy scalar-only domain by clearing the scalar fields, not by filtering the (nonexistent) array (CodeRabbit)', async () => {
+      mockRequest.params = { domainId: 'legacy-id' };
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id', emailDomain: 'legacy.com', resendDomainId: 'legacy-id',
+      });
+      (userDb.updateUser as jest.Mock).mockResolvedValue({});
+
+      const handle = getHandler('/email-domains/:domainId', 'delete');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(userDb.updateUser).toHaveBeenCalledWith('test-user-id', { emailDomain: '', resendDomainId: '' });
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'Domain removed.' });
+    });
   });
 
   describe('POST /email-domains/:domainId/verify', () => {
@@ -299,6 +386,20 @@ describe('CRM multi-domain endpoints (ENG-265)', () => {
       expect(resendService.verifyDomain).toHaveBeenCalledWith('d1');
       const jsonCall = (mockResponse.json as jest.Mock).mock.calls[0][0];
       expect(jsonCall.domain.status).toBe('verified');
+    });
+
+    it('verifies a legacy scalar-only domain too (CodeRabbit)', async () => {
+      mockRequest.params = { domainId: 'legacy-id' };
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id', emailDomain: 'legacy.com', resendDomainId: 'legacy-id',
+      });
+      (resendService.verifyDomain as jest.Mock).mockResolvedValue(true);
+      (resendService.getDomain as jest.Mock).mockResolvedValue({ id: 'legacy-id', name: 'legacy.com', status: 'verified', records: [] });
+
+      const handle = getHandler('/email-domains/:domainId/verify', 'post');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(resendService.verifyDomain).toHaveBeenCalledWith('legacy-id');
     });
   });
 
@@ -330,6 +431,54 @@ describe('CRM multi-domain endpoints (ENG-265)', () => {
 
       const jsonCall = (mockResponse.json as jest.Mock).mock.calls[0][0];
       expect(jsonCall.domains).toEqual([]);
+    });
+
+    it('surfaces a legacy scalar-only domain (registered before ENG-265) alongside the array (CodeRabbit)', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id', emailDomain: 'legacy.com', resendDomainId: 'legacy-id',
+      });
+      (resendService.getDomain as jest.Mock).mockResolvedValue({ id: 'legacy-id', name: 'legacy.com', status: 'verified', records: [] });
+
+      const handle = getHandler('/email-domains', 'get');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      const jsonCall = (mockResponse.json as jest.Mock).mock.calls[0][0];
+      expect(jsonCall.domains).toHaveLength(1);
+      expect(jsonCall.domains[0]).toEqual(expect.objectContaining({ id: 'legacy-id', domain: 'legacy.com', status: 'verified' }));
+    });
+
+    it('does not double-count a legacy domain that has already been folded into emailDomains[]', async () => {
+      const migrated = { id: 'legacy-id', domain: 'legacy.com', status: 'verified', addedAt: '2026-01-01T00:00:00.000Z' };
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id', emailDomain: 'legacy.com', resendDomainId: 'legacy-id', emailDomains: [migrated],
+      });
+      (resendService.getDomain as jest.Mock).mockResolvedValue({ id: 'legacy-id', name: 'legacy.com', status: 'verified', records: [] });
+
+      const handle = getHandler('/email-domains', 'get');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      const jsonCall = (mockResponse.json as jest.Mock).mock.calls[0][0];
+      expect(jsonCall.domains).toHaveLength(1);
+    });
+
+    it('falls back to the stored status for one domain whose live Resend lookup fails, instead of failing the whole list (CodeRabbit)', async () => {
+      const entries = [
+        { id: 'd1', domain: 'first.com', status: 'pending', addedAt: '2026-01-01T00:00:00.000Z' },
+        { id: 'd2', domain: 'second.com', status: 'verified', addedAt: '2026-01-02T00:00:00.000Z' },
+      ];
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user-id', emailDomains: entries });
+      (resendService.getDomain as jest.Mock)
+        .mockRejectedValueOnce(new Error('Resend timed out'))
+        .mockResolvedValueOnce({ id: 'd2', name: 'second.com', status: 'verified', records: [] });
+
+      const handle = getHandler('/email-domains', 'get');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(mockResponse.status).not.toHaveBeenCalledWith(500);
+      const jsonCall = (mockResponse.json as jest.Mock).mock.calls[0][0];
+      expect(jsonCall.domains).toHaveLength(2);
+      expect(jsonCall.domains[0]).toEqual(expect.objectContaining({ id: 'd1', status: 'pending', records: [] }));
+      expect(jsonCall.domains[1]).toEqual(expect.objectContaining({ id: 'd2', status: 'verified' }));
     });
   });
 });
