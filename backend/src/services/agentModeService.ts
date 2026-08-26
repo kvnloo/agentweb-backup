@@ -11413,23 +11413,35 @@ export class AgentModeService {
         // 6082779b-f9f1-4e38-a8eb-34abbc3da419) was always a same-user list mixup.
         // Only fall back to the full org-wide getLeadListsForUser (which queries
         // once per org member) when the lead isn't among the caller's own lists.
-        //
-        // AW-LeadLists runs on fixed provisioned capacity in production, so this
-        // best-effort recovery must never make a caller worse off than before it
-        // existed: any failure here (including a throttled read) is swallowed and
-        // falls through to the plain not-found below, unchanged from pre-fix behavior.
-        try {
+        const attemptRecovery = async (): Promise<any> => {
           const ownLists = await crmDb.getLeadListsByUserId(userId);
           const ownListIds = ownLists
             .map((ownList: any) => ownList.listId)
             .filter((ownListId: string) => ownListId && ownListId !== requestedListId);
-          let found = await crmDb.getLeadByIdAcrossLists(ownListIds, leadId);
-          if (!found) {
-            const accessibleLists = await crmDb.getLeadListsForUser(userId);
-            const otherListIds = accessibleLists
-              .map((otherList: any) => otherList.listId)
-              .filter((otherListId: string) => otherListId && otherListId !== requestedListId && !ownListIds.includes(otherListId));
-            found = await crmDb.getLeadByIdAcrossLists(otherListIds, leadId);
+          const foundInOwnLists = await crmDb.getLeadByIdAcrossLists(ownListIds, leadId);
+          if (foundInOwnLists) return foundInOwnLists;
+          const accessibleLists = await crmDb.getLeadListsForUser(userId);
+          const otherListIds = accessibleLists
+            .map((otherList: any) => otherList.listId)
+            .filter((otherListId: string) => otherListId && otherListId !== requestedListId && !ownListIds.includes(otherListId));
+          return crmDb.getLeadByIdAcrossLists(otherListIds, leadId);
+        };
+        // AW-LeadLists runs on fixed provisioned capacity in production, so this
+        // best-effort recovery must never make a caller worse off than before it
+        // existed. The AWS SDK already retries an individual throttled DynamoDB
+        // call a few times internally — a throw here means that already failed,
+        // so blindly retrying again immediately would just pile more load onto
+        // an already-contended table. Instead: wait past a likely short burst,
+        // retry the WHOLE recovery exactly once, and if that also fails, swallow
+        // and fall through to the plain not-found below, unchanged from pre-fix
+        // behavior — never a new or amplified failure mode.
+        try {
+          let found;
+          try {
+            found = await attemptRecovery();
+          } catch {
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            found = await attemptRecovery();
           }
           if (found) {
             lead = found;
@@ -11437,7 +11449,7 @@ export class AgentModeService {
             correctedListId = found.listId;
           }
         } catch {
-          // Best-effort recovery failed — fall through to the ordinary not-found
+          // Recovery failed twice — fall through to the ordinary not-found
           // response below, exactly like before this fix existed.
         }
       }

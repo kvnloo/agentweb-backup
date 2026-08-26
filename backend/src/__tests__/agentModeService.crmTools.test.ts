@@ -973,9 +973,36 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.message).toBe('Lead not found');
     });
 
-    it('ENG-969: degrades to a plain not-found (not a new error) when the recovery lookup itself fails', async () => {
-      // AW-LeadLists runs on fixed provisioned capacity in production — a throttled
-      // read here must never leave the caller worse off than before this fix existed.
+    it('ENG-969: retries the whole recovery once after a throttle, and succeeds on the retry', async () => {
+      // The AWS SDK already retries an individual throttled DynamoDB call a few
+      // times internally, so a throw reaching our code means that already
+      // failed. One bounded retry (after a real pause) still gives a short,
+      // transient burst a second chance to resolve the correction.
+      const otherListId = 'list-def';
+      const otherList = { ...mockList, listId: otherListId, name: 'Other List' };
+      const leadInOtherList = { ...mockLead, listId: otherListId };
+
+      mockCrmDb.getLeadListById.mockImplementation((id: string) =>
+        Promise.resolve(id === otherListId ? (otherList as any) : (mockList as any))
+      );
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId
+        .mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'))
+        .mockResolvedValueOnce([mockList, otherList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValueOnce(leadInOtherList as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.listId).toBe(otherListId);
+      expect(mockCrmDb.getLeadListsByUserId).toHaveBeenCalledTimes(2);
+    });
+
+    it('ENG-969: degrades to a plain not-found (not a new error) when the recovery lookup fails on both attempts', async () => {
+      // AW-LeadLists runs on fixed provisioned capacity in production — a sustained
+      // throttle here must never leave the caller worse off than before this fix existed.
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(null as any);
       mockCrmDb.getLeadListsByUserId.mockRejectedValue(new Error('ProvisionedThroughputExceededException'));
@@ -987,19 +1014,22 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.error).toBe('The specified lead does not exist in this list');
       // Must NOT surface as the generic catch-all 'Failed to get lead details'.
       expect(mockCrmDb.getLeadListsForUser).not.toHaveBeenCalled();
+      // Proves the retry actually happened, not just a single attempt.
+      expect(mockCrmDb.getLeadListsByUserId).toHaveBeenCalledTimes(2);
     });
 
-    it('ENG-969: degrades to a plain not-found when tier 2 itself throws', async () => {
+    it('ENG-969: degrades to a plain not-found when tier 2 throws on both attempts', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(null as any);
       mockCrmDb.getLeadListsByUserId.mockResolvedValue([mockList] as any);
-      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValueOnce(null as any); // tier 1 miss
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(null as any); // tier 1 always misses
       mockCrmDb.getLeadListsForUser.mockRejectedValue(new Error('ProvisionedThroughputExceededException'));
 
       const result = await service.getLeadDetails(listId, leadId, userId);
 
       expect(result.success).toBe(false);
       expect(result.message).toBe('Lead not found');
+      expect(mockCrmDb.getLeadListsForUser).toHaveBeenCalledTimes(2);
     });
 
     it('should expose enrichmentMetadata provenance so the agent can cite data sources', async () => {
