@@ -23,7 +23,13 @@ jest.mock('../controllers/templates', () => ({
 import { Request, Response } from 'express';
 import { userDb } from '../services/db';
 import { resendService } from '../services/resendService';
+import { claimEmailDomain, EmailDomainAlreadyClaimedError } from '../services/emailDomainClaimService';
 import router from '../routes/crm';
+
+jest.mock('../services/emailDomainClaimService', () => ({
+  ...jest.requireActual('../services/emailDomainClaimService'),
+  claimEmailDomain: jest.fn().mockResolvedValue(undefined),
+}));
 
 // Mock dependencies
 jest.mock('../services/db', () => ({
@@ -190,6 +196,26 @@ describe('CRM Email Domain Endpoints', () => {
 
       expect(mockResponse.status).toHaveBeenCalledWith(409);
       expect(mockResponse.json).toHaveBeenCalledWith({ message: 'This domain is already in use by another account' });
+    });
+
+    it('goes through the atomic claim protocol too — a claim conflict wins even when the eventually-consistent scan missed it (CodeRabbit)', async () => {
+      // This legacy singular route previously bypassed claimEmailDomain() entirely, letting a
+      // concurrent request race past it the same way the plural route's own scan-only check
+      // could be raced — the getUsersByEmailDomain scan below finds nothing (simulating the
+      // TOCTOU gap: eventually consistent, or the race landed between this read and the
+      // write), but the atomic claim must still catch it.
+      mockRequest.body = { domain: 'raced.com' };
+      (userDb.getUsersByEmailDomain as jest.Mock).mockResolvedValue([]);
+      (claimEmailDomain as jest.Mock).mockRejectedValueOnce(
+        new EmailDomainAlreadyClaimedError('raced.com', 'other-user-id'),
+      );
+
+      const handle = getHandler('/email-domain', 'post');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(mockResponse.status).toHaveBeenCalledWith(409);
+      expect(resendService.createDomain).not.toHaveBeenCalled();
+      expect(userDb.updateUser).not.toHaveBeenCalled();
     });
 
     it('should allow same user to re-register their domain', async () => {

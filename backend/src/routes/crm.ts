@@ -5211,53 +5211,79 @@ router.post('/email-domain', async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'Invalid domain format' });
     }
 
-    // Check if another user already has this domain
+    // Check if another user already has this domain — fast-fail UX check only (eventually
+    // consistent scan, TOCTOU-prone on its own); claimEmailDomain() below is the actual
+    // cross-user correctness guarantee (ENG-265: this legacy singular route previously bypassed
+    // that protocol entirely, letting it race the plural route's own protection).
     const usersWithDomain = await userDb.getUsersByEmailDomain(normalizedDomain);
     const otherUserWithDomain = usersWithDomain.find(u => u.userId !== userId);
     if (otherUserWithDomain) {
       return res.status(409).json({ message: 'This domain is already in use by another account' });
     }
 
-    // Check if domain already exists in Resend
-    const existingDomains = await resendService.listDomains();
-    const existingDomain = existingDomains.find(d => d.name === normalizedDomain);
+    try {
+      await claimEmailDomain(userId, normalizedDomain);
+    } catch (claimError: any) {
+      if (claimError instanceof EmailDomainAlreadyClaimedError) {
+        return res.status(409).json({ message: 'This domain is already in use by another account' });
+      }
+      throw claimError;
+    }
 
-    if (existingDomain) {
-      // Domain already exists in Resend — return its current status and records
-      const domainDetails = await resendService.getDomain(existingDomain.id);
-      if (!domainDetails) {
-        return res.status(500).json({ message: 'Failed to retrieve existing domain details' });
+    try {
+      // Check if domain already exists in Resend
+      const existingDomains = await resendService.listDomains();
+      const existingDomain = existingDomains.find(d => d.name === normalizedDomain);
+
+      if (existingDomain) {
+        // Domain already exists in Resend — return its current status and records
+        const domainDetails = await resendService.getDomain(existingDomain.id);
+        if (!domainDetails) {
+          await releaseEmailDomainClaim(normalizedDomain, userId);
+          return res.status(500).json({ message: 'Failed to retrieve existing domain details' });
+        }
+
+        // Save the resend domain ID and domain to the user record
+        await userDb.updateUser(userId, {
+          emailDomain: normalizedDomain,
+          resendDomainId: existingDomain.id,
+        });
+        await confirmEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+          console.error(`CRITICAL: failed to confirm email domain claim for "${normalizedDomain}" (user ${userId}) after retries — claim may expire and be taken over:`, e));
+
+        return res.json({
+          message: 'Domain already registered in Resend',
+          domain: domainDetails,
+          alreadyExists: true,
+        });
+      }
+
+      // Create new domain in Resend
+      const result = await resendService.createDomain(normalizedDomain);
+      if (!result) {
+        await releaseEmailDomainClaim(normalizedDomain, userId);
+        return res.status(500).json({ message: 'Failed to create domain in Resend' });
       }
 
       // Save the resend domain ID and domain to the user record
       await userDb.updateUser(userId, {
         emailDomain: normalizedDomain,
-        resendDomainId: existingDomain.id,
+        resendDomainId: result.id,
       });
+      await confirmEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+        console.error(`CRITICAL: failed to confirm email domain claim for "${normalizedDomain}" (user ${userId}) after retries — claim may expire and be taken over:`, e));
 
-      return res.json({
-        message: 'Domain already registered in Resend',
-        domain: domainDetails,
-        alreadyExists: true,
+      res.json({
+        message: 'Domain created successfully. Add the DNS records below to verify.',
+        domain: result,
       });
+    } catch (innerError) {
+      // The claim succeeded but a later step didn't — release it so the domain isn't
+      // permanently stuck unclaimable by anyone.
+      await releaseEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+        console.error(`Failed to release email domain claim for "${normalizedDomain}" after a failed registration:`, e));
+      throw innerError;
     }
-
-    // Create new domain in Resend
-    const result = await resendService.createDomain(normalizedDomain);
-    if (!result) {
-      return res.status(500).json({ message: 'Failed to create domain in Resend' });
-    }
-
-    // Save the resend domain ID and domain to the user record
-    await userDb.updateUser(userId, {
-      emailDomain: normalizedDomain,
-      resendDomainId: result.id,
-    });
-
-    res.json({
-      message: 'Domain created successfully. Add the DNS records below to verify.',
-      domain: result,
-    });
   } catch (error: any) {
     console.error('Error creating email domain:', error);
     res.status(500).json({ message: error.message || 'Failed to create email domain' });
