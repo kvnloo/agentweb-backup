@@ -248,14 +248,19 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(elapsedMs).toBeLessThanOrEqual(CAP_MS);
   });
 
-  it('falls back to the time-limit message, not the ledger recap, when the forced synthesis returns residue (ENG-1576)', async () => {
-    // Same failure family as the empty-content case above, but reached via the
-    // residue guard (ENG-1054) instead: the forced-final-synthesis turn comes back
-    // with structural JSON debris ("}]") rather than nothing. isUnusableSynthesis
-    // flags it and synthesisResidueDropped becomes true — before this fix, that
-    // branch set `content` to the generic executed-action ledger unconditionally,
-    // pre-empting the dedicated time-limit message exactly like the plain-empty
-    // case above, just reached via a different trigger (CodeRabbit finding, PR #2639).
+  it('still prefers the ledger recap over the time-limit message when the forced synthesis returns residue (ENG-1576 correction)', async () => {
+    // A forced-final-synthesis turn (truncatedByTimeBudget) can ALSO produce
+    // residue-shaped output ("}]") — isUnusableSynthesis runs unconditionally, so
+    // the two flags are not mutually exclusive (CodeRabbit question, PR #2639). An
+    // earlier revision of this fix made that combination defer to the generic
+    // time-limit message instead of the ledger recap — but that's wrong:
+    // synthesisResidueDropped also covers ENG-1188's echoed-nudge detection
+    // (including the wall-clock nudge specifically — see nudgeEchoRecovery.test.ts's
+    // "recovers with the executed-action ledger when the forced synthesis turn
+    // echoes the time-budget nudge"), and ENG-1188's entire point is that an echoed
+    // nudge must never reach the user, EVEN under time-budget truncation. Since
+    // isUnusableSynthesis gives the caller no way to distinguish plain residue from
+    // a nudge echo, the ledger recap has to win for both — reverted to match.
     const { result, elapsedMs, finalSynthesisPerCall } = await runRealLoop((call, isFinalSynthesis) =>
       isFinalSynthesis
         ? { content: '}]' }
@@ -266,8 +271,9 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     );
 
     expect(result.truncatedByTimeBudget).toBe(true);
-    expect(result.content).toMatch(/time limit/i);
-    expect(result.content).not.toMatch(/built directly from the actions I actually ran/);
+    expect(result.content).toMatch(/built directly from the actions I actually ran/);
+    expect(result.content).toContain('twitter_outreach');
+    expect(result.content).not.toMatch(/time limit/i);
     expect(finalSynthesisPerCall.filter(Boolean)).toHaveLength(1);
     expect(elapsedMs).toBeLessThanOrEqual(CAP_MS);
   });
