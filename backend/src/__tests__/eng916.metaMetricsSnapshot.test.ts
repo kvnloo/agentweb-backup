@@ -61,6 +61,21 @@ function makeLead(campaign: string | undefined, createdAt: string) {
   };
 }
 
+/**
+ * ENG-1601: the OTHER shape production actually delivers — the campaign id sits in the
+ * free-form `customFields` bag and there is no `firstTouch` at all. 13 of Haven's 36 tagged
+ * inbound leads looked like this, and the join dropped every one of them.
+ */
+function makeCustomFieldsLead(campaign: string | undefined, createdAt: string) {
+  return {
+    leadId: `cf_lead_${createdAt}`,
+    listId: 'list_test',
+    createdAt,
+    // no firstTouch, deliberately
+    customFields: campaign ? { utm_campaign: campaign } : { role: 'CTO' },
+  };
+}
+
 describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
   beforeEach(() => {
     jest.resetAllMocks();
@@ -589,5 +604,91 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
     for (const call of (global.fetch as jest.Mock).mock.calls) {
       expect(call[1]?.signal).toBeInstanceOf(AbortSignal);
     }
+  });
+});
+
+describe('ENG-1601 leads whose campaign id lives only in customFields', () => {
+  const INSIGHTS = () => ({
+    ok: true,
+    json: async () => makeCampaignInsightsResponse([
+      { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '10.50', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10.5', frequency: '1.2' },
+    ]),
+  });
+
+  it('attributes a lead whose campaign id is ONLY in customFields', async () => {
+    // This is the production shape that was silently dropped: no firstTouch at all, a valid
+    // campaign id in the free-form bag. 13 of Haven's 36 tagged inbound leads looked like this.
+    (global.fetch as jest.Mock).mockResolvedValue(INSIGHTS());
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [makeCustomFieldsLead('120244135557390173', `${TEST_DATE}T10:00:00.000Z`)],
+      lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+
+    expect(result.leadCount).toBe(1);
+    expect(result.unattributedLeadCount).toBe(0);
+    expect(mockAdsDb.putSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({ campaignId: '120244135557390173', leadCount: 1 })
+    );
+  });
+
+  it('counts BOTH shapes together — this is the +57% the fix recovers', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(INSIGHTS());
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [
+        makeLead('120244135557390173', `${TEST_DATE}T10:00:00.000Z`),             // structured
+        makeCustomFieldsLead('120244135557390173', `${TEST_DATE}T11:00:00.000Z`), // bag only
+      ],
+      lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    expect(result.leadCount).toBe(2);
+    expect(result.unattributedLeadCount).toBe(0);
+  });
+
+  it('lets a structured firstTouch WIN over customFields — promotion only gap-fills', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(INSIGHTS());
+    const conflicted: any = makeLead('120244135557390173', `${TEST_DATE}T10:00:00.000Z`);
+    conflicted.customFields = { utm_campaign: 'some-other-campaign' };
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [conflicted], lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    expect(result.leadCount).toBe(1); // matched on the structured value, not the bag
+  });
+
+  it('still counts a lead with neither shape as unattributed', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(INSIGHTS());
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [makeCustomFieldsLead(undefined, `${TEST_DATE}T10:00:00.000Z`)],
+      lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    expect(result.leadCount).toBe(0);
+    expect(result.unattributedLeadCount).toBe(1);
+  });
+
+  it('does NOT let the free-form bag defeat the ambiguity guard', async () => {
+    // Two campaigns sharing a name: a promoted value that resolves to both must stay
+    // unattributed, exactly as a structured one would. Promotion must not widen what counts.
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => makeCampaignInsightsResponse([
+        { campaign_id: '111', campaign_name: 'Spring Sale', spend: '5', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+        { campaign_id: '222', campaign_name: 'Spring Sale', spend: '5', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+      ]),
+    });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [makeCustomFieldsLead('Spring Sale', `${TEST_DATE}T10:00:00.000Z`)],
+      lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    expect(result.leadCount).toBe(0);
+    expect(result.unattributedLeadCount).toBe(1);
   });
 });
