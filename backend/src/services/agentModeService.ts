@@ -5282,6 +5282,13 @@ export class AgentModeService {
     'search_knowledge_base',
     'list_knowledge_base_files',
     'read_knowledge_base_files',
+    // Sibling of read_knowledge_base_files for images/video — same gate class as
+    // ENG-152/ENG-260 below: without this, materializing a KB image/video is
+    // invisible on any subscription tier whose allowedSkills doesn't unlock
+    // __other_skills__ (confirmed live: Gemini correctly named the tool, then
+    // reported it "not available on your subscription" because installing
+    // __other_skills__ itself was rejected).
+    'materialize_knowledge_base_asset',
     'you_search_web',         // Explicit You.com web search
     'you_search_news',        // Explicit You.com news search
 
