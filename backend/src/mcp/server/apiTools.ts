@@ -332,6 +332,7 @@ mcpToolRegistry.register({
       required: []
     }
   },
+  /** Lists tasks for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'GET',
@@ -509,6 +510,7 @@ mcpToolRegistry.register({
       required: []
     }
   },
+  /** Lists scheduled chats for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'GET',
@@ -892,6 +894,7 @@ mcpToolRegistry.register({
       required: []
     }
   },
+  /** Lists lead lists for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'GET',
@@ -968,10 +971,19 @@ mcpToolRegistry.register({
       required: ['action', 'list_id']
     }
   },
+  /**
+   * CRUD dispatch for a lead list's leads. `args.client_id` (admin-only) scopes
+   * `list`/`get` to a specific client's list; `add`/`update`/`delete` reject it
+   * outright (ENG-1557: cross-account writes are pending authorization review).
+   */
   execute: async (args: any, context: any) => {
     const listId = args.list_id;
     const isWriteAction = args.action === 'add' || args.action === 'update' || args.action === 'delete';
-    const hasClientId = typeof args.client_id === 'string' && args.client_id.trim() !== '';
+    // CodeRabbit (PR #2651): reject ANY present client_id on a write action,
+    // not just non-empty strings — a number/object/boolean is still "provided,"
+    // and the earlier string-only check let those silently fall through to a
+    // caller-scoped write instead of being rejected loudly.
+    const hasClientId = args.client_id !== undefined && args.client_id !== null;
     if (isWriteAction && hasClientId) {
       // ENG-1557: cross-account mutation via client_id needs its own authorization
       // contract (staff roles, attribution, audit) before it ships — reads
@@ -1050,6 +1062,7 @@ mcpToolRegistry.register({
       required: ['list_id', 'filters']
     }
   },
+  /** Searches leads for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/search-leads', context: await resolveClientScopedContext(context, args.client_id, 'search_leads'),
@@ -1446,6 +1459,7 @@ Admin-only: pass client_id to list a specific client's connected accounts instea
       required: []
     }
   },
+  /** Lists connected accounts for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
     const qp: Record<string, string> = {};
     if (args.platform) qp.platform = args.platform;
@@ -3431,6 +3445,7 @@ mcpToolRegistry.register({
       required: []
     }
   },
+  /** Reports the caller's own account status, or (admin-only) `args.client_id`'s. */
   execute: async (args: any, context: any) => {
     const c = await resolveClientScopedContext(context, args?.client_id, 'get_account_status');
 

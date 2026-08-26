@@ -7269,12 +7269,15 @@ for (const toolName of bridgedToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);
   if (handler) {
     const selfOnly = SELF_ONLY_BRIDGE_DEFINITIONS[toolName];
-    // CodeRabbit (PR #2651): the schema swap above keeps client_id out of what
-    // the model is TOLD about, but the underlying execute is the same function
-    // the admin external-MCP surface uses — it would still honor a client_id
-    // that slipped through anyway (e.g. a hallucinated arg, or an admin's own
-    // in-app chat). Strip it here, unconditionally, for every in-app caller
-    // (admin or not) — the in-app bridge stays self-scoped, full stop.
+    /**
+     * Bridged execute for this tool. For a self-only entry, strips
+     * `client_id` unconditionally before delegating — CodeRabbit (PR #2651):
+     * the schema swap above keeps `client_id` out of what the model is TOLD
+     * about, but the underlying execute is the same function the admin
+     * external-MCP surface uses, and would still honor one that slipped
+     * through anyway (a hallucinated arg, or an admin's own in-app chat).
+     * The in-app bridge stays self-scoped, full stop, for every caller.
+     */
     const execute = selfOnly
       ? (args: any, context: any) => handler.execute({ ...args, client_id: undefined }, context)
       : handler.execute;

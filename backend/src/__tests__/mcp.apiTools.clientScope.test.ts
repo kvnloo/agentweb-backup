@@ -162,6 +162,22 @@ describe('admin client_id scoping — end to end (ENG-1596)', () => {
       expect(mockMcpFetch).not.toHaveBeenCalled();
     });
 
+    // CodeRabbit (PR #2651): the guard originally only checked for a non-empty
+    // STRING client_id — a malformed value (number, object) silently fell
+    // through to a caller-scoped write instead of being rejected.
+    it('rejects a malformed (non-string) client_id on action:add too', async () => {
+      await expect(
+        mcpToolRegistry.execute('manage_leads', {
+          action: 'add',
+          list_id: 'list-1',
+          leads: [{ email: 'lead@example.com' }],
+          client_id: 12345,
+        }, callerContext)
+      ).rejects.toThrow('client_id is not supported for manage_leads action "add"');
+
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+    });
+
     it('rejects client_id on action:delete', async () => {
       await expect(
         mcpToolRegistry.execute('manage_leads', {

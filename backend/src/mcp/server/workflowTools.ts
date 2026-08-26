@@ -243,6 +243,7 @@ mcpToolRegistry.register({
       },
     },
   },
+  /** Reports the caller's own account status, or (admin-only) `args.client_id`'s. */
   execute: async (args: any, context: any) => {
     const me: any = await mcpFetch({ method: 'GET', path: '/api/auth/me', context: await resolveClientScopedContext(context, args?.client_id, 'emma_get_account_status') });
     return jsonResult({

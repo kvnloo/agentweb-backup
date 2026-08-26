@@ -95,6 +95,13 @@ function getBaseUrl(): string {
   return `http://localhost:${port}`;
 }
 
+/**
+ * Make an authenticated self-call to the backend REST API on behalf of an MCP
+ * tool. Mints a short-lived self-call JWT for `context.userId`/`agentUserId`
+ * unless `context.overrideToken` is already set (ENG-1596: a client-scoped
+ * call that already carries a pre-minted delegate token for the target
+ * client), in which case that token is used as-is.
+ */
 export async function mcpFetch(options: McpFetchOptions): Promise<any> {
   const { method, path, context, body, queryParams } = options;
 
