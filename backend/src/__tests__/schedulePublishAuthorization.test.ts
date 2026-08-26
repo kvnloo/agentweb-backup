@@ -522,10 +522,40 @@ describe('isPublishCallWithinAuthorizedScope (ENG-1599)', () => {
     ).toBe(false);
   });
 
-  it('is false on an empty grant', () => {
+  // Not `tools: []` — an empty grant short-circuits `tools.some(...)` trivially,
+  // before EQUIVALENT_PUBLISH_ROUTES is ever consulted, so it passes regardless of
+  // whether the route logic below is correct. A non-empty grant naming a tool with
+  // no route to post_on_connected_account actually exercises that logic.
+  it('does NOT authorize post_on_connected_account for a grant naming an unrelated tool with no route to it', () => {
     expect(
-      isPublishCallWithinAuthorizedScope('post_on_connected_account', { platform: 'twitter' }, [])
+      isPublishCallWithinAuthorizedScope('post_on_connected_account', { platform: 'twitter' }, ['publish_blog_article'])
     ).toBe(false);
+  });
+});
+
+/**
+ * ENG-1599 review (security) — `postOnConnectedAccount` (agentModeService.ts) resolves
+ * the account to post to by `account_id` FIRST and ignores `platform` entirely whenever
+ * `account_id` is present. Trusting `args.platform` here regardless would let a call that
+ * names a mismatched (e.g. non-twitter) `account_id` alongside `platform: 'twitter'` pass
+ * a twitter-only grant and actually publish to that account_id's real, unauthorized
+ * platform.
+ */
+describe('isPublishCallWithinAuthorizedScope — fails closed when account_id is present (ENG-1599 review)', () => {
+  it('does NOT authorize a call naming account_id even with a matching platform claim', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope(
+        'post_on_connected_account',
+        { platform: 'twitter', account_id: 'some-account-id' },
+        ['twitter_manage_post']
+      )
+    ).toBe(false);
+  });
+
+  it('still authorizes on platform alone when no account_id is given', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope('post_on_connected_account', { platform: 'twitter' }, ['twitter_manage_post'])
+    ).toBe(true);
   });
 });
 
