@@ -215,6 +215,24 @@ export function leadTotals(actions: MetaAction[] | undefined | null): FamilyTota
  * copies, and one-implementation-for-both is the entire point of this change. Counters are
  * initialised defensively (`|| 0`) so both an accumulator that pre-seeds them to 0 and one that
  * leaves them undefined behave the same.
+ *
+ * ROW SEMANTICS — counts ADD across rows, aliases take the MAX within a row.
+ *
+ * `action_breakdowns=action_type` does NOT split an entity into several rows; it structures the
+ * `actions` array INSIDE one row. Measured against a live account at all three levels: campaign
+ * 2 rows / 2 campaigns, adset 4/4, ad 10/10 — never more than one row per entity, each carrying
+ * ~26 action entries. So the two operations never collide today.
+ *
+ * Adding across rows is also the CORRECT behaviour for the query shapes that do produce several
+ * rows per entity — `time_increment` (one row per day) and `breakdowns` (one row per segment).
+ * Taking a max across rows instead would silently collapse a 30-day series into its largest
+ * single day, so it must not be "fixed" that way.
+ *
+ * Cost cannot be taken from an arbitrary row when several contribute: first-wins and last-wins
+ * are both order-dependent. So a row's reported cost is used only while it is the ONLY opinion;
+ * as soon as a second row disagrees the value is cleared, which hands the decision to the
+ * caller's `cost || spend / leads` fallback — the correct figure for an aggregate anyway. That
+ * is order-independent: any disagreement produces the same result whichever row arrives first.
  */
 export function applyLeadMetrics(target: any, row: any): void {
   const totals = leadTotals(row?.actions);
@@ -222,8 +240,19 @@ export function applyLeadMetrics(target: any, row: any): void {
   target.formLeads = (target.formLeads || 0) + totals.instantForm;
 
   const cost = selectLeadCost(row?.cost_per_action_type);
-  if (cost.website !== null) target.costPerWebsiteLead = cost.website;
-  if (cost.instantForm !== null) target.costPerFormLead = cost.instantForm;
+  applyCost(target, 'costPerWebsiteLead', cost.website);
+  applyCost(target, 'costPerFormLead', cost.instantForm);
+}
+
+/** See the ROW SEMANTICS note above: unanimous rows keep the value, disagreement clears it. */
+function applyCost(target: any, field: string, proposed: number | null): void {
+  if (proposed === null) return;
+  const current = target[field];
+  if (!current) {
+    target[field] = proposed;
+  } else if (current !== proposed) {
+    target[field] = 0; // disagreement -> let the caller derive it from spend / leads
+  }
 }
 
 /**

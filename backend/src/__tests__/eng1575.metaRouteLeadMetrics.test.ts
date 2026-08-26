@@ -80,6 +80,32 @@ describe('ENG-1575 routes/meta applyLeadMetrics', () => {
     expect(totalOf(t)).toBe(12);
   });
 
+  it('keeps cost deterministic across multiple rows regardless of order', () => {
+    // CodeRabbit: cost was last-wins, so a multi-row result made the reported figure depend on
+    // the order Meta returned rows in. Now first-wins. (Measured: action_breakdowns=action_type
+    // never returns >1 row per entity — campaign 2/2, adset 4/4, ad 10/10 — but time_increment
+    // and breakdowns do, and this must not depend on ordering there either.)
+    const rowA = { actions: [act('lead', 5)], cost_per_action_type: [act('lead', 40)] };
+    const rowB = { actions: [act('lead', 7)], cost_per_action_type: [act('lead', 90)] };
+    const fwd = blank(); applyLeadMetrics(fwd, rowA); applyLeadMetrics(fwd, rowB);
+    const rev = blank(); applyLeadMetrics(rev, rowB); applyLeadMetrics(rev, rowA);
+    // Counts ADD across rows — correct for daily/segment rows, which is what multi-row means.
+    expect(totalOf(fwd)).toBe(12);
+    expect(totalOf(rev)).toBe(12);
+    // Cost must not swing on row order. The rows disagree (40 vs 90), so neither is adopted —
+    // cleared to 0 so the caller's `cost || spend / leads` fallback derives the aggregate.
+    expect(fwd.costPerWebsiteLead).toBe(rev.costPerWebsiteLead);
+    expect(fwd.costPerWebsiteLead).toBe(0);
+  });
+
+  it('keeps a unanimous cost across rows', () => {
+    const t = blank();
+    applyLeadMetrics(t, { actions: [act('lead', 5)], cost_per_action_type: [act('lead', 40)] });
+    applyLeadMetrics(t, { actions: [act('lead', 7)], cost_per_action_type: [act('lead', 40)] });
+    expect(totalOf(t)).toBe(12);
+    expect(t.costPerWebsiteLead).toBe(40);
+  });
+
   it('tolerates rows with no actions', () => {
     const t = blank();
     applyLeadMetrics(t, {});
