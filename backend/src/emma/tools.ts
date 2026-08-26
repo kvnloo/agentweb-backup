@@ -7245,13 +7245,48 @@ const adminToolNames = [
   'get_landing_page_effective_view',
 ];
 
+// ENG-1596 added an admin-only `client_id` param to these tools' mcpToolRegistry
+// definitions (external MCP admin surface), so an admin's own MCP session can
+// scope the call to a specific client. That param must NOT leak into the
+// in-app bridge below: every logged-in customer (not just admins) gets these
+// as self-serve tools, and `resolveClientScopedContext` treats client_id as
+// admin-only regardless — so a non-admin customer could never use it, it would
+// just be confusing schema noise (exactly the "asked me for my email instead
+// of reporting my own account" bug this bridge already guards against, see
+// mcpGetAccountStatusExposure.test.ts). Same `execute`, self-only schema.
+const SELF_ONLY_BRIDGE_DEFINITIONS: Record<string, { description: string; inputSchema: any }> = {
+  get_account_status: {
+    description: "Get the current user's account status, subscription plan, and usage.",
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  list_scheduled_chats: {
+    description: 'List all scheduled chats for the authenticated user.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+};
+
 for (const toolName of bridgedToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);
   if (handler) {
+    const selfOnly = SELF_ONLY_BRIDGE_DEFINITIONS[toolName];
+    /**
+     * Bridged execute for this tool. For a self-only entry, strips
+     * `client_id` unconditionally before delegating — CodeRabbit (PR #2651):
+     * the schema swap above keeps `client_id` out of what the model is TOLD
+     * about, but the underlying execute is the same function the admin
+     * external-MCP surface uses, and would still honor one that slipped
+     * through anyway (a hallucinated arg, or an admin's own in-app chat).
+     * The in-app bridge stays self-scoped, full stop, for every caller.
+     */
+    const execute = selfOnly
+      ? (args: any, context: any) => handler.execute({ ...args, client_id: undefined }, context)
+      : handler.execute;
     emmaToolRegistry.register({
       name: handler.name,
-      definition: handler.definition,
-      execute: handler.execute,
+      definition: selfOnly
+        ? { ...handler.definition, description: selfOnly.description, inputSchema: selfOnly.inputSchema }
+        : handler.definition,
+      execute,
     });
   } else {
     console.warn(`[emma/tools] Failed to bridge tool "${toolName}" — not found in mcpToolRegistry`);
