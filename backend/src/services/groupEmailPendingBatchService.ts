@@ -87,6 +87,17 @@ export async function upsertPendingBatch(
   expectedUpdatedAt: string | null,
 ): Promise<void> {
   const { listId, ...fields } = batch;
+  // The CAS token IS updatedAt, and new Date() is millisecond-resolution — a write landing in
+  // the same millisecond as the updatedAt it guards against could rewrite the identical value,
+  // leaving the token unchanged and letting a second, still-stale writer's precondition also
+  // pass against a record it never read. Force the replacement strictly past the precondition
+  // so any successful write MOVES the token (same pattern as crmDb.addLeadEngagement /
+  // orgDb.updateShareSettings in db.ts, ENG-787).
+  let updatedAt = new Date().toISOString();
+  if (expectedUpdatedAt !== null && updatedAt <= expectedUpdatedAt) {
+    const bumped = new Date(new Date(expectedUpdatedAt).getTime() + 1);
+    if (!Number.isNaN(bumped.getTime())) updatedAt = bumped.toISOString();
+  }
   try {
     await client()
       .put({
@@ -95,7 +106,7 @@ export async function upsertPendingBatch(
           userId,
           configId: pendingBatchConfigId(listId),
           ...fields,
-          updatedAt: new Date().toISOString(),
+          updatedAt,
         },
         ...(expectedUpdatedAt === null
           ? { ConditionExpression: 'attribute_not_exists(configId)' }

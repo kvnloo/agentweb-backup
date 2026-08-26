@@ -46,7 +46,13 @@ function client(): AWS.DynamoDB.DocumentClient {
   return cachedClient;
 }
 
-/** Atomically claim a domain for userId. Throws EmailDomainAlreadyClaimedError if already claimed. */
+/**
+ * Atomically claim a domain for userId. Throws EmailDomainAlreadyClaimedError if already
+ * claimed. The claim starts UNCONFIRMED — call confirmEmailDomainClaim once the caller's
+ * later emailDomains[] write actually succeeds. Only an unconfirmed claim can be taken over
+ * by the staleness window below; a confirmed claim is a real, completed registration and
+ * must never expire, or two accounts could end up owning the same domain.
+ */
 export async function claimEmailDomain(userId: string, normalizedDomain: string): Promise<void> {
   const staleBefore = new Date(Date.now() - CLAIM_STALE_MS).toISOString();
   try {
@@ -59,7 +65,8 @@ export async function claimEmailDomain(userId: string, normalizedDomain: string)
           ownerUserId: userId,
           claimedAt: new Date().toISOString(),
         },
-        ConditionExpression: 'attribute_not_exists(configId) OR claimedAt < :staleBefore',
+        ConditionExpression:
+          'attribute_not_exists(configId) OR (attribute_not_exists(confirmed) AND claimedAt < :staleBefore)',
         ExpressionAttributeValues: { ':staleBefore': staleBefore },
       })
       .promise();
@@ -76,6 +83,32 @@ export async function claimEmailDomain(userId: string, normalizedDomain: string)
       })
       .promise();
     throw new EmailDomainAlreadyClaimedError(normalizedDomain, existing.Item?.ownerUserId ?? 'another account');
+  }
+}
+
+/**
+ * Promote a claim to confirmed once the caller's emailDomains[] write has actually landed, so
+ * the abandoned-claim staleness window in claimEmailDomain no longer applies to it. Conditioned
+ * on the caller still being the current owner (mirrors releaseEmailDomainClaim) — a failed
+ * condition means this claim was already superseded, which is a no-op, not an error.
+ */
+export async function confirmEmailDomainClaim(normalizedDomain: string, ownerUserId: string): Promise<void> {
+  try {
+    await client()
+      .update({
+        TableName: CONFIGS_TABLE,
+        Key: { userId: CLAIM_PARTITION, configId: claimConfigId(normalizedDomain) },
+        UpdateExpression: 'SET confirmed = :true, confirmedAt = :now',
+        ConditionExpression: 'ownerUserId = :ownerUserId',
+        ExpressionAttributeValues: {
+          ':true': true,
+          ':now': new Date().toISOString(),
+          ':ownerUserId': ownerUserId,
+        },
+      })
+      .promise();
+  } catch (err: any) {
+    if (err?.code !== 'ConditionalCheckFailedException') throw err;
   }
 }
 

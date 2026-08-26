@@ -222,7 +222,7 @@ import {
 } from '../services/crmSenderService';
 import { MAILBOX_PROVIDERS, CrmSender, isMailboxSender } from '../services/crmSenderTypes';
 import { sendAsSender, SenderDailyLimitExceededError } from '../services/sendAsSender';
-import { claimEmailDomain, releaseEmailDomainClaim, EmailDomainAlreadyClaimedError } from '../services/emailDomainClaimService';
+import { claimEmailDomain, releaseEmailDomainClaim, confirmEmailDomainClaim, EmailDomainAlreadyClaimedError } from '../services/emailDomainClaimService';
 import { getPendingBatch, upsertPendingBatch, deletePendingBatch, PendingBatchConflictError } from '../services/groupEmailPendingBatchService';
 import { effectiveDailyLimit } from '../services/senderUsageTracker';
 import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
@@ -5532,6 +5532,12 @@ router.post('/email-domains', async (req: Request, res: Response) => {
           expectedSize = freshDomains.length;
         }
       }
+
+      // The emailDomains[] write landed — promote the claim to confirmed so the abandoned-claim
+      // staleness window in claimEmailDomain no longer applies to it (a completed registration
+      // must never expire and become takeable by another account).
+      await confirmEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+        console.error('Failed to confirm email domain claim:', e));
 
       res.json({
         message: alreadyExists
