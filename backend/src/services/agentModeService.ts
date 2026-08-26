@@ -11407,15 +11407,38 @@ export class AgentModeService {
         // than the lead not existing at all — see getLeadByIdAcrossLists. Only search
         // lists this user already has access to, so this can't leak a lead the caller
         // couldn't otherwise see.
-        const accessibleLists = await crmDb.getLeadListsForUser(userId);
-        const otherListIds = accessibleLists
-          .map((otherList: any) => otherList.listId)
-          .filter((otherListId: string) => otherListId && otherListId !== requestedListId);
-        const found = await crmDb.getLeadByIdAcrossLists(otherListIds, leadId);
-        if (found) {
-          lead = found;
-          listId = found.listId;
-          correctedListId = found.listId;
+        //
+        // Tiered on purpose: try the caller's OWN lists first — one cheap query,
+        // no fan-out — since the production case this fixes (session
+        // 6082779b-f9f1-4e38-a8eb-34abbc3da419) was always a same-user list mixup.
+        // Only fall back to the full org-wide getLeadListsForUser (which queries
+        // once per org member) when the lead isn't among the caller's own lists.
+        //
+        // AW-LeadLists runs on fixed provisioned capacity in production, so this
+        // best-effort recovery must never make a caller worse off than before it
+        // existed: any failure here (including a throttled read) is swallowed and
+        // falls through to the plain not-found below, unchanged from pre-fix behavior.
+        try {
+          const ownLists = await crmDb.getLeadListsByUserId(userId);
+          const ownListIds = ownLists
+            .map((ownList: any) => ownList.listId)
+            .filter((ownListId: string) => ownListId && ownListId !== requestedListId);
+          let found = await crmDb.getLeadByIdAcrossLists(ownListIds, leadId);
+          if (!found) {
+            const accessibleLists = await crmDb.getLeadListsForUser(userId);
+            const otherListIds = accessibleLists
+              .map((otherList: any) => otherList.listId)
+              .filter((otherListId: string) => otherListId && otherListId !== requestedListId && !ownListIds.includes(otherListId));
+            found = await crmDb.getLeadByIdAcrossLists(otherListIds, leadId);
+          }
+          if (found) {
+            lead = found;
+            listId = found.listId;
+            correctedListId = found.listId;
+          }
+        } catch {
+          // Best-effort recovery failed — fall through to the ordinary not-found
+          // response below, exactly like before this fix existed.
         }
       }
       if (!lead) {
