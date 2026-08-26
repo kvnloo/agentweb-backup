@@ -76,6 +76,15 @@ export interface EquivalentPublishRoute {
    * not the other for the very same publish.
    */
   actions?: string[];
+  /**
+   * Which `platform` argument values count, for a route to a platform-multiplexed
+   * tool like `post_on_connected_account` (also used for LinkedIn/Instagram/
+   * YouTube). Omitted means any platform. A call that names `account_id` instead
+   * of `platform` cannot be resolved to a platform here without an account
+   * lookup this checker doesn't have, so — like every other ambiguous case in
+   * this module — it fails closed rather than guessing.
+   */
+  platforms?: string[];
 }
 
 /**
@@ -104,6 +113,16 @@ export const EQUIVALENT_PUBLISH_ROUTES: Record<string, EquivalentPublishRoute[]>
     { tool: 'twitter_manage_post', actions: ['post_thread'] },
   ],
   post_thread: [{ tool: 'twitter_manage_post', actions: ['post_thread'] }],
+  // ENG-1599 — the reverse of the route above. A schedule that requires
+  // twitter_manage_post already tolerates autonomous threads, replies,
+  // quote-tweets and retweets going out under the owner's identity, so it
+  // necessarily tolerates the strictly narrower act of posting ONE new tweet —
+  // the single outcome twitter_manage_post cannot express at all (post_thread
+  // hard-refuses under 2 tweets; see agentModeService.ts's 'post-thread'
+  // handler). Scoped to platform=twitter so this cannot widen a twitter-only
+  // requirement into cover for post_on_connected_account calls that target a
+  // different platform (LinkedIn/Instagram/YouTube all share that tool name).
+  twitter_manage_post: [{ tool: 'post_on_connected_account', platforms: ['twitter'] }],
   // ENG-1276 follow-up #3 — bidirectional (see the module docblock). email's own
   // description prefers send_email_from_sender when the user has no connected
   // mailbox but has a configured sender, and send_email_from_sender's description
@@ -117,6 +136,11 @@ export const EQUIVALENT_PUBLISH_ROUTES: Record<string, EquivalentPublishRoute[]>
 /** Fold an action to the one spelling the route table is keyed on. */
 export function normalizeAction(action: unknown): string {
   return typeof action === 'string' ? action.trim().toLowerCase().replace(/-/g, '_') : '';
+}
+
+/** Fold a `platform` argument to the spelling `EQUIVALENT_PUBLISH_ROUTES` is keyed on. */
+export function normalizePlatform(platform: unknown): string {
+  return typeof platform === 'string' ? platform.trim().toLowerCase() : '';
 }
 
 /**
@@ -138,6 +162,20 @@ function resolveAction(entry: RequiredCallLedgerEntry | null | undefined): strin
   try {
     const parsed = JSON.parse(args);
     return parsed && typeof parsed === 'object' ? normalizeAction(parsed.action) : '';
+  } catch {
+    return '';
+  }
+}
+
+/** Same string/JSON-string fallback as {@link resolveAction}, for `.platform`. */
+function resolvePlatform(entry: RequiredCallLedgerEntry | null | undefined): string {
+  const args = entry?.arguments;
+  if (args == null) return '';
+  if (typeof args === 'object') return normalizePlatform((args as any).platform);
+  if (typeof args !== 'string') return '';
+  try {
+    const parsed = JSON.parse(args);
+    return parsed && typeof parsed === 'object' ? normalizePlatform(parsed.platform) : '';
   } catch {
     return '';
   }
@@ -183,6 +221,7 @@ export function callSatisfiesRequirement(
   const route = routes.find((r) => r.tool === name);
   if (!route) return false;
   if (route.actions && !route.actions.includes(resolveAction(entry))) return false;
+  if (route.platforms && !route.platforms.includes(resolvePlatform(entry))) return false;
 
   if (requiredFunctionNames) {
     const required = requiredFunctionNames instanceof Set ? requiredFunctionNames : new Set(requiredFunctionNames);
