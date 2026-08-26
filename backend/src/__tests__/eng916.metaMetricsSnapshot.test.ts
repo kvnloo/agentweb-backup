@@ -39,7 +39,7 @@ const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockAdsDb = adsMetricsDb as jest.Mocked<typeof adsMetricsDb>;
 const mockGetCreds = getMetaAccountCredentials as jest.Mock;
 
-const HAVEN_USER_ID = 'a3917669-1c7d-45ed-8ef9-f454de109b6f';
+const TEST_USER_ID_MATCHING_CRON = 'a3917669-1c7d-45ed-8ef9-f454de109b6f';
 const TEST_DATE = '2026-08-09';
 
 /**
@@ -61,24 +61,39 @@ function makeLead(campaign: string | undefined, createdAt: string) {
   };
 }
 
+/**
+ * ENG-1601: the OTHER shape production actually delivers — the campaign id sits in the
+ * free-form `customFields` bag and there is no `firstTouch` at all. 13 of 36 tagged
+ * inbound leads looked like this, and the join dropped every one of them.
+ */
+function makeCustomFieldsLead(campaign: string | undefined, createdAt: string) {
+  return {
+    leadId: `cf_lead_${createdAt}`,
+    listId: 'list_test',
+    createdAt,
+    // no firstTouch, deliberately
+    customFields: campaign ? { utm_campaign: campaign } : { role: 'CTO' },
+  };
+}
+
 describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
   beforeEach(() => {
     jest.resetAllMocks();
     global.fetch = jest.fn();
 
     mockUserDb.getUserById.mockResolvedValue({
-      userId: HAVEN_USER_ID,
+      userId: TEST_USER_ID_MATCHING_CRON,
       connected_accounts: [{ platform: 'meta', config: { account_type: 'ad_account', access_token: 'tok' } }],
     } as any);
 
     mockGetCreds.mockResolvedValue({
-      accountId: '1842363582956923',
+      accountId: '1000000000000001',
       accessToken: 'tok',
-      accountName: 'Haven AI',
+      accountName: 'Test Account',
     });
 
     mockCrmDb.getLeadListsByUserId.mockResolvedValue([
-      { listId: 'list_test', userId: HAVEN_USER_ID },
+      { listId: 'list_test', userId: TEST_USER_ID_MATCHING_CRON },
     ] as any);
 
     mockAdsDb.putSnapshot.mockResolvedValue(undefined as any);
@@ -88,21 +103,21 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
-        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '10.50', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10.5', frequency: '1.2' },
+        { campaign_id: '100000000000000001', campaign_name: 'Leasing', spend: '10.50', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10.5', frequency: '1.2' },
       ]),
     });
 
     mockCrmDb.getLeadsByListId.mockResolvedValue({
-      items: [makeLead('120244135557390173', `${TEST_DATE}T10:00:00.000Z`)],
+      items: [makeLead('100000000000000001', `${TEST_DATE}T10:00:00.000Z`)],
       lastEvaluatedKey: null,
       hasMore: false,
     } as any);
 
-    await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
 
     expect(mockAdsDb.putSnapshot).toHaveBeenCalledWith(
       expect.objectContaining({
-        campaignId: '120244135557390173',
+        campaignId: '100000000000000001',
         date: TEST_DATE,
         leadCount: 1,
         rowType: 'campaign',
@@ -120,28 +135,28 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
-        { campaign_id: '120244135557390173', campaign_name: 'Leasing Automation', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+        { campaign_id: '100000000000000001', campaign_name: 'Leasing Automation', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
       ]),
     });
-    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: HAVEN_USER_ID }] as any);
+    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: TEST_USER_ID_MATCHING_CRON }] as any);
     mockCrmDb.getLeadsByListId.mockResolvedValue({
       items: [
         makeLead('Leasing Automation', `${TEST_DATE}T10:00:00.000Z`),      // exact name
         makeLead('Leasing+Automation', `${TEST_DATE}T11:00:00.000Z`),      // plus-encoded
         makeLead('Leasing%20Automation', `${TEST_DATE}T12:00:00.000Z`),    // percent-encoded
-        makeLead('120244135557390173', `${TEST_DATE}T13:00:00.000Z`),      // id still wins
+        makeLead('100000000000000001', `${TEST_DATE}T13:00:00.000Z`),      // id still wins
       ],
       lastEvaluatedKey: null,
       hasMore: false,
     } as any);
 
-    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    const result = await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
 
     expect(result.leadCount).toBe(4);
     expect(result.unattributedLeadCount).toBe(0);
     // All four land on the campaign ID, never on the name — the row key stays the id.
     expect(campaignRows()[0].leadCount).toBe(4);
-    expect(campaignRows()[0].campaignId).toBe('120244135557390173');
+    expect(campaignRows()[0].campaignId).toBe('100000000000000001');
   });
 
   it('refuses to guess when two campaigns share a name, counting those leads unattributed', async () => {
@@ -154,14 +169,14 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
         { campaign_id: '222', campaign_name: 'Duplicate Name', spend: '2', impressions: '20', clicks: '2', ctr: '1', cpm: '1', frequency: '1' },
       ]),
     });
-    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: HAVEN_USER_ID }] as any);
+    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: TEST_USER_ID_MATCHING_CRON }] as any);
     mockCrmDb.getLeadsByListId.mockResolvedValue({
       items: [makeLead('Duplicate Name', `${TEST_DATE}T10:00:00.000Z`)],
       lastEvaluatedKey: null,
       hasMore: false,
     } as any);
 
-    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    const result = await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
 
     expect(result.unattributedLeadCount).toBe(1);
     expect(result.leadCount).toBe(0);
@@ -178,7 +193,7 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
         { campaign_id: '222', campaign_name: 'Spring Sale', spend: '2', impressions: '20', clicks: '2', ctr: '1', cpm: '1', frequency: '1' },
       ]),
     });
-    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: HAVEN_USER_ID }] as any);
+    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: TEST_USER_ID_MATCHING_CRON }] as any);
     mockCrmDb.getLeadsByListId.mockResolvedValue({
       items: [
         makeLead('Spring+Sale', `${TEST_DATE}T10:00:00.000Z`),
@@ -188,7 +203,7 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
       hasMore: false,
     } as any);
 
-    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    const result = await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
 
     // Neither spelling can be resolved to one campaign, so neither lead is attributed.
     expect(result.unattributedLeadCount).toBe(2);
@@ -200,13 +215,13 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
-        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '10.50', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10.5', frequency: '1.2' },
+        { campaign_id: '100000000000000001', campaign_name: 'Leasing', spend: '10.50', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10.5', frequency: '1.2' },
       ]),
     });
 
     mockCrmDb.getLeadsByListId.mockResolvedValue({
       items: [
-        makeLead('120244135557390173', `${TEST_DATE}T10:00:00.000Z`),
+        makeLead('100000000000000001', `${TEST_DATE}T10:00:00.000Z`),
         makeLead('some-other-campaign-name', `${TEST_DATE}T11:00:00.000Z`),
         makeLead(undefined, `${TEST_DATE}T12:00:00.000Z`),
       ],
@@ -214,13 +229,13 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
       hasMore: false,
     } as any);
 
-    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    const result = await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
 
     // Unattributed leads aren't tied to any specific campaign, so they don't get
     // stamped onto a per-campaign row (that would misattribute them) — the campaign's
     // own row only reflects its own matched leads.
     expect(mockAdsDb.putSnapshot).toHaveBeenCalledWith(
-      expect.objectContaining({ campaignId: '120244135557390173', leadCount: 1 })
+      expect.objectContaining({ campaignId: '100000000000000001', leadCount: 1 })
     );
     // They must still be visible somewhere, though — at the day/account level via the
     // function's own return value (which the cron logs), not silently swallowed.
@@ -238,7 +253,7 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
 
     mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false } as any);
 
-    await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
 
     // A campaign ID never seen anywhere in this codebase's prior research must still
     // get a row written — proves discovery is dynamic, not a hardcoded list.
@@ -251,13 +266,13 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
-        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '10', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10', frequency: '1.2' },
+        { campaign_id: '100000000000000001', campaign_name: 'Leasing', spend: '10', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10', frequency: '1.2' },
       ]),
     });
     mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false } as any);
 
-    await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
-    await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
 
     expect(campaignRows()).toHaveLength(2);
     const firstCallArg = campaignRows()[0];
@@ -274,7 +289,7 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
       json: async () => ({ error: { message: 'Meta API is down' } }),
     });
 
-    await expect(snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT)).rejects.toThrow();
+    await expect(snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT)).rejects.toThrow();
     expect(mockAdsDb.putSnapshot).not.toHaveBeenCalled();
   });
 
@@ -289,7 +304,7 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
           data: [
             { campaign_id: 'campaign_page1', campaign_name: 'Page1 Campaign', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
           ],
-          paging: { next: 'https://graph.facebook.com/v25.0/act_1842363582956923/insights?after=CURSOR1' },
+          paging: { next: 'https://graph.facebook.com/v25.0/act_1000000000000001/insights?after=CURSOR1' },
         }),
       })
       .mockResolvedValueOnce({
@@ -304,7 +319,7 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
 
     mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false } as any);
 
-    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    const result = await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
 
     expect(global.fetch).toHaveBeenCalledTimes(2);
     expect(mockAdsDb.putSnapshot).toHaveBeenCalledWith(
@@ -325,29 +340,29 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
-        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '10', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10', frequency: '1.2' },
+        { campaign_id: '100000000000000001', campaign_name: 'Leasing', spend: '10', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10', frequency: '1.2' },
       ]),
     });
 
     mockCrmDb.getLeadsByListId
       .mockResolvedValueOnce({
         // Page 1 (leadId order): an older-dated lead sorts ahead of the target-date lead.
-        items: [makeLead('120244135557390173', '2026-08-01T09:00:00.000Z')],
+        items: [makeLead('100000000000000001', '2026-08-01T09:00:00.000Z')],
         lastEvaluatedKey: { listId: 'list_test', leadId: 'cursor1' },
         hasMore: true,
       } as any)
       .mockResolvedValueOnce({
         // Page 2: the target-date lead, reachable only if pagination continues.
-        items: [makeLead('120244135557390173', `${TEST_DATE}T10:00:00.000Z`)],
+        items: [makeLead('100000000000000001', `${TEST_DATE}T10:00:00.000Z`)],
         lastEvaluatedKey: null,
         hasMore: false,
       } as any);
 
-    await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
 
     expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledTimes(2);
     expect(mockAdsDb.putSnapshot).toHaveBeenCalledWith(
-      expect.objectContaining({ campaignId: '120244135557390173', leadCount: 1 })
+      expect.objectContaining({ campaignId: '100000000000000001', leadCount: 1 })
     );
   });
 
@@ -358,13 +373,13 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
-        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '10', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10', frequency: '1.2' },
+        { campaign_id: '100000000000000001', campaign_name: 'Leasing', spend: '10', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10', frequency: '1.2' },
       ]),
     });
 
     mockCrmDb.getLeadsByListId.mockResolvedValue({
       items: [
-        makeLead('120244135557390173', `${TEST_DATE}T10:00:00.000Z`),
+        makeLead('100000000000000001', `${TEST_DATE}T10:00:00.000Z`),
         makeLead('some-other-campaign', `${TEST_DATE}T11:00:00.000Z`),
         makeLead(undefined, `${TEST_DATE}T12:00:00.000Z`),
       ],
@@ -372,7 +387,7 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
       hasMore: false,
     } as any);
 
-    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    const result = await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
 
     expect(result.unattributedLeadCount).toBe(2);
 
@@ -396,14 +411,14 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
       ok: true,
       json: async () => makeCampaignInsightsResponse([]),
     });
-    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: HAVEN_USER_ID }] as any);
+    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: TEST_USER_ID_MATCHING_CRON }] as any);
     mockCrmDb.getLeadsByListId.mockResolvedValue({
       items: [makeLead(undefined, `${TEST_DATE}T10:00:00.000Z`)],
       lastEvaluatedKey: null,
       hasMore: false,
     } as any);
 
-    await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
 
     expect(campaignRows()).toHaveLength(0);
     expect(accountDayRows()).toHaveLength(1);
@@ -419,13 +434,13 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
-        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+        { campaign_id: '100000000000000001', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
       ]),
     });
-    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: HAVEN_USER_ID }] as any);
+    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: TEST_USER_ID_MATCHING_CRON }] as any);
     mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false } as any);
 
-    await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
 
     // Currency varies BETWEEN accounts of the same user (mvarma holds Meta accounts in INR and
     // USD), and a mis-stated currency is an ~80x silent error. Timezone is recorded because the
@@ -447,11 +462,11 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
     jest.resetAllMocks();
     global.fetch = jest.fn();
     mockUserDb.getUserById.mockResolvedValue({
-      userId: HAVEN_USER_ID,
+      userId: TEST_USER_ID_MATCHING_CRON,
       connected_accounts: [{ platform: 'meta', config: { account_type: 'ad_account', access_token: 'tok' } }],
     } as any);
-    mockGetCreds.mockResolvedValue({ accountId: '1842363582956923', accessToken: 'tok', accountName: 'Haven AI' });
-    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: HAVEN_USER_ID }] as any);
+    mockGetCreds.mockResolvedValue({ accountId: '1000000000000001', accessToken: 'tok', accountName: 'Test Account' });
+    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: TEST_USER_ID_MATCHING_CRON }] as any);
     mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false } as any);
     mockAdsDb.putSnapshot.mockResolvedValue(undefined as any);
   });
@@ -464,7 +479,7 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
-        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+        { campaign_id: '100000000000000001', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
       ]),
     });
 
@@ -485,7 +500,7 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
       return {
         ok: true,
         json: async () => makeCampaignInsightsResponse([
-          { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+          { campaign_id: '100000000000000001', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
         ]),
       };
     });
@@ -504,7 +519,7 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
     // Account-context call answers without a currency.
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
-      json: async () => ({ id: 'act_1842363582956923', timezone_name: 'America/Los_Angeles' }),
+      json: async () => ({ id: 'act_1000000000000001', timezone_name: 'America/Los_Angeles' }),
     });
 
     await runMetaMetricsSnapshot();
@@ -520,7 +535,7 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
-        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+        { campaign_id: '100000000000000001', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
       ]),
     });
 
@@ -558,7 +573,7 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
-        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+        { campaign_id: '100000000000000001', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
       ]),
     });
 
@@ -577,7 +592,7 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
-        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+        { campaign_id: '100000000000000001', campaign_name: 'Leasing', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
       ]),
     });
 
@@ -589,5 +604,114 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
     for (const call of (global.fetch as jest.Mock).mock.calls) {
       expect(call[1]?.signal).toBeInstanceOf(AbortSignal);
     }
+  });
+});
+
+describe('ENG-1601 leads whose campaign id lives only in customFields', () => {
+  const INSIGHTS = () => ({
+    ok: true,
+    json: async () => makeCampaignInsightsResponse([
+      { campaign_id: '100000000000000001', campaign_name: 'Leasing', spend: '10.50', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10.5', frequency: '1.2' },
+    ]),
+  });
+
+  it('attributes a lead whose campaign id is ONLY in customFields', async () => {
+    // This is the production shape that was silently dropped: no firstTouch at all, a valid
+    // campaign id in the free-form bag. 13 of 36 tagged inbound leads on one production account looked like this.
+    (global.fetch as jest.Mock).mockResolvedValue(INSIGHTS());
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [makeCustomFieldsLead('100000000000000001', `${TEST_DATE}T10:00:00.000Z`)],
+      lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+
+    expect(result.leadCount).toBe(1);
+    expect(result.unattributedLeadCount).toBe(0);
+    expect(mockAdsDb.putSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({ campaignId: '100000000000000001', leadCount: 1 })
+    );
+  });
+
+  it('counts BOTH shapes together — this is the +57% the fix recovers', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(INSIGHTS());
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [
+        makeLead('100000000000000001', `${TEST_DATE}T10:00:00.000Z`),             // structured
+        makeCustomFieldsLead('100000000000000001', `${TEST_DATE}T11:00:00.000Z`), // bag only
+      ],
+      lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    expect(result.leadCount).toBe(2);
+    expect(result.unattributedLeadCount).toBe(0);
+  });
+
+  it('lets a structured firstTouch WIN over customFields — promotion only gap-fills', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(INSIGHTS());
+    const conflicted: any = makeLead('100000000000000001', `${TEST_DATE}T10:00:00.000Z`);
+    conflicted.customFields = { utm_campaign: 'some-other-campaign' };
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [conflicted], lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    expect(result.leadCount).toBe(1); // matched on the structured value, not the bag
+  });
+
+  it('still counts a lead with neither shape as unattributed', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(INSIGHTS());
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [makeCustomFieldsLead(undefined, `${TEST_DATE}T10:00:00.000Z`)],
+      lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    expect(result.leadCount).toBe(0);
+    expect(result.unattributedLeadCount).toBe(1);
+  });
+
+  it('does NOT attribute a promoted tag whose campaign was not reported that day', async () => {
+    /*
+     * The staleness bound, pinned. A `utm_campaign` sitting in customFields could be old — the
+     * bag carries no timestamp (none of the 13 real leads had a `landing_ts`), so the value
+     * itself cannot be dated. What bounds it is the join's existing same-day constraint:
+     * `knownCampaignIds` holds only the campaigns Meta REPORTED for this date, so a tag naming
+     * a campaign that was not running cannot match.
+     *
+     * That constraint applies identically to a structured firstTouch, so promotion does not
+     * widen the staleness exposure — it applies the same bound to more leads. This test exists
+     * so that stays true.
+     */
+    (global.fetch as jest.Mock).mockResolvedValue(INSIGHTS());
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [makeCustomFieldsLead('999999999999999', `${TEST_DATE}T10:00:00.000Z`)], // never reported
+      lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    expect(result.leadCount).toBe(0);
+    expect(result.unattributedLeadCount).toBe(1);
+  });
+
+  it('does NOT let the free-form bag defeat the ambiguity guard', async () => {
+    // Two campaigns sharing a name: a promoted value that resolves to both must stay
+    // unattributed, exactly as a structured one would. Promotion must not widen what counts.
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => makeCampaignInsightsResponse([
+        { campaign_id: '111', campaign_name: 'Spring Sale', spend: '5', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+        { campaign_id: '222', campaign_name: 'Spring Sale', spend: '5', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+      ]),
+    });
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [makeCustomFieldsLead('Spring Sale', `${TEST_DATE}T10:00:00.000Z`)],
+      lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(TEST_USER_ID_MATCHING_CRON, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    expect(result.leadCount).toBe(0);
+    expect(result.unattributedLeadCount).toBe(1);
   });
 });
