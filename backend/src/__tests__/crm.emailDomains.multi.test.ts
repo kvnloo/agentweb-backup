@@ -171,6 +171,45 @@ describe('CRM multi-domain endpoints (ENG-265)', () => {
       expect(userDb.updateUser).toHaveBeenCalledWith('test-user-id', {
         emailDomains: [first, { id: 'd2', domain: 'second.com', status: 'not_started', addedAt: expect.any(String) }],
         emailDomainList: ['first.com', 'second.com'],
+      }, {
+        condition: {
+          expression: 'size(#emailDomains) = :expectedSize',
+          names: { '#emailDomains': 'emailDomains' },
+          values: { ':expectedSize': 1 },
+        },
+      });
+      expect(mockResponse.json).toHaveBeenCalled();
+    });
+
+    it('retries once against a fresh read when a concurrent write races the conditional check', async () => {
+      const first = { id: 'd1', domain: 'first.com', status: 'verified', addedAt: '2026-01-01T00:00:00.000Z' };
+      const racedIn = { id: 'd-raced', domain: 'raced.com', status: 'verified', addedAt: '2026-01-01T00:00:01.000Z' };
+      mockRequest.body = { domain: 'second.com' };
+      (userDb.getUserById as jest.Mock)
+        .mockResolvedValueOnce({ userId: 'test-user-id', emailDomains: [first] })
+        .mockResolvedValueOnce({ userId: 'test-user-id', emailDomains: [first, racedIn] });
+      (userDb.getUsersByEmailDomain as jest.Mock).mockResolvedValue([]);
+      (resendService.listDomains as jest.Mock).mockResolvedValue([]);
+      (resendService.createDomain as jest.Mock).mockResolvedValue({
+        id: 'd2', name: 'second.com', status: 'not_started', records: [],
+      });
+      (userDb.updateUser as jest.Mock)
+        .mockRejectedValueOnce({ code: 'ConditionalCheckFailedException' })
+        .mockResolvedValueOnce({});
+
+      const handle = getHandler('/email-domains', 'post');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(2);
+      expect(userDb.updateUser).toHaveBeenLastCalledWith('test-user-id', {
+        emailDomains: [first, racedIn, { id: 'd2', domain: 'second.com', status: 'not_started', addedAt: expect.any(String) }],
+        emailDomainList: ['first.com', 'raced.com', 'second.com'],
+      }, {
+        condition: {
+          expression: 'size(#emailDomains) = :expectedSize',
+          names: { '#emailDomains': 'emailDomains' },
+          values: { ':expectedSize': 2 },
+        },
       });
       expect(mockResponse.json).toHaveBeenCalled();
     });
@@ -197,7 +236,30 @@ describe('CRM multi-domain endpoints (ENG-265)', () => {
       expect(userDb.updateUser).toHaveBeenCalledWith('test-user-id', {
         emailDomains: [keep],
         emailDomainList: ['keep.com'],
+      }, {
+        condition: {
+          expression: 'size(#emailDomains) = :expectedSize',
+          names: { '#emailDomains': 'emailDomains' },
+          values: { ':expectedSize': 2 },
+        },
       });
+    });
+
+    it('short-circuits on a race if the fresh read shows the domain was already removed', async () => {
+      const keep = { id: 'keep', domain: 'keep.com', status: 'verified', addedAt: '2026-01-01T00:00:00.000Z' };
+      const remove = { id: 'remove', domain: 'remove.com', status: 'verified', addedAt: '2026-01-02T00:00:00.000Z' };
+      mockRequest.params = { domainId: 'remove' };
+      (userDb.getUserById as jest.Mock)
+        .mockResolvedValueOnce({ userId: 'test-user-id', emailDomains: [keep, remove] })
+        .mockResolvedValueOnce({ userId: 'test-user-id', emailDomains: [keep] });
+      (userDb.updateUser as jest.Mock)
+        .mockRejectedValueOnce({ code: 'ConditionalCheckFailedException' });
+
+      const handle = getHandler('/email-domains/:domainId', 'delete');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'Domain removed.' });
     });
 
     it('returns 404 for an unknown domainId', async () => {

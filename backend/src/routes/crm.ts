@@ -5468,12 +5468,41 @@ router.post('/email-domains', async (req: Request, res: Response) => {
       status: domainResult.status,
       addedAt: new Date().toISOString(),
     };
-    const updatedDomains = [...existingDomains, newEntry];
 
-    await userDb.updateUser(userId, {
-      emailDomains: updatedDomains,
-      emailDomainList: updatedDomains.map(d => d.domain),
-    });
+    // ENG-265: emailDomains[] is read-modify-write. Guard against a lost update from a
+    // concurrent request for the same user (double-click, two tabs) by conditioning the
+    // write on the array being unchanged since we read it; on a race, re-read once and
+    // retry rather than surfacing a spurious 500/409 for what's usually a double-click.
+    let domainsToWrite: SenderDomainEntry[] = [...existingDomains, newEntry];
+    let expectedSize = existingDomains.length;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await userDb.updateUser(userId, {
+          emailDomains: domainsToWrite,
+          emailDomainList: domainsToWrite.map(d => d.domain),
+        }, {
+          condition: {
+            expression: expectedSize === 0
+              ? 'attribute_not_exists(#emailDomains) OR size(#emailDomains) = :expectedSize'
+              : 'size(#emailDomains) = :expectedSize',
+            names: { '#emailDomains': 'emailDomains' },
+            values: { ':expectedSize': expectedSize },
+          },
+        });
+        break;
+      } catch (writeError: any) {
+        if (writeError?.code !== 'ConditionalCheckFailedException' || attempt >= 1) {
+          throw writeError;
+        }
+        const freshUser = await userDb.getUserById(userId);
+        const freshDomains: SenderDomainEntry[] = freshUser?.emailDomains || [];
+        if (freshDomains.some((d: SenderDomainEntry) => d.domain === normalizedDomain)) {
+          return res.status(409).json({ message: 'You have already registered this domain' });
+        }
+        domainsToWrite = [...freshDomains, newEntry];
+        expectedSize = freshDomains.length;
+      }
+    }
 
     res.json({
       message: alreadyExists
@@ -5546,11 +5575,37 @@ router.delete('/email-domains/:domainId', async (req: Request, res: Response) =>
       return res.status(404).json({ message: 'Domain not found' });
     }
 
-    const updatedDomains = existingDomains.filter((d: SenderDomainEntry) => d.id !== domainId);
-    await userDb.updateUser(userId, {
-      emailDomains: updatedDomains,
-      emailDomainList: updatedDomains.map((d: SenderDomainEntry) => d.domain),
-    });
+    // ENG-265: same lost-update guard as POST /email-domains — condition the write on the
+    // array being unchanged since we read it, and retry once on a race.
+    let domainsToWrite = existingDomains.filter((d: SenderDomainEntry) => d.id !== domainId);
+    let expectedSize = existingDomains.length;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await userDb.updateUser(userId, {
+          emailDomains: domainsToWrite,
+          emailDomainList: domainsToWrite.map((d: SenderDomainEntry) => d.domain),
+        }, {
+          condition: {
+            expression: 'size(#emailDomains) = :expectedSize',
+            names: { '#emailDomains': 'emailDomains' },
+            values: { ':expectedSize': expectedSize },
+          },
+        });
+        break;
+      } catch (writeError: any) {
+        if (writeError?.code !== 'ConditionalCheckFailedException' || attempt >= 1) {
+          throw writeError;
+        }
+        const freshUser = await userDb.getUserById(userId);
+        const freshDomains: SenderDomainEntry[] = freshUser?.emailDomains || [];
+        if (!freshDomains.some((d: SenderDomainEntry) => d.id === domainId)) {
+          // Already removed by the racing request — nothing left to do.
+          return res.json({ message: 'Domain removed.' });
+        }
+        domainsToWrite = freshDomains.filter((d: SenderDomainEntry) => d.id !== domainId);
+        expectedSize = freshDomains.length;
+      }
+    }
 
     res.json({ message: 'Domain removed.' });
   } catch (error: any) {
