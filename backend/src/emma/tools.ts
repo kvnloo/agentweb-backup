@@ -8663,6 +8663,7 @@ Response keys:
 - cursor — pagination cursor for the next page of the same query (null when no more results)
 - anonymizedSkipped — count of out-of-network placeholder results ("LinkedIn Member", "LinkedIn User" and their localized equivalents) that were discarded before writing (they carry no usable name, email or profile URL, so they are not importable). A high value means the search reached beyond the connected account's network.
 - companySizeFiltered — count of leads dropped by company_size_min/max (out of range, or an unverifiable employer). Always present; 0 when the filter wasn't used or excluded nothing.
+- earlyExitOnSizeFilter — present (true) only when company_size_min/max was given AND 3 consecutive pages were excluded entirely by it. The search stopped BEFORE exhausting to avoid burning through many pages on a range that's proving unproductive for this market — call again with the returned cursor to keep looking, or widen the range.
 - importedLeads — summaries (firstName, lastName, linkedin, title, company) of up to the first 5 leads ACTUALLY WRITTEN by this call. It never includes results that were deduplicated into an existing lead, trimmed to honour the requested limit, or discarded as anonymized — report only from this array, and never describe a search result as imported unless it appears here.
 - autoEnrichJobId — present only when auto_enrich=true AND at least 1 new lead was imported AND the background job was successfully queued`,
     inputSchema: {

@@ -34578,6 +34578,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // ENG-1558: leads dropped by the company_size_min/max post-filter
     // (outside the requested range, or an unverifiable employer).
     let companySizeFiltered = 0;
+    // ENG-1558 follow-up: consecutive pages the size filter emptied
+    // completely. A narrow company_size range against a market where it's
+    // genuinely rare could otherwise burn all MAX_ITERATIONS pages — each
+    // costing a full searchPeople call plus per-employer lookups — before
+    // giving up. Bail out well before that once the filter has clearly
+    // proven unproductive, rather than paying the full cap's cost every time.
+    let consecutiveEmptiedBySizeFilter = 0;
+    const SIZE_FILTER_EARLY_EXIT_AFTER = 3;
+    let earlyExitOnSizeFilter = false;
 
     while (iterationCount < MAX_ITERATIONS) {
       iterationCount++;
@@ -34754,6 +34763,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // the kept subset can be mapped back without disturbing `importable`'s
       // order (batchCreateLeads' returned sourceIndex must match).
       if (company_size_min != null || company_size_max != null) {
+        const preFilterCount = importable.length;
         const sizableItems = importable.map((lead: any, idx: number) => ({
           __idx: idx,
           work_experience: lead.company ? [{ company: lead.company, current: true }] : [],
@@ -34766,6 +34776,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         const keepIdx = new Set(kept.map((it: any) => it.__idx));
         companySizeFiltered += importable.length - keepIdx.size;
         importable = importable.filter((_: any, i: number) => keepIdx.has(i));
+
+        if (preFilterCount > 0 && importable.length === 0) {
+          consecutiveEmptiedBySizeFilter++;
+          if (consecutiveEmptiedBySizeFilter >= SIZE_FILTER_EARLY_EXIT_AFTER) {
+            // The filter has proven unproductive several pages running —
+            // stop paying for more searchPeople + per-employer lookup calls
+            // rather than grinding to MAX_ITERATIONS on a range that's
+            // clearly not matching this market.
+            earlyExitOnSizeFilter = true;
+            break;
+          }
+        } else {
+          consecutiveEmptiedBySizeFilter = 0;
+        }
       }
       if (importable.length === 0) {
         if (!nextCursor) break;
@@ -34856,8 +34880,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     };
     if (searchError) response.searchError = searchError;
     if (searchUnavailable) response.searchUnavailable = true;
+    if (earlyExitOnSizeFilter) response.earlyExitOnSizeFilter = true;
     if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
       response.message = 'No results found for the given search criteria.';
+    } else if (earlyExitOnSizeFilter) {
+      // ENG-1558 follow-up: distinct from (and takes priority over) the
+      // generic "excluded all, search exhausted normally" message below —
+      // this stopped BEFORE exhausting, so there may be more matches the
+      // cursor can still reach.
+      response.message = cumulativeNew > 0
+        ? `Imported ${cumulativeNew} lead(s), then stopped early after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where the company_size filter excluded every result. There may be more matches — resume from the returned cursor, or widen the range.`
+        : `Stopped after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where every result was excluded by the company_size filter (out of range, or an unverifiable employer) — this looks like a narrow niche for this market, not an empty search. Widen the company_size range, or drop it to import the unfiltered results.`;
     } else if (cumulativeNew === 0 && anonymizedSkipped > 0 && !searchError) {
       response.message = `${anonymizedSkipped} search result(s) were out-of-network LinkedIn profiles with no name or profile URL and were not imported. Widen the search or connect a LinkedIn account with closer network reach.`;
     } else if (cumulativeNew === 0 && companySizeFiltered > 0 && !searchError) {

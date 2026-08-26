@@ -451,6 +451,21 @@ export class LinkedInOutreachService {
   static readonly SEARCH_CAPABILITY_CANARY_KEYWORDS = 'marketing';
 
   /**
+   * Concurrency cap for filterByCompanySize's per-employer lookups (ENG-1558
+   * follow-up). Each distinct employer costs two sequential outbound calls
+   * (resolve name -> id, then fetch the company profile), so an unthrottled
+   * `Promise.all` over a page with 15-20 distinct employers could fire
+   * 30-40 concurrent Unipile requests from a single search — an
+   * uncomfortable burst against the shared/platform-fallback account other
+   * users are also hitting. Chunking bounds it to
+   * `2 * COMPANY_SIZE_LOOKUP_CONCURRENCY` concurrent requests at a time,
+   * matching the plain chunked-Promise.all pattern already used elsewhere
+   * in this codebase for external lookups (e.g. emailDeliverabilityService's
+   * MX_LOOKUP_CONCURRENCY) rather than pulling in a semaphore/library.
+   */
+  static readonly COMPANY_SIZE_LOOKUP_CONCURRENCY = 5;
+
+  /**
    * People-search capability canary (ENG-975).
    *
    * An account can lose its people-search capability while leaving profile
@@ -1190,7 +1205,7 @@ export class LinkedInOutreachService {
     );
 
     const headcountByName = new Map<string, number | null>();
-    await Promise.all(uniqueNames.map(async (name) => {
+    const lookupOne = async (name: string) => {
       try {
         const companyId = await this.resolveCompanyId(name, accountId);
         if (!companyId) { headcountByName.set(name, null); return; }
@@ -1212,7 +1227,13 @@ export class LinkedInOutreachService {
         });
         headcountByName.set(name, null);
       }
-    }));
+    };
+    // Chunked, not one big Promise.all — see COMPANY_SIZE_LOOKUP_CONCURRENCY.
+    const CONCURRENCY = LinkedInOutreachService.COMPANY_SIZE_LOOKUP_CONCURRENCY;
+    for (let i = 0; i < uniqueNames.length; i += CONCURRENCY) {
+      const batch = uniqueNames.slice(i, i + CONCURRENCY);
+      await Promise.all(batch.map(lookupOne));
+    }
 
     let excludedUnverifiable = 0;
     const filtered = items.filter((item) => {
