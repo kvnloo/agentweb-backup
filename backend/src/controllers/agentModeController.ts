@@ -600,6 +600,61 @@ export function detectRunBlockedReason(toolCalls: any[] | undefined | null): str
   return blocked ? LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON : null;
 }
 
+const LINKEDIN_INVITE_CAP_BLOCK_RE =
+  /cannot resend yet|account[ -]level invitation (?:cooldown|cap|limit)|linkedin (?:daily volume limit reached|write actions are being paced)|daily (?:invite|volume).*(?:cap|limit)|(?:pacing|paced).*(?:cap|limit|refus|reach)/i;
+
+type LinkedInInviteSendBlock = {
+  notice: string;
+  successfulInviteSends: number;
+};
+
+function linkedInOutreachAction(call: any): string {
+  const args = call?.arguments;
+  if (args && typeof args === 'object') return String(args.action || '').toLowerCase();
+  if (typeof args !== 'string') return '';
+  try {
+    const parsed = JSON.parse(args);
+    return parsed && typeof parsed === 'object' ? String(parsed.action || '').toLowerCase() : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Detect a schedule-wide LinkedIn invitation block from the executed tool ledger.
+ *
+ * A `Cannot resend yet` response and our daily/hourly pacing refusals apply to the
+ * sending account, not just the recipient. Treating an attempted send as a clean
+ * required-function match therefore reports a run as underway while every later
+ * invite is guaranteed to fail (ENG-1132).
+ */
+function detectLinkedInInviteSendBlock(toolCalls: any[] | undefined | null): LinkedInInviteSendBlock | null {
+  if (!Array.isArray(toolCalls)) return null;
+  const inviteCalls = toolCalls.filter(
+    (call: any) => call?.name === 'linkedin_outreach' && linkedInOutreachAction(call) === 'send-invite',
+  );
+  const blockedCall = inviteCalls.find((call: any) => {
+    if (toolCallSucceeded(call)) return false;
+    const detail = [call?.error, call?.result?.error, call?.result?.message]
+      .filter((value) => typeof value === 'string')
+      .join('\n');
+    return LINKEDIN_INVITE_CAP_BLOCK_RE.test(detail);
+  });
+  if (!blockedCall) return null;
+
+  const detail = [blockedCall.error, blockedCall.result?.error, blockedCall.result?.message]
+    .filter((value) => typeof value === 'string')
+    .join(' ');
+  const internalPacing = /daily (?:invite|volume).*(?:cap|limit)|write actions are being paced|pacing|paced/i.test(detail);
+  const reason = internalPacing ? 'our internal pacing cap' : "LinkedIn's account-level invitation cooldown";
+  return {
+    notice:
+      `LinkedIn send-invite was blocked by ${reason}. ` +
+      'No further send-invite actions will succeed until it clears; the remaining invitations were not sent.',
+    successfulInviteSends: inviteCalls.filter(toolCallSucceeded).length,
+  };
+}
+
 // ENG-1131 follow-up: minimum real time since the schedule's last observed
 // blocked-state transition before alerting on a new one. Guards against a
 // borderline account whose search-capability probe oscillates right at its
@@ -5259,6 +5314,26 @@ export async function runScheduledChat(
       }
     }
 
+    // ENG-1132: an account-level invitation throttle makes additional invite
+    // attempts futile. Persist a plain-language completion note in the session
+    // before deriving the result/email so every surface tells the same truth.
+    const linkedInInviteSendBlock = detectLinkedInInviteSendBlock(result.toolCalls);
+    if (linkedInInviteSendBlock && sessionId) {
+      try {
+        await chatbotDb.addMessageToSession(sessionId, {
+          role: 'assistant',
+          content: linkedInInviteSendBlock.notice,
+          timestamp: new Date().toISOString(),
+          metadata: { timestamp: new Date().toISOString(), linkedInInviteSendBlocked: true },
+        });
+      } catch (persistError) {
+        console.error('Failed to persist LinkedIn invitation-block notice to session:', persistError);
+      }
+    }
+    const scheduledResponse = linkedInInviteSendBlock
+      ? `${result.content}\n\n${linkedInInviteSendBlock.notice}`
+      : result.content;
+
     // Generate a 2-3 word summary and update the session title
     try {
       // ENG-803: ground the title suffix in the tools that actually ran, so a run
@@ -5337,10 +5412,33 @@ export async function runScheduledChat(
       };
     });
 
+    // An account-wide cooldown/pacing refusal is not a successful send. The
+    // verifier historically counted every non-publish call by name, so correct
+    // the persisted requirement evidence for the one send action we can prove
+    // did not happen. This avoids the false-success state without widening
+    // outcome requirements for reads and other non-send tools.
+    const linkedInInviteSendRequirementMissed = Boolean(
+      linkedInInviteSendBlock
+      && heldToFunctionNames.includes('linkedin_outreach')
+      && linkedInInviteSendBlock.successfulInviteSends < (functionCallMinCalls.linkedin_outreach || 1),
+    );
+    if (linkedInInviteSendBlock && heldToFunctionNames.includes('linkedin_outreach')) {
+      finalFunctionCallDetails.linkedin_outreach = {
+        actual: linkedInInviteSendBlock.successfulInviteSends,
+        required: functionCallMinCalls.linkedin_outreach || 1,
+      };
+    }
+    const finalFunctionCallMatches = linkedInInviteSendRequirementMissed
+      ? result.functionCallMatches.filter((name: string) => name !== 'linkedin_outreach')
+      : result.functionCallMatches;
+    const finalFunctionCallMisses = linkedInInviteSendRequirementMissed
+      ? Array.from(new Set([...result.functionCallMisses, 'linkedin_outreach']))
+      : result.functionCallMisses;
+
     // ENG-635: a run that met its requirements but still deferred to an absent human
     // (deferredUnresolved) produced no real deliverable — record it as a failure so it
     // is surfaced (auto-issue + oncall) instead of scored as a clean run.
-    const runDelivered = result.success && !result.deferredUnresolved;
+    const runDelivered = result.success && !result.deferredUnresolved && !linkedInInviteSendRequirementMissed;
 
     // ENG-1131: read off this run's tool ledger before it is trimmed for storage.
     const blockedBy = detectRunBlockedReason(result.toolCalls);
@@ -5356,12 +5454,12 @@ export async function runScheduledChat(
       runId: preGeneratedRunId || require('uuid').v4(),
       status: (runDelivered ? 'success' : 'failure') as 'success' | 'failure',
       passed: runDelivered,
-      actualResponse: result.content,
+      actualResponse: scheduledResponse,
       actualFunctionCalls: actualFunctionCalls,
       keywordMatches: result.keywordMatches,
       keywordMisses: result.keywordMisses,
-      functionCallMatches: result.functionCallMatches,
-      functionCallMisses: result.functionCallMisses,
+      functionCallMatches: finalFunctionCallMatches,
+      functionCallMisses: finalFunctionCallMisses,
       functionCallDetails: finalFunctionCallDetails,
       executionTime: Date.now() - now.getTime(),
       sessionId: sessionId,
@@ -5384,6 +5482,9 @@ export async function runScheduledChat(
       // and self-clearing, so flipping these runs to failures would bury the
       // owner's real failure signal under a fleet-wide vendor incident.
       ...(blockedBy ? { blockedBy } : {}),
+      // Kept distinct from `blockedBy`, which tracks the LinkedIn *search*
+      // outage transition and drives its own owner notification workflow.
+      ...(linkedInInviteSendBlock ? { linkedInInviteSendBlock: linkedInInviteSendBlock.notice } : {}),
       // ENG-947: the run ended early because its publish-press budget ran out with
       // the publish tool still uncalled — the content was drafted and held, not
       // published. Still a `failure` (nothing shipped, so the streak/oncall
@@ -5405,6 +5506,13 @@ export async function runScheduledChat(
       // that is empty, when what they need is to reconnect the account.
       ...(result.publishToolFailing ? { publishToolFailing: true } : {}),
     };
+    const scheduledChatFailureDescription =
+      `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\n` +
+      `Missing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\n` +
+      `Keyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}` +
+      (linkedInInviteSendBlock
+        ? `\n\nBlocked action: send-invite. ${linkedInInviteSendBlock.notice}`
+        : '');
 
     // ENG-1131 follow-up: re-fetch the schedule immediately before deciding on a
     // sourcing-block transition, instead of using `schedule` as loaded at the
@@ -5484,7 +5592,7 @@ export async function runScheduledChat(
     if (!finalResult.passed && !isTest) {
       void fileAutoIssue({
         title: `Scheduled Chat Failed: ${schedule.scheduleName}`,
-        description: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
+        description: scheduledChatFailureDescription,
         source: 'Scheduled chat (validation)',
         extraLabels: ['Scheduled Chat'],
         notionTags: ['Scheduled Chat'],
@@ -5498,7 +5606,7 @@ export async function runScheduledChat(
         .catch(err => console.error('Failed to file scheduled-chat-failure issue:', err))
         .then(() => sendAgentModeOncallAlert({
           subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
-          message: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
+          message: scheduledChatFailureDescription,
           sessionId,
           // One alert per (user, schedule, errorClass) per hour — a flapping
           // schedule cannot flood oncall (ENG-145/146 class). Gated so flag
