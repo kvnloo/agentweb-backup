@@ -98,6 +98,28 @@ describe('ENG-1575 routes/meta applyLeadMetrics', () => {
     expect(fwd.costPerWebsiteLead).toBe(0);
   });
 
+  it('locks a disputed cost across EVERY ordering of three disagreeing rows', () => {
+    // CodeRabbit: writing 0 on conflict made the cleared value read as "unset" on the next row,
+    // so 40/90/60 ended at 60 while 60/90/40 ended at 0 — the order dependence this removes.
+    const rows = [40, 90, 60].map((c, i) => ({
+      actions: [act('lead', i + 1)],
+      cost_per_action_type: [act('lead', c)],
+    }));
+    const perms = [
+      [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0],
+    ];
+    const results = perms.map((order) => {
+      const t = blank();
+      for (const i of order) applyLeadMetrics(t, rows[i]);
+      return { cost: t.costPerWebsiteLead, total: totalOf(t) };
+    });
+    for (const r of results) {
+      expect(r.cost).toBe(0);   // disputed -> caller derives from spend / leads
+      expect(r.total).toBe(6);  // 1 + 2 + 3, order-independent
+    }
+    expect(new Set(results.map((r) => r.cost)).size).toBe(1);
+  });
+
   it('keeps a unanimous cost across rows', () => {
     const t = blank();
     applyLeadMetrics(t, { actions: [act('lead', 5)], cost_per_action_type: [act('lead', 40)] });

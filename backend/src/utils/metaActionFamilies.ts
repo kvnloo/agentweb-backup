@@ -244,14 +244,32 @@ export function applyLeadMetrics(target: any, row: any): void {
   applyCost(target, 'costPerFormLead', cost.instantForm);
 }
 
+/**
+ * Conflict state, kept OUT of `target` so nothing extra reaches a serialised API response.
+ *
+ * A conflict cannot be recorded by writing a sentinel into the field itself: the cleared value
+ * has to be falsy for the caller's `cost || spend / leads` fallback to fire, and a falsy value
+ * is indistinguishable from "not yet set" on the next row. Costs 40, 90, 60 would then end at
+ * 60 — and 60, 90, 40 at 0 — which is the order dependence this exists to remove. (NaN would be
+ * falsy AND distinguishable, but it serialises to null if no fallback runs.) WeakMap so entries
+ * disappear with the accumulator.
+ */
+const disputedCosts = new WeakMap<object, Set<string>>();
+
 /** See the ROW SEMANTICS note above: unanimous rows keep the value, disagreement clears it. */
 function applyCost(target: any, field: string, proposed: number | null): void {
   if (proposed === null) return;
+  // Once disputed, always disputed — later rows must not resurrect a value.
+  if (disputedCosts.get(target)?.has(field)) return;
+
   const current = target[field];
   if (!current) {
     target[field] = proposed;
   } else if (current !== proposed) {
     target[field] = 0; // disagreement -> let the caller derive it from spend / leads
+    const fields = disputedCosts.get(target) ?? new Set<string>();
+    fields.add(field);
+    disputedCosts.set(target, fields);
   }
 }
 
