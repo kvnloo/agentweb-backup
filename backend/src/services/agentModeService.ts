@@ -32727,11 +32727,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               // item didn't already carry a usable one — otherwise this
               // overwrites a real Tier-1 work_experience (with `position`, etc.)
               // with the resolver's bare { company, current } shape, silently
-              // dropping fields for the rare item that already had them.
+              // dropping fields for the rare item that already had them. The
+              // "usable" check has to match the current/first-entry semantics
+              // resolveEmployersForSizeFilter's Tier 1 and filterByCompanySize's
+              // employerOf() both use — a bare .some() across every entry can
+              // keep an item whose CURRENT entry has no company, discarding a
+              // real resolved value and later reading as unverifiable anyway.
+              const hasCurrentCompany = (item: any): boolean => {
+                const exp = Array.isArray(item?.work_experience) ? item.work_experience : [];
+                const current = exp.find((w: any) => w?.current) || exp[0];
+                return !!current?.company;
+              };
               sizeFilterInput = usableItems.map((item: any, i: number) => (
-                item?.work_experience?.some((w: any) => w?.company)
-                  ? item
-                  : { ...item, ...resolved[i] }
+                hasCurrentCompany(item) ? item : { ...item, ...resolved[i] }
               ));
             }
             const { items: sizedItems, excludedUnverifiable: companySizeFiltered } =
