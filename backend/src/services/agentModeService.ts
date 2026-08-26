@@ -32723,7 +32723,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             let sizeFilterInput = usableItems;
             if (wantsSizeFilter) {
               const resolved = await this.resolveEmployersForSizeFilter(usableItems, account_id, userId);
-              sizeFilterInput = usableItems.map((item: any, i: number) => ({ ...item, ...resolved[i] }));
+              // CodeRabbit: only fill in the synthetic work_experience when the
+              // item didn't already carry a usable one — otherwise this
+              // overwrites a real Tier-1 work_experience (with `position`, etc.)
+              // with the resolver's bare { company, current } shape, silently
+              // dropping fields for the rare item that already had them.
+              sizeFilterInput = usableItems.map((item: any, i: number) => (
+                item?.work_experience?.some((w: any) => w?.company)
+                  ? item
+                  : { ...item, ...resolved[i] }
+              ));
             }
             const { items: sizedItems, excludedUnverifiable: companySizeFiltered } =
               await linkedInOutreachService.filterByCompanySize(
