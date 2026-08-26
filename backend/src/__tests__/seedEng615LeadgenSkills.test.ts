@@ -109,6 +109,7 @@ describe('seed-eng615-leadgen-skills', () => {
           'save_memory',
         ])
       );
+      expect(skill.toolNames).not.toContain('linkedin_outreach');
     });
 
     it('carries all five hardening blocks (sends + unattended)', () => {
