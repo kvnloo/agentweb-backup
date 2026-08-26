@@ -223,7 +223,7 @@ import {
 import { MAILBOX_PROVIDERS, CrmSender, isMailboxSender } from '../services/crmSenderTypes';
 import { sendAsSender, SenderDailyLimitExceededError } from '../services/sendAsSender';
 import { claimEmailDomain, releaseEmailDomainClaim, EmailDomainAlreadyClaimedError } from '../services/emailDomainClaimService';
-import { getPendingBatch, upsertPendingBatch, deletePendingBatch } from '../services/groupEmailPendingBatchService';
+import { getPendingBatch, upsertPendingBatch, deletePendingBatch, PendingBatchConflictError } from '../services/groupEmailPendingBatchService';
 import { effectiveDailyLimit } from '../services/senderUsageTracker';
 import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
 router.use(apolloSubRouter);
@@ -5485,7 +5485,7 @@ router.post('/email-domains', async (req: Request, res: Response) => {
       }
 
       if (!domainResult) {
-        await releaseEmailDomainClaim(normalizedDomain);
+        await releaseEmailDomainClaim(normalizedDomain, userId);
         return res.status(500).json({ message: 'Failed to register domain in Resend' });
       }
 
@@ -5543,7 +5543,7 @@ router.post('/email-domains', async (req: Request, res: Response) => {
     } catch (innerError) {
       // The claim succeeded but a later step didn't — release it so the domain isn't
       // permanently stuck unclaimable by anyone.
-      await releaseEmailDomainClaim(normalizedDomain).catch(() => {});
+      await releaseEmailDomainClaim(normalizedDomain, userId).catch(() => {});
       throw innerError;
     }
   } catch (error: any) {
@@ -5644,7 +5644,7 @@ router.delete('/email-domains/:domainId', async (req: Request, res: Response) =>
     }
 
     // Free the domain up for any account to claim, now that this one no longer holds it.
-    await releaseEmailDomainClaim(removedEntry.domain).catch(() => {});
+    await releaseEmailDomainClaim(removedEntry.domain, userId).catch(() => {});
 
     res.json({ message: 'Domain removed.' });
   } catch (error: any) {
@@ -6369,20 +6369,37 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     // resume that stops early again replaces it with the new (smaller) remaining set while
     // preserving the campaign's original totals.
     if (stoppedEarlyReason) {
-      const existingBatch = await getPendingBatch(userId, listId).catch(() => null);
-      await upsertPendingBatch(userId, {
-        listId,
-        senderId: sender.id,
-        senderEmail: sender.email,
-        senderName: sender.fromName,
-        subject,
-        htmlContent,
-        textContent,
-        unsubscribeFooterHtml,
-        skippedLeadIds,
-        sentSoFar: (existingBatch?.sentSoFar ?? 0) + sent,
-        totalOriginal: existingBatch?.totalOriginal ?? total,
-      }).catch((e) => console.error('Failed to persist pending group-email batch:', e));
+      // Conditioned on the record being unchanged since we read it, so a concurrent send/resume
+      // for this same list can't silently clobber this write's skippedLeadIds/sentSoFar (and
+      // vice versa). On a lost race, reload the latest record and fold this send's progress on
+      // top of it rather than overwriting — same retry shape as the emailDomains[] writes above.
+      let existingBatch = await getPendingBatch(userId, listId).catch(() => null);
+      const MAX_PENDING_BATCH_WRITE_ATTEMPTS = 3;
+      for (let attempt = 0; attempt < MAX_PENDING_BATCH_WRITE_ATTEMPTS; attempt++) {
+        try {
+          await upsertPendingBatch(userId, {
+            listId,
+            senderId: sender.id,
+            senderEmail: sender.email,
+            senderName: sender.fromName,
+            subject,
+            htmlContent,
+            textContent,
+            unsubscribeFooterHtml,
+            skippedLeadIds,
+            sentSoFar: (existingBatch?.sentSoFar ?? 0) + sent,
+            totalOriginal: existingBatch?.totalOriginal ?? total,
+            createdAt: existingBatch?.createdAt ?? new Date().toISOString(),
+          }, existingBatch?.updatedAt ?? null);
+          break;
+        } catch (writeError: any) {
+          if (!(writeError instanceof PendingBatchConflictError) || attempt === MAX_PENDING_BATCH_WRITE_ATTEMPTS - 1) {
+            console.error('Failed to persist pending group-email batch:', writeError);
+            break;
+          }
+          existingBatch = await getPendingBatch(userId, listId).catch(() => null);
+        }
+      }
     } else {
       await deletePendingBatch(userId, listId).catch(() => {});
     }

@@ -58,7 +58,7 @@ const outlookSender: CrmSender = {
 beforeEach(() => {
   jest.clearAllMocks();
   mockBootstrapEmailProviders.mockResolvedValue(undefined);
-  mockReserveSend.mockResolvedValue(undefined);
+  mockReserveSend.mockResolvedValue('2026-05-04');
   mockReleaseSend.mockResolvedValue(undefined);
 });
 
@@ -240,6 +240,20 @@ describe('sendAsSender — daily cap / warmup (ENG-265)', () => {
     expect(mockReleaseSend).not.toHaveBeenCalled();
   });
 
+  it('releases against the exact date reserveSend returned, not a freshly recomputed "today" (ENG-265 midnight-rollover fix)', async () => {
+    mockResendSendEmail.mockResolvedValue(null); // Resend "failed" signal
+    mockReserveSend.mockResolvedValue('2026-05-04'); // reserved just before UTC midnight
+    const capped: CrmSender = { ...resendSender, dailyLimit: 25 };
+
+    await expect(
+      sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' }),
+    ).rejects.toThrow(SenderSendError);
+
+    // Even if "now" has since rolled to a new UTC day, the release must target the
+    // reservation's own date so it can't decrement the new day's real usage.
+    expect(mockReleaseSend).toHaveBeenCalledWith('u1', 's1', '2026-05-04');
+  });
+
   it('does not release the reservation when Resend confirms success', async () => {
     mockResendSendEmail.mockResolvedValue({ id: 'resend-msg' });
     const capped: CrmSender = { ...resendSender, dailyLimit: 25 };
@@ -257,7 +271,7 @@ describe('sendAsSender — daily cap / warmup (ENG-265)', () => {
     await expect(
       sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' }),
     ).rejects.toThrow(SenderSendError);
-    expect(mockReleaseSend).toHaveBeenCalledWith('u1', 's1');
+    expect(mockReleaseSend).toHaveBeenCalledWith('u1', 's1', '2026-05-04');
   });
 
   it('releases the reservation when a mailbox provider throws after a successful reservation', async () => {
@@ -269,7 +283,7 @@ describe('sendAsSender — daily cap / warmup (ENG-265)', () => {
       sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' }),
     ).rejects.toThrow('token revoked');
     expect(mockReserveSend).toHaveBeenCalledWith('u1', 's2', 10);
-    expect(mockReleaseSend).toHaveBeenCalledWith('u1', 's2');
+    expect(mockReleaseSend).toHaveBeenCalledWith('u1', 's2', '2026-05-04');
   });
 
   it('applies the same cap reserve/no-release-on-success to a mailbox (Gmail) sender', async () => {

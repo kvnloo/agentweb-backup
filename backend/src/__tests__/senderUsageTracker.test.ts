@@ -16,9 +16,9 @@ beforeEach(() => {
 });
 
 describe('InMemorySenderUsageTracker.reserveSend', () => {
-  it('does not throw and consumes one slot when the sender is below its daily cap', async () => {
+  it('does not throw, returns the reservation date, and consumes one slot when the sender is below its daily cap', async () => {
     const t = new InMemorySenderUsageTracker();
-    await expect(t.reserveSend('u1', 's1', 5)).resolves.toBeUndefined();
+    await expect(t.reserveSend('u1', 's1', 5)).resolves.toMatch(/^\d{4}-\d{2}-\d{2}$/);
     expect((await t.getUsage('u1', 's1')).sentCount).toBe(1);
   });
 
@@ -48,14 +48,14 @@ describe('InMemorySenderUsageTracker.reserveSend', () => {
     const t = new InMemorySenderUsageTracker();
     await t.reserveSend('u1', 's1', 1);
     await expect(t.reserveSend('u1', 's1', 1)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
-    await expect(t.reserveSend('u1', 's2', 1)).resolves.toBeUndefined();
+    await expect(t.reserveSend('u1', 's2', 1)).resolves.toMatch(/^\d{4}-\d{2}-\d{2}$/);
   });
 
   it('counters are tracked independently per user even for the same senderId', async () => {
     const t = new InMemorySenderUsageTracker();
     await t.reserveSend('u1', 's1', 1);
     await expect(t.reserveSend('u1', 's1', 1)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
-    await expect(t.reserveSend('u2', 's1', 1)).resolves.toBeUndefined();
+    await expect(t.reserveSend('u2', 's1', 1)).resolves.toMatch(/^\d{4}-\d{2}-\d{2}$/);
   });
 
   it('resets at the start of a new UTC day', async () => {
@@ -64,23 +64,35 @@ describe('InMemorySenderUsageTracker.reserveSend', () => {
     await expect(t.reserveSend('u1', 's1', 1)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
 
     (t as any)._now = () => new Date('2026-05-05T00:01:00Z');
-    await expect(t.reserveSend('u1', 's1', 1)).resolves.toBeUndefined();
+    await expect(t.reserveSend('u1', 's1', 1)).resolves.toBe('2026-05-05');
   });
 });
 
 describe('InMemorySenderUsageTracker.releaseSend', () => {
   it('a failed send that releases its reservation does not permanently consume quota', async () => {
     const t = new InMemorySenderUsageTracker();
-    await t.reserveSend('u1', 's1', 1); // reserve, then simulate the provider call failing
-    await t.releaseSend('u1', 's1');
+    const reservedDate = await t.reserveSend('u1', 's1', 1); // reserve, then simulate the provider call failing
+    await t.releaseSend('u1', 's1', reservedDate);
     expect((await t.getUsage('u1', 's1')).sentCount).toBe(0);
-    await expect(t.reserveSend('u1', 's1', 1)).resolves.toBeUndefined();
+    await expect(t.reserveSend('u1', 's1', 1)).resolves.toMatch(/^\d{4}-\d{2}-\d{2}$/);
   });
 
   it('never goes negative when released with nothing reserved', async () => {
     const t = new InMemorySenderUsageTracker();
-    await t.releaseSend('u1', 's1');
+    await t.releaseSend('u1', 's1', '2026-05-04');
     expect((await t.getUsage('u1', 's1')).sentCount).toBe(0);
+  });
+
+  it('does not decrement the new day\'s count when released against a reservation date from before a UTC-midnight rollover', async () => {
+    const t = new InMemorySenderUsageTracker({ now: () => new Date('2026-05-04T23:59:00Z') });
+    const reservedDate = await t.reserveSend('u1', 's1', 5); // reserved on 2026-05-04
+
+    // Day rolls over before the release call comes back (provider call failed just after midnight).
+    (t as any)._now = () => new Date('2026-05-05T00:01:00Z');
+    await t.reserveSend('u1', 's1', 5); // a legitimate send on the new day, 2026-05-05
+
+    await t.releaseSend('u1', 's1', reservedDate); // releasing the stale 05-04 reservation
+    expect((await t.getUsage('u1', 's1')).sentCount).toBe(1); // today's real send must stay counted
   });
 });
 
@@ -142,10 +154,10 @@ describe('DynamoSenderUsageTracker', () => {
     expect(usage.sentCount).toBe(0);
   });
 
-  it('delegates reserveSend to the deps-injected reserveUsage with today\'s date and the limit', async () => {
+  it('delegates reserveSend to the deps-injected reserveUsage with today\'s date and the limit, and returns that date', async () => {
     const reserveUsage = jest.fn().mockResolvedValue(undefined);
     const { tracker } = makeTracker({ reserveUsage });
-    await tracker.reserveSend('u1', 's1', 5);
+    await expect(tracker.reserveSend('u1', 's1', 5)).resolves.toBe('2026-05-04');
     expect(reserveUsage).toHaveBeenCalledWith('u1', 's1', '2026-05-04', 5);
   });
 
@@ -155,10 +167,10 @@ describe('DynamoSenderUsageTracker', () => {
     await expect(tracker.reserveSend('u1', 's1', 5)).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
   });
 
-  it('delegates releaseSend to the deps-injected releaseUsage with today\'s date', async () => {
+  it('delegates releaseSend to the deps-injected releaseUsage with the given reservation date, not a freshly recomputed today', async () => {
     const releaseUsage = jest.fn().mockResolvedValue(undefined);
-    const { tracker } = makeTracker({ releaseUsage });
-    await tracker.releaseSend('u1', 's1');
+    const { tracker } = makeTracker({ releaseUsage, today: '2026-05-05' });
+    await tracker.releaseSend('u1', 's1', '2026-05-04');
     expect(releaseUsage).toHaveBeenCalledWith('u1', 's1', '2026-05-04');
   });
 });

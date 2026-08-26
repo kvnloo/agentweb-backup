@@ -21,6 +21,14 @@ const TABLE_PREFIX = process.env.NODE_ENV === 'production' ? '' : 'Dev-';
 const CONFIGS_TABLE = `${TABLE_PREFIX}AW-Configs`;
 const CLAIM_PARTITION = '__system__:emailDomainClaims';
 
+// An abandoned claim (process dies between this write and the caller's later
+// emailDomains[] persistence) must not block the domain forever — a fresh
+// claim attempt is allowed to override one older than this window instead of
+// requiring manual intervention. Comfortably longer than the Resend
+// create/get-domain round trip the registration route makes right after
+// claiming.
+const CLAIM_STALE_MS = 10 * 60 * 1000;
+
 function claimConfigId(normalizedDomain: string): string {
   return `emailDomainClaim:${normalizedDomain}`;
 }
@@ -40,6 +48,7 @@ function client(): AWS.DynamoDB.DocumentClient {
 
 /** Atomically claim a domain for userId. Throws EmailDomainAlreadyClaimedError if already claimed. */
 export async function claimEmailDomain(userId: string, normalizedDomain: string): Promise<void> {
+  const staleBefore = new Date(Date.now() - CLAIM_STALE_MS).toISOString();
   try {
     await client()
       .put({
@@ -50,21 +59,45 @@ export async function claimEmailDomain(userId: string, normalizedDomain: string)
           ownerUserId: userId,
           claimedAt: new Date().toISOString(),
         },
-        ConditionExpression: 'attribute_not_exists(configId)',
+        ConditionExpression: 'attribute_not_exists(configId) OR claimedAt < :staleBefore',
+        ExpressionAttributeValues: { ':staleBefore': staleBefore },
       })
       .promise();
   } catch (err: any) {
     if (err?.code !== 'ConditionalCheckFailedException') throw err;
+    // Strongly consistent: the put above just lost a race (or hit a live claim), and an
+    // eventually-consistent read here could still return stale/missing data and misreport
+    // claimedByUserId.
     const existing = await client()
-      .get({ TableName: CONFIGS_TABLE, Key: { userId: CLAIM_PARTITION, configId: claimConfigId(normalizedDomain) } })
+      .get({
+        TableName: CONFIGS_TABLE,
+        Key: { userId: CLAIM_PARTITION, configId: claimConfigId(normalizedDomain) },
+        ConsistentRead: true,
+      })
       .promise();
     throw new EmailDomainAlreadyClaimedError(normalizedDomain, existing.Item?.ownerUserId ?? 'another account');
   }
 }
 
-/** Release a claim (e.g. on removal, or to unwind a claim after a later step in registration failed). */
-export async function releaseEmailDomainClaim(normalizedDomain: string): Promise<void> {
-  await client()
-    .delete({ TableName: CONFIGS_TABLE, Key: { userId: CLAIM_PARTITION, configId: claimConfigId(normalizedDomain) } })
-    .promise();
+/**
+ * Release a claim (e.g. on removal, or to unwind a claim after a later step in registration
+ * failed). Conditioned on the caller still being the current owner, so a delayed or duplicate
+ * release call can't delete a different user's newer claim on the same domain (which would let
+ * two users end up "owning" it at once — e.g. a stale retry racing a stale-claim override by a
+ * different user). A failed condition means someone else already holds this domain's claim slot,
+ * which is exactly the state the caller wanted, so it's a successful no-op, not an error.
+ */
+export async function releaseEmailDomainClaim(normalizedDomain: string, ownerUserId: string): Promise<void> {
+  try {
+    await client()
+      .delete({
+        TableName: CONFIGS_TABLE,
+        Key: { userId: CLAIM_PARTITION, configId: claimConfigId(normalizedDomain) },
+        ConditionExpression: 'ownerUserId = :ownerUserId',
+        ExpressionAttributeValues: { ':ownerUserId': ownerUserId },
+      })
+      .promise();
+  } catch (err: any) {
+    if (err?.code !== 'ConditionalCheckFailedException') throw err;
+  }
 }

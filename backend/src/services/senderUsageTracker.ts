@@ -35,10 +35,15 @@ export class SenderDailyLimitExceededError extends Error {
 }
 
 export interface SenderUsageTracker {
-  /** Atomically checks the limit and reserves one send. Throws SenderDailyLimitExceededError if already at/over limit. */
-  reserveSend(userId: string, senderId: string, limit: number): Promise<void>;
-  /** Undoes a reservation — call only when the provider call definitively failed after a successful reserveSend. */
-  releaseSend(userId: string, senderId: string): Promise<void>;
+  /**
+   * Atomically checks the limit and reserves one send. Returns the UTC date (YYYY-MM-DD) the
+   * reservation was recorded against — pass it back into releaseSend so a UTC-midnight rollover
+   * between reserve and release can't decrement the new day's count instead of the reserved one.
+   * Throws SenderDailyLimitExceededError if already at/over limit.
+   */
+  reserveSend(userId: string, senderId: string, limit: number): Promise<string>;
+  /** Undoes a reservation — call only when the provider call definitively failed after a successful reserveSend. `reservedDate` must be the value reserveSend returned. */
+  releaseSend(userId: string, senderId: string, reservedDate: string): Promise<void>;
   getUsage(userId: string, senderId: string): Promise<SenderUsageRow>;
 }
 
@@ -107,17 +112,18 @@ export class InMemorySenderUsageTracker implements SenderUsageTracker {
     return fresh;
   }
 
-  async reserveSend(userId: string, senderId: string, limit: number): Promise<void> {
+  async reserveSend(userId: string, senderId: string, limit: number): Promise<string> {
     const row = this.getOrInit(userId, senderId);
     if (row.sentCount >= limit) {
       throw new SenderDailyLimitExceededError(senderId, limit);
     }
     row.sentCount += 1;
+    return row.date;
   }
 
-  async releaseSend(userId: string, senderId: string): Promise<void> {
-    const row = this.getOrInit(userId, senderId);
-    if (row.sentCount > 0) {
+  async releaseSend(userId: string, senderId: string, reservedDate: string): Promise<void> {
+    const row = this.store.get(`${userId}:${senderId}`);
+    if (row && row.date === reservedDate && row.sentCount > 0) {
       row.sentCount -= 1;
     }
   }
@@ -149,12 +155,14 @@ export class DynamoSenderUsageTracker implements SenderUsageTracker {
     return row;
   }
 
-  async reserveSend(userId: string, senderId: string, limit: number): Promise<void> {
-    await this.deps.reserveUsage(userId, senderId, todayUtc(this.now()), limit);
+  async reserveSend(userId: string, senderId: string, limit: number): Promise<string> {
+    const today = todayUtc(this.now());
+    await this.deps.reserveUsage(userId, senderId, today, limit);
+    return today;
   }
 
-  async releaseSend(userId: string, senderId: string): Promise<void> {
-    await this.deps.releaseUsage(userId, senderId, todayUtc(this.now()));
+  async releaseSend(userId: string, senderId: string, reservedDate: string): Promise<void> {
+    await this.deps.releaseUsage(userId, senderId, reservedDate);
   }
 
   async getUsage(userId: string, senderId: string): Promise<SenderUsageRow> {

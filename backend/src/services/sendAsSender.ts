@@ -78,8 +78,12 @@ export async function sendAsSender(
   // if the provider call then definitively fails, so quota is still only consumed
   // by a send that actually went out.
   const limit = effectiveDailyLimit(sender);
+  // Retain the exact date the reservation landed on — releasing it later must target this
+  // same date, not "today" recomputed at release time, so a send that reserves right before
+  // and fails right after UTC midnight can't decrement the new day's count instead.
+  let reservedDate: string | null = null;
   if (limit !== null) {
-    await senderUsageTracker.reserveSend(userId, sender.id, limit);
+    reservedDate = await senderUsageTracker.reserveSend(userId, sender.id, limit);
   }
 
   try {
@@ -132,8 +136,8 @@ export async function sendAsSender(
   } catch (error) {
     // Release a reservation we actually made — SenderDailyLimitExceededError itself
     // never reaches here, since reserveSend() throws it before this try block starts.
-    if (limit !== null) {
-      await senderUsageTracker.releaseSend(userId, sender.id).catch(() => {});
+    if (limit !== null && reservedDate !== null) {
+      await senderUsageTracker.releaseSend(userId, sender.id, reservedDate).catch(() => {});
     }
     throw error;
   }

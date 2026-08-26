@@ -48,6 +48,18 @@ function client(): AWS.DynamoDB.DocumentClient {
   return cachedClient;
 }
 
+/**
+ * Thrown by upsertPendingBatch when the record was modified by another write between the
+ * caller's read and this write. Not a hard failure — the caller should reload the current
+ * record, fold its own progress on top of it, and retry.
+ */
+export class PendingBatchConflictError extends Error {
+  constructor(public listId: string) {
+    super(`The pending group-email batch for list ${listId} was updated concurrently.`);
+    this.name = 'PendingBatchConflictError';
+  }
+}
+
 export async function getPendingBatch(userId: string, listId: string): Promise<GroupEmailPendingBatch | null> {
   const r = await client()
     .get({ TableName: CONFIGS_TABLE, Key: { userId, configId: pendingBatchConfigId(listId) } })
@@ -58,29 +70,47 @@ export async function getPendingBatch(userId: string, listId: string): Promise<G
 }
 
 /**
- * Create or replace the pending batch for this list. Preserves the original createdAt
- * (and, via the caller, totalOriginal/cumulative sentSoFar) across repeated resumes —
- * see crm.ts's group-email/send route for how those are accumulated before calling this.
+ * Create or replace the pending batch for this list. `expectedUpdatedAt` must be the
+ * `updatedAt` of the record the caller's new values were computed from — `null` if the
+ * caller believes no record exists yet. The write is conditioned on that value still being
+ * current, so two concurrent sends/resumes for the same list (e.g. a double-click, or a
+ * resume racing a fresh send) can't silently clobber each other's skippedLeadIds/sentSoFar
+ * via an unconditional last-writer-wins put. Throws PendingBatchConflictError on a lost
+ * race — see crm.ts's group-email/send route for the reload-and-retry loop this drives.
+ * Callers own createdAt (carry the existing record's value forward on a resume, or a fresh
+ * timestamp for a brand-new batch) since they've already read the prior record to compute
+ * expectedUpdatedAt anyway.
  */
 export async function upsertPendingBatch(
   userId: string,
-  batch: Omit<GroupEmailPendingBatch, 'createdAt' | 'updatedAt'>,
+  batch: Omit<GroupEmailPendingBatch, 'updatedAt'>,
+  expectedUpdatedAt: string | null,
 ): Promise<void> {
-  const now = new Date().toISOString();
-  const existing = await getPendingBatch(userId, batch.listId).catch(() => null);
   const { listId, ...fields } = batch;
-  await client()
-    .put({
-      TableName: CONFIGS_TABLE,
-      Item: {
-        userId,
-        configId: pendingBatchConfigId(listId),
-        ...fields,
-        createdAt: existing?.createdAt ?? now,
-        updatedAt: now,
-      },
-    })
-    .promise();
+  try {
+    await client()
+      .put({
+        TableName: CONFIGS_TABLE,
+        Item: {
+          userId,
+          configId: pendingBatchConfigId(listId),
+          ...fields,
+          updatedAt: new Date().toISOString(),
+        },
+        ...(expectedUpdatedAt === null
+          ? { ConditionExpression: 'attribute_not_exists(configId)' }
+          : {
+              ConditionExpression: 'updatedAt = :expectedUpdatedAt',
+              ExpressionAttributeValues: { ':expectedUpdatedAt': expectedUpdatedAt },
+            }),
+      })
+      .promise();
+  } catch (err: any) {
+    if (err?.code === 'ConditionalCheckFailedException') {
+      throw new PendingBatchConflictError(listId);
+    }
+    throw err;
+  }
 }
 
 export async function deletePendingBatch(userId: string, listId: string): Promise<void> {

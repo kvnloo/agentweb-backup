@@ -26,7 +26,7 @@ import { settingsService } from '../services/settingsService';
 import { io } from '../server';
 import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
 import { SenderDailyLimitExceededError } from '../services/senderUsageTracker';
-import { getPendingBatch, upsertPendingBatch, deletePendingBatch } from '../services/groupEmailPendingBatchService';
+import { getPendingBatch, upsertPendingBatch, deletePendingBatch, PendingBatchConflictError } from '../services/groupEmailPendingBatchService';
 import router from '../routes/crm';
 
 jest.mock('../services/db', () => ({
@@ -103,6 +103,7 @@ jest.mock('../services/leadListAlertService', () => ({
 }));
 
 jest.mock('../services/groupEmailPendingBatchService', () => ({
+  ...jest.requireActual('../services/groupEmailPendingBatchService'),
   getPendingBatch: jest.fn().mockResolvedValue(null),
   upsertPendingBatch: jest.fn().mockResolvedValue(undefined),
   deletePendingBatch: jest.fn().mockResolvedValue(undefined),
@@ -662,7 +663,7 @@ describe('CRM Group Email Endpoints', () => {
           skippedLeadIds: ['3'],
           sentSoFar: 2,
           totalOriginal: 3,
-        }));
+        }), null);
         expect(deletePendingBatch).not.toHaveBeenCalled();
       });
 
@@ -700,7 +701,49 @@ describe('CRM Group Email Endpoints', () => {
           skippedLeadIds: ['4', '5'],
           sentSoFar: 3,
           totalOriginal: 5,
-        }));
+        }), '2026-01-01T00:00:00.000Z');
+      });
+
+      it('reloads and retries on a concurrent-write conflict instead of losing this send\'s progress', async () => {
+        cappedSenderConfig();
+        const staleBatch = {
+          listId: 'list-1', senderId: 'r-1', senderEmail: 'me@test.com', senderName: 'Me',
+          subject: 'Hi', htmlContent: '<p>Hello</p>', skippedLeadIds: ['3', '4', '5'],
+          sentSoFar: 2, totalOriginal: 5, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+        };
+        const freshBatch = { ...staleBatch, sentSoFar: 3, updatedAt: '2026-01-01T00:05:00.000Z' }; // written by a concurrent request
+        (getPendingBatch as jest.Mock)
+          .mockResolvedValueOnce(staleBatch) // this request's initial read
+          .mockResolvedValueOnce(freshBatch); // reload after the conflict
+        (upsertPendingBatch as jest.Mock)
+          .mockRejectedValueOnce(new PendingBatchConflictError('list-1'))
+          .mockResolvedValueOnce(undefined);
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+          items: [
+            { leadId: '3', email: 'c@test.com' },
+            { leadId: '4', email: 'd@test.com' },
+          ],
+          lastEvaluatedKey: undefined,
+        });
+        (resendService.sendEmail as jest.Mock).mockResolvedValueOnce({ id: 'msg-3' });
+        (senderUsageTracker.reserveSend as jest.Mock)
+          .mockResolvedValueOnce(undefined)
+          .mockRejectedValueOnce(new SenderDailyLimitExceededError('r-1', 2));
+
+        mockReq.body = {
+          senderId: 'r-1', senderEmail: 'me@test.com', senderName: 'Me', subject: 'Hi', htmlContent: '<p>Hello</p>',
+          leadIds: ['3', '4'],
+        };
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        expect(upsertPendingBatch).toHaveBeenCalledTimes(2);
+        // Second attempt folds this send's +1 onto the reloaded freshBatch.sentSoFar (3), not
+        // the stale first-read value (2) — the retry must be based on the reloaded record.
+        expect(upsertPendingBatch).toHaveBeenNthCalledWith(2, 'test-user-id', expect.objectContaining({
+          sentSoFar: 4,
+        }), '2026-01-01T00:05:00.000Z');
       });
 
       it('clears the pending-batch record once a resume finishes everyone', async () => {
