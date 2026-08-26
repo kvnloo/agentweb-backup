@@ -44,6 +44,7 @@ import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHisto
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
+import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
@@ -4477,6 +4478,43 @@ export class AgentModeService {
           // waiting on — the failure mode this prevents is a silent overclaim, which
           // is strictly less bad than losing the message.
           console.warn('AgentMode: unconsumed-cursor notice failed', cursorError);
+        }
+      }
+
+      // ENG-1565: model resolution reads ONLY the request's llmModel field (the
+      // picker) — no code path parses chat text for an intent to switch/reassess
+      // models. So a message like "reassess using a new model" is inert by
+      // construction, and previously ran on the same model with no acknowledgement
+      // that nothing changed (production evidence: session
+      // e6c9e693-ff33-4883-a18a-9d674b4074c4, audited on ENG-426).
+      //
+      // Same shape as the reconcilers above: deterministic, append-only, patched
+      // into the last assistant message. `llmModel` here is already the model
+      // resolved for THIS turn; `findLastAssistantModel(sessionHistory)` is the
+      // model that generated the turn before it — comparing the two (rather than
+      // assuming chat text can never change the model) correctly stays silent if
+      // the picker was ALSO flipped in this same request, which really would
+      // change the model despite the chat text.
+      //
+      // Kill switch: set AGENT_MODEL_REASSESS_ACK=false to disable. Absent means ON.
+      if (content && !wasCancelled && !mockMode
+          && process.env.AGENT_MODEL_REASSESS_ACK !== 'false') {
+        try {
+          const modelBefore = findLastAssistantModel(sessionHistory as any);
+          const reconciled = reconcileModelReassessAck(content, messageContent, modelBefore, llmModel);
+          if (reconciled !== content) {
+            content = reconciled;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                break;
+              }
+            }
+          }
+        } catch (modelReassessError) {
+          // Advisory, same reasoning as the cursor notice above: never block
+          // delivery of a reply the user is waiting on over this note.
+          console.warn('AgentMode: model-reassess acknowledgement failed', modelReassessError);
         }
       }
 
