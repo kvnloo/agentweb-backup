@@ -36,9 +36,14 @@ const FAILURE_HANDLING = `## FAILURE HANDLING
   succeeded unless the tool result confirms it.`;
 
 const SAFETY_VOLUME_LIMITS = `## SAFETY & VOLUME LIMITS (apply in ALL modes, including scheduled/unattended runs)
-- HARD CAPS per run: max 5 LinkedIn invites, 10 LinkedIn messages, 25 emails,
-  0 deletions. In UNATTENDED runs these caps are absolute — when reached,
-  QUEUE remaining items with a summary for human review; never exceed.
+- HARD CAPS per run: max 25 emails, 0 deletions.
+  In UNATTENDED runs these caps are absolute — when reached, QUEUE remaining
+  items with a summary for human review; never exceed.
+- LinkedIn invites and messages are capped PER DAY by the backend, not by a fixed
+  number here. Do not self-count: the send-invite/send-message/send-inmail tool
+  call itself refuses with a clear reason once the account's daily cap is
+  reached. On that refusal, STOP sending on this account and queue the rest for
+  a later run — do not retry and do not switch to a different account.
 - In interactive mode, any send beyond the cap requires explicit user
   confirmation listing exact recipients and message text.
 - NEVER delete leads, lists, or drafts in an unattended run under any

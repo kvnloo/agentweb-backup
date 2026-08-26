@@ -316,7 +316,13 @@ import {
   usableProfileUrl,
   withoutFabricatedProfileFields,
 } from '../utils/linkedInAnonymizedProfile';
-import { PACED_WRITE_ACTIONS, reserveWriteSlot } from './linkedInWritePacer';
+import { PACED_WRITE_ACTIONS } from './linkedInWritePacer';
+import {
+  paceLinkedInWrite,
+  resolveLinkedInAccountForWrite,
+  setDailyInviteCap,
+  type ResolvedLinkedInAccount,
+} from './agentMode/linkedInDailyVolumeGate';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -32148,11 +32154,25 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // Same set the pacer uses, deliberately not a second hand-maintained copy: a
     // sixth write action added to one list and not the other would be either
     // silently unpaced or silently unauthorized.
-    if (PACED_WRITE_ACTIONS.has(action)) {
-      const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
-      const userAccounts = await getAccountsByUserIdIncludingOrgShared(userId);
-      const authorized = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
-      if (!authorized) {
+    //
+    // Also resolves the account's owner + daily-cap config here (via
+    // resolveLinkedInAccountForWrite — services/agentMode/linkedInDailyVolumeGate.ts),
+    // from the same lookup this authorization check already needs, avoiding a
+    // second DB read. The daily cap is self-reported (set directly by the user
+    // in Settings, or by Emma via the set-daily-invite-cap action after asking
+    // about Premium status), never auto-detected — see linkedInWritePacer.ts's
+    // module doc comment for why. Unset defaults to the conservative free-tier
+    // number, never to the Premium max. The resolved owner may differ from the
+    // calling user for an org-shared account — writes below go through the
+    // owner's record, not the caller's.
+    // set-daily-invite-cap shares this same ownership check (a config write on
+    // the account still needs to be the caller's own/shared account) but is
+    // deliberately NOT in PACED_WRITE_ACTIONS — it doesn't touch LinkedIn at
+    // all, so none of the burst/hourly/daily send-pacing below applies to it.
+    let resolvedLinkedInAccount: ResolvedLinkedInAccount | null = null;
+    if (PACED_WRITE_ACTIONS.has(action) || action === 'set-daily-invite-cap') {
+      resolvedLinkedInAccount = await resolveLinkedInAccountForWrite(userId, account_id);
+      if (!resolvedLinkedInAccount) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
       }
     }
@@ -32255,26 +32275,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // batch of already-invited leads would both crawl and eat the hourly ceiling
     // that the genuinely-new invites later in the same run need. Each case below
     // therefore calls this immediately before its own Unipile write.
+    // Daily-volume + hourly/burst pacing lives in
+    // services/agentMode/linkedInDailyVolumeGate.ts — see that module's doc
+    // comment for the ownership and check-ordering fixes it encodes.
     const paceWrite = async (): Promise<{ refusal: any } | null> => {
       if (!PACED_WRITE_ACTIONS.has(action)) return null;
-      const slot = await reserveWriteSlot(account_id);
-      if (slot.allowed) return null;
-      console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by write pacer — ${slot.reason}`);
-      return {
-        refusal: {
-          success: false,
-          message: 'LinkedIn write actions are being paced',
-          error: [
-            slot.reason,
-            '',
-            'This is a deliberate safety limit on our side, not a LinkedIn rejection: sending or',
-            'withdrawing too quickly is what causes LinkedIn to revoke the account\'s session, which',
-            'blocks ALL outreach until the account owner manually reconnects.',
-            '',
-            'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
-          ].join('\n'),
-        },
-      };
+      const result = await paceLinkedInWrite(action, resolvedLinkedInAccount!, account_id);
+      return result.refusal ? { refusal: result.refusal } : null;
     };
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
@@ -33061,8 +33068,32 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           };
         }
 
+        case 'set-daily-invite-cap': {
+          // Self-reported, not detected — see linkedInWritePacer.ts's module doc
+          // comment for why this is a direct question to the user rather than an
+          // API probe. Use this ONLY after the user has told you, in THIS
+          // conversation, whether their connected LinkedIn account has Premium —
+          // never guess, never infer it from anything else, and never call this
+          // for an unattended/scheduled run (there's no one to ask).
+          // Writes through the account OWNER's record, not necessarily the
+          // caller's — see linkedInDailyVolumeGate.ts's module doc comment.
+          const clampedCap = await setDailyInviteCap(
+            resolvedLinkedInAccount!,
+            account_id,
+            args.daily_invite_cap,
+          );
+          return {
+            success: true,
+            data: {
+              account_id,
+              daily_invite_cap: clampedCap,
+              ...(clampedCap !== Number(args.daily_invite_cap) ? { note: `Requested ${args.daily_invite_cap} was clamped to the system-wide maximum of ${clampedCap}.` } : {}),
+            },
+          };
+        }
+
         default: {
-          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters'];
+          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters','set-daily-invite-cap'];
           throw new Error(`Unsupported LinkedIn outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }
       }

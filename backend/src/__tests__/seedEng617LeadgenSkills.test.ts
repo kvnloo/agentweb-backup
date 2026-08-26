@@ -135,7 +135,12 @@ describe('seed-eng617-leadgen-skills', () => {
       ]) {
         expect(skill.systemPrompt).toContain(block);
       }
-      expect(skill.systemPrompt).toContain('5 LinkedIn invites');
+      // The fixed "5 LinkedIn invites" prompt number was replaced by a real,
+      // Premium-aware daily cap enforced in the backend (linkedInWritePacer.ts,
+      // ENG-1197 follow-up) — asserting the old literal here would lock in the
+      // stale prompt text as the invariant instead of the enforced behavior.
+      expect(skill.systemPrompt).toContain('capped PER DAY by the backend');
+      expect(skill.systemPrompt).toContain('SELF-REPORTED, not detected');
       expect(skill.systemPrompt).toContain('25 emails');
       expect(skill.systemPrompt).toContain('across ALL channels combined');
     });
