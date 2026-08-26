@@ -6924,6 +6924,8 @@ export const crmDb = {
     enrichmentMetadata?: Record<string, any>;
     /** ISO timestamp set when a LinkedIn connection invite is manually sent from the CRM. */
     linkedInInviteSentAt?: string | null;
+    /** ISO timestamp set when this account accepted an INBOUND LinkedIn invite from this lead — distinct from linkedInInviteSentAt (an outbound send), since the two are opposite real-world events. */
+    linkedInInviteAcceptedAt?: string | null;
     /** ENG-1026: pre-send identity cross-check stamp (ISO date + verified canonical URL). */
     linkedinIdentityVerifiedAt?: string | null;
     linkedinIdentityVerifiedUrl?: string | null;
@@ -7120,6 +7122,15 @@ export const crmDb = {
         } else {
           setExpressions.push('linkedInInviteSentAt = :linkedInInviteSentAt');
           expressionAttributeValues[':linkedInInviteSentAt'] = updates.linkedInInviteSentAt;
+        }
+      }
+
+      if (updates.linkedInInviteAcceptedAt !== undefined) {
+        if (updates.linkedInInviteAcceptedAt === null) {
+          removeExpressions.push('linkedInInviteAcceptedAt');
+        } else {
+          setExpressions.push('linkedInInviteAcceptedAt = :linkedInInviteAcceptedAt');
+          expressionAttributeValues[':linkedInInviteAcceptedAt'] = updates.linkedInInviteAcceptedAt;
         }
       }
 

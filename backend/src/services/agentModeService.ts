@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
+import { applyLeadMetrics, finalizeLeadCosts } from '../utils/metaActionFamilies';
 import { parse as parseCsv } from 'csv-parse/sync';
 import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
@@ -1222,6 +1223,14 @@ type GoogleAdsConfigShape = { customer_id: string; currency?: string; test_accou
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
+  // ENG-1295 hardening: self-consistency cache for perform_data_analysis. Keyed by
+  // userId + a hash of the exact (file_urls, analysis_instruction) pair, so a
+  // literal repeat of the same call can be checked against its own prior grouping-
+  // key result instead of silently returning a contradictory answer. Bounded size
+  // and TTL since this lives on the long-running singleton service instance.
+  private dataAnalysisConsistencyCache: Map<string, { groupingKeyValues: string[]; timestamp: number }> = new Map();
+  private readonly DATA_ANALYSIS_CONSISTENCY_CACHE_MAX = 500;
+  private readonly DATA_ANALYSIS_CONSISTENCY_TTL_MS = 30 * 60 * 1000; // 30 minutes
   // ENG-475: deterministic browser-session persistence (auto load-at-start /
   // save-as-you-go around browser automation tools, so an intermittent login
   // success is captured without depending on the model calling the cookie tools).
@@ -8610,6 +8619,160 @@ export class AgentModeService {
     return { cleanedText, links };
   }
 
+  /**
+   * ENG-1295 provenance/consistency helper: parses a generated CSV block into its
+   * header, rows, data-row count, and the distinct values of its first column —
+   * the grouping-key convention this tool's prompts ask the model to use (see the
+   * per-ad-group / per-user breakdown instructions in the callers of this tool).
+   * Used to append a cheap-to-verify provenance stub, to diff repeat calls for
+   * self-consistency, and to check the CSV's own internal id/name consistency.
+   */
+  private parseCsvProvenance(csvText: string): { rowsOut: number; groupingKeyValues: string[]; header: string[]; rows: string[][] } | null {
+    // ENG-1600: was `line.split(',')`, which breaks on any quoted field containing a comma
+    // ("Acme, Inc") and shifts every column after it left. That misalignment is not cosmetic:
+    // column 0 feeds the cross-call comparison below, which HARD-REJECTS the analysis with
+    // `inconsistent_result` — so a shifted row on one run and not the other refuses a correct
+    // analysis. `csv-parse` is already imported here and used elsewhere in this file.
+    let parsed: string[][];
+    try {
+      parsed = parseCsv(csvText, {
+        skip_empty_lines: true,
+        trim: true,
+        // Generated CSVs are not guaranteed rectangular; a ragged row must not throw away the
+        // whole provenance check, which is the only guard against fabricated output.
+        relax_column_count: true,
+        relax_quotes: true,
+      }) as string[][];
+    } catch (error) {
+      console.warn('AgentMode: parseCsvProvenance could not parse the generated CSV:', error);
+      return null;
+    }
+    if (parsed.length === 0) return null;
+    const header = parsed[0];
+    const rows = parsed.slice(1); // first line is assumed to be the header
+    const groupingKeyValues: string[] = [];
+    const seen = new Set<string>();
+    for (const row of rows) {
+      const firstCol = row[0];
+      if (firstCol && !seen.has(firstCol)) {
+        seen.add(firstCol);
+        groupingKeyValues.push(firstCol);
+      }
+    }
+    return { rowsOut: rows.length, groupingKeyValues, header, rows };
+  }
+
+  /** ENG-1295: splits a CSV header cell into lowercase word tokens (camelCase- and separator-aware) for id/name column detection. */
+  private tokenizeCsvHeaderCell(cell: string): string[] {
+    return cell
+      .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+      .split(/[^a-zA-Z0-9]+/)
+      .map(t => t.toLowerCase())
+      .filter(Boolean);
+  }
+
+  /**
+   * ENG-1295 intra-response check: detects the exact failure pattern that
+   * produced the prod hallucination — the SAME id mapped to more than one
+   * DIFFERENT name within one generated CSV (e.g. id 199836788398 as both
+   * "Product Analytics Platform" and "Game Analytics Platform"). This requires
+   * no narrative parsing. Informational only, NOT a hard reject: a real entity
+   * (an ad group, a CRM lead's company, etc.) can legitimately be renamed
+   * within a query's date window, which would produce this exact shape from
+   * genuinely correct source data — we can't tell "renamed" apart from
+   * "fabricated" using the CSV alone, so this is surfaced in Provenance for the
+   * caller to judge rather than blocking a possibly-correct result. Only
+   * applies when the CSV actually has both an id-like and a name-like column.
+   */
+  private findCsvIdNameCollisions(header: string[], rows: string[][]): { id: string; names: string[] }[] {
+    const idIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('id'));
+    const nameIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('name'));
+    if (idIdx === -1 || nameIdx === -1 || idIdx === nameIdx) return [];
+    const idToNames = new Map<string, Set<string>>();
+    for (const row of rows) {
+      const id = row[idIdx];
+      const name = row[nameIdx];
+      if (!id || !name) continue;
+      if (!idToNames.has(id)) idToNames.set(id, new Set());
+      idToNames.get(id)!.add(name);
+    }
+    const collisions: { id: string; names: string[] }[] = [];
+    for (const [id, names] of idToNames) {
+      if (names.size > 1) {
+        collisions.push({ id, names: [...names] });
+      }
+    }
+    return collisions;
+  }
+
+  /**
+   * ENG-1295 grounding check: for a CSV with an id-like column, verifies each
+   * distinct id actually occurs somewhere in the raw source file(s) that were
+   * sent to the sandbox — the same objective technique the agent used manually
+   * (search_tool_response) to catch the fabricated name in prod session
+   * d789c175. Informational only (not a hard reject): a substring miss can also
+   * mean the model reformatted the id, so this is surfaced as a provenance
+   * caveat rather than blocking a possibly-correct result.
+   */
+  private checkCsvIdGrounding(header: string[], rows: string[][], fileRawContents: string[]): { checked: number; unverified: number } | null {
+    const idIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('id'));
+    if (idIdx === -1 || fileRawContents.length === 0) return null;
+    const distinctIds = [...new Set(rows.map(r => r[idIdx]).filter(Boolean))];
+    if (distinctIds.length === 0) return null;
+    const combinedSource = fileRawContents.join('\n');
+    const unverified = distinctIds.filter(id => !combinedSource.includes(id)).length;
+    return { checked: distinctIds.length, unverified };
+  }
+
+  /**
+   * ENG-1295 provenance helper: best-effort input row count for a source file, so
+   * the caller can cheaply sanity-check rows_out against rows_in. Counts elements
+   * of the largest JSON array found (top-level array, or the largest array
+   * property for the common `{ results: [...] }` / `{ sessions: [...] }` API-
+   * response shape used throughout this codebase), falling back to a non-empty
+   * line count for non-JSON content. This is a heuristic, not an exact parse of
+   * the analysis_instruction's semantics.
+   */
+  private estimateRowsIn(rawContent: string): number | null {
+    const trimmed = rawContent.trim();
+    if (!trimmed) return null;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed.length;
+      if (parsed && typeof parsed === 'object') {
+        let maxLen = -1;
+        for (const value of Object.values(parsed)) {
+          if (Array.isArray(value) && value.length > maxLen) maxLen = value.length;
+        }
+        if (maxLen >= 0) return maxLen;
+      }
+    } catch {
+      // Not JSON — fall through to a line-count approximation.
+    }
+    return trimmed.split('\n').filter(l => l.trim().length > 0).length;
+  }
+
+  /** ENG-1295: cache key for the self-consistency check — exact (userId, file_urls, analysis_instruction) match. */
+  private buildDataAnalysisCacheKey(userId: string, fileUrls: string[], analysisInstruction: string): string {
+    const hash = createHash('sha256').update(JSON.stringify(fileUrls) + ' ' + analysisInstruction).digest('hex');
+    return `${userId}:${hash}`;
+  }
+
+  /** ENG-1295: bound the self-consistency cache so the long-lived singleton doesn't grow unboundedly. */
+  private pruneDataAnalysisConsistencyCache(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.dataAnalysisConsistencyCache) {
+      if (now - entry.timestamp > this.DATA_ANALYSIS_CONSISTENCY_TTL_MS) {
+        this.dataAnalysisConsistencyCache.delete(key);
+      }
+    }
+    while (this.dataAnalysisConsistencyCache.size > this.DATA_ANALYSIS_CONSISTENCY_CACHE_MAX) {
+      const oldestKey = this.dataAnalysisConsistencyCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.dataAnalysisConsistencyCache.delete(oldestKey);
+    }
+  }
+
   public async performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
     try {
       const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
@@ -8728,6 +8891,9 @@ export class AgentModeService {
       // Human-readable source description per file, parallel to fileParts, used to
       // build the filename manifest in the prompt.
       const fileSources: string[] = [];
+      // Decoded raw content per file, parallel to fileSources — kept only for the
+      // ENG-1295 provenance stub's rows_in estimate, not sent anywhere else.
+      const fileRawContents: string[] = [];
       let totalSize = 0;
 
       for (const fileUrl of urlsToProcess) {
@@ -8771,6 +8937,7 @@ export class AgentModeService {
               }
             });
             fileSources.push(fileUrl);
+            fileRawContents.push(s3Content);
             continue;
           }
 
@@ -8809,6 +8976,7 @@ export class AgentModeService {
               }
             });
             fileSources.push(fileUrl);
+            fileRawContents.push(s3Content);
             continue;
           }
 
@@ -8831,7 +8999,8 @@ export class AgentModeService {
           // Send to Gemini as text/csv so the file materializes on the sandbox
           // filesystem (see SANDBOX_FILE_MIME note above). The actual content may
           // be CSV, JSON, or plain text — the model is told this in the prompt.
-          const base64Content = Buffer.from(fileData).toString('base64');
+          const fileBuffer = Buffer.from(fileData);
+          const base64Content = fileBuffer.toString('base64');
 
           fileParts.push({
             inlineData: {
@@ -8840,6 +9009,7 @@ export class AgentModeService {
             }
           });
           fileSources.push(fileUrl);
+          fileRawContents.push(fileBuffer.toString('utf-8'));
 
         } catch (error) {
           console.error(`Error processing file ${fileUrl}:`, error);
@@ -8923,6 +9093,15 @@ export class AgentModeService {
       // the post-loop block) — folding every intermediate code stdout into the
       // analysis would bury the real summary under print()-debugging noise.
       const codeExecOutputs: string[] = [];
+      // ENG-1295: the generated CSV text (if any), kept separately from resultParts
+      // so the provenance stub and self-consistency check below can parse it.
+      let generatedCsvText: string | null = null;
+      // ENG-1600: Gemini can return more than one text/csv inline part. Every one is shown to
+      // the caller as Computed Data, but only one can back the provenance stub and the
+      // cross-call cache. Comparing an arbitrary part against a previous run's arbitrary part
+      // fabricates an inconsistency and hard-rejects a correct analysis, so the count is
+      // tracked and the comparison is skipped when it exceeds one.
+      let generatedCsvPartCount = 0;
 
       // Extract parts from response
       const responseParts = candidates[0].content.parts || [];
@@ -8959,10 +9138,33 @@ export class AgentModeService {
         // Handle inline data (images/charts from code execution) (handle both camelCase and snake_case)
         if ((part as any).inlineData && (part as any).inlineData.data) {
           const mimeType = (part as any).inlineData.mimeType || 'image/png';
-          if (!mimeType.startsWith('image/')) {
+          if (mimeType === 'text/csv') {
+            // Gemini's code-execution sandbox returns generated tabular data (e.g. a
+            // df.to_csv() write) as an inlineData part with mimeType text/csv rather
+            // than through stdout/codeExecutionResult. Discarding this — as the old
+            // code did for every non-image inlineData — left the caller with only the
+            // model's separate narrative `text` summary, ungrounded by the real
+            // computed output. That is how perform_data_analysis reported hallucinated
+            // ad-group names and contradictory row counts (ENG-1295).
+            codeExecuted = true;
+            try {
+              const csvText = Buffer.from((part as any).inlineData.data, 'base64').toString('utf-8').trim();
+              if (csvText) {
+                resultParts.push(`**Computed Data:**\n${csvText}`);
+                generatedCsvText = csvText;
+                generatedCsvPartCount++;
+              }
+            } catch (error) {
+              console.error('AgentMode: performDataAnalysis error decoding generated CSV inlineData:', error);
+            }
+          } else if (!mimeType.startsWith('image/')) {
             // Gemini returned non-image data (e.g. Vega-Lite JSON from altair) — skip it
             console.warn(`AgentMode: performDataAnalysis skipping non-image inlineData with mimeType=${mimeType}`);
           } else {
+            // A rendered chart image is itself proof that code actually ran in the
+            // sandbox (ENG-1295 hard guard below) — set this regardless of whether
+            // the subsequent S3 upload succeeds.
+            codeExecuted = true;
             try {
               const imageData = (part as any).inlineData.data;
 
@@ -8990,10 +9192,27 @@ export class AgentModeService {
         } else if ((part as any).inline_data && (part as any).inline_data.data) {
           // Handle snake_case format
           const mimeType = (part as any).inline_data.mimeType || (part as any).inline_data.mime_type || 'image/png';
-          if (!mimeType.startsWith('image/')) {
+          if (mimeType === 'text/csv') {
+            // See the camelCase inlineData branch above (ENG-1295): a generated CSV
+            // must be surfaced, not discarded, or the caller only sees the model's
+            // ungrounded narrative summary.
+            codeExecuted = true;
+            try {
+              const csvText = Buffer.from((part as any).inline_data.data, 'base64').toString('utf-8').trim();
+              if (csvText) {
+                resultParts.push(`**Computed Data:**\n${csvText}`);
+                generatedCsvText = csvText;
+                generatedCsvPartCount++;
+              }
+            } catch (error) {
+              console.error('AgentMode: performDataAnalysis error decoding generated CSV inline_data (snake_case):', error);
+            }
+          } else if (!mimeType.startsWith('image/')) {
             // Gemini returned non-image data (e.g. Vega-Lite JSON from altair) — skip it
             console.warn(`AgentMode: performDataAnalysis skipping non-image inline_data with mimeType=${mimeType}`);
           } else {
+            // See the camelCase branch above — a rendered chart proves code executed.
+            codeExecuted = true;
             try {
               const imageData = (part as any).inline_data.data;
 
@@ -9019,6 +9238,30 @@ export class AgentModeService {
             }
           }
         }
+      }
+
+      // ENG-1295 hard guard: real external data was supplied (file_urls resolved to
+      // at least one sandbox file) but nothing in the response shows code actually
+      // executing over it — no generated CSV, no rendered image, no codeExecutionResult
+      // stdout. A bare narrative `text` part in this case is unverifiable prose about
+      // data the model never touched — exactly how perform_data_analysis reported
+      // hallucinated ad-group names and contradictory counts in prod session d789c175.
+      // Reject rather than pass it off as computed output. Calls with no file_urls are
+      // unaffected: there is no external tabular data to hallucinate about, so
+      // inline-only summarization remains a legitimate use of this tool.
+      if (fileParts.length > 0 && !codeExecuted) {
+        console.warn(
+          `AgentMode: performDataAnalysis got narrative text with no verified code execution over ${fileParts.length} supplied file(s) (model=${modelName})`
+        );
+        return {
+          success: false,
+          message:
+            'The analysis model returned a narrative summary without any verified code execution over the supplied file_urls — ' +
+            'this cannot be trusted as computed output and was not returned. Retry with a more explicit instruction that forces ' +
+            'Python code execution over the file(s) (e.g. "You MUST read and parse the file(s) with Python and print exact ' +
+            'computed values — do not summarize without computing").',
+          error: 'execution_failed'
+        };
       }
 
       // Fallback narrative: the model produced executed-code output but no
@@ -9061,6 +9304,105 @@ export class AgentModeService {
         };
       }
 
+      // ENG-1295 hardening: cross-call self-consistency and a provenance stub
+      // (including intra-CSV id/name collision and source-grounding checks) for
+      // generated CSV data.
+      if (generatedCsvText) {
+        const provenance = this.parseCsvProvenance(generatedCsvText);
+        if (provenance) {
+          // 1. Cross-call self-consistency: an exact repeat call whose grouping-key
+          // set changed since its last run.
+          const cacheKey = this.buildDataAnalysisCacheKey(userId, urlsToProcess, analysisInstruction);
+          // ENG-1600: with several CSV parts, `provenance` describes only one of them and which
+          // one depends on part order. Comparing that against a previous run — which may have
+          // captured a different part — is a fabricated inconsistency, and this check hard-rejects.
+          const comparable = generatedCsvPartCount <= 1;
+          const prior = comparable ? this.dataAnalysisConsistencyCache.get(cacheKey) : undefined;
+          if (prior) {
+            const priorSet = new Set(prior.groupingKeyValues);
+            const currentSet = new Set(provenance.groupingKeyValues);
+            const isConsistent = priorSet.size === currentSet.size &&
+              [...priorSet].every(v => currentSet.has(v));
+            if (!isConsistent) {
+              console.warn(
+                `AgentMode: performDataAnalysis inconsistent result on an identical repeat call (userId=${userId}): ` +
+                `prior grouping keys=[${prior.groupingKeyValues.join(', ')}] vs current=[${provenance.groupingKeyValues.join(', ')}]`
+              );
+              return {
+                success: false,
+                message:
+                  'This exact analysis call (identical file_urls and analysis_instruction) previously returned a DIFFERENT set of ' +
+                  'result names than this run — the data-analysis model is not consistently computing over the real data, so ' +
+                  'neither result can be trusted. Do NOT retry with the identical arguments. Instead, re-run grouping strictly by ' +
+                  'a stable ID field (not a name) so the result is verifiable against the source data.',
+                error: 'inconsistent_result'
+              };
+            }
+          }
+          // Only cache a single-part result: storing one arbitrary part of a multi-part answer
+          // would poison the NEXT call's comparison exactly the same way.
+          if (comparable) {
+            this.dataAnalysisConsistencyCache.set(cacheKey, { groupingKeyValues: provenance.groupingKeyValues, timestamp: Date.now() });
+            this.pruneDataAnalysisConsistencyCache();
+          }
+
+          // 2. Provenance stub: cheap-to-verify rows_in / rows_out / distinct
+          // grouping-key values, so the caller doesn't have to trust the narrative
+          // summary about what the tool actually computed. Includes two
+          // informational (not hard-reject) caveats:
+          // - id grounding: a distinct id in the CSV that can't be found anywhere
+          //   in the raw source file(s) — a substring miss can also mean the
+          //   model reformatted the id, so this doesn't block a possibly-correct
+          //   result.
+          // - id/name collisions: the same id mapped to more than one name within
+          //   this CSV (the exact shape of the prod hallucination). Deliberately
+          //   NOT a hard reject — a real entity (an ad group, a CRM lead's
+          //   company) can legitimately be renamed within a query's date window,
+          //   which produces this same shape from genuinely correct data. We
+          //   can't tell "renamed" apart from "fabricated" from the CSV alone, so
+          //   this is surfaced for the caller to judge rather than risking a hard
+          //   failure on a correct result.
+          const rowsInPerFile = fileRawContents.map(c => this.estimateRowsIn(c)).filter((n): n is number => n !== null);
+          const rowsIn = rowsInPerFile.length > 0 ? rowsInPerFile.reduce((a, b) => a + b, 0) : null;
+          const MAX_DISTINCT_VALUES_SHOWN = 25;
+          const distinctPreview = provenance.groupingKeyValues.slice(0, MAX_DISTINCT_VALUES_SHOWN);
+          const moreCount = provenance.groupingKeyValues.length - distinctPreview.length;
+          const grounding = this.checkCsvIdGrounding(provenance.header, provenance.rows, fileRawContents);
+          const collisions = this.findCsvIdNameCollisions(provenance.header, provenance.rows);
+          if (collisions.length > 0) {
+            console.warn(
+              `AgentMode: performDataAnalysis intra-CSV id/name collision (userId=${userId}, informational): ` +
+              collisions.map(c => `id=${c.id} names=[${c.names.join(', ')}]`).join('; ')
+            );
+          }
+          resultParts.push(
+            `**Provenance:**\n` +
+            `rows_in: ${rowsIn !== null ? rowsIn : 'unknown (no parsable input file)'}\n` +
+            `rows_out: ${provenance.rowsOut}\n` +
+            `distinct grouping-key values (${provenance.groupingKeyValues.length}): ${distinctPreview.join(', ')}` +
+            (moreCount > 0 ? ` … (+${moreCount} more)` : '') +
+            (grounding && grounding.unverified > 0
+              ? `\n⚠️ ${grounding.unverified} of ${grounding.checked} id(s) in this result could not be found in the raw source file(s) — treat those rows as unverified.`
+              : '') +
+            (collisions.length > 0
+              ? `\n⚠️ ${collisions.length} id(s) map to more than one name within this result — e.g. id "${collisions[0].id}" as [${collisions[0].names.join(', ')}]. ` +
+                'This can mean the source entity was renamed during the query window, or that a row was fabricated/corrupted — verify before trusting these names.'
+              : '')
+          );
+
+          // 3. Explicit untrusted-narrative caveat: make it part of the tool's own
+          // contract that the free-form prose has not been cross-checked, rather
+          // than relying on the calling agent to know to verify it independently
+          // (the ad-hoc behavior that happened to save prod session d789c175).
+          if (hasNarrativeText) {
+            resultParts.push(
+              '**Note:** The prose above has not been independently verified. Treat **Computed Data** and **Provenance** as ' +
+              'the trusted, verified source — cross-check any names, ids, or counts mentioned in the prose against them before repeating them.'
+            );
+          }
+        }
+      }
+
       // Combine all results
       const analysisResult = resultParts.join('\n\n');
 
@@ -9081,6 +9423,13 @@ export class AgentModeService {
         /payload size exceeds|request too large|too large|exceeds.*limit/i.test(errorMessage);
       const isTimeout = (error as any)?.code === 'ECONNABORTED' ||
         /timeout|timed out|ETIMEDOUT/i.test(errorMessage);
+      // ENG-1295 (recommendation #4): a raw Gemini 400/422 that ISN'T already
+      // classified as payload-too-large is an invalid-argument rejection (e.g. a
+      // malformed file_urls entry, an unfetchable reference, or a request the
+      // sandbox otherwise refused). Previously this fell through to the generic
+      // "check that the file URLs are accessible" message with no distinct error
+      // code — the exact ambiguous failure hit in prod session 97a28948.
+      const isInvalidArgument = !isPayloadTooLarge && (statusCode === 400 || statusCode === 422);
       if (isPayloadTooLarge) {
         return {
           success: false,
@@ -9093,6 +9442,13 @@ export class AgentModeService {
           success: false,
           message: `The data analysis timed out — the dataset or analysis task is too large for a single call. Break it into smaller pieces: (1) split the data into smaller subsets, (2) call perform_data_analysis separately for each subset with a focused analysis_instruction, then (3) synthesize the individual results into a final summary.`,
           error: errorMessage
+        };
+      }
+      if (isInvalidArgument) {
+        return {
+          success: false,
+          message: `The data analysis request was rejected as invalid by the model API (HTTP ${statusCode}). This usually means a file_urls entry could not be read or parsed, or the request violated a sandbox limit. Verify each file_urls entry is a real, fetchable S3 URL or tool-response key, and that analysis_instruction does not reference unsupported content. Do NOT blindly retry the identical call — fix the arguments first.`,
+          error: 'invalid_argument'
         };
       }
       return {
@@ -20452,19 +20808,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  // Action type mappings (shared across all processing functions)
-  private readonly FORM_ACTIONS = new Set([
-    'leadgen',
-    'on_facebook_lead',
-    'onsite_conversion.lead_form',
-    'offsite_conversion.fb_pixel_custom',
-    'offsite_conversion.fb_pixel_lead'
-  ]);
-  private readonly WEBSITE_ACTIONS = new Set([
-    'website_lead',
-    'lead'
-  ]);
-
   // Helper function to process campaign data from Meta API
   private processCampaignData(campaigns: any[], insights: any[], adSets: any[]): any[] {
     const campaignMap = new Map();
@@ -20513,27 +20856,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         campaign.reach = parseInt(insight.reach) || 0;
 
         // Process lead generation metrics from actions and cost_per_action_type
-        if (insight.actions && Array.isArray(insight.actions)) {
-          for (const action of insight.actions) {
-            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-              campaign.websiteLeads += parseInt(action.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(action.action_type)) {
-              campaign.formLeads += parseInt(action.value) || 0;
-            }
-          }
-        }
-
-        if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
-          for (const costAction of insight.cost_per_action_type) {
-            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-              campaign.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(costAction.action_type)) {
-              campaign.costPerFormLead = parseFloat(costAction.value) || 0;
-            }
-          }
-        }
+        applyLeadMetrics(campaign, insight);
       }
     }
 
@@ -20549,19 +20872,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         campaign.frequency = campaign.impressions / campaign.reach;
       }
 
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (campaign.websiteLeads > 0) {
-        campaign.formLeads = 0; // Set form submissions to 0 when website leads exist
-        campaign.costPerWebsiteLead = campaign.costPerWebsiteLead || (campaign.spend / campaign.websiteLeads);
-        campaign.costPerFormLead = 0;
-      } else if (campaign.formLeads > 0) {
-        campaign.costPerFormLead = campaign.costPerFormLead || (campaign.spend / campaign.formLeads);
-      }
-
-      campaign.totalLeads = (campaign.websiteLeads || 0) + (campaign.formLeads || 0);
-      if (campaign.totalLeads > 0) {
-        campaign.costPerLead = campaign.spend / campaign.totalLeads;
-      }
+      // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
+      // longer need to suppress form leads. That suppression is what reported every Instant
+      // Form lead as a website lead on any account that also had website conversions.
+      finalizeLeadCosts(campaign);
     }
 
     // Return all campaigns regardless of activity
@@ -20615,27 +20929,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         adSet.reach = parseInt(insight.reach) || 0;
 
         // Process lead generation metrics from actions and cost_per_action_type
-        if (insight.actions && Array.isArray(insight.actions)) {
-          for (const action of insight.actions) {
-            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-              adSet.websiteLeads += parseInt(action.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(action.action_type)) {
-              adSet.formLeads += parseInt(action.value) || 0;
-            }
-          }
-        }
-
-        if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
-          for (const costAction of insight.cost_per_action_type) {
-            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-              adSet.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(costAction.action_type)) {
-              adSet.costPerFormLead = parseFloat(costAction.value) || 0;
-            }
-          }
-        }
+        applyLeadMetrics(adSet, insight);
       }
     }
 
@@ -20651,19 +20945,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         adSet.frequency = adSet.impressions / adSet.reach;
       }
 
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (adSet.websiteLeads > 0) {
-        adSet.formLeads = 0; // Set form submissions to 0 when website leads exist
-        adSet.costPerWebsiteLead = adSet.costPerWebsiteLead || (adSet.spend / adSet.websiteLeads);
-        adSet.costPerFormLead = 0;
-      } else if (adSet.formLeads > 0) {
-        adSet.costPerFormLead = adSet.costPerFormLead || (adSet.spend / adSet.formLeads);
-      }
-
-      adSet.totalLeads = (adSet.websiteLeads || 0) + (adSet.formLeads || 0);
-      if (adSet.totalLeads > 0) {
-        adSet.costPerLead = adSet.spend / adSet.totalLeads;
-      }
+      // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
+      // longer need to suppress form leads. That suppression is what reported every Instant
+      // Form lead as a website lead on any account that also had website conversions.
+      finalizeLeadCosts(adSet);
     }
 
     // Return all ad sets regardless of activity
@@ -20726,27 +21011,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ad.reach += parseInt(insight.reach) || 0;
 
         // Process lead generation metrics from actions and cost_per_action_type
-        if (insight.actions && Array.isArray(insight.actions)) {
-          for (const action of insight.actions) {
-            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-              ad.websiteLeads += parseInt(action.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(action.action_type)) {
-              ad.formLeads += parseInt(action.value) || 0;
-            }
-          }
-        }
-
-        if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
-          for (const costAction of insight.cost_per_action_type) {
-            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-              ad.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(costAction.action_type)) {
-              ad.costPerFormLead = parseFloat(costAction.value) || 0;
-            }
-          }
-        }
+        applyLeadMetrics(ad, insight);
       }
     }
 
@@ -20762,19 +21027,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ad.frequency = ad.impressions / ad.reach;
       }
 
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (ad.websiteLeads > 0) {
-        ad.formLeads = 0; // Set form submissions to 0 when website leads exist
-        ad.costPerWebsiteLead = ad.costPerWebsiteLead || (ad.spend / ad.websiteLeads);
-        ad.costPerFormLead = 0;
-      } else if (ad.formLeads > 0) {
-        ad.costPerFormLead = ad.costPerFormLead || (ad.spend / ad.formLeads);
-      }
-
-      ad.totalLeads = (ad.websiteLeads || 0) + (ad.formLeads || 0);
-      if (ad.totalLeads > 0) {
-        ad.costPerLead = ad.spend / ad.totalLeads;
-      }
+      // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
+      // longer need to suppress form leads. That suppression is what reported every Instant
+      // Form lead as a website lead on any account that also had website conversions.
+      finalizeLeadCosts(ad);
     }
 
     // Return all ads regardless of activity
@@ -20830,33 +21086,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
 
       // Process lead generation metrics from actions and cost_per_action_type
-      if (item.actions && Array.isArray(item.actions)) {
-        for (const action of item.actions) {
-          if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-            processedItem.websiteLeads += parseInt(action.value) || 0;
-          }
-          if (this.FORM_ACTIONS.has(action.action_type)) {
-            processedItem.formLeads += parseInt(action.value) || 0;
-          }
-        }
-      }
+      applyLeadMetrics(processedItem, item);
 
-      if (item.cost_per_action_type && Array.isArray(item.cost_per_action_type)) {
-        for (const costAction of item.cost_per_action_type) {
-          if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-            processedItem.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-          }
-          if (this.FORM_ACTIONS.has(costAction.action_type)) {
-            processedItem.costPerFormLead = parseFloat(costAction.value) || 0;
-          }
-        }
-      }
-
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (processedItem.websiteLeads > 0) {
-        processedItem.formLeads = 0; // Set form submissions to 0 when website leads exist
-        processedItem.costPerFormLead = 0;
-      }
+      // ENG-1575: buckets are disjoint (see applyLeadMetrics) — no suppression needed.
 
       // Calculate totals
       processedItem.totalLeads = (processedItem.websiteLeads || 0) + (processedItem.formLeads || 0);
@@ -32361,6 +32593,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             keywords, search_url, title, company, cursor,
             company_id, location, location_id,
             industry, industry_id, school, school_id,
+            company_size_min, company_size_max,
           } = args;
           // Unipile classic search needs at least one of keywords/search_url/cursor.
           // The downstream linkedInOutreachService.searchPeople synthesizes keywords
@@ -32404,7 +32637,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // count has to be reported, or the agent is left guessing which of three
             // very different situations it is in.
             const anonymizedFiltered = searchResult.items.length - usableItems.length;
-            const trimmedItems = usableItems.map((item: any) => {
+            // ENG-1558: Unipile has no native headcount filter for people search
+            // (only for its Companies category), so a company-size ask is applied
+            // as a post-filter here — resolve each candidate's current employer
+            // and drop those outside the requested range (or unverifiable). No-op
+            // (zero extra Unipile calls) when the caller didn't ask for it.
+            const { items: sizedItems, excludedUnverifiable: companySizeFiltered } =
+              await linkedInOutreachService.filterByCompanySize(
+                usableItems,
+                { min: company_size_min, max: company_size_max },
+                account_id,
+              );
+            const trimmedItems = sizedItems.map((item: any) => {
               const trimmed: any = {
                 provider_id: item.provider_id,
                 public_identifier: item.public_identifier,
@@ -32430,6 +32674,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               ...searchResult,
               items: trimmedItems,
               ...(anonymizedFiltered > 0 ? { anonymizedFiltered } : {}),
+              ...(companySizeFiltered > 0 ? { companySizeFiltered } : {}),
             });
             if (trimmedItems.length === 0 && anonymizedFiltered > 0) {
               // Say plainly what happened, so this does not get reported to the
@@ -32440,6 +32685,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                   `All ${anonymizedFiltered} result(s) were anonymized by LinkedIn (out-of-network), so none are usable. ` +
                   `The search itself worked — this is a reach limit, not an outage and not an empty niche. ` +
                   `Broaden the query, or search from an account whose network covers these people.`,
+                data: searchData,
+              };
+            }
+            if (trimmedItems.length === 0 && companySizeFiltered > 0) {
+              // Same transparency principle as the anonymized case above: a
+              // company-size ask that excluded every real candidate is a
+              // narrow-niche result, not an empty search and not an outage.
+              return {
+                success: true,
+                message:
+                  `Found candidates, but excluded all ${companySizeFiltered} of them because their employer's size ` +
+                  `either fell outside the requested range or couldn't be verified. The search itself worked — ` +
+                  `try widening the company_size range, or drop it to see the unfiltered results.`,
                 data: searchData,
               };
             }
@@ -32608,9 +32866,76 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const sharedSecret = args.shared_secret;
           if (!invitationId) throw new Error('invitation_id is required for accept-invitation');
           if (!sharedSecret) throw new Error('shared_secret is required for accept-invitation (use the value from list-received-invitations)');
+
+          // ENG-1595 identity binding: resolve the invitee's identity from Unipile's
+          // OWN received-invitations record for THIS invitationId, before accepting —
+          // never from caller-supplied profile_url/provider_id/name args. Those are
+          // LLM-supplied and unverified against invitation_id; unlike send-invite
+          // (where the supplied identity IS the send target by construction), a
+          // mismatched pair here would accept invitation A but mirror the CRM write
+          // onto an unrelated person B. Bounded scan: received invitations are a
+          // live feed, not something to page through unboundedly on a request path.
+          let acceptedSenderProfile: { public_id?: string; provider_id?: string; full_name?: string } | null = null;
+          try {
+            const MAX_PAGES = 5;
+            let cursor: string | undefined;
+            for (let page = 0; page < MAX_PAGES && !acceptedSenderProfile; page++) {
+              const received = await linkedInOutreachService.listReceivedInvitations(account_id, cursor);
+              const items = Array.isArray(received?.items) ? received.items : [];
+              const match = items.find((it: any) => String(it?.id) === String(invitationId));
+              if (match) {
+                acceptedSenderProfile = match.sender_profile || null;
+                break;
+              }
+              cursor = received?.cursor;
+              if (!cursor) break;
+            }
+          } catch (lookupErr) {
+            console.warn(`[AgentMode] accept-invitation: could not verify sender identity for invitation ${invitationId} (CRM mirror will be skipped):`, lookupErr);
+          }
+
           const acceptPaced = await paceWrite();
           if (acceptPaced) return acceptPaced.refusal;
           const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, account_id, sharedSecret);
+
+          // ENG-1595: mirror the now-accepted INBOUND connection into the CRM, same
+          // best-effort pattern send-invite uses below — an accepted connection must
+          // be as findable/engageable as one this account invited, or name-based CRM
+          // search silently misses a real, legitimate contact (the reported symptom).
+          // No-ops cleanly when identity couldn't be verified or list can't be
+          // resolved — mirrors nothing rather than guessing or trusting the caller.
+          try {
+            const publicId = acceptedSenderProfile?.public_id;
+            const mirrorProfileUrl = publicId ? `https://www.linkedin.com/in/${publicId}/` : null;
+            if (mirrorProfileUrl) {
+              const { resolveListIdForAccount, mirrorLinkedInInviteToCrm, splitInvitedUserName, INVITE_ACCEPTED_EVENT } = await import('./linkedInInviteCrmMirror');
+              const mirrorListId = args.list_id || (await resolveListIdForAccount(userId, account_id));
+              if (mirrorListId) {
+                const { crmDb } = await import('./db');
+                const mirrorList = await crmDb.getLeadListById(mirrorListId);
+                const { canDestructiveCrmList } = await import('./crmAccessControl');
+                if (mirrorList && (await canDestructiveCrmList(userId, mirrorList))) {
+                  const { firstName, lastName } = splitInvitedUserName(acceptedSenderProfile?.full_name);
+                  await mirrorLinkedInInviteToCrm({
+                    userId,
+                    listId: mirrorListId,
+                    linkedinUrl: mirrorProfileUrl,
+                    leadId: args.lead_id,
+                    firstName,
+                    lastName,
+                    accountId: account_id,
+                    invitationId,
+                    eventType: INVITE_ACCEPTED_EVENT,
+                  });
+                } else {
+                  console.warn(`[AgentMode] accept-invitation: skipping CRM mirror — list ${mirrorListId} not accessible to user ${userId}`);
+                }
+              }
+            }
+          } catch (mirrorErr) {
+            console.warn('[AgentMode] accept-invitation: failed to mirror accepted connection to CRM (non-fatal):', mirrorErr);
+          }
+
           return { success: true, data: acceptResult };
         }
 
@@ -34124,11 +34449,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
      *  lead back to the persona that sourced it. Distinct from the
      *  `lead.icpMatch` scoring field (post-import scoring). */
     icpSource?: string;
+    /** ENG-1558: post-filter on each lead's resolved employer headcount —
+     *  same semantics as search-people's company_size_min/max. Applied AFTER
+     *  the 4-tier company-resolution chain below (not on raw work_experience
+     *  alone), so a lead whose company only resolved via title-parse/LLM/
+     *  profile fallback is still correctly sized instead of excluded early. */
+    company_size_min?: number;
+    company_size_max?: number;
   }): Promise<any> {
     const {
       listId, keywords, search_url, title, company, company_id,
       location, location_id, industry, industry_id, school, school_id,
       cursor, limit = 20, auto_enrich = false, icpSource,
+      company_size_min, company_size_max,
     } = args;
 
     if (!listId) return { success: false, error: 'listId is required' };
@@ -34223,6 +34556,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const allCreated: Array<{ leadId: string; email?: string; lead?: any }> = [];
     // Out-of-network "LinkedIn Member" hits dropped before the write.
     let anonymizedSkipped = 0;
+    // ENG-1558: leads dropped by the company_size_min/max post-filter
+    // (outside the requested range, or an unverifiable employer).
+    let companySizeFiltered = 0;
+    // ENG-1558 follow-up: consecutive pages the size filter emptied
+    // completely. A narrow company_size range against a market where it's
+    // genuinely rare could otherwise burn all MAX_ITERATIONS pages — each
+    // costing a full searchPeople call plus per-employer lookups — before
+    // giving up. Bail out well before that once the filter has clearly
+    // proven unproductive, rather than paying the full cap's cost every time.
+    let consecutiveEmptiedBySizeFilter = 0;
+    const SIZE_FILTER_EARLY_EXIT_AFTER = 3;
+    let earlyExitOnSizeFilter = false;
 
     while (iterationCount < MAX_ITERATIONS) {
       iterationCount++;
@@ -34344,7 +34689,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         candidates.push({ lead: leads[i], item: items[i] });
       }
-      const importable: any[] = candidates.map((c) => c.lead);
+      let importable: any[] = candidates.map((c) => c.lead);
       if (importable.length === 0) {
         if (!nextCursor) break;
         continue;
@@ -34388,6 +34733,49 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           console.warn('[importLeadsFromSearch] getProfile fallback failed:', e?.message ?? String(e));
         }
       }));
+
+      // Phase 3.5 (ENG-1558): company-size post-filter, run AFTER every
+      // resolution tier above so lead.company reflects the best available
+      // employer name — filtering on Tier-1 (work_experience) alone, like
+      // search-people does, would wrongly exclude leads whose company only
+      // resolved via title-parse/LLM/profile fallback. Adapts each lead's
+      // flat `.company` string into the work_experience shape
+      // filterByCompanySize expects, tagging each with its array index so
+      // the kept subset can be mapped back without disturbing `importable`'s
+      // order (batchCreateLeads' returned sourceIndex must match).
+      if (company_size_min != null || company_size_max != null) {
+        const preFilterCount = importable.length;
+        const sizableItems = importable.map((lead: any, idx: number) => ({
+          __idx: idx,
+          work_experience: lead.company ? [{ company: lead.company, current: true }] : [],
+        }));
+        const { items: kept } = await linkedInOutreachService.filterByCompanySize(
+          sizableItems,
+          { min: company_size_min, max: company_size_max },
+          accountId,
+        );
+        const keepIdx = new Set(kept.map((it: any) => it.__idx));
+        companySizeFiltered += importable.length - keepIdx.size;
+        importable = importable.filter((_: any, i: number) => keepIdx.has(i));
+
+        if (preFilterCount > 0 && importable.length === 0) {
+          consecutiveEmptiedBySizeFilter++;
+          if (consecutiveEmptiedBySizeFilter >= SIZE_FILTER_EARLY_EXIT_AFTER) {
+            // The filter has proven unproductive several pages running —
+            // stop paying for more searchPeople + per-employer lookup calls
+            // rather than grinding to MAX_ITERATIONS on a range that's
+            // clearly not matching this market.
+            earlyExitOnSizeFilter = true;
+            break;
+          }
+        } else {
+          consecutiveEmptiedBySizeFilter = 0;
+        }
+      }
+      if (importable.length === 0) {
+        if (!nextCursor) break;
+        continue;
+      }
 
       const result = await crmDb.batchCreateLeads(listId, importable);
       cumulativeNew += result.newCount ?? 0;
@@ -34468,14 +34856,29 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       iterations: iterationCount,
       trimmed: trimmedCount,
       anonymizedSkipped,
+      companySizeFiltered,
       safetyCapHit,
     };
     if (searchError) response.searchError = searchError;
     if (searchUnavailable) response.searchUnavailable = true;
+    if (earlyExitOnSizeFilter) response.earlyExitOnSizeFilter = true;
     if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
       response.message = 'No results found for the given search criteria.';
+    } else if (earlyExitOnSizeFilter) {
+      // ENG-1558 follow-up: distinct from (and takes priority over) the
+      // generic "excluded all, search exhausted normally" message below —
+      // this stopped BEFORE exhausting, so there may be more matches the
+      // cursor can still reach.
+      response.message = cumulativeNew > 0
+        ? `Imported ${cumulativeNew} lead(s), then stopped early after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where the company_size filter excluded every result. There may be more matches — resume from the returned cursor, or widen the range.`
+        : `Stopped after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where every result was excluded by the company_size filter (out of range, or an unverifiable employer) — this looks like a narrow niche for this market, not an empty search. Widen the company_size range, or drop it to import the unfiltered results.`;
     } else if (cumulativeNew === 0 && anonymizedSkipped > 0 && !searchError) {
       response.message = `${anonymizedSkipped} search result(s) were out-of-network LinkedIn profiles with no name or profile URL and were not imported. Widen the search or connect a LinkedIn account with closer network reach.`;
+    } else if (cumulativeNew === 0 && companySizeFiltered > 0 && !searchError) {
+      // ENG-1558: same transparency principle as the anonymized-skip case
+      // above — a company-size ask that excluded every candidate is a
+      // narrow-niche result, not an empty search and not an outage.
+      response.message = `${companySizeFiltered} search result(s) were excluded because their employer's size either fell outside the requested range or couldn't be verified. Widen the company_size range, or drop it to import the unfiltered results.`;
     }
     // Preview strictly the records that were written and survived trimming.
     response.importedLeads = allCreated.slice(0, 5).map((c) => c.lead).filter(Boolean);

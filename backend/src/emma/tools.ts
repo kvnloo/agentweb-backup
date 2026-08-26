@@ -492,7 +492,7 @@ emmaToolRegistry.register({
     description: `LinkedIn outreach tool via a connected Unipile account. To find the account_id, call list_connected_accounts(platform='unipile') tool.
 
 Actions:
-- search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person. OUT-OF-NETWORK RESULTS: LinkedIn anonymizes hits outside the connected account's network — they come back with no public_identifier/public_profile_url and a placeholder name ("LinkedIn Member", "LinkedIn User", or its localized equivalent). Those are not people you can contact or dedup: never write them to the CRM (via add_leads_to_list or otherwise) and never present them to the user as found leads. Skip them, or use import_leads_from_search, which drops them for you and reports the count as anonymizedSkipped.
+- search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school, company_size_min/company_size_max. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person. COMPANY SIZE: there is no native LinkedIn/Unipile filter for a person's employer headcount, so company_size_min/max is a post-filter applied after the search — it can meaningfully shrink the result count (candidates whose employer size can't be verified are excluded, not guessed at), and the response may report companySizeFiltered with a count and a message when this happens. Only pass it when the user actually asked for a size constraint (e.g. "at startups", "at large companies") — it costs extra lookups per search. OUT-OF-NETWORK RESULTS: LinkedIn anonymizes hits outside the connected account's network — they come back with no public_identifier/public_profile_url and a placeholder name ("LinkedIn Member", "LinkedIn User", or its localized equivalent). Those are not people you can contact or dedup: never write them to the CRM (via add_leads_to_list or otherwise) and never present them to the user as found leads. Skip them, or use import_leads_from_search, which drops them for you and reports the count as anonymizedSkipped.
 - get-profile: Get detailed profile info (headline, About, location, network_distance, is_open_profile, etc.) for a LinkedIn user by profile_url or provider_id. This reads the LIVE profile from the connected/platform-wide Unipile account — it is the ONLY authoritative source for a person's current headline/About. NEVER take a headline, About, or other profile-identity field from a you_search_web snippet or a page-source scrape: search caches lag LinkedIn edits by many months and will report a stale headline as if current. When you specifically need the CURRENT profile — a founder/profile readiness audit, or a "what is my headline right now?" question — pass force_refresh=true to bypass the profile cache and read live. If no LinkedIn account can be resolved, get-profile fails with an explicit connect-LinkedIn error; surface that and prompt the user to connect LinkedIn rather than substituting search-snippet text.
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
@@ -502,7 +502,7 @@ Actions:
 - send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
 - cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
-- accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations.
+- accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations. CRM ATTRIBUTION: also pass list_id (the CRM list this contact belongs to) — the connection's identity is looked up automatically from LinkedIn's own record of this invitation (not from anything else you pass), so list_id is the only extra thing needed to mirror it into that CRM list as a lead. Omitting list_id still accepts the connection, but the person then exists ONLY on LinkedIn, not in the CRM — a later search by name for them will fail.
 - update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
 - search-parameters: Resolve a free-text query (company name, location, industry, school, service) to LinkedIn entity IDs via Unipile's parameter search. Required: type (one of COMPANY, LOCATION, INDUSTRY, SCHOOL, SERVICE) and keywords. Optional limit. Returns ranked candidates with id/title/subtitle plus fromCache and source metadata. Use the returned id with the matching *_id field on search-people for precise structured filtering.
 - set-daily-invite-cap: Set this account's daily LinkedIn connection-request limit. Requires daily_invite_cap (a number, up to the system-wide maximum — a higher value you pass is clamped automatically, so 30 always works as "the Premium number" without needing to know the exact ceiling). SELF-REPORTED, NEVER DETECTED: call this ONLY after asking the user directly, in THIS conversation, whether their connected LinkedIn account has Premium — never guess, never infer it from anything else about the account. If they say yes, call this with daily_invite_cap=30 (or their stated preference, if lower); if no, call it with daily_invite_cap=10. Before running any LinkedIn outreach for an account you haven't confirmed this for, ask first — a live/interactive turn is the only place you CAN ask, since an unattended/scheduled run has no one to answer. If a scheduled run reaches this point with the cap still unconfirmed, do NOT call this action from that run — proceed at whatever cap is already configured (defaults to the conservative 10 until someone answers) and say so plainly in the completion ledger, rather than guessing Premium.
@@ -532,11 +532,11 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         profile_url: {
           type: 'string',
-          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). For send-invite, send-message, update-conversation-history. Provide this OR provider_id.'
+          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). For send-invite, send-message, update-conversation-history. Provide this OR provider_id. (Not used by accept-invitation — that action resolves the invitee\'s identity itself from the invitation record.)'
         },
         provider_id: {
           type: 'string',
-          description: 'The Unipile provider_id for the target LinkedIn user. For send-invite, send-message, get-profile, update-conversation-history. Provide this OR profile_url.'
+          description: 'The Unipile provider_id for the target LinkedIn user. For send-invite, send-message, get-profile, update-conversation-history. Provide this OR profile_url. (Not used by accept-invitation — that action resolves the invitee\'s identity itself from the invitation record.)'
         },
         message: {
           type: 'string',
@@ -553,19 +553,19 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         list_id: {
           type: 'string',
-          description: 'CRM lead list ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate. For send-invite: pass the list you are running outreach for so the invite is mirrored back into that CRM list (ENG-787 attribution).'
+          description: 'CRM lead list ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate. For send-invite: pass the list you are running outreach for so the invite is mirrored back into that CRM list. For accept-invitation: pass the list this contact belongs to so the newly-accepted connection is mirrored in as a lead — otherwise it stays LinkedIn-only and won\'t be findable by CRM search later.'
         },
         lead_id: {
           type: 'string',
-          description: 'CRM lead ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate. Optional for send-invite — pass it when you already know the CRM lead so the invite is attributed to it directly.'
+          description: 'CRM lead ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate. Optional for send-invite and accept-invitation — pass it when you already know the CRM lead so the invite/accept is attributed to it directly (still verified server-side against the invitee\'s actual LinkedIn URL before being trusted).'
         },
         first_name: {
           type: 'string',
-          description: 'The target person\'s first name. Pass with send-invite (alongside list_id) so a lead created for CRM attribution carries their name.'
+          description: 'The target person\'s first name. Pass with send-invite (alongside list_id) so a lead created for CRM attribution carries their name. Not used by accept-invitation — that action derives the name itself from the invitation record.'
         },
         last_name: {
           type: 'string',
-          description: 'The target person\'s last name. Pass with send-invite (alongside list_id) so a lead created for CRM attribution carries their name.'
+          description: 'The target person\'s last name. Pass with send-invite (alongside list_id) so a lead created for CRM attribution carries their name. Not used by accept-invitation — that action derives the name itself from the invitation record.'
         },
         keywords: {
           type: 'string',
@@ -577,15 +577,23 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         title: {
           type: 'string',
-          description: 'For search-people: job title FILTER (e.g. "CTO"). For send-invite: the invitee\'s ACTUAL job title, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite; omit it if you do not know the person\'s real title.'
+          description: 'For search-people: job title FILTER (e.g. "CTO"). For send-invite: the invitee\'s ACTUAL job title, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite; omit it if you do not know the person\'s real title. Not used by accept-invitation.'
         },
         company: {
           type: 'string',
-          description: 'For search-people: company name FILTER — free text, auto-resolved to a LinkedIn company id if no company_id is provided. For send-invite: the invitee\'s ACTUAL employer, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite; omit it if you do not know the person\'s real employer.'
+          description: 'For search-people: company name FILTER — free text, auto-resolved to a LinkedIn company id if no company_id is provided. For send-invite: the invitee\'s ACTUAL employer, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite; omit it if you do not know the person\'s real employer. Not used by accept-invitation.'
         },
         company_id: {
           type: 'string',
           description: 'LinkedIn company identifier/slug. Used for get-company. Optional pre-resolved LinkedIn company entity ID for search-people — when provided, skips the resolver.'
+        },
+        company_size_min: {
+          type: 'number',
+          description: 'For search-people: minimum employee headcount for each candidate\'s CURRENT employer. Unipile has no native headcount filter for people search, so this is applied as a post-filter — a candidate whose employer size can\'t be verified is excluded rather than let through unchecked, so result counts can shrink noticeably. Rough guide: startup ~1-200, mid-market ~201-1000, enterprise ~1000+. Only pass this when the user explicitly cares about company size — it adds extra lookups per search.'
+        },
+        company_size_max: {
+          type: 'number',
+          description: 'For search-people: maximum employee headcount for each candidate\'s CURRENT employer. Combine with company_size_min for a range (e.g. min omitted, max 200, for "startups"). See company_size_min for how unverifiable employers are handled.'
         },
         location: {
           type: 'string',
@@ -8641,6 +8649,8 @@ Use this when the user wants to:
 
 Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend (via the search-parameter resolver), giving precise structured filtering. Pass keywords ONLY for free-text broad search — when you have structured filters, the backend handles Unipile's keyword requirement transparently.
 
+company_size_min/company_size_max filter by each lead's resolved current-employer headcount (e.g. "startup PMs" ≈ max 200). There is no native LinkedIn/Unipile headcount filter for people search, so this is a post-filter applied after every other company-resolution step (work_experience, title-parsing, LLM fallback, profile fallback) — a lead whose employer size can't be verified is excluded, not guessed at, so imported counts can shrink noticeably. Only pass this when the user explicitly asked for a size constraint; it costs extra lookups per page.
+
 For more than ~30 results from a single query, use the cursor returned in the response to paginate through subsequent pages.
 
 When you make multiple sequential import calls, trust the "list_total_after_import" field on each response for the actual list size — do NOT sum the per-call "imported" values across calls, because the same lead can match multiple queries and is correctly deduplicated by the backend. Summing produces an inflated count.
@@ -8652,6 +8662,8 @@ Response keys:
 - list_total_after_import — actual post-import list size (trust this for cumulative counts)
 - cursor — pagination cursor for the next page of the same query (null when no more results)
 - anonymizedSkipped — count of out-of-network placeholder results ("LinkedIn Member", "LinkedIn User" and their localized equivalents) that were discarded before writing (they carry no usable name, email or profile URL, so they are not importable). A high value means the search reached beyond the connected account's network.
+- companySizeFiltered — count of leads dropped by company_size_min/max (out of range, or an unverifiable employer). Always present; 0 when the filter wasn't used or excluded nothing.
+- earlyExitOnSizeFilter — present (true) only when company_size_min/max was given AND 3 consecutive pages were excluded entirely by it. The search stopped BEFORE exhausting to avoid burning through many pages on a range that's proving unproductive for this market — call again with the returned cursor to keep looking, or widen the range.
 - importedLeads — summaries (firstName, lastName, linkedin, title, company) of up to the first 5 leads ACTUALLY WRITTEN by this call. It never includes results that were deduplicated into an existing lead, trimmed to honour the requested limit, or discarded as anonymized — report only from this array, and never describe a search result as imported unless it appears here.
 - autoEnrichJobId — present only when auto_enrich=true AND at least 1 new lead was imported AND the background job was successfully queued`,
     inputSchema: {
@@ -8676,6 +8688,14 @@ Response keys:
         company_id: {
           type: 'string',
           description: 'Optional pre-resolved LinkedIn company entity ID — when provided, skips the resolver.'
+        },
+        company_size_min: {
+          type: 'number',
+          description: 'Minimum employee headcount for each lead\'s resolved current employer. See the tool description for how this post-filter works and what it costs.'
+        },
+        company_size_max: {
+          type: 'number',
+          description: 'Maximum employee headcount for each lead\'s resolved current employer. Combine with company_size_min for a range (e.g. max 200 for "startups").'
         },
         location: {
           type: 'string',
@@ -8731,6 +8751,8 @@ Response keys:
       title: args.title,
       company: args.company,
       company_id: args.company_id,
+      company_size_min: args.company_size_min,
+      company_size_max: args.company_size_max,
       location: args.location,
       location_id: args.location_id,
       industry: args.industry,
