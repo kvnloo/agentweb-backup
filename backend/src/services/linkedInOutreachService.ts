@@ -1147,6 +1147,86 @@ export class LinkedInOutreachService {
     return this.resolveSearchParamId('COMPANY', company, accountId);
   }
 
+  /**
+   * Filter search-people result items by their current employer's headcount
+   * (ENG-1558). Unipile has no native headcount filter for the People search
+   * category — only for Companies — so this resolves each item's employer
+   * NAME (from `work_experience`, free text) to a company ID via the same
+   * cached resolver `searchPeople` itself uses, then reads `employee_count`
+   * off the cached company profile (UnipileCompanyService — 30-day TTL, same
+   * service the `get-company` tool action already uses). Both hops are
+   * already-cached lookups; nothing new to cache here.
+   *
+   * A candidate whose employer can't be resolved, or whose profile carries
+   * no employee_count, is EXCLUDED rather than silently let through — the
+   * caller explicitly asked for a size-filtered list, so an unverifiable
+   * result is worse than a smaller, honest one. `excludedUnverifiable`
+   * reports how many so the caller can be transparent about it (mirrors the
+   * ENG-1002 anonymizedFiltered pattern), the same way an out-of-network
+   * result or a reach limit gets reported instead of silently vanishing.
+   *
+   * No-op (returns items unchanged) when neither bound is given, so callers
+   * that never ask for this pay no extra latency or Unipile calls.
+   */
+  async filterByCompanySize(
+    items: any[],
+    range: { min?: number; max?: number },
+    accountId: string,
+  ): Promise<{ items: any[]; excludedUnverifiable: number }> {
+    if (range.min == null && range.max == null) return { items, excludedUnverifiable: 0 };
+
+    const employerOf = (item: any): string | null => {
+      const exp = Array.isArray(item?.work_experience) ? item.work_experience : [];
+      const current = exp.find((w: any) => w?.current) || exp[0];
+      return typeof current?.company === 'string' && current.company.trim()
+        ? current.company.trim()
+        : null;
+    };
+
+    // Resolve each DISTINCT employer once, not once per candidate — a page
+    // of results routinely has several candidates at the same company.
+    const uniqueNames = Array.from(
+      new Set(items.map(employerOf).filter((n): n is string => !!n)),
+    );
+
+    const headcountByName = new Map<string, number | null>();
+    await Promise.all(uniqueNames.map(async (name) => {
+      try {
+        const companyId = await this.resolveCompanyId(name, accountId);
+        if (!companyId) { headcountByName.set(name, null); return; }
+        const { getUnipileCompanyService } = await import('./unipileCompanyServiceFactory');
+        const result = await getUnipileCompanyService().getCompany(companyId, accountId);
+        const count =
+          typeof result.rawData?.employee_count === 'number'
+            ? result.rawData.employee_count
+            : typeof result.rawData?.insights?.employeesCount?.totalCount === 'number'
+            ? result.rawData.insights.employeesCount.totalCount
+            : null;
+        headcountByName.set(name, count);
+      } catch (error: any) {
+        // A single company lookup failing (rate limit, transient 5xx) must
+        // not fail the whole search — treat that one employer as
+        // unverifiable, same as a resolver miss.
+        this.log(`Company size lookup failed for "${name}" — treating as unverifiable`, {
+          reason: error?.message,
+        });
+        headcountByName.set(name, null);
+      }
+    }));
+
+    let excludedUnverifiable = 0;
+    const filtered = items.filter((item) => {
+      const name = employerOf(item);
+      const count = name ? headcountByName.get(name) ?? null : null;
+      if (count == null) { excludedUnverifiable++; return false; }
+      if (range.min != null && count < range.min) return false;
+      if (range.max != null && count > range.max) return false;
+      return true;
+    });
+
+    return { items: filtered, excludedUnverifiable };
+  }
+
   private async resolveSearchParamId(
     type: 'COMPANY' | 'LOCATION' | 'INDUSTRY' | 'SCHOOL' | 'SERVICE',
     keywords: string,
