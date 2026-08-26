@@ -5309,6 +5309,16 @@ router.delete('/email-domain', async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'No domain configured to reset' });
     }
 
+    // Release the claim before clearing the user record (same reasoning and ordering as
+    // DELETE /email-domains/:domainId) — this is a confirmed claim that never expires on its
+    // own, so a domain deleted only through this legacy route would otherwise remain
+    // permanently claimed, unregistrable through either endpoint, by no one. Idempotent (a
+    // no-op if this domain predates the claim protocol and was never actually claimed) via the
+    // conditional delete already inside releaseEmailDomainClaim.
+    if (user.emailDomain) {
+      await releaseEmailDomainClaim(user.emailDomain, userId);
+    }
+
     // Clear domain fields from user record (don't delete from Resend — may be shared or reused)
     await userDb.updateUser(userId, {
       emailDomain: '',
