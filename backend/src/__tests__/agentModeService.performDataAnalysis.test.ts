@@ -1010,7 +1010,11 @@ describe('AgentModeService.performDataAnalysis', () => {
 
   // ─── ENG-1295 hardening: intra-CSV id/name collision, grounding, narrative caveat ─
 
-  test('rejects the result when the generated CSV maps the same id to two different names', async () => {
+  test('flags (without rejecting) a generated CSV that maps the same id to two different names', async () => {
+    // Deliberately informational, not a hard reject: a real entity (an ad group, a
+    // CRM lead's company) can legitimately be renamed within a query's date window,
+    // which produces this exact shape from genuinely correct source data — we can't
+    // tell "renamed" apart from "fabricated" from the CSV alone.
     const csv = 'ad_group_id,ad_group_name,impressions\n199836788398,Product Analytics Platform,100\n199836788398,Game Analytics Platform,50';
 
     mockedAxiosPost.mockResolvedValueOnce({
@@ -1022,11 +1026,10 @@ describe('AgentModeService.performDataAnalysis', () => {
 
     const result = await (service as any).performDataAnalysis([], 'Break down by ad group id and name.', 'user-1');
 
-    expect(result.success).toBe(false);
-    expect(result.error).toBe('internal_inconsistency');
-    expect(result.message).toContain('199836788398');
-    expect(result.message).toContain('Product Analytics Platform');
-    expect(result.message).toContain('Game Analytics Platform');
+    expect(result.success).toBe(true);
+    expect(result.error).toBeUndefined();
+    expect(result.analysis).toContain('199836788398');
+    expect(result.analysis).toContain('map to more than one name');
   });
 
   test('does not flag a CSV where each id consistently maps to exactly one name', async () => {
