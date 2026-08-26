@@ -12897,45 +12897,50 @@ export class AgentModeService {
 
       // Accept both shapes — see note in sendEmailFromConfiguredSender.
       const leadSenderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
+      const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+      if (leadSenderProvider !== 'resend' && !connectedAccountId) {
+        return {
+          success: false,
+          message: `${providerLabel(leadSenderProvider)} sender misconfigured`,
+          error: `The ${providerLabel(leadSenderProvider)} sender is missing its connected account id`,
+        };
+      }
 
-      if (leadSenderProvider !== 'resend') {
-        // Send through the customer's own connected mailbox (Gmail / Outlook)
-        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
-        if (!connectedAccountId) {
-          return {
-            success: false,
-            message: `${providerLabel(leadSenderProvider)} sender misconfigured`,
-            error: `The ${providerLabel(leadSenderProvider)} sender is missing its connected account id`,
-          };
-        }
-        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
-        await bootstrapEmailProviders();
-        const provider = getEmailProvider(leadSenderProvider);
-        const body = draft.htmlContent || draft.textContent || '';
+      // ENG-265: route through sendAsSender (not the provider APIs directly) so this
+      // chat-driven send is subject to the same daily-cap/warmup enforcement as every
+      // other send path. resolveSenderForSend gives the authoritative CrmSender
+      // (dailyLimit/warmupStartedAt included) — the same lookup crm.ts's send routes use.
+      const { resolveSenderForSend } = await import('./crmSenderService');
+      const { sendAsSender, SenderDailyLimitExceededError } = await import('./sendAsSender');
+      // Fail closed rather than falling back to a synthesized sender: resolveSenderForSend
+      // re-reads the persisted config, so a null here means the sender that existed a moment
+      // ago (from getCrmSenders) is now gone — a real (if narrow) race, not a legitimate
+      // ad-hoc-sender case. A synthesized fallback would carry no dailyLimit/warmupStartedAt
+      // and sendAsSender would treat it as uncapped, silently skipping enforcement.
+      const crmSender = await resolveSenderForSend(senderOwnerUserId, sender.id, sender.email);
+      if (!crmSender) {
+        return {
+          success: false,
+          message: 'Sender no longer available',
+          error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
+        };
+      }
+
+      try {
         // senderOwnerUserId, not userId: the connected account belongs to whoever owns the
         // sender config, and a refreshed/rotated token must be written back to them (ENG-299).
-        const sendResult = await provider.sendEmail(senderOwnerUserId, connectedAccountId, {
-          to: lead.email,
-          subject: draft.subject,
-          body,
-          isHtml: !!draft.htmlContent,
-        });
-        emailId = sendResult.messageId;
-      } else {
-        // Send via Resend (custom domain sender)
-        const { resendService } = await import('./resendService');
-        const from = `${sender.fromName} <${sender.email}>`;
-        const result = await resendService.sendEmail({
-          from,
+        const sendResult = await sendAsSender(senderOwnerUserId, crmSender, {
           to: lead.email,
           subject: draft.subject,
           html: draft.htmlContent,
-          text: draft.textContent
+          text: draft.textContent,
         });
-        if (!result) {
-          return { success: false, message: 'Email send failed', error: 'Failed to send email via Resend' };
+        emailId = sendResult.messageId;
+      } catch (error) {
+        if (error instanceof SenderDailyLimitExceededError) {
+          return { success: false, message: 'Daily sending limit reached', error: error.message };
         }
-        emailId = result.id;
+        throw error;
       }
 
       // Clear the draft after successful send
@@ -13073,62 +13078,61 @@ export class AgentModeService {
       // persisted key. A sender resolved outside loadSenderConfig may only carry the latter.
       const senderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
 
-      if (senderProvider !== 'resend') {
-        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
-        if (!connectedAccountId) {
-          return {
-            success: false,
-            message: `${providerLabel(senderProvider)} sender misconfigured`,
-            error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
-          };
-        }
-        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
-        const label = providerLabel(senderProvider);
-        await bootstrapEmailProviders();
-        const provider = getEmailProvider(senderProvider);
-        const body = htmlBody || textBody || '';
-        try {
-          const sendResult = await provider.sendEmail(userId, connectedAccountId, {
-            to,
-            subject: params.subject,
-            body,
-            isHtml: !!htmlBody,
-          });
-          emailId = sendResult.messageId;
-        } catch (providerErr: any) {
-          // Translate OAuth failures into an actionable message that names the
-          // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
-          // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
-          // configured"). Nearly all are resolved by reconnecting in Settings.
-          const raw = providerErr instanceof Error ? providerErr.message : String(providerErr);
-          const needsReconnect = /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
-          if (needsReconnect) {
-            return {
-              success: false,
-              message: `${label} sender needs reconnecting`,
-              error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
-            };
-          }
-          return {
-            success: false,
-            message: `${label} send failed`,
-            error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
-          };
-        }
-      } else {
-        const { resendService } = await import('./resendService');
-        const from = `${sender.fromName} <${sender.email}>`;
-        const result = await resendService.sendEmail({
-          from,
+      const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+      if (senderProvider !== 'resend' && !connectedAccountId) {
+        return {
+          success: false,
+          message: `${providerLabel(senderProvider)} sender misconfigured`,
+          error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
+        };
+      }
+      const label = providerLabel(senderProvider);
+
+      // ENG-265: route through sendAsSender so this chat-driven ad-hoc send is subject
+      // to the same daily-cap/warmup enforcement as every other send path.
+      const { resolveSenderForSend } = await import('./crmSenderService');
+      const { sendAsSender, SenderDailyLimitExceededError } = await import('./sendAsSender');
+      // Fail closed rather than falling back to a synthesized sender — see the matching
+      // comment in sendEmailToLead for why a null here must not become an uncapped send.
+      const crmSender = await resolveSenderForSend(userId, sender.id, sender.email);
+      if (!crmSender) {
+        return {
+          success: false,
+          message: 'Sender no longer available',
+          error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
+        };
+      }
+
+      try {
+        const sendResult = await sendAsSender(userId, crmSender, {
           to,
           subject: params.subject,
           html: htmlBody,
           text: textBody,
         });
-        if (!result) {
-          return { success: false, message: 'Email send failed', error: `Failed to send email to "${to}" via the configured sender ${sender.email}. This is often caused by an invalid or rejected recipient address, or the sender domain not being verified. Please double-check the recipient address.` };
+        emailId = sendResult.messageId;
+      } catch (error: any) {
+        if (error instanceof SenderDailyLimitExceededError) {
+          return { success: false, message: 'Daily sending limit reached', error: error.message };
         }
-        emailId = result.id;
+        // Translate OAuth failures into an actionable message that names the
+        // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
+        // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
+        // configured"). Nearly all are resolved by reconnecting in Settings.
+        const raw = error instanceof Error ? error.message : String(error);
+        const needsReconnect = senderProvider !== 'resend' && /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
+        if (needsReconnect) {
+          return {
+            success: false,
+            message: `${label} sender needs reconnecting`,
+            error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
+          };
+        }
+        return {
+          success: false,
+          message: `${label} send failed`,
+          error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
+        };
       }
 
       return {

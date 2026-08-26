@@ -40,6 +40,19 @@ export interface CrmSender {
   senderProvider: SenderProvider;
   /** Required iff senderProvider is a mailbox provider. */
   connectedAccountId?: string;
+  /**
+   * Daily send cap (ENG-265). Unset means no cap — legacy/default behavior.
+   * Applies to all three provider types: a Gmail/Outlook mailbox is at least
+   * as reputation-sensitive to volume spikes as a custom domain.
+   */
+  dailyLimit?: number;
+  /**
+   * ISO date the sender started warmup (ENG-265). While set, the effective
+   * cap ramps per senderUsageTracker.effectiveDailyLimit() regardless of
+   * dailyLimit, until warmup completes (day 15+), after which dailyLimit
+   * (or the default) applies.
+   */
+  warmupStartedAt?: string;
 }
 
 export interface CrmSenderConfig {

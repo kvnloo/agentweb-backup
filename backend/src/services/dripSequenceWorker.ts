@@ -12,7 +12,7 @@
  */
 
 import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition, SequenceChannel } from './dripSequenceDb';
-import { sendAsSender } from './sendAsSender';
+import { sendAsSender, SenderDailyLimitExceededError } from './sendAsSender';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { crmDb, userDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
@@ -70,6 +70,14 @@ export async function processDueEnrollments(): Promise<{
         const retryAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
         await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
         console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (not yet connected)`);
+      } else if (err instanceof SenderDailyLimitExceededError) {
+        // ENG-265: the sender's daily counter resets at UTC midnight — releasing
+        // the claim here would just re-fail on the very next 5-minute tick until
+        // then. Snooze straight to the reset instead of hammering.
+        const now = new Date();
+        const nextUtcMidnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString();
+        await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, nextUtcMidnight).catch(() => {});
+        console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${nextUtcMidnight} (sender ${err.senderId} hit its daily limit)`);
       } else {
         // Generic/transient error: release the claim so this enrollment is
         // retried on the very next tick, same as today's behavior, instead
