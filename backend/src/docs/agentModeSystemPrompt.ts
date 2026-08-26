@@ -802,9 +802,16 @@ export function getUnattendedExecutionDirective(
   const equivalentRouteNotes = Array.from(new Set(
     (authorizedPublishTools || [])
       .flatMap((tool) => EQUIVALENT_PUBLISH_ROUTES[tool] || [])
-      .map((route) => (route.actions && route.actions.length > 0
-        ? `${route.tool} (${route.actions.join('/')} only)`
-        : route.tool))
+      .map((route) => {
+        // route.platforms understates the restriction if left off — e.g. the
+        // twitter_manage_post -> post_on_connected_account route is twitter-only,
+        // not a blanket grant across every platform post_on_connected_account serves.
+        const qualifiers = [
+          route.actions && route.actions.length > 0 ? `${route.actions.join('/')} only` : null,
+          route.platforms && route.platforms.length > 0 ? `${route.platforms.join('/')} only` : null,
+        ].filter((q): q is string => Boolean(q));
+        return qualifiers.length > 0 ? `${route.tool} (${qualifiers.join(', ')})` : route.tool;
+      })
   ));
   // The userId→identity mapping and its data-minimization guard reference two
   // admin-only tools (get_chat_history, list_all_clients). Inject this slice
