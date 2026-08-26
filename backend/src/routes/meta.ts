@@ -2,21 +2,9 @@ import express from "express";
 import { authenticateToken } from "../middleware/auth";
 import { userDb, taskDb } from "../services/db";
 import { getMetaAccessToken } from "../utils/secretsManager";
+import { applyLeadMetrics, finalizeLeadCosts } from "../utils/metaActionFamilies";
 
 const router = express.Router();
-
-// Action type mappings (shared across all processing functions)
-const FORM_ACTIONS = new Set([
-  'leadgen',
-  'on_facebook_lead',
-  'onsite_conversion.lead_form',
-  'offsite_conversion.fb_pixel_custom',
-  'offsite_conversion.fb_pixel_lead'
-]);
-const WEBSITE_ACTIONS = new Set([
-  'website_lead',
-  'lead'
-]);
 
 // Apply authentication middleware to all routes
 router.use(authenticateToken);
@@ -321,7 +309,8 @@ async function processCampaignData(campaigns: any, insights: any, adSets: any): 
     });
   }
   
-      // Process campaign-level insights directly
+      let leadMetricsCollapsed = 0;
+  // Process campaign-level insights directly
       for (const insight of insights) {
         const campaignId = insight.campaign_id;
         
@@ -339,32 +328,25 @@ async function processCampaignData(campaigns: any, insights: any, adSets: any): 
             console.log("Lead Ad Campaign actions:", JSON.stringify(insight.actions, null, 2));
           }
           
-          // Leads
-          if (Array.isArray(insight.actions)) {
-            for (const a of insight.actions) {
-              if (WEBSITE_ACTIONS.has(a.action_type)) {
-                campaign.websiteLeads = (campaign.websiteLeads || 0) + (parseInt(a.value) || 0);
-                console.log(`Found website action ${a.action_type}: ${a.value} for campaign ${campaign.name}`);
-              }
-              if (FORM_ACTIONS.has(a.action_type)) {
-                campaign.formLeads = (campaign.formLeads || 0) + (parseInt(a.value) || 0);
-                console.log(`Found form action ${a.action_type}: ${a.value} for campaign ${campaign.name}`);
-              }
-            }
-          }
-      if (Array.isArray(insight.cost_per_action_type)) {
-        for (const c of insight.cost_per_action_type) {
-          if (WEBSITE_ACTIONS.has(c.action_type)) {
-            campaign.costPerWebsiteLead = parseFloat(c.value) || 0;
-          }
-          if (FORM_ACTIONS.has(c.action_type)) {
-            campaign.costPerFormLead = parseFloat(c.value) || 0;
-          }
-        }
-      }
+          // Leads (cost per lead is resolved inside applyLeadMetrics)
+          applyLeadMetrics(campaign, insight);
+
+          // CodeRabbit (ENG-1575): this replaced two per-action logs that recorded every
+          // recognised lead action while building a customer-facing report. Removing them
+          // outright cost observability on a customer-impacting computation, so the equivalent
+          // is logged here — and it is strictly more auditable, because it records what was
+          // actually COUNTED after alias collapsing rather than each raw alias seen. No token
+          // or credential is included.
+          leadMetricsCollapsed++;
     }
   }
   
+  // ENG-1575: records only THAT the alias collapse ran, and over how many campaigns. No
+  // identifier and no metric: the observability question is whether the collapse executed, and
+  // per-campaign ids and counts are customer-derived. (This replaced two per-action logs that
+  // emitted the campaign NAME and every raw value, so it is a large net reduction.)
+  console.log(`[meta/ad-performance] lead-metric collapse ran for ${leadMetricsCollapsed} campaign insight row(s)`);
+
   // Calculate derived metrics (CTR, CPC) after aggregation
   for (const campaign of campaignMap.values()) {
     if (campaign.impressions > 0) {
@@ -377,16 +359,7 @@ async function processCampaignData(campaigns: any, insights: any, adSets: any): 
       campaign.frequency = campaign.impressions / campaign.reach;
     }
     // Derived
-    if (campaign.websiteLeads > 0) {
-      campaign.costPerWebsiteLead = campaign.costPerWebsiteLead || (campaign.spend / campaign.websiteLeads);
-    }
-    if (campaign.formLeads > 0) {
-      campaign.costPerFormLead = campaign.costPerFormLead || (campaign.spend / campaign.formLeads);
-    }
-    campaign.totalLeads = (campaign.websiteLeads || 0) + (campaign.formLeads || 0);
-    if (campaign.totalLeads > 0) {
-      campaign.costPerLead = campaign.spend / campaign.totalLeads;
-    }
+    finalizeLeadCosts(campaign);
   }
   
   // Return all campaigns regardless of activity
@@ -465,31 +438,9 @@ async function processAdSetsData(adSets: any, insights: any, campaigns: any): Pr
       adSet.cpc = parseFloat(insight.cpc) || 0;
       adSet.reach = parseInt(insight.reach) || 0;
       adSet.frequency = parseFloat(insight.frequency) || 0;
-      if (Array.isArray(insight.actions)) {
-        for (const a of insight.actions) {
-          if (WEBSITE_ACTIONS.has(a.action_type)) {
-            adSet.websiteLeads += (parseInt(a.value) || 0);
-          }
-          if (FORM_ACTIONS.has(a.action_type)) {
-            adSet.formLeads += (parseInt(a.value) || 0);
-          }
-        }
-      }
-      if (Array.isArray(insight.cost_per_action_type)) {
-        for (const c of insight.cost_per_action_type) {
-          if (WEBSITE_ACTIONS.has(c.action_type)) {
-            adSet.costPerWebsiteLead = parseFloat(c.value) || 0;
-          }
-          if (FORM_ACTIONS.has(c.action_type)) {
-            adSet.costPerFormLead = parseFloat(c.value) || 0;
-          }
-        }
-      }
+      applyLeadMetrics(adSet, insight);
       // Derived
-      if (adSet.websiteLeads > 0) adSet.costPerWebsiteLead = adSet.costPerWebsiteLead || (adSet.spend / adSet.websiteLeads);
-      if (adSet.formLeads > 0) adSet.costPerFormLead = adSet.costPerFormLead || (adSet.spend / adSet.formLeads);
-      adSet.totalLeads = (adSet.websiteLeads || 0) + (adSet.formLeads || 0);
-      if (adSet.totalLeads > 0) adSet.costPerLead = adSet.spend / adSet.totalLeads;
+      finalizeLeadCosts(adSet);
       console.log(`Updated adset ${adSetId} with spend: ${adSet.spend}`);
     } else {
       console.log(`Adset ${adSetId} not found in adSetsMap`);
@@ -555,30 +506,8 @@ async function processAdsData(ads: any, insights: any, adSets: any, campaigns: a
       ad.cpc = parseFloat(insight.cpc) || 0;
       ad.reach = parseInt(insight.reach) || 0;
       ad.frequency = parseFloat(insight.frequency) || 0;
-      if (Array.isArray(insight.actions)) {
-        for (const a of insight.actions) {
-          if (WEBSITE_ACTIONS.has(a.action_type)) {
-            ad.websiteLeads += (parseInt(a.value) || 0);
-          }
-          if (FORM_ACTIONS.has(a.action_type)) {
-            ad.formLeads += (parseInt(a.value) || 0);
-          }
-        }
-      }
-      if (Array.isArray(insight.cost_per_action_type)) {
-        for (const c of insight.cost_per_action_type) {
-          if (WEBSITE_ACTIONS.has(c.action_type)) {
-            ad.costPerWebsiteLead = parseFloat(c.value) || 0;
-          }
-          if (FORM_ACTIONS.has(c.action_type)) {
-            ad.costPerFormLead = parseFloat(c.value) || 0;
-          }
-        }
-      }
-      if (ad.websiteLeads > 0) ad.costPerWebsiteLead = ad.costPerWebsiteLead || (ad.spend / ad.websiteLeads);
-      if (ad.formLeads > 0) ad.costPerFormLead = ad.costPerFormLead || (ad.spend / ad.formLeads);
-      ad.totalLeads = (ad.websiteLeads || 0) + (ad.formLeads || 0);
-      if (ad.totalLeads > 0) ad.costPerLead = ad.spend / ad.totalLeads;
+      applyLeadMetrics(ad, insight);
+      finalizeLeadCosts(ad);
     }
   }
   

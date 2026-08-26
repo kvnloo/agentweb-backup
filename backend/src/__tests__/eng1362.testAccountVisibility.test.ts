@@ -50,4 +50,20 @@ describe('ENG-1362 spend risk is derived from the flag, never the name', () => {
       expect(describeGoogleAdsSpendRisk({ test_account: v }).can_spend).toBe(true);
     }
   });
+
+  /**
+   * The route enriches google_ads rows by asking Google for the flag when it was never
+   * recorded. That call reaches Secrets Manager and the Google Ads API, either of which
+   * can fail — and this endpoint lists EVERY connected account a customer has.
+   *
+   * A failure there must degrade to "unresolved", never blank the page. An earlier draft
+   * imported googleAdsService at module scope and 500'd the whole endpoint when the
+   * client could not construct, which is a far worse outcome than a missing badge.
+   */
+  it('an unresolved flag is still a well-formed, billable answer', () => {
+    // What the route stores in its map when the lookup throws.
+    expect(describeGoogleAdsSpendRisk({ test_account: null })).toEqual({ test_account: null, can_spend: true });
+    // ...and when the account was simply never looked up at all.
+    expect(describeGoogleAdsSpendRisk({})).toEqual({ test_account: undefined, can_spend: true });
+  });
 });

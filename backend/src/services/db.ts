@@ -152,8 +152,10 @@ export interface User {
   displayName?: string;
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
-  emailDomain?: string; // Email sender domain
-  resendDomainId?: string; // Resend domain ID for domain verification
+  emailDomain?: string; // @deprecated legacy single sending domain — kept for the task/subscriber-notification fallback sender (emailService.ts, dripSequenceWorker.ts legacyDefaultSender); CRM sending domains live in emailDomains[] (ENG-265)
+  resendDomainId?: string; // @deprecated Resend domain ID paired with the legacy emailDomain above
+  emailDomains?: Array<{ id: string; domain: string; status: string; addedAt: string }>; // Multiple verified Resend sending domains (ENG-265). id = Resend domain id.
+  emailDomainList?: string[]; // Denormalized domain names from emailDomains[], kept in sync on every write — lets getUsersByEmailDomain's Scan filter with contains() instead of pulling every row into app memory.
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels. Kept for backward-compat reads.
@@ -1245,7 +1247,9 @@ export class UserDB {
       do {
         const params: AWS.DynamoDB.DocumentClient.ScanInput = {
           TableName: this.tableName,
-          FilterExpression: 'emailDomain = :emailDomain AND NOT begins_with(userId, :tombstone)',
+          // ENG-265: also matches a domain registered as one of several entries in emailDomains[]
+          // via the denormalized emailDomainList — see the field comment on User.emailDomainList.
+          FilterExpression: '(emailDomain = :emailDomain OR contains(emailDomainList, :emailDomain)) AND NOT begins_with(userId, :tombstone)',
           ExpressionAttributeValues: {
             ':emailDomain': normalizedDomain,
             ':tombstone': 'deleted_',
@@ -6958,6 +6962,8 @@ export const crmDb = {
     enrichmentMetadata?: Record<string, any>;
     /** ISO timestamp set when a LinkedIn connection invite is manually sent from the CRM. */
     linkedInInviteSentAt?: string | null;
+    /** ISO timestamp set when this account accepted an INBOUND LinkedIn invite from this lead — distinct from linkedInInviteSentAt (an outbound send), since the two are opposite real-world events. */
+    linkedInInviteAcceptedAt?: string | null;
     /** ENG-1026: pre-send identity cross-check stamp (ISO date + verified canonical URL). */
     linkedinIdentityVerifiedAt?: string | null;
     linkedinIdentityVerifiedUrl?: string | null;
@@ -7154,6 +7160,15 @@ export const crmDb = {
         } else {
           setExpressions.push('linkedInInviteSentAt = :linkedInInviteSentAt');
           expressionAttributeValues[':linkedInInviteSentAt'] = updates.linkedInInviteSentAt;
+        }
+      }
+
+      if (updates.linkedInInviteAcceptedAt !== undefined) {
+        if (updates.linkedInInviteAcceptedAt === null) {
+          removeExpressions.push('linkedInInviteAcceptedAt');
+        } else {
+          setExpressions.push('linkedInInviteAcceptedAt = :linkedInInviteAcceptedAt');
+          expressionAttributeValues[':linkedInInviteAcceptedAt'] = updates.linkedInInviteAcceptedAt;
         }
       }
 

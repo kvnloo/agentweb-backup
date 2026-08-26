@@ -150,7 +150,7 @@ interface HistoryMessageLike {
   timestamp?: string;
   metadata?: {
     timestamp?: string;
-    toolCalls?: Array<{ id?: string; name?: string; arguments?: unknown; result?: any; error?: string }>;
+    toolCalls?: Array<{ id?: string; name?: string; arguments?: unknown; result?: any; error?: string; duplicateOf?: string }>;
   } | null;
 }
 
@@ -197,6 +197,56 @@ export function seedMediaCallKeysFromHistory(
     }
   }
   return seeded;
+}
+
+/**
+ * ENG-426: session-wide cap on `WEB_SEARCH_TOOL_NAMES` calls. Prod incident: a research
+ * turn made 193 web searches (73 file reads, 503 retained messages, 17.4M prompt tokens,
+ * $8.68) before an outer time limit ended it — the loop's exact-match anti-loop signature
+ * check (name + byte-identical arguments) never caught it, because each search varied its
+ * query text. This is a volume cap, not a dedupe: every prior call in the session counts
+ * regardless of arguments or outcome, so the model can't outrun it by rephrasing the query.
+ *
+ * Mirrors Claude Code's own fix for the identical failure mode ("Added a session-wide
+ * limit on WebSearch tool calls (default 200) to stop runaway search loops",
+ * `CLAUDE_CODE_MAX_WEB_SEARCHES_PER_SESSION`). Default set well above legitimate heavy
+ * single-topic research (rarely >20-30 distinct searches) while decisively catching a
+ * runaway. Override with AGENT_MODE_MAX_SEARCH_CALLS_PER_SESSION.
+ */
+export const SEARCH_CALL_SESSION_CAP = Math.max(
+  1,
+  parseInt(process.env.AGENT_MODE_MAX_SEARCH_CALLS_PER_SESSION || '60', 10) || 60,
+);
+
+/**
+ * ENG-426: count prior `WEB_SEARCH_TOOL_NAMES` calls across the WHOLE persisted session
+ * history. Deliberately NOT time-bounded (unlike `seedMediaCallKeysFromHistory` above) —
+ * a session naturally resets to zero the moment the user starts a new chat (a fresh
+ * `sessionId` has empty history), which is AgentMode's equivalent of Claude Code's
+ * `/clear`, so there is no old-unrelated-session risk to bound against here. Counts every
+ * call regardless of success/failure/arguments: this bounds the tool's volume, it does not
+ * detect duplicates.
+ */
+export function seedSearchCallCountFromHistory(
+  messages: HistoryMessageLike[] | undefined | null,
+): number {
+  if (!Array.isArray(messages)) return 0;
+  let count = 0;
+  for (const message of messages) {
+    if (!message || message.role !== 'assistant') continue;
+    const toolCalls = message.metadata?.toolCalls;
+    if (!Array.isArray(toolCalls)) continue;
+    for (const tc of toolCalls) {
+      // CodeRabbit (PR #2633): appendSuppressedDuplicate ALSO pushes a ledger entry with
+      // the collapsed call's name and a `duplicateOf` id (see executePreparedTools below)
+      // so the next LLM turn isn't left with an orphaned tool_call_id — but that entry
+      // never actually dispatched (no network call, no budget spent). Counting it here
+      // would inflate a later turn's seeded count for a search that only ran once.
+      if (tc?.duplicateOf) continue;
+      if (tc?.name && WEB_SEARCH_TOOL_NAMES.has(tc.name)) count++;
+    }
+  }
+  return count;
 }
 
 /** A tool-result outcome from the gateway, normalized into the loop's union shape. */
@@ -408,6 +458,16 @@ export interface ExecutePreparedToolsInput {
    * unless every requested input image is in this allow-list.
    */
   approvedRevisionImageSources?: string[];
+  /**
+   * ENG-426: count of `WEB_SEARCH_TOOL_NAMES` calls already made this SESSION before
+   * this iteration — seeded from persisted history via `seedSearchCallCountFromHistory`
+   * plus any earlier iterations of this same turn (the loop accumulates
+   * `searchCallsThisIteration` across iterations, same pattern as media asset tracking
+   * above). The cap check always runs; defaulting to 0 only means a caller that doesn't
+   * thread this through (or a unit test) starts counting from zero for that one call,
+   * so cross-iteration/cross-turn accumulation requires wiring it, as agentModeService.ts does.
+   */
+  priorSearchCallCount?: number;
   // ---- ports ----
   ports: ToolDispatchPorts;
 }
@@ -437,6 +497,13 @@ export interface ExecutePreparedToolsResult {
    * the same turn is suppressed instead of regenerating the image.
    */
   producedMediaCallKeys: Map<string, string>;
+  /**
+   * ENG-426: number of `WEB_SEARCH_TOOL_NAMES` calls ALLOWED to execute this iteration
+   * (i.e. not rejected by the session search-call cap). The loop adds this to its
+   * running `priorSearchCallCount` and threads the total into the next iteration, the
+   * same accumulate-and-thread pattern as `mediaAssetsProduced`/`mediaAssetsProducedThisRun`.
+   */
+  searchCallsThisIteration: number;
 }
 
 /**
@@ -525,6 +592,7 @@ export async function executePreparedTools(
     longestMediaCallMsThisRun = 0,
     priorMediaCallKeys,
     approvedRevisionImageSources,
+    priorSearchCallCount = 0,
     ports,
   } = input;
   // ENG-510: keys of media-gen assets successfully produced this iteration, returned to the
@@ -536,6 +604,8 @@ export async function executePreparedTools(
   let skillsUpdated = false;
   let mediaAssetsProduced = 0;
   let mediaBudgetDeferred = false;
+  // ENG-426: search calls ALLOWED to execute this iteration (see SEARCH_CALL_SESSION_CAP).
+  let searchCallsThisIteration = 0;
 
   // Phase 1: Validate and prepare tool calls (synchronous)
   const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision; dedupeKey: string }> = [];
@@ -630,6 +700,21 @@ export async function executePreparedTools(
 
       if (excludeTools?.includes(toolCall.function.name)) {
         const errorMsg = `Tool "${toolCall.function.name}" is not available in this context.`;
+        appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
+        continue;
+      }
+
+      // ENG-426: session-wide search-call budget. Checked against calls already
+      // ALLOWED (prior turns + earlier this iteration loop), so a call that itself
+      // trips the cap is rejected before counting toward its own limit.
+      if (WEB_SEARCH_TOOL_NAMES.has(toolCall.function.name)
+          && priorSearchCallCount + searchCallsThisIteration >= SEARCH_CALL_SESSION_CAP) {
+        const used = priorSearchCallCount + searchCallsThisIteration;
+        const errorMsg =
+          `Search budget reached: this session has already used ${used} web-search calls `
+          + `(limit ${SEARCH_CALL_SESSION_CAP}). Stop searching. Answer now using what you've `
+          + `already found, or tell the user you've hit the research limit and ask how they'd `
+          + `like to proceed.`;
         appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
         continue;
       }
@@ -754,6 +839,14 @@ export async function executePreparedTools(
         continue;
       }
       seenToolCallKeys.set(dedupeKey, toolCall.id);
+
+      // ENG-426: count this call toward the session search-call budget only once it has
+      // cleared same-turn/cross-iteration dedupe and is genuinely about to execute — an
+      // exact-duplicate call suppressed above never reaches the gateway, so it shouldn't
+      // consume budget either.
+      if (WEB_SEARCH_TOOL_NAMES.has(toolCall.function.name)) {
+        searchCallsThisIteration++;
+      }
 
       preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision, dedupeKey });
     } catch (error) {
@@ -1267,5 +1360,5 @@ export async function executePreparedTools(
     appendSuppressedDuplicate(suppressed);
   }
 
-  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred, longestMediaCallMs, producedMediaCallKeys };
+  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred, longestMediaCallMs, producedMediaCallKeys, searchCallsThisIteration };
 }

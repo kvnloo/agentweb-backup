@@ -7,6 +7,7 @@ import {
   AdsPlatform,
 } from "../services/adsMetricsDb";
 import { META_GRAPH_TIMEOUT_MS } from "../utils/metaApiFetch";
+import { promoteAttributionFromCustomFields } from "../types/attribution";
 
 // ENG-916: Haven only, deliberately. Every.io's Meta CAPI gap (ENG-993) means its
 // Meta-reported conversions would read as artificially low/zero even with real leads
@@ -334,7 +335,32 @@ export async function snapshotMetaMetricsForDate(
   const leadCountByCampaign = new Map<string, number>();
 
   for (const lead of leadsForDate) {
-    const campaign = lead.firstTouch?.utm?.campaign;
+    /*
+     * ENG-1601: resolve the touch through the promoter, not the raw field.
+     *
+     * Reading `lead.firstTouch?.utm?.campaign` directly dropped 36% of attributable leads.
+     * Measured on Haven, 2026-07-29..08-25: of 36 inbound leads carrying a usable campaign id,
+     * 23 had it in `firstTouch` and 13 had it ONLY in `customFields` with no `firstTouch` at all
+     * — the same two campaign ids, from the same two campaigns. The attribution arrived; the
+     * join looked in one of the two places it can live.
+     *
+     * `promoteAttributionFromCustomFields` was written for exactly this (ENG-926 §A) and is
+     * already used at ingest by routes/webhooks.ts. It GAP-FILLS: a structured value always
+     * wins, so a lead with a proper envelope is untouched, and it promotes only an allowlisted
+     * set so a free-form bag cannot assert paid acquisition.
+     *
+     * Why the original passed verification: every end-to-end check ran against Dev CRM, which
+     * holds none of Haven's production leads, so the join only ever saw ONE write path.
+     *
+     * ⚠ STALENESS: the bag carries no timestamp — none of the 13 real leads had a `landing_ts` —
+     * so a promoted `utm_campaign` cannot be dated. What bounds it is the join's EXISTING
+     * same-day constraint below: `knownCampaignIds` holds only campaigns Meta reported for THIS
+     * date, so a tag naming a campaign that was not running cannot match. That bound applies
+     * identically to a structured firstTouch, so promotion does not widen the exposure — it
+     * applies the same bound to more leads. Pinned by a test.
+     */
+    const touch = promoteAttributionFromCustomFields(lead.customFields, lead.firstTouch);
+    const campaign = touch?.utm?.campaign;
     const raw = campaign === undefined || campaign === null ? "" : String(campaign);
     // Id first — it is exact and unambiguous. Only then name, which is a convention.
     let matchedId: string | undefined;
