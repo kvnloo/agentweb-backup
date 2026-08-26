@@ -351,6 +351,13 @@ export async function snapshotMetaMetricsForDate(
      *
      * Why the original passed verification: every end-to-end check ran against Dev CRM, which
      * holds none of Haven's production leads, so the join only ever saw ONE write path.
+     *
+     * ⚠ STALENESS: the bag carries no timestamp — none of the 13 real leads had a `landing_ts` —
+     * so a promoted `utm_campaign` cannot be dated. What bounds it is the join's EXISTING
+     * same-day constraint below: `knownCampaignIds` holds only campaigns Meta reported for THIS
+     * date, so a tag naming a campaign that was not running cannot match. That bound applies
+     * identically to a structured firstTouch, so promotion does not widen the exposure — it
+     * applies the same bound to more leads. Pinned by a test.
      */
     const touch = promoteAttributionFromCustomFields(lead.customFields, lead.firstTouch);
     const campaign = touch?.utm?.campaign;

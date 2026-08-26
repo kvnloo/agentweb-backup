@@ -672,6 +672,29 @@ describe('ENG-1601 leads whose campaign id lives only in customFields', () => {
     expect(result.unattributedLeadCount).toBe(1);
   });
 
+  it('does NOT attribute a promoted tag whose campaign was not reported that day', async () => {
+    /*
+     * The staleness bound, pinned. A `utm_campaign` sitting in customFields could be old — the
+     * bag carries no timestamp (none of the 13 real leads had a `landing_ts`), so the value
+     * itself cannot be dated. What bounds it is the join's existing same-day constraint:
+     * `knownCampaignIds` holds only the campaigns Meta REPORTED for this date, so a tag naming
+     * a campaign that was not running cannot match.
+     *
+     * That constraint applies identically to a structured firstTouch, so promotion does not
+     * widen the staleness exposure — it applies the same bound to more leads. This test exists
+     * so that stays true.
+     */
+    (global.fetch as jest.Mock).mockResolvedValue(INSIGHTS());
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [makeCustomFieldsLead('999999999999999', `${TEST_DATE}T10:00:00.000Z`)], // never reported
+      lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE, undefined, undefined, TEST_CONTEXT);
+    expect(result.leadCount).toBe(0);
+    expect(result.unattributedLeadCount).toBe(1);
+  });
+
   it('does NOT let the free-form bag defeat the ambiguity guard', async () => {
     // Two campaigns sharing a name: a promoted value that resolves to both must stay
     // unattributed, exactly as a structured one would. Promotion must not widen what counts.
