@@ -3921,10 +3921,19 @@ export class AgentModeService {
           // never claim a false success. Gated on the per-turn flag, not on `content`:
           // `content` still holds any earlier turn's text and would suppress this.
           if (synthesisResidueGuardEnabled && synthesisResidueDropped) {
-            if (!turnHadUsableText) {
+            // ENG-1576 (CodeRabbit, PR #2639): a forced-final-synthesis turn
+            // (`truncatedByTimeBudget`) can ALSO produce residue-shaped output —
+            // `isUnusableSynthesis` runs unconditionally above, so the two flags are
+            // not mutually exclusive. Left as a plain if/else, the `!turnHadUsableText`
+            // arm below fired every time regardless of truncation reason, clobbering
+            // `content` before the dedicated TURN_TIME_BUDGET_FALLBACK_CONTENT message
+            // (gated on `!content`, below) ever got a chance to apply — the identical
+            // clobbering bug this PR already fixed for the sibling branch, just reached
+            // via the residue path instead of the plain-empty path.
+            if (!turnHadUsableText && !truncatedByTimeBudget) {
               console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
               content = buildExecutedActionsFallback(toolCalls);
-            } else {
+            } else if (turnHadUsableText) {
               // The retry DID produce text. Keep it — but do not let "the model
               // emitted characters" stand in for "the model answered". A retry that
               // returns a fragment or drifts also satisfies that check, and the
@@ -3937,6 +3946,8 @@ export class AgentModeService {
                 content = `${content}\n\n${footer}`;
               }
             }
+            // else: !turnHadUsableText && truncatedByTimeBudget — leave `content`
+            // untouched (still empty) so the time-limit-specific message below applies.
             if (responseMessage) responseMessage.content = content;
           } else if (synthesisResidueGuardEnabled && !turnHadUsableText && toolCalls.length > 0 && !truncatedByTimeBudget) {
             // Same failure family as the residue case above (a synthesis the run could
