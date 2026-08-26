@@ -85,6 +85,18 @@ export interface EquivalentPublishRoute {
    * this module — it fails closed rather than guessing.
    */
   platforms?: string[];
+  /**
+   * ENG-1599 review — true for a route that is valid ONLY for widening
+   * `isPublishCallWithinAuthorizedScope`'s consent scope (schedulePublishAuthorization.ts),
+   * never for `callSatisfiesRequirement`'s completion credit. "A broader publish grant
+   * covers a strictly narrower act" is sound reasoning for what a run is ALLOWED to call,
+   * but not for what counts as having FULFILLED a requirement: a schedule that requires
+   * `twitter_manage_post` mandates the reply/quote-tweet/retweet/thread it names, and an
+   * unrelated standalone tweet through `post_on_connected_account` does not satisfy that —
+   * crediting it would reverse this module's own asymmetric-equivalence invariant (see the
+   * module docblock). `callSatisfiesRequirement` must reject any route with this flag.
+   */
+  consentOnly?: boolean;
 }
 
 /**
@@ -122,7 +134,12 @@ export const EQUIVALENT_PUBLISH_ROUTES: Record<string, EquivalentPublishRoute[]>
   // handler). Scoped to platform=twitter so this cannot widen a twitter-only
   // requirement into cover for post_on_connected_account calls that target a
   // different platform (LinkedIn/Instagram/YouTube all share that tool name).
-  twitter_manage_post: [{ tool: 'post_on_connected_account', platforms: ['twitter'] }],
+  // consentOnly: this direction only holds for AUTHORIZATION ("a broader grant
+  // covers a narrower act") — it does not hold for COMPLETION credit, where a
+  // schedule requiring twitter_manage_post specifically mandates the reply/
+  // quote-tweet/retweet/thread it names, not an unrelated standalone tweet. See
+  // the `consentOnly` field doc on `EquivalentPublishRoute` above.
+  twitter_manage_post: [{ tool: 'post_on_connected_account', platforms: ['twitter'], consentOnly: true }],
   // ENG-1276 follow-up #3 — bidirectional (see the module docblock). email's own
   // description prefers send_email_from_sender when the user has no connected
   // mailbox but has a configured sender, and send_email_from_sender's description
@@ -222,6 +239,9 @@ export function callSatisfiesRequirement(
   if (!route) return false;
   if (route.actions && !route.actions.includes(resolveAction(entry))) return false;
   if (route.platforms && !route.platforms.includes(resolvePlatform(entry))) return false;
+  // A consentOnly route only widens what an AUTHORIZED schedule may call
+  // (isPublishCallWithinAuthorizedScope); it never counts toward completion.
+  if (route.consentOnly) return false;
 
   if (requiredFunctionNames) {
     const required = requiredFunctionNames instanceof Set ? requiredFunctionNames : new Set(requiredFunctionNames);
