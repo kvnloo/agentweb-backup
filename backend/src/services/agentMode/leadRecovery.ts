@@ -51,10 +51,13 @@ async function attemptLeadRecovery(
   const foundInOwnLists = await db.getLeadByIdAcrossLists(ownListIds, leadId);
   if (foundInOwnLists) return foundInOwnLists;
 
+  // Set for O(1) membership instead of .includes() inside .filter() (O(n) per
+  // check) — matters once an org has enough lists for this to add up.
+  const ownListIdSet = new Set(ownListIds);
   const accessibleLists = await db.getLeadListsForUser(userId);
   const otherListIds = accessibleLists
     .map((otherList) => otherList.listId)
-    .filter((otherListId) => otherListId && otherListId !== requestedListId && !ownListIds.includes(otherListId));
+    .filter((otherListId) => otherListId && otherListId !== requestedListId && !ownListIdSet.has(otherListId));
   return db.getLeadByIdAcrossLists(otherListIds, leadId);
 }
 
