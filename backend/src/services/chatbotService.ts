@@ -144,7 +144,6 @@ export interface ChatMessage {
     imageUrl?: string;                  // ENG-510: image URL on the immediate marker so a completed image survives a whole-turn-cap kill
     citations?: Citation[];             // ENG-351: de-duplicated web sources this message consulted (ChatGPT-style Sources UI)
     mediaBudgetDeferred?: boolean;      // ENG-1239: set on the tool-role deferral marker AND on the whole-turn-timeout partial-delivery message that reports it, so an unresolved media-batch pause is detectable from the tail of session history alone
-    linkedInInviteSendBlocked?: boolean; // ENG-1132: marks the scheduled-run notice for an account-level LinkedIn invite cooldown or pacing cap
   };
 }
 

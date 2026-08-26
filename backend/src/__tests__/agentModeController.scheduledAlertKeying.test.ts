@@ -253,7 +253,7 @@ describe('runScheduledChat — oncall-alert keying (ENG-145/146 class)', () => {
     }));
   }, 30000);
 
-  it('persists the blocked send-invite reason in scheduled run history', async () => {
+  it('persists the blocked send-invite reason in the existing session history', async () => {
     mockWorker.runInWorker.mockResolvedValue({
       ...okResponse,
       toolCalls: [{
@@ -265,11 +265,10 @@ describe('runScheduledChat — oncall-alert keying (ENG-145/146 class)', () => {
 
     await runScheduledChat(linkedInInviteSchedule, mockUserId, true, 'run-linkedin-history');
 
-    expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith(
-      linkedInInviteSchedule.scheduleId,
+    expect(mockChatbotDb.addMessageToSession).toHaveBeenCalledWith(
+      'session-sid',
       expect.objectContaining({
-        status: 'failure',
-        linkedInInviteSendBlock: expect.stringContaining('account-level invitation cooldown'),
+        content: expect.stringContaining('account-level invitation cooldown'),
       }),
     );
   }, 30000);
@@ -363,6 +362,38 @@ describe('runScheduledChat — oncall-alert keying (ENG-145/146 class)', () => {
       functionCallMatches: ['linkedin_outreach'],
       functionCallMisses: [],
       functionCallDetails: { linkedin_outreach: { actual: 2, required: 1 } },
+    }));
+  }, 30000);
+
+  it('does not let one successful non-invite action satisfy a two-call LinkedIn minimum after an invite cap block', async () => {
+    mockWorker.runInWorker.mockResolvedValue({
+      ...okResponse,
+      toolCalls: [
+        { name: 'linkedin_outreach', arguments: { action: 'search-people' }, result: { success: true } },
+        {
+          name: 'linkedin_outreach',
+          arguments: { action: 'send-invite' },
+          result: { success: false, error: 'Cannot resend yet — account invitation limit reached.' },
+        },
+      ],
+    } as any);
+
+    const result = await runScheduledChat(
+      {
+        ...baseSchedule,
+        requiredFunctionCalls: ['linkedin_outreach'],
+        functionCallMinCalls: { linkedin_outreach: 2 },
+      },
+      mockUserId,
+      true,
+      'run-linkedin-read-plus-blocked-invite-minimum-two',
+    );
+
+    expect(result).toEqual(expect.objectContaining({
+      status: 'failure',
+      passed: false,
+      functionCallMisses: ['linkedin_outreach'],
+      functionCallDetails: { linkedin_outreach: { actual: 1, required: 2 } },
     }));
   }, 30000);
 

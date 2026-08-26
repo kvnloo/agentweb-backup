@@ -5317,14 +5317,19 @@ export async function runScheduledChat(
     // ENG-1132: an account-level invitation throttle makes additional invite
     // attempts futile. Persist a plain-language completion note in the session
     // before deriving the result/email so every surface tells the same truth.
-    const linkedInInviteSendBlock = detectLinkedInInviteSendBlock(result.toolCalls);
+    // A resumed run's final outcome includes its abandoned portion. Use the
+    // same combined ledger here as the requirement verifier below: a prior
+    // blocked invite is still an account-level capacity signal, and a prior
+    // successful call still counts toward the configured minimum.
+    const linkedInOutcomeToolCalls = [...resumePriorToolCalls, ...result.toolCalls];
+    const linkedInInviteSendBlock = detectLinkedInInviteSendBlock(linkedInOutcomeToolCalls);
     if (linkedInInviteSendBlock && sessionId) {
       try {
         await chatbotDb.addMessageToSession(sessionId, {
           role: 'assistant',
           content: linkedInInviteSendBlock.notice,
           timestamp: new Date().toISOString(),
-          metadata: { timestamp: new Date().toISOString(), linkedInInviteSendBlocked: true },
+          metadata: { timestamp: new Date().toISOString() },
         });
       } catch (persistError) {
         console.error('Failed to persist LinkedIn invitation-block notice to session:', persistError);
@@ -5414,25 +5419,23 @@ export async function runScheduledChat(
 
     // An account-wide cooldown/pacing refusal is not a successful send. The
     // verifier historically counted every non-publish call by name, so correct
-    // the persisted requirement evidence only when no successful non-invite
-    // LinkedIn action has already satisfied the schedule's generic tool-name
-    // requirement. Schedules currently contract by tool name, not action: a
-    // successful read must remain valid evidence for `linkedin_outreach`.
-    const genericLinkedInRequirementAlreadyMet = [...resumePriorToolCalls, ...result.toolCalls].some(
-      (call: any) => call?.name === 'linkedin_outreach'
-        && linkedInOutreachAction(call) !== 'send-invite'
-        && toolCallSucceeded(call),
+    // Schedules contract by tool name rather than action, so successful
+    // non-invite LinkedIn calls count too. Count every successful call from
+    // the combined ledger, rather than treating one such call as enough for
+    // a schedule that requires multiple calls.
+    const requiredLinkedInCalls = functionCallMinCalls.linkedin_outreach || 1;
+    const successfulLinkedInCalls = linkedInOutcomeToolCalls.filter(
+      (call: any) => call?.name === 'linkedin_outreach' && toolCallSucceeded(call),
     );
     const linkedInInviteSendRequirementMissed = Boolean(
       linkedInInviteSendBlock
       && heldToFunctionNames.includes('linkedin_outreach')
-      && !genericLinkedInRequirementAlreadyMet
-      && linkedInInviteSendBlock.successfulInviteSends < (functionCallMinCalls.linkedin_outreach || 1),
+      && successfulLinkedInCalls.length < requiredLinkedInCalls,
     );
     if (linkedInInviteSendRequirementMissed) {
       finalFunctionCallDetails.linkedin_outreach = {
-        actual: linkedInInviteSendBlock.successfulInviteSends,
-        required: functionCallMinCalls.linkedin_outreach || 1,
+        actual: successfulLinkedInCalls.length,
+        required: requiredLinkedInCalls,
       };
     }
     const finalFunctionCallMatches = linkedInInviteSendRequirementMissed
@@ -5489,9 +5492,6 @@ export async function runScheduledChat(
       // and self-clearing, so flipping these runs to failures would bury the
       // owner's real failure signal under a fleet-wide vendor incident.
       ...(blockedBy ? { blockedBy } : {}),
-      // Kept distinct from `blockedBy`, which tracks the LinkedIn *search*
-      // outage transition and drives its own owner notification workflow.
-      ...(linkedInInviteSendBlock ? { linkedInInviteSendBlock: linkedInInviteSendBlock.notice } : {}),
       // ENG-947: the run ended early because its publish-press budget ran out with
       // the publish tool still uncalled — the content was drafted and held, not
       // published. Still a `failure` (nothing shipped, so the streak/oncall
