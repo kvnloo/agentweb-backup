@@ -42,10 +42,22 @@ jest.mock('../services/gmailService', () => ({
   }
 }));
 
+// ENG-265: sendEmailToLead/sendEmailFromConfiguredSender now re-resolve the sender via
+// resolveSenderForSend (crmSenderService.ts) as the authoritative source, instead of trusting
+// the getCrmSenders() snapshot they already have — see the "fail closed" fix in
+// agentModeService.ts. This suite doesn't back real settingsService/DynamoDB data, so wire
+// resolveSenderForSend to mirror whatever getCrmSenders() is mocked to return per-test
+// (getCrmSenders is always called first in real production order, so its mock is already
+// configured by the time this runs) rather than repeating each test's sender fixture twice.
+jest.mock('../services/crmSenderService', () => ({
+  resolveSenderForSend: jest.fn(),
+}));
+
 import { AgentModeService } from '../services/agentModeService';
 import { crmDb, userDb, orgDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import { gmailService } from '../services/gmailService';
+import { resolveSenderForSend } from '../services/crmSenderService';
 import { LEAD_IMPORT_WRITE_BUDGET_MS } from '../utils/leadImportLedger';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
@@ -118,6 +130,24 @@ describe('AgentModeService - CRM Tools', () => {
     // clearAllMocks() does not reset implementations, so set this deterministically
     // on every test; deny tests override to false explicitly.
     (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+
+    (resolveSenderForSend as jest.Mock).mockImplementation(async (uid: string, senderId?: string, senderEmail?: string) => {
+      const result = await (service as any).getCrmSenders(uid);
+      if (!result?.success) return null;
+      const needle = String(senderEmail || '').toLowerCase();
+      const found =
+        result.senders.find((s: any) => senderId && s.id === senderId) ??
+        result.senders.find((s: any) => s.email?.toLowerCase() === needle) ??
+        null;
+      if (!found) return null;
+      // Mirror crmSenderService.normalizeSender: the fixtures in this file use the legacy
+      // senderType/gmailAccountId keys the same way a real persisted sender might.
+      return {
+        ...found,
+        senderProvider: found.senderProvider || found.senderType || 'resend',
+        connectedAccountId: found.connectedAccountId || found.gmailAccountId,
+      };
+    });
   });
 
   // ─── getLeads ──────────────────────────────────────────────────────────

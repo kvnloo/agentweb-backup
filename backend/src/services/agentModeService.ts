@@ -12680,14 +12680,19 @@ export class AgentModeService {
       // (dailyLimit/warmupStartedAt included) — the same lookup crm.ts's send routes use.
       const { resolveSenderForSend } = await import('./crmSenderService');
       const { sendAsSender, SenderDailyLimitExceededError } = await import('./sendAsSender');
-      const resolvedSender = await resolveSenderForSend(senderOwnerUserId, sender.id, sender.email);
-      const crmSender = resolvedSender ?? {
-        id: sender.id,
-        email: sender.email,
-        fromName: sender.fromName,
-        senderProvider: leadSenderProvider as any,
-        connectedAccountId,
-      };
+      // Fail closed rather than falling back to a synthesized sender: resolveSenderForSend
+      // re-reads the persisted config, so a null here means the sender that existed a moment
+      // ago (from getCrmSenders) is now gone — a real (if narrow) race, not a legitimate
+      // ad-hoc-sender case. A synthesized fallback would carry no dailyLimit/warmupStartedAt
+      // and sendAsSender would treat it as uncapped, silently skipping enforcement.
+      const crmSender = await resolveSenderForSend(senderOwnerUserId, sender.id, sender.email);
+      if (!crmSender) {
+        return {
+          success: false,
+          message: 'Sender no longer available',
+          error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
+        };
+      }
 
       try {
         // senderOwnerUserId, not userId: the connected account belongs to whoever owns the
@@ -12855,14 +12860,16 @@ export class AgentModeService {
       // to the same daily-cap/warmup enforcement as every other send path.
       const { resolveSenderForSend } = await import('./crmSenderService');
       const { sendAsSender, SenderDailyLimitExceededError } = await import('./sendAsSender');
-      const resolvedSender = await resolveSenderForSend(userId, sender.id, sender.email);
-      const crmSender = resolvedSender ?? {
-        id: sender.id,
-        email: sender.email,
-        fromName: sender.fromName,
-        senderProvider: senderProvider as any,
-        connectedAccountId,
-      };
+      // Fail closed rather than falling back to a synthesized sender — see the matching
+      // comment in sendEmailToLead for why a null here must not become an uncapped send.
+      const crmSender = await resolveSenderForSend(userId, sender.id, sender.email);
+      if (!crmSender) {
+        return {
+          success: false,
+          message: 'Sender no longer available',
+          error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
+        };
+      }
 
       try {
         const sendResult = await sendAsSender(userId, crmSender, {
