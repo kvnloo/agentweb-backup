@@ -178,12 +178,23 @@ describe('setDailyInviteCap', () => {
       { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined },
       ACCOUNT_ID,
       -1,
-    )).rejects.toThrow('daily_invite_cap must be a non-negative number');
+    )).rejects.toThrow('daily_invite_cap must be a non-negative integer');
 
     await expect(setDailyInviteCap(
       { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined },
       ACCOUNT_ID,
       100,
     )).resolves.toBe(30);
+  });
+
+  // Regression test: Number.isFinite alone accepts fractional values, so a cap
+  // of 10.5 would let reserveDailyVolumeSlot's integer count comparison permit
+  // an 11th invite — exceeding the configured daily cap.
+  it('rejects a fractional cap', async () => {
+    await expect(setDailyInviteCap(
+      { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined },
+      ACCOUNT_ID,
+      10.5,
+    )).rejects.toThrow('daily_invite_cap must be a non-negative integer');
   });
 });

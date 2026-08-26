@@ -197,8 +197,8 @@ export async function setDailyInviteCap(
   cap: unknown,
 ): Promise<number> {
   const parsedCap = typeof cap === 'number' ? cap : Number(cap);
-  if (!Number.isFinite(parsedCap) || parsedCap < 0) {
-    throw new Error('daily_invite_cap must be a non-negative number for set-daily-invite-cap');
+  if (!Number.isFinite(parsedCap) || !Number.isInteger(parsedCap) || parsedCap < 0) {
+    throw new Error('daily_invite_cap must be a non-negative integer for set-daily-invite-cap');
   }
   const absoluteMax = dailyInviteAbsoluteMax();
   const clampedCap = Number.isFinite(absoluteMax) && absoluteMax > 0
