@@ -26,6 +26,7 @@ import { settingsService } from '../services/settingsService';
 import { io } from '../server';
 import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
 import { SenderDailyLimitExceededError } from '../services/senderUsageTracker';
+import { getPendingBatch, upsertPendingBatch, deletePendingBatch } from '../services/groupEmailPendingBatchService';
 import router from '../routes/crm';
 
 jest.mock('../services/db', () => ({
@@ -99,6 +100,12 @@ jest.mock('../services/emailProviderService', () => ({
 
 jest.mock('../services/leadListAlertService', () => ({
   leadListAlertService: { handleLeadEvent: jest.fn() },
+}));
+
+jest.mock('../services/groupEmailPendingBatchService', () => ({
+  getPendingBatch: jest.fn().mockResolvedValue(null),
+  upsertPendingBatch: jest.fn().mockResolvedValue(undefined),
+  deletePendingBatch: jest.fn().mockResolvedValue(undefined),
 }));
 
 const mockUploadFileToS3 = jest.fn();
@@ -617,6 +624,114 @@ describe('CRM Group Email Endpoints', () => {
         expect(response.total).toBe(3);
       });
     });
+
+    describe('ENG-265 — durable pending-batch record (survives closing the tab)', () => {
+      const cappedSenderConfig = () =>
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify({
+            senders: [{ id: 'r-1', email: 'me@test.com', fromName: 'Me', dailyLimit: 2 }],
+          }),
+        });
+
+      it('persists skippedLeadIds when a fresh send stops early, with totalOriginal/sentSoFar seeded from this call', async () => {
+        cappedSenderConfig();
+        (getPendingBatch as jest.Mock).mockResolvedValue(null); // no prior batch
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+          items: [
+            { leadId: '1', email: 'a@test.com' },
+            { leadId: '2', email: 'b@test.com' },
+            { leadId: '3', email: 'c@test.com' },
+          ],
+          lastEvaluatedKey: undefined,
+        });
+        (resendService.sendEmail as jest.Mock)
+          .mockResolvedValueOnce({ id: 'msg-1' })
+          .mockResolvedValueOnce({ id: 'msg-2' });
+        (senderUsageTracker.reserveSend as jest.Mock)
+          .mockResolvedValueOnce(undefined)
+          .mockResolvedValueOnce(undefined)
+          .mockRejectedValueOnce(new SenderDailyLimitExceededError('r-1', 2));
+
+        mockReq.body = { senderId: 'r-1', senderEmail: 'me@test.com', senderName: 'Me', subject: 'Hi', htmlContent: '<p>Hello</p>' };
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        expect(upsertPendingBatch).toHaveBeenCalledWith('test-user-id', expect.objectContaining({
+          listId: 'list-1',
+          skippedLeadIds: ['3'],
+          sentSoFar: 2,
+          totalOriginal: 3,
+        }));
+        expect(deletePendingBatch).not.toHaveBeenCalled();
+      });
+
+      it('accumulates sentSoFar and preserves totalOriginal when a resume also stops early', async () => {
+        cappedSenderConfig();
+        (getPendingBatch as jest.Mock).mockResolvedValue({
+          listId: 'list-1', senderId: 'r-1', senderEmail: 'me@test.com', senderName: 'Me',
+          subject: 'Hi', htmlContent: '<p>Hello</p>', skippedLeadIds: ['3', '4', '5'],
+          sentSoFar: 2, totalOriginal: 5, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+        });
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+          items: [
+            { leadId: '3', email: 'c@test.com' },
+            { leadId: '4', email: 'd@test.com' },
+            { leadId: '5', email: 'e@test.com' },
+          ],
+          lastEvaluatedKey: undefined,
+        });
+        (resendService.sendEmail as jest.Mock).mockResolvedValueOnce({ id: 'msg-3' });
+        (senderUsageTracker.reserveSend as jest.Mock)
+          .mockResolvedValueOnce(undefined)
+          .mockRejectedValueOnce(new SenderDailyLimitExceededError('r-1', 2));
+
+        mockReq.body = {
+          senderId: 'r-1', senderEmail: 'me@test.com', senderName: 'Me', subject: 'Hi', htmlContent: '<p>Hello</p>',
+          leadIds: ['3', '4', '5'],
+        };
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        // 1 more sent this call (2 previously + 1 now = 3), original total of 5 preserved,
+        // and the remaining set shrinks to just what's still outstanding.
+        expect(upsertPendingBatch).toHaveBeenCalledWith('test-user-id', expect.objectContaining({
+          skippedLeadIds: ['4', '5'],
+          sentSoFar: 3,
+          totalOriginal: 5,
+        }));
+      });
+
+      it('clears the pending-batch record once a resume finishes everyone', async () => {
+        cappedSenderConfig();
+        (getPendingBatch as jest.Mock).mockResolvedValue({
+          listId: 'list-1', senderId: 'r-1', senderEmail: 'me@test.com', senderName: 'Me',
+          subject: 'Hi', htmlContent: '<p>Hello</p>', skippedLeadIds: ['4', '5'],
+          sentSoFar: 3, totalOriginal: 5, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+        });
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+          items: [
+            { leadId: '4', email: 'd@test.com' },
+            { leadId: '5', email: 'e@test.com' },
+          ],
+          lastEvaluatedKey: undefined,
+        });
+        (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg' });
+        (senderUsageTracker.reserveSend as jest.Mock).mockResolvedValue(undefined);
+
+        mockReq.body = {
+          senderId: 'r-1', senderEmail: 'me@test.com', senderName: 'Me', subject: 'Hi', htmlContent: '<p>Hello</p>',
+          leadIds: ['4', '5'],
+        };
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        expect(deletePendingBatch).toHaveBeenCalledWith('test-user-id', 'list-1');
+        expect(upsertPendingBatch).not.toHaveBeenCalled();
+      });
+    });
   });
 
   describe('POST /lists/:listId/group-email/test', () => {
@@ -714,6 +829,42 @@ describe('CRM Group Email Endpoints', () => {
       expect(mockGetEmailProvider).toHaveBeenCalledWith('outlook');
       const response = (mockRes.json as jest.Mock).mock.calls[0][0];
       expect(response.sent).toBe(1);
+    });
+  });
+
+  describe('GET /lists/:listId/group-email/pending', () => {
+    it('returns the durable pending batch for this list', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+      const batch = { listId: 'list-1', skippedLeadIds: ['4', '5'], sentSoFar: 3, totalOriginal: 5 };
+      (getPendingBatch as jest.Mock).mockResolvedValue(batch);
+
+      const handler = findHandler('/lists/:listId/group-email/pending', 'get');
+      await handler!(mockReq, mockRes);
+
+      expect(getPendingBatch).toHaveBeenCalledWith('test-user-id', 'list-1');
+      expect(mockRes.json).toHaveBeenCalledWith({ batch });
+    });
+
+    it('returns { batch: null } when there is nothing pending', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+      (getPendingBatch as jest.Mock).mockResolvedValue(null);
+
+      const handler = findHandler('/lists/:listId/group-email/pending', 'get');
+      await handler!(mockReq, mockRes);
+
+      expect(mockRes.json).toHaveBeenCalledWith({ batch: null });
+    });
+  });
+
+  describe('DELETE /lists/:listId/group-email/pending', () => {
+    it('dismisses the pending batch', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+
+      const handler = findHandler('/lists/:listId/group-email/pending', 'delete');
+      await handler!(mockReq, mockRes);
+
+      expect(deletePendingBatch).toHaveBeenCalledWith('test-user-id', 'list-1');
+      expect(mockRes.json).toHaveBeenCalledWith({ message: 'Pending group email dismissed.' });
     });
   });
 });

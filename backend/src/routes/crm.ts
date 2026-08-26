@@ -223,6 +223,7 @@ import {
 import { MAILBOX_PROVIDERS, CrmSender, isMailboxSender } from '../services/crmSenderTypes';
 import { sendAsSender, SenderDailyLimitExceededError } from '../services/sendAsSender';
 import { claimEmailDomain, releaseEmailDomainClaim, EmailDomainAlreadyClaimedError } from '../services/emailDomainClaimService';
+import { getPendingBatch, upsertPendingBatch, deletePendingBatch } from '../services/groupEmailPendingBatchService';
 import { effectiveDailyLimit } from '../services/senderUsageTracker';
 import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
 router.use(apolloSubRouter);
@@ -6361,6 +6362,31 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
 
     const skippedDueToLimit = skippedLeadIds.length;
 
+    // Durable record of what's left, so the gap survives closing the tab or coming back a
+    // different day — the in-response skippedLeadIds above is correct but ephemeral (React
+    // state), and a campaign that needs 20 days to clear a 50/day cap will absolutely
+    // outlive one browser session. A resume that finishes everyone clears the record; a
+    // resume that stops early again replaces it with the new (smaller) remaining set while
+    // preserving the campaign's original totals.
+    if (stoppedEarlyReason) {
+      const existingBatch = await getPendingBatch(userId, listId).catch(() => null);
+      await upsertPendingBatch(userId, {
+        listId,
+        senderId: sender.id,
+        senderEmail: sender.email,
+        senderName: sender.fromName,
+        subject,
+        htmlContent,
+        textContent,
+        unsubscribeFooterHtml,
+        skippedLeadIds,
+        sentSoFar: (existingBatch?.sentSoFar ?? 0) + sent,
+        totalOriginal: existingBatch?.totalOriginal ?? total,
+      }).catch((e) => console.error('Failed to persist pending group-email batch:', e));
+    } else {
+      await deletePendingBatch(userId, listId).catch(() => {});
+    }
+
     return res.json({
       total,
       sent,
@@ -6378,6 +6404,65 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
   } catch (error) {
     console.error('Error sending group email:', error);
     return res.status(500).json({ message: 'Failed to send group email' });
+  }
+});
+
+/**
+ * @route GET /api/crm/lists/:listId/group-email/pending
+ * @desc Get the durable record of an incomplete group-email campaign for this list, if any
+ *       (ENG-265 — survives closing the tab; see groupEmailPendingBatchService.ts)
+ */
+router.get('/lists/:listId/group-email/pending', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (!(await canAccessCrmList(userId, list))) {
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
+    }
+
+    const batch = await getPendingBatch(userId, listId);
+    res.json({ batch });
+  } catch (error: any) {
+    console.error('Error getting pending group email batch:', error);
+    res.status(500).json({ message: error.message || 'Failed to get pending group email batch' });
+  }
+});
+
+/**
+ * @route DELETE /api/crm/lists/:listId/group-email/pending
+ * @desc Dismiss the pending-batch record without sending the rest
+ */
+router.delete('/lists/:listId/group-email/pending', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (!(await canDestructiveCrmList(userId, list))) {
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
+    }
+
+    await deletePendingBatch(userId, listId);
+    res.json({ message: 'Pending group email dismissed.' });
+  } catch (error: any) {
+    console.error('Error dismissing pending group email batch:', error);
+    res.status(500).json({ message: error.message || 'Failed to dismiss pending group email batch' });
   }
 });
 
