@@ -12,6 +12,8 @@ jest.mock('../services/db', () => ({
     getLeadsByICPFlag: jest.fn(),
     getLeadsByEngagedFlag: jest.fn(),
     getLeadById: jest.fn(),
+    getLeadByIdAcrossLists: jest.fn(),
+    getLeadListsForUser: jest.fn(),
     updateLead: jest.fn(),
     batchCreateLeads: jest.fn(),
     deleteLead: jest.fn(),
@@ -883,11 +885,59 @@ describe('AgentModeService - CRM Tools', () => {
     it('should return not found for missing lead', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      // No other accessible list holds this lead_id either — a genuine miss.
+      mockCrmDb.getLeadListsForUser.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(null as any);
 
       const result = await service.getLeadDetails(listId, leadId, userId);
 
       expect(result.success).toBe(false);
       expect(result.message).toBe('Lead not found');
+      expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenCalledWith([], leadId);
+    });
+
+    it('ENG-969: corrects a stale list_id when the lead exists in a different accessible list', async () => {
+      // Reproduces the production sequence from session 6082779b-f9f1-4e38-a8eb-34abbc3da419:
+      // the agent paired a valid lead_id with the wrong list_id after re-scoping it
+      // correctly one tool call earlier in the same run.
+      const otherListId = 'list-def';
+      const otherList = { ...mockList, listId: otherListId, name: 'Other List', linkedInAccountId: 'acc-other' };
+      const leadInOtherList = { ...mockLead, listId: otherListId };
+
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsForUser.mockResolvedValue([mockList, otherList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(leadInOtherList as any);
+      mockCrmDb.getLeadListById.mockImplementation((id: string) =>
+        Promise.resolve(id === otherListId ? (otherList as any) : (mockList as any))
+      );
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.listId).toBe(otherListId);
+      expect(result.note).toContain(listId);
+      expect(result.note).toContain(otherListId);
+      expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenCalledWith([otherListId], leadId);
+      // Engagement lookups must use the corrected list, not the one originally requested.
+      expect(mockCrmDb.getLeadEngagementCount).toHaveBeenCalledWith(otherListId, leadId, userId);
+    });
+
+    it('ENG-969: does not leak a lead from a list the caller cannot access', async () => {
+      // getLeadByIdAcrossLists is only ever given getLeadListsForUser's own output,
+      // so a list the caller can't see is never a candidate in the first place.
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsForUser.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(null as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Lead not found');
+      expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenCalledWith([], leadId);
     });
 
     it('should expose enrichmentMetadata provenance so the agent can cite data sources', async () => {
