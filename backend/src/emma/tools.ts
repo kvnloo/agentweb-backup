@@ -8649,6 +8649,8 @@ Use this when the user wants to:
 
 Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend (via the search-parameter resolver), giving precise structured filtering. Pass keywords ONLY for free-text broad search — when you have structured filters, the backend handles Unipile's keyword requirement transparently.
 
+company_size_min/company_size_max filter by each lead's resolved current-employer headcount (e.g. "startup PMs" ≈ max 200). There is no native LinkedIn/Unipile headcount filter for people search, so this is a post-filter applied after every other company-resolution step (work_experience, title-parsing, LLM fallback, profile fallback) — a lead whose employer size can't be verified is excluded, not guessed at, so imported counts can shrink noticeably. Only pass this when the user explicitly asked for a size constraint; it costs extra lookups per page.
+
 For more than ~30 results from a single query, use the cursor returned in the response to paginate through subsequent pages.
 
 When you make multiple sequential import calls, trust the "list_total_after_import" field on each response for the actual list size — do NOT sum the per-call "imported" values across calls, because the same lead can match multiple queries and is correctly deduplicated by the backend. Summing produces an inflated count.
@@ -8660,6 +8662,7 @@ Response keys:
 - list_total_after_import — actual post-import list size (trust this for cumulative counts)
 - cursor — pagination cursor for the next page of the same query (null when no more results)
 - anonymizedSkipped — count of out-of-network placeholder results ("LinkedIn Member", "LinkedIn User" and their localized equivalents) that were discarded before writing (they carry no usable name, email or profile URL, so they are not importable). A high value means the search reached beyond the connected account's network.
+- companySizeFiltered — count of leads dropped by company_size_min/max (out of range, or an unverifiable employer). Always present; 0 when the filter wasn't used or excluded nothing.
 - importedLeads — summaries (firstName, lastName, linkedin, title, company) of up to the first 5 leads ACTUALLY WRITTEN by this call. It never includes results that were deduplicated into an existing lead, trimmed to honour the requested limit, or discarded as anonymized — report only from this array, and never describe a search result as imported unless it appears here.
 - autoEnrichJobId — present only when auto_enrich=true AND at least 1 new lead was imported AND the background job was successfully queued`,
     inputSchema: {
@@ -8684,6 +8687,14 @@ Response keys:
         company_id: {
           type: 'string',
           description: 'Optional pre-resolved LinkedIn company entity ID — when provided, skips the resolver.'
+        },
+        company_size_min: {
+          type: 'number',
+          description: 'Minimum employee headcount for each lead\'s resolved current employer. See the tool description for how this post-filter works and what it costs.'
+        },
+        company_size_max: {
+          type: 'number',
+          description: 'Maximum employee headcount for each lead\'s resolved current employer. Combine with company_size_min for a range (e.g. max 200 for "startups").'
         },
         location: {
           type: 'string',
@@ -8739,6 +8750,8 @@ Response keys:
       title: args.title,
       company: args.company,
       company_id: args.company_id,
+      company_size_min: args.company_size_min,
+      company_size_max: args.company_size_max,
       location: args.location,
       location_id: args.location_id,
       industry: args.industry,
