@@ -110,6 +110,8 @@ beforeEach(() => {
           config: {
             account_type: 'oauth',
             profile_id: 'p-1',
+            daily_invite_cap: 30,
+            daily_volume: { invite: { count: 4, windowStartedAt: 1760000000000 } },
             access_token: 'ya29.a0-super-secret-access-token',
             refresh_token: 'refresh-me-please',
             api_key: 'sk_live_51H0000000000',
@@ -156,6 +158,8 @@ describe('ENG-953 — GET /api/org/me projection', () => {
     expect(account.config.access_token).toBeUndefined();
     expect(account.config.refresh_token).toBeUndefined();
     expect(account.config.api_key).toBeUndefined();
+    expect(account.config.daily_invite_cap).toBeUndefined();
+    expect(account.config.daily_volume).toBeUndefined();
   });
 
   it('AC3: is an allowlist — an unknown org field does not appear', async () => {
