@@ -2,6 +2,14 @@ import axios from 'axios';
 import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
 import { applyLeadMetrics, finalizeLeadCosts } from '../utils/metaActionFamilies';
 import { parse as parseCsv } from 'csv-parse/sync';
+import {
+  parseCsvProvenance,
+  tokenizeCsvHeaderCell,
+  findCsvIdNameCollisions,
+  checkCsvIdGrounding,
+  estimateRowsIn,
+  buildDataAnalysisCacheKey,
+} from './agentMode/csvProvenance';
 import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
@@ -8619,145 +8627,6 @@ export class AgentModeService {
     return { cleanedText, links };
   }
 
-  /**
-   * ENG-1295 provenance/consistency helper: parses a generated CSV block into its
-   * header, rows, data-row count, and the distinct values of its first column —
-   * the grouping-key convention this tool's prompts ask the model to use (see the
-   * per-ad-group / per-user breakdown instructions in the callers of this tool).
-   * Used to append a cheap-to-verify provenance stub, to diff repeat calls for
-   * self-consistency, and to check the CSV's own internal id/name consistency.
-   */
-  private parseCsvProvenance(csvText: string): { rowsOut: number; groupingKeyValues: string[]; header: string[]; rows: string[][] } | null {
-    // ENG-1600: was `line.split(',')`, which breaks on any quoted field containing a comma
-    // ("Acme, Inc") and shifts every column after it left. That misalignment is not cosmetic:
-    // column 0 feeds the cross-call comparison below, which HARD-REJECTS the analysis with
-    // `inconsistent_result` — so a shifted row on one run and not the other refuses a correct
-    // analysis. `csv-parse` is already imported here and used elsewhere in this file.
-    let parsed: string[][];
-    try {
-      parsed = parseCsv(csvText, {
-        skip_empty_lines: true,
-        trim: true,
-        // Generated CSVs are not guaranteed rectangular; a ragged row must not throw away the
-        // whole provenance check, which is the only guard against fabricated output.
-        relax_column_count: true,
-        relax_quotes: true,
-      }) as string[][];
-    } catch (error) {
-      console.warn('AgentMode: parseCsvProvenance could not parse the generated CSV:', error);
-      return null;
-    }
-    if (parsed.length === 0) return null;
-    const header = parsed[0];
-    const rows = parsed.slice(1); // first line is assumed to be the header
-    const groupingKeyValues: string[] = [];
-    const seen = new Set<string>();
-    for (const row of rows) {
-      const firstCol = row[0];
-      if (firstCol && !seen.has(firstCol)) {
-        seen.add(firstCol);
-        groupingKeyValues.push(firstCol);
-      }
-    }
-    return { rowsOut: rows.length, groupingKeyValues, header, rows };
-  }
-
-  /** ENG-1295: splits a CSV header cell into lowercase word tokens (camelCase- and separator-aware) for id/name column detection. */
-  private tokenizeCsvHeaderCell(cell: string): string[] {
-    return cell
-      .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-      .split(/[^a-zA-Z0-9]+/)
-      .map(t => t.toLowerCase())
-      .filter(Boolean);
-  }
-
-  /**
-   * ENG-1295 intra-response check: detects the exact failure pattern that
-   * produced the prod hallucination — the SAME id mapped to more than one
-   * DIFFERENT name within one generated CSV (e.g. id 199836788398 as both
-   * "Product Analytics Platform" and "Game Analytics Platform"). This requires
-   * no narrative parsing. Informational only, NOT a hard reject: a real entity
-   * (an ad group, a CRM lead's company, etc.) can legitimately be renamed
-   * within a query's date window, which would produce this exact shape from
-   * genuinely correct source data — we can't tell "renamed" apart from
-   * "fabricated" using the CSV alone, so this is surfaced in Provenance for the
-   * caller to judge rather than blocking a possibly-correct result. Only
-   * applies when the CSV actually has both an id-like and a name-like column.
-   */
-  private findCsvIdNameCollisions(header: string[], rows: string[][]): { id: string; names: string[] }[] {
-    const idIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('id'));
-    const nameIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('name'));
-    if (idIdx === -1 || nameIdx === -1 || idIdx === nameIdx) return [];
-    const idToNames = new Map<string, Set<string>>();
-    for (const row of rows) {
-      const id = row[idIdx];
-      const name = row[nameIdx];
-      if (!id || !name) continue;
-      if (!idToNames.has(id)) idToNames.set(id, new Set());
-      idToNames.get(id)!.add(name);
-    }
-    const collisions: { id: string; names: string[] }[] = [];
-    for (const [id, names] of idToNames) {
-      if (names.size > 1) {
-        collisions.push({ id, names: [...names] });
-      }
-    }
-    return collisions;
-  }
-
-  /**
-   * ENG-1295 grounding check: for a CSV with an id-like column, verifies each
-   * distinct id actually occurs somewhere in the raw source file(s) that were
-   * sent to the sandbox — the same objective technique the agent used manually
-   * (search_tool_response) to catch the fabricated name in prod session
-   * d789c175. Informational only (not a hard reject): a substring miss can also
-   * mean the model reformatted the id, so this is surfaced as a provenance
-   * caveat rather than blocking a possibly-correct result.
-   */
-  private checkCsvIdGrounding(header: string[], rows: string[][], fileRawContents: string[]): { checked: number; unverified: number } | null {
-    const idIdx = header.findIndex(h => this.tokenizeCsvHeaderCell(h).includes('id'));
-    if (idIdx === -1 || fileRawContents.length === 0) return null;
-    const distinctIds = [...new Set(rows.map(r => r[idIdx]).filter(Boolean))];
-    if (distinctIds.length === 0) return null;
-    const combinedSource = fileRawContents.join('\n');
-    const unverified = distinctIds.filter(id => !combinedSource.includes(id)).length;
-    return { checked: distinctIds.length, unverified };
-  }
-
-  /**
-   * ENG-1295 provenance helper: best-effort input row count for a source file, so
-   * the caller can cheaply sanity-check rows_out against rows_in. Counts elements
-   * of the largest JSON array found (top-level array, or the largest array
-   * property for the common `{ results: [...] }` / `{ sessions: [...] }` API-
-   * response shape used throughout this codebase), falling back to a non-empty
-   * line count for non-JSON content. This is a heuristic, not an exact parse of
-   * the analysis_instruction's semantics.
-   */
-  private estimateRowsIn(rawContent: string): number | null {
-    const trimmed = rawContent.trim();
-    if (!trimmed) return null;
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed)) return parsed.length;
-      if (parsed && typeof parsed === 'object') {
-        let maxLen = -1;
-        for (const value of Object.values(parsed)) {
-          if (Array.isArray(value) && value.length > maxLen) maxLen = value.length;
-        }
-        if (maxLen >= 0) return maxLen;
-      }
-    } catch {
-      // Not JSON — fall through to a line-count approximation.
-    }
-    return trimmed.split('\n').filter(l => l.trim().length > 0).length;
-  }
-
-  /** ENG-1295: cache key for the self-consistency check — exact (userId, file_urls, analysis_instruction) match. */
-  private buildDataAnalysisCacheKey(userId: string, fileUrls: string[], analysisInstruction: string): string {
-    const hash = createHash('sha256').update(JSON.stringify(fileUrls) + ' ' + analysisInstruction).digest('hex');
-    return `${userId}:${hash}`;
-  }
-
   /** ENG-1295: bound the self-consistency cache so the long-lived singleton doesn't grow unboundedly. */
   private pruneDataAnalysisConsistencyCache(): void {
     const now = Date.now();
@@ -9153,6 +9022,10 @@ export class AgentModeService {
                 resultParts.push(`**Computed Data:**\n${csvText}`);
                 generatedCsvText = csvText;
                 generatedCsvPartCount++;
+                // ENG-1295 follow-up: this Gemini response shape is rare and non-deterministic, so it
+                // could not be re-triggered on demand to confirm the fix still fires in real traffic.
+                // A positive signal here means the next organic occurrence shows up in CloudWatch.
+                console.log('AgentMode: performDataAnalysis surfaced generated CSV via inlineData (mimeType=text/csv)');
               }
             } catch (error) {
               console.error('AgentMode: performDataAnalysis error decoding generated CSV inlineData:', error);
@@ -9203,6 +9076,9 @@ export class AgentModeService {
                 resultParts.push(`**Computed Data:**\n${csvText}`);
                 generatedCsvText = csvText;
                 generatedCsvPartCount++;
+                // ENG-1295 follow-up: snake_case variant of the same rare shape — logged separately
+                // so the two branches are distinguishable in CloudWatch.
+                console.log('AgentMode: performDataAnalysis surfaced generated CSV via inline_data (mimeType=text/csv)');
               }
             } catch (error) {
               console.error('AgentMode: performDataAnalysis error decoding generated CSV inline_data (snake_case):', error);
@@ -9308,11 +9184,11 @@ export class AgentModeService {
       // (including intra-CSV id/name collision and source-grounding checks) for
       // generated CSV data.
       if (generatedCsvText) {
-        const provenance = this.parseCsvProvenance(generatedCsvText);
+        const provenance = parseCsvProvenance(generatedCsvText);
         if (provenance) {
           // 1. Cross-call self-consistency: an exact repeat call whose grouping-key
           // set changed since its last run.
-          const cacheKey = this.buildDataAnalysisCacheKey(userId, urlsToProcess, analysisInstruction);
+          const cacheKey = buildDataAnalysisCacheKey(userId, urlsToProcess, analysisInstruction);
           // ENG-1600: with several CSV parts, `provenance` describes only one of them and which
           // one depends on part order. Comparing that against a previous run — which may have
           // captured a different part — is a fabricated inconsistency, and this check hard-rejects.
@@ -9362,13 +9238,13 @@ export class AgentModeService {
           //   can't tell "renamed" apart from "fabricated" from the CSV alone, so
           //   this is surfaced for the caller to judge rather than risking a hard
           //   failure on a correct result.
-          const rowsInPerFile = fileRawContents.map(c => this.estimateRowsIn(c)).filter((n): n is number => n !== null);
+          const rowsInPerFile = fileRawContents.map(c => estimateRowsIn(c)).filter((n): n is number => n !== null);
           const rowsIn = rowsInPerFile.length > 0 ? rowsInPerFile.reduce((a, b) => a + b, 0) : null;
           const MAX_DISTINCT_VALUES_SHOWN = 25;
           const distinctPreview = provenance.groupingKeyValues.slice(0, MAX_DISTINCT_VALUES_SHOWN);
           const moreCount = provenance.groupingKeyValues.length - distinctPreview.length;
-          const grounding = this.checkCsvIdGrounding(provenance.header, provenance.rows, fileRawContents);
-          const collisions = this.findCsvIdNameCollisions(provenance.header, provenance.rows);
+          const grounding = checkCsvIdGrounding(provenance.header, provenance.rows, fileRawContents);
+          const collisions = findCsvIdNameCollisions(provenance.header, provenance.rows);
           if (collisions.length > 0) {
             console.warn(
               `AgentMode: performDataAnalysis intra-CSV id/name collision (userId=${userId}, informational): ` +
@@ -13021,45 +12897,50 @@ export class AgentModeService {
 
       // Accept both shapes — see note in sendEmailFromConfiguredSender.
       const leadSenderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
+      const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+      if (leadSenderProvider !== 'resend' && !connectedAccountId) {
+        return {
+          success: false,
+          message: `${providerLabel(leadSenderProvider)} sender misconfigured`,
+          error: `The ${providerLabel(leadSenderProvider)} sender is missing its connected account id`,
+        };
+      }
 
-      if (leadSenderProvider !== 'resend') {
-        // Send through the customer's own connected mailbox (Gmail / Outlook)
-        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
-        if (!connectedAccountId) {
-          return {
-            success: false,
-            message: `${providerLabel(leadSenderProvider)} sender misconfigured`,
-            error: `The ${providerLabel(leadSenderProvider)} sender is missing its connected account id`,
-          };
-        }
-        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
-        await bootstrapEmailProviders();
-        const provider = getEmailProvider(leadSenderProvider);
-        const body = draft.htmlContent || draft.textContent || '';
+      // ENG-265: route through sendAsSender (not the provider APIs directly) so this
+      // chat-driven send is subject to the same daily-cap/warmup enforcement as every
+      // other send path. resolveSenderForSend gives the authoritative CrmSender
+      // (dailyLimit/warmupStartedAt included) — the same lookup crm.ts's send routes use.
+      const { resolveSenderForSend } = await import('./crmSenderService');
+      const { sendAsSender, SenderDailyLimitExceededError } = await import('./sendAsSender');
+      // Fail closed rather than falling back to a synthesized sender: resolveSenderForSend
+      // re-reads the persisted config, so a null here means the sender that existed a moment
+      // ago (from getCrmSenders) is now gone — a real (if narrow) race, not a legitimate
+      // ad-hoc-sender case. A synthesized fallback would carry no dailyLimit/warmupStartedAt
+      // and sendAsSender would treat it as uncapped, silently skipping enforcement.
+      const crmSender = await resolveSenderForSend(senderOwnerUserId, sender.id, sender.email);
+      if (!crmSender) {
+        return {
+          success: false,
+          message: 'Sender no longer available',
+          error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
+        };
+      }
+
+      try {
         // senderOwnerUserId, not userId: the connected account belongs to whoever owns the
         // sender config, and a refreshed/rotated token must be written back to them (ENG-299).
-        const sendResult = await provider.sendEmail(senderOwnerUserId, connectedAccountId, {
-          to: lead.email,
-          subject: draft.subject,
-          body,
-          isHtml: !!draft.htmlContent,
-        });
-        emailId = sendResult.messageId;
-      } else {
-        // Send via Resend (custom domain sender)
-        const { resendService } = await import('./resendService');
-        const from = `${sender.fromName} <${sender.email}>`;
-        const result = await resendService.sendEmail({
-          from,
+        const sendResult = await sendAsSender(senderOwnerUserId, crmSender, {
           to: lead.email,
           subject: draft.subject,
           html: draft.htmlContent,
-          text: draft.textContent
+          text: draft.textContent,
         });
-        if (!result) {
-          return { success: false, message: 'Email send failed', error: 'Failed to send email via Resend' };
+        emailId = sendResult.messageId;
+      } catch (error) {
+        if (error instanceof SenderDailyLimitExceededError) {
+          return { success: false, message: 'Daily sending limit reached', error: error.message };
         }
-        emailId = result.id;
+        throw error;
       }
 
       // Clear the draft after successful send
@@ -13197,62 +13078,61 @@ export class AgentModeService {
       // persisted key. A sender resolved outside loadSenderConfig may only carry the latter.
       const senderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
 
-      if (senderProvider !== 'resend') {
-        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
-        if (!connectedAccountId) {
-          return {
-            success: false,
-            message: `${providerLabel(senderProvider)} sender misconfigured`,
-            error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
-          };
-        }
-        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
-        const label = providerLabel(senderProvider);
-        await bootstrapEmailProviders();
-        const provider = getEmailProvider(senderProvider);
-        const body = htmlBody || textBody || '';
-        try {
-          const sendResult = await provider.sendEmail(userId, connectedAccountId, {
-            to,
-            subject: params.subject,
-            body,
-            isHtml: !!htmlBody,
-          });
-          emailId = sendResult.messageId;
-        } catch (providerErr: any) {
-          // Translate OAuth failures into an actionable message that names the
-          // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
-          // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
-          // configured"). Nearly all are resolved by reconnecting in Settings.
-          const raw = providerErr instanceof Error ? providerErr.message : String(providerErr);
-          const needsReconnect = /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
-          if (needsReconnect) {
-            return {
-              success: false,
-              message: `${label} sender needs reconnecting`,
-              error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
-            };
-          }
-          return {
-            success: false,
-            message: `${label} send failed`,
-            error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
-          };
-        }
-      } else {
-        const { resendService } = await import('./resendService');
-        const from = `${sender.fromName} <${sender.email}>`;
-        const result = await resendService.sendEmail({
-          from,
+      const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+      if (senderProvider !== 'resend' && !connectedAccountId) {
+        return {
+          success: false,
+          message: `${providerLabel(senderProvider)} sender misconfigured`,
+          error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
+        };
+      }
+      const label = providerLabel(senderProvider);
+
+      // ENG-265: route through sendAsSender so this chat-driven ad-hoc send is subject
+      // to the same daily-cap/warmup enforcement as every other send path.
+      const { resolveSenderForSend } = await import('./crmSenderService');
+      const { sendAsSender, SenderDailyLimitExceededError } = await import('./sendAsSender');
+      // Fail closed rather than falling back to a synthesized sender — see the matching
+      // comment in sendEmailToLead for why a null here must not become an uncapped send.
+      const crmSender = await resolveSenderForSend(userId, sender.id, sender.email);
+      if (!crmSender) {
+        return {
+          success: false,
+          message: 'Sender no longer available',
+          error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
+        };
+      }
+
+      try {
+        const sendResult = await sendAsSender(userId, crmSender, {
           to,
           subject: params.subject,
           html: htmlBody,
           text: textBody,
         });
-        if (!result) {
-          return { success: false, message: 'Email send failed', error: `Failed to send email to "${to}" via the configured sender ${sender.email}. This is often caused by an invalid or rejected recipient address, or the sender domain not being verified. Please double-check the recipient address.` };
+        emailId = sendResult.messageId;
+      } catch (error: any) {
+        if (error instanceof SenderDailyLimitExceededError) {
+          return { success: false, message: 'Daily sending limit reached', error: error.message };
         }
-        emailId = result.id;
+        // Translate OAuth failures into an actionable message that names the
+        // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
+        // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
+        // configured"). Nearly all are resolved by reconnecting in Settings.
+        const raw = error instanceof Error ? error.message : String(error);
+        const needsReconnect = senderProvider !== 'resend' && /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
+        if (needsReconnect) {
+          return {
+            success: false,
+            message: `${label} sender needs reconnecting`,
+            error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
+          };
+        }
+        return {
+          success: false,
+          message: `${label} send failed`,
+          error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
+        };
       }
 
       return {

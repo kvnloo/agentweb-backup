@@ -57,6 +57,8 @@ export function normalizeSender(raw: any): CrmSender {
     senderProvider,
     // `gmailAccountId` is the pre-Outlook key. Prefer the neutral one when both exist.
     connectedAccountId: raw?.connectedAccountId ?? raw?.gmailAccountId,
+    dailyLimit: typeof raw?.dailyLimit === 'number' ? raw.dailyLimit : undefined,
+    warmupStartedAt: typeof raw?.warmupStartedAt === 'string' ? raw.warmupStartedAt : undefined,
   };
 }
 
@@ -83,6 +85,8 @@ export function serializeSender(sender: CrmSender): any {
     email: sender.email,
     fromName: sender.fromName,
     notes: sender.notes,
+    dailyLimit: sender.dailyLimit,
+    warmupStartedAt: sender.warmupStartedAt,
   };
 
   if (!isMailboxSender(sender)) {
@@ -116,6 +120,25 @@ export function validateSender(raw: any, connectedAccounts: any[]): SenderValida
 
   if (provider !== undefined && !ALL_PROVIDERS.includes(provider)) {
     return { ok: false, error: `Invalid senderType: ${provider}` };
+  }
+
+  if (
+    raw?.dailyLimit !== undefined &&
+    (typeof raw.dailyLimit !== 'number' || !Number.isInteger(raw.dailyLimit) || raw.dailyLimit < 1 || raw.dailyLimit > 5000)
+  ) {
+    return { ok: false, error: 'dailyLimit must be a positive integer between 1 and 5000' };
+  }
+
+  // Require an exact ISO-8601 round-trip (what `new Date().toISOString()` produces), not just
+  // "parseable" — JS's Date constructor silently normalizes malformed/invalid-calendar strings
+  // (e.g. "1", "2026-02-30") into a valid-looking timestamp, which would shift the warmup
+  // schedule without ever surfacing an error.
+  if (raw?.warmupStartedAt !== undefined) {
+    const value = raw.warmupStartedAt;
+    const parsed = typeof value === 'string' ? new Date(value) : null;
+    if (!parsed || Number.isNaN(parsed.getTime()) || parsed.toISOString() !== value) {
+      return { ok: false, error: 'warmupStartedAt must be an ISO-8601 timestamp, e.g. new Date().toISOString()' };
+    }
   }
 
   if (provider === undefined || provider === 'resend') {
