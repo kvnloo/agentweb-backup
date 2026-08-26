@@ -497,6 +497,39 @@ describe('isPublishCallWithinAuthorizedScope (ENG-1045)', () => {
 });
 
 /**
+ * ENG-1599 — the reverse of ENG-1045's gap. Session 90ad8838 (2026-08-26,
+ * "Harsha Daily X Post (Autonomous)", schedule 1d001fba-0fb7-4bcd-80f6-6041b244a442):
+ * the schedule's only authorized/required publish tool was `twitter_manage_post`,
+ * but the task was a single standalone tweet — the ONE outcome `twitter_manage_post`
+ * structurally cannot express (post_thread hard-refuses under 2 tweets; see
+ * agentModeService.ts's 'post-thread' handler). The model correctly reached for
+ * post_on_connected_account instead and was refused: "The owner authorized only:
+ * twitter_manage_post." A grant that already permits autonomous threads, replies,
+ * quote-tweets and retweets under the owner's identity necessarily covers the
+ * strictly narrower act of posting one new tweet, so the equivalence route needs
+ * to run in this direction too.
+ */
+describe('isPublishCallWithinAuthorizedScope (ENG-1599)', () => {
+  it('authorizes a standalone tweet via post_on_connected_account when only twitter_manage_post was granted', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope('post_on_connected_account', { platform: 'twitter' }, ['twitter_manage_post'])
+    ).toBe(true);
+  });
+
+  it('does NOT widen the grant to other platforms post_on_connected_account also supports', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope('post_on_connected_account', { platform: 'linkedin' }, ['twitter_manage_post'])
+    ).toBe(false);
+  });
+
+  it('is false on an empty grant', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope('post_on_connected_account', { platform: 'twitter' }, [])
+    ).toBe(false);
+  });
+});
+
+/**
  * ENG-1245 — session 0e5af215 (2026-08-15) and every daily run since, through
  * today, told the owner "you turned ON Require approval before publishing,
  * turn it OFF to unblock." Verified against the live schedule record
