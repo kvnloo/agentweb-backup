@@ -1188,6 +1188,17 @@ export class LinkedInOutreachService {
     range: { min?: number; max?: number },
     accountId: string,
   ): Promise<{ items: any[]; excludedUnverifiable: number }> {
+    // CodeRabbit: contradictory or negative bounds would otherwise silently
+    // exclude every verifiable candidate (min > max fails both comparisons
+    // for any real count) with no signal to the caller about why — fail
+    // fast instead of burning employer lookups on an unsatisfiable range.
+    if (
+      (range.min != null && range.min < 0) ||
+      (range.max != null && range.max < 0) ||
+      (range.min != null && range.max != null && range.min > range.max)
+    ) {
+      throw new Error('company_size_min and company_size_max must be non-negative and min must not exceed max');
+    }
     if (range.min == null && range.max == null) return { items, excludedUnverifiable: 0 };
 
     const employerOf = (item: any): string | null => {
@@ -1210,7 +1221,15 @@ export class LinkedInOutreachService {
         const companyId = await this.resolveCompanyId(name, accountId);
         if (!companyId) { headcountByName.set(name, null); return; }
         const { getUnipileCompanyService } = await import('./unipileCompanyServiceFactory');
-        const result = await getUnipileCompanyService().getCompany(companyId, accountId);
+        // CodeRabbit: getCompanyProfile has no timeout of its own — one hung
+        // Unipile request would otherwise stall this whole lookup batch
+        // (Promise.all never settles until every member does). Bound it and
+        // treat a timeout as unverifiable, same as any other lookup failure.
+        const result = await LinkedInOutreachService.withTimeout(
+          getUnipileCompanyService().getCompany(companyId, accountId),
+          LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          `LinkedIn company lookup for ${companyId}`,
+        );
         const count =
           typeof result.rawData?.employee_count === 'number'
             ? result.rawData.employee_count
