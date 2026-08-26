@@ -6304,8 +6304,17 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     // fail the same way — stop the batch instead of burning through the rest
     // of the list generating identical failures, and report why.
     let stoppedEarlyReason: string | null = null;
+    // A send is never recorded back onto the lead record (no timestamp, no engagement
+    // entry), so nothing here can distinguish "already emailed in this exact batch" from
+    // "never contacted" on a later request. Re-running the same send against the FULL
+    // eligible list — even after the cap resets, even from a different sender — would
+    // re-email everyone who already went through in this batch. skippedLeadIds is the only
+    // safe way to resume: it lets the caller re-POST scoped to just these ids (leadIds is
+    // already an accepted filter on this route) instead of the whole list.
+    const skippedLeadIds: string[] = [];
 
-    for (const lead of eligibleLeads) {
+    for (let i = 0; i < eligibleLeads.length; i++) {
+      const lead = eligibleLeads[i];
       try {
         // Substitute variables in subject and content
         const personalizedSubject = substituteVariables(subject, lead);
@@ -6334,6 +6343,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       } catch (err: any) {
         if (err instanceof SenderDailyLimitExceededError) {
           stoppedEarlyReason = err.message;
+          skippedLeadIds.push(...eligibleLeads.slice(i).map((l: any) => l.leadId));
           break;
         }
         const reason = err.message || String(err);
@@ -6349,7 +6359,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       }
     }
 
-    const skippedDueToLimit = stoppedEarlyReason ? total - sent - failed : 0;
+    const skippedDueToLimit = skippedLeadIds.length;
 
     return res.json({
       total,
@@ -6362,6 +6372,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedMissingVars,
       skippedUndeliverable,
       skippedDueToLimit,
+      skippedLeadIds,
       stoppedEarlyReason,
     });
   } catch (error) {

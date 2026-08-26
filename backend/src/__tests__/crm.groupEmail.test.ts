@@ -575,6 +575,46 @@ describe('CRM Group Email Endpoints', () => {
         expect(response.failed).toBe(0); // hitting the cap is not counted as a per-lead failure
         expect(response.skippedDueToLimit).toBe(3); // c, d, e never attempted
         expect(response.stoppedEarlyReason).toMatch(/daily sending limit/);
+        // A resend is never recorded back onto the lead — retrying the full list later
+        // would re-email a and b. skippedLeadIds is what makes a safe, scoped resend
+        // possible: the caller can re-POST with leadIds: skippedLeadIds.
+        expect(response.skippedLeadIds).toEqual(['3', '4', '5']);
+      });
+
+      it('a subsequent send scoped to skippedLeadIds only attempts those leads, not the whole list again', async () => {
+        cappedSenderConfig();
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+          items: [
+            { leadId: '1', email: 'a@test.com' },
+            { leadId: '2', email: 'b@test.com' },
+            { leadId: '3', email: 'c@test.com' },
+            { leadId: '4', email: 'd@test.com' },
+            { leadId: '5', email: 'e@test.com' },
+          ],
+          lastEvaluatedKey: undefined,
+        });
+        (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg' });
+        (senderUsageTracker.reserveSend as jest.Mock).mockResolvedValue(undefined);
+
+        mockReq.body = {
+          senderId: 'r-1',
+          senderEmail: 'me@test.com',
+          senderName: 'Me',
+          subject: 'Hi',
+          htmlContent: '<p>Hello</p>',
+          leadIds: ['3', '4', '5'],
+        };
+
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        expect(resendService.sendEmail).toHaveBeenCalledTimes(3);
+        const attemptedAddresses = (resendService.sendEmail as jest.Mock).mock.calls.map((c) => c[0].to);
+        expect(attemptedAddresses.sort()).toEqual(['c@test.com', 'd@test.com', 'e@test.com']);
+        const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+        expect(response.sent).toBe(3);
+        expect(response.total).toBe(3);
       });
     });
   });
