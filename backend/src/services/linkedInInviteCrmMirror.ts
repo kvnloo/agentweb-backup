@@ -309,11 +309,15 @@ export async function mirrorLinkedInInviteToCrm(
   if (!leadId) return null;
 
   // Advance status to 'contacted' only when the lead has no meaningful status yet.
-  // Always stamp the invite timestamp so the UI reflects the send.
+  // Stamp the direction-appropriate timestamp so the UI reflects what actually
+  // happened — an ACCEPTED inbound connection must never be recorded under
+  // linkedInInviteSentAt (an outbound-send field), which would misrepresent who
+  // initiated contact and could overwrite a real prior outbound timestamp.
   const currentStatus = String(existing?.status ?? '').trim().toLowerCase();
-  const leadUpdate: { status?: string; linkedInInviteSentAt: string } = {
-    linkedInInviteSentAt: sentAt,
-  };
+  const leadUpdate: { status?: string; linkedInInviteSentAt?: string; linkedInInviteAcceptedAt?: string } =
+    eventType === INVITE_ACCEPTED_EVENT
+      ? { linkedInInviteAcceptedAt: sentAt }
+      : { linkedInInviteSentAt: sentAt };
   if (!created && UNCONTACTED_STATUSES.has(currentStatus)) {
     leadUpdate.status = 'contacted';
   }
@@ -390,7 +394,7 @@ export async function mirrorLinkedInInviteToCrm(
 }
 
 /** Split a LinkedIn display name ("Bala S.", "泓杰 虞") into best-effort first/last. */
-function splitInvitedUserName(name?: string): { firstName?: string; lastName?: string } {
+export function splitInvitedUserName(name?: string): { firstName?: string; lastName?: string } {
   const trimmed = (name || '').trim().replace(/\s+/g, ' ');
   if (!trimmed) return {};
   const parts = trimmed.split(' ');
