@@ -604,6 +604,59 @@ describe('AgentModeService.importLeadsFromSearch — company-size post-filter (E
     expect(result.message).toContain('1 search result(s) were excluded');
     expect(result.message).not.toMatch(/no results found/i);
   });
+
+  // ENG-1558 follow-up: without an early-exit, a size filter that's
+  // genuinely unproductive for this market would burn all MAX_ITERATIONS
+  // (20) pages — each costing a full searchPeople call plus per-employer
+  // lookups — before giving up.
+  it('stops after 3 consecutive pages fully excluded by size, instead of paging to MAX_ITERATIONS', async () => {
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: [{ name: 'A', public_identifier: 'a', work_experience: [{ current: true, company: 'Mega Corp' }] }], cursor: 'page-2' })
+      .mockResolvedValueOnce({ items: [{ name: 'B', public_identifier: 'b', work_experience: [{ current: true, company: 'Giant Inc' }] }], cursor: 'page-3' })
+      .mockResolvedValueOnce({ items: [{ name: 'C', public_identifier: 'c', work_experience: [{ current: true, company: 'Huge LLC' }] }], cursor: 'page-4' });
+    mockFilterByCompanySize.mockResolvedValue({ items: [], excludedUnverifiable: 1 });
+
+    const result = await service.importLeadsFromSearch('user-1', {
+      listId: 'list-1', title: 'PM', company_size_max: 200,
+    });
+
+    // Exactly 3 — a 4th page was never fetched.
+    expect(mockSearchPeople).toHaveBeenCalledTimes(3);
+    expect(mockBatchCreateLeads).not.toHaveBeenCalled();
+    expect(result.imported).toBe(0);
+    expect(result.earlyExitOnSizeFilter).toBe(true);
+    expect(result.companySizeFiltered).toBe(3);
+    expect(result.message).toMatch(/stopped after 3 consecutive pages/i);
+    // The cursor is preserved (it's whatever continues search AFTER the
+    // last processed page — page 3 returned 'page-4' as ITS continuation)
+    // so a follow-up call can keep looking rather than losing the caller's
+    // place.
+    expect(result.cursor).toBe('page-4');
+  });
+
+  it('does NOT early-exit when a productive page resets the consecutive-empty streak', async () => {
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: [{ name: 'A', public_identifier: 'a', work_experience: [{ current: true, company: 'Mega Corp' }] }], cursor: 'page-2' })
+      .mockResolvedValueOnce({ items: [{ name: 'B', public_identifier: 'b', work_experience: [{ current: true, company: 'Giant Inc' }] }], cursor: 'page-3' })
+      .mockResolvedValueOnce({ items: [{ name: 'C', public_identifier: 'c', work_experience: [{ current: true, company: 'Startup Co' }] }], cursor: null });
+    mockFilterByCompanySize
+      .mockResolvedValueOnce({ items: [], excludedUnverifiable: 1 }) // page 1: empty
+      .mockResolvedValueOnce({ items: [], excludedUnverifiable: 1 }) // page 2: empty (2 in a row, still below threshold of 3)
+      .mockResolvedValueOnce({
+        items: [{ __idx: 0, work_experience: [{ company: 'Startup Co', current: true }] }],
+        excludedUnverifiable: 0,
+      }); // page 3: kept — resets the streak
+    mockBatchCreateLeads.mockResolvedValue({ newCount: 1, mergedCount: 0, errors: [], created: [{ leadId: 'l-1', sourceIndex: 0 }] });
+
+    const result = await service.importLeadsFromSearch('user-1', {
+      listId: 'list-1', title: 'PM', company_size_max: 200,
+    });
+
+    expect(mockSearchPeople).toHaveBeenCalledTimes(3);
+    expect(result.earlyExitOnSizeFilter).toBeUndefined();
+    expect(result.imported).toBe(1);
+    expect(mockBatchCreateLeads.mock.calls[0][1][0].company).toBe('Startup Co');
+  });
 });
 
 // ─── findReason tagging ───────────────────────────────────────────────────────

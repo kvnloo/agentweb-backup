@@ -1301,6 +1301,35 @@ describe('LinkedInOutreachService', () => {
         );
         expect(result.items).toEqual(items);
       });
+
+      // ENG-1558 follow-up: an unthrottled Promise.all over every distinct
+      // employer on a page could fire 30-40 concurrent Unipile requests from
+      // one search. Confirms the chunking actually bounds concurrency rather
+      // than just being present in the code but ineffective.
+      it('throttles concurrent lookups instead of firing them all at once', async () => {
+        const uniqueCompanyCount = 12; // > COMPANY_SIZE_LOOKUP_CONCURRENCY (5)
+        let inFlight = 0;
+        let maxInFlight = 0;
+        mockResolveTopId.mockImplementation(async () => {
+          inFlight++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          inFlight--;
+          return 'company-id';
+        });
+        mockGetCompany.mockResolvedValue({ rawData: { employee_count: 50 } });
+
+        const items = Array.from({ length: uniqueCompanyCount }, (_, i) =>
+          itemWithCompany(`Company ${i}`, { provider_id: `p-${i}` }),
+        );
+        await linkedInOutreachService.filterByCompanySize(items, { max: 200 }, 'account-1');
+
+        expect(maxInFlight).toBeLessThanOrEqual(5);
+        // Sanity check the throttle isn't accidentally serializing to 1 —
+        // it should still run several lookups genuinely concurrently.
+        expect(maxInFlight).toBeGreaterThan(1);
+        expect(mockResolveTopId).toHaveBeenCalledTimes(uniqueCompanyCount);
+      });
     });
 
     // ─── Auto-injected keywords (Unipile classic search rejects calls without
