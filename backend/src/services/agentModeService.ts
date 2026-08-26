@@ -32929,6 +32929,53 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const acceptPaced = await paceWrite();
           if (acceptPaced) return acceptPaced.refusal;
           const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, account_id, sharedSecret);
+
+          // ENG-1595: mirror the now-accepted INBOUND connection into the CRM, same
+          // best-effort pattern send-invite uses below — an accepted connection must
+          // be as findable/engageable as one this account invited, or name-based CRM
+          // search silently misses a real, legitimate contact (the reported symptom).
+          // No-ops cleanly when the model didn't pass identity/list args (e.g. an
+          // older client) — mirrors nothing rather than guessing.
+          try {
+            let mirrorProfileUrl: string | null = isUrl && profile_url ? profile_url : null;
+            if (!mirrorProfileUrl && provider_id) {
+              try {
+                const profile = await linkedInOutreachService.getProfile(provider_id, account_id);
+                const publicId = profile?.public_id || profile?.public_identifier || profile?.rawData?.public_identifier;
+                if (publicId) mirrorProfileUrl = `https://www.linkedin.com/in/${publicId}/`;
+              } catch (profileErr) {
+                console.warn('[AgentMode] accept-invitation: could not resolve provider_id to a profile URL for CRM mirror:', profileErr);
+              }
+            }
+            if (mirrorProfileUrl) {
+              const { resolveListIdForAccount, mirrorLinkedInInviteToCrm, INVITE_ACCEPTED_EVENT } = await import('./linkedInInviteCrmMirror');
+              const mirrorListId = args.list_id || (await resolveListIdForAccount(userId, account_id));
+              if (mirrorListId) {
+                const { crmDb } = await import('./db');
+                const mirrorList = await crmDb.getLeadListById(mirrorListId);
+                const { canDestructiveCrmList } = await import('./crmAccessControl');
+                if (mirrorList && (await canDestructiveCrmList(userId, mirrorList))) {
+                  await mirrorLinkedInInviteToCrm({
+                    userId,
+                    listId: mirrorListId,
+                    linkedinUrl: mirrorProfileUrl,
+                    firstName: args.first_name,
+                    lastName: args.last_name,
+                    company: args.company,
+                    title: args.title,
+                    accountId: account_id,
+                    invitationId,
+                    eventType: INVITE_ACCEPTED_EVENT,
+                  });
+                } else {
+                  console.warn(`[AgentMode] accept-invitation: skipping CRM mirror — list ${mirrorListId} not accessible to user ${userId}`);
+                }
+              }
+            }
+          } catch (mirrorErr) {
+            console.warn('[AgentMode] accept-invitation: failed to mirror accepted connection to CRM (non-fatal):', mirrorErr);
+          }
+
           return { success: true, data: acceptResult };
         }
 
