@@ -55,6 +55,12 @@ export async function applyAttioPersonEvent(
       return;
     }
   }
+  // Note: AttioService.fromToken (manual/PAT) connections write as actor.type
+  // 'api-token', not 'app', so this guard doesn't suppress their own echoes —
+  // Attio's API has no self-identify endpoint to learn a token's own actor id
+  // and compare it here. Not a correctness bug: this function never triggers
+  // an outbound push, so an unsuppressed echo is at worst one redundant local
+  // pull, not a loop. Revisit if manual-token Attio connections see real usage.
 
   if (eventType === 'record.deleted') {
     if (!config.deleteOnPull) {
@@ -156,8 +162,8 @@ export async function applyAttioPersonEvent(
       syncMetadata: { attio_record_id: recordId },
     };
     if (Object.keys(customFields).length > 0) newLead.customFields = customFields;
-    await crmDb.createLead(listId, newLead);
-    console.log(`[AttioWebhook] Created lead for ${email} in list ${listId}`);
+    const created = await crmDb.createLead(listId, newLead);
+    console.log(`[AttioWebhook] Created lead ${created?.leadId ?? '(unknown)'} for recordId=${recordId} in list ${listId}`);
   } else {
     const updates: Record<string, any> = { ...leadData };
     if (Object.keys(customFields).length > 0) {
