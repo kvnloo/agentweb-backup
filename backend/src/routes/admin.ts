@@ -193,7 +193,6 @@ const ADMIN_USER_LIST_FIELDS = [
   "fromName",
   "slackChannel",
   "slackChannels",
-  "slackSuggestedRepliesDisabled",
   "seoDomains",
   "googleAnalyticsPropertyId",
   "googleAnalyticsProperties",
@@ -1363,29 +1362,6 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
   } catch (error) {
     console.error("Error updating user slack channels:", error);
     res.status(500).json({ message: "Error updating slack channels" });
-  }
-});
-
-// Toggle Slack suggested-reply (slack-triggered) monitoring for a user.
-// Body: { enabled: boolean } — true = suggestions on (default), false = suppress.
-// Persisted as the inverse `slackSuggestedRepliesDisabled` flag so absent = enabled.
-router.put("/users/:userId/slack-suggested-replies", async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { enabled } = req.body;
-
-    const user = await userDb.getUserById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    const updatedUser = await userDb.updateUser(userId, {
-      slackSuggestedRepliesDisabled: !enabled,
-    });
-    res.json(updatedUser);
-  } catch (error) {
-    console.error("Error updating slack suggested replies setting:", error);
-    res.status(500).json({ message: "Error updating slack suggested replies setting" });
   }
 });
 

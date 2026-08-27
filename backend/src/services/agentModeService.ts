@@ -51,6 +51,7 @@ import {
 } from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
+import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
@@ -11727,7 +11728,7 @@ export class AgentModeService {
       const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
 
       // Verify list ownership (org members can access lists owned by other org members)
-      const list = await crmDb.getLeadListById(listId);
+      let list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
@@ -11736,9 +11737,29 @@ export class AgentModeService {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
-      const lead = await crmDb.getLeadById(listId, leadId);
+      const requestedListId = listId;
+      let lead = await crmDb.getLeadById(listId, leadId);
+      let correctedListId: string | null = null;
+      if (!lead) {
+        // ENG-969 follow-up: the requested list_id may just be stale/wrong
+        // rather than the lead not existing at all. See leadRecovery.ts for
+        // the full rationale (tiering, retry, and why it always fails safe).
+        const found = await recoverLeadFromWrongList(crmDb, userId, requestedListId, leadId);
+        if (found) {
+          lead = found;
+          listId = found.listId;
+          correctedListId = found.listId;
+        }
+      }
       if (!lead) {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
+      }
+      if (correctedListId) {
+        // Point `list` at the list the lead actually belongs to (never mutate the
+        // fetched record in place) — downstream code reads list.linkedInAccountId,
+        // which is per-list.
+        const correctedList = await crmDb.getLeadListById(correctedListId);
+        if (correctedList) list = correctedList;
       }
 
       // Per-field provenance sidecar — lets the agent answer "where does this
@@ -11810,8 +11831,14 @@ export class AgentModeService {
       return {
         success: true,
         message: `Lead details for ${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+        // Tell the caller the list_id it passed was wrong so it corrects its own
+        // working state for later calls, instead of repeating the same mismatch.
+        ...(correctedListId
+          ? { note: `list_id "${requestedListId}" does not contain this lead. Corrected to its actual list_id "${correctedListId}" — use that for future calls with lead_id "${leadId}".` }
+          : {}),
         lead: {
           leadId: lead.leadId,
+          listId: lead.listId,
           email: lead.email || '',
           firstName: lead.firstName || '',
           lastName: lead.lastName || '',
