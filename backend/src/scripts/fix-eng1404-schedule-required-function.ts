@@ -21,16 +21,24 @@
  *
  * THE FIX. Swap the mismatched name for the one the prompt actually calls:
  * `requiredFunctionCalls` -> `["twitter_outreach", "post_on_connected_account"]`.
+ * This always fixes completion-checking (the false `publishRequirementMismatch`
+ * failure). Whether it ALSO fixes authorization depends on a field this script
+ * does not own — see below.
  *
- * Confirmed sufficient on its own — independent of ENG-1404's separate
- * `autopublishAuthorized` grant, which remains a useful but non-blocking
- * durability follow-up. Traced end to end against
+ * THE ONE THING THIS CANNOT GUARANTEE ON ITS OWN. Traced end to end against
  * `resolveSchedulePublishAuthorization`'s "never asked" fallback
- * (`schedulePublishAuthorization.ts`): with `post_on_connected_account` named
- * directly in `requiredFunctionCalls`, `getRequiredPublishTools` derives the
- * correct authorization scope on its own — no equivalence-route credit needed —
- * and the completion checker's exact-name match is satisfied by that same call.
- * Also directly endorsed by Harsha on ENG-1404: "swapping twitter_manage_post
+ * (`schedulePublishAuthorization.ts`): AS LONG AS `autopublishAuthorized` is
+ * still unset when a run reads the schedule, putting `post_on_connected_account`
+ * directly in `requiredFunctionCalls` makes `getRequiredPublishTools` derive the
+ * correct authorization scope on its own — no separate grant needed. But if
+ * ENG-1404's `autopublishAuthorized` grant is EVER set explicitly (there or
+ * elsewhere) with the wrong tool scope, that explicit grant wins over this
+ * fallback regardless of what `requiredFunctionCalls` says, and this swap alone
+ * stops being sufficient for authorization (it still fixes completion-checking).
+ * `fixRequiredFunctionMismatch` reads and reports that field's current state in
+ * `authorizationNote` below instead of assuming it is still unset — check that
+ * note before treating a run of this script as a complete fix. Also directly
+ * endorsed by Harsha on ENG-1404 as a valid path: "swapping twitter_manage_post
  * for post_on_connected_account in Required Actions instead of running the
  * grant: that would also work... either path is fine."
  *
@@ -67,6 +75,57 @@ export interface FixResult {
   before: string[] | undefined;
   after: string[];
   skippedReason?: string;
+  /**
+   * Diagnosis of whether this swap is, on its own, ALSO sufficient to fix
+   * authorization (not just completion-checking) — computed from the
+   * schedule's own `autopublishAuthorized`/`autopublishAuthorizedTools` state
+   * at read time, not assumed. See the module docblock.
+   */
+  authorizationNote: string;
+}
+
+const PUBLISH_TOOL_NAME = 'post_on_connected_account';
+
+function diagnoseAuthorization(schedule: any): string {
+  if (schedule.requirePublishApproval === true) {
+    return (
+      'requirePublishApproval is true — the owner has explicitly asked to review every ' +
+      'publish. This swap still fixes completion-checking, but the schedule will stay ' +
+      'draft-only until the owner turns that off, independent of anything here.'
+    );
+  }
+  const consent = schedule.autopublishAuthorized;
+  if (consent === undefined || consent === null) {
+    return (
+      'autopublishAuthorized is unset — authorization derives from requiredFunctionCalls ' +
+      '(the ENG-803 fallback), so this swap fixes BOTH authorization and completion-checking.'
+    );
+  }
+  if (consent === false) {
+    return (
+      'autopublishAuthorized is explicitly false (revoked) — this swap still fixes ' +
+      'completion-checking, but the schedule will stay draft-only until the owner ' +
+      're-authorizes, independent of anything here.'
+    );
+  }
+  const grantedTools: string[] = Array.isArray(schedule.autopublishAuthorizedTools)
+    ? schedule.autopublishAuthorizedTools
+    : [];
+  if (grantedTools.includes(PUBLISH_TOOL_NAME)) {
+    return (
+      `autopublishAuthorized is already true with ${PUBLISH_TOOL_NAME} in ` +
+      'autopublishAuthorizedTools — authorization is already correct via that explicit ' +
+      'grant. This swap only fixes completion-checking.'
+    );
+  }
+  return (
+    `WARNING: autopublishAuthorized is already true, but autopublishAuthorizedTools is ` +
+    `${JSON.stringify(grantedTools)} — does NOT include ${PUBLISH_TOOL_NAME}. An explicit ` +
+    'grant always wins over the requiredFunctionCalls fallback, so this swap fixes ' +
+    'completion-checking but does NOT fix authorization: the run will still be refused. ' +
+    'autopublishAuthorizedTools needs correcting too (see ENG-1404) before this schedule ' +
+    'can actually publish.'
+  );
 }
 
 export async function fixRequiredFunctionMismatch(opts: {
@@ -87,8 +146,11 @@ export async function fixRequiredFunctionMismatch(opts: {
       before: undefined,
       after: CORRECTED_REQUIRED_FUNCTION_CALLS,
       skippedReason: 'schedule not found',
+      authorizationNote: 'not applicable — schedule not found',
     };
   }
+
+  const authorizationNote = diagnoseAuthorization(schedule);
 
   // Fail closed rather than silently touching a different owner's schedule if the
   // id were ever mistyped or reused.
@@ -99,13 +161,21 @@ export async function fixRequiredFunctionMismatch(opts: {
       before: schedule.requiredFunctionCalls,
       after: CORRECTED_REQUIRED_FUNCTION_CALLS,
       skippedReason: `owner mismatch — expected ${EXPECTED_OWNER_ID}, found ${schedule.userId}`,
+      authorizationNote,
     };
   }
 
   const current: string[] = Array.isArray(schedule.requiredFunctionCalls) ? schedule.requiredFunctionCalls : [];
 
   if (sameNames(current, CORRECTED_REQUIRED_FUNCTION_CALLS)) {
-    return { applied: false, scheduleId: SCHEDULE_ID, before: current, after: current, skippedReason: 'already corrected' };
+    return {
+      applied: false,
+      scheduleId: SCHEDULE_ID,
+      before: current,
+      after: current,
+      skippedReason: 'already corrected',
+      authorizationNote,
+    };
   }
 
   if (!sameNames(current, STALE_REQUIRED_FUNCTION_CALLS)) {
@@ -119,11 +189,18 @@ export async function fixRequiredFunctionMismatch(opts: {
       skippedReason:
         `requiredFunctionCalls is ${JSON.stringify(current)}, not the expected stale value ` +
         `${JSON.stringify(STALE_REQUIRED_FUNCTION_CALLS)} — re-check before running`,
+      authorizationNote,
     };
   }
 
   if (!opts.apply) {
-    return { applied: false, scheduleId: SCHEDULE_ID, before: current, after: CORRECTED_REQUIRED_FUNCTION_CALLS };
+    return {
+      applied: false,
+      scheduleId: SCHEDULE_ID,
+      before: current,
+      after: CORRECTED_REQUIRED_FUNCTION_CALLS,
+      authorizationNote,
+    };
   }
 
   await update(
@@ -138,7 +215,13 @@ export async function fixRequiredFunctionMismatch(opts: {
     },
   );
 
-  return { applied: true, scheduleId: SCHEDULE_ID, before: current, after: CORRECTED_REQUIRED_FUNCTION_CALLS };
+  return {
+    applied: true,
+    scheduleId: SCHEDULE_ID,
+    before: current,
+    after: CORRECTED_REQUIRED_FUNCTION_CALLS,
+    authorizationNote,
+  };
 }
 
 /* istanbul ignore next -- CLI wrapper, exercised by hand under Harsha's supervision */
@@ -158,6 +241,7 @@ async function main() {
   console.log(`Schedule ${result.scheduleId}`);
   console.log(`  before: ${JSON.stringify(result.before)}`);
   console.log(`  after:  ${JSON.stringify(result.after)}`);
+  console.log(`  authorization: ${result.authorizationNote}`);
   if (result.skippedReason) {
     console.log(`  SKIPPED: ${result.skippedReason}`);
   } else {

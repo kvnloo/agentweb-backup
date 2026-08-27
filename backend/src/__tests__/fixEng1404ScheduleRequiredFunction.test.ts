@@ -174,3 +174,66 @@ describe("ENG-1404 fix-eng1404-schedule-required-function — fails closed", () 
     ).rejects.toThrow("ConditionalCheckFailedException");
   });
 });
+
+/**
+ * ENG-1599 follow-up — this swap ALWAYS fixes completion-checking, but whether it
+ * ALSO fixes authorization depends on a field this script does not own
+ * (`autopublishAuthorized`/`autopublishAuthorizedTools`, set by ENG-1404's
+ * separate grant script or the owner directly). Rather than assume that field is
+ * still unset, the script reads and reports its actual state on every run — these
+ * cases pin what gets reported for each shape it could be in.
+ */
+describe("ENG-1404 fix-eng1404-schedule-required-function — authorization diagnosis", () => {
+  it("reports the fallback path fixes BOTH when autopublishAuthorized is unset", async () => {
+    const result = await fixRequiredFunctionMismatch({
+      apply: false,
+      getScheduleById: async () => schedule(),
+      update: jest.fn(),
+    });
+
+    expect(result.authorizationNote).toMatch(/fixes BOTH authorization and completion-checking/);
+  });
+
+  it("reports authorization is already fine when an explicit grant already includes the right tool", async () => {
+    const result = await fixRequiredFunctionMismatch({
+      apply: false,
+      getScheduleById: async () =>
+        schedule({ autopublishAuthorized: true, autopublishAuthorizedTools: ["post_on_connected_account"] }),
+      update: jest.fn(),
+    });
+
+    expect(result.authorizationNote).toMatch(/already correct via that explicit grant/);
+  });
+
+  it("WARNS when an explicit grant is set but scoped to the wrong tool — the swap alone will not unblock publishing", async () => {
+    const result = await fixRequiredFunctionMismatch({
+      apply: false,
+      getScheduleById: async () =>
+        schedule({ autopublishAuthorized: true, autopublishAuthorizedTools: ["twitter_manage_post"] }),
+      update: jest.fn(),
+    });
+
+    expect(result.authorizationNote).toMatch(/^WARNING:/);
+    expect(result.authorizationNote).toMatch(/does NOT fix authorization/);
+  });
+
+  it("reports a revoked grant (autopublishAuthorized: false) still leaves the schedule draft-only", async () => {
+    const result = await fixRequiredFunctionMismatch({
+      apply: false,
+      getScheduleById: async () => schedule({ autopublishAuthorized: false }),
+      update: jest.fn(),
+    });
+
+    expect(result.authorizationNote).toMatch(/explicitly false \(revoked\)/);
+  });
+
+  it("reports requirePublishApproval as an independent hold, outranking everything else", async () => {
+    const result = await fixRequiredFunctionMismatch({
+      apply: false,
+      getScheduleById: async () => schedule({ requirePublishApproval: true }),
+      update: jest.fn(),
+    });
+
+    expect(result.authorizationNote).toMatch(/requirePublishApproval is true/);
+  });
+});
