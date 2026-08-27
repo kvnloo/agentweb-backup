@@ -1,0 +1,115 @@
+/**
+ * ENG-397 — impure orchestration for the Workflow engine. The pure decision
+ * logic lives in `core/workflow.ts`; this file is where session I/O
+ * (chatbotDb) happens.
+ *
+ * There is no chat/tool wiring yet — startWorkflow/advanceWorkflow are
+ * internal entry points exercised by tests in this slice. Rendering a
+ * workflow through Emma's chat loop is a deliberately separate follow-on
+ * (see ENG-419's own comment thread), not part of this ticket's 4
+ * acceptance criteria.
+ */
+
+import { v4 as uuidv4 } from 'uuid';
+import { chatbotDb } from '../chatbotService';
+import {
+  WorkflowDefinition,
+  WorkflowRunState,
+  buildWorkflowRunState,
+  findNextStep,
+  resolveStepParameters,
+  recordStepSuccess,
+  recordStepFailure,
+  markBlockedOnParameter,
+  collectEntityIdsFromCheckpoints,
+} from './core/workflow';
+
+export async function startWorkflow(
+  sessionId: string,
+  definition: WorkflowDefinition,
+  initialParameters?: Record<string, unknown>,
+): Promise<WorkflowRunState> {
+  const run = buildWorkflowRunState({
+    runId: uuidv4(),
+    workflowId: definition.workflowId,
+    createdAt: new Date().toISOString(),
+    initialParameters,
+  });
+  const session = await chatbotDb.updateSessionWorkflowRun(sessionId, run, { failIfActiveExists: true });
+  if (!session?.workflowRun) throw new Error('WORKFLOW_ALREADY_ACTIVE');
+  return session.workflowRun;
+}
+
+export type AdvanceOutcome =
+  | { kind: 'no_active_run' }
+  | { kind: 'blocked'; run: WorkflowRunState }
+  | { kind: 'step_verified'; run: WorkflowRunState }
+  | { kind: 'completed'; run: WorkflowRunState }
+  | { kind: 'step_failed'; run: WorkflowRunState }
+  // Optimistic-lock loss — caller must re-read and retry rather than trust `run`.
+  | { kind: 'conflict'; run: WorkflowRunState };
+
+/**
+ * Advance the session's active workflow run by exactly one step. Always
+ * re-reads the session fresh from the DB first (mirrors
+ * resolveCampaignObjectiveGate's "never trust in-memory" rule) so a stale
+ * caller can't race a concurrent write.
+ */
+export async function advanceWorkflow(sessionId: string, definition: WorkflowDefinition): Promise<AdvanceOutcome> {
+  const session = await chatbotDb.getChatSession(sessionId);
+  const run = session?.workflowRun;
+  if (!run) return { kind: 'no_active_run' };
+
+  const step = findNextStep(definition, run);
+  if (!step) return { kind: run.status === 'failed' ? 'step_failed' : 'completed', run };
+
+  const resolution = resolveStepParameters(step, run, session?.pendingUserQuestion, session?.answeredQuestions);
+  if (resolution.blocked) {
+    const blockedRun = markBlockedOnParameter(run, resolution.block, new Date().toISOString());
+    const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, blockedRun, { requireVersion: run.version });
+    if (!persisted?.workflowRun) return { kind: 'conflict', run };
+    return { kind: 'blocked', run: persisted.workflowRun };
+  }
+
+  const at = () => new Date().toISOString();
+
+  // "campaign_id feeds the next step": merge prior VERIFIED steps' checkpointed
+  // entity IDs ahead of resolvedParameters, so a step declaring an input that
+  // matches an earlier step's output name receives it automatically — without
+  // ever persisting entity IDs into run.resolvedParameters itself (they stay
+  // sourced from the checkpoints, the single place this data lives).
+  const executionInput = { ...collectEntityIdsFromCheckpoints(run), ...resolution.resolvedParameters };
+
+  let executeResult: Record<string, unknown>;
+  try {
+    executeResult = await step.execute(executionInput);
+  } catch (err: any) {
+    const failedRun = recordStepFailure(run, step, { error: err?.message || 'execute failed' }, at());
+    const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, failedRun, { requireVersion: run.version });
+    if (!persisted?.workflowRun) return { kind: 'conflict', run };
+    return { kind: 'step_failed', run: persisted.workflowRun };
+  }
+
+  const verification = await step.verify(executeResult, executionInput);
+  if (!verification.verified) {
+    const discrepancy = 'mismatches' in verification ? verification.mismatches : { error: verification.error };
+    const failedRun = recordStepFailure(run, step, discrepancy, at());
+    const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, failedRun, { requireVersion: run.version });
+    if (!persisted?.workflowRun) return { kind: 'conflict', run };
+    return { kind: 'step_failed', run: persisted.workflowRun };
+  }
+
+  const entityIds = Object.fromEntries(step.outputs.map((k) => [k, String(executeResult[k])]));
+  const successRun = recordStepSuccess(
+    definition,
+    run,
+    step,
+    resolution.resolvedParameters,
+    entityIds,
+    verification.verifiedFields,
+    at(),
+  );
+  const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, successRun, { requireVersion: run.version });
+  if (!persisted?.workflowRun) return { kind: 'conflict', run };
+  return { kind: persisted.workflowRun.status === 'completed' ? 'completed' : 'step_verified', run: persisted.workflowRun };
+}

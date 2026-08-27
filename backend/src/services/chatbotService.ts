@@ -33,6 +33,7 @@ import type { CacheWriteByTtl } from '../utils/llmPricing';
 import { approvalDb } from './approvalDb';
 import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
 import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
+import { WorkflowRunState } from './agentMode/core/workflow';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -237,6 +238,13 @@ export interface ChatSession {
   // carries typed values rather than an option selection; the write guard
   // still makes the two mutually exclusive while either is awaiting.
   pendingWorkPlanInput?: WorkPlanInputRequest;
+  // ENG-397: the structured, typed workflow run in flight for this session
+  // (if any). Each mutating step's checkpoint (entity IDs + verified
+  // end-state) is persisted here so a killed-and-restarted session resumes
+  // from the last VERIFIED step instead of re-deriving state from chat prose
+  // / re-creating entities. Distinct from `workPlan` (a narrative to-do
+  // list) — see agentMode/core/workflow.ts file header.
+  workflowRun?: WorkflowRunState;
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
@@ -3182,6 +3190,69 @@ export class ChatbotDB {
         return null;
       }
       console.error('Error updating session work-plan input request:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-397: persist (or clear) the session's workflow run. Two guard modes,
+   * mirroring updateSessionAskUserQuestion/updateSessionWorkPlanInputRequest:
+   *  - failIfActiveExists: used by startWorkflow — refuses to start a new run
+   *    while an existing one is still 'in_progress'/'blocked_on_parameter'
+   *    (one active workflow run per session, matching the one-question/
+   *    one-input-request invariants elsewhere on ChatSession).
+   *  - requireVersion: used by every step-transition write — optimistic lock
+   *    on WorkflowRunState.version. Caller passes the PRE-transition version;
+   *    the condition checks the STORED version still matches before the new
+   *    (already version+1'd) run overwrites it. Loses the race -> null, and
+   *    the caller must re-read + recompute rather than trust its local object.
+   */
+  async updateSessionWorkflowRun(
+    sessionId: string,
+    workflowRun: WorkflowRunState | null,
+    opts?: { failIfActiveExists?: boolean; requireVersion?: number },
+  ): Promise<ChatSession | null> {
+    const guard = opts?.failIfActiveExists === true && workflowRun !== null;
+    const requireVersion = typeof opts?.requireVersion === 'number' ? opts.requireVersion : undefined;
+
+    const params: any = workflowRun
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET workflowRun = :workflowRun, adminListPartition = :adminListPartition',
+          ExpressionAttributeValues: { ':workflowRun': workflowRun, ':adminListPartition': 'all' },
+          ReturnValues: 'ALL_NEW',
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'REMOVE workflowRun',
+          ReturnValues: 'ALL_NEW',
+        };
+
+    if (guard) {
+      params.ConditionExpression =
+        'attribute_not_exists(workflowRun) OR workflowRun.#wStatus IN (:completedStatus, :failedStatus)';
+      params.ExpressionAttributeNames = { '#wStatus': 'status' };
+      params.ExpressionAttributeValues[':completedStatus'] = 'completed';
+      params.ExpressionAttributeValues[':failedStatus'] = 'failed';
+    } else if (requireVersion !== undefined) {
+      params.ConditionExpression = 'workflowRun.runId = :requireRunId AND workflowRun.version = :requireVersion';
+      params.ExpressionAttributeValues = {
+        ...(params.ExpressionAttributeValues || {}),
+        ':requireRunId': workflowRun?.runId,
+        ':requireVersion': requireVersion,
+      };
+    }
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      if ((guard || requireVersion !== undefined) && (error as any)?.code === 'ConditionalCheckFailedException') {
+        return null;
+      }
+      console.error('Error updating session workflow run:', error);
       throw error;
     }
   }
