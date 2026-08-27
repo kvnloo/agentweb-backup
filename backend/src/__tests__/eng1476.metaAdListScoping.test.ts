@@ -476,6 +476,80 @@ describe('ENG-1476 listAds — pagination', () => {
     }
   });
 
+  /**
+   * Page count bounds HOW MANY calls; the wall clock bounds the LOOP; neither bounds a SINGLE
+   * call that never answers — a hung request parks execution inside `await`, so the loop's own
+   * clock check never runs again. These cover the per-call deadline that closes that.
+   */
+  describe('per-call read deadline', () => {
+    const NEVER = () => new Promise(() => {});
+
+    it('does not hang forever when the initial list call never answers', async () => {
+      jest.useFakeTimers();
+      try {
+        (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAds: NEVER }));
+        const p = service.listAds('act123', 'tok');
+        const assertion = expect(p).rejects.toThrow(/did not respond within/);
+        await jest.advanceTimersByTimeAsync(16_000);
+        await assertion;
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('turns a hung PAGE into a partial truncated result, not a total failure', async () => {
+      jest.useFakeTimers();
+      try {
+        const cursor: any = [ad('1'), ad('2')];
+        cursor.hasNext = () => true;
+        cursor.next = NEVER;
+        (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+          getAds: jest.fn().mockResolvedValue(cursor),
+        }));
+
+        const p = service.listAds('act123', 'tok');
+        await jest.advanceTimersByTimeAsync(16_000);
+        const result = await p;
+
+        // Page 1 already arrived; the hang must not throw it away.
+        expect(result.ads.map((a: any) => a.id)).toEqual(['1', '2']);
+        expect(result.truncated).toBe(true);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not hang forever on a stuck ownership lookup', async () => {
+      jest.useFakeTimers();
+      const getAds = jest.fn();
+      try {
+        (Campaign as unknown as jest.Mock).mockImplementation(() => ({ getAds, get: NEVER }));
+        const p = service.listAds('act123', 'tok', undefined, { campaignId: 'camp_x' });
+        const assertion = expect(p).rejects.toThrow(/Could not verify the requested campaign/);
+        // Two attempts, each with its own deadline.
+        await jest.advanceTimersByTimeAsync(40_000);
+        await assertion;
+        expect(getAds).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('leaves no pending timer behind on the success path', async () => {
+      jest.useFakeTimers();
+      try {
+        (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+          getAds: jest.fn().mockResolvedValue(makeCursor([[ad('1')]])),
+        }));
+        await service.listAds('act123', 'tok');
+        // A timer left per page would pile up across a long walk.
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+  });
+
   it('asks Meta for a larger page than the 25 default', async () => {
     const getAds = jest.fn().mockResolvedValue(makeCursor([[ad('1')]]));
     (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAds }));

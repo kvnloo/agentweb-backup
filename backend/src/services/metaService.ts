@@ -140,6 +140,24 @@ export const META_LIST_MAX_PAGES = 25;
  */
 export const META_LIST_MAX_MS = 45_000;
 
+/**
+ * Ceiling on how long ONE Graph read may block this request.
+ *
+ * The page bound limits how MANY calls happen; `META_LIST_MAX_MS` limits the loop; neither
+ * limits a SINGLE call that never answers. A hung request parks execution inside `await`, so
+ * the loop's own clock check never runs again.
+ *
+ * ⚠ Applied ONLY to the read paths in this file (ownership lookup, initial list, each page).
+ * It is deliberately NOT installed on the SDK's shared HTTP layer, because that layer is a
+ * process-wide singleton (`FacebookAdsApi.init` -> `setDefaultApi`) whose `Http.request` is a
+ * static with no per-call options — patching it would put a client-side deadline on every WRITE
+ * too. A timed-out write is the dangerous case: pausing an ad or creating a campaign may have
+ * SUCCEEDED on Meta's side while we report failure, so a retry double-creates, or we tell a
+ * customer an ad is still running when we just paused it. Abandoning a READ has no such
+ * ambiguity — nothing changed.
+ */
+export const META_READ_CALL_TIMEOUT_MS = 15_000;
+
 /** Which node a list read was actually scoped to. Empty object means account-wide. */
 export interface MetaAdListScope {
   campaignId?: string;
@@ -1450,7 +1468,10 @@ export class MetaService {
       }
 
       this.log(`Listing ad creatives for account: ${adAccountId}`, { fields, scope });
-      const cursor = await source.getAdCreatives(fields, params);
+      const cursor = await MetaService.withReadDeadline(
+        () => source.getAdCreatives(fields, params),
+        'ad creative list',
+      );
       const { items, truncated, pagesFetched } = await this.drainCursor(
         cursor,
         options.maxPages ?? META_LIST_MAX_PAGES
@@ -1775,6 +1796,35 @@ export class MetaService {
    * report `truncated: true` and the caller must say so. We never return a short list that
    * looks complete: that is the entire defect being fixed here.
    */
+  /**
+   * Bound the wait on a single Graph read.
+   *
+   * ⚠ Honest about what this does: it bounds how long WE wait, not how long the socket stays
+   * open. Without an SDK hook for `AbortSignal` (there is none — see META_READ_CALL_TIMEOUT_MS)
+   * the underlying request is abandoned rather than cancelled, and the connection closes on its
+   * own. For a read that is safe: no side effect is left half-applied, and the caller gets an
+   * answer instead of hanging. That distinction is exactly why this is not applied to writes.
+   */
+  private static async withReadDeadline<T>(op: () => Promise<T>, what: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        op(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Meta ${what} did not respond within ${META_READ_CALL_TIMEOUT_MS}ms`)),
+            META_READ_CALL_TIMEOUT_MS,
+          );
+          // Never hold the event loop open just for this timer.
+          (timer as any)?.unref?.();
+        }),
+      ]);
+    } finally {
+      // Always clear it — a pending timer per page would otherwise pile up across a long walk.
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   private async drainCursor(
     cursor: any,
     maxPages: number
@@ -1815,7 +1865,7 @@ export class MetaService {
       }
       try {
         // Replaces the cursor's contents with the next page, so accumulate as we go.
-        await cursor.next();
+        await MetaService.withReadDeadline(() => cursor.next(), 'page fetch');
       } catch (e: any) {
         /*
          * A page-N failure must not throw away pages 1..N-1. Adding pagination added this
@@ -1899,7 +1949,11 @@ export class MetaService {
     let lastError: unknown;
     for (let attempt = 0; attempt < 2 && data === undefined; attempt++) {
       try {
-        data = (await node.get(['account_id']))?._data ?? {};
+        const node_ = await MetaService.withReadDeadline<any>(
+          () => node.get(['account_id']),
+          `${nodeLabel.toLowerCase()} ownership lookup`,
+        );
+        data = node_?._data ?? {};
       } catch (e) {
         lastError = e;
       }
@@ -2007,7 +2061,7 @@ export class MetaService {
       }
 
       this.log(`Listing ads for account: ${adAccountId}`, { fields, scope, ...params });
-      const cursor = await source.getAds(fields, params);
+      const cursor = await MetaService.withReadDeadline(() => source.getAds(fields, params), 'ad list');
       const { items, truncated, pagesFetched } = await this.drainCursor(
         cursor,
         options.maxPages ?? META_LIST_MAX_PAGES
