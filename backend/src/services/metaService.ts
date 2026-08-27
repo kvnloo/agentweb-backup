@@ -110,6 +110,48 @@ export interface CapiUsage {
 }
 
 /**
+ * Meta's default page on the list edges is 25 records. Asking for a larger page fetches the
+ * same data in fewer round trips — it does not fetch more data, and it is not what bounds the
+ * read; `META_LIST_MAX_PAGES` is.
+ */
+export const META_LIST_PAGE_SIZE = 100;
+
+/**
+ * Hard bound on how far a single list call will walk (100 x 25 = 2,500 records). Every real
+ * ad account we serve is far inside this. Crossing it returns `truncated: true` rather than a
+ * silently short list — see `MetaService.drainCursor`.
+ */
+export const META_LIST_MAX_PAGES = 25;
+
+/** Which node a list read was actually scoped to. Empty object means account-wide. */
+export interface MetaAdListScope {
+  campaignId?: string;
+  adSetId?: string;
+}
+
+/**
+ * A list read plus the truth about its completeness.
+ *
+ * ENG-1476 / ENG-1584 both came from returning a bare array: page 1 of 25 is indistinguishable
+ * from a whole account once it is just `any[]`, so every caller downstream reported a partial
+ * read as a complete one. `truncated` exists so that is no longer expressible.
+ */
+export interface MetaAdListResult {
+  ads: any[];
+  truncated: boolean;
+  pagesFetched: number;
+  scope: MetaAdListScope;
+}
+
+/** Same contract as `MetaAdListResult`, for the ad-creative edge. */
+export interface MetaAdCreativeListResult {
+  creatives: any[];
+  truncated: boolean;
+  pagesFetched: number;
+  scope: MetaAdListScope;
+}
+
+/**
  * Parse `X-Business-Use-Case-Usage` off a real Marketing API response. The
  * header is a JSON object keyed by ad account id, each value an array with one
  * usage entry — CAPI's ad-account-scoped rate limit is DYNAMIC (Meta documents
@@ -1342,18 +1384,51 @@ export class MetaService {
   }
 
   /**
-   * List ad creatives for an ad account
+   * List ad creatives, optionally scoped to one ad set.
+   *
+   * Paginates and reports truncation for the same reason `listAds` does — this edge was the
+   * other half of ENG-1476, where "Found 25 ad creative(s)" was the whole account's worth of
+   * creatives as far as any caller could tell.
+   *
+   * ⚠ Meta exposes no `/{campaign_id}/adcreatives` edge, so there is no campaign scope here.
+   * A campaign-scoped creative question is answered by `listAds({ campaignId })`, which already
+   * returns `creative{...}` inline on each ad. The tool description says so explicitly.
    */
-  public async listAdCreatives(adAccountId: string, accessToken: string) {
+  public async listAdCreatives(
+    adAccountId: string,
+    accessToken: string,
+    options: { adSetId?: string; maxPages?: number } = {}
+  ): Promise<MetaAdCreativeListResult> {
     try {
       this.initApi(accessToken);
-      const account = new AdAccount(`act_${adAccountId}`);
       const fields = ['id', 'name', 'status', 'body', 'title', 'image_url', 'thumbnail_url', 'object_type', 'link_url', 'object_story_spec', 'url_tags'];
-      this.log(`Listing ad creatives for account: ${adAccountId}`, { fields });
-      const creatives = await account.getAdCreatives(fields);
-      return creatives.map((c: any) => c._data);
+      const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
+
+      const scope: MetaAdListScope = {};
+      let source: any;
+      if (options.adSetId) {
+        scope.adSetId = options.adSetId;
+        source = new AdSet(options.adSetId);
+      } else {
+        source = new AdAccount(`act_${adAccountId}`);
+      }
+
+      this.log(`Listing ad creatives for account: ${adAccountId}`, { fields, scope });
+      const cursor = await source.getAdCreatives(fields, params);
+      const { items, truncated, pagesFetched } = await this.drainCursor(
+        cursor,
+        options.maxPages ?? META_LIST_MAX_PAGES
+      );
+
+      return {
+        creatives: items.map((c: any) => c._data ?? c),
+        truncated,
+        pagesFetched,
+        scope
+      };
     } catch (error) {
-      return this.handleError(error, 'listAdCreatives');
+      // handleError always throws — see listAds.
+      return this.handleError(error, 'listAdCreatives') as never;
     }
   }
 
@@ -1650,12 +1725,66 @@ export class MetaService {
   }
 
   /**
-   * List ads for an ad account
+   * Drain a Meta SDK `Cursor` into a single array.
+   *
+   * The SDK's Cursor extends Array but only ever holds ONE PAGE: `next()` REPLACES its
+   * contents rather than appending (see the SDK's `cursor.js` -> `_loadPage` -> `this.set()`).
+   * So `const xs = await account.getAds(...); xs.map(...)` reads page 1 — Meta's default 25
+   * records — and nothing else. That is ENG-1476 / ENG-1584: 25 records reported as an
+   * entire ad account, which told a customer an ad they were protecting did not exist.
+   *
+   * `maxPages` is a real bound, not a formality. An unbounded walk of a large account is a
+   * latency risk AND produces a payload big enough to be offloaded to S3 — and the offloaded
+   * read path is itself where ENG-1584's false negative surfaced. So when we stop early we
+   * report `truncated: true` and the caller must say so. We never return a short list that
+   * looks complete: that is the entire defect being fixed here.
    */
-  public async listAds(adAccountId: string, accessToken: string, adSetId?: string) {
+  private async drainCursor(
+    cursor: any,
+    maxPages: number
+  ): Promise<{ items: any[]; truncated: boolean; pagesFetched: number }> {
+    // `getAds`/`getAdCreatives` already fetched page 1 (getEdge defaults fetchFirstPage=true).
+    const items: any[] = Array.isArray(cursor) ? [...cursor] : [];
+    let pagesFetched = 1;
+
+    // A plain array (tests, or any non-cursor) carries no paging: one page, nothing more.
+    const canPage = typeof cursor?.hasNext === 'function' && typeof cursor?.next === 'function';
+    if (!canPage) return { items, truncated: false, pagesFetched };
+
+    while (cursor.hasNext()) {
+      if (pagesFetched >= maxPages) {
+        this.log(`Stopped paginating at the ${maxPages}-page bound`, { pagesFetched, itemsSoFar: items.length });
+        return { items, truncated: true, pagesFetched };
+      }
+      // Replaces the cursor's contents with the next page, so accumulate as we go.
+      await cursor.next();
+      items.push(...cursor);
+      pagesFetched++;
+    }
+
+    return { items, truncated: false, pagesFetched };
+  }
+
+  /**
+   * List ads, optionally scoped to one campaign or one ad set.
+   *
+   * ⚠ Scoping goes through Meta's own node edges (`/{campaign_id}/ads`, `/{adset_id}/ads`),
+   * NOT through `params.adset_id` / `params.campaign_id`. Meta **silently ignores** those as
+   * bare params on the `/act_X/ads` edge and hands back the whole account — the filter looks
+   * applied and is not (ENG-1476). Querying the node instead makes the scope structurally
+   * impossible to ignore: a bad id is an error, never a silent account-wide result.
+   *
+   * Returns a result object rather than a bare array so truncation cannot be dropped on the
+   * floor by a caller that just maps over it.
+   */
+  public async listAds(
+    adAccountId: string,
+    accessToken: string,
+    adSetId?: string,
+    options: { campaignId?: string; maxPages?: number } = {}
+  ): Promise<MetaAdListResult> {
     try {
       this.initApi(accessToken);
-      const account = new AdAccount(`act_${adAccountId}`);
       const fields = [
         'id', 'name', 'status', 'effective_status', 'adset_id', 'campaign_id',
         'creative{id,name,body,title,image_url,thumbnail_url,object_story_spec}'
@@ -1667,14 +1796,42 @@ export class MetaService {
           'ACTIVE', 'PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED',
           'PENDING_REVIEW', 'DISAPPROVED', 'PREAPPROVED',
           'PENDING_BILLING_INFO', 'IN_PROCESS', 'WITH_ISSUES'
-        ]
+        ],
+        // Bigger pages mean fewer round trips for the same data, not more data.
+        limit: META_LIST_PAGE_SIZE
       };
-      if (adSetId) params.adset_id = adSetId;
-      this.log(`Listing ads for account: ${adAccountId}`, { fields, ...params });
-      const ads = await account.getAds(fields, params);
-      return ads.map((a: any) => a._data);
+
+      // Most-specific scope wins: an ad set lives inside a campaign, so asking for both and
+      // honouring the ad set is the narrower, more useful read.
+      const scope: MetaAdListScope = {};
+      let source: any;
+      if (adSetId) {
+        scope.adSetId = adSetId;
+        source = new AdSet(adSetId);
+      } else if (options.campaignId) {
+        scope.campaignId = options.campaignId;
+        source = new Campaign(options.campaignId);
+      } else {
+        source = new AdAccount(`act_${adAccountId}`);
+      }
+
+      this.log(`Listing ads for account: ${adAccountId}`, { fields, scope, ...params });
+      const cursor = await source.getAds(fields, params);
+      const { items, truncated, pagesFetched } = await this.drainCursor(
+        cursor,
+        options.maxPages ?? META_LIST_MAX_PAGES
+      );
+
+      return {
+        ads: items.map((a: any) => a._data ?? a),
+        truncated,
+        pagesFetched,
+        scope
+      };
     } catch (error) {
-      return this.handleError(error, 'listAds');
+      // handleError always throws — a failed read must never look like "no ads",
+      // which a caller would report as an empty-but-complete account.
+      return this.handleError(error, 'listAds') as never;
     }
   }
 

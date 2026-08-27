@@ -16525,10 +16525,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}, ad_set_id?: string): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsAdCreatives(userId, account_id);
+        // ENG-1476: ad_set_id never reached this edge either. Meta has no campaign->adcreatives
+        // edge, so campaign scoping is deliberately absent — use AD LIST with campaign_id, which
+        // returns creative{...} inline on each ad.
+        return this.listMetaAdsAdCreatives(userId, account_id, ad_set_id ?? params?.ad_set_id);
       case 'GET': {
         // Read ONE creative back by id (ENG-471). The service method has existed
         // and is already used by COPY_AD/RETAG_UTM — only the model-facing
@@ -16597,10 +16600,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsAds(userId, ad_set_id, account_id);
+        // ENG-1476: campaign_id used to stop here — it was never a parameter of this method,
+        // so an explicitly campaign-scoped LIST silently became an account-wide one. Accept it
+        // from the top-level argument or from params, since callers have used both spellings.
+        return this.listMetaAdsAds(userId, ad_set_id ?? params?.ad_set_id, account_id, campaign_id ?? params?.campaign_id);
       case 'CREATE':
         return this.createMetaAdsAd(userId, { ...params, account_id, adset_id: ad_set_id });
       case 'UPDATE':
@@ -17486,17 +17492,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsAdCreatives(userId: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAdCreatives(userId: string, account_id?: string, adSetId?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const creatives = (await metaService.listAdCreatives(accountId, accessToken)) || [];
-      const totalCount = Array.isArray(creatives) ? creatives.length : 0;
+      const result = await metaService.listAdCreatives(accountId, accessToken, { adSetId });
+      const creatives = result?.creatives ?? [];
+      const totalCount = creatives.length;
 
+      const where = result?.scope?.adSetId ? ` in ad set ${result.scope.adSetId}` : ' in this ad account';
+      const message = result?.truncated
+        ? `Found ${totalCount} ad creative(s)${where}, but THIS LIST IS INCOMPLETE — Meta had more results and the read stopped at its page bound. Do NOT conclude a creative is absent from this list.`
+        : `Found ${totalCount} ad creative(s)${where} (complete list).`;
+
+      // Completeness before payload — same S3-preview reasoning as listMetaAdsAds.
       return {
         success: true,
-        message: `Found ${totalCount} ad creative(s)`,
-        creatives: creatives,
-        totalCount: totalCount
+        message,
+        complete: !result?.truncated,
+        hasMore: !!result?.truncated,
+        totalCount: totalCount,
+        scope: result?.scope ?? {},
+        creatives: creatives
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
@@ -17589,17 +17605,47 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsAds(userId: string, adSetId?: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAds(userId: string, adSetId?: string, account_id?: string, campaignId?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const ads = (await metaService.listAds(accountId, accessToken, adSetId)) || [];
-      const totalCount = Array.isArray(ads) ? ads.length : 0;
+      const result = await metaService.listAds(accountId, accessToken, adSetId, { campaignId });
+      const ads = result?.ads ?? [];
+      const totalCount = ads.length;
 
+      // Say what was actually asked for. "Found 25 ad(s)" with no scope and no bound is the
+      // sentence that told an Every.io user their ad did not exist (ENG-1584) — it read as
+      // "these are all the ads" when it meant "these are the first 25 in the account".
+      const where = result?.scope?.adSetId
+        ? ` in ad set ${result.scope.adSetId}`
+        : result?.scope?.campaignId
+          ? ` in campaign ${result.scope.campaignId}`
+          : ' in this ad account';
+
+      const message = result?.truncated
+        ? `Found ${totalCount} ad(s)${where}, but THIS LIST IS INCOMPLETE — Meta had more results and the read stopped at its page bound. Do NOT conclude an ad is absent from this list. Narrow the request with campaign_id or ad_set_id and ask again.`
+        : `Found ${totalCount} ad(s)${where} (complete list).`;
+
+      /*
+       * ⚠ FIELD ORDER IS LOAD-BEARING — completeness BEFORE the payload.
+       *
+       * An ad list carries object_story_spec per ad, so it routinely exceeds
+       * TOOL_RESPONSE_S3_THRESHOLD (8,000 chars) and gets offloaded. On offload the model is
+       * handed a SEALED 20,000-char PREFIX of this JSON plus an S3 key. Anything serialized
+       * after a large `ads` array falls off that cut and the model never sees it.
+       *
+       * Putting `complete` / `hasMore` / `totalCount` / `scope` after the array would mean the
+       * truncation warning disappears precisely on the big lists that need it most — which is
+       * the ENG-1584 failure wearing a different hat.
+       */
       return {
         success: true,
-        message: `Found ${totalCount} ad(s)`,
-        ads: ads,
-        totalCount: totalCount
+        message,
+        // Explicit completeness, so no caller has to infer it from the count.
+        complete: !result?.truncated,
+        hasMore: !!result?.truncated,
+        totalCount: totalCount,
+        scope: result?.scope ?? {},
+        ads: ads
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
@@ -19395,10 +19441,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return this.manageMetaAdsAdSets(userId, action as any, account_id, campaign_id, ad_set_id, params);
 
       case 'AD_CREATIVE':
-        return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params);
+        return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params, ad_set_id);
 
       case 'AD':
-        return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params);
+        // campaign_id is forwarded here (ENG-1476). It was already in scope for the tracking
+        // gate above and was simply never handed to the AD handler, which is why an
+        // AD LIST scoped to a campaign returned the entire account instead.
+        return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params, campaign_id);
 
       case 'CUSTOM_AUDIENCE':
         return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
