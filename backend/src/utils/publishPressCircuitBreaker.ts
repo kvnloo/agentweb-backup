@@ -1,4 +1,5 @@
-import { isPowerTool } from './hardeningGaps';
+import { isPublishName } from './hardeningGaps';
+import { EQUIVALENT_PUBLISH_ROUTES } from './requiredCallSatisfaction';
 
 /**
  * ENG-947 — the publish-press circuit breaker.
@@ -57,34 +58,59 @@ import { isPowerTool } from './hardeningGaps';
 export const MAX_PUBLISH_PRESS_ATTEMPTS = 3;
 
 /**
+ * True when `name` participates in a KNOWN, documented equivalence relationship
+ * — either as a requirement `EQUIVALENT_PUBLISH_ROUTES` names a route FOR, or as
+ * a route's own target tool. This is deliberately NOT "any SEND/publish-classed
+ * tool": most of `SEND_TOOLS` (delete_leads, enrich_leads_execute,
+ * import_leads_from_search, linkedin_outreach, twitter_outreach, plain
+ * send_email/send_email_to_lead) have no registered alternate route, so a
+ * successful call to one of them proves nothing about whether some UNRELATED
+ * still-unmet requirement will ever be satisfied — they are independent steps
+ * in a workflow, not interchangeable ways to achieve the same outcome. Only a
+ * name this module can actually cross-reference against an equivalence table
+ * is safe to treat that way.
+ */
+function hasKnownEquivalenceRoute(name: string): boolean {
+  if (Object.prototype.hasOwnProperty.call(EQUIVALENT_PUBLISH_ROUTES, name)) return true;
+  return Object.values(EQUIVALENT_PUBLISH_ROUTES).some((routes) => routes.some((route) => route.tool === name));
+}
+
+/**
  * True when the ONLY thing a run still has outstanding is one or more
- * irreversible-write tools — i.e. the state in which the next unmet-requirement
- * retry would press for a publish (or an equally irreversible send/delete) and
- * nothing else.
+ * irreversible-write tools this module can reason about — i.e. the state in
+ * which the next unmet-requirement retry would press for a publish (or a
+ * registered equivalent of one) and nothing else.
  *
  * ENG-1599: originally scoped to `isPublishName` (the post_on_ and publish_
- * prefixes) only,
- * which excluded `twitter_manage_post` and the rest of the SEND_TOOLS family —
- * NOT because re-pressing for those is any safer (a duplicate reply, a second
- * DM blast, a repeated delete are all exactly the same class of harm this
- * breaker exists to prevent), but because `isPublishName`/`isSendName` were
- * built for a DIFFERENT classification (which governance block a skill needs)
- * and this module borrowed the narrower half by default. Widened to
- * `isPowerTool` (publish ∪ send) so a schedule whose requiredFunctionCalls
- * names a SEND-classified tool — like the twitter_manage_post/
- * post_on_connected_account mismatch this schedule actually hit — gets the
- * same early-stop protection instead of pressing all the way to maxAttempts.
+ * prefixes) only, which excluded `twitter_manage_post`/`email`/
+ * `send_email_from_sender` — the exact tools `EQUIVALENT_PUBLISH_ROUTES`
+ * already treats as interchangeable with a publish-classed tool. Extended to
+ * cover those specifically (via `hasKnownEquivalenceRoute`), NOT the whole
+ * `SEND_TOOLS` family (`isPowerTool`) — an earlier version of this fix widened
+ * to `isPowerTool` and was caught before shipping: `classifyPublishStall`'s
+ * `wroteSomethingElse` check would then treat ANY successful power-tool call as
+ * proof an unrelated required send/post tool was never going to be called —
+ * e.g. a CRM schedule that legitimately calls `enrich_leads_execute` before
+ * `send_email_from_sender` would get stopped early, mid-workflow, on a false
+ * `publishRequirementMismatch`, before the email was ever attempted. Scoping to
+ * documented equivalence routes instead means a tool only counts as
+ * interchangeable when this module can prove it is, from the same table
+ * `callSatisfiesRequirement` uses — the two can never disagree about which
+ * tools substitute for which.
  *
  * Scoped deliberately tight:
- * - every unmet entry must be an irreversible-write tool. If anything
- *   cheap/reversible is also outstanding, pressing still has value and the
+ * - every unmet entry must be an irreversible-write tool this module
+ *   recognizes. If anything cheap/reversible — or a write tool with no known
+ *   equivalence route — is also outstanding, pressing still has value and the
  *   normal budget applies;
  * - a non-string entry disqualifies the whole set rather than being skipped, so
  *   a malformed requirement can never be silently read as "publish only".
  */
 export function isPublishOnlyUnmet(unmetRequiredFunctions: string[]): boolean {
   if (!Array.isArray(unmetRequiredFunctions) || unmetRequiredFunctions.length === 0) return false;
-  return unmetRequiredFunctions.every((name) => typeof name === 'string' && isPowerTool(name));
+  return unmetRequiredFunctions.every(
+    (name) => typeof name === 'string' && (isPublishName(name) || hasKnownEquivalenceRoute(name))
+  );
 }
 
 /**
@@ -167,6 +193,17 @@ export type PublishStallReason =
  * error might clear. A mismatch has no such upside: the write already happened
  * under the wrong name, so every press between here and the budget is a second
  * chance to publish a duplicate, not a chance to fix anything.
+ *
+ * `wroteSomethingElse` below matches a succeeded write against `requiredCall
+ * Satisfaction.ts`'s OWN `EQUIVALENT_PUBLISH_ROUTES` table — the same routes
+ * `callSatisfiesRequirement` treats as the outcome-equivalent substitute for a
+ * given requirement — rather than "any other isPowerTool call succeeded". A
+ * caught-before-shipping version of this used the broader check and would have
+ * stopped a CRM schedule mid-workflow (e.g. `enrich_leads_execute` succeeding
+ * before `send_email_from_sender` was ever attempted) on a false mismatch,
+ * because enrichment has no registered relationship to a send at all. Requiring
+ * the succeeded name to be a documented route FOR one of the still-unmet
+ * requirements means this can only fire when the two really are interchangeable.
  */
 export function classifyPublishStall(params: {
   pressAttempt: number;
@@ -179,9 +216,13 @@ export function classifyPublishStall(params: {
   if (!isPublishOnlyUnmet(unmetRequiredFunctions)) return null;
 
   const unmet = new Set(unmetRequiredFunctions);
-  const wroteSomethingElse = (externalWritesSucceeded || []).some(
-    (name) => typeof name === 'string' && !unmet.has(name) && isPowerTool(name),
-  );
+  const wroteSomethingElse = (externalWritesSucceeded || []).some((name) => {
+    if (typeof name !== 'string' || unmet.has(name)) return false;
+    return unmetRequiredFunctions.some((requirement) => {
+      const routes = EQUIVALENT_PUBLISH_ROUTES[requirement];
+      return Array.isArray(routes) && routes.some((route) => route.tool === name);
+    });
+  });
   if (wroteSomethingElse) return 'requirement-names-unused-publish-tool';
 
   if (
