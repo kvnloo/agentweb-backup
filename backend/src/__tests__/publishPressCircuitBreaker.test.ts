@@ -349,4 +349,49 @@ describe('classifyPublishStall (ENG-947)', () => {
       }),
     ).toBe('requirement-names-unused-publish-tool');
   });
+
+  /**
+   * ENG-1599 review (CodeRabbit) — a schedule that requires BOTH
+   * post_on_connected_account AND twitter_manage_post as SEPARATE line items
+   * wants two distinct actions. A succeeded post_on_connected_account call
+   * already satisfies its OWN requirement (so it drops out of
+   * unmetRequiredFunctions), but was still being read as "wrote something
+   * else" for the still-unmet twitter_manage_post via the same reverse route —
+   * stopping the run before twitter_manage_post was ever attempted, even
+   * though the schedule explicitly asked for it too. heldToFunctionNames
+   * mirrors callSatisfiesRequirement's own double-credit suppression: when
+   * BOTH the route's target requirement and the call's own name are held-to
+   * requirements, the cross-credit (here, cross-disqualification) is
+   * suppressed and the run keeps pressing for the one still genuinely unmet.
+   */
+  it('does not let a call that already satisfied ITS OWN requirement disqualify a sibling held-to requirement', () => {
+    expect(
+      classify({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['twitter_manage_post'],
+        externalWritesSucceeded: [entry('post_on_connected_account', { platform: 'twitter' })],
+        heldToFunctionNames: ['post_on_connected_account', 'twitter_manage_post'],
+      }),
+    ).toBeNull();
+    // Without the full held-to set (the pre-fix shape), the same call still
+    // correctly reports the mismatch — this is the ENG-1599 case itself.
+    expect(
+      classify({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['twitter_manage_post'],
+        externalWritesSucceeded: [entry('post_on_connected_account', { platform: 'twitter' })],
+      }),
+    ).toBe('requirement-names-unused-publish-tool');
+    // A held-to set that names the requirement but not the call (or vice
+    // versa) must not suppress — only BOTH names being separately required
+    // triggers the suppression.
+    expect(
+      classify({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['twitter_manage_post'],
+        externalWritesSucceeded: [entry('post_on_connected_account', { platform: 'twitter' })],
+        heldToFunctionNames: ['twitter_manage_post'],
+      }),
+    ).toBe('requirement-names-unused-publish-tool');
+  });
 });
