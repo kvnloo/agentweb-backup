@@ -211,6 +211,25 @@ async function main(): Promise<void> {
 
   if (from > to) throw new Error(`--from (${from}) is after --to (${to})`);
 
+  /*
+   * ⚠ Never write today or later.
+   *
+   * Today is INCOMPLETE — Meta is still accumulating it — and these rows are stamped
+   * `dataQuality: "exact"`. Persisting a partial day under that label is not a smaller
+   * measurement, it is a false one, and it is exactly why the cron walks `daysAgo` 1..28 and
+   * never 0. Future dates are simply Meta calls that cannot return anything.
+   *
+   * The default `--to` is already yesterday; this stops an explicit one from reaching past it.
+   */
+  const latestComplete = toDateStr(yesterday);
+  if (to > latestComplete) {
+    throw new Error(
+      `--to ${to} is later than the last COMPLETE UTC day (${latestComplete}). Today is still ` +
+      `accumulating and these rows are written as dataQuality "exact", so storing a partial day ` +
+      `would record it as settled. The cron never snapshots today for the same reason.`
+    );
+  }
+
   if (from < UTM_EPOCH && !has('allow-pre-utm')) {
     throw new Error(
       `--from ${from} predates the ${UTM_EPOCH} UTM epoch. Days before that carry no UTM tagging, ` +
