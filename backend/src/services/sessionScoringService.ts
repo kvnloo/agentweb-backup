@@ -745,22 +745,36 @@ function isTestScheduledSession(session: ChatSession): boolean {
 
 // ENG-803/ENG-1245: the exact terminal sentence a scheduled run is instructed to end
 // on when it genuinely withholds a mandated publish for lack of authorization (see
-// getScheduledSessionOverride in agentModeSystemPrompt.ts). Mirrors
+// getScheduledSessionOverride in agentModeSystemPrompt.ts). Mirrors the WORDING of
 // PUBLISH_WITHHELD_MARKER in controllers/agentModeController.ts — kept as a separate
 // copy here rather than an import so this scoring module does not pull in that
-// (much heavier) controller file; if the marker sentence ever changes, both copies
+// (much heavier) controller file; if the marker SENTENCE ever changes, both copies
 // must change together.
+//
+// Deliberately NOT identical, though: the controller's copy stays loose (matches
+// the sentence anywhere in the text) because it only decides whether to send one
+// more continuation nudge — a false match there costs at most a redundant nudge.
+// Anchored to end-of-message here (CodeRabbit, PR #2616) because a false match
+// here is worse: it EXCLUDES the session from the judged cohort and can retract an
+// existing score. Without the anchor, a last message reading "PUBLISH WITHHELD:
+// ... has not been granted standing publish authorization. Actually, let me try
+// again." would still match — exactly the re-attempt/re-explain-across-turns shape
+// ENG-995's own rubric (see PUBLISH_APPROVAL_WITHHOLDING_CLAUSE's STOP-ONCE vs LOOP
+// bullet) says must NOT be treated as a clean, complete terminal state. Trailing
+// whitespace is still permitted — the prompt asks for the sentence "on its own
+// line", which can leave a trailing newline.
 const PUBLISH_WITHHELD_MARKER =
-  /PUBLISH WITHHELD:\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))/i;
+  /PUBLISH WITHHELD:\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))\.?\s*$/i;
 
 // The 'revoked' variant specifically — emitted only when a run that WAS admitted
 // authorized=true (publishAdmission) had that consent narrowed away mid-run by
 // ENG-827's refreshPublishAuthorization. The admission snapshot is a one-time
 // stamp taken before the first turn, so on its own it cannot tell a run that
 // stayed authorized throughout apart from one revoked partway through — only the
-// marker variant the prompt reserves for that exact case can.
+// marker variant the prompt reserves for that exact case can. Anchored to
+// end-of-message for the same reason as PUBLISH_WITHHELD_MARKER above.
 const PUBLISH_WITHHELD_REVOKED_MARKER =
-  /PUBLISH WITHHELD:\s*this schedule's publish authorization has been revoked/i;
+  /PUBLISH WITHHELD:\s*this schedule's publish authorization has been revoked\.?\s*$/i;
 
 /**
  * ENG-995 — two scheduled sessions with IDENTICAL behavior (drafted the content,

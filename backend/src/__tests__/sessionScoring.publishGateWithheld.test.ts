@@ -139,6 +139,62 @@ describe('genuinely publish-gate-withheld scheduled runs are excluded from the j
     expect(result?.score).toBe(3);
   });
 
+  // CodeRabbit (PR #2616): the marker regexes originally had no end-of-message
+  // anchor, so they matched anywhere in the text. A last message that states the
+  // marker and then keeps going — re-attempting, qualifying, or contradicting the
+  // withhold — is exactly the "re-explain/re-attempt across turns" shape ENG-995's
+  // own rubric (STOP-ONCE vs LOOP) says must NOT be scored as a clean stop, yet the
+  // unanchored regex would still have excluded it from the judged cohort.
+  it('does NOT exclude a scheduled session whose last message states the marker and then keeps going', async () => {
+    mockCallLLM.mockResolvedValue(makeLLMResponse(2, 'kept re-attempting after the marker', { goalCompletion: 2, dataAccuracy: 4, outputQuality: 3 }));
+
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Draft and post today\'s LinkedIn update.' },
+      {
+        role: 'assistant',
+        content: 'Drafted the post.',
+        metadata: { toolCalls: [{ name: 'update_knowledge_base_file' }] },
+      } as any,
+      {
+        role: 'assistant',
+        content:
+          'Saved the draft; nothing was posted because this schedule has not been granted standing publish authorization.\n\n' +
+          'PUBLISH WITHHELD: this schedule has not been granted standing publish authorization.\n\n' +
+          'Actually, let me try posting it anyway.',
+      },
+    ];
+
+    const result = await scoreSessionIfNeeded(withheldSession({ messages, messageCount: messages.length }));
+
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(result?.score).toBe(2);
+  });
+
+  // The prompt asks for the marker "on its own line", which can leave a trailing
+  // newline/whitespace or closing punctuation after it — that must still count as
+  // a clean stop, not get rejected by the new end-anchor.
+  it('still excludes when the marker is followed only by trailing whitespace', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Draft and post today\'s LinkedIn update.' },
+      {
+        role: 'assistant',
+        content: 'Drafted the post.',
+        metadata: { toolCalls: [{ name: 'update_knowledge_base_file' }] },
+      } as any,
+      {
+        role: 'assistant',
+        content:
+          'Saved the draft; nothing was posted because this schedule has not been granted standing publish authorization.\n\n' +
+          'PUBLISH WITHHELD: this schedule has not been granted standing publish authorization.\n\n',
+      },
+    ];
+
+    const result = await scoreSessionIfNeeded(withheldSession({ messages, messageCount: messages.length }));
+
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(result).toBeNull();
+  });
+
   it('does NOT exclude a run that was actually admitted as authorized to publish, even if it emits the marker (fabrication guard)', async () => {
     mockCallLLM.mockResolvedValue(makeLLMResponse(2, 'fabricated a withhold', { goalCompletion: 2, dataAccuracy: 5, outputQuality: 3 }));
 
