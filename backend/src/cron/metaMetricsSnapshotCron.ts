@@ -150,10 +150,17 @@ export interface SnapshotResult {
 /**
  * Shared per-day snapshot logic — pulls Meta's campaign-level insights for exactly one
  * date (dynamic campaign discovery, never a hardcoded list), joins against that day's
- * CRM leads by exact `campaignId` === `firstTouch.utm.campaign` string equality
- * (empirically verified for Haven's real ad traffic, not assumed), and writes one row
- * per campaign Meta reported activity for. Also usable by a future backfill script
- * without duplicating this logic.
+ * CRM leads by exact `campaignId` string equality against the campaign id resolved by
+ * `promoteAttributionFromCustomFields` (empirically verified for Haven's real ad traffic,
+ * not assumed), and writes one row per campaign Meta reported activity for. Also usable
+ * by a backfill script without duplicating this logic —
+ * `scripts/backfill-eng1601-meta-metrics-history.ts` does exactly that.
+ *
+ * ⚠ This previously read `firstTouch.utm.campaign` DIRECTLY, and this comment said so. That
+ * dropped 36% of attributable leads, because the id lives in `customFields` for leads that
+ * have no `firstTouch` at all (ENG-1601). The comment is called out rather than quietly
+ * corrected because it survived the fix by two commits, and a stale contract sitting above an
+ * exported function is precisely what a backfill author would build against.
  */
 export interface ResolvedMetaCredentials {
   accountId: string;
