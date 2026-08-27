@@ -76,6 +76,27 @@ export interface EquivalentPublishRoute {
    * not the other for the very same publish.
    */
   actions?: string[];
+  /**
+   * Which `platform` argument values count, for a route to a platform-multiplexed
+   * tool like `post_on_connected_account` (also used for LinkedIn/Instagram/
+   * YouTube). Omitted means any platform. A call that names `account_id` instead
+   * of `platform` cannot be resolved to a platform here without an account
+   * lookup this checker doesn't have, so — like every other ambiguous case in
+   * this module — it fails closed rather than guessing.
+   */
+  platforms?: string[];
+  /**
+   * ENG-1599 review — true for a route that is valid ONLY for widening
+   * `isPublishCallWithinAuthorizedScope`'s consent scope (schedulePublishAuthorization.ts),
+   * never for `callSatisfiesRequirement`'s completion credit. "A broader publish grant
+   * covers a strictly narrower act" is sound reasoning for what a run is ALLOWED to call,
+   * but not for what counts as having FULFILLED a requirement: a schedule that requires
+   * `twitter_manage_post` mandates the reply/quote-tweet/retweet/thread it names, and an
+   * unrelated standalone tweet through `post_on_connected_account` does not satisfy that —
+   * crediting it would reverse this module's own asymmetric-equivalence invariant (see the
+   * module docblock). `callSatisfiesRequirement` must reject any route with this flag.
+   */
+  consentOnly?: boolean;
 }
 
 /**
@@ -104,6 +125,21 @@ export const EQUIVALENT_PUBLISH_ROUTES: Record<string, EquivalentPublishRoute[]>
     { tool: 'twitter_manage_post', actions: ['post_thread'] },
   ],
   post_thread: [{ tool: 'twitter_manage_post', actions: ['post_thread'] }],
+  // ENG-1599 — the reverse of the route above. A schedule that requires
+  // twitter_manage_post already tolerates autonomous threads, replies,
+  // quote-tweets and retweets going out under the owner's identity, so it
+  // necessarily tolerates the strictly narrower act of posting ONE new tweet —
+  // the single outcome twitter_manage_post cannot express at all (post_thread
+  // hard-refuses under 2 tweets; see agentModeService.ts's 'post-thread'
+  // handler). Scoped to platform=twitter so this cannot widen a twitter-only
+  // requirement into cover for post_on_connected_account calls that target a
+  // different platform (LinkedIn/Instagram/YouTube all share that tool name).
+  // consentOnly: this direction only holds for AUTHORIZATION ("a broader grant
+  // covers a narrower act") — it does not hold for COMPLETION credit, where a
+  // schedule requiring twitter_manage_post specifically mandates the reply/
+  // quote-tweet/retweet/thread it names, not an unrelated standalone tweet. See
+  // the `consentOnly` field doc on `EquivalentPublishRoute` above.
+  twitter_manage_post: [{ tool: 'post_on_connected_account', platforms: ['twitter'], consentOnly: true }],
   // ENG-1276 follow-up #3 — bidirectional (see the module docblock). email's own
   // description prefers send_email_from_sender when the user has no connected
   // mailbox but has a configured sender, and send_email_from_sender's description
@@ -117,6 +153,11 @@ export const EQUIVALENT_PUBLISH_ROUTES: Record<string, EquivalentPublishRoute[]>
 /** Fold an action to the one spelling the route table is keyed on. */
 export function normalizeAction(action: unknown): string {
   return typeof action === 'string' ? action.trim().toLowerCase().replace(/-/g, '_') : '';
+}
+
+/** Fold a `platform` argument to the spelling `EQUIVALENT_PUBLISH_ROUTES` is keyed on. */
+export function normalizePlatform(platform: unknown): string {
+  return typeof platform === 'string' ? platform.trim().toLowerCase() : '';
 }
 
 /**
@@ -141,6 +182,60 @@ function resolveAction(entry: RequiredCallLedgerEntry | null | undefined): strin
   } catch {
     return '';
   }
+}
+
+/** Same string/JSON-string fallback as {@link resolveAction}, for `.platform`. */
+function resolvePlatform(entry: RequiredCallLedgerEntry | null | undefined): string {
+  const args = entry?.arguments;
+  if (args == null) return '';
+  if (typeof args === 'object') return normalizePlatform((args as any).platform);
+  if (typeof args !== 'string') return '';
+  try {
+    const parsed = JSON.parse(args);
+    return parsed && typeof parsed === 'object' ? normalizePlatform(parsed.platform) : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Does `entry` match a registered equivalence route FOR `requirement` — same
+ * tool, and (when the route names them) the same action/platform — regardless
+ * of `consentOnly` or success. This is the SHAPE check every consumer of
+ * `EQUIVALENT_PUBLISH_ROUTES` needs before applying its own further meaning:
+ * `callSatisfiesRequirement` below layers `consentOnly` + success on top for
+ * completion credit; `publishPressCircuitBreaker.ts`'s `classifyPublishStall`
+ * layers only success on top, deliberately NOT excluding `consentOnly` routes,
+ * because "a real write happened via an authorized alternate route" is true
+ * even when that route doesn't count toward literal completion credit — that
+ * asymmetry is the whole point of `consentOnly` (see its field doc above) and
+ * is exactly the ENG-1599 case: a schedule authorized only for
+ * `twitter_manage_post` that actually published via `post_on_connected_account`
+ * has genuinely published, even though the completion checker correctly never
+ * credits that call toward a `twitter_manage_post` requirement.
+ *
+ * ENG-1599 review (CodeRabbit): matching on `route.tool` alone — without this
+ * function's action/platform check — let an unrelated call satisfy the shape
+ * check. A `twitter_manage_post` REPLY (not `post_thread`) would have matched
+ * `post_on_connected_account`'s route, and a `post_on_connected_account` call
+ * to a non-Twitter platform would have matched `twitter_manage_post`'s route —
+ * in both cases treating an unrelated call as if it had achieved the specific
+ * outcome the route documents. Extracted here as ONE shape check so every
+ * consumer applies the identical qualifiers and can never drift apart.
+ */
+export function matchingEquivalentRoute(
+  requirement: string,
+  entry: RequiredCallLedgerEntry | null | undefined
+): EquivalentPublishRoute | null {
+  const name = typeof entry?.name === 'string' ? entry.name : '';
+  if (!name) return null;
+  const routes = EQUIVALENT_PUBLISH_ROUTES[requirement];
+  if (!routes) return null;
+  const route = routes.find((r) => r.tool === name);
+  if (!route) return null;
+  if (route.actions && !route.actions.includes(resolveAction(entry))) return null;
+  if (route.platforms && !route.platforms.includes(resolvePlatform(entry))) return null;
+  return route;
 }
 
 /**
@@ -177,12 +272,11 @@ export function callSatisfiesRequirement(
   if (!name) return false;
   if (name === requirement) return isPublishName(name) ? toolCallSucceeded(entry) : true;
 
-  const routes = EQUIVALENT_PUBLISH_ROUTES[requirement];
-  if (!routes) return false;
-
-  const route = routes.find((r) => r.tool === name);
+  const route = matchingEquivalentRoute(requirement, entry);
   if (!route) return false;
-  if (route.actions && !route.actions.includes(resolveAction(entry))) return false;
+  // A consentOnly route only widens what an AUTHORIZED schedule may call
+  // (isPublishCallWithinAuthorizedScope); it never counts toward completion.
+  if (route.consentOnly) return false;
 
   if (requiredFunctionNames) {
     const required = requiredFunctionNames instanceof Set ? requiredFunctionNames : new Set(requiredFunctionNames);
