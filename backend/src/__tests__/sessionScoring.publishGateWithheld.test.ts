@@ -224,6 +224,34 @@ describe('genuinely publish-gate-withheld scheduled runs are excluded from the j
     expect(result).toBeNull();
   });
 
+  // CodeRabbit (PR #2660): the closing-tag pattern originally used bare letters
+  // (`[a-zA-Z]+`), which cannot match a digit — so a numbered heading like
+  // `</h3>` would fail the same way `</p>` failed before the first HTML fix.
+  // The SAME real production session (ENG-1245, 0e5af215-...) uses `<h3>`
+  // elsewhere in this exact report for its own section heading, so this isn't
+  // a hypothetical: the tag-name class must accept digits/hyphens too.
+  it('still excludes when the marker is wrapped in a numbered heading tag (e.g. </h3>)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Draft and post today\'s update.' },
+      {
+        role: 'assistant',
+        content: 'Drafted the post.',
+        metadata: { toolCalls: [{ name: 'update_knowledge_base_file' }] },
+      } as any,
+      {
+        role: 'assistant',
+        content:
+          '<h3>Run summary</h3>\n\n' +
+          'PUBLISH WITHHELD: this schedule requires approval before publishing.</h3>',
+      },
+    ];
+
+    const result = await scoreSessionIfNeeded(withheldSession({ messages, messageCount: messages.length }));
+
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(result).toBeNull();
+  });
+
   // The closing-tag allowance must not swallow a genuinely NEW paragraph tacked
   // on after the marker's own closing tag — that is still the re-explain/loop
   // shape, just HTML-wrapped instead of plain text.

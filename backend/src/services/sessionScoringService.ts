@@ -771,9 +771,18 @@ function isTestScheduledSession(session: ChatSession): boolean {
 // every real HTML-formatted report. Trailing whitespace AND trailing closing
 // HTML tags (e.g. `</p>`) are now both permitted after the sentence — but a new
 // opening tag or any other content still breaks the match, since "<p>" lacks the
-// closing slash `(?:\s*<\/[a-zA-Z]+>)*` requires.
-const PUBLISH_WITHHELD_MARKER =
-  /PUBLISH WITHHELD:\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))\.?(?:\s*<\/[a-zA-Z]+>)*\s*$/i;
+// closing slash the tag pattern requires.
+//
+// Tag-name character class is `[A-Za-z][A-Za-z0-9:-]*`, not bare letters
+// (CodeRabbit, PR #2660): the same real session's report uses `<h3>` elsewhere
+// for its own formatting, and a bare `[a-zA-Z]+` cannot match a digit — `</h3>`
+// (or any numbered heading, or a hyphenated custom element) would have silently
+// failed the same way the un-anchored-for-HTML version originally did.
+const HTML_CLOSING_TAG = '(?:\\s*<\\/[A-Za-z][A-Za-z0-9:-]*>)*';
+const PUBLISH_WITHHELD_MARKER = new RegExp(
+  `PUBLISH WITHHELD:\\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))\\.?${HTML_CLOSING_TAG}\\s*$`,
+  'i'
+);
 
 // The 'revoked' variant specifically — emitted only when a run that WAS admitted
 // authorized=true (publishAdmission) had that consent narrowed away mid-run by
@@ -783,8 +792,10 @@ const PUBLISH_WITHHELD_MARKER =
 // marker variant the prompt reserves for that exact case can. Anchored to
 // end-of-message for the same reason as PUBLISH_WITHHELD_MARKER above, including
 // the same trailing-closing-tag allowance.
-const PUBLISH_WITHHELD_REVOKED_MARKER =
-  /PUBLISH WITHHELD:\s*this schedule's publish authorization has been revoked\.?(?:\s*<\/[a-zA-Z]+>)*\s*$/i;
+const PUBLISH_WITHHELD_REVOKED_MARKER = new RegExp(
+  `PUBLISH WITHHELD:\\s*this schedule's publish authorization has been revoked\\.?${HTML_CLOSING_TAG}\\s*$`,
+  'i'
+);
 
 /**
  * ENG-995 — two scheduled sessions with IDENTICAL behavior (drafted the content,
