@@ -5,6 +5,10 @@ import {
   classifyPublishStall,
 } from '../utils/publishPressCircuitBreaker';
 
+/** A minimal succeeded ledger entry — classifyPublishStall's route match needs
+ * the call's arguments (action/platform), not just its name. */
+const entry = (name: string, args?: Record<string, unknown>) => ({ name, arguments: args });
+
 describe('shouldStopPressingForPublish (ENG-947)', () => {
   const press = (over: Partial<Parameters<typeof shouldStopPressingForPublish>[0]> = {}) =>
     shouldStopPressingForPublish({
@@ -147,13 +151,13 @@ describe('classifyPublishStall (ENG-947)', () => {
    */
   it('reports a mismatch on the FIRST press, not the third — pressing again cannot fix a name mismatch', () => {
     expect(
-      classify({ pressAttempt: 1, externalWritesSucceeded: ['twitter_manage_post'] }),
+      classify({ pressAttempt: 1, externalWritesSucceeded: [entry('twitter_manage_post', { action: 'post_thread' })] }),
     ).toBe('requirement-names-unused-publish-tool');
     expect(
       classify({
         pressAttempt: 1,
         unmetRequiredFunctions: ['twitter_manage_post'],
-        externalWritesSucceeded: ['post_on_connected_account'],
+        externalWritesSucceeded: [entry('post_on_connected_account', { platform: 'twitter' })],
       }),
     ).toBe('requirement-names-unused-publish-tool');
   });
@@ -168,7 +172,7 @@ describe('classifyPublishStall (ENG-947)', () => {
 
   it('reports a TOOL MISMATCH when the run published through a different tool', () => {
     // The real 2026-08-11 evening run.
-    expect(classify({ externalWritesSucceeded: ['twitter_manage_post'] })).toBe(
+    expect(classify({ externalWritesSucceeded: [entry('twitter_manage_post', { action: 'post_thread' })] })).toBe(
       'requirement-names-unused-publish-tool',
     );
   });
@@ -182,13 +186,13 @@ describe('classifyPublishStall (ENG-947)', () => {
     // Defensive: if a caller ever passed the unmet name through, the run plainly
     // did NOT succeed at it (that is why it is unmet), so this must not flip to
     // mismatch and silently suppress the approval signal.
-    expect(classify({ externalWritesSucceeded: ['post_on_connected_account'] })).toBe(
+    expect(classify({ externalWritesSucceeded: [entry('post_on_connected_account')] })).toBe(
       'held-for-approval',
     );
   });
 
   it('ignores non-write tools entirely', () => {
-    expect(classify({ externalWritesSucceeded: ['you_search_web', 'save_memory'] })).toBe(
+    expect(classify({ externalWritesSucceeded: [entry('you_search_web'), entry('save_memory')] })).toBe(
       'held-for-approval',
     );
   });
@@ -217,7 +221,7 @@ describe('classifyPublishStall (ENG-947)', () => {
     expect(
       classify({
         publishToolsAttempted: ['post_on_connected_account'],
-        externalWritesSucceeded: ['twitter_manage_post'],
+        externalWritesSucceeded: [entry('twitter_manage_post', { action: 'post_thread' })],
       }),
     ).toBe('requirement-names-unused-publish-tool');
   });
@@ -247,14 +251,14 @@ describe('classifyPublishStall (ENG-947)', () => {
       classify({
         pressAttempt: 1,
         unmetRequiredFunctions: ['send_email_from_sender'],
-        externalWritesSucceeded: ['enrich_leads_execute'],
+        externalWritesSucceeded: [entry('enrich_leads_execute')],
       }),
     ).toBeNull();
     expect(
       classify({
         pressAttempt: 1,
         unmetRequiredFunctions: ['send_email_from_sender'],
-        externalWritesSucceeded: ['import_leads_from_search', 'delete_leads_by_filter'],
+        externalWritesSucceeded: [entry('import_leads_from_search'), entry('delete_leads_by_filter')],
       }),
     ).toBeNull();
     // Even at full budget, still just a genuine withhold, not a mismatch —
@@ -262,7 +266,7 @@ describe('classifyPublishStall (ENG-947)', () => {
     expect(
       classify({
         unmetRequiredFunctions: ['send_email_from_sender'],
-        externalWritesSucceeded: ['enrich_leads_execute'],
+        externalWritesSucceeded: [entry('enrich_leads_execute')],
       }),
     ).toBe('held-for-approval');
   });
@@ -272,20 +276,76 @@ describe('classifyPublishStall (ENG-947)', () => {
    * registered bidirectional pair (ENG-1276), so a succeeded `email` call
    * genuinely does satisfy a `send_email_from_sender` requirement outcome —
    * this must still report the mismatch immediately, same as the twitter pair.
+   * `send_email_from_sender`'s route to `email` is scoped to `actions: ['send']`
+   * (email's own registry entry has send/save/draft actions); `email`'s route
+   * back to `send_email_from_sender` has no qualifier at all.
    */
   it('still reports a mismatch for the registered email/send_email_from_sender pair', () => {
     expect(
       classify({
         pressAttempt: 1,
         unmetRequiredFunctions: ['send_email_from_sender'],
-        externalWritesSucceeded: ['email'],
+        externalWritesSucceeded: [entry('email', { action: 'send' })],
       }),
     ).toBe('requirement-names-unused-publish-tool');
     expect(
       classify({
         pressAttempt: 1,
         unmetRequiredFunctions: ['email'],
-        externalWritesSucceeded: ['send_email_from_sender'],
+        externalWritesSucceeded: [entry('send_email_from_sender')],
+      }),
+    ).toBe('requirement-names-unused-publish-tool');
+  });
+
+  /**
+   * ENG-1599 review (CodeRabbit) — matching on `route.tool` alone, ignoring
+   * `route.actions`/`route.platforms`, let an UNRELATED call satisfy a route's
+   * shape check:
+   *  - a `twitter_manage_post` REPLY (not `post_thread`) would have matched
+   *    `post_on_connected_account`'s route, which is scoped to `post_thread`
+   *    only — a reply to someone else's tweet is not "the schedule's own
+   *    content going out", so it must NOT stop the press.
+   *  - a `post_on_connected_account` call to a non-Twitter platform would have
+   *    matched `twitter_manage_post`'s route, which is scoped to
+   *    `platforms: ['twitter']` only — a LinkedIn post proves nothing about a
+   *    Twitter-only grant.
+   * Both must still allow pressing to continue for the real requirement.
+   */
+  it('does NOT match a route whose action/platform qualifier the actual call fails', () => {
+    expect(
+      classify({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['post_on_connected_account'],
+        externalWritesSucceeded: [entry('twitter_manage_post', { action: 'reply' })],
+      }),
+    ).toBeNull();
+    expect(
+      classify({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['twitter_manage_post'],
+        externalWritesSucceeded: [entry('post_on_connected_account', { platform: 'linkedin' })],
+      }),
+    ).toBeNull();
+  });
+
+  /**
+   * Same qualifier check, but confirming the POSITIVE case still works when the
+   * action/platform IS present and matches — i.e. this isn't accidentally
+   * requiring arguments to be absent, it requires them to be RIGHT.
+   */
+  it('matches a route when the action/platform qualifier IS satisfied', () => {
+    expect(
+      classify({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['post_on_connected_account'],
+        externalWritesSucceeded: [entry('twitter_manage_post', { action: 'post_thread' })],
+      }),
+    ).toBe('requirement-names-unused-publish-tool');
+    expect(
+      classify({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['twitter_manage_post'],
+        externalWritesSucceeded: [entry('post_on_connected_account', { platform: 'twitter' })],
       }),
     ).toBe('requirement-names-unused-publish-tool');
   });
