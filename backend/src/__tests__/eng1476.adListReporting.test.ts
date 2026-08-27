@@ -160,3 +160,62 @@ describe('ENG-1476 manageMetaAdsAds — campaign_id must survive the dispatch', 
     );
   });
 });
+
+/**
+ * AD_CREATIVE LIST cannot honour campaign_id — Meta exposes no campaign->adcreatives edge.
+ * That is a legitimate limitation, but returning an account-wide list labelled "(complete list)"
+ * while quietly discarding the requested scope is precisely the defect this PR removes. The
+ * unsupportable scope has to be named, not dropped.
+ */
+describe('ENG-1476 AD_CREATIVE LIST — an unsupportable scope is stated, never silently dropped', () => {
+  let agentModeService: AgentModeService;
+
+  const mockUser = {
+    id: 'user123',
+    connected_accounts: [{
+      platform: 'meta',
+      account_id: '123456789',
+      account_name: 'Test Business',
+      config: { account_type: 'ad_account', access_token: 'mock-access-token', ad_account_id: '123456789' }
+    }]
+  };
+
+  beforeEach(() => {
+    agentModeService = new AgentModeService();
+    jest.clearAllMocks();
+    (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+    (metaService.listAdCreatives as jest.Mock).mockResolvedValue({
+      creatives: [{ id: 'c1' }], truncated: false, pagesFetched: 1, scope: {}
+    });
+  });
+
+  it('says loudly that campaign_id was NOT applied', async () => {
+    const result: any = await agentModeService.manageMetaAdsAdCreatives(
+      'user123', 'LIST', '123456789', { campaign_id: '120240930011430395' }
+    );
+
+    expect(result.message).toContain('was NOT applied');
+    expect(result.message).toContain('120240930011430395');
+    expect(result.message).toContain('use AD LIST with campaign_id');
+    expect(result.scopeIgnored).toEqual({ campaign_id: '120240930011430395' });
+  });
+
+  it('stays quiet when no unsupported scope was requested', async () => {
+    const result: any = await agentModeService.manageMetaAdsAdCreatives(
+      'user123', 'LIST', '123456789', {}
+    );
+
+    expect(result.message).not.toContain('was NOT applied');
+    expect(result.scopeIgnored).toBeUndefined();
+  });
+
+  it('still forwards a supported ad_set_id scope', async () => {
+    await agentModeService.manageMetaAdsAdCreatives(
+      'user123', 'LIST', '123456789', { ad_set_id: 'adset_7' }
+    );
+
+    expect(metaService.listAdCreatives).toHaveBeenCalledWith(
+      '123456789', 'mock-access-token', { adSetId: 'adset_7' }
+    );
+  });
+});

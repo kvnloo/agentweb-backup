@@ -47,6 +47,17 @@ function makeCursor(pages: any[][]) {
 
 const ad = (id: string) => ({ _data: { id, name: `Ad ${id}` } });
 
+/**
+ * A campaign/ad-set node mock. `get` is what the tenancy guard reads: a node id is global and
+ * one Meta token spans several ad accounts, so every scoped read must prove the node belongs
+ * to the SELECTED account before returning anything through it.
+ */
+const nodeOwnedBy = (accountId: string | undefined, getAds: jest.Mock) => ({
+  getAds,
+  getAdCreatives: getAds,
+  get: jest.fn().mockResolvedValue({ _data: accountId === undefined ? {} : { account_id: accountId } }),
+});
+
 describe('ENG-1476 listAds — scoping goes through the node, not an ignorable param', () => {
   let service: MetaService;
   let accountGetAds: jest.Mock;
@@ -60,8 +71,8 @@ describe('ENG-1476 listAds — scoping goes through the node, not an ignorable p
     campaignGetAds = jest.fn().mockResolvedValue(makeCursor([[ad('camp_1')]]));
     adSetGetAds = jest.fn().mockResolvedValue(makeCursor([[ad('adset_1')]]));
     (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAds: accountGetAds }));
-    (Campaign as unknown as jest.Mock).mockImplementation(() => ({ getAds: campaignGetAds }));
-    (AdSet as unknown as jest.Mock).mockImplementation(() => ({ getAds: adSetGetAds }));
+    (Campaign as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy('act123', campaignGetAds));
+    (AdSet as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy('act123', adSetGetAds));
   });
 
   it('reads the campaign node when campaign_id is given, and never the account edge', async () => {
@@ -106,14 +117,128 @@ describe('ENG-1476 listAds — scoping goes through the node, not an ignorable p
   });
 });
 
+/**
+ * Tenancy. Listing through `new AdAccount('act_X')` was implicitly account-scoped — Meta could
+ * only ever return X's ads. Reading through `new Campaign(id)` / `new AdSet(id)` is NOT: a node
+ * id is global and one Meta OAuth token routinely reaches several ad accounts. Without an
+ * ownership check, selecting account A and passing a node id from account B returns B's ads
+ * labelled as A's. `getMetaCredentials` validates the SELECTED account, never the node.
+ *
+ * Every branch fails CLOSED: an unverifiable owner is refused, not returned.
+ */
+describe('ENG-1476 listAds — a scoped read must not cross ad accounts', () => {
+  let service: MetaService;
+  let campaignGetAds: jest.Mock;
+  let adSetGetAds: jest.Mock;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = MetaService.getInstance();
+    campaignGetAds = jest.fn().mockResolvedValue(makeCursor([[ad('leaked')]]));
+    adSetGetAds = jest.fn().mockResolvedValue(makeCursor([[ad('leaked')]]));
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAds: jest.fn() }));
+  });
+
+  it('refuses a campaign that belongs to a DIFFERENT account, and returns nothing', async () => {
+    (Campaign as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy('999_other', campaignGetAds));
+
+    await expect(service.listAds('act123', 'tok', undefined, { campaignId: 'camp_from_B' }))
+      .rejects.toThrow(/belongs to ad account 999_other, not the selected account act123/);
+
+    // The payload must never be fetched, let alone returned.
+    expect(campaignGetAds).not.toHaveBeenCalled();
+  });
+
+  it('refuses an ad set that belongs to a DIFFERENT account', async () => {
+    (AdSet as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy('999_other', adSetGetAds));
+
+    await expect(service.listAds('act123', 'tok', 'adset_from_B'))
+      .rejects.toThrow(/belongs to ad account 999_other/);
+    expect(adSetGetAds).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the node reports no owner at all', async () => {
+    (Campaign as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy(undefined, campaignGetAds));
+
+    await expect(service.listAds('act123', 'tok', undefined, { campaignId: 'camp_x' }))
+      .rejects.toThrow(/Could not verify which ad account/);
+    expect(campaignGetAds).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the selected account is empty, rather than treating it as a match', async () => {
+    // An empty selected account compares equal to nothing; treating that as "no mismatch"
+    // would pass every node the token can reach.
+    (Campaign as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy('999_other', campaignGetAds));
+
+    await expect(service.listAds('', 'tok', undefined, { campaignId: 'camp_x' }))
+      .rejects.toThrow(/Could not determine which ad account was selected/);
+    expect(campaignGetAds).not.toHaveBeenCalled();
+  });
+
+  it('accepts a node in the selected account, normalising the act_ prefix', async () => {
+    (Campaign as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy('act_123456', campaignGetAds));
+
+    const result = await service.listAds('123456', 'tok', undefined, { campaignId: 'camp_ok' });
+
+    expect(campaignGetAds).toHaveBeenCalled();
+    expect(result.ads).toHaveLength(1);
+  });
+
+  it('does not spend an ownership call on an unscoped account-wide read', async () => {
+    const campaignNode = nodeOwnedBy('act123', campaignGetAds);
+    (Campaign as unknown as jest.Mock).mockImplementation(() => campaignNode);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+      getAds: jest.fn().mockResolvedValue(makeCursor([[ad('1')]])),
+    }));
+
+    await service.listAds('act123', 'tok');
+
+    expect(campaignNode.get).not.toHaveBeenCalled();
+  });
+});
+
+describe('ENG-1476 listAdCreatives — the same tenancy boundary', () => {
+  let service: MetaService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = MetaService.getInstance();
+  });
+
+  it('refuses an ad set from a different account', async () => {
+    const getAdCreatives = jest.fn().mockResolvedValue(makeCursor([[{ _data: { id: 'c_leaked' } }]]));
+    (AdSet as unknown as jest.Mock).mockImplementation(() => ({
+      getAdCreatives,
+      get: jest.fn().mockResolvedValue({ _data: { account_id: '999_other' } }),
+    }));
+
+    await expect(service.listAdCreatives('act123', 'tok', { adSetId: 'adset_from_B' }))
+      .rejects.toThrow(/belongs to ad account 999_other/);
+    expect(getAdCreatives).not.toHaveBeenCalled();
+  });
+
+  it('allows an ad set inside the selected account', async () => {
+    const getAdCreatives = jest.fn().mockResolvedValue(makeCursor([[{ _data: { id: 'c1' } }]]));
+    (AdSet as unknown as jest.Mock).mockImplementation(() => ({
+      getAdCreatives,
+      get: jest.fn().mockResolvedValue({ _data: { account_id: 'act123' } }),
+    }));
+
+    const result = await service.listAdCreatives('act123', 'tok', { adSetId: 'adset_ok' });
+
+    expect(result.creatives).toEqual([{ id: 'c1' }]);
+    expect(result.scope).toEqual({ adSetId: 'adset_ok' });
+  });
+});
+
 describe('ENG-1476 listAds — pagination', () => {
   let service: MetaService;
 
   beforeEach(() => {
     jest.clearAllMocks();
     service = MetaService.getInstance();
-    (Campaign as unknown as jest.Mock).mockImplementation(() => ({ getAds: jest.fn() }));
-    (AdSet as unknown as jest.Mock).mockImplementation(() => ({ getAds: jest.fn() }));
+    (Campaign as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy('act123', jest.fn()));
+    (AdSet as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy('act123', jest.fn()));
   });
 
   it('walks every page instead of returning page 1 — the ENG-1584 shape', async () => {
@@ -197,6 +322,32 @@ describe('ENG-1476 listAds — pagination', () => {
     const result = await service.listAds('act123', 'tok');
 
     expect(result.ads.map((a: any) => a.id)).toEqual(['novel', 'nostatus']);
+  });
+
+  /**
+   * `maxPages` reaches drainCursor from a caller-supplied option, and `?? META_LIST_MAX_PAGES`
+   * only covers `undefined`. `Infinity` and `NaN` both make `pagesFetched >= maxPages`
+   * permanently false — the documented "hard bound" becomes an unbounded walk that accumulates
+   * every page in memory. The ceiling has to be enforced, not just described.
+   */
+  it.each([
+    ['Infinity', Infinity],
+    ['NaN', NaN],
+    ['zero', 0],
+    ['negative', -5],
+    ['fractional', 2.5],
+    ['above the cap', 10_000],
+  ])('clamps a %s maxPages instead of walking forever', async (_label, bad) => {
+    // 30 pages: more than META_LIST_MAX_PAGES (25), so an unclamped bound would drain them all.
+    const pages = Array.from({ length: 30 }, (_, i) => [ad(String(i))]);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+      getAds: jest.fn().mockResolvedValue(makeCursor(pages)),
+    }));
+
+    const result = await service.listAds('act123', 'tok', undefined, { maxPages: bad as number });
+
+    expect(result.pagesFetched).toBeLessThanOrEqual(25);
+    expect(result.truncated).toBe(true);
   });
 
   it('asks Meta for a larger page than the 25 default', async () => {

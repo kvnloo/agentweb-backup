@@ -1424,6 +1424,8 @@ export class MetaService {
       if (options.adSetId) {
         scope.adSetId = options.adSetId;
         source = new AdSet(options.adSetId);
+        // Same tenancy boundary as listAds — an ad-set id is global, the token spans accounts.
+        await this.assertNodeInAccount(source, options.adSetId, 'Ad set', adAccountId);
       } else {
         source = new AdAccount(`act_${adAccountId}`);
       }
@@ -1758,6 +1760,18 @@ export class MetaService {
     cursor: any,
     maxPages: number
   ): Promise<{ items: any[]; truncated: boolean; pagesFetched: number }> {
+    /*
+     * Normalise the bound before it is used as one. `maxPages` arrives from a caller-supplied
+     * option, and `?? META_LIST_MAX_PAGES` only covers `undefined` — `Infinity` and `NaN` both
+     * make `pagesFetched >= maxPages` permanently false, which turns the "hard bound" documented
+     * on META_LIST_MAX_PAGES into an unbounded walk that accumulates every page in memory.
+     * Anything not a positive safe integer falls back to the default, and valid values are
+     * clamped, so the ceiling is real rather than merely described.
+     */
+    const pageLimit = Number.isSafeInteger(maxPages) && maxPages > 0
+      ? Math.min(maxPages, META_LIST_MAX_PAGES)
+      : META_LIST_MAX_PAGES;
+
     // `getAds`/`getAdCreatives` already fetched page 1 (getEdge defaults fetchFirstPage=true).
     const items: any[] = Array.isArray(cursor) ? [...cursor] : [];
     let pagesFetched = 1;
@@ -1767,8 +1781,8 @@ export class MetaService {
     if (!canPage) return { items, truncated: false, pagesFetched };
 
     while (cursor.hasNext()) {
-      if (pagesFetched >= maxPages) {
-        this.log(`Stopped paginating at the ${maxPages}-page bound`, { pagesFetched, itemsSoFar: items.length });
+      if (pagesFetched >= pageLimit) {
+        this.log(`Stopped paginating at the ${pageLimit}-page bound`, { pagesFetched, itemsSoFar: items.length });
         return { items, truncated: true, pagesFetched };
       }
       // Replaces the cursor's contents with the next page, so accumulate as we go.
@@ -1778,6 +1792,51 @@ export class MetaService {
     }
 
     return { items, truncated: false, pagesFetched };
+  }
+
+  /**
+   * Bind a campaign / ad-set node to the SELECTED ad account before reading through it.
+   *
+   * ⚠ This is a tenancy boundary, not a nicety. Listing through `new AdAccount('act_X')` was
+   * implicitly account-scoped: Meta could only ever hand back X's ads. Reading through
+   * `new Campaign(id)` / `new AdSet(id)` is NOT — a node id addresses a node globally, and one
+   * Meta OAuth token routinely reaches several ad accounts. Without this check a caller could
+   * select account A, pass a campaign id from account B, and receive B's ads labelled as A's.
+   *
+   * `getMetaCredentials` validates the selected account and returns its token; it says nothing
+   * about the node. The token being valid is not the same as the node being in scope. This
+   * mirrors the guard `AD_CREATIVE GET` already applies for exactly this reason (ENG-471).
+   *
+   * Fails closed on every uncertain branch: an unverifiable owner is refused, not returned.
+   */
+  private async assertNodeInAccount(
+    node: any,
+    nodeId: string,
+    nodeLabel: string,
+    adAccountId: string
+  ): Promise<void> {
+    const data = (await node.get(['account_id']))?._data ?? {};
+    const norm = (id: unknown) => String(id ?? '').replace(/^act_/, '').trim();
+    const owner = norm(data.account_id);
+    const selected = norm(adAccountId);
+
+    if (!owner) {
+      throw new Error(
+        `Could not verify which ad account ${nodeLabel} ${nodeId} belongs to; refusing to list through it.`,
+      );
+    }
+    // Both sides must be known. An empty selected account cannot be compared against anything,
+    // so treating it as "no mismatch" would pass every node the token can reach.
+    if (!selected) {
+      throw new Error(
+        `Could not determine which ad account was selected; refusing to list through ${nodeLabel} ${nodeId}.`,
+      );
+    }
+    if (owner !== selected) {
+      throw new Error(
+        `${nodeLabel} ${nodeId} belongs to ad account ${owner}, not the selected account ${selected}.`,
+      );
+    }
   }
 
   /**
@@ -1823,9 +1882,12 @@ export class MetaService {
       if (adSetId) {
         scope.adSetId = adSetId;
         source = new AdSet(adSetId);
+        // Node reads are not account-scoped by construction the way the account edge is.
+        await this.assertNodeInAccount(source, adSetId, 'Ad set', adAccountId);
       } else if (options.campaignId) {
         scope.campaignId = options.campaignId;
         source = new Campaign(options.campaignId);
+        await this.assertNodeInAccount(source, options.campaignId, 'Campaign', adAccountId);
       } else {
         source = new AdAccount(`act_${adAccountId}`);
       }

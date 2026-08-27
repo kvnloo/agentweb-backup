@@ -16527,11 +16527,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}, ad_set_id?: string): Promise<MetaApiResult> {
     switch (action) {
-      case 'LIST':
+      case 'LIST': {
         // ENG-1476: ad_set_id never reached this edge either. Meta has no campaign->adcreatives
         // edge, so campaign scoping is deliberately absent — use AD LIST with campaign_id, which
         // returns creative{...} inline on each ad.
-        return this.listMetaAdsAdCreatives(userId, account_id, ad_set_id ?? params?.ad_set_id);
+        const result = await this.listMetaAdsAdCreatives(userId, account_id, ad_set_id ?? params?.ad_set_id);
+
+        /*
+         * If a caller supplied campaign_id anyway, say so. Returning an account-wide list
+         * labelled "(complete list)" while quietly discarding the requested scope is the exact
+         * defect this PR exists to remove — it would just be wearing a different hat. The scope
+         * is unsupportable here, so the honest move is to name it, not to drop it silently.
+         */
+        const ignoredCampaignId = params?.campaign_id;
+        if (ignoredCampaignId && result?.success) {
+          return {
+            ...result,
+            scopeIgnored: { campaign_id: String(ignoredCampaignId) },
+            message:
+              `${result.message} ⚠ campaign_id "${ignoredCampaignId}" was NOT applied — Meta exposes no ` +
+              `campaign-scoped adcreatives edge, so this list is not limited to that campaign. ` +
+              `Do NOT treat it as evidence about that campaign; use AD LIST with campaign_id instead, ` +
+              `which returns each ad's creative inline.`,
+          };
+        }
+        return result;
+      }
       case 'GET': {
         // Read ONE creative back by id (ENG-471). The service method has existed
         // and is already used by COPY_AD/RETAG_UTM — only the model-facing

@@ -533,7 +533,12 @@ describe('MetaService', () => {
             const mockAds = [{ _data: { id: 'ad_1', name: 'Ad 1', effective_status: 'PAUSED' } }];
             const adSetGetAds = jest.fn().mockResolvedValue(mockAds);
             const accountGetAds = jest.fn().mockResolvedValue([]);
-            (AdSet as unknown as jest.Mock).mockImplementation(() => ({ getAds: adSetGetAds }));
+            (AdSet as unknown as jest.Mock).mockImplementation(() => ({
+                getAds: adSetGetAds,
+                // The tenancy guard reads the node's owning account before listing through it:
+                // an ad-set id is global and one Meta token can reach several ad accounts.
+                get: jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } }),
+            }));
             (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAds: accountGetAds }));
 
             const result = await service.listAds(mockAdAccountId, mockAccessToken, 'adset_999');
