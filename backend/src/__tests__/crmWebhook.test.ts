@@ -22,6 +22,7 @@ jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListById: jest.fn(),
     getLeadByEmail: jest.fn(),
+    getLeadByAttioRecordId: jest.fn().mockResolvedValue(null),
     updateLead: jest.fn(),
   },
 }));

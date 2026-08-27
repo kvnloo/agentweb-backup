@@ -3,6 +3,7 @@ import { AttioService } from '../services/attioService';
 import { ExternalCrmSyncConfig } from '../services/externalCrmSyncService';
 import { getAttioConfig } from '../config/integrations';
 import { extractAttioValue } from '../services/adapters/attioAdapter';
+import { mergeCustomFields } from './customFieldsGuard';
 
 /**
  * Applies a single Attio `record.*` (People only — Companies are skipped,
@@ -161,7 +162,17 @@ export async function applyAttioPersonEvent(
   }
   delete leadData.email; // used only as the lookup key / stamped separately below
 
-  const lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
+  // Match by attio_record_id first, same as record.deleted above — an email
+  // edit in Attio must still resolve to the same AgentWeb lead, not silently
+  // create a duplicate (the pre-existing email-only lookup here missed the
+  // lead once its email changed, since it's now keyed on the old address).
+  // Fall back to email only for a lead that predates being linked to this
+  // record at all (e.g. created via a lead-capture form, now syncing to
+  // Attio for the first time).
+  let lead = await crmDb.getLeadByAttioRecordId(listId, recordId);
+  if (!lead) {
+    lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
+  }
 
   if (!lead) {
     const newLead: Record<string, any> = {
@@ -174,8 +185,22 @@ export async function applyAttioPersonEvent(
     console.log(`[AttioWebhook] Created lead ${created?.leadId ?? '(unknown)'} for recordId=${recordId} in list ${listId}`);
   } else {
     const updates: Record<string, any> = { ...leadData };
+    // Keep AgentWeb's stored email in sync with an email change made in
+    // Attio, and stamp attio_record_id when this lead was only just matched
+    // by email (first time this record is linked) — neither is covered by
+    // leadData, which had email deleted from it above.
+    if (email.toLowerCase() !== lead.email) {
+      updates.email = email.toLowerCase();
+    }
+    if (lead.syncMetadata?.attio_record_id !== recordId) {
+      updates.syncMetadata = { ...(lead.syncMetadata || {}), attio_record_id: recordId };
+    }
     if (Object.keys(customFields).length > 0) {
-      updates.customFields = { ...(lead.customFields || {}), ...customFields };
+      updates.customFields = mergeCustomFields(
+        lead.customFields,
+        customFields,
+        { source: 'attioPersonWebhookEvent', listId, leadId: lead.leadId },
+      );
     }
     if (Object.keys(updates).length > 0) {
       await crmDb.updateLead(listId, lead.leadId, updates);

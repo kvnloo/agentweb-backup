@@ -331,6 +331,34 @@ describe('applyAttioPersonEvent', () => {
     }));
   });
 
+  // Regression: a raw `{...lead.customFields, ...customFields}` spread
+  // reproduces the char-indexed corruption pattern customFieldsGuard exists
+  // to prevent, if lead.customFields is ever a corrupted string rather than
+  // an object. mergeCustomFields must sanitize it away instead of spreading
+  // it (see customFieldsGuard.test.ts for the guard's own unit coverage).
+  it('sanitizes a corrupted (string) existing customFields instead of char-indexing it into the merge', async () => {
+    const config = {
+      ...baseConfig,
+      customFieldMapping: [{ agentwebField: 'favoriteColor', crmProperty: 'favorite_color', direction: 'both', enabled: true }],
+    };
+    const svc = makeSvc({
+      email_addresses: [{ email_address: 'existing@example.com' }],
+      favorite_color: [{ value: 'green' }],
+    });
+    mockGetLeadByEmail.mockResolvedValue({ leadId: 'lead-1', customFields: '{"corrupted":true}' as any });
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    await applyAttioPersonEvent('list-1', config, svc as any, {
+      event_type: 'record.updated',
+      id: { record_id: 'rec-1' },
+    });
+
+    expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-1', expect.objectContaining({
+      customFields: { favoriteColor: 'green' },
+    }));
+    (console.error as jest.Mock).mockRestore();
+  });
+
   it('skips creation when the record has no email', async () => {
     const svc = makeSvc({ name: [{ first_name: 'No', last_name: 'Email' }] });
     await applyAttioPersonEvent('list-1', baseConfig, svc as any, {
@@ -355,6 +383,53 @@ describe('applyAttioPersonEvent', () => {
     expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-1', expect.objectContaining({
       firstName: 'Updated',
       lastName: 'Name',
+    }));
+  });
+
+  // Regression: matching solely by email meant an email change in Attio made
+  // getLeadByEmail miss the existing lead (still keyed on the old address)
+  // and silently create a duplicate instead of updating it — the same live
+  // -caught failure mode record.deleted was fixed to avoid, above.
+  it('updates the existing lead (by attio_record_id) rather than creating a duplicate when its email changed in Attio', async () => {
+    const svc = makeSvc({
+      email_addresses: [{ email_address: 'new-address@example.com' }],
+      name: [{ first_name: 'Ada', last_name: 'Lovelace' }],
+    });
+    mockGetLeadByAttioRecordId.mockResolvedValue({
+      leadId: 'lead-1',
+      email: 'old-address@example.com',
+      syncMetadata: { attio_record_id: 'rec-1' },
+    });
+
+    await applyAttioPersonEvent('list-1', baseConfig, svc as any, {
+      event_type: 'record.updated',
+      id: { record_id: 'rec-1' },
+    });
+
+    expect(mockGetLeadByAttioRecordId).toHaveBeenCalledWith('list-1', 'rec-1');
+    expect(mockGetLeadByEmail).not.toHaveBeenCalled();
+    expect(mockCreateLead).not.toHaveBeenCalled();
+    expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-1', expect.objectContaining({
+      email: 'new-address@example.com',
+      firstName: 'Ada',
+      lastName: 'Lovelace',
+    }));
+  });
+
+  it('stamps attio_record_id when a lead is matched by email for the first time (no duplicate stamp thereafter)', async () => {
+    const svc = makeSvc({
+      email_addresses: [{ email_address: 'existing@example.com' }],
+    });
+    mockGetLeadByAttioRecordId.mockResolvedValue(null);
+    mockGetLeadByEmail.mockResolvedValue({ leadId: 'lead-1', email: 'existing@example.com', syncMetadata: { someOtherKey: 'kept' } });
+
+    await applyAttioPersonEvent('list-1', baseConfig, svc as any, {
+      event_type: 'record.updated',
+      id: { record_id: 'rec-1' },
+    });
+
+    expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-1', expect.objectContaining({
+      syncMetadata: { someOtherKey: 'kept', attio_record_id: 'rec-1' },
     }));
   });
 
