@@ -7,6 +7,7 @@ import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
+import { mintDelegateToken } from "../services/delegateAccessToken";
 import { linkedInOutreachService } from "../services/linkedInOutreachService";
 import { deleteAccountById, createAccount } from "../services/connectedAccountsDb";
 import { waitlistDb } from "../services/waitlistDb";
@@ -192,7 +193,6 @@ const ADMIN_USER_LIST_FIELDS = [
   "fromName",
   "slackChannel",
   "slackChannels",
-  "slackSuggestedRepliesDisabled",
   "seoDomains",
   "googleAnalyticsPropertyId",
   "googleAnalyticsProperties",
@@ -1365,29 +1365,6 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
   }
 });
 
-// Toggle Slack suggested-reply (slack-triggered) monitoring for a user.
-// Body: { enabled: boolean } — true = suggestions on (default), false = suppress.
-// Persisted as the inverse `slackSuggestedRepliesDisabled` flag so absent = enabled.
-router.put("/users/:userId/slack-suggested-replies", async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { enabled } = req.body;
-
-    const user = await userDb.getUserById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    const updatedUser = await userDb.updateUser(userId, {
-      slackSuggestedRepliesDisabled: !enabled,
-    });
-    res.json(updatedUser);
-  } catch (error) {
-    console.error("Error updating slack suggested replies setting:", error);
-    res.status(500).json({ message: "Error updating slack suggested replies setting" });
-  }
-});
-
 // Get user secret names (keys only, not values)
 router.get("/users/:userId/secrets", async (req, res) => {
   try {
@@ -1565,6 +1542,8 @@ router.get("/google-drive-folders", async (req, res) => {
       fields: "files(id, name)",
       orderBy: "name",
       pageSize: 100,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
     });
 
     const folders = (response.data.files || []).map((f) => ({
@@ -1898,25 +1877,13 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
     // from the TARGET user and compared on every request by the auth middleware —
     // bumping either one rejects this token immediately. Without them the only
     // limit on a leaked support token was its expiry.
-    const delegatePayload = {
-      userId: targetUser.userId, // This will be the active user in the token
-      email: targetUser.email,
-      roles: targetUser.roles,
-      isAdmin: false, // Target user permissions
-      dte: targetUser.delegateTokenEpoch ?? 0,
-      sv: targetUser.sessionVersion ?? 0,
-      delegateAccess: {
-        adminUserId: adminReq.user.userId,
-        adminEmail: adminReq.user.email,
-        targetUserId: targetUser.userId,
-        targetEmail: targetUser.email
-      }
-    };
-
-    const delegateToken = jwt.sign(
-      delegatePayload,
-      getJwtSecret(),
-      { expiresIn: DELEGATE_TOKEN_TTL }
+    //
+    // ENG-1596: minting extracted to delegateAccessToken.ts so the MCP tool layer
+    // (apiTools.ts) can mint the same shape of token internally, per tool call.
+    const delegateToken = mintDelegateToken(
+      { userId: adminReq.user.userId, email: adminReq.user.email },
+      targetUser,
+      DELEGATE_TOKEN_TTL,
     );
 
     // Return the delegate token and customer portal URL

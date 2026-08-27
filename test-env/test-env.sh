@@ -57,10 +57,21 @@ err()  { echo -e "${RED}[test-env]${NC} $*" >&2; }
 # Environment name resolution
 ###############################################################################
 resolve_env_name() {
-  local aws_user folder
+  local aws_user folder parent suffix
   aws_user=$(aws sts get-caller-identity --query 'Arn' --output text 2>/dev/null | sed 's|.*/||')
   folder=$(basename "$REPO_ROOT")
-  echo "${aws_user}-${folder}"
+  # Multiple clones on this machine each have their own EC2 instance
+  # (agentweb-sync-env1 skill's Clone -> Instance Mapping table). Without a
+  # per-clone suffix every clone's folder name is the same ("agentweb"), so
+  # they'd all resolve to the same ENV_NAME and collide on the same state
+  # file/instance. Derive the suffix from the PARENT folder: "AgentWeb - N" -> "-N",
+  # bare "AgentWeb" -> no suffix.
+  parent=$(basename "$(dirname "$REPO_ROOT")")
+  suffix=""
+  if [[ "$parent" =~ ^AgentWeb\ -\ ([0-9]+)$ ]]; then
+    suffix="-${BASH_REMATCH[1]}"
+  fi
+  echo "${aws_user}-${folder}${suffix}"
 }
 
 state_file_for() {
