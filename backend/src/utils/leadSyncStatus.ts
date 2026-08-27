@@ -26,17 +26,25 @@ const DEFAULT_MAPPED_FIELDS = [
 ];
 
 /**
- * Read the connected-CRM state off a lead-list record. A list can only ever
- * be connected to one provider at a time (saveConfig throws if a second
- * provider is configured on an already-connected list), so checking both
- * keys and using whichever is present is safe and unambiguous.
+ * Read the connected-CRM state off a lead-list record. A list is only ever
+ * meant to be connected to one provider at a time (saveConfig throws if a
+ * second provider is configured on an already-connected list) — but
+ * disconnectAccount clears a provider's credentials without removing its
+ * config object, so a disconnected HubSpot config can still be present
+ * alongside a connected Attio config. Prefer whichever provider actually
+ * has credentials; fall back to the first present config only if neither
+ * does, preserving the existing disconnected-state behavior.
  */
 export function getExternalCrmConnection(list: any): ExternalCrmConnection {
   const configs = list?.externalCrmSyncConfigs ?? {};
-  const provider: 'hubspot' | 'attio' | null =
-    configs.hubspot ? 'hubspot' : configs.attio ? 'attio' : null;
+  const hasCreds = (c: any) => !!c && (!!c.accountId || !!c.apiKeyEncrypted);
+  let provider: 'hubspot' | 'attio' | null = null;
+  if (hasCreds(configs.hubspot)) provider = 'hubspot';
+  else if (hasCreds(configs.attio)) provider = 'attio';
+  else if (configs.hubspot) provider = 'hubspot';
+  else if (configs.attio) provider = 'attio';
   const config = provider ? configs[provider] : null;
-  const connected = !!config && (!!config.accountId || !!config.apiKeyEncrypted);
+  const connected = hasCreds(config);
   return { connected, autoSyncEnabled: !!config?.autoSyncEnabled, provider: connected ? provider : null, config };
 }
 
