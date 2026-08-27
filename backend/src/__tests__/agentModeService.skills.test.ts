@@ -1368,5 +1368,44 @@ describe('AgentModeService - Skills', () => {
       expect(otherSkill!.name).toBe('Other Skills');
       expect(otherSkill!.toolNames).toContain('orphan_tool');
     });
+
+    it('does not double-list a tool under Other Skills when an unpublished skill\'s own card already shows it (ENG-1237 follow-up)', async () => {
+      // The ENG-1237 fix correctly stops an unpublished skill from removing its
+      // tools from the installable __other_skills__ pool — but that skill's own
+      // card in this same response already lists those toolNames. This is a
+      // display-only dedup: `draft_tool` must still count toward whether
+      // __other_skills__ appears at all and must still be installable through it,
+      // it just shouldn't be repeated in the rendered toolNames list.
+      const unpublishedOrgSkill = {
+        skillId: 'draft-skill', name: 'Draft Skill', description: 'd',
+        toolNames: ['draft_tool'], isPublished: false, ownerId: 'owner-1', orgId: 'org-1', visibility: 'private',
+      };
+      const mockDb = require('../services/db');
+      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'member-1', orgId: 'org-1', orgRole: 'member' }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({
+        orgId: 'org-1', ownerUserId: 'owner-1',
+        shareSettings: { skills: { enabled: true, editors: [] } },
+      }) };
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([unpublishedOrgSkill]);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+
+      const mockToolRegistry = (agentModeService as any).toolRegistry;
+      mockToolRegistry.getAllTools.mockReturnValue([
+        { name: 'draft_tool', definition: { function: { description: 'Claimed by the draft skill' } } },
+        { name: 'orphan_tool', definition: { function: { description: 'Claimed by nothing' } } },
+      ]);
+
+      const result = await agentModeService.getSkillsForDisplay([], 'member-1');
+
+      const draftCard = result.find(s => s.skillId === 'draft-skill');
+      const otherSkill = result.find(s => s.skillId === '__other_skills__');
+      expect(draftCard!.toolNames).toContain('draft_tool');
+      // Still installable/present because the real pool is non-empty (ENG-1237 behavior).
+      expect(otherSkill).toBeDefined();
+      expect(otherSkill!.toolNames).toContain('orphan_tool');
+      // But not repeated — it's already shown on the draft skill's own card.
+      expect(otherSkill!.toolNames).not.toContain('draft_tool');
+    });
   });
 });
