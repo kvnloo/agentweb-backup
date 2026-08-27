@@ -3735,8 +3735,14 @@ export async function runVerifiedChat(
       if (publishStall) {
         const heldForApproval = publishStall === 'held-for-approval';
         const toolFailing = publishStall === 'publish-tool-failing';
+        const mismatch = publishStall === 'requirement-names-unused-publish-tool';
         console.warn(
-          `AgentMode runVerifiedChat: session ${sessionId} spent its publish-press budget ` +
+          `AgentMode runVerifiedChat: session ${sessionId} ` +
+          (mismatch
+            // ENG-1599: this cause fires as soon as it is detected, not once the
+            // press budget is spent — see classifyPublishStall.
+            ? `already published via a tool its requiredFunctionCalls does not name `
+            : `spent its publish-press budget `) +
           `(${publishPressAttempts}/${MAX_PUBLISH_PRESS_ATTEMPTS} press attempts, ${attempt} attempts overall) ` +
           `with [${functionCallMisses.join(', ')}] still unmet. ` +
           `Ending the run instead of re-pressing to ${maxAttempts} attempts — ` +

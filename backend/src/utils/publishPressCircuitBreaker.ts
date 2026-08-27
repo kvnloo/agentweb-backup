@@ -1,4 +1,4 @@
-import { isPublishName, isPowerTool } from './hardeningGaps';
+import { isPowerTool } from './hardeningGaps';
 
 /**
  * ENG-947 — the publish-press circuit breaker.
@@ -28,6 +28,17 @@ import { isPublishName, isPowerTool } from './hardeningGaps';
  * Related: ENG-844 already established the same reasoning one layer down, where
  * the anti-loop override deterministically declines to fire on a function-call
  * retry press aimed at an irreversible write.
+ *
+ * ENG-1599 follow-up: the "wrote something else" cause below used to be gated
+ * behind the same press-budget wait as the other two causes. That is wrong for
+ * THIS cause specifically — once a power-tool write has already gone out under a
+ * name the requirement isn't asking about, no amount of further pressing can
+ * retroactively make it match. The next press can only ask the model to publish
+ * AGAIN, which is exactly how a same-content duplicate reaches a live account
+ * (ENG-1045 was that outcome from the opposite tool direction; the schedule
+ * behind ENG-1599 was one press away from reproducing it from this direction —
+ * requiredFunctionCalls names twitter_manage_post, the schedule's own prompt
+ * publishes via post_on_connected_account). See classifyPublishStall.
  */
 
 /**
@@ -46,19 +57,34 @@ import { isPublishName, isPowerTool } from './hardeningGaps';
 export const MAX_PUBLISH_PRESS_ATTEMPTS = 3;
 
 /**
- * True when the ONLY thing a run still has outstanding is one or more publish
- * tools — i.e. the state in which the next unmet-requirement retry would press
- * for an irreversible publish and nothing else.
+ * True when the ONLY thing a run still has outstanding is one or more
+ * irreversible-write tools — i.e. the state in which the next unmet-requirement
+ * retry would press for a publish (or an equally irreversible send/delete) and
+ * nothing else.
+ *
+ * ENG-1599: originally scoped to `isPublishName` (the post_on_ and publish_
+ * prefixes) only,
+ * which excluded `twitter_manage_post` and the rest of the SEND_TOOLS family —
+ * NOT because re-pressing for those is any safer (a duplicate reply, a second
+ * DM blast, a repeated delete are all exactly the same class of harm this
+ * breaker exists to prevent), but because `isPublishName`/`isSendName` were
+ * built for a DIFFERENT classification (which governance block a skill needs)
+ * and this module borrowed the narrower half by default. Widened to
+ * `isPowerTool` (publish ∪ send) so a schedule whose requiredFunctionCalls
+ * names a SEND-classified tool — like the twitter_manage_post/
+ * post_on_connected_account mismatch this schedule actually hit — gets the
+ * same early-stop protection instead of pressing all the way to maxAttempts.
  *
  * Scoped deliberately tight:
- * - every unmet entry must be a publish tool. If anything cheap/reversible is
- *   also outstanding, pressing still has value and the normal budget applies;
+ * - every unmet entry must be an irreversible-write tool. If anything
+ *   cheap/reversible is also outstanding, pressing still has value and the
+ *   normal budget applies;
  * - a non-string entry disqualifies the whole set rather than being skipped, so
  *   a malformed requirement can never be silently read as "publish only".
  */
 export function isPublishOnlyUnmet(unmetRequiredFunctions: string[]): boolean {
   if (!Array.isArray(unmetRequiredFunctions) || unmetRequiredFunctions.length === 0) return false;
-  return unmetRequiredFunctions.every((name) => typeof name === 'string' && isPublishName(name));
+  return unmetRequiredFunctions.every((name) => typeof name === 'string' && isPowerTool(name));
 }
 
 /**
@@ -133,6 +159,14 @@ export type PublishStallReason =
  * an attempt at some unrelated publish tool says nothing about why THIS
  * requirement stalled. A succeeded write elsewhere still outranks it, because a
  * post that is already live is the more consequential fact to report.
+ *
+ * ENG-1599: the mismatch cause (`requirement-names-unused-publish-tool`) is
+ * checked BEFORE the press budget, not after. `held-for-approval` and
+ * `publish-tool-failing` still wait out the budget because pressing might
+ * genuinely help — the model hasn't reached for the tool yet, or a transient
+ * error might clear. A mismatch has no such upside: the write already happened
+ * under the wrong name, so every press between here and the budget is a second
+ * chance to publish a duplicate, not a chance to fix anything.
  */
 export function classifyPublishStall(params: {
   pressAttempt: number;
@@ -142,6 +176,14 @@ export function classifyPublishStall(params: {
   maxPressAttempts?: number;
 }): PublishStallReason | null {
   const { unmetRequiredFunctions, externalWritesSucceeded } = params;
+  if (!isPublishOnlyUnmet(unmetRequiredFunctions)) return null;
+
+  const unmet = new Set(unmetRequiredFunctions);
+  const wroteSomethingElse = (externalWritesSucceeded || []).some(
+    (name) => typeof name === 'string' && !unmet.has(name) && isPowerTool(name),
+  );
+  if (wroteSomethingElse) return 'requirement-names-unused-publish-tool';
+
   if (
     !shouldStopPressingForPublish({
       pressAttempt: params.pressAttempt,
@@ -151,11 +193,6 @@ export function classifyPublishStall(params: {
   ) {
     return null;
   }
-  const unmet = new Set(unmetRequiredFunctions);
-  const wroteSomethingElse = (externalWritesSucceeded || []).some(
-    (name) => typeof name === 'string' && !unmet.has(name) && isPowerTool(name),
-  );
-  if (wroteSomethingElse) return 'requirement-names-unused-publish-tool';
   const triedTheNamedTool = (params.publishToolsAttempted || []).some(
     (name) => typeof name === 'string' && unmet.has(name),
   );
