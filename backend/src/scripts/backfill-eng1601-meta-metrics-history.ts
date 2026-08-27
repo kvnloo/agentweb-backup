@@ -115,8 +115,10 @@ function arg(name: string): string | undefined {
   }
   return v;
 }
+/** True when a boolean flag is present. Boolean flags carry no value, so they need no validation. */
 const has = (name: string) => process.argv.includes(`--${name}`);
 
+/** A Date as `YYYY-MM-DD` in UTC — the same key format the snapshot rows are stored under. */
 function toDateStr(d: Date): string {
   return d.toISOString().split('T')[0];
 }
@@ -184,6 +186,14 @@ function assertWriteTargetIsDeliberate(): 'production' | 'development' {
   return env;
 }
 
+/**
+ * Resolve the run, then either print the plan (dry run) or write it (`--apply`).
+ *
+ * Ordering is deliberate: every cheap refusal — scope, calendar validity, the UTM floor, the
+ * latest complete day, the range ceiling, and the write-target guard — runs BEFORE any credential
+ * resolution or CRM walk. A run that is going to be rejected should be rejected before it touches
+ * a customer's record or spends a Graph call.
+ */
 async function main(): Promise<void> {
   const apply = has('apply');
 
