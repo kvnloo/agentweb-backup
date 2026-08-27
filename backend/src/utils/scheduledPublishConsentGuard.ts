@@ -61,7 +61,13 @@ async function defaultDeps(): Promise<ScheduledPublishGuardDeps> {
     getScheduleById: (scheduleId: string) => scheduleDb.getScheduleById(scheduleId),
     resolveAccountPlatform: async (accountId: string, userId: string) => {
       const accounts = await getAccountsWithOwnerIncludingOrgShared(userId);
-      return accounts.find((a) => a.account_id === accountId)?.platform ?? null;
+      // account_id alone does not identify an account — the same id can sit on two
+      // platforms — so narrow to social-posting platforms first, mirroring
+      // postOnConnectedAccount's own socialAccounts filter.
+      const socialAccounts = accounts.filter((a) =>
+        ['twitter', 'linkedin', 'instagram', 'youtube'].includes(a.platform)
+      );
+      return socialAccounts.find((a) => a.account_id === accountId)?.platform ?? null;
     },
   };
 }
