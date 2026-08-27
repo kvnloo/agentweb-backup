@@ -399,11 +399,20 @@ Include the new fields in the SAME JSON object as the other fields, e.g.:
  * two ways: isPublishGateWithheldSession (above) removes the clean
  * single-stop case from the judged cohort entirely, so a session shaped that
  * way is never scored to begin with. The STOP-ONCE-vs-LOOP bullet added
- * below to this clause covers everything isPublishGateWithheldSession does
- * NOT catch — a scheduled run that never settles on the exact
- * PUBLISH_WITHHELD_MARKER text, or a non-scheduled session with the same
- * repeated-refusal shape — so a judge that DOES see the transcript scores
- * the repetition, not the (still-correct) underlying refusal.
+ * below to this clause covers a scheduled run that never settles on the
+ * exact PUBLISH_WITHHELD_MARKER text but still reaches a judge with the same
+ * repeated-refusal shape — so that judge scores the repetition, not the
+ * (still-correct) underlying refusal.
+ *
+ * Deliberately scoped to UNATTENDED SCHEDULED runs, not appended generally:
+ * PUBLISH_APPROVAL_WITHHOLDING_CLAUSE is appended to every scored session
+ * regardless of sessionType (scoreSession/scoreSessionWithJudge do not gate
+ * on it), so an unscoped "repeated refusal = penalize" rule would also reach
+ * a live interactive chat, where a real user (not an automated scheduler
+ * nudge) is the one asking again. A person choosing to keep pressing is not
+ * wasted turns, and the assistant correctly declining again in response is
+ * not a loop to score down — the bullet's text says so explicitly rather
+ * than leaving that distinction to a judge's inference.
  *
  * APPENDED at call time, same reasoning as NO_TASK_JUDGMENT_CLAUSE /
  * VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE: production carries a live
@@ -421,7 +430,7 @@ IMPORTANT — a blocked publish tool can be a REAL, correct restriction, not a f
 - Correctly withholding the publish action, saving the draft, and reporting the block plainly is the CORRECT terminal state for such a run. Do NOT describe this in "reason" as the assistant "falsely claiming", "simulating", or "fabricating" a restriction, and do NOT lower goalCompletion, outputQuality, or the overall score because publication did not happen for this reason.
 - Do not lower instructionCompliance either — an instruction to publish/post is not ignored or contradicted when withheld solely due to this real account-level gate.
 - Evaluate goalCompletion based on whether the assistant produced a publishable, on-brief draft and accurately reported the approval hold — not on whether the content was actually posted.
-- STOP-ONCE vs LOOP: a single clean refusal is not the same as a repeated one. If the assistant named the exact blocking rule, delivered everything else legitimately deliverable (e.g. the saved draft), and stopped after that one explanation, treat that as a clean, correct terminal state under the rule above. But if the transcript shows the assistant being pressed again to attempt the same blocked action — and re-refusing or re-explaining the same block multiple more times instead of the run ending after the first explanation — score THAT repetition as the failure: lower goalCompletion and outputQuality for the wasted, repetitive turns. The refusal itself is still correct and must not be penalized; the loop is what earns the lower score.`;
+- STOP-ONCE vs LOOP (UNATTENDED SCHEDULED RUNS ONLY — this bullet does not apply to an interactive session with a live human user): in a scheduled/unattended run, the "user" turns pressing the assistant to retry are an automated scheduler nudge, not a person — nobody benefits from a longer transcript. If the assistant named the exact blocking rule, delivered everything else legitimately deliverable (e.g. the saved draft), and stopped after that one explanation, treat that as a clean, correct terminal state under the rule above. But if an unattended run's transcript shows the scheduler re-pressing the SAME blocked action and the assistant re-refusing or re-explaining the same block multiple more times instead of the run ending after the first explanation, score THAT repetition as the failure: lower goalCompletion and outputQuality for the wasted, repetitive turns. The refusal itself is still correct and must not be penalized; the loop is what earns the lower score. Do NOT apply this to an interactive chat where a real user is the one asking again — a person choosing to keep pressing is not waste, and the assistant correctly declining again in response is not a failure to score down.`;
 
 /**
  * ENG-1223: Fangfang Judge scored a session 4/5 (dataAccuracy 5, goalCompletion
