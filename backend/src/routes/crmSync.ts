@@ -105,19 +105,26 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
     const config = await externalCrmSyncService.getConfig(userId, listId, provider);
     if (!config) return res.json({ configured: false });
 
+    // Editor-level check, reused below for both the backfill-write gate and
+    // the webhookUrl visibility gate. This route itself is read-authorized
+    // (any same-org member when crm.enabled, per verifyListOwnership's
+    // destructive:false above) — but webhookUrl embeds the plaintext
+    // webhookSecret, which is the sole auth for this list's public webhook
+    // endpoint. A same-org member with mere read access must not receive a
+    // credential that lets them forge sync-triggering requests into a list
+    // they can't edit.
+    const list = await crmDb.getLeadListById(listId);
+    const canEdit = !!list && (await canDestructiveCrmList(userId, list as any));
+
     // Lazily backfill webhookSecret for configs created before this feature was added.
     // Non-fatal: if the write fails the config is still returned without a webhookUrl.
-    // This route is read-authorized (any same-org member when crm.enabled, per
-    // verifyListOwnership's destructive:false above) — but the backfill itself is a
-    // write, so it must independently require owner/org-owner/crm.editor, or a plain
-    // reader could cause another member's sync config to be mutated just by viewing
-    // it (Greptile P1, ENG-1049 follow-up).
-    if (!config.webhookSecret) {
+    // Gated on canEdit — the backfill itself is a write, so it must independently
+    // require owner/org-owner/crm.editor, or a plain reader could cause another
+    // member's sync config to be mutated just by viewing it (Greptile P1, ENG-1049
+    // follow-up).
+    if (!config.webhookSecret && canEdit) {
       try {
-        const list = await crmDb.getLeadListById(listId);
-        if (list && (await canDestructiveCrmList(userId, list as any))) {
-          await externalCrmSyncService.ensureWebhookSecret(userId, listId, provider, config);
-        }
+        await externalCrmSyncService.ensureWebhookSecret(userId, listId, provider, config);
       } catch (backfillErr: any) {
         console.warn(`[CrmSync] ensureWebhookSecret failed for list ${listId}/${provider}: ${backfillErr.message}`);
       }
@@ -158,8 +165,11 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       lastSyncErrorCount: config.lastSyncErrorCount,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
-      // Webhook URL — secret embedded as query param so HubSpot/Attio can call it with no custom headers
-      webhookUrl: config.webhookSecret
+      // Webhook URL — secret embedded as query param so HubSpot/Attio can call
+      // it with no custom headers. Only ever returned to an editor (canEdit,
+      // computed above) — a read-only same-org viewer must not receive a
+      // credential that authenticates writes into this list's leads.
+      webhookUrl: (canEdit && config.webhookSecret)
         ? `${backendUrl}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
         : undefined,
     });
@@ -469,9 +479,10 @@ router.put('/config/:listId/:provider/pipeline', async (req: any, res) => {
       attioDealListId: config.attioDealListId,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
-      webhookUrl: config.webhookSecret
-        ? `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
-        : undefined,
+      // No webhookUrl here (unlike GET/PUT /config) — the frontend's
+      // handleChangePipeline never reads this response at all, it calls
+      // fetchConfig() separately to refresh state, so including a
+      // secret-bearing URL nobody consumes was pure unnecessary exposure.
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to change pipeline' });
