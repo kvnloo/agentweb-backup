@@ -449,29 +449,29 @@ export class AttioAdapter implements CrmAdapter {
                 // (non-critical, same graceful-degrade convention as a total
                 // prefetch failure below).
                 const MAX_DEAL_PREFETCH_PAGES = 200;
-                let dealCursor: string | undefined;
+                let dealOffset: number | undefined = 0;
                 let dealPages = 0;
                 do {
-                    const { entries, nextCursor: nextDealCursor } = await svc.listListEntriesDetailed(config.attioDealListId, dealCursor);
+                    const { entries, nextOffset: nextDealOffset } = await svc.listListEntriesDetailed(config.attioDealListId, dealOffset);
                     for (const entry of entries) {
                         dealEntriesByPersonId.set(entry.personRecordId, { entryId: entry.entryId, values: entry.values });
                     }
-                    dealCursor = nextDealCursor;
+                    dealOffset = nextDealOffset;
                     dealPages++;
-                    if (dealCursor && dealPages >= MAX_DEAL_PREFETCH_PAGES) {
+                    if (dealOffset !== undefined && dealPages >= MAX_DEAL_PREFETCH_PAGES) {
                         console.warn(`[Attio-Pull] Deal-list ${config.attioDealListId} has more than ${MAX_DEAL_PREFETCH_PAGES} pages of entries — stopping prefetch early, some people will pull without deal fields.`);
                         break;
                     }
-                } while (dealCursor);
+                } while (dealOffset !== undefined);
             } catch (e: any) {
                 console.error('[Attio-Pull] Failed to prefetch deal-list entries (non-critical):', e.response?.data?.message || e.message);
             }
         }
 
-        let cursor: string | undefined;
+        let offset: number | undefined = 0;
 
         do {
-            const { people, nextCursor } = await svc.listPeople(cursor);
+            const { people, nextOffset } = await svc.listPeople(offset);
             const pageLeadData: any[] = [];
 
             for (const person of people) {
@@ -599,8 +599,8 @@ export class AttioAdapter implements CrmAdapter {
                 }
             }
 
-            cursor = nextCursor;
-        } while (cursor);
+            offset = nextOffset;
+        } while (offset !== undefined);
 
         return result;
     }

@@ -81,7 +81,7 @@ describe('AttioAdapter.pullContacts — company field mapping', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     adapter = new AttioAdapter();
-    mockListPeople.mockResolvedValue({ people: [makePerson()], nextCursor: undefined });
+    mockListPeople.mockResolvedValue({ people: [makePerson()], nextOffset: undefined });
     mockGetPersonValues.mockResolvedValue({
       email_addresses: [{ email_address: 'jane@acme.com' }],
       company: [{ target_record_id: 'company_1' }],
@@ -142,7 +142,7 @@ describe('AttioAdapter.pullContacts — company field mapping', () => {
   it('fetches a shared company only once per pull run, not once per person', async () => {
     mockListPeople.mockResolvedValue({
       people: [makePerson('person_1'), makePerson('person_2')],
-      nextCursor: undefined,
+      nextOffset: undefined,
     });
     mockGetPersonValues.mockImplementation((recordId: string) => Promise.resolve({
       email_addresses: [{ email_address: `${recordId}@acme.com` }],
@@ -190,7 +190,7 @@ describe('AttioAdapter.pullContacts — company field mapping', () => {
   });
 
   it('loads companies attribute types only once across multiple people', async () => {
-    mockListPeople.mockResolvedValue({ people: [makePerson('p1'), makePerson('p2')], nextCursor: undefined });
+    mockListPeople.mockResolvedValue({ people: [makePerson('p1'), makePerson('p2')], nextOffset: undefined });
     mockGetPersonValues.mockResolvedValue({
       email_addresses: [{ email_address: 'x@acme.com' }],
       company: [{ target_record_id: 'company_1' }],

@@ -63,7 +63,7 @@ describe('AttioAdapter.pullContacts — non-native contact mapping routes to cus
   beforeEach(() => {
     jest.clearAllMocks();
     adapter = new AttioAdapter();
-    mockListPeople.mockResolvedValue({ people: [{ recordId: 'person_1' }], nextCursor: undefined });
+    mockListPeople.mockResolvedValue({ people: [{ recordId: 'person_1' }], nextOffset: undefined });
     mockLoadAttributeTypes.mockResolvedValue(new Map([
       ['object:people:email_addresses', 'email_address'],
       ['object:people:job_level', 'text'],

@@ -77,7 +77,7 @@ describe('AttioAdapter.pullContacts — deal entry pull', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     adapter = new AttioAdapter();
-    mockListPeople.mockResolvedValue({ people: [makePerson()], nextCursor: undefined });
+    mockListPeople.mockResolvedValue({ people: [makePerson()], nextOffset: undefined });
     mockGetPersonValues.mockResolvedValue({ email_addresses: [{ email_address: 'jane@acme.com' }] });
     // Person-level call (no listId) needs email_addresses typed correctly for
     // extraction; deal-list-scoped calls (listId present) default empty unless
@@ -85,7 +85,7 @@ describe('AttioAdapter.pullContacts — deal entry pull', () => {
     mockLoadAttributeTypes.mockImplementation((_objectSlug: string, listId?: string) =>
       Promise.resolve(listId ? new Map() : new Map([['object:people:email_addresses', 'email_address']]))
     );
-    mockListListEntriesDetailed.mockResolvedValue({ entries: [], nextCursor: undefined });
+    mockListListEntriesDetailed.mockResolvedValue({ entries: [], nextOffset: undefined });
   });
 
   // ─── Gate ──────────────────────────────────────────────────────────────────
@@ -115,8 +115,11 @@ describe('AttioAdapter.pullContacts — deal entry pull', () => {
 
   it('stops prefetching after 200 pages of deal entries instead of paging forever', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    mockListListEntriesDetailed.mockImplementation(() =>
-      Promise.resolve({ entries: [{ entryId: 'e', personRecordId: 'person_1', values: {} }], nextCursor: 'next' })
+    // Always a "full" 50-entry page (limit/offset contract), so nextOffset is
+    // always defined and the loop would page forever without the cap.
+    const fullPage = Array.from({ length: 50 }, (_, i) => ({ entryId: `e${i}`, personRecordId: `person_${i}`, values: {} }));
+    mockListListEntriesDetailed.mockImplementation((_listId: string, offset: number) =>
+      Promise.resolve({ entries: fullPage, nextOffset: offset + 50 })
     );
 
     await adapter.pullContacts(auth, 'list_1', makeConfig({ dealFieldMapping: dealMapping, attioDealListId: 'deallist_1' }));
@@ -129,7 +132,7 @@ describe('AttioAdapter.pullContacts — deal entry pull', () => {
   it('does not merge deal fields for a person with no matching list entry', async () => {
     mockListListEntriesDetailed.mockResolvedValue({
       entries: [{ entryId: 'entry_other', personRecordId: 'person_other', values: { deal_value: [{ value: '999' }] } }],
-      nextCursor: undefined,
+      nextOffset: undefined,
     });
 
     await adapter.pullContacts(auth, 'list_1', makeConfig({ dealFieldMapping: dealMapping, attioDealListId: 'deallist_1' }));
@@ -148,7 +151,7 @@ describe('AttioAdapter.pullContacts — deal entry pull', () => {
         personRecordId: 'person_1',
         values: { deal_value: [{ value: 5000 }], deal_status: [{ status: { title: 'open' } }] },
       }],
-      nextCursor: undefined,
+      nextOffset: undefined,
     });
     mockLoadAttributeTypes.mockImplementation((_objectSlug: string, listId?: string) => {
       if (listId) {
@@ -179,7 +182,7 @@ describe('AttioAdapter.pullContacts — deal entry pull', () => {
     ];
     mockListListEntriesDetailed.mockResolvedValue({
       entries: [{ entryId: 'entry_1', personRecordId: 'person_1', values: { deal_notes: [{ value: 'hot lead' }] } }],
-      nextCursor: undefined,
+      nextOffset: undefined,
     });
 
     await adapter.pullContacts(auth, 'list_1', makeConfig({ dealFieldMapping: customDealMapping, attioDealListId: 'deallist_1' }));
@@ -189,7 +192,7 @@ describe('AttioAdapter.pullContacts — deal entry pull', () => {
   });
 
   it('prefetches the deal list only once across multiple people/pages', async () => {
-    mockListPeople.mockResolvedValue({ people: [makePerson('p1'), makePerson('p2')], nextCursor: undefined });
+    mockListPeople.mockResolvedValue({ people: [makePerson('p1'), makePerson('p2')], nextOffset: undefined });
     mockGetPersonValues.mockResolvedValue({ email_addresses: [{ email_address: 'x@acme.com' }] });
 
     await adapter.pullContacts(auth, 'list_1', makeConfig({ dealFieldMapping: dealMapping, attioDealListId: 'deallist_1' }));

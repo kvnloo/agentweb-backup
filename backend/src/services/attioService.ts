@@ -189,19 +189,27 @@ export class AttioService {
 
   // ─── People ───────────────────────────────────────────────────────────────
 
-  async listPeople(cursor?: string): Promise<{ people: AttioPerson[]; nextCursor?: string }> {
-    const body: any = { limit: 50 };
-    if (cursor) body.cursor = cursor;
-
+  // POST /objects/{object}/records/query uses limit/offset pagination, not
+  // cursor — confirmed against Attio's own docs (docs.attio.com/rest-api/
+  // guides/pagination and .../endpoint-reference/records/list-records, which
+  // uses this exact endpoint as its offset-pagination example). There is no
+  // next_cursor in the response; end-of-results is inferred from a
+  // short/empty page. The previous cursor-based implementation always sent
+  // no cursor param, so Attio always returned page 1, and the response never
+  // carried next_cursor — every call silently returned at most 50 people
+  // with no way to reach a second page, for any list.
+  async listPeople(offset: number = 0): Promise<{ people: AttioPerson[]; nextOffset?: number }> {
+    const limit = 50;
     const res = await axiosInstance.post(
       `${this.baseUrl}/objects/people/records/query`,
-      body,
+      { limit, offset },
       { headers: this.headers() }
     );
 
+    const people = ((res.data as any)?.data ?? []).map((r: any) => this.mapPerson(r));
     return {
-      people: ((res.data as any)?.data ?? []).map((r: any) => this.mapPerson(r)),
-      nextCursor: (res.data as any)?.next_cursor,
+      people,
+      nextOffset: people.length === limit ? offset + limit : undefined,
     };
   }
 
@@ -345,19 +353,19 @@ export class AttioService {
 
   // ─── Companies ────────────────────────────────────────────────────────────
 
-  async listCompanies(cursor?: string): Promise<{ companies: AttioCompany[]; nextCursor?: string }> {
-    const body: any = { limit: 50 };
-    if (cursor) body.cursor = cursor;
-
+  // See listPeople's comment — same endpoint family, same limit/offset contract.
+  async listCompanies(offset: number = 0): Promise<{ companies: AttioCompany[]; nextOffset?: number }> {
+    const limit = 50;
     const res = await axiosInstance.post(
       `${this.baseUrl}/objects/companies/records/query`,
-      body,
+      { limit, offset },
       { headers: this.headers() }
     );
 
+    const companies = ((res.data as any)?.data ?? []).map((r: any) => this.mapCompany(r));
     return {
-      companies: ((res.data as any)?.data ?? []).map((r: any) => this.mapCompany(r)),
-      nextCursor: (res.data as any)?.next_cursor,
+      companies,
+      nextOffset: companies.length === limit ? offset + limit : undefined,
     };
   }
 
@@ -874,20 +882,24 @@ export class AttioService {
 
   // ─── List entries ─────────────────────────────────────────────────────────
 
+  // POST /lists/{list}/entries/query also uses limit/offset pagination, not
+  // cursor — same contract as listPeople above (confirmed via Attio's
+  // pagination docs); no next_cursor in the response, end-of-results
+  // inferred from a short/empty page.
   async listListEntries(
     listId: string,
-    cursor?: string
-  ): Promise<{ entries: any[]; nextCursor?: string }> {
-    const body: any = { limit: 50 };
-    if (cursor) body.cursor = cursor;
+    offset: number = 0
+  ): Promise<{ entries: any[]; nextOffset?: number }> {
+    const limit = 50;
     const res = await axiosInstance.post(
       `${this.baseUrl}/lists/${listId}/entries/query`,
-      body,
+      { limit, offset },
       { headers: this.headers() }
     );
+    const entries = (res.data as any).data ?? [];
     return {
-      entries: (res.data as any).data ?? [],
-      nextCursor: (res.data as any).next_cursor,
+      entries,
+      nextOffset: entries.length === limit ? offset + limit : undefined,
     };
   }
 
@@ -904,19 +916,19 @@ export class AttioService {
   async countListEntries(listId: string): Promise<{ count: number; capped: boolean }> {
     const MAX_COUNT_PAGES = 200;
     let total = 0;
-    let cursor: string | undefined;
+    let offset: number | undefined = 0;
     let pages = 0;
     let capped = false;
     do {
-      const { entries, nextCursor } = await this.listListEntries(listId, cursor);
+      const { entries, nextOffset } = await this.listListEntries(listId, offset);
       total += entries.length;
-      cursor = nextCursor;
+      offset = nextOffset;
       pages++;
-      if (cursor && pages >= MAX_COUNT_PAGES) {
+      if (offset !== undefined && pages >= MAX_COUNT_PAGES) {
         capped = true;
         break;
       }
-    } while (cursor);
+    } while (offset !== undefined);
     return { count: total, capped };
   }
 
@@ -929,9 +941,9 @@ export class AttioService {
    */
   async listListEntriesDetailed(
     listId: string,
-    cursor?: string
-  ): Promise<{ entries: AttioListEntry[]; nextCursor?: string }> {
-    const { entries, nextCursor } = await this.listListEntries(listId, cursor);
+    offset: number = 0
+  ): Promise<{ entries: AttioListEntry[]; nextOffset?: number }> {
+    const { entries, nextOffset } = await this.listListEntries(listId, offset);
     const detailed = entries
       .map((e: any) => ({
         entryId: e?.id?.entry_id as string | undefined,
@@ -939,7 +951,7 @@ export class AttioService {
         values: (e?.entry_values ?? {}) as Record<string, any>,
       }))
       .filter((e): e is AttioListEntry => !!e.entryId && !!e.personRecordId);
-    return { entries: detailed, nextCursor };
+    return { entries: detailed, nextOffset };
   }
 
   /**

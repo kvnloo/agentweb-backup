@@ -107,37 +107,58 @@ describe('AttioService', () => {
   // ─── People ──────────────────────────────────────────────────────
 
   describe('listPeople', () => {
-    it('returns mapped people array', async () => {
-      mockAxiosPost.mockResolvedValue({ data: { data: [MOCK_PERSON_RECORD], next_cursor: undefined } });
+    // Attio's /objects/{object}/records/query endpoints use limit/offset
+    // pagination, not cursor — confirmed against Attio's own docs. There is
+    // no next_cursor in the response envelope at all; end-of-results is
+    // inferred purely from getting back fewer than `limit` records.
+    it('returns mapped people array, sending offset:0 on the first page', async () => {
+      mockAxiosPost.mockResolvedValue({ data: { data: [MOCK_PERSON_RECORD] } });
 
       const result = await service.listPeople();
 
       expect(mockAxiosPost).toHaveBeenCalledWith(
         'https://api.attio.com/v2/objects/people/records/query',
-        { limit: 50 },
+        { limit: 50, offset: 0 },
         expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer test-token' }) })
       );
       expect(result.people).toHaveLength(1);
       expect(result.people[0]).toMatchObject({ recordId: 'rec-person-1', email: 'john@acme.com', firstName: 'John' });
     });
 
-    it('passes cursor for pagination', async () => {
-      mockAxiosPost.mockResolvedValue({ data: { data: [], next_cursor: 'next-page' } });
+    it('passes an explicit offset for a later page', async () => {
+      mockAxiosPost.mockResolvedValue({ data: { data: [] } });
 
-      const result = await service.listPeople('some-cursor');
+      await service.listPeople(50);
 
       expect(mockAxiosPost).toHaveBeenCalledWith(
         expect.any(String),
-        { limit: 50, cursor: 'some-cursor' },
+        { limit: 50, offset: 50 },
         expect.any(Object)
       );
-      expect(result.nextCursor).toBe('next-page');
+    });
+
+    it('reports nextOffset when a full page comes back (there may be more)', async () => {
+      const fullPage = Array.from({ length: 50 }, () => MOCK_PERSON_RECORD);
+      mockAxiosPost.mockResolvedValue({ data: { data: fullPage } });
+
+      const result = await service.listPeople(0);
+
+      expect(result.nextOffset).toBe(50);
+    });
+
+    it('reports nextOffset:undefined for a short page (end of results)', async () => {
+      mockAxiosPost.mockResolvedValue({ data: { data: [MOCK_PERSON_RECORD] } });
+
+      const result = await service.listPeople(100);
+
+      expect(result.nextOffset).toBeUndefined();
     });
 
     it('returns empty array when no records', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: [] } });
       const result = await service.listPeople();
       expect(result.people).toHaveLength(0);
+      expect(result.nextOffset).toBeUndefined();
     });
   });
 
@@ -454,25 +475,27 @@ describe('AttioService', () => {
       expect(result).toEqual({ count: 0, capped: false });
     });
 
-    it('sums entries across multiple pages', async () => {
+    it('sums entries across multiple pages, advancing offset by page size (limit/offset, not cursor)', async () => {
+      const fullPage = Array.from({ length: 50 }, (_, i) => ({ id: i }));
       mockAxiosPost
-        .mockResolvedValueOnce({ data: { data: [{ id: 1 }, { id: 2 }], next_cursor: 'page-2' } })
-        .mockResolvedValueOnce({ data: { data: [{ id: 3 }], next_cursor: undefined } });
+        .mockResolvedValueOnce({ data: { data: fullPage } })
+        .mockResolvedValueOnce({ data: { data: [{ id: 51 }] } });
 
       const result = await service.countListEntries('list-abc');
 
-      expect(result).toEqual({ count: 3, capped: false });
+      expect(result).toEqual({ count: 51, capped: false });
       expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+      expect(mockAxiosPost).toHaveBeenNthCalledWith(1, expect.any(String), { limit: 50, offset: 0 }, expect.any(Object));
+      expect(mockAxiosPost).toHaveBeenNthCalledWith(2, expect.any(String), { limit: 50, offset: 50 }, expect.any(Object));
     });
 
     it('stops after 200 pages and reports capped:true for a pathologically large list', async () => {
-      mockAxiosPost.mockImplementation(() =>
-        Promise.resolve({ data: { data: [{ id: 1 }], next_cursor: 'next' } })
-      );
+      const fullPage = Array.from({ length: 50 }, (_, i) => ({ id: i }));
+      mockAxiosPost.mockImplementation(() => Promise.resolve({ data: { data: fullPage } }));
 
       const result = await service.countListEntries('huge-list');
 
-      expect(result).toEqual({ count: 200, capped: true });
+      expect(result).toEqual({ count: 10000, capped: true });
       expect(mockAxiosPost).toHaveBeenCalledTimes(200);
     });
   });
@@ -508,11 +531,10 @@ describe('AttioService', () => {
               entry_values: { deal_value: [{ value: '100' }], deal_status: [{ status: 'open' }] },
             },
           ],
-          next_cursor: 'page-2',
         },
       });
 
-      const { entries, nextCursor } = await service.listListEntriesDetailed('list-abc');
+      const { entries, nextOffset } = await service.listListEntriesDetailed('list-abc');
 
       expect(entries).toEqual([
         {
@@ -521,7 +543,8 @@ describe('AttioService', () => {
           values: { deal_value: [{ value: '100' }], deal_status: [{ status: 'open' }] },
         },
       ]);
-      expect(nextCursor).toBe('page-2');
+      // A 1-entry page is short of the 50-entry limit — end of results.
+      expect(nextOffset).toBeUndefined();
     });
 
     it('defaults values to {} when entry_values is absent', async () => {
@@ -532,14 +555,27 @@ describe('AttioService', () => {
       expect(entries[0].values).toEqual({});
     });
 
-    it('passes the cursor through to the underlying request', async () => {
+    it('passes the offset through to the underlying request', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: [] } });
-      await service.listListEntriesDetailed('list-abc', 'some-cursor');
+      await service.listListEntriesDetailed('list-abc', 100);
       expect(mockAxiosPost).toHaveBeenCalledWith(
         expect.any(String),
-        expect.objectContaining({ cursor: 'some-cursor' }),
+        { limit: 50, offset: 100 },
         expect.any(Object)
       );
+    });
+
+    it('reports nextOffset when a full page comes back (there may be more)', async () => {
+      const fullPage = Array.from({ length: 50 }, (_, i) => ({
+        id: { entry_id: `entry-${i}` },
+        parent_record_id: `person-${i}`,
+        entry_values: {},
+      }));
+      mockAxiosPost.mockResolvedValue({ data: { data: fullPage } });
+
+      const { nextOffset } = await service.listListEntriesDetailed('list-abc', 0);
+
+      expect(nextOffset).toBe(50);
     });
   });
 });
