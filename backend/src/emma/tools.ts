@@ -949,9 +949,26 @@ ACTION MATRIX (entity_type → supported actions):
   DATASET       → LIST, GET_MATCH_QUALITY
 
 AD_CREATIVE GET — read ONE creative back by id (params.creative_id), including asset_feed_spec.
-  LIST is account-wide, capped, and omits asset_feed_spec, so it cannot tell you what a specific
-  creative actually contains. Use GET to verify a creative you just built or swapped onto an ad, and
-  to read a placement-customized creative (1:1 Feed + 9:16 Story/Reels) faithfully before cloning it.
+  LIST omits asset_feed_spec, so it cannot tell you what a specific creative actually contains.
+  Use GET to verify a creative you just built or swapped onto an ad, and to read a
+  placement-customized creative (1:1 Feed + 9:16 Story/Reels) faithfully before cloning it.
+
+SCOPING AND COMPLETENESS ON EVERY LIST — read this before reporting that something is absent.
+  ALWAYS pass campaign_id (or ad_set_id) when you care about one campaign or ad set. AD LIST
+  accepts both and scopes the read to that node. AD_CREATIVE LIST accepts ad_set_id only —
+  Meta has no campaign→creatives edge, so for campaign-scoped creatives use AD LIST with
+  campaign_id, which returns creative{...} inline on every ad.
+
+  Every LIST result carries "complete" and "hasMore" fields. A list is only the whole set when
+  complete is true, and the message says "(complete list)". When hasMore is true the read
+  stopped at a page bound and the set is PARTIAL.
+
+  ⚠ NEVER conclude that an ad, creative, campaign or ad set does not exist from a list where
+  complete is not true. An unscoped account-wide list is the weakest possible evidence of
+  absence. To check whether one specific thing exists, scope the list to its parent
+  (campaign_id / ad_set_id) or read the object directly by id — do not search a broad list and
+  report a miss. Reporting "not found" off a partial list has already told a customer that an
+  ad they were protecting did not exist, when it existed and we had paused it ourselves.
 
 READING CONFIG (LIST) — read what a campaign/ad set is actually set to optimize for (use to verify after a CREATE/UPDATE):
   AD_SET LIST returns optimization_goal, billing_event, destination_type, promoted_object (pixel_id + custom_event_type), bid_strategy, and budgets per ad set. Pass ad_set_id to read a single ad set; pass campaign_id to scope to one campaign's ad sets.
@@ -1111,11 +1128,11 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         campaign_id: {
           type: "string",
-          description: "Campaign ID. Required for: CAMPAIGN UPDATE/DELETE, AD_SET CREATE, AD_SET LIST (optional filter)."
+          description: "Campaign ID. Required for: CAMPAIGN UPDATE/DELETE, AD_SET CREATE, AD_SET LIST (optional filter), AD LIST (optional filter — scopes the read to that campaign; strongly preferred over listing the whole account)."
         },
         ad_set_id: {
           type: "string",
-          description: "Ad Set ID. Required for: AD_SET UPDATE/DELETE, AD CREATE, AD LIST (optional filter)."
+          description: "Ad Set ID. Required for: AD_SET UPDATE/DELETE, AD CREATE, AD LIST (optional filter), AD_CREATIVE LIST (optional filter). Scopes the read to that ad set; takes precedence over campaign_id when both are given."
         },
         ad_id: {
           type: "string",
