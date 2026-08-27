@@ -5558,9 +5558,14 @@ export class AgentModeService {
    * Excludes foundation tools and admin-only tools.
    */
   private getUnassociatedTools(publishedSkills: any[]): { name: string; description: string }[] {
-    // Collect all tool names used by any published skill
+    // Collect all tool names used by any published skill. Callers (e.g.
+    // loadAuthorizedSkillCatalog) pass a catalog that also mixes in unpublished
+    // private/org-shared skills for install purposes — those must NOT count here,
+    // or a single draft skill nobody published can silently steal a tool out of
+    // the shared __other_skills__ bundle for an entire org (ENG-1237).
     const associatedToolNames = new Set<string>();
     publishedSkills.forEach(skill => {
+      if (skill.isPublished !== true) return;
       skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
     });
 
@@ -5729,12 +5734,18 @@ export class AgentModeService {
     if (isWildcard || allowedSet.has(OTHER_SKILLS_VIRTUAL_ID)) {
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
       if (unassociatedTools.length > 0) {
+        // ENG-1237 follow-up: an unpublished/org-shared skill's own card already
+        // lists its toolNames above, and (correctly, post-ENG-1237) no longer
+        // removes those tools from this pool. Only trim the DISPLAY copy here —
+        // installability (the length check above) and execution (buildSkillContext,
+        // which never sees this per-user catalog) stay keyed on the real pool.
+        const displayedToolNames = new Set(skills.flatMap(s => s.toolNames));
         skills.push({
           skillId: OTHER_SKILLS_VIRTUAL_ID,
           name: 'Other Skills',
           description: 'Tools not associated with any specific skill',
           installed: installedIds.has(OTHER_SKILLS_VIRTUAL_ID),
-          toolNames: unassociatedTools.map(t => t.name)
+          toolNames: unassociatedTools.map(t => t.name).filter(name => !displayedToolNames.has(name))
         });
       }
     }
