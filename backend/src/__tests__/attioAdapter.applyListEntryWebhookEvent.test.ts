@@ -117,6 +117,32 @@ describe('AttioAdapter.applyListEntryWebhookEvent', () => {
     }));
   });
 
+  // Regression: a raw `{...lead.customFields, ...customFieldUpdates}` spread
+  // reproduces the char-indexed corruption pattern customFieldsGuard exists
+  // to prevent, if lead.customFields is ever a corrupted string rather than
+  // an object.
+  it('sanitizes a corrupted (string) existing customFields instead of char-indexing it into the merge', async () => {
+    const svc = makeSvc({
+      getListEntry: jest.fn().mockResolvedValue({
+        entryId: 'entry_1',
+        personRecordId: 'person_1',
+        values: { deal_priority: [{ value: 'High' }] },
+      }),
+      loadAttributeTypes: jest.fn().mockResolvedValue(new Map([
+        ['list:deallist_1:deal_priority', 'text'],
+      ])),
+    });
+    mockGetLeadByAttioRecordId.mockResolvedValue({ leadId: 'lead_1', customFields: '{"corrupted":true}' as any, syncMetadata: {} });
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    await adapter.applyListEntryWebhookEvent('list_1', makeConfig(), svc as any, 'entry_1', 'list-entry.updated');
+
+    expect(mockUpdateLead).toHaveBeenCalledWith('list_1', 'lead_1', expect.objectContaining({
+      customFields: { priority: 'High' },
+    }));
+    (console.error as jest.Mock).mockRestore();
+  });
+
   it('list-entry.deleted clears the deal link on the matching lead without deleting it', async () => {
     mockGetLeadByAttioListEntryId.mockResolvedValue({
       leadId: 'lead_1',

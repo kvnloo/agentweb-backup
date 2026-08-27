@@ -4,6 +4,7 @@ import { AttioService } from '../attioService';
 import { crmDb } from '../db';
 import { buildSyncedMetadataBase, buildFailedMetadata } from '../../utils/leadSyncStatus';
 import { validateEmail } from '../../utils/validation';
+import { mergeCustomFields } from '../../utils/customFieldsGuard';
 
 /**
  * System list-identity mapping, mirroring HUBSPOT_LIST_IDENTITY_MAPPING
@@ -675,7 +676,11 @@ export class AttioAdapter implements CrmAdapter {
         }
 
         if (Object.keys(customFieldUpdates).length > 0) {
-            leadUpdates.customFields = { ...(lead.customFields || {}), ...customFieldUpdates };
+            leadUpdates.customFields = mergeCustomFields(
+                lead.customFields,
+                customFieldUpdates,
+                { source: 'attioAdapter.applyListEntryWebhookEvent', listId, leadId: lead.leadId },
+            );
         }
         leadUpdates.syncMetadata = { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId };
 
