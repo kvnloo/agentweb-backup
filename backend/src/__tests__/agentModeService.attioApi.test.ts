@@ -189,6 +189,23 @@ describe('LIST_ENTRIES ADD_ENTRIES', () => {
       { recordId: 'p2', success: false, error: 'already in list' },
     ]);
   });
+
+  it('returns success: false when every record fails', async () => {
+    mockAddPersonToList.mockRejectedValue(new Error('quota exceeded'));
+
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'ADD_ENTRIES', list_id: LIST_ID, record_ids: ['p1', 'p2'] });
+
+    expect(result.success).toBe(false);
+    expect(result.results.every((r: any) => !r.success)).toBe(true);
+  });
+
+  it('rejects a non-array record_ids (e.g. a bare string) instead of iterating it character-by-character', async () => {
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'ADD_ENTRIES', list_id: LIST_ID, record_ids: 'p1' as any });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/record_ids/i);
+    expect(mockAddPersonToList).not.toHaveBeenCalled();
+  });
 });
 
 describe('LIST_ENTRIES REMOVE_ENTRIES', () => {
@@ -223,8 +240,33 @@ describe('LIST_ENTRIES REMOVE_ENTRIES', () => {
     const result = await at({ entity_type: 'LIST_ENTRIES', action: 'REMOVE_ENTRIES', list_id: LIST_ID, record_ids: ['p1'] });
 
     expect(mockDeleteListEntry).not.toHaveBeenCalled();
-    expect(result.success).toBe(true);
+    // The one and only record failed — the call as a whole did not succeed,
+    // not a blanket success: true that would mislead the model.
+    expect(result.success).toBe(false);
     expect(result.results).toEqual([{ recordId: 'p1', success: false, error: 'No list entry found for this record.' }]);
+  });
+
+  it('returns success: true when at least one record succeeds among failures', async () => {
+    mockFindListEntry
+      .mockResolvedValueOnce('entry_1')
+      .mockResolvedValueOnce(null);
+    mockDeleteListEntry.mockResolvedValue(undefined);
+
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'REMOVE_ENTRIES', list_id: LIST_ID, record_ids: ['p1', 'p2'] });
+
+    expect(result.success).toBe(true);
+    expect(result.results).toEqual([
+      { recordId: 'p1', success: true },
+      { recordId: 'p2', success: false, error: 'No list entry found for this record.' },
+    ]);
+  });
+
+  it('rejects a non-array record_ids (e.g. a bare string) instead of iterating it character-by-character', async () => {
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'REMOVE_ENTRIES', list_id: LIST_ID, record_ids: 'p1' as any });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/record_ids/i);
+    expect(mockFindListEntry).not.toHaveBeenCalled();
   });
 
   it('routes to the Company-record lookup when the target list holds companies', async () => {

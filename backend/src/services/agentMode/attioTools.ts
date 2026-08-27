@@ -127,8 +127,14 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
         }
         case 'ADD_ENTRIES': {
           if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES ADD_ENTRIES.' };
-          const recordIds: string[] = args?.record_ids ?? [];
-          if (!recordIds.length) return { success: false, error: 'record_ids array is required for LIST_ENTRIES ADD_ENTRIES.' };
+          // record_ids comes from model-generated tool arguments and is never
+          // type-checked against the schema — a string here (e.g. a single id
+          // passed without brackets) has a truthy .length and would otherwise
+          // be iterated character-by-character.
+          const recordIds: string[] = Array.isArray(args?.record_ids) ? args.record_ids : [];
+          if (!recordIds.length || recordIds.some(id => typeof id !== 'string' || !id.trim())) {
+            return { success: false, error: 'record_ids must be a non-empty array of record id strings for LIST_ENTRIES ADD_ENTRIES.' };
+          }
           if (recordIds.length > MAX_LIST_ENTRY_RECORD_IDS) {
             return { success: false, error: `record_ids exceeds the maximum of ${MAX_LIST_ENTRY_RECORD_IDS} per call.` };
           }
@@ -147,12 +153,16 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
               return { recordId, success: false, error: err?.response?.data?.message ?? err?.message };
             }
           });
-          return { success: true, results };
+          // If every record failed, the call as a whole did not succeed —
+          // the model should see that rather than a blanket success: true.
+          return { success: results.some(r => r.success), results };
         }
         case 'REMOVE_ENTRIES': {
           if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES REMOVE_ENTRIES.' };
-          const recordIds: string[] = args?.record_ids ?? [];
-          if (!recordIds.length) return { success: false, error: 'record_ids array is required for LIST_ENTRIES REMOVE_ENTRIES.' };
+          const recordIds: string[] = Array.isArray(args?.record_ids) ? args.record_ids : [];
+          if (!recordIds.length || recordIds.some(id => typeof id !== 'string' || !id.trim())) {
+            return { success: false, error: 'record_ids must be a non-empty array of record id strings for LIST_ENTRIES REMOVE_ENTRIES.' };
+          }
           if (recordIds.length > MAX_LIST_ENTRY_RECORD_IDS) {
             return { success: false, error: `record_ids exceeds the maximum of ${MAX_LIST_ENTRY_RECORD_IDS} per call.` };
           }
@@ -169,7 +179,7 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
               return { recordId, success: false, error: err?.response?.data?.message ?? err?.message };
             }
           });
-          return { success: true, results };
+          return { success: results.some(r => r.success), results };
         }
         default:
           return { success: false, error: `Unknown action "${action}" for LIST_ENTRIES. Valid: COUNT, ADD_ENTRIES, REMOVE_ENTRIES.` };
