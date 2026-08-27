@@ -315,6 +315,16 @@ describe('AttioAdapter.pushLeads — deal list sync', () => {
     );
   });
 
+  it('stamps attio_deal_list_id alongside the entry id, so a later delete can target the right list', async () => {
+    await adapter.pushLeads(auth, [makeLead()], makeConfig({ dealFieldMapping: dealMapping }));
+
+    expect(crmDb.updateLead).toHaveBeenCalledWith(
+      'list_1',
+      'l1',
+      expect.objectContaining({ syncMetadata: expect.objectContaining({ attio_list_entry_id: 'entry_1', attio_deal_list_id: 'deallist_1' }) })
+    );
+  });
+
   it('stamps syncStatus=synced + lastSyncedAt on a successful push (Gap 1 closure)', async () => {
     await adapter.pushLeads(auth, [makeLead()], makeConfig({ dealFieldMapping: [] }));
 

@@ -167,6 +167,10 @@ describe('AttioAdapter.pullContacts — deal entry pull', () => {
     expect(leadData.dealValue).toBe(5000); // native field -> top-level
     expect(leadData.status).toBe('open'); // native field -> top-level
     expect(leadData.syncMetadata.attio_list_entry_id).toBe('entry_1');
+    // Stamped alongside the entry id so a later delete targets the list this
+    // entry actually lives in, not whatever attioDealListId the config might
+    // point at after a later changePipeline re-point.
+    expect(leadData.syncMetadata.attio_deal_list_id).toBe('deallist_1');
   });
 
   it('routes a non-native deal field into customFields', async () => {

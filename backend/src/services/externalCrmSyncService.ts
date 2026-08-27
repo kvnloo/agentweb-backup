@@ -876,9 +876,20 @@ export class ExternalCrmSyncService {
       // analog (a List Entry) must also be removed, or it's orphaned in the
       // workspace. Non-critical: an entry-deletion failure shouldn't block
       // deleting the Person record.
+      //
+      // Unlike HubSpot's deleteDeal (a standalone-object delete, unaffected
+      // by which pipeline the deal is currently in), an Attio List Entry
+      // lives inside a specific list — deleting it requires the list it's
+      // actually in, not whatever attioDealListId the config points at now.
+      // changePipeline re-points the config without migrating existing
+      // leads' pointers, so a lead not yet re-pushed since a re-point still
+      // has its entry in the OLD list. Prefer the list id stamped on the
+      // lead itself at write time; fall back to the config's current value
+      // only for a lead synced before this stamp existed.
       const entryId = lead.syncMetadata?.attio_list_entry_id ?? lead.customFields?.attio_list_entry_id;
-      if (entryId && config.attioDealListId) {
-        await svc.deleteListEntry(config.attioDealListId, entryId).catch(err =>
+      const entryListId = lead.syncMetadata?.attio_deal_list_id ?? lead.customFields?.attio_deal_list_id ?? config.attioDealListId;
+      if (entryId && entryListId) {
+        await svc.deleteListEntry(entryListId, entryId).catch(err =>
           console.error(`[ExternalCrmSync] deleteLeadFromCrm: failed to delete list entry ${entryId}:`, err.message)
         );
       }

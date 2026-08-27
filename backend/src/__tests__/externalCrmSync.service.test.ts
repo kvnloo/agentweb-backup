@@ -1934,6 +1934,34 @@ describe('ExternalCrmSyncService', () => {
       expect(mockAttioServiceInstance.deleteListEntry).toHaveBeenCalledWith('deallist_1', 'entry_1');
     });
 
+    it('deletes the list entry from the list stamped on the lead, not the config\'s current (re-pointed) list', async () => {
+      // The lead was pushed to the OLD deal list, then changePipeline
+      // re-pointed the config to a NEW list without migrating this lead's
+      // pointer (self-heals lazily on next push, not yet re-pushed). Deletion
+      // must still target the list the entry actually lives in.
+      const config = makeConfig({ provider: 'attio', deleteOnPush: true, attioDealListId: 'new_list' });
+      mockListWithConfig(config, 'attio');
+
+      await service.deleteLeadFromCrm('user1', 'list1', 'attio', {
+        leadId: 'l1', email: 'a@b.com',
+        syncMetadata: { attio_record_id: 'p123', attio_list_entry_id: 'entry_1', attio_deal_list_id: 'old_list' },
+      });
+
+      expect(mockAttioServiceInstance.deleteListEntry).toHaveBeenCalledWith('old_list', 'entry_1');
+    });
+
+    it('falls back to the config\'s attioDealListId for a lead synced before attio_deal_list_id was stamped', async () => {
+      const config = makeConfig({ provider: 'attio', deleteOnPush: true, attioDealListId: 'deallist_1' });
+      mockListWithConfig(config, 'attio');
+
+      await service.deleteLeadFromCrm('user1', 'list1', 'attio', {
+        leadId: 'l1', email: 'a@b.com',
+        syncMetadata: { attio_record_id: 'p123', attio_list_entry_id: 'entry_1' }, // no attio_deal_list_id
+      });
+
+      expect(mockAttioServiceInstance.deleteListEntry).toHaveBeenCalledWith('deallist_1', 'entry_1');
+    });
+
     it('does not fail person deletion when list-entry deletion fails (non-critical)', async () => {
       const config = makeConfig({ provider: 'attio', deleteOnPush: true, attioDealListId: 'deallist_1' });
       mockListWithConfig(config, 'attio');

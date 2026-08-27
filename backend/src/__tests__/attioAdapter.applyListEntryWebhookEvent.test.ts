@@ -113,7 +113,7 @@ describe('AttioAdapter.applyListEntryWebhookEvent', () => {
       dealValue: 9999,
       status: 'Won',
       customFields: { existing: 'kept', priority: 'High' },
-      syncMetadata: { attio_list_entry_id: 'entry_1' },
+      syncMetadata: { attio_list_entry_id: 'entry_1', attio_deal_list_id: 'deallist_1' },
     }));
   });
 
@@ -155,6 +155,20 @@ describe('AttioAdapter.applyListEntryWebhookEvent', () => {
     expect(svc.getListEntry).not.toHaveBeenCalled(); // deletion doesn't need a live fetch
     expect(mockUpdateLead).toHaveBeenCalledWith('list_1', 'lead_1', {
       syncMetadata: { attio_record_id: 'person_1', syncStatus: 'synced' }, // attio_list_entry_id genuinely absent, not undefined
+    });
+  });
+
+  it('list-entry.deleted also clears the stamped deal-list id, not just the entry id', async () => {
+    mockGetLeadByAttioListEntryId.mockResolvedValue({
+      leadId: 'lead_1',
+      syncMetadata: { attio_record_id: 'person_1', attio_list_entry_id: 'entry_1', attio_deal_list_id: 'deallist_1' },
+    });
+    const svc = makeSvc();
+
+    await adapter.applyListEntryWebhookEvent('list_1', makeConfig(), svc as any, 'entry_1', 'list-entry.deleted');
+
+    expect(mockUpdateLead).toHaveBeenCalledWith('list_1', 'lead_1', {
+      syncMetadata: { attio_record_id: 'person_1' },
     });
   });
 

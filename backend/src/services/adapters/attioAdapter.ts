@@ -344,10 +344,17 @@ export class AttioAdapter implements CrmAdapter {
                         }
 
                         if (entryId && entryId !== existingEntryId) {
+                            // Stamp attio_deal_list_id alongside the entry id so a
+                            // later delete (deleteLeadFromCrm) targets the list this
+                            // entry actually lives in, not whatever attioDealListId
+                            // the config happens to point at by then — changePipeline
+                            // re-points the config without migrating existing leads'
+                            // pointers (self-heals lazily on next push, same as here),
+                            // so those can diverge for a lead not yet re-pushed.
                             await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
-                                syncMetadata: { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId },
+                                syncMetadata: { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId, attio_deal_list_id: dealListId },
                             }).catch((err: any) => { });
-                            lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId };
+                            lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId, attio_deal_list_id: dealListId };
                         }
                     } catch (e: any) {
                         const msg = e.response?.data?.message || e.message || 'Unknown error';
@@ -558,6 +565,9 @@ export class AttioAdapter implements CrmAdapter {
                             }
                         }
                         syncMetadata.attio_list_entry_id = dealEntry.entryId;
+                        // See pushLeads' identical stamp for why: lets a later
+                        // delete target the list this entry actually lives in.
+                        syncMetadata.attio_deal_list_id = config.attioDealListId;
                     }
 
                 } catch (e: any) {
@@ -647,6 +657,7 @@ export class AttioAdapter implements CrmAdapter {
             // as far as DynamoDB's marshaller is concerned.
             const syncMetadata = { ...(lead.syncMetadata || {}) };
             delete syncMetadata.attio_list_entry_id;
+            delete syncMetadata.attio_deal_list_id;
             await crmDb.updateLead(listId, lead.leadId, { syncMetadata });
             console.log(`[AttioWebhook] Cleared deal link on lead ${lead.leadId} in list ${listId} (entry ${entryId} deleted)`);
             return;
@@ -682,7 +693,7 @@ export class AttioAdapter implements CrmAdapter {
                 { source: 'attioAdapter.applyListEntryWebhookEvent', listId, leadId: lead.leadId },
             );
         }
-        leadUpdates.syncMetadata = { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId };
+        leadUpdates.syncMetadata = { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId, attio_deal_list_id: config.attioDealListId };
 
         await crmDb.updateLead(listId, lead.leadId, leadUpdates);
         console.log(`[AttioWebhook] Updated deal fields on lead ${lead.leadId} in list ${listId} from entry ${entryId}`);
@@ -792,6 +803,11 @@ export class AttioAdapter implements CrmAdapter {
         const cleanType = type.replace(/-/g, '_');
         switch (cleanType) {
             case 'status': return { status: str };
+            // select/number shapes confirmed against Attio's official docs
+            // (docs.attio.com/rest-api/attribute-types/attribute-types-select
+            // and .../attribute-types-number): select writes as {option: str},
+            // number writes as {value: num} — matches extractAttioValue's
+            // read-side entry.option?.title / entry.value below exactly.
             case 'select': return { option: str };
             case 'number': return { value: Number(str) };
             case 'currency': return { currency_value: Number(String(value).replace(/[^0-9.]/g, '')) };
