@@ -90,10 +90,23 @@ jest.mock('../services/contactCaptureHooks', () => ({
   onPublicPageVisited: jest.fn(),
 }));
 jest.mock('../services/db', () => ({
-  crmDb: { getLeadListsByUserId: jest.fn().mockResolvedValue([]) },
+  crmDb: {
+    getLeadListsByUserId: jest.fn().mockResolvedValue([]),
+    // Defaults to "not an AgentWeb list" so every pre-existing test's LIST_ID
+    // is treated as a raw Attio list id, unchanged from before the access-
+    // control fix. Tests that need a matching AgentWeb list override this.
+    getLeadListById: jest.fn().mockResolvedValue(null),
+  },
   userDb: { getUserById: jest.fn() },
   accountMemoryDb: { getMemories: jest.fn().mockResolvedValue([]), putMemory: jest.fn(), deleteMemory: jest.fn() },
   orgMemoryDb: { getMemories: jest.fn().mockResolvedValue([]) },
+}));
+const mockCanAccessCrmList = jest.fn().mockResolvedValue(true);
+const mockCanDestructiveCrmList = jest.fn().mockResolvedValue(true);
+jest.mock('../services/crmAccessControl', () => ({
+  canAccessCrmList: (...a: any[]) => mockCanAccessCrmList(...a),
+  canDestructiveCrmList: (...a: any[]) => mockCanDestructiveCrmList(...a),
+  CRM_EDITOR_REQUIRED_MESSAGE: 'Only the list owner, the org owner, or a listed CRM editor can do this.',
 }));
 jest.mock('../mcp/server/registry', () => ({
   McpToolRegistry: jest.fn().mockImplementation(() => ({ register: jest.fn(), getTool: jest.fn(), getToolNames: jest.fn(() => []), getAllToolDefinitions: jest.fn(() => []), getAllTools: jest.fn(() => []) })),
@@ -198,7 +211,7 @@ describe('LIST_ENTRIES REMOVE_ENTRIES', () => {
 
     const result = await at({ entity_type: 'LIST_ENTRIES', action: 'REMOVE_ENTRIES', list_id: LIST_ID, record_ids: ['p1'] });
 
-    expect(mockFindListEntry).toHaveBeenCalledWith(LIST_ID, 'p1');
+    expect(mockFindListEntry).toHaveBeenCalledWith(LIST_ID, 'p1', 'people');
     expect(mockDeleteListEntry).toHaveBeenCalledWith(LIST_ID, 'entry_1');
     expect(result.success).toBe(true);
     expect(result.results).toEqual([{ recordId: 'p1', success: true }]);
@@ -212,6 +225,84 @@ describe('LIST_ENTRIES REMOVE_ENTRIES', () => {
     expect(mockDeleteListEntry).not.toHaveBeenCalled();
     expect(result.success).toBe(true);
     expect(result.results).toEqual([{ recordId: 'p1', success: false, error: 'No list entry found for this record.' }]);
+  });
+
+  it('routes to the Company-record lookup when the target list holds companies', async () => {
+    mockGetAllLists.mockResolvedValue([{ id: LIST_ID, name: 'Accounts', parentObject: 'companies' }]);
+    mockFindListEntry.mockResolvedValue('entry_9');
+    mockDeleteListEntry.mockResolvedValue(undefined);
+
+    await at({ entity_type: 'LIST_ENTRIES', action: 'REMOVE_ENTRIES', list_id: LIST_ID, record_ids: ['c1'] });
+
+    expect(mockFindListEntry).toHaveBeenCalledWith(LIST_ID, 'c1', 'companies');
+  });
+});
+
+// ─── LIST_ENTRIES access control ────────────────────────────────────────────
+// resolveAttioListId only enforces the shared CRM policy when list_id
+// resolves to a real AgentWeb list (getLeadListById returns one with an
+// attioDealListId) — a raw Attio list id with no matching AgentWeb list
+// runs under the caller's own Attio credentials with no AgentWeb object to
+// protect, unaffected by this gate (covered by every test above, since the
+// default db mock returns null).
+
+describe('LIST_ENTRIES access control (list_id resolves to a real AgentWeb list)', () => {
+  const AGENTWEB_LIST_ID = 'lead_list_1';
+  const RESOLVED_ATTIO_LIST_ID = 'attio-deal-list-9';
+
+  beforeEach(() => {
+    const { crmDb } = require('../services/db');
+    crmDb.getLeadListById.mockResolvedValue({
+      listId: AGENTWEB_LIST_ID,
+      userId: 'other-user',
+      externalCrmSyncConfigs: { attio: { attioDealListId: RESOLVED_ATTIO_LIST_ID } },
+    });
+  });
+
+  it('COUNT calls canAccessCrmList (read), not canDestructiveCrmList', async () => {
+    mockCountListEntries.mockResolvedValue(3);
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'COUNT', list_id: AGENTWEB_LIST_ID });
+
+    expect(mockCanAccessCrmList).toHaveBeenCalled();
+    expect(mockCanDestructiveCrmList).not.toHaveBeenCalled();
+    expect(mockCountListEntries).toHaveBeenCalledWith(RESOLVED_ATTIO_LIST_ID);
+    expect(result.success).toBe(true);
+  });
+
+  it('COUNT is denied when the caller cannot access the list', async () => {
+    mockCanAccessCrmList.mockResolvedValueOnce(false);
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'COUNT', list_id: AGENTWEB_LIST_ID });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/CRM editor/i);
+    expect(mockCountListEntries).not.toHaveBeenCalled();
+  });
+
+  it('ADD_ENTRIES requires canDestructiveCrmList and is denied for a non-editor same-org member', async () => {
+    mockCanDestructiveCrmList.mockResolvedValueOnce(false);
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'ADD_ENTRIES', list_id: AGENTWEB_LIST_ID, record_ids: ['p1'] });
+
+    expect(mockCanDestructiveCrmList).toHaveBeenCalled();
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/CRM editor/i);
+    expect(mockAddPersonToList).not.toHaveBeenCalled();
+  });
+
+  it('REMOVE_ENTRIES requires canDestructiveCrmList and is denied for a non-editor same-org member', async () => {
+    mockCanDestructiveCrmList.mockResolvedValueOnce(false);
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'REMOVE_ENTRIES', list_id: AGENTWEB_LIST_ID, record_ids: ['p1'] });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/CRM editor/i);
+    expect(mockFindListEntry).not.toHaveBeenCalled();
+  });
+
+  it('ADD_ENTRIES proceeds against the resolved Attio list id when the caller is authorized', async () => {
+    mockAddPersonToList.mockResolvedValue('entry_1');
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'ADD_ENTRIES', list_id: AGENTWEB_LIST_ID, record_ids: ['p1'] });
+
+    expect(mockAddPersonToList).toHaveBeenCalledWith(RESOLVED_ATTIO_LIST_ID, 'p1');
+    expect(result.success).toBe(true);
   });
 });
 

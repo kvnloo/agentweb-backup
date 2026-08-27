@@ -417,11 +417,12 @@ export class AttioService {
     return this.objectSlugCache.get(objectId) ?? null;
   }
 
-  async getAllLists(): Promise<Array<{ id: string; name: string }>> {
+  async getAllLists(): Promise<Array<{ id: string; name: string; parentObject: 'people' | 'companies' | string }>> {
     const res = await axiosInstance.get(`${this.baseUrl}/lists`, { headers: this.headers() });
     return ((res.data as any)?.data ?? []).map((l: any) => ({
       id: l.id?.list_id as string,
       name: l.name as string,
+      parentObject: l.parent_object as string,
     }));
   }
 
@@ -585,10 +586,11 @@ export class AttioService {
 
   async findListEntry(
     listId: string,
-    personRecordId: string
+    recordId: string,
+    objectSlug: 'people' | 'companies' = 'people'
   ): Promise<string | null> {
     const res = await axiosInstance.get(
-      `${this.baseUrl}/objects/people/records/${personRecordId}/entries`,
+      `${this.baseUrl}/objects/${objectSlug}/records/${recordId}/entries`,
       { headers: this.headers() }
     );
     const entries = (res.data as any)?.data ?? [];
@@ -623,8 +625,8 @@ export class AttioService {
   // Delete doesn't), and update-a-list's fields have no archive/is_archived
   // option either. Deleting a list is only possible through Attio's own UI.
 
-  async addCompanyToList(listId: string, recordId: string): Promise<void> {
-    await axiosInstance.post(
+  async addCompanyToList(listId: string, recordId: string): Promise<string | undefined> {
+    const res = await axiosInstance.post(
       `${this.baseUrl}/lists/${listId}/entries`,
       {
         data: {
@@ -635,6 +637,7 @@ export class AttioService {
       },
       { headers: this.headers() }
     );
+    return (res.data as any)?.data?.id?.entry_id;
   }
 
   // ─── Webhooks ──────────────────────────────────────────────────────────────

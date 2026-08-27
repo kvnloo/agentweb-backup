@@ -334,7 +334,7 @@ import {
   trackingOverrideTokenMatches,
 } from './metaLaunchGate';
 import { HubSpotService } from './hubspotService';
-import { AttioService } from './attioService';
+import { handleAttioApi as handleAttioApiImpl } from './agentMode/attioTools';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
@@ -35099,150 +35099,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
-  private async resolveAttioService(userId: string, accountId?: string): Promise<AttioService> {
-    try {
-      return await AttioService.create(userId, accountId);
-    } catch (err: any) {
-      // An explicit account_id or a multi-account ambiguity is actionable by the
-      // caller — surface it instead of silently falling back to token-paste.
-      if (accountId || /multiple attio accounts/i.test(err?.message ?? '')) throw err;
-      // Fall back to token-paste: scan lead lists for Attio apiKeyEncrypted
-    }
-    const { crmDb } = await import('./db');
-    const lists = await crmDb.getLeadListsByUserId(userId);
-    for (const list of lists as any[]) {
-      const attioConfig = list?.externalCrmSyncConfigs?.attio;
-      if (attioConfig?.apiKeyEncrypted) {
-        const { decryptPassword } = await import('../utils/crypto');
-        const { password } = decryptPassword(attioConfig.apiKeyEncrypted);
-        return AttioService.fromToken(password);
-      }
-    }
-    throw new Error('No Attio account connected. Please connect Attio in Settings → External CRM Sync or via OAuth in Connected Accounts.');
-  }
-
   /**
-   * Resolves a `list_id` argument that may be either an AgentWeb lead-list id
-   * or a raw Attio list id. Emma's other tools (get_lead_lists, etc.) only
-   * ever hand back AgentWeb list ids, so without this the model has no way
-   * to discover the Attio deal-list's actual id and either guesses wrong
-   * (404) or asks the user to paste a UUID it has no reason to know. If
-   * `candidateId` matches one of the user's own lead lists with a cached
-   * `attioDealListId`, substitute that; otherwise assume it's already a raw
-   * Attio list id (still supported, for anyone who does have one to hand).
-   */
-  private async resolveAttioListId(userId: string, candidateId: string): Promise<string> {
-    const { externalCrmSyncService } = await import('./externalCrmSyncService');
-    try {
-      const config = await externalCrmSyncService.getConfig(userId, candidateId, 'attio');
-      if (config?.attioDealListId) return config.attioDealListId;
-    } catch {
-      // Not an AgentWeb list id (or no Attio config for it) — fall through.
-    }
-    return candidateId;
-  }
-
-  /**
-   * Emma tool: read-only Attio lead counts, for CPL/attribution reporting.
-   * Deliberately narrower than handleHubspotApi — Attio has no equivalent of
-   * HubSpot's marketing-asset concepts (campaigns, emails, landing pages,
-   * workflows, social broadcasts), so this only covers what was actually
-   * asked for: counting leads in an Attio list.
+   * Emma tool: read-only Attio lead counts, for CPL/attribution reporting,
+   * plus Attio list/list-entry management. Extracted to
+   * services/agentMode/attioTools.ts (self-contained, no monolith coupling)
+   * per this file's subtraction-biased complexity policy.
    */
   public async handleAttioApi(userId: string, args: any): Promise<any> {
-    const entityType: string = (args?.entity_type ?? '').toUpperCase();
-    const action: string = (args?.action ?? '').toUpperCase();
-    try {
-      const svc = await this.resolveAttioService(userId, args?.account_id);
-
-      // ─── LIST_ENTRIES ──────────────────────────────────────────────────────
-      // Entry-level actions scoped to one already-identified list — these go
-      // through resolveAttioListId (AgentWeb list id or raw Attio list id),
-      // same as the pre-existing COUNT action.
-      if (entityType === 'LIST_ENTRIES') {
-        switch (action) {
-          case 'COUNT': {
-            if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES COUNT.' };
-            const attioListId = await this.resolveAttioListId(userId, args.list_id);
-            const count = await svc.countListEntries(attioListId);
-            return { success: true, count };
-          }
-          case 'ADD_ENTRIES': {
-            if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES ADD_ENTRIES.' };
-            const recordIds: string[] = args?.record_ids ?? [];
-            if (!recordIds.length) return { success: false, error: 'record_ids array is required for LIST_ENTRIES ADD_ENTRIES.' };
-            const attioListId = await this.resolveAttioListId(userId, args.list_id);
-            const results = await Promise.all(recordIds.map(async recordId => {
-              try {
-                const entryId = await svc.addPersonToList(attioListId, recordId);
-                return { recordId, success: true, entryId };
-              } catch (err: any) {
-                return { recordId, success: false, error: err?.response?.data?.message ?? err?.message };
-              }
-            }));
-            return { success: true, results };
-          }
-          case 'REMOVE_ENTRIES': {
-            if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES REMOVE_ENTRIES.' };
-            const recordIds: string[] = args?.record_ids ?? [];
-            if (!recordIds.length) return { success: false, error: 'record_ids array is required for LIST_ENTRIES REMOVE_ENTRIES.' };
-            const attioListId = await this.resolveAttioListId(userId, args.list_id);
-            const results = await Promise.all(recordIds.map(async recordId => {
-              try {
-                const entryId = await svc.findListEntry(attioListId, recordId);
-                if (!entryId) return { recordId, success: false, error: 'No list entry found for this record.' };
-                await svc.deleteListEntry(attioListId, entryId);
-                return { recordId, success: true };
-              } catch (err: any) {
-                return { recordId, success: false, error: err?.response?.data?.message ?? err?.message };
-              }
-            }));
-            return { success: true, results };
-          }
-          default:
-            return { success: false, error: `Unknown action "${action}" for LIST_ENTRIES. Valid: COUNT, ADD_ENTRIES, REMOVE_ENTRIES.` };
-        }
-      }
-
-      // ─── LISTS ─────────────────────────────────────────────────────────────
-      // Whole-list actions (create/enumerate a list itself). No DELETE action:
-      // live-verified against Attio's REST API (ENG-1380) that no delete-list
-      // endpoint exists at all — deleting a list is only possible through
-      // Attio's own UI. Deliberately NOT routed through resolveAttioListId —
-      // that helper exists specifically to disambiguate an entry-scoped id
-      // against one already-bound deal list, and applying it here (e.g. to a
-      // raw id returned by LIST/GET) risks silently resolving to an unrelated
-      // AgentWeb list's own deal-list id.
-      if (entityType === 'LISTS') {
-        switch (action) {
-          case 'LIST': {
-            const lists = await svc.getAllLists();
-            return { success: true, lists };
-          }
-          case 'GET': {
-            if (!args?.list_id) return { success: false, error: 'list_id is required for LISTS GET.' };
-            const lists = await svc.getAllLists();
-            const list = lists.find(l => l.id === args.list_id);
-            if (!list) return { success: false, error: `List not found in Attio: ${args.list_id}` };
-            return { success: true, list };
-          }
-          case 'CREATE': {
-            const name: string = args?.name ?? '';
-            if (!name.trim()) return { success: false, error: 'name is required for LISTS CREATE.' };
-            const objectSlug: 'people' | 'companies' = args?.object_type === 'companies' ? 'companies' : 'people';
-            const listId = await svc.createList(name.trim(), objectSlug);
-            return { success: true, list_id: listId };
-          }
-          default:
-            return { success: false, error: `Unknown action "${action}" for LISTS. Valid: LIST, GET, CREATE. (Attio's API has no delete-list endpoint — remove a list from Attio's own UI.)` };
-        }
-      }
-
-      return { success: false, error: `Unknown entity_type "${entityType}". Valid: LIST_ENTRIES, LISTS.` };
-    } catch (err: any) {
-      return { success: false, error: err?.message ?? 'Attio API call failed.', attioError: err?.response?.data ?? null, status: err?.response?.status ?? null };
-    }
+    return handleAttioApiImpl(userId, args);
   }
+
 
 }
 
