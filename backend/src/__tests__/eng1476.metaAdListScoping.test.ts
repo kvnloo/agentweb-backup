@@ -490,7 +490,7 @@ describe('ENG-1476 listAds — pagination', () => {
         (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAds: NEVER }));
         const p = service.listAds('act123', 'tok');
         const assertion = expect(p).rejects.toThrow(/did not respond within/);
-        await jest.advanceTimersByTimeAsync(16_000);
+        await jest.advanceTimersByTimeAsync(31_000);
         await assertion;
       } finally {
         jest.useRealTimers();
@@ -508,7 +508,7 @@ describe('ENG-1476 listAds — pagination', () => {
         }));
 
         const p = service.listAds('act123', 'tok');
-        await jest.advanceTimersByTimeAsync(16_000);
+        await jest.advanceTimersByTimeAsync(31_000);
         const result = await p;
 
         // Page 1 already arrived; the hang must not throw it away.
@@ -527,10 +527,46 @@ describe('ENG-1476 listAds — pagination', () => {
         const p = service.listAds('act123', 'tok', undefined, { campaignId: 'camp_x' });
         const assertion = expect(p).rejects.toThrow(/Could not verify the requested campaign/);
         // Two attempts, each with its own deadline.
-        await jest.advanceTimersByTimeAsync(40_000);
+        await jest.advanceTimersByTimeAsync(70_000);
         await assertion;
         expect(getAds).not.toHaveBeenCalled();
       } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    /**
+     * When the deadline wins, the original request is still in flight. A LATE rejection with no
+     * listener becomes an unhandledRejection, and server.ts's global handler logs `reason` in
+     * full — for a Meta error that includes the request URL, and a PAGED Graph URL carries the
+     * access token in its query string. So a late failure would print a live credential.
+     */
+    it('swallows a LATE rejection instead of leaking it as an unhandled rejection', async () => {
+      jest.useFakeTimers();
+      const seen: unknown[] = [];
+      const onUnhandled = (r: unknown) => seen.push(r);
+      process.on('unhandledRejection', onUnhandled);
+      try {
+        let rejectLate: (e: Error) => void = () => {};
+        (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+          getAds: () => new Promise((_res, rej) => { rejectLate = rej; }),
+        }));
+
+        const p = service.listAds('act123', 'tok');
+        const assertion = expect(p).rejects.toThrow(/did not respond within/);
+        await jest.advanceTimersByTimeAsync(31_000);
+        await assertion;
+
+        // Now the abandoned request fails, carrying a token-bearing URL.
+        rejectLate(Object.assign(new Error('late failure'), {
+          url: 'https://graph.facebook.com/v24.0/act_1/ads?access_token=SECRET&after=x',
+        }));
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(seen).toHaveLength(0);
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
         jest.useRealTimers();
       }
     });

@@ -155,8 +155,15 @@ export const META_LIST_MAX_MS = 45_000;
  * SUCCEEDED on Meta's side while we report failure, so a retry double-creates, or we tell a
  * customer an ad is still running when we just paused it. Abandoning a READ has no such
  * ambiguity — nothing changed.
+ *
+ * Deliberately generous. A 100-record ad list with nested `creative{...}` expansion is a genuinely
+ * heavy Graph call, and the costly mistake here is the opposite of the obvious one: too short a
+ * deadline breaks reads that work today, which is a REGRESSION, while too long merely extends a
+ * wait that was previously unbounded anyway. So this is a backstop against a hang, not a latency
+ * target. One slow page fits inside META_LIST_MAX_MS; a second cannot, so the loop then stops and
+ * reports `truncated` rather than grinding on.
  */
-export const META_READ_CALL_TIMEOUT_MS = 15_000;
+export const META_READ_CALL_TIMEOUT_MS = 30_000;
 
 /** Which node a list read was actually scoped to. Empty object means account-wide. */
 export interface MetaAdListScope {
@@ -1807,9 +1814,25 @@ export class MetaService {
    */
   private static async withReadDeadline<T>(op: () => Promise<T>, what: string): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const inFlight = op();
+
+    /*
+     * ⚠ Claim the rejection NOW, before racing.
+     *
+     * When the deadline wins, `inFlight` is still pending. If it rejects later nothing is
+     * listening, so it surfaces as an unhandledRejection — and the global handler in server.ts
+     * logs `reason` in full. A Meta FacebookRequestError carries the request URL, and a PAGED
+     * Graph URL carries the access token in its query string. So an un-awaited late failure
+     * would print a live credential into the logs.
+     *
+     * `.catch()` here marks it handled without consuming it: `inFlight` still settles normally
+     * for the race below.
+     */
+    inFlight.catch(() => { /* superseded by the deadline; swallowed on purpose */ });
+
     try {
       return await Promise.race([
-        op(),
+        inFlight,
         new Promise<never>((_resolve, reject) => {
           timer = setTimeout(
             () => reject(new Error(`Meta ${what} did not respond within ${META_READ_CALL_TIMEOUT_MS}ms`)),
