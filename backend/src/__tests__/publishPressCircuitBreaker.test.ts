@@ -99,9 +99,32 @@ describe('classifyPublishStall (ENG-947)', () => {
       ...over,
     });
 
-  it('keeps pressing while the budget is unspent, whatever else happened', () => {
+  it('keeps pressing while the budget is unspent and nothing else was written', () => {
     expect(classify({ pressAttempt: 1 })).toBeNull();
-    expect(classify({ pressAttempt: 1, externalWritesSucceeded: ['twitter_manage_post'] })).toBeNull();
+  });
+
+  /**
+   * ENG-1599: requiredFunctionCalls named twitter_manage_post, but the schedule's
+   * own prompt publishes via post_on_connected_account. Before this fix, the
+   * mismatch reason was gated behind the same 3-press budget as the other two
+   * causes, so the FIRST press after the successful post_on_connected_account
+   * call still fired "Please try again. Make sure to twitter_manage_post" — and
+   * the model complied by posting a second, redundant thread live on X. Live
+   * forensics on session 90ad8838 confirm this run actually took that path
+   * (attempt 2, functionCallMatches: [twitter_outreach, twitter_manage_post]).
+   * A mismatch must be reported on the very first press, not the third.
+   */
+  it('reports a mismatch on the FIRST press, not the third — pressing again cannot fix a name mismatch', () => {
+    expect(
+      classify({ pressAttempt: 1, externalWritesSucceeded: ['twitter_manage_post'] }),
+    ).toBe('requirement-names-unused-publish-tool');
+    expect(
+      classify({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['twitter_manage_post'],
+        externalWritesSucceeded: ['post_on_connected_account'],
+      }),
+    ).toBe('requirement-names-unused-publish-tool');
   });
 
   it('keeps pressing when something reversible is also outstanding', () => {

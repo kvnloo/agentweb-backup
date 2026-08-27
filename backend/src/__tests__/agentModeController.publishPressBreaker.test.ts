@@ -311,9 +311,11 @@ describe('runScheduledChat — publish-press circuit breaker (ENG-947)', () => {
 
     const result = await runScheduledChat(publishSchedule, 'kevin', true);
 
-    // Still capped — pressing for a tool the model has worked around is as futile
-    // as pressing for one it refused.
-    expect(result.attempt).toBe(MAX_PUBLISH_PRESS_ATTEMPTS);
+    // ENG-1599: stops on the FIRST press now, not after burning the full budget.
+    // A mismatched-but-successful write is known as soon as attempt 1 finishes —
+    // waiting out the budget before reporting it only bought 2 more presses that
+    // ask the model to publish AGAIN (how a same-content duplicate goes out live).
+    expect(result.attempt).toBe(1);
     // Still a failure — the requirement genuinely is unmet.
     expect(result.status).toBe('failure');
     // But NOT held for approval: nothing is waiting on the owner.
@@ -400,7 +402,8 @@ describe('runScheduledChat — published through a different tool (ENG-947)', ()
 
     const result = await runScheduledChat(publishSchedule, 'kevin', true);
 
-    expect(result.attempt).toBe(MAX_PUBLISH_PRESS_ATTEMPTS);
+    // ENG-1599: the mismatch is detected on attempt 1, before any further press.
+    expect(result.attempt).toBe(1);
     expect(result.functionCallMisses).toEqual(['post_on_connected_account']);
     expect((result as any).publishRequirementMismatch).toBe(true);
     expect((result as any).publishHeldForApproval).toBeUndefined();
