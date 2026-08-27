@@ -677,26 +677,15 @@ export class ExternalCrmSyncService {
     await crmDb.setLeadListCrmSyncConfig(listId, provider, updated as any);
 
     // Leads already synced to the OLD list carry a stale attio_list_entry_id
-    // pointing at an entry in that list. A re-push's updateListEntry would
-    // then reference an entry id that doesn't exist in the NEW list. Clear
-    // that pointer for every lead in this AgentWeb list — the next push's
-    // findListEntry/addPersonToList fallback recreates the entry fresh in
-    // the new list from the lead's own fields (the same source of truth a
-    // push already uses), rather than needing a bespoke migration copier.
-    // Same shape as markRemovedLeads' existing every-lead-in-a-list write.
-    let cursor: any;
-    do {
-      const page = await crmDb.getLeadsByListId(listId, 500, cursor);
-      for (const lead of page.items) {
-        if (lead.syncMetadata?.attio_list_entry_id) {
-          const syncMetadata = { ...lead.syncMetadata };
-          delete syncMetadata.attio_list_entry_id;
-          await crmDb.updateLead(listId, lead.leadId, { syncMetadata }).catch(() => {});
-        }
-      }
-      cursor = page.lastEvaluatedKey;
-    } while (cursor);
-
+    // pointing at an entry that doesn't exist in the NEW list. Deliberately
+    // NOT bulk-cleared here: an unbounded synchronous per-lead write loop
+    // inside this HTTP request can outlast the ~40s upstream proxy timeout
+    // on a large list (the same reason the push route moved to a background
+    // job — see routes/crmSync.ts), and a partial run would leave leads
+    // mid-cleanup with no retry. Instead, pushLeads's updateListEntry call
+    // treats a 404 (stale entry, wrong list) as "entry is gone, recreate it"
+    // via the same findListEntry/addPersonToList fallback an entry-less lead
+    // already uses — each lead repairs itself lazily on its own next push.
     return updated;
   }
 

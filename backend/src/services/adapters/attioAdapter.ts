@@ -188,7 +188,7 @@ export class AttioAdapter implements CrmAdapter {
                 if (trimmedEmail && !validateEmail(trimmedEmail)) {
                     result.errorCount++;
                     const msg = `Invalid email "${trimmedEmail}" — skipped (not a valid email address)`;
-                    console.warn(`[AttioAdapter] ${msg} for lead=${lead.leadId}`);
+                    console.warn(`[AttioAdapter] Invalid email for lead=${lead.leadId} — skipped (not a valid email address)`);
                     result.errors.push(`${trimmedEmail}: ${msg}`);
                     await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
                         syncMetadata: buildFailedMetadata(lead.syncMetadata, msg),
@@ -314,12 +314,25 @@ export class AttioAdapter implements CrmAdapter {
                 if (dealListId) {
                     try {
                         const entryValues = this.buildDealEntryValues(lead, dealMappings, dealSlugs, dealTypes);
-                        const existingEntryId = lead.syncMetadata?.attio_list_entry_id;
+                        let existingEntryId = lead.syncMetadata?.attio_list_entry_id;
                         let entryId: string | undefined = existingEntryId;
 
                         if (existingEntryId) {
-                            await svc.updateListEntry(dealListId, existingEntryId, entryValues);
-                        } else {
+                            try {
+                                await svc.updateListEntry(dealListId, existingEntryId, entryValues);
+                            } catch (updateErr: any) {
+                                // A stamped entry id can go stale after changePipeline
+                                // re-points this list's deal list — the entry lives in
+                                // the OLD list, not dealListId. Self-heal: treat a 404
+                                // as "gone, recreate it" via the same fallback an
+                                // entry-less lead already uses, rather than a bulk
+                                // migration copier run at re-point time.
+                                if (updateErr?.response?.status !== 404) throw updateErr;
+                                existingEntryId = undefined;
+                                entryId = undefined;
+                            }
+                        }
+                        if (!existingEntryId) {
                             const foundEntryId = await svc.findListEntry(dealListId, personId);
                             if (foundEntryId) {
                                 await svc.updateListEntry(dealListId, foundEntryId, entryValues);
@@ -397,6 +410,10 @@ export class AttioAdapter implements CrmAdapter {
         const companiesAttrCache = pullCompanyMappings.length > 0
             ? await svc.loadAttributeTypes('companies')
             : new Map<string, string>();
+        // Cache one getCompanyValues() call per distinct company for the whole
+        // run — otherwise every person sharing the same company re-fetches it,
+        // an N+1 pattern this list's own person count doesn't need to pay for.
+        const companyValuesCache = new Map<string, Record<string, any>>();
         const pullDealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'push');
         const standardEntryFields = ['company'];
         const nativeDealFields = ['status', 'dealValue', 'dealCurrency'];
@@ -494,7 +511,11 @@ export class AttioAdapter implements CrmAdapter {
                         const companyRef = personValues['company']?.[0]?.target_record_id;
                         if (companyRef) {
                             try {
-                                const companyValues = await svc.getCompanyValues(companyRef);
+                                let companyValues = companyValuesCache.get(companyRef);
+                                if (!companyValues) {
+                                    companyValues = await svc.getCompanyValues(companyRef);
+                                    companyValuesCache.set(companyRef, companyValues);
+                                }
                                 for (const m of pullCompanyMappings) {
                                     const slug = m.crmProperty;
                                     const type = companiesAttrCache.get(`object:companies:${slug}`) || 'text';

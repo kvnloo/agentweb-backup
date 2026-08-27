@@ -139,6 +139,24 @@ describe('AttioAdapter.pullContacts — company field mapping', () => {
     expect(call[1][0].customFields.industry).toBe('Software');
   });
 
+  it('fetches a shared company only once per pull run, not once per person', async () => {
+    mockListPeople.mockResolvedValue({
+      people: [makePerson('person_1'), makePerson('person_2')],
+      nextCursor: undefined,
+    });
+    mockGetPersonValues.mockImplementation((recordId: string) => Promise.resolve({
+      email_addresses: [{ email_address: `${recordId}@acme.com` }],
+      company: [{ target_record_id: 'company_1' }], // both people share the same company
+    }));
+
+    await adapter.pullContacts(auth, 'list_1', makeConfig({ companyFieldMapping: companyMapping }));
+
+    expect(mockGetCompanyValues).toHaveBeenCalledTimes(1);
+    const call = (crmDb.batchCreateLeads as jest.Mock).mock.calls[0];
+    expect(call[1][0].customFields.industry).toBe('Software');
+    expect(call[1][1].customFields.industry).toBe('Software');
+  });
+
   it('respects the enabled flag — a disabled company mapping is not synced', async () => {
     const disabled: FieldMapping[] = [{ ...companyMapping[0], enabled: false }];
     await adapter.pullContacts(auth, 'list_1', makeConfig({ companyFieldMapping: disabled }));

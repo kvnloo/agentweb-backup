@@ -236,6 +236,45 @@ describe('AttioAdapter.pushLeads — deal list sync', () => {
     expect(mockAddPersonToList).not.toHaveBeenCalled();
   });
 
+  // ─── Self-healing after changePipeline re-points the deal list ─────────────
+  // changePipeline deliberately does NOT bulk-clear stale attio_list_entry_id
+  // values (would be an unbounded per-lead write loop inside an HTTP request).
+  // A stale entry id 404s against the new list, and the push must recover by
+  // falling back to the same findListEntry/addPersonToList path an
+  // entry-less lead already uses, rather than failing the lead.
+
+  it('recreates the entry when the cached entry id 404s against the current deal list', async () => {
+    const lead = makeLead({ syncMetadata: { attio_record_id: 'person_1', attio_list_entry_id: 'entry_stale' } });
+    mockUpdateLeadNoOldRecordId();
+    const notFound: any = new Error('Entry not found');
+    notFound.response = { status: 404 };
+    mockUpdateListEntry.mockRejectedValueOnce(notFound);
+    mockFindListEntry.mockResolvedValue(null);
+    mockAddPersonToList.mockResolvedValue('entry_fresh');
+
+    const result = await adapter.pushLeads(auth, [lead], makeConfig({ dealFieldMapping: dealMapping }));
+
+    expect(mockFindListEntry).toHaveBeenCalledWith('deallist_1', 'person_1');
+    expect(mockAddPersonToList).toHaveBeenCalledWith('deallist_1', 'person_1', expect.any(Object));
+    expect(result.errorCount).toBe(0);
+    const stampCall = (crmDb.updateLead as jest.Mock).mock.calls.find(
+      call => call[2]?.syncMetadata?.attio_list_entry_id === 'entry_fresh'
+    );
+    expect(stampCall).toBeDefined();
+  });
+
+  it('still fails the lead when updateListEntry throws a non-404 error', async () => {
+    const lead = makeLead({ syncMetadata: { attio_record_id: 'person_1', attio_list_entry_id: 'entry_existing' } });
+    mockUpdateLeadNoOldRecordId();
+    mockUpdateListEntry.mockRejectedValueOnce(new Error('rate limited'));
+
+    const result = await adapter.pushLeads(auth, [lead], makeConfig({ dealFieldMapping: dealMapping }));
+
+    expect(mockFindListEntry).not.toHaveBeenCalled();
+    expect(mockAddPersonToList).not.toHaveBeenCalled();
+    expect(result.errorCount).toBe(1);
+  });
+
   // ─── Success path ──────────────────────────────────────────────────────────
 
   it('creates the deal list, ensures its attributes, and adds the person with typed entry values', async () => {

@@ -274,7 +274,14 @@ describe('ExternalCrmSyncService', () => {
       await expect(service.changePipeline('user1', 'list1', 'attio', 'nonexistent')).rejects.toThrow(/not found/i);
     });
 
-    it('re-points the Attio deal list and clears stale attio_list_entry_id from every lead in this list', async () => {
+    it('re-points the Attio deal list without a bulk lead-cleanup pass', async () => {
+      // Deliberately NOT clearing attio_list_entry_id in bulk here — an
+      // unbounded synchronous per-lead write loop inside this HTTP request
+      // can outlast the upstream proxy timeout on a large list. Instead,
+      // pushLeads self-heals: a stale entry id 404s against the new list,
+      // and the push falls back to findListEntry/addPersonToList exactly
+      // like an entry-less lead already does (covered in
+      // attioAdapter.pushLeads.deal.test.ts).
       const config = makeConfig({
         provider: 'attio' as any,
         lastPushSyncAt: '2024-02-01T00:00:00.000Z',
@@ -282,29 +289,14 @@ describe('ExternalCrmSyncService', () => {
       });
       mockListWithConfig(config, 'attio');
       (mockAttioServiceInstance as any).getAllLists = jest.fn().mockResolvedValue([{ id: 'new_list', name: 'New Deals' }]);
-      mockCrmDb.getLeadsByListId.mockResolvedValue({
-        items: [
-          { leadId: 'l1', listId: 'list1', syncMetadata: { attio_record_id: 'p1', attio_list_entry_id: 'entry_old_1' } },
-          { leadId: 'l2', listId: 'list1', syncMetadata: { attio_record_id: 'p2' } }, // no entry id — untouched
-        ] as any,
-        lastEvaluatedKey: null,
-        hasMore: false,
-      });
 
       const updated = await service.changePipeline('user1', 'list1', 'attio', 'new_list');
 
       expect(updated.attioDealListId).toBe('new_list');
       const savedCall = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
       expect((savedCall[2] as any).attioDealListId).toBe('new_list');
-
-      // Stale entry id cleared for the lead that had one.
-      const l1Update = mockCrmDb.updateLead.mock.calls.find(c => c[1] === 'l1');
-      const l1Updates = l1Update?.[2] as any;
-      expect(l1Updates.syncMetadata.attio_list_entry_id).toBeUndefined();
-      expect(l1Updates.syncMetadata.attio_record_id).toBe('p1'); // person link preserved
-
-      // The lead with no entry id was never touched.
-      expect(mockCrmDb.updateLead.mock.calls.find(c => c[1] === 'l2')).toBeUndefined();
+      expect(mockCrmDb.getLeadsByListId).not.toHaveBeenCalled();
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
     });
 
     it('updates externalPipelineId and clears the stage map even after a sync (lock bypass)', async () => {
