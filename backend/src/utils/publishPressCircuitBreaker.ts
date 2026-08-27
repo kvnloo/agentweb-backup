@@ -217,6 +217,20 @@ export type PublishStallReason =
  *    exists for (post_on_connected_account succeeding never earns
  *    twitter_manage_post completion credit, but it is still evidence the
  *    schedule's requiredFunctionCalls names a tool this run does not use).
+ *
+ * `heldToFunctionNames` (ENG-1599 review) is the schedule's FULL held-to
+ * requirement set — not just `unmetRequiredFunctions` — mirroring
+ * `callSatisfiesRequirement`'s own `requiredFunctionNames` double-credit
+ * suppression. A schedule that requires BOTH names of an equivalence pair
+ * separately (e.g. post_on_connected_account AND twitter_manage_post) wants
+ * two distinct actions, not one call credited toward the other. Without this,
+ * a succeeded post_on_connected_account call — which already satisfied ITS OWN
+ * requirement and so is no longer in `unmetRequiredFunctions` — would still be
+ * read as "wrote something else" for the still-unmet twitter_manage_post via
+ * the same reverse route, and stop the run before twitter_manage_post was ever
+ * attempted. Omitted (or a name not in the set) keeps the existing behavior —
+ * no evidenced schedule requires both names of any pair today, so this is a
+ * defensive suppression, not a common case.
  */
 export function classifyPublishStall(params: {
   pressAttempt: number;
@@ -224,15 +238,28 @@ export function classifyPublishStall(params: {
   externalWritesSucceeded: RequiredCallLedgerEntry[];
   publishToolsAttempted?: string[];
   maxPressAttempts?: number;
+  heldToFunctionNames?: Iterable<string> | Set<string>;
 }): PublishStallReason | null {
   const { unmetRequiredFunctions, externalWritesSucceeded } = params;
   if (!isPublishOnlyUnmet(unmetRequiredFunctions)) return null;
 
   const unmet = new Set(unmetRequiredFunctions);
+  const held = params.heldToFunctionNames
+    ? params.heldToFunctionNames instanceof Set
+      ? params.heldToFunctionNames
+      : new Set(params.heldToFunctionNames)
+    : null;
   const wroteSomethingElse = (externalWritesSucceeded || []).some((entry) => {
     const name = typeof entry?.name === 'string' ? entry.name : '';
     if (!name || unmet.has(name)) return false;
-    return unmetRequiredFunctions.some((requirement) => Boolean(matchingEquivalentRoute(requirement, entry)));
+    return unmetRequiredFunctions.some((requirement) => {
+      if (!matchingEquivalentRoute(requirement, entry)) return false;
+      // Both names separately required as their OWN line items: the call
+      // already satisfied its own requirement, so it must not also disqualify
+      // the sibling requirement it merely shares a route with.
+      if (held && held.has(requirement) && held.has(name)) return false;
+      return true;
+    });
   });
   if (wroteSomethingElse) return 'requirement-names-unused-publish-tool';
 
