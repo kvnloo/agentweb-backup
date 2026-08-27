@@ -90,6 +90,15 @@ const UTM_EPOCH = '2026-07-02';
 const PER_DAY_PAUSE_MS = 750;
 
 /**
+ * Hard ceiling on how many days one run may touch.
+ *
+ * `--limit` is applied AFTER the range is generated, so it never protected against a range like
+ * `2026-07-02 .. 9999-12-31` — roughly 3 million dates materialised before the limit was even
+ * consulted. The range itself has to be bounded, not just the slice taken from it.
+ */
+const MAX_RANGE_DAYS = 400;
+
+/**
  * Read a value option, refusing one that was supplied without a value.
  *
  * ⚠ A bare `--from` at the end of argv previously returned `undefined`, which fell through to the
@@ -142,9 +151,57 @@ function datesBetween(from: string, to: string): string[] {
   return out;
 }
 
+/**
+ * Refuse to write unless the target was named deliberately.
+ *
+ * ⚠ `adsMetricsDb` selects its table with `NODE_ENV === "development" ? "Dev-" : ""`, so ANY other
+ * value — including UNSET — resolves to the production table. That is fail-OPEN: forgetting an
+ * environment variable is enough to write production. For a read-only script that is harmless; for
+ * one that overwrites rows it is not.
+ *
+ * So `--apply` additionally requires the environment to be stated explicitly, and writing to
+ * production requires naming it. Nothing here can be satisfied by omission.
+ */
+function assertWriteTargetIsDeliberate(): 'production' | 'development' {
+  const env = process.env.NODE_ENV;
+  if (env !== 'production' && env !== 'development') {
+    throw new Error(
+      `--apply requires NODE_ENV to be exactly "production" or "development"; got ${env === undefined ? 'UNSET' : `"${env}"`}. ` +
+      `adsMetricsDb treats every value except "development" as PRODUCTION, so an unset or typo'd ` +
+      `value would write live data by accident.`
+    );
+  }
+  if (env === 'production' && !has('yes-write-production')) {
+    throw new Error(
+      `Refusing to write to the PRODUCTION metrics table without --yes-write-production. ` +
+      `Per AGENTS.md, a backfill also requires Harsha's explicit pre-merge approval; pass ` +
+      `--approved-by "<name>" to record who authorised this run.`
+    );
+  }
+  if (env === 'production' && !arg('approved-by')) {
+    throw new Error(`--approved-by "<name>" is required when writing to production (AGENTS.md data-plane rule).`);
+  }
+  return env;
+}
+
 async function main(): Promise<void> {
   const apply = has('apply');
-  const userId = arg('user') || DEFAULT_USER_ID;
+
+  /*
+   * The Haven-only scope is the cron's, and it is deliberate (ENG-916: Every.io's CAPI gap means
+   * its Meta-reported conversions read as artificially low). An unrestricted --user would let this
+   * script write metrics rows for an account the scope was never reasoned about.
+   */
+  const requestedUser = arg('user');
+  if (requestedUser && requestedUser !== DEFAULT_USER_ID) {
+    throw new Error(
+      `--user ${requestedUser} is outside this script's scope. It targets the same single account ` +
+      `as the cron (ENG-916, Haven only). Widening it is a scope decision, not a flag.`
+    );
+  }
+  const userId = requestedUser || DEFAULT_USER_ID;
+
+  const targetEnv = apply ? assertWriteTargetIsDeliberate() : (process.env.NODE_ENV || '(unset)');
 
   const yesterday = new Date();
   yesterday.setUTCDate(yesterday.getUTCDate() - 1);
@@ -159,6 +216,14 @@ async function main(): Promise<void> {
       `--from ${from} predates the ${UTM_EPOCH} UTM epoch. Days before that carry no UTM tagging, ` +
       `so every row written would show 0 attributed leads — indistinguishable from a regression ` +
       `on any chart reading this store. Pass --allow-pre-utm if that is genuinely what you want.`
+    );
+  }
+
+  const spanDays = Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000) + 1;
+  if (spanDays > MAX_RANGE_DAYS) {
+    throw new Error(
+      `${from}..${to} spans ${spanDays} days, over the ${MAX_RANGE_DAYS}-day ceiling. ` +
+      `Narrow --from/--to. (--limit does not help: it is applied after the range is built.)`
     );
   }
 
@@ -179,7 +244,8 @@ async function main(): Promise<void> {
   console.log(
     `[ENG-1601 backfill] ${apply ? 'APPLY' : 'DRY RUN (no metrics rows written, no Meta insights calls)'}`
   );
-  console.log(`[ENG-1601 backfill] user=${userId} NODE_ENV=${process.env.NODE_ENV || '(unset)'}`);
+  console.log(`[ENG-1601 backfill] user=${userId} target=${targetEnv}` +
+    (apply && targetEnv === 'production' ? ` approved-by="${arg('approved-by')}"` : ''));
   console.log(`[ENG-1601 backfill] range ${dates[0]} .. ${dates[dates.length - 1]} (${dates.length} days)\n`);
 
   // Resolve ONCE for the whole run. getMetaAccountCredentials can refresh AND PERSIST the token
@@ -205,7 +271,9 @@ async function main(): Promise<void> {
 
   let leadsByDate: Map<string, any[]>;
   try {
-    leadsByDate = await getLeadsByDateForUser(userId);
+    // Bounded to the requested window: the same pages are read either way, but only the leads
+    // that can actually be joined are retained.
+    leadsByDate = await getLeadsByDateForUser(userId, { from: dates[0], to: dates[dates.length - 1] });
   } catch (error) {
     console.error('[ENG-1601 backfill] FATAL reading CRM leads:', error);
     process.exit(1);
@@ -246,7 +314,11 @@ async function main(): Promise<void> {
 
   for (const dateStr of dates) {
     try {
-      const r = await snapshotMetaMetricsForDate(userId, dateStr, credentials, leadsByDate, accountContext);
+      const r = await snapshotMetaMetricsForDate(
+        userId, dateStr, credentials, leadsByDate, accountContext,
+        // Stamped so a replayed row is distinguishable from one the cron observed live.
+        'backfill',
+      );
       ok++;
       // `rowsWritten` counts CAMPAIGN rows only — snapshotMetaMetricsForDate also always writes
       // one account_day row, which its return value does not include. Reporting the raw number
