@@ -3752,10 +3752,19 @@ export async function runVerifiedChat(
             // ITS OWN requirement, so it drops out of functionCallMisses) would
             // be misread as "wrote something else" for the still-unmet
             // twitter_manage_post requirement via the same reverse route, and
-            // stop the run before twitter_manage_post was ever attempted. Same
-            // suppression callSatisfiesRequirement already applies for
-            // completion credit — see requiredFunctionNames there.
-            heldToFunctionNames: requiredFunctionNames,
+            // stop the run before twitter_manage_post was ever attempted.
+            //
+            // Built fresh from the CURRENT requiredFunctions here, deliberately
+            // NOT the stale requiredFunctionNames const captured before the
+            // retry loop (narrowed by authorization revocation via the
+            // reassignments above) — unlike that const's own use in
+            // countCallsForRequirement, staleness is UNSAFE in this direction.
+            // There, a stale/wider set only ever WITHHOLDS completion credit
+            // more conservatively. Here, suppression means "keep pressing", so
+            // a stale/wider set would suppress a genuine mismatch and press a
+            // requirement whose sibling was since narrowed OUT — risking a
+            // second live publish through the tool that's still required.
+            heldToFunctionNames: new Set(requiredFunctions.map((reqFunc) => reqFunc.functionName)),
           })
         : null;
       if (publishStall) {
