@@ -229,7 +229,7 @@ describe('emailService.sendScheduledChatTokenLimitEmail', () => {
     jest.clearAllMocks();
   });
 
-  it('renders a token-based message and subject when the token cap is the cause', async () => {
+  it('renders a percentage-only message when the token cap is the cause — never the raw token count (ENG-1566)', async () => {
     const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
 
     await emailService.sendScheduledChatTokenLimitEmail(
@@ -249,14 +249,19 @@ describe('emailService.sendScheduledChatTokenLimitEmail', () => {
 
     expect(spy).toHaveBeenCalledTimes(1);
     const [, subject, textContent, htmlContent] = spy.mock.calls[0];
-    expect(subject).toContain('Monthly Token Limit Reached');
-    expect(htmlContent).toContain('Monthly Token Limit Reached');
-    expect(htmlContent).toContain('1,050,000 / 1,000,000 tokens used this month');
-    expect(textContent).toContain('1,050,000 / 1,000,000 tokens used this month');
+    expect(subject).toContain('Monthly Usage Limit Reached');
+    expect(htmlContent).toContain('Monthly Usage Limit Reached');
+    expect(htmlContent).toContain('105% of your monthly allowance used');
+    expect(textContent).toContain('105% of your monthly allowance used');
+    // ENG-1566: neither the raw token count nor the "cost"/"token" dimension name
+    // may reach the customer — only a percentage of "monthly usage".
+    expect(htmlContent).not.toContain('1,050,000');
     expect(htmlContent).not.toContain('spent this month');
+    expect(htmlContent).not.toContain('tokens used');
+    expect(htmlContent).not.toContain('$');
   });
 
-  it('renders a cost-based message when the cost cap is the cause and token allowance is unlimited', async () => {
+  it('renders a percentage-only message when the cost cap is the cause — never the raw dollar spend (ENG-1566)', async () => {
     const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
 
     await emailService.sendScheduledChatTokenLimitEmail(
@@ -276,10 +281,15 @@ describe('emailService.sendScheduledChatTokenLimitEmail', () => {
 
     expect(spy).toHaveBeenCalledTimes(1);
     const [, subject, textContent, htmlContent] = spy.mock.calls[0];
-    expect(subject).toContain('Monthly Cost Limit Reached');
-    expect(htmlContent).toContain('Monthly Cost Limit Reached');
-    expect(htmlContent).toContain('$42.50 / $40.00 spent this month');
-    expect(textContent).toContain('$42.50 / $40.00 spent this month');
+    expect(subject).toContain('Monthly Usage Limit Reached');
+    expect(htmlContent).toContain('Monthly Usage Limit Reached');
+    expect(htmlContent).toContain('106% of your monthly allowance used');
+    expect(textContent).toContain('106% of your monthly allowance used');
+    // ENG-1566: neither the raw dollar spend/allowance nor the "cost"/"token"
+    // dimension name may reach the customer — only a percentage of "monthly usage".
+    expect(htmlContent).not.toContain('$');
+    expect(textContent).not.toContain('$');
+    expect(htmlContent).not.toContain('spent this month');
     // Must not misleadingly show "N/A tokens" when tokens are unlimited
     expect(htmlContent).not.toContain('N/A tokens');
   });

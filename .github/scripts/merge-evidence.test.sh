@@ -626,7 +626,7 @@ pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" "${SUPERSEDED_CANCELLED_RUN}"
 workflowruns "${d}" "${SUPERSEDED_CANCELLED_WFRUNS}"
 run_gate "${d}"
-check 'the verdict reports how many superseded check-runs were ignored' 0 'ignored 2 superseded check-run(s)'
+check 'the verdict reports how many superseded check-runs were ignored' 0 'ignored 2 superseded and/or retired-allowlisted check-run(s)'
 
 # The inverse guards against a cosmetic dedupe that simply prefers success:
 # the latest suite still owns the context when it is the failing one.
@@ -893,6 +893,75 @@ checkruns "${d}" "${SUPERSEDED_2231}"
 printf '{"total_count":40,"workflow_runs":%s}\n' "${SUPERSEDED_2231_WFRUNS}" >"${d}/workflowruns.json"
 run_gate "${d}"
 check 'a truncated workflow-run page fails loud, never passes' 4 'truncated'
+
+# ---------------------------------------------------------------------------
+# ENG-1453 — a retired check-run left on GitHub cannot block forever
+# ---------------------------------------------------------------------------
+#
+# ENG-1371 deleted the `Require Greptile Review` job. GitHub's
+# commits/{sha}/check-runs endpoint keeps its last row forever — a new run
+# cannot overwrite a job that no longer exists to schedule one. Live-verified
+# 2026-08-24: agentweb#2417 and #2334 are otherwise green, unchanged PRs that
+# still hard-fail this gate on nothing but that leftover `failure`.
+
+# The real #2417 shape, trimmed: otherwise-healthy run, one retired failure.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success"},
+  {"name":"CI script tests","status":"completed","conclusion":"skipped"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"failure"}
+]'
+run_gate "${d}"
+check 'ENG-1453: an otherwise-green run with only the retired check failing is PASS' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"failure"}
+]'
+run_gate "${d}"
+check 'ENG-1453: the ignored retired check is named in the log, not silently dropped' 0 'ignored check-run(s) named on MERGE_EVIDENCE_RETIRED_CHECKS'
+
+# A retired check with a SUCCESS conclusion is ignored too ("any conclusion") —
+# it must not be counted toward the positive-success requirement either, since
+# a leftover success from a deleted job describes nothing about this head.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Require Greptile Review","status":"completed","conclusion":"success"}
+]'
+run_gate "${d}"
+check "ENG-1453: a retired check's success alone is still NO_EVIDENCE, not a pass" 3 'NO_EVIDENCE'
+
+# The allowlist matches by exact name. A DIFFERENT, still-active failing check
+# must keep blocking — this is not a general "ignore anything Greptile-shaped"
+# rule, and CI-script/backend jobs must never be swallowed by it.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"CI script tests","status":"completed","conclusion":"failure"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"failure"}
+]'
+run_gate "${d}"
+check 'ENG-1453: an active, currently-defined check still blocks alongside a retired one' 1 'CI script tests (failure)'
+
+# Exact-name matching, not substring: a job whose name merely CONTAINS the
+# allowlisted string must not be swallowed by it.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Require Greptile Review (extended)","status":"completed","conclusion":"failure"}
+]'
+run_gate "${d}"
+check 'ENG-1453: a similarly-named but distinct check is NOT swallowed by the allowlist' 1 'Require Greptile Review (extended) (failure)'
 
 # ---------------------------------------------------------------------------
 # Regression proof — the previous procedure returns a false green here

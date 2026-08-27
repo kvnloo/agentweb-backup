@@ -3,6 +3,11 @@
  * Uses jest.isolateModules so SLACK_BOT_TOKEN is set before the module initializes.
  */
 
+// Force module scope (no other import/export in this file) — without it, TS
+// treats this as a global script and its top-level `const mockUsersInfo`
+// collides with the same name in slackService.teamIdCache.test.ts (TS2451).
+export {};
+
 const mockUsersInfo = jest.fn();
 
 jest.mock('@slack/web-api', () => ({

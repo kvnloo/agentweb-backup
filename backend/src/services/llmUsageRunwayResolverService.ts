@@ -41,6 +41,7 @@ import { readBilledLedgerRows, hasInferredAttribution } from "./llmUsageLedgerRe
  */
 const LEDGER_COMPLETENESS_TOLERANCE = 0.95;
 import {
+  assessForecastAccuracy,
   computeUsageRunway,
   type UsageRunway,
 } from "./llmUsageForecastService";
@@ -129,7 +130,11 @@ export async function resolveUsageRunway(
     usage.costUsedMicroUsd > 0 &&
     ledgerTotalMicroUsd < usage.costUsedMicroUsd * LEDGER_COMPLETENESS_TOLERANCE;
 
-  const runway = computeUsageRunway({
+  // Named rather than inlined so the accuracy backtest below re-runs the
+  // forecast over EXACTLY the same inputs — a backtest against a different
+  // ledger view would measure the difference between the two views, not the
+  // accuracy of the forecast.
+  const forecastInput = {
     // Both of these are already credit-adjusted by getEffectiveLlmUsagePolicy —
     // re-applying credits here would double-count them.
     costUsedMicroUsd: usage.costUsedMicroUsd,
@@ -142,7 +147,8 @@ export async function resolveUsageRunway(
     cycleStartDate,
     cycleResetDate,
     today,
-  });
+  };
+  const runway = computeUsageRunway(forecastInput);
 
   // ENG-1212 AC6: record the forecast's inputs and output version so any figure
   // a customer was shown can be reproduced later. Awaited but non-throwing —
@@ -165,6 +171,27 @@ export async function resolveUsageRunway(
     resetDate: runway.resetDate,
     ledgerRowCount: rows.length,
   });
+
+  // ENG-1215 AC4: telemetry has to record forecast versus ACTUAL, not only what
+  // was shown. Every event above says what we told the customer; none says
+  // whether it turned out to be true, so nothing could answer "is the forecast
+  // any good" — on a screen whose entire value is asking people to act on it.
+  //
+  // Recomputed from the same ledger rather than read from a stored snapshot:
+  // `computeUsageRunway` is pure, so the earlier forecast is reproducible
+  // exactly, and a snapshot could drift from the code that produced it. Null
+  // for a cycle too short to hold both a forecast and an outcome — in which
+  // case nothing is emitted rather than a zero that would read as a perfect
+  // score.
+  const accuracy = assessForecastAccuracy(forecastInput, runway, {
+    creditsApplied: usage.creditsApplied,
+  });
+  if (accuracy) {
+    await recordUsageTelemetry(usage.billingUserId, USAGE_TELEMETRY_EVENTS.forecastAccuracy, {
+      version: runway.version,
+      ...accuracy,
+    });
+  }
 
   return { billingUserId: usage.billingUserId, available: true, runway };
 }

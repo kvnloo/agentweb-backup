@@ -18,7 +18,18 @@ jest.mock('../services/emailProviderService', () => ({
   bootstrapEmailProviders: (...args: any[]) => mockBootstrapEmailProviders(...args),
 }));
 
+const mockReserveSend = jest.fn();
+const mockReleaseSend = jest.fn();
+jest.mock('../services/senderUsageTrackerFactory', () => ({
+  senderUsageTracker: {
+    reserveSend: (...args: any[]) => mockReserveSend(...args),
+    releaseSend: (...args: any[]) => mockReleaseSend(...args),
+    getUsage: jest.fn(),
+  },
+}));
+
 import { sendAsSender, SenderSendError } from '../services/sendAsSender';
+import { SenderDailyLimitExceededError } from '../services/senderUsageTracker';
 import { CrmSender } from '../services/crmSenderTypes';
 
 const resendSender: CrmSender = {
@@ -47,6 +58,8 @@ const outlookSender: CrmSender = {
 beforeEach(() => {
   jest.clearAllMocks();
   mockBootstrapEmailProviders.mockResolvedValue(undefined);
+  mockReserveSend.mockResolvedValue('2026-05-04');
+  mockReleaseSend.mockResolvedValue(undefined);
 });
 
 describe('sendAsSender — FAIL cases', () => {
@@ -195,5 +208,120 @@ describe('sendAsSender — SUCCESS cases', () => {
 
     expect(setTimeoutSpy).toHaveBeenCalled();
     setTimeoutSpy.mockRestore();
+  });
+});
+
+describe('sendAsSender — daily cap / warmup (ENG-265)', () => {
+  it('does not touch the usage tracker at all for a sender with no cap configured', async () => {
+    mockResendSendEmail.mockResolvedValue({ id: 'resend-msg' });
+    await sendAsSender('u1', resendSender, { to: 'a@b.com', subject: 's', html: 'h' });
+    expect(mockReserveSend).not.toHaveBeenCalled();
+    expect(mockReleaseSend).not.toHaveBeenCalled();
+  });
+
+  it('reserves quota before sending, using the sender id and its effective limit', async () => {
+    mockResendSendEmail.mockResolvedValue({ id: 'resend-msg' });
+    const capped: CrmSender = { ...resendSender, dailyLimit: 25 };
+
+    await sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' });
+
+    expect(mockReserveSend).toHaveBeenCalledWith('u1', 's1', 25);
+  });
+
+  it('refuses to send when the sender is at its daily limit, without calling the provider', async () => {
+    mockReserveSend.mockRejectedValue(new SenderDailyLimitExceededError('s1', 25));
+    const capped: CrmSender = { ...resendSender, dailyLimit: 25 };
+
+    await expect(
+      sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' }),
+    ).rejects.toBeInstanceOf(SenderDailyLimitExceededError);
+    expect(mockResendSendEmail).not.toHaveBeenCalled();
+    // The rejection came from reserveSend itself — there's no reservation to release.
+    expect(mockReleaseSend).not.toHaveBeenCalled();
+  });
+
+  it('does not release the reservation when Resend confirms success', async () => {
+    mockResendSendEmail.mockResolvedValue({ id: 'resend-msg' });
+    const capped: CrmSender = { ...resendSender, dailyLimit: 25 };
+
+    await sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' });
+
+    expect(mockReserveSend).toHaveBeenCalledWith('u1', 's1', 25);
+    expect(mockReleaseSend).not.toHaveBeenCalled();
+  });
+
+  // CodeRabbit (post-fix review): a missing Resend message id is ambiguous, not proof the
+  // send never went out — Resend may have accepted it before a response failure reached this
+  // process. Releasing quota here would let a client-side retry exceed the sender's real
+  // daily limit if the original attempt actually sent. Same for any dispatch-time throw from
+  // a mailbox provider (timeout, connection drop after the request started, etc.) — none of
+  // these prove no dispatch occurred, so the reservation now stays consumed in every case
+  // past the pre-flight validation stage (conservative: under- not over-sending).
+  it('does NOT release the reservation on an ambiguous Resend outcome (missing message id)', async () => {
+    mockResendSendEmail.mockResolvedValue(null); // Resend "failed" signal — but maybe not really
+    const capped: CrmSender = { ...resendSender, dailyLimit: 25 };
+
+    await expect(
+      sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' }),
+    ).rejects.toThrow(SenderSendError);
+    expect(mockReleaseSend).not.toHaveBeenCalled();
+  });
+
+  it('does NOT release the reservation when a mailbox provider throws after dispatch was attempted', async () => {
+    const mockSendEmail = jest.fn().mockRejectedValue(new Error('token revoked'));
+    mockGetEmailProvider.mockReturnValue({ sendEmail: mockSendEmail });
+    const capped: CrmSender = { ...gmailSender, dailyLimit: 10 };
+
+    await expect(
+      sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' }),
+    ).rejects.toThrow('token revoked');
+    expect(mockReserveSend).toHaveBeenCalledWith('u1', 's2', 10);
+    expect(mockReleaseSend).not.toHaveBeenCalled();
+  });
+
+  it('applies the same cap reserve/no-release-on-success to a mailbox (Gmail) sender', async () => {
+    const mockSendEmail = jest.fn().mockResolvedValue({ messageId: 'gm-1', threadId: '' });
+    mockGetEmailProvider.mockReturnValue({ sendEmail: mockSendEmail });
+    const capped: CrmSender = { ...gmailSender, dailyLimit: 10 };
+
+    await sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' });
+
+    expect(mockReserveSend).toHaveBeenCalledWith('u1', 's2', 10);
+    expect(mockReleaseSend).not.toHaveBeenCalled();
+  });
+
+  it('never reserves quota when bootstrapEmailProviders/getEmailProvider fails for a mailbox sender (pre-flight, not dispatch)', async () => {
+    mockBootstrapEmailProviders.mockRejectedValue(new Error('provider registry init failed'));
+    const capped: CrmSender = { ...gmailSender, dailyLimit: 10 };
+
+    await expect(
+      sendAsSender('u1', capped, { to: 'a@b.com', subject: 's', html: 'h' }),
+    ).rejects.toThrow('provider registry init failed');
+    expect(mockReserveSend).not.toHaveBeenCalled();
+  });
+
+  it('never reserves quota for a pre-flight validation failure (bcc on Resend, missing connectedAccountId)', async () => {
+    const cappedResend: CrmSender = { ...resendSender, dailyLimit: 25 };
+    await expect(
+      sendAsSender('u1', cappedResend, { to: 'a@b.com', subject: 's', html: 'h', bcc: 'x@y.com' }),
+    ).rejects.toThrow(SenderSendError);
+
+    const cappedBrokenGmail: CrmSender = { ...gmailSender, dailyLimit: 10, connectedAccountId: undefined };
+    await expect(
+      sendAsSender('u1', cappedBrokenGmail, { to: 'a@b.com', subject: 's', html: 'h' }),
+    ).rejects.toThrow(SenderSendError);
+
+    expect(mockReserveSend).not.toHaveBeenCalled();
+    expect(mockReleaseSend).not.toHaveBeenCalled();
+  });
+
+  it('a warming-up sender is checked against its ramped limit, not its eventual dailyLimit', async () => {
+    mockResendSendEmail.mockResolvedValue({ id: 'resend-msg' });
+    const warmingUp: CrmSender = { ...resendSender, dailyLimit: 200, warmupStartedAt: new Date().toISOString() };
+
+    await sendAsSender('u1', warmingUp, { to: 'a@b.com', subject: 's', html: 'h' });
+
+    // Day 1 of warmup caps at 10 (see senderUsageTracker.effectiveDailyLimit), not 200.
+    expect(mockReserveSend).toHaveBeenCalledWith('u1', 's1', 10);
   });
 });

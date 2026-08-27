@@ -77,6 +77,24 @@ describe('normalizeSender — legacy records must keep working', () => {
     });
     expect(s.connectedAccountId).toBe('current');
   });
+
+  // ENG-265
+  it('reads dailyLimit and warmupStartedAt when present', () => {
+    const s = normalizeSender({ id: '4', email: 'a@b.com', fromName: 'X', dailyLimit: 25, warmupStartedAt: '2026-05-01T00:00:00.000Z' });
+    expect(s.dailyLimit).toBe(25);
+    expect(s.warmupStartedAt).toBe('2026-05-01T00:00:00.000Z');
+  });
+
+  it('leaves dailyLimit/warmupStartedAt undefined for a legacy record without them (no cap, unchanged)', () => {
+    const s = normalizeSender({ id: '5', email: 'a@b.com', fromName: 'X' });
+    expect(s.dailyLimit).toBeUndefined();
+    expect(s.warmupStartedAt).toBeUndefined();
+  });
+
+  it('ignores a non-numeric persisted dailyLimit rather than propagating garbage', () => {
+    const s = normalizeSender({ id: '6', email: 'a@b.com', fromName: 'X', dailyLimit: 'fifty' });
+    expect(s.dailyLimit).toBeUndefined();
+  });
 });
 
 describe('serializeSender — round-trips and dual-writes for rollback safety', () => {
@@ -116,6 +134,33 @@ describe('serializeSender — round-trips and dual-writes for rollback safety', 
     });
     expect(raw.senderType).toBeUndefined();
     expect(raw.connectedAccountId).toBeUndefined();
+  });
+
+  // ENG-265: dailyLimit/warmupStartedAt must survive the round trip for every
+  // provider type — all three (resend/gmail/outlook) can opt into a cap.
+  it('writes dailyLimit and warmupStartedAt for a resend sender', () => {
+    const raw = serializeSender({
+      id: '0', email: 'hi@acme.com', fromName: 'Acme', senderProvider: 'resend',
+      dailyLimit: 30, warmupStartedAt: '2026-05-01T00:00:00.000Z',
+    });
+    expect(raw.dailyLimit).toBe(30);
+    expect(raw.warmupStartedAt).toBe('2026-05-01T00:00:00.000Z');
+  });
+
+  it('writes dailyLimit and warmupStartedAt for a mailbox sender too', () => {
+    const raw = serializeSender({
+      id: '1', email: 'habeb@gmail.com', fromName: 'Habeb', senderProvider: 'gmail', connectedAccountId: 'gmail-acct-1',
+      dailyLimit: 15, warmupStartedAt: '2026-05-01T00:00:00.000Z',
+    });
+    expect(raw.dailyLimit).toBe(15);
+    expect(raw.warmupStartedAt).toBe('2026-05-01T00:00:00.000Z');
+  });
+
+  it('a normalize -> serialize -> normalize round trip preserves dailyLimit/warmupStartedAt', () => {
+    const original = { id: '1', email: 'hi@acme.com', fromName: 'Acme', dailyLimit: 20, warmupStartedAt: '2026-05-01T00:00:00.000Z' };
+    const roundTripped = normalizeSender(JSON.parse(JSON.stringify(serializeSender(normalizeSender(original)))));
+    expect(roundTripped.dailyLimit).toBe(20);
+    expect(roundTripped.warmupStartedAt).toBe('2026-05-01T00:00:00.000Z');
   });
 
   it('survives a normalize -> serialize -> normalize round trip', () => {
@@ -164,10 +209,46 @@ describe('validateSender — FAIL cases', () => {
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/must match/i);
   });
+
+  // ENG-265: dailyLimit / warmupStartedAt validation
+  it('rejects a zero dailyLimit', () => {
+    const r = validateSender({ email: 'hi@acme.com', fromName: 'Acme', dailyLimit: 0 }, connectedAccounts);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/dailyLimit/i);
+  });
+
+  it('rejects a negative dailyLimit', () => {
+    const r = validateSender({ email: 'hi@acme.com', fromName: 'Acme', dailyLimit: -5 }, connectedAccounts);
+    expect(r.ok).toBe(false);
+  });
+
+  it('rejects a non-numeric dailyLimit', () => {
+    const r = validateSender({ email: 'hi@acme.com', fromName: 'Acme', dailyLimit: 'fifty' }, connectedAccounts);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/dailyLimit/i);
+  });
+
+  it('rejects a malformed warmupStartedAt', () => {
+    const r = validateSender({ email: 'hi@acme.com', fromName: 'Acme', warmupStartedAt: 'not-a-date' }, connectedAccounts);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/warmupStartedAt/i);
+  });
 });
 
 describe('validateSender — SUCCESS cases', () => {
   it('accepts a legacy resend sender with no senderType', () => {
+    expect(validateSender({ email: 'hi@acme.com', fromName: 'Acme' }, connectedAccounts).ok).toBe(true);
+  });
+
+  it('accepts a sender with a positive dailyLimit and a valid warmupStartedAt', () => {
+    const r = validateSender(
+      { email: 'hi@acme.com', fromName: 'Acme', dailyLimit: 10, warmupStartedAt: '2026-05-01T00:00:00.000Z' },
+      connectedAccounts,
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  it('accepts a sender with neither dailyLimit nor warmupStartedAt (no cap, unchanged legacy behavior)', () => {
     expect(validateSender({ email: 'hi@acme.com', fromName: 'Acme' }, connectedAccounts).ok).toBe(true);
   });
 

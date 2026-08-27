@@ -39,6 +39,15 @@ jest.mock("../services/llmModelChangeAuditDb", () => ({
   markModelChangeUndone: jest.fn(),
   buildChangeSortKey: (a: string, b: string) => `${a}#${b}`,
 }));
+// Delegates to the real implementation; wrapped only so the permission the
+// service asks for can be asserted. ENG-1528 — `org:content:manage` and
+// `org:members:read` happen to carry identical role grants today, so behaviour
+// alone cannot tell them apart, and a later decision to let members read the
+// roster would silently hand them model-switching too.
+jest.mock("../services/orgAuthz", () => {
+  const actual = jest.requireActual("../services/orgAuthz");
+  return { ...actual, callerCan: jest.fn(actual.callerCan) };
+});
 jest.mock("../services/llmUsageTelemetry", () => ({
   recordUsageTelemetry: jest.fn(),
   USAGE_TELEMETRY_EVENTS: {
@@ -48,7 +57,8 @@ jest.mock("../services/llmUsageTelemetry", () => ({
 }));
 
 import { applyModelChange, undoModelChange } from "../services/llmModelChangeService";
-import { scheduleDb } from "../services/db";
+import { scheduleDb, userDb, orgDb } from "../services/db";
+import { callerCan } from "../services/orgAuthz";
 import { getEffectiveLlmUsagePolicy } from "../services/llmUsagePolicyResolverService";
 import { agentModeService } from "../services/agentModeService";
 import {
@@ -312,5 +322,142 @@ describe("undoModelChange", () => {
     mockUndone.mockResolvedValue(false);
     const result = await undoModelChange("member-a", changeSk);
     expect(result.undone).toBe(false);
+  });
+
+});
+
+/**
+ * ENG-1528 — an org owner may switch a colleague's schedule; a member may not.
+ *
+ * `usage-drivers` is billing-scoped: it pools schedules across every org member,
+ * so an org owner is SHOWN colleagues' spend and told it is theirs to reduce.
+ * The write then compared user ids and refused all of it. Measured on
+ * production: 8 of the 10 schedules offered to the `AgentWeb` org owner were a
+ * colleague's, and every one 404'd.
+ *
+ * `orgAuthz` already draws the line this needs — `org:content:manage`, held by
+ * owner and admin, withheld from member. Nothing here widens a member's reach.
+ *
+ * The anti-enumeration property is load-bearing and tested separately: a
+ * blanket 403 would turn this endpoint into an existence oracle for any UUID.
+ */
+describe("llmModelChangeService — org authority (ENG-1528)", () => {
+  const mockGetUser = userDb.getUserById as jest.Mock;
+  const mockGetOrg = orgDb.getOrgById as jest.Mock;
+
+  /** A schedule owned by someone else, in org `org-1`. */
+  const colleaguesSchedule = () =>
+    mockGetSchedule.mockResolvedValue({
+      scheduleId: "sched-a",
+      userId: "colleague",
+      llmModel: OPUS,
+      scheduleName: "Harsha Daily X Post",
+    });
+
+  const wire = (callerRecord: Record<string, unknown>, org: Record<string, unknown> | null) => {
+    mockGetUser.mockImplementation(async (id: string) =>
+      id === "colleague" ? { userId: "colleague", orgId: "org-1" } : callerRecord,
+    );
+    mockGetOrg.mockResolvedValue(org);
+  };
+
+  it("lets the org's billing root switch a colleague's schedule", async () => {
+    // The reported case exactly: the caller IS `ownerUserId`.
+    colleaguesSchedule();
+    wire({ userId: "member-a", orgId: "org-1" }, { orgId: "org-1", ownerUserId: "member-a" });
+
+    const result = await apply();
+
+    expect(result.applied).toBe(true);
+    expect(mockUpdateSchedule).toHaveBeenCalled();
+  });
+
+  it("lets an org admin switch a colleague's schedule", async () => {
+    colleaguesSchedule();
+    wire(
+      { userId: "member-a", orgId: "org-1", orgRole: "admin" },
+      { orgId: "org-1", ownerUserId: "someone-else" },
+    );
+
+    const result = await apply();
+
+    expect(result.applied).toBe(true);
+  });
+
+  it("refuses a plain member, and says why rather than lying", async () => {
+    // `ROLE_PERMISSIONS.member` is empty, so this is unchanged from before —
+    // but the words change: inside their own org the schedule is already on
+    // their billing page, so "not found" was false and unactionable.
+    colleaguesSchedule();
+    wire(
+      { userId: "member-a", orgId: "org-1", orgRole: "member" },
+      { orgId: "org-1", ownerUserId: "someone-else" },
+    );
+
+    await expect(apply()).rejects.toThrow(/belongs to another member/i);
+    expect(mockUpdateSchedule).not.toHaveBeenCalled();
+  });
+
+  it("still reports NOT FOUND across a tenant boundary, so ids cannot be enumerated", async () => {
+    // The property the original 404 existed to protect. A caller in a different
+    // org must not be able to distinguish "exists but forbidden" from "does not
+    // exist" — otherwise this endpoint is an existence oracle for any UUID.
+    colleaguesSchedule();
+    wire(
+      { userId: "member-a", orgId: "org-2", orgRole: "owner" },
+      { orgId: "org-1", ownerUserId: "someone-else" },
+    );
+
+    await expect(apply()).rejects.toThrow(/not found/i);
+    await expect(apply()).rejects.not.toThrow(/belongs to another member/i);
+    expect(mockUpdateSchedule).not.toHaveBeenCalled();
+  });
+
+  it("reports NOT FOUND when the owner has no org at all", async () => {
+    colleaguesSchedule();
+    mockGetUser.mockImplementation(async (id: string) =>
+      id === "colleague" ? { userId: "colleague" } : { userId: "member-a", orgId: "org-1" },
+    );
+    mockGetOrg.mockResolvedValue(null);
+
+    await expect(apply()).rejects.toThrow(/not found/i);
+  });
+
+  it("asks for content-management authority specifically, not merely some org permission", async () => {
+    // Guards a drift this suite otherwise cannot see. Switching the requested
+    // permission to `org:members:read` leaves every other test in this file
+    // green, because both are owner+admin today — but reading a roster is a
+    // benign thing to widen to members later, and switching their colleagues'
+    // models is not.
+    colleaguesSchedule();
+    wire({ userId: "member-a", orgId: "org-1" }, { orgId: "org-1", ownerUserId: "member-a" });
+
+    await apply();
+
+    expect(callerCan).toHaveBeenCalledWith(
+      "member-a",
+      expect.objectContaining({ orgId: "org-1" }),
+      "org:content:manage",
+    );
+  });
+
+  it("applies the same authority to UNDO, not just apply", async () => {
+    // Undo is the other write. It re-checks the scope deliberately, so it has
+    // to reach the same answer — otherwise an owner can switch and not revert.
+    colleaguesSchedule();
+    wire({ userId: "member-a", orgId: "org-1" }, { orgId: "org-1", ownerUserId: "member-a" });
+    const changeSk = "2026-08-15T10:00:00.000Z#chg-1";
+    mockList.mockResolvedValue([
+      {
+        changeId: "chg-1",
+        changedAt: "2026-08-15T10:00:00.000Z",
+        scope: "schedule",
+        scopeId: "sched-a",
+        modelBefore: OPUS,
+        modelAfter: SONNET,
+      },
+    ]);
+
+    await expect(undoModelChange("member-a", changeSk)).resolves.toBeDefined();
   });
 });

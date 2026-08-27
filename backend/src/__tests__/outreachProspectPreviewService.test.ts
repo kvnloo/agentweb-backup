@@ -10,6 +10,7 @@ jest.mock("../services/linkedInOutreachService", () => ({
   linkedInOutreachService: {
     resolveAccountId: jest.fn(),
     searchPeople: jest.fn(),
+    probeSearchCapability: jest.fn(),
   },
 }));
 
@@ -254,6 +255,7 @@ describe("searchProspectsPreview", () => {
     );
     getAccountsByUserId.mockResolvedValue([]); // no user-owned LI
     linkedInOutreachService.searchPeople.mockResolvedValue({ items: [] });
+    linkedInOutreachService.probeSearchCapability.mockResolvedValue("ok");
     const r = await searchProspectsPreview("user-1", {
       icp: "Founders",
       specifications: "B2B SaaS",
@@ -349,10 +351,65 @@ describe("searchProspectsPreview", () => {
     if (r.ok) expect(r.items).toHaveLength(5);
   });
 
-  it("returns ok with empty items when Unipile returns no results", async () => {
+  it("returns ok with empty items when Unipile returns no results and the account can search fine (genuine no-match)", async () => {
     linkedInOutreachService.resolveAccountId.mockResolvedValue("acct-1");
     getAccountsByUserId.mockResolvedValue([]);
     linkedInOutreachService.searchPeople.mockResolvedValue({ items: [] });
+    linkedInOutreachService.probeSearchCapability.mockResolvedValue("ok");
+    const r = await searchProspectsPreview("user-1", {
+      icp: "Niche",
+      specifications: "very specific",
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.items).toEqual([]);
+    expect(linkedInOutreachService.probeSearchCapability).toHaveBeenCalledWith(
+      "acct-1",
+    );
+  });
+
+  // ENG-975/ENG-1559: this preview endpoint reused searchPeople but never got
+  // the probeSearchCapability guard the agent-facing surfaces (search-people,
+  // search-parameters, find-leads) got — a new user landing on a degraded
+  // account during onboarding saw a bare empty prospect list, indistinguishable
+  // from "nobody matches your ICP", at the worst possible moment.
+  it("returns search_unavailable when the raw response is empty and probeSearchCapability confirms the account is degraded", async () => {
+    linkedInOutreachService.resolveAccountId.mockResolvedValue("acct-1");
+    getAccountsByUserId.mockResolvedValue([]);
+    linkedInOutreachService.searchPeople.mockResolvedValue({ items: [] });
+    linkedInOutreachService.probeSearchCapability.mockResolvedValue("degraded");
+    const r = await searchProspectsPreview("user-1", {
+      icp: "Founders",
+      specifications: "B2B SaaS",
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toBe("search_unavailable");
+    expect(linkedInOutreachService.probeSearchCapability).toHaveBeenCalledWith(
+      "acct-1",
+    );
+  });
+
+  it("does not call probeSearchCapability when Unipile returns real results (happy path stays cheap)", async () => {
+    linkedInOutreachService.resolveAccountId.mockResolvedValue("acct-1");
+    getAccountsByUserId.mockResolvedValue([]);
+    linkedInOutreachService.searchPeople.mockResolvedValue({
+      items: [{ name: "Jane Doe", public_identifier: "janedoe" }],
+    });
+    const r = await searchProspectsPreview("user-1", {
+      icp: "Founders",
+      specifications: "B2B SaaS",
+    });
+    expect(r.ok).toBe(true);
+    expect(linkedInOutreachService.probeSearchCapability).not.toHaveBeenCalled();
+  });
+
+  it("still reports an honest empty when the raw response is empty but probeSearchCapability is indeterminate ('unknown')", async () => {
+    // Mirrors ENG-975's own philosophy: an indeterminate probe proves
+    // nothing and must never block the caller, so this must NOT become
+    // search_unavailable.
+    linkedInOutreachService.resolveAccountId.mockResolvedValue("acct-1");
+    getAccountsByUserId.mockResolvedValue([]);
+    linkedInOutreachService.searchPeople.mockResolvedValue({ items: [] });
+    linkedInOutreachService.probeSearchCapability.mockResolvedValue("unknown");
     const r = await searchProspectsPreview("user-1", {
       icp: "Niche",
       specifications: "very specific",
