@@ -159,13 +159,15 @@ async function applyCorrection(c: Correction): Promise<void> {
       .update({
         TableName: TABLE,
         Key: { sessionId: c.sessionId },
-        ConditionExpression: `${basePath}.#score = :staleScore AND ${basePath}.dimensions.#goalCompletion = :staleScore`,
-        UpdateExpression: `SET ${basePath}.#score = :fixedScore, ${basePath}.dimensions.#goalCompletion = :fixedScore, ${basePath}.#reason = :reason, ${basePath}.correctedAt = :now`,
+        ConditionExpression: `${basePath}.#score = :staleScore AND ${basePath}.#dimensions.#goalCompletion = :staleScore`,
+        UpdateExpression: `SET ${basePath}.#score = :fixedScore, ${basePath}.#dimensions.#goalCompletion = :fixedScore, ${basePath}.#reason = :reason, ${basePath}.#correctedAt = :now`,
         ExpressionAttributeNames: {
           ...names,
           '#score': 'score',
+          '#dimensions': 'dimensions',
           '#goalCompletion': 'goalCompletion',
           '#reason': 'reason',
+          '#correctedAt': 'correctedAt',
         },
         ExpressionAttributeValues: {
           ':staleScore': c.staleScore,
