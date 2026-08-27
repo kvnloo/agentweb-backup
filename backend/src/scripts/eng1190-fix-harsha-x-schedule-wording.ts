@@ -97,9 +97,11 @@ async function main(): Promise<void> {
   console.log('--- scheduleName ---');
   console.log(`  before: ${JSON.stringify(currentName)}`);
   console.log(`  after:  ${JSON.stringify(nextName)}`);
-  console.log('--- startingMessage tail ---');
-  console.log(`  before: ...${STALE_TAIL}`);
-  console.log(`  after:  ...${FIXED_TAIL}`);
+  if (promptMatches) {
+    console.log('--- startingMessage tail ---');
+    console.log(`  before: ...${STALE_TAIL}`);
+    console.log(`  after:  ...${FIXED_TAIL}`);
+  }
 
   if (!APPLY) {
     console.log('[dry-run] no write performed. Re-run with --apply to write these changes.');
