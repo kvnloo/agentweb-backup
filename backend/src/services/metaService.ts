@@ -130,6 +130,21 @@ export interface MetaAdListScope {
 }
 
 /**
+ * Statuses that must never appear in a list of an account's ads.
+ *
+ * `effective_status` is sent as a request param, but Meta's documented habit with a param it
+ * does not support on a given edge is to IGNORE it — that is precisely the bug this file is
+ * fixing, where `adset_id` was accepted and discarded. `effective_status` is proven on the
+ * account edge; on the campaign/ad-set node edges we do not get to assume it, and a silently
+ * ignored status filter would start reporting deleted and archived ads as real ones.
+ *
+ * So the same intent is enforced client-side as a net. Deliberately a DENY list, not an allow
+ * list: an allow list would silently drop any status Meta adds later, which is the same
+ * class of silent omission this whole change exists to remove.
+ */
+const NON_LIVE_AD_STATUSES = new Set(['DELETED', 'ARCHIVED']);
+
+/**
  * A list read plus the truth about its completeness.
  *
  * ENG-1476 / ENG-1584 both came from returning a bare array: page 1 of 25 is indistinguishable
@@ -1822,12 +1837,12 @@ export class MetaService {
         options.maxPages ?? META_LIST_MAX_PAGES
       );
 
-      return {
-        ads: items.map((a: any) => a._data ?? a),
-        truncated,
-        pagesFetched,
-        scope
-      };
+      const ads = items
+        .map((a: any) => a._data ?? a)
+        // Net for a status filter Meta may have ignored on a node edge — see NON_LIVE_AD_STATUSES.
+        .filter((a: any) => !NON_LIVE_AD_STATUSES.has(String(a?.effective_status ?? '').toUpperCase()));
+
+      return { ads, truncated, pagesFetched, scope };
     } catch (error) {
       // handleError always throws — a failed read must never look like "no ads",
       // which a caller would report as an empty-but-complete account.

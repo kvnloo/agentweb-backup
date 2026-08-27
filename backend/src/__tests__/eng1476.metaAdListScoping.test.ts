@@ -162,6 +162,43 @@ describe('ENG-1476 listAds — pagination', () => {
     expect(result.pagesFetched).toBe(1);
   });
 
+  /**
+   * `effective_status` is sent as a request param and is proven on the ACCOUNT edge. On the
+   * campaign/ad-set node edges we do not get to assume Meta honours it — and Meta's habit with
+   * an unsupported param is to IGNORE it, which is the exact mechanism of the bug being fixed.
+   * If it were ignored, deleted and archived ads would start being reported as real ones.
+   */
+  it('drops DELETED/ARCHIVED client-side in case Meta ignored the status param', async () => {
+    const withStatus = (id: string, effective_status: string) => ({ _data: { id, effective_status } });
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+      getAds: jest.fn().mockResolvedValue(makeCursor([[
+        withStatus('live', 'ACTIVE'),
+        withStatus('paused', 'PAUSED'),
+        withStatus('gone', 'DELETED'),
+        withStatus('old', 'ARCHIVED'),
+      ]])),
+    }));
+
+    const result = await service.listAds('act123', 'tok');
+
+    expect(result.ads.map((a: any) => a.id)).toEqual(['live', 'paused']);
+  });
+
+  it('keeps a status it does not recognise rather than silently dropping it', async () => {
+    // Deny list, not allow list: an allow list would drop any status Meta adds later, which is
+    // the same silent-omission class this whole change removes.
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+      getAds: jest.fn().mockResolvedValue(makeCursor([[
+        { _data: { id: 'novel', effective_status: 'SOME_FUTURE_STATUS' } },
+        { _data: { id: 'nostatus' } },
+      ]])),
+    }));
+
+    const result = await service.listAds('act123', 'tok');
+
+    expect(result.ads.map((a: any) => a.id)).toEqual(['novel', 'nostatus']);
+  });
+
   it('asks Meta for a larger page than the 25 default', async () => {
     const getAds = jest.fn().mockResolvedValue(makeCursor([[ad('1')]]));
     (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAds }));
