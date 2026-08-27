@@ -175,6 +175,40 @@ describe('ENG-1476 listAds — a scoped read must not cross ad accounts', () => 
     expect(campaignGetAds).not.toHaveBeenCalled();
   });
 
+  it('retries a failed ownership lookup once, then serves the read', async () => {
+    // "Meta could not be reached" is a blip, not a tenancy violation. Failing it identically to
+    // a real mismatch would break a legitimate read while protecting nobody.
+    const get = jest.fn()
+      .mockRejectedValueOnce(new Error('transient'))
+      .mockResolvedValueOnce({ _data: { account_id: 'act123' } });
+    (Campaign as unknown as jest.Mock).mockImplementation(() => ({ getAds: campaignGetAds, get }));
+
+    const result = await service.listAds('act123', 'tok', undefined, { campaignId: 'camp_ok' });
+
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(result.ads).toHaveLength(1);
+  });
+
+  it('still refuses when the lookup is unreachable on both attempts', async () => {
+    const get = jest.fn().mockRejectedValue(new Error('Meta down'));
+    (Campaign as unknown as jest.Mock).mockImplementation(() => ({ getAds: campaignGetAds, get }));
+
+    await expect(service.listAds('act123', 'tok', undefined, { campaignId: 'camp_x' }))
+      .rejects.toThrow(/Could not reach Meta to verify/);
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(campaignGetAds).not.toHaveBeenCalled();
+  });
+
+  it('does NOT retry a genuine mismatch into an allow', async () => {
+    const get = jest.fn().mockResolvedValue({ _data: { account_id: '999_other' } });
+    (Campaign as unknown as jest.Mock).mockImplementation(() => ({ getAds: campaignGetAds, get }));
+
+    await expect(service.listAds('act123', 'tok', undefined, { campaignId: 'camp_from_B' }))
+      .rejects.toThrow(/belongs to ad account 999_other/);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(campaignGetAds).not.toHaveBeenCalled();
+  });
+
   it('accepts a node in the selected account, normalising the act_ prefix', async () => {
     (Campaign as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy('act_123456', campaignGetAds));
 

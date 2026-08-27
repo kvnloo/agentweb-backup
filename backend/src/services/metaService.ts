@@ -1836,7 +1836,31 @@ export class MetaService {
     nodeLabel: string,
     adAccountId: string
   ): Promise<void> {
-    const data = (await node.get(['account_id']))?._data ?? {};
+    /*
+     * Separate "this node belongs to someone else" from "Meta could not be reached to answer".
+     * Only the first is a tenancy violation. Failing the second identically would break a
+     * legitimate read over a transient blip while protecting nobody, so the lookup is retried
+     * once — the same reasoning the S3 offload path already applies.
+     *
+     * This costs nothing in strictness: a genuine mismatch refuses on both attempts, and an
+     * unreachable lookup still ends in a refusal rather than an unverified read.
+     */
+    let data: any;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2 && data === undefined; attempt++) {
+      try {
+        data = (await node.get(['account_id']))?._data ?? {};
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    if (data === undefined) {
+      throw new Error(
+        `Could not reach Meta to verify which ad account ${nodeLabel} ${nodeId} belongs to; ` +
+        `refusing to list through it. (${(lastError as any)?.message ?? 'unknown error'})`,
+      );
+    }
+
     const norm = (id: unknown) => String(id ?? '').replace(/^act_/, '').trim();
     const owner = norm(data.account_id);
     const selected = norm(adAccountId);
