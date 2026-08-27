@@ -10,6 +10,11 @@ import {
   estimateRowsIn,
   buildDataAnalysisCacheKey,
 } from './agentMode/csvProvenance';
+import {
+  buildListMessage,
+  buildListResult,
+  describeIgnoredCampaignScope,
+} from './agentMode/metaListScope';
 import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
@@ -16544,20 +16549,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // warning unreachable on the one path that actually matters.
         const ignoredCampaignId = campaign_id ?? params?.campaign_id;
         if (ignoredCampaignId && result?.success) {
-          // Rebuilt rather than spread: `{...result, scopeIgnored}` appends the new key AFTER
-          // `creatives`, which puts it behind the S3 preview cut on exactly the large lists
-          // where it matters. Same field-order rule as listMetaAdsAds.
-          const { creatives, ...head } = result as any;
-          return {
-            ...head,
-            message:
-              `${result.message} ⚠ campaign_id "${ignoredCampaignId}" was NOT applied — Meta exposes no ` +
-              `campaign-scoped adcreatives edge, so this list is not limited to that campaign. ` +
-              `Do NOT treat it as evidence about that campaign; use AD LIST with campaign_id instead, ` +
-              `which returns each ad's creative inline.`,
+          // Rebuilt via buildListResult rather than spread: `{...result, scopeIgnored}` appends
+          // the new key AFTER `creatives`, putting it behind the S3 preview cut on exactly the
+          // large lists where it matters.
+          const r = result as any;
+          return buildListResult({
+            payloadKey: 'creatives',
+            payload: r.creatives ?? [],
+            message: `${r.message}${describeIgnoredCampaignScope(String(ignoredCampaignId))}`,
+            truncated: r.hasMore,
+            scope: r.scope,
             scopeIgnored: { campaign_id: String(ignoredCampaignId) },
-            creatives,
-          };
+          }) as MetaApiResult;
         }
         return result;
       }
@@ -17526,23 +17529,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const result = await metaService.listAdCreatives(accountId, accessToken, { adSetId });
       const creatives = result?.creatives ?? [];
-      const totalCount = creatives.length;
 
-      const where = result?.scope?.adSetId ? ` in ad set ${result.scope.adSetId}` : ' in this ad account';
-      const message = result?.truncated
-        ? `Found ${totalCount} ad creative(s)${where}, but THIS LIST IS INCOMPLETE — Meta had more results and the read stopped at its page bound. Do NOT conclude a creative is absent from this list.`
-        : `Found ${totalCount} ad creative(s)${where} (complete list).`;
-
-      // Completeness before payload — same S3-preview reasoning as listMetaAdsAds.
-      return {
-        success: true,
-        message,
-        complete: !result?.truncated,
-        hasMore: !!result?.truncated,
-        totalCount: totalCount,
-        scope: result?.scope ?? {},
-        creatives: creatives
-      };
+      return buildListResult({
+        payloadKey: 'creatives',
+        payload: creatives,
+        message: buildListMessage({
+          noun: 'ad creative(s)',
+          totalCount: creatives.length,
+          scope: result?.scope,
+          truncated: result?.truncated,
+          // Meta has no campaign->adcreatives edge, so a campaign scope is never applied here.
+          campaignScopable: false,
+        }),
+        truncated: result?.truncated,
+        scope: result?.scope,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ad creatives:', error);
@@ -17639,43 +17640,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const result = await metaService.listAds(accountId, accessToken, adSetId, { campaignId });
       const ads = result?.ads ?? [];
-      const totalCount = ads.length;
 
-      // Say what was actually asked for. "Found 25 ad(s)" with no scope and no bound is the
-      // sentence that told an Every.io user their ad did not exist (ENG-1584) — it read as
-      // "these are all the ads" when it meant "these are the first 25 in the account".
-      const where = result?.scope?.adSetId
-        ? ` in ad set ${result.scope.adSetId}`
-        : result?.scope?.campaignId
-          ? ` in campaign ${result.scope.campaignId}`
-          : ' in this ad account';
-
-      const message = result?.truncated
-        ? `Found ${totalCount} ad(s)${where}, but THIS LIST IS INCOMPLETE — Meta had more results and the read stopped at its page bound. Do NOT conclude an ad is absent from this list. Narrow the request with campaign_id or ad_set_id and ask again.`
-        : `Found ${totalCount} ad(s)${where} (complete list).`;
-
-      /*
-       * ⚠ FIELD ORDER IS LOAD-BEARING — completeness BEFORE the payload.
-       *
-       * An ad list carries object_story_spec per ad, so it routinely exceeds
-       * TOOL_RESPONSE_S3_THRESHOLD (8,000 chars) and gets offloaded. On offload the model is
-       * handed a SEALED 20,000-char PREFIX of this JSON plus an S3 key. Anything serialized
-       * after a large `ads` array falls off that cut and the model never sees it.
-       *
-       * Putting `complete` / `hasMore` / `totalCount` / `scope` after the array would mean the
-       * truncation warning disappears precisely on the big lists that need it most — which is
-       * the ENG-1584 failure wearing a different hat.
-       */
-      return {
-        success: true,
-        message,
-        // Explicit completeness, so no caller has to infer it from the count.
-        complete: !result?.truncated,
-        hasMore: !!result?.truncated,
-        totalCount: totalCount,
-        scope: result?.scope ?? {},
-        ads: ads
-      };
+      // Message shape and field order both live in agentMode/metaListScope.ts — see that module
+      // for why completeness must precede the payload (the S3 preview cut).
+      return buildListResult({
+        payloadKey: 'ads',
+        payload: ads,
+        message: buildListMessage({
+          noun: 'ad(s)',
+          totalCount: ads.length,
+          scope: result?.scope,
+          truncated: result?.truncated,
+          campaignScopable: true,
+        }),
+        truncated: result?.truncated,
+        scope: result?.scope,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ads:', error);

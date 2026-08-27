@@ -1436,13 +1436,15 @@ export class MetaService {
       const fields = ['id', 'name', 'status', 'body', 'title', 'image_url', 'thumbnail_url', 'object_type', 'link_url', 'object_story_spec', 'url_tags'];
       const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
 
+      const wantedAdSet = MetaService.resolveScopeId(options.adSetId, 'ad_set_id');
+
       const scope: MetaAdListScope = {};
       let source: any;
-      if (options.adSetId) {
-        scope.adSetId = options.adSetId;
-        source = new AdSet(options.adSetId);
+      if (wantedAdSet) {
+        scope.adSetId = wantedAdSet;
+        source = new AdSet(wantedAdSet);
         // Same tenancy boundary as listAds — an ad-set id is global, the token spans accounts.
-        await this.assertNodeInAccount(source, options.adSetId, 'Ad set', adAccountId);
+        await this.assertNodeInAccount(source, wantedAdSet, 'Ad set', adAccountId);
       } else {
         source = new AdAccount(`act_${adAccountId}`);
       }
@@ -1856,6 +1858,28 @@ export class MetaService {
    *
    * Fails closed on every uncertain branch: an unverifiable owner is refused, not returned.
    */
+  /**
+   * Resolve a scope id that was SUPPLIED versus one that was omitted.
+   *
+   * `if (adSetId)` treats an explicitly-supplied empty string as absent, so a caller asking to
+   * scope a read silently gets a broader one — a campaign-wide or account-wide list returned
+   * for a request that named an ad set. That is the exact defect this change exists to remove,
+   * so an empty scope id is refused rather than quietly widened.
+   *
+   * `undefined`/`null` means "not supplied" and legitimately selects the broader source.
+   */
+  private static resolveScopeId(value: unknown, label: string): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    const trimmed = String(value).trim();
+    if (!trimmed) {
+      throw new Error(
+        `${label} was supplied but empty. Refusing to widen this read to a broader scope — ` +
+        `omit ${label} entirely to list without it.`,
+      );
+    }
+    return trimmed;
+  }
+
   private async assertNodeInAccount(
     node: any,
     nodeId: string,
@@ -1881,9 +1905,14 @@ export class MetaService {
       }
     }
     if (data === undefined) {
+      // Distinguishable in logs, deliberately not to the caller — see the refusal note below.
+      console.warn(
+        `[MetaService] scope ownership unverifiable for ${nodeLabel} ${nodeId}: ` +
+        `${(lastError as any)?.message ?? 'unknown error'}`,
+      );
       throw new Error(
-        `Could not reach Meta to verify which ad account ${nodeLabel} ${nodeId} belongs to; ` +
-        `refusing to list through it. (${(lastError as any)?.message ?? 'unknown error'})`,
+        `Could not verify the requested ${nodeLabel.toLowerCase()} against the selected ad account; ` +
+        `please retry.`,
       );
     }
 
@@ -1891,22 +1920,33 @@ export class MetaService {
     const owner = norm(data.account_id);
     const selected = norm(adAccountId);
 
-    if (!owner) {
+    /*
+     * ⚠ The refusal must not describe the OTHER tenant.
+     *
+     * Naming the owning account turns this guard into an oracle: anyone able to guess a node id
+     * could learn which ad account owns it, which is cross-account disclosure of exactly the
+     * kind the guard exists to prevent — a block that answers the question it is refusing.
+     *
+     * So the caller (and the model, and ultimately the user) gets one generic message for every
+     * failed branch, and the discriminating detail goes to the server log only.
+     */
+    const refuse = (serverDetail: string): never => {
+      console.warn(`[MetaService] scope ownership refused: ${serverDetail}`);
       throw new Error(
-        `Could not verify which ad account ${nodeLabel} ${nodeId} belongs to; refusing to list through it.`,
+        `The requested ${nodeLabel.toLowerCase()} is not available in the selected ad account.`,
       );
+    };
+
+    if (!owner) {
+      refuse(`no account_id on ${nodeLabel} ${nodeId}`);
     }
     // Both sides must be known. An empty selected account cannot be compared against anything,
     // so treating it as "no mismatch" would pass every node the token can reach.
     if (!selected) {
-      throw new Error(
-        `Could not determine which ad account was selected; refusing to list through ${nodeLabel} ${nodeId}.`,
-      );
+      refuse(`no selected account resolved for ${nodeLabel} ${nodeId}`);
     }
     if (owner !== selected) {
-      throw new Error(
-        `${nodeLabel} ${nodeId} belongs to ad account ${owner}, not the selected account ${selected}.`,
-      );
+      refuse(`${nodeLabel} ${nodeId} owned by ${owner}, selected ${selected}`);
     }
   }
 
@@ -1948,17 +1988,20 @@ export class MetaService {
 
       // Most-specific scope wins: an ad set lives inside a campaign, so asking for both and
       // honouring the ad set is the narrower, more useful read.
+      const wantedAdSet = MetaService.resolveScopeId(adSetId, 'ad_set_id');
+      const wantedCampaign = MetaService.resolveScopeId(options.campaignId, 'campaign_id');
+
       const scope: MetaAdListScope = {};
       let source: any;
-      if (adSetId) {
-        scope.adSetId = adSetId;
-        source = new AdSet(adSetId);
+      if (wantedAdSet) {
+        scope.adSetId = wantedAdSet;
+        source = new AdSet(wantedAdSet);
         // Node reads are not account-scoped by construction the way the account edge is.
-        await this.assertNodeInAccount(source, adSetId, 'Ad set', adAccountId);
-      } else if (options.campaignId) {
-        scope.campaignId = options.campaignId;
-        source = new Campaign(options.campaignId);
-        await this.assertNodeInAccount(source, options.campaignId, 'Campaign', adAccountId);
+        await this.assertNodeInAccount(source, wantedAdSet, 'Ad set', adAccountId);
+      } else if (wantedCampaign) {
+        scope.campaignId = wantedCampaign;
+        source = new Campaign(wantedCampaign);
+        await this.assertNodeInAccount(source, wantedCampaign, 'Campaign', adAccountId);
       } else {
         source = new AdAccount(`act_${adAccountId}`);
       }

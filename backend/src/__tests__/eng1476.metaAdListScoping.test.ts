@@ -109,6 +109,25 @@ describe('ENG-1476 listAds — scoping goes through the node, not an ignorable p
     expect(result.scope).toEqual({ adSetId: 'adset_999' });
   });
 
+  /**
+   * `if (adSetId)` treated an explicitly-supplied empty string as ABSENT, so a caller asking to
+   * scope a read silently got a broader one — the exact defect this change removes.
+   */
+  it.each([['empty', ''], ['whitespace', '   ']])(
+    'refuses an %s ad_set_id instead of silently widening the read',
+    async (_label, bad) => {
+      await expect(service.listAds('act123', 'tok', bad))
+        .rejects.toThrow(/ad_set_id was supplied but empty/);
+      expect(accountGetAds).not.toHaveBeenCalled();
+      expect(adSetGetAds).not.toHaveBeenCalled();
+    });
+
+  it('refuses an empty campaign_id rather than falling through to account scope', async () => {
+    await expect(service.listAds('act123', 'tok', undefined, { campaignId: '' }))
+      .rejects.toThrow(/campaign_id was supplied but empty/);
+    expect(accountGetAds).not.toHaveBeenCalled();
+  });
+
   it('falls back to the account edge only when nothing is scoped', async () => {
     const result = await service.listAds('act123', 'tok');
 
@@ -125,6 +144,12 @@ describe('ENG-1476 listAds — scoping goes through the node, not an ignorable p
  * labelled as A's. `getMetaCredentials` validates the SELECTED account, never the node.
  *
  * Every branch fails CLOSED: an unverifiable owner is refused, not returned.
+ */
+/*
+ * NOTE ON THE ASSERTIONS BELOW: these originally matched the refusal text verbatim, including
+ * the owning account id. That text was itself a disclosure — a refusal that names the other
+ * tenant answers the question it is declining — so the messages are now generic and these
+ * assertions check BOTH that the read is refused and that no foreign identifier leaks.
  */
 describe('ENG-1476 listAds — a scoped read must not cross ad accounts', () => {
   let service: MetaService;
@@ -143,7 +168,7 @@ describe('ENG-1476 listAds — a scoped read must not cross ad accounts', () => 
     (Campaign as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy('999_other', campaignGetAds));
 
     await expect(service.listAds('act123', 'tok', undefined, { campaignId: 'camp_from_B' }))
-      .rejects.toThrow(/belongs to ad account 999_other, not the selected account act123/);
+      .rejects.toThrow(/The requested campaign is not available in the selected ad account/);
 
     // The payload must never be fetched, let alone returned.
     expect(campaignGetAds).not.toHaveBeenCalled();
@@ -153,7 +178,7 @@ describe('ENG-1476 listAds — a scoped read must not cross ad accounts', () => 
     (AdSet as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy('999_other', adSetGetAds));
 
     await expect(service.listAds('act123', 'tok', 'adset_from_B'))
-      .rejects.toThrow(/belongs to ad account 999_other/);
+      .rejects.toThrow(/The requested ad set is not available in the selected ad account/);
     expect(adSetGetAds).not.toHaveBeenCalled();
   });
 
@@ -161,7 +186,7 @@ describe('ENG-1476 listAds — a scoped read must not cross ad accounts', () => 
     (Campaign as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy(undefined, campaignGetAds));
 
     await expect(service.listAds('act123', 'tok', undefined, { campaignId: 'camp_x' }))
-      .rejects.toThrow(/Could not verify which ad account/);
+      .rejects.toThrow(/not available in the selected ad account/);
     expect(campaignGetAds).not.toHaveBeenCalled();
   });
 
@@ -171,7 +196,7 @@ describe('ENG-1476 listAds — a scoped read must not cross ad accounts', () => 
     (Campaign as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy('999_other', campaignGetAds));
 
     await expect(service.listAds('', 'tok', undefined, { campaignId: 'camp_x' }))
-      .rejects.toThrow(/Could not determine which ad account was selected/);
+      .rejects.toThrow(/not available in the selected ad account/);
     expect(campaignGetAds).not.toHaveBeenCalled();
   });
 
@@ -194,7 +219,7 @@ describe('ENG-1476 listAds — a scoped read must not cross ad accounts', () => 
     (Campaign as unknown as jest.Mock).mockImplementation(() => ({ getAds: campaignGetAds, get }));
 
     await expect(service.listAds('act123', 'tok', undefined, { campaignId: 'camp_x' }))
-      .rejects.toThrow(/Could not reach Meta to verify/);
+      .rejects.toThrow(/Could not verify the requested campaign against the selected ad account/);
     expect(get).toHaveBeenCalledTimes(2);
     expect(campaignGetAds).not.toHaveBeenCalled();
   });
@@ -204,9 +229,27 @@ describe('ENG-1476 listAds — a scoped read must not cross ad accounts', () => 
     (Campaign as unknown as jest.Mock).mockImplementation(() => ({ getAds: campaignGetAds, get }));
 
     await expect(service.listAds('act123', 'tok', undefined, { campaignId: 'camp_from_B' }))
-      .rejects.toThrow(/belongs to ad account 999_other/);
+      .rejects.toThrow(/not available in the selected ad account/);
     expect(get).toHaveBeenCalledTimes(1);
     expect(campaignGetAds).not.toHaveBeenCalled();
+  });
+
+  /**
+   * A refusal must not describe the OTHER tenant. Naming the owning account would turn this
+   * guard into an oracle: guess a node id, learn which account owns it — cross-account
+   * disclosure of exactly the kind the guard exists to prevent.
+   */
+  it('does not leak the foreign account id in the refusal', async () => {
+    (Campaign as unknown as jest.Mock).mockImplementation(() => nodeOwnedBy('999_secret_acct', campaignGetAds));
+
+    await expect(service.listAds('act123', 'tok', undefined, { campaignId: 'camp_from_B' }))
+      .rejects.toThrow(/not available in the selected ad account/);
+
+    // The other tenant's identifier must appear nowhere in the caller-facing error.
+    await service.listAds('act123', 'tok', undefined, { campaignId: 'camp_from_B' }).catch((e: any) => {
+      expect(e.message).not.toContain('999_secret_acct');
+      expect(e.message).not.toContain('camp_from_B');
+    });
   });
 
   it('accepts a node in the selected account, normalising the act_ prefix', async () => {
@@ -247,7 +290,7 @@ describe('ENG-1476 listAdCreatives — the same tenancy boundary', () => {
     }));
 
     await expect(service.listAdCreatives('act123', 'tok', { adSetId: 'adset_from_B' }))
-      .rejects.toThrow(/belongs to ad account 999_other/);
+      .rejects.toThrow(/The requested ad set is not available in the selected ad account/);
     expect(getAdCreatives).not.toHaveBeenCalled();
   });
 
