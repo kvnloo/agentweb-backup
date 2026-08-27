@@ -123,6 +123,23 @@ export const META_LIST_PAGE_SIZE = 100;
  */
 export const META_LIST_MAX_PAGES = 25;
 
+/**
+ * Wall-clock ceiling for one paginated list walk.
+ *
+ * Page count alone bounds the WORK but not the TIME: `drainCursor` awaits each page
+ * sequentially, so 25 slow pages compound into a request that is technically bounded and
+ * practically hung. This PR is what made that compounding possible — the previous code issued a
+ * single request — so the tail it introduced is bounded here.
+ *
+ * Deliberately NOT a per-call transport timeout: that would have to be configured on the SDK's
+ * shared HTTP layer and would silently change every other Meta call in this service. A single
+ * hung request was already possible before this change and is not what this guards.
+ *
+ * Crossing it returns `truncated: true`, reusing the same "incomplete, do not conclude absence"
+ * contract as the page bound rather than inventing a second failure mode.
+ */
+export const META_LIST_MAX_MS = 45_000;
+
 /** Which node a list read was actually scoped to. Empty object means account-wide. */
 export interface MetaAdListScope {
   campaignId?: string;
@@ -1780,7 +1797,16 @@ export class MetaService {
     const canPage = typeof cursor?.hasNext === 'function' && typeof cursor?.next === 'function';
     if (!canPage) return { items, truncated: false, pagesFetched };
 
+    const deadline = Date.now() + META_LIST_MAX_MS;
+
     while (cursor.hasNext()) {
+      if (Date.now() >= deadline) {
+        this.log(`Stopped paginating at the ${META_LIST_MAX_MS}ms wall-clock bound`, {
+          pagesFetched,
+          itemsSoFar: items.length,
+        });
+        return { items, truncated: true, pagesFetched };
+      }
       if (pagesFetched >= pageLimit) {
         this.log(`Stopped paginating at the ${pageLimit}-page bound`, { pagesFetched, itemsSoFar: items.length });
         return { items, truncated: true, pagesFetched };

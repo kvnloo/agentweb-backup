@@ -209,6 +209,28 @@ describe('ENG-1476 AD_CREATIVE LIST — an unsupportable scope is stated, never 
     expect(json.indexOf('"message"')).toBeLessThan(json.indexOf('"creatives"'));
   });
 
+  /**
+   * The tool executor passes campaign_id POSITIONALLY into callMetaMarketingApi, never nested in
+   * params. Checking only params made this warning unreachable on the standard path — the fix
+   * for a silently-dropped scope was itself silently dropped.
+   */
+  it('fires on the POSITIONAL campaign_id, which is how the tool actually calls it', async () => {
+    const result: any = await agentModeService.manageMetaAdsAdCreatives(
+      'user123', 'LIST', '123456789', {}, undefined, 'camp_positional'
+    );
+
+    expect(result.message).toContain('was NOT applied');
+    expect(result.scopeIgnored).toEqual({ campaign_id: 'camp_positional' });
+  });
+
+  it('routes campaign_id through callMetaMarketingApi end to end', async () => {
+    const result: any = await (agentModeService as any).callMetaMarketingApi(
+      'user123', 'AD_CREATIVE', 'LIST', '123456789', 'camp_e2e', undefined, undefined, {}, undefined
+    );
+
+    expect(result.scopeIgnored).toEqual({ campaign_id: 'camp_e2e' });
+  });
+
   it('stays quiet when no unsupported scope was requested', async () => {
     const result: any = await agentModeService.manageMetaAdsAdCreatives(
       'user123', 'LIST', '123456789', {}

@@ -403,6 +403,36 @@ describe('ENG-1476 listAds — pagination', () => {
     expect(result.truncated).toBe(true);
   });
 
+  it('stops on the wall-clock bound even while pages remain, and says so', async () => {
+    // Page count bounds the WORK but not the TIME. Sequential awaits over slow pages compound
+    // into a request that is technically bounded and practically hung. This PR created that
+    // compounding (the old code issued one request), so the tail it introduced is bounded.
+    const realNow = Date.now;
+    let clock = 1_000_000;
+    Date.now = () => clock;
+    try {
+      const pages = Array.from({ length: 10 }, (_, i) => [ad(String(i))]);
+      const cursor = makeCursor(pages);
+      const realNext = cursor.next;
+      cursor.next = async () => { clock += 30_000; return realNext(); }; // 30s per page
+      (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+        getAds: jest.fn().mockResolvedValue(cursor),
+      }));
+
+      const result = await service.listAds('act123', 'tok');
+
+      // 45s budget. The deadline gates whether a NEW page is STARTED, not whether an in-flight
+      // one is aborted — aborting mid-call needs transport support this deliberately avoids.
+      // So: page 2 starts at 0s, page 3 starts at 30s (still inside budget) and lands at 60s;
+      // the fourth is refused. A single slow call can overshoot the budget by its own duration.
+      expect(result.pagesFetched).toBe(3);
+      expect(result.truncated).toBe(true);
+      expect(result.ads.length).toBeLessThan(10);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
   it('asks Meta for a larger page than the 25 default', async () => {
     const getAds = jest.fn().mockResolvedValue(makeCursor([[ad('1')]]));
     (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAds }));

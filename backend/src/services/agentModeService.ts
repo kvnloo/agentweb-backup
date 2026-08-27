@@ -16525,7 +16525,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}, ad_set_id?: string): Promise<MetaApiResult> {
+  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}, ad_set_id?: string, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST': {
         // ENG-1476: ad_set_id never reached this edge either. Meta has no campaign->adcreatives
@@ -16539,7 +16539,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
          * defect this PR exists to remove — it would just be wearing a different hat. The scope
          * is unsupportable here, so the honest move is to name it, not to drop it silently.
          */
-        const ignoredCampaignId = params?.campaign_id;
+        // Both spellings. The tool executor passes campaign_id POSITIONALLY into
+        // callMetaMarketingApi, never nested in params — reading only params here made this
+        // warning unreachable on the one path that actually matters.
+        const ignoredCampaignId = campaign_id ?? params?.campaign_id;
         if (ignoredCampaignId && result?.success) {
           // Rebuilt rather than spread: `{...result, scopeIgnored}` appends the new key AFTER
           // `creatives`, which puts it behind the S3 preview cut on exactly the large lists
@@ -19467,7 +19470,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return this.manageMetaAdsAdSets(userId, action as any, account_id, campaign_id, ad_set_id, params);
 
       case 'AD_CREATIVE':
-        return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params, ad_set_id);
+        // campaign_id is forwarded so AD_CREATIVE LIST can SAY it cannot honour it, rather than
+        // dropping it silently — the same threading the AD case below does (ENG-1476).
+        return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params, ad_set_id, campaign_id);
 
       case 'AD':
         // campaign_id is forwarded here (ENG-1476). It was already in scope for the tracking
