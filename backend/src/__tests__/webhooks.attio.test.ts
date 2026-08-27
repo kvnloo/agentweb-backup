@@ -261,6 +261,47 @@ describe('POST /api/webhooks/attio — shared OAuth webhook', () => {
     expect(mockEnqueueJob).not.toHaveBeenCalled();
   });
 
+  // Regression: the unsigned-request bypass must fail closed. It was
+  // previously gated on `NODE_ENV === 'production'` exactly, so an unset,
+  // staging, mistyped, or any other non-'production' value in a real
+  // deployment let a completely unauthenticated, unsigned request through —
+  // matched against the first candidate account and processed as if
+  // legitimate. It must now be gated on `NODE_ENV === 'development'`
+  // exactly (mirroring TABLE_PREFIX's own convention), so every other value
+  // rejects a missing signature.
+  describe('missing Attio-Signature — fails closed except in development', () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    afterEach(() => {
+      process.env.NODE_ENV = originalNodeEnv;
+    });
+
+    it.each([
+      ['production', 'production'],
+      ['staging', 'staging'],
+      ['unset', undefined],
+      ['a mistyped value', 'produciton'],
+    ])('rejects an unsigned request when NODE_ENV is %s', async (_label, value) => {
+      process.env.NODE_ENV = value as any;
+      const body = { event_type: 'record.updated', id: { workspace_id: WORKSPACE_ID, record_id: 'rec-1' } };
+
+      await request(app).post('/api/webhooks/attio').send(body);
+      await flushPromises();
+
+      expect(mockEnqueueJob).not.toHaveBeenCalled();
+      expect(mockApplyAttioPersonEvent).not.toHaveBeenCalled();
+    });
+
+    it('allows an unsigned request only when NODE_ENV is exactly development', async () => {
+      process.env.NODE_ENV = 'development';
+      const body = { event_type: 'record.updated', id: { workspace_id: WORKSPACE_ID, record_id: 'rec-1' } };
+
+      await request(app).post('/api/webhooks/attio').send(body);
+      await flushPromises();
+
+      expect(mockEnqueueJob).toHaveBeenCalled();
+    });
+  });
+
   it('processes a valid, correctly-signed delivery: record.* routed to applyAttioPersonEvent', async () => {
     const body = { event_type: 'record.updated', id: { workspace_id: WORKSPACE_ID, record_id: 'rec-1' } };
     await request(app).post('/api/webhooks/attio').set('attio-signature', makeSignature(body)).send(body);

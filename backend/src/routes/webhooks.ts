@@ -1237,7 +1237,16 @@ router.post('/attio', (req: express.Request, res: express.Response) => {
       // guess (same multi-tenant-collision defense as getAccountsByAttioWorkspaceId
       // itself documents).
       const signature = (req.headers['attio-signature'] ?? req.headers['x-attio-signature']) as string | undefined;
-      const isProd = process.env.NODE_ENV === 'production';
+      // Fail closed: the unsigned-request bypass is only allowed when
+      // NODE_ENV is explicitly 'development', mirroring this codebase's own
+      // TABLE_PREFIX convention (constants.ts) of treating anything that
+      // isn't exactly 'development' as needing production-safe behavior.
+      // The previous `isProd = NODE_ENV === 'production'` check was
+      // fail-open: an unset, staging, mistyped, or otherwise non-'production'
+      // NODE_ENV value in a real deployment let a completely unauthenticated
+      // request through, matched against the first candidate account, and
+      // processed as if legitimate.
+      const isDev = process.env.NODE_ENV === 'development';
       let matched: { userId: string; accountId: string } | null = null;
 
       if (signature) {
@@ -1252,8 +1261,8 @@ router.post('/attio', (req: express.Request, res: express.Response) => {
           console.warn(`[Attio Webhook] Signature did not verify against any connected account for workspace ${workspaceId} — request ignored`);
           return;
         }
-      } else if (isProd) {
-        console.warn('[Attio Webhook] Missing Attio-Signature in production — request rejected');
+      } else if (!isDev) {
+        console.warn('[Attio Webhook] Missing Attio-Signature — request rejected (unsigned requests are only allowed when NODE_ENV=development)');
         return;
       } else {
         console.warn('[Attio Webhook] No Attio-Signature header — proceeding without verification (dev only)');
