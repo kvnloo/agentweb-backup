@@ -77,6 +77,7 @@ jest.mock('../services/hubspotService', () => ({
 }));
 
 const mockAttioServiceCreate = jest.fn();
+const mockLoadAttributeTypes = jest.fn();
 jest.mock('../services/attioService', () => ({
   AttioService: {
     create: (...a: any[]) => mockAttioServiceCreate(...a),
@@ -161,7 +162,8 @@ describe('POST /api/webhooks/attio — shared OAuth webhook', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetAccountsByAttioWorkspaceId.mockResolvedValue([mockAccount]);
-    mockAttioServiceCreate.mockResolvedValue({});
+    mockLoadAttributeTypes.mockResolvedValue(new Map());
+    mockAttioServiceCreate.mockResolvedValue({ loadAttributeTypes: mockLoadAttributeTypes });
     mockGetLeadListsByUserId.mockResolvedValue([mockList]);
     mockGetSyncConfig.mockResolvedValue({ webhookEnabled: true, dealFieldMapping: [] });
     mockEnqueueJob.mockResolvedValue('enqueued');
@@ -225,6 +227,7 @@ describe('POST /api/webhooks/attio — shared OAuth webhook', () => {
       expect.anything(),
       expect.anything(),
       expect.objectContaining({ event_type: 'record.updated' }),
+      expect.any(Map),
     );
   });
 
@@ -264,7 +267,7 @@ describe('POST /api/webhooks/attio — shared OAuth webhook', () => {
     await flushPromises();
 
     expect(mockEnqueueJob).toHaveBeenCalled();
-    expect(mockApplyAttioPersonEvent).toHaveBeenCalledWith(LIST_ID, expect.objectContaining({ webhookEnabled: true }), expect.anything(), expect.objectContaining({ event_type: 'record.updated' }));
+    expect(mockApplyAttioPersonEvent).toHaveBeenCalledWith(LIST_ID, expect.objectContaining({ webhookEnabled: true }), expect.anything(), expect.objectContaining({ event_type: 'record.updated' }), expect.any(Map));
   });
 
   it('processes list-entry.* events by routing to AttioAdapter.applyListEntryWebhookEvent', async () => {
@@ -278,6 +281,9 @@ describe('POST /api/webhooks/attio — shared OAuth webhook', () => {
       expect.anything(),
       'entry-1',
       'list-entry.updated',
+      // No attioDealListId on this test's sync config, so there's nothing to
+      // key a shared cache by — the call passes the 6th arg as undefined.
+      undefined,
     );
   });
 
@@ -300,6 +306,43 @@ describe('POST /api/webhooks/attio — shared OAuth webhook', () => {
 
     const processedListIds = mockApplyAttioPersonEvent.mock.calls.map((c) => c[0]);
     expect(processedListIds.sort()).toEqual(['list-1', 'list-2']); // not list-3 (different account)
+  });
+
+  it('fetches person attribute types once per delivery, not once per event/list', async () => {
+    // Regression guard: loadAttributeTypes has no cache of its own, and was
+    // previously called fresh inside applyAttioPersonEvent for every single
+    // record.* event — multiplied by every matching list. One delivery with
+    // several events across two lists should still fetch it exactly once.
+    const secondList = { listId: 'list-2', userId: USER_ID, externalCrmSyncConfigs: { attio: { accountId: ACCOUNT_ID } } };
+    mockGetLeadListsByUserId.mockResolvedValue([mockList, secondList]);
+
+    const body = {
+      webhook_id: 'wh-1',
+      events: [
+        { event_type: 'record.updated', id: { workspace_id: WORKSPACE_ID, record_id: 'rec-1' } },
+        { event_type: 'record.updated', id: { workspace_id: WORKSPACE_ID, record_id: 'rec-2' } },
+      ],
+    };
+    await request(app).post('/api/webhooks/attio').set('attio-signature', makeSignature(body)).send(body);
+    await flushPromises();
+
+    // 2 events × 2 matching lists = 4 applyAttioPersonEvent calls, but the
+    // attribute-type fetch behind them should have happened exactly once.
+    expect(mockApplyAttioPersonEvent).toHaveBeenCalledTimes(4);
+    expect(mockLoadAttributeTypes).toHaveBeenCalledTimes(1);
+    expect(mockLoadAttributeTypes).toHaveBeenCalledWith('people');
+    const sharedCache = mockLoadAttributeTypes.mock.results[0].value;
+    for (const call of mockApplyAttioPersonEvent.mock.calls) {
+      expect(call[4]).toBe(await sharedCache); // same Map instance on every call
+    }
+  });
+
+  it('never calls loadAttributeTypes when the delivery has no record.* events', async () => {
+    const body = { event_type: 'list-entry.updated', id: { workspace_id: WORKSPACE_ID, entry_id: 'entry-1' } };
+    await request(app).post('/api/webhooks/attio').set('attio-signature', makeSignature(body)).send(body);
+    await flushPromises();
+
+    expect(mockLoadAttributeTypes).not.toHaveBeenCalled();
   });
 
   it('deduplicates a redelivery via Idempotency-Key', async () => {

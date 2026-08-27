@@ -1132,6 +1132,21 @@ export async function processAttioWebhookJob(payload: AttioJobPayload): Promise<
     l => l.externalCrmSyncConfigs?.attio?.accountId === payload.accountId,
   );
 
+  // Person attribute types are workspace-wide, not list-scoped, and
+  // loadAttributeTypes has no cache of its own — without sharing one fetch
+  // across this whole job, every record.* event (times every matching list)
+  // reissues the same Attio HTTP request. Fetched lazily (only if the
+  // delivery actually contains a record.* event) and once, then handed to
+  // every applyAttioPersonEvent call below.
+  let peopleAttrCache: Map<string, string> | undefined;
+  if (payload.events.some(e => (e?.event_type ?? '').startsWith('record.'))) {
+    peopleAttrCache = await svc.loadAttributeTypes('people');
+  }
+  // Deal-list attribute types ARE list-scoped (config.attioDealListId), so
+  // cache per distinct deal list id instead — different AgentWeb lists can
+  // point at different Attio deal lists.
+  const dealAttrCacheByListId = new Map<string, Map<string, string>>();
+
   for (const list of matchingLists) {
     const syncConfig = await externalCrmSyncService.getConfig(payload.userId, list.listId, 'attio');
     if (!syncConfig || syncConfig.webhookEnabled === false) continue;
@@ -1140,11 +1155,17 @@ export async function processAttioWebhookJob(payload: AttioJobPayload): Promise<
       const eventType: string = event?.event_type ?? '';
       try {
         if (eventType.startsWith('record.')) {
-          await applyAttioPersonEvent(list.listId, syncConfig, svc, event);
+          await applyAttioPersonEvent(list.listId, syncConfig, svc, event, peopleAttrCache);
         } else if (eventType.startsWith('list-entry.')) {
           const entryId: string = event?.id?.entry_id ?? event?.data?.entry_id ?? '';
           if (entryId) {
-            await attioAdapter.applyListEntryWebhookEvent(list.listId, syncConfig, svc, entryId, eventType);
+            const dealListId = syncConfig.attioDealListId;
+            let dealAttrCache = dealListId ? dealAttrCacheByListId.get(dealListId) : undefined;
+            if (dealListId && !dealAttrCache) {
+              dealAttrCache = await svc.loadAttributeTypes('people', dealListId);
+              dealAttrCacheByListId.set(dealListId, dealAttrCache);
+            }
+            await attioAdapter.applyListEntryWebhookEvent(list.listId, syncConfig, svc, entryId, eventType, dealAttrCache);
           }
         }
       } catch (err: any) {

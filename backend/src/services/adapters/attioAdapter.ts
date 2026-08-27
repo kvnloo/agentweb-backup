@@ -614,6 +614,11 @@ export class AttioAdapter implements CrmAdapter {
         svc: AttioService,
         entryId: string,
         eventType: string,
+        // Deal-list attribute types are scoped to config.attioDealListId. A
+        // caller processing many list-entry events across lists in one job
+        // can fetch this once per distinct deal-list id and share it —
+        // otherwise every event refetches it fresh, with no cache of its own.
+        sharedDealAttrCache?: Map<string, string>,
     ): Promise<void> {
         if (!config.attioDealListId) return;
         const pullDealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'push');
@@ -640,7 +645,7 @@ export class AttioAdapter implements CrmAdapter {
         const lead = await crmDb.getLeadByAttioRecordId(listId, entry.personRecordId);
         if (!lead) return; // deal entry for a person we haven't pulled/pushed — nothing to update
 
-        const dealAttrCache = await svc.loadAttributeTypes('people', config.attioDealListId);
+        const dealAttrCache = sharedDealAttrCache ?? await svc.loadAttributeTypes('people', config.attioDealListId);
         const nativeDealFields = ['status', 'dealValue', 'dealCurrency'];
         const leadUpdates: Record<string, any> = {};
         const customFieldUpdates: Record<string, any> = {};

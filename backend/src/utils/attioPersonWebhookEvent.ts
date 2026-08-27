@@ -26,6 +26,14 @@ export async function applyAttioPersonEvent(
   config: ExternalCrmSyncConfig,
   svc: AttioService,
   event: any,
+  // Person attribute types are workspace-wide (not list-scoped), so a caller
+  // processing many events/lists in one job (the shared OAuth webhook) can
+  // fetch this once and share it — otherwise every single event refetches it
+  // fresh from Attio with no cache, turning one delivery into hundreds of
+  // repeated identical API calls. Callers that only ever handle one event at
+  // a time (the per-list webhook endpoint) can omit this and it's fetched
+  // internally, unchanged from before.
+  sharedAttrCache?: Map<string, string>,
 ): Promise<void> {
   const eventType: string = event?.event_type ?? '';
   const recordId: string = event?.data?.record?.id?.record_id ?? event?.id?.record_id ?? '';
@@ -105,7 +113,7 @@ export async function applyAttioPersonEvent(
   // push-only, but the old code synced it on every webhook event anyway).
   const pullContactMappings = config.contactFieldMapping.filter(m => m.enabled && m.direction !== 'push');
   const pullCustomMappings = config.customFieldMapping.filter(m => m.enabled && m.direction !== 'push');
-  const attrCache = await svc.loadAttributeTypes('people');
+  const attrCache = sharedAttrCache ?? await svc.loadAttributeTypes('people');
   // Mirrors attioAdapter.ts's pullContacts nativeFields allow-list exactly —
   // a contactFieldMapping targeting any other agentwebField must route to
   // customFields, since crmDb.createLead/updateLead silently drop anything
