@@ -760,11 +760,20 @@ function isTestScheduledSession(session: ChatSession): boolean {
 // ... has not been granted standing publish authorization. Actually, let me try
 // again." would still match — exactly the re-attempt/re-explain-across-turns shape
 // ENG-995's own rubric (see PUBLISH_APPROVAL_WITHHOLDING_CLAUSE's STOP-ONCE vs LOOP
-// bullet) says must NOT be treated as a clean, complete terminal state. Trailing
-// whitespace is still permitted — the prompt asks for the sentence "on its own
-// line", which can leave a trailing newline.
+// bullet) says must NOT be treated as a clean, complete terminal state.
+//
+// LIVE-VERIFIED AND CORRECTED (post-merge): pulled a real production session
+// matching this exact pattern (ENG-1245, session 0e5af215-9c14-4ff3-806e-
+// bbbd0984afaf, "Harsha Daily X Post (Autonomous)") and its actual final message
+// wraps the marker sentence in an HTML paragraph, e.g. "...before publishing.</p>"
+// — the initial `\.?\s*$` anchor (no allowance for a trailing closing tag) missed
+// that real shape entirely, which would have silently un-done the whole fix for
+// every real HTML-formatted report. Trailing whitespace AND trailing closing
+// HTML tags (e.g. `</p>`) are now both permitted after the sentence — but a new
+// opening tag or any other content still breaks the match, since "<p>" lacks the
+// closing slash `(?:\s*<\/[a-zA-Z]+>)*` requires.
 const PUBLISH_WITHHELD_MARKER =
-  /PUBLISH WITHHELD:\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))\.?\s*$/i;
+  /PUBLISH WITHHELD:\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))\.?(?:\s*<\/[a-zA-Z]+>)*\s*$/i;
 
 // The 'revoked' variant specifically — emitted only when a run that WAS admitted
 // authorized=true (publishAdmission) had that consent narrowed away mid-run by
@@ -772,9 +781,10 @@ const PUBLISH_WITHHELD_MARKER =
 // stamp taken before the first turn, so on its own it cannot tell a run that
 // stayed authorized throughout apart from one revoked partway through — only the
 // marker variant the prompt reserves for that exact case can. Anchored to
-// end-of-message for the same reason as PUBLISH_WITHHELD_MARKER above.
+// end-of-message for the same reason as PUBLISH_WITHHELD_MARKER above, including
+// the same trailing-closing-tag allowance.
 const PUBLISH_WITHHELD_REVOKED_MARKER =
-  /PUBLISH WITHHELD:\s*this schedule's publish authorization has been revoked\.?\s*$/i;
+  /PUBLISH WITHHELD:\s*this schedule's publish authorization has been revoked\.?(?:\s*<\/[a-zA-Z]+>)*\s*$/i;
 
 /**
  * ENG-995 — two scheduled sessions with IDENTICAL behavior (drafted the content,
