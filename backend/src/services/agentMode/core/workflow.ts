@@ -83,6 +83,20 @@ export interface WorkflowDefinition {
   steps: WorkflowStepDefinition[];
 }
 
+/**
+ * Every parameter `key` gated by ANY step in this definition — i.e. every
+ * value that MUST come from a human-attributed AskUserQuestion answer, never
+ * from a caller-supplied initial value. The caller starting a workflow run
+ * (see workflowRunner.startWorkflow) MUST reject any `initialParameters` key
+ * that appears here: resolveStepParameters below only checks whether a key
+ * is ALREADY PRESENT in resolvedParameters, not how it got there, so an
+ * unguarded initial value would silently satisfy the gate without ever
+ * touching checkQuestionGate — the exact bypass this module exists to close.
+ */
+export function findGatedParameterKeys(definition: WorkflowDefinition): Set<string> {
+  return new Set(definition.steps.flatMap((step) => step.requiredParameters.map((req) => req.key)));
+}
+
 export type WorkflowRunStatus = 'in_progress' | 'blocked_on_parameter' | 'completed' | 'failed';
 
 /** Persisted per-attempted-step record. Absence of an entry for a step id

@@ -26,6 +26,7 @@ import {
   markBlockedOnParameter,
   describeFailedAtStep,
   collectEntityIdsFromCheckpoints,
+  findGatedParameterKeys,
   type WorkflowDefinition,
   type WorkflowStepDefinition,
   type WorkflowRunState,
@@ -291,6 +292,24 @@ describe('collectEntityIdsFromCheckpoints — the "output feeds the next step" m
       ],
     });
     expect(collectEntityIdsFromCheckpoints(run)).toEqual({ campaign_id: 'camp_1', ad_set_id: 'adset_1' });
+  });
+});
+
+describe('findGatedParameterKeys', () => {
+  it('collects every requiredParameters key across every step', () => {
+    const stepA = makeStep({
+      id: 'a',
+      requiredParameters: [{ key: 'objective', questionKind: 'workflow_meta_objective', payloadField: 'objective' }],
+    });
+    const stepB = makeStep({
+      id: 'b',
+      requiredParameters: [{ key: 'budget_mode', questionKind: 'workflow_meta_budget_mode', payloadField: 'budget_mode' }],
+    });
+    expect(findGatedParameterKeys(makeDefinition([stepA, stepB]))).toEqual(new Set(['objective', 'budget_mode']));
+  });
+
+  it('returns an empty set when no step gates anything', () => {
+    expect(findGatedParameterKeys(makeDefinition([makeStep()]))).toEqual(new Set());
   });
 });
 

@@ -22,6 +22,7 @@ import {
   recordStepFailure,
   markBlockedOnParameter,
   collectEntityIdsFromCheckpoints,
+  findGatedParameterKeys,
 } from './core/workflow';
 
 export async function startWorkflow(
@@ -29,6 +30,18 @@ export async function startWorkflow(
   definition: WorkflowDefinition,
   initialParameters?: Record<string, unknown>,
 ): Promise<WorkflowRunState> {
+  // A gated key (objective, budget_mode, ...) MUST come from a
+  // human-attributed AskUserQuestion answer, never a caller-supplied initial
+  // value — resolveStepParameters only checks presence, not provenance, so
+  // letting one through here would silently bypass checkQuestionGate.
+  const gatedKeys = findGatedParameterKeys(definition);
+  const rejectedKeys = Object.keys(initialParameters ?? {}).filter((key) => gatedKeys.has(key));
+  if (rejectedKeys.length > 0) {
+    throw new Error(
+      `startWorkflow: initialParameters cannot supply gated parameter(s) that must be resolved via AskUserQuestion: ${rejectedKeys.join(', ')}`,
+    );
+  }
+
   const run = buildWorkflowRunState({
     runId: uuidv4(),
     workflowId: definition.workflowId,

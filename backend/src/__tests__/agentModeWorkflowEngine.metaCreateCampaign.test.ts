@@ -26,7 +26,7 @@ jest.mock('../services/chatbotService', () => ({
 
 import { metaService } from '../services/metaService';
 import { chatbotDb } from '../services/chatbotService';
-import { advanceWorkflow } from '../services/agentMode/workflowRunner';
+import { advanceWorkflow, startWorkflow } from '../services/agentMode/workflowRunner';
 import { buildCreateCampaignStep } from '../services/agentMode/createCampaignStep';
 import { buildWorkflowRunState, type WorkflowDefinition, type WorkflowStepDefinition, type WorkflowRunState } from '../services/agentMode/core/workflow';
 import { buildPendingUserQuestion, applyAnswer, type PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
@@ -252,5 +252,32 @@ describe('ENG-397 hardening — budget_mode is verified, not just gated', () => 
     expect(outcome.run.checkpoints[0].discrepancy).toEqual([
       { parameter: 'budget_mode', requested: 'campaign_budget_optimization', applied: null },
     ]);
+  });
+});
+
+describe('ENG-397 hardening — initialParameters cannot bypass the AskUserQuestion gate', () => {
+  it('startWorkflow rejects initialParameters that supply a gated key directly, before any persistence write', async () => {
+    wireSessionStore({});
+    const definition = makeDefinition();
+
+    // Without this rejection, resolveStepParameters would see `objective`
+    // already present in resolvedParameters and skip checkQuestionGate
+    // entirely — the caller could inject the immutable objective value
+    // without any human ever answering the question.
+    await expect(
+      startWorkflow(SESSION_ID, definition, { objective: 'OUTCOME_LEADS', name: 'Test Campaign' }),
+    ).rejects.toThrow(/gated parameter/i);
+
+    expect(mockUpdateSessionWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('startWorkflow accepts initialParameters that only supply ordinary (non-gated) values', async () => {
+    wireSessionStore({});
+    const definition = makeDefinition();
+
+    const run = await startWorkflow(SESSION_ID, definition, INITIAL_PARAMS);
+
+    expect(run.resolvedParameters).toEqual(INITIAL_PARAMS);
+    expect(run.status).toBe('in_progress');
   });
 });
