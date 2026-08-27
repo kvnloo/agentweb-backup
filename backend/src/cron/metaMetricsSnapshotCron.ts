@@ -90,7 +90,7 @@ function toDateStr(d: Date): string {
  * indexing by date is strictly less work and changes no behaviour — a date with no leads simply has
  * no entry, which the caller reads as an empty list exactly as before.
  */
-async function getLeadsByDateForUser(userId: string): Promise<Map<string, any[]>> {
+export async function getLeadsByDateForUser(userId: string): Promise<Map<string, any[]>> {
   const byDate = new Map<string, any[]>();
   const leadLists = await crmDb.getLeadListsByUserId(userId);
   for (const list of leadLists) {

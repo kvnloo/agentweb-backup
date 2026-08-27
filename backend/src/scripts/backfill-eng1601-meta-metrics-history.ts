@@ -65,11 +65,17 @@
  *
  * On a deployed host none of this applies — the instance role and real env are already correct.
  */
-import { userDb, crmDb } from '../services/db';
+import { userDb } from '../services/db';
 import { getMetaAccountCredentials } from '../services/metaAccountCredentials';
 import {
   fetchMetaAccountContext,
   snapshotMetaMetricsForDate,
+  // Imported, NOT reimplemented. An earlier draft of this script kept its own copy of the lead
+  // bucketing, which matched for real data and diverged on malformed `createdAt` — the cron threw,
+  // the copy silently bucketed under a junk key and dropped the lead. A duplicate that can drift
+  // from the thing it is supposed to mirror is how you end up verifying your own reimplementation
+  // instead of the code that actually runs.
+  getLeadsByDateForUser,
   type ResolvedMetaCredentials,
   type MetaAccountContext,
 } from '../cron/metaMetricsSnapshotCron';
@@ -110,33 +116,6 @@ function datesBetween(from: string, to: string): string[] {
     cur.setUTCDate(cur.getUTCDate() + 1);
   }
   return out;
-}
-
-/**
- * Every lead for a user bucketed by createdAt date.
- *
- * Mirrors the cron's own prefetch, and for the same reason: the per-date path cannot early-stop
- * (leads are ordered by leadId, not createdAt), so asking per day would re-walk every list once
- * per day — 90 full walks for a 90-day backfill, all returning identical pages.
- */
-async function getLeadsByDateForUser(userId: string): Promise<Map<string, any[]>> {
-  const byDate = new Map<string, any[]>();
-  const lists = await crmDb.getLeadListsByUserId(userId);
-  for (const list of lists) {
-    let lastKey: any;
-    do {
-      const { items, lastEvaluatedKey } = await crmDb.getLeadsByListId(list.listId, 100, lastKey);
-      for (const lead of items) {
-        const created = (lead as any)?.createdAt;
-        if (!created) continue;
-        const day = String(created).split('T')[0];
-        if (!byDate.has(day)) byDate.set(day, []);
-        byDate.get(day)!.push(lead);
-      }
-      lastKey = lastEvaluatedKey;
-    } while (lastKey);
-  }
-  return byDate;
 }
 
 async function main(): Promise<void> {
