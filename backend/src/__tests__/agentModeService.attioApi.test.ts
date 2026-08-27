@@ -137,15 +137,25 @@ describe('LIST_ENTRIES COUNT', () => {
   });
 
   it('calls countListEntries and returns the count', async () => {
-    mockCountListEntries.mockResolvedValue(42);
+    mockCountListEntries.mockResolvedValue({ count: 42, capped: false });
     const result = await at({ entity_type: 'LIST_ENTRIES', action: 'COUNT', list_id: LIST_ID });
     expect(mockCountListEntries).toHaveBeenCalledWith(LIST_ID);
     expect(result.success).toBe(true);
     expect(result.count).toBe(42);
+    expect(result.capped).toBeUndefined();
+  });
+
+  it('surfaces capped:true and an explanatory note for a pathologically large list', async () => {
+    mockCountListEntries.mockResolvedValue({ count: 10000, capped: true });
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'COUNT', list_id: LIST_ID });
+    expect(result.success).toBe(true);
+    expect(result.count).toBe(10000);
+    expect(result.capped).toBe(true);
+    expect(result.note).toMatch(/floor, not the exact total/i);
   });
 
   it('resolves the account via account_id when provided', async () => {
-    mockCountListEntries.mockResolvedValue(0);
+    mockCountListEntries.mockResolvedValue({ count: 0, capped: false });
     await at({ entity_type: 'LIST_ENTRIES', action: 'COUNT', list_id: LIST_ID, account_id: 'acct-9' });
     expect(mockAttioCreate).toHaveBeenCalledWith(USER, 'acct-9');
   });
@@ -302,7 +312,7 @@ describe('LIST_ENTRIES access control (list_id resolves to a real AgentWeb list)
   });
 
   it('COUNT calls canAccessCrmList (read), not canDestructiveCrmList', async () => {
-    mockCountListEntries.mockResolvedValue(3);
+    mockCountListEntries.mockResolvedValue({ count: 3, capped: false });
     const result = await at({ entity_type: 'LIST_ENTRIES', action: 'COUNT', list_id: AGENTWEB_LIST_ID });
 
     expect(mockCanAccessCrmList).toHaveBeenCalled();
@@ -432,7 +442,7 @@ describe('account resolution failure', () => {
       { listId: 'l1', externalCrmSyncConfigs: { attio: { apiKeyEncrypted: 'enc:token' } } },
     ]);
     jest.doMock('../utils/crypto', () => ({ decryptPassword: () => ({ password: 'raw-token' }) }));
-    mockCountListEntries.mockResolvedValue(5);
+    mockCountListEntries.mockResolvedValue({ count: 5, capped: false });
 
     const result = await at({ entity_type: 'LIST_ENTRIES', action: 'COUNT', list_id: LIST_ID });
 

@@ -450,8 +450,8 @@ describe('AttioService', () => {
 
     it('returns 0 for an empty list', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: [] } });
-      const count = await service.countListEntries('list-abc');
-      expect(count).toBe(0);
+      const result = await service.countListEntries('list-abc');
+      expect(result).toEqual({ count: 0, capped: false });
     });
 
     it('sums entries across multiple pages', async () => {
@@ -459,10 +459,21 @@ describe('AttioService', () => {
         .mockResolvedValueOnce({ data: { data: [{ id: 1 }, { id: 2 }], next_cursor: 'page-2' } })
         .mockResolvedValueOnce({ data: { data: [{ id: 3 }], next_cursor: undefined } });
 
-      const count = await service.countListEntries('list-abc');
+      const result = await service.countListEntries('list-abc');
 
-      expect(count).toBe(3);
+      expect(result).toEqual({ count: 3, capped: false });
       expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+    });
+
+    it('stops after 200 pages and reports capped:true for a pathologically large list', async () => {
+      mockAxiosPost.mockImplementation(() =>
+        Promise.resolve({ data: { data: [{ id: 1 }], next_cursor: 'next' } })
+      );
+
+      const result = await service.countListEntries('huge-list');
+
+      expect(result).toEqual({ count: 200, capped: true });
+      expect(mockAxiosPost).toHaveBeenCalledTimes(200);
     });
   });
 

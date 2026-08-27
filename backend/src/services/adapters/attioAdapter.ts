@@ -435,13 +435,25 @@ export class AttioAdapter implements CrmAdapter {
         if (pullDealMappings.length > 0 && config.attioDealListId) {
             try {
                 dealAttrCache = await svc.loadAttributeTypes('people', config.attioDealListId);
+                // Bounded so an enormous deal list can't retain an unbounded number
+                // of entries in memory for one pull run — people beyond this many
+                // pages of deal entries simply pull without their deal fields
+                // (non-critical, same graceful-degrade convention as a total
+                // prefetch failure below).
+                const MAX_DEAL_PREFETCH_PAGES = 200;
                 let dealCursor: string | undefined;
+                let dealPages = 0;
                 do {
                     const { entries, nextCursor: nextDealCursor } = await svc.listListEntriesDetailed(config.attioDealListId, dealCursor);
                     for (const entry of entries) {
                         dealEntriesByPersonId.set(entry.personRecordId, { entryId: entry.entryId, values: entry.values });
                     }
                     dealCursor = nextDealCursor;
+                    dealPages++;
+                    if (dealCursor && dealPages >= MAX_DEAL_PREFETCH_PAGES) {
+                        console.warn(`[Attio-Pull] Deal-list ${config.attioDealListId} has more than ${MAX_DEAL_PREFETCH_PAGES} pages of entries — stopping prefetch early, some people will pull without deal fields.`);
+                        break;
+                    }
                 } while (dealCursor);
             } catch (e: any) {
                 console.error('[Attio-Pull] Failed to prefetch deal-list entries (non-critical):', e.response?.data?.message || e.message);

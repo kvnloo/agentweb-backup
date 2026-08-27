@@ -896,16 +896,28 @@ export class AttioService {
    * a total in its response envelope, so this pages through with
    * listListEntries and sums — same page-and-sum shape as
    * businessFunnelService.fetchLeadCount for AgentWeb's own lead lists.
+   * Bounded at MAX_COUNT_PAGES (50 entries/page, so 10,000 entries tallied
+   * exactly) so an enormous or pathological list can't turn a single Emma
+   * CPL-reporting call into an unbounded API-call fan-out — `capped: true`
+   * tells the caller the real total may be higher than `count`.
    */
-  async countListEntries(listId: string): Promise<number> {
+  async countListEntries(listId: string): Promise<{ count: number; capped: boolean }> {
+    const MAX_COUNT_PAGES = 200;
     let total = 0;
     let cursor: string | undefined;
+    let pages = 0;
+    let capped = false;
     do {
       const { entries, nextCursor } = await this.listListEntries(listId, cursor);
       total += entries.length;
       cursor = nextCursor;
+      pages++;
+      if (cursor && pages >= MAX_COUNT_PAGES) {
+        capped = true;
+        break;
+      }
     } while (cursor);
-    return total;
+    return { count: total, capped };
   }
 
   /**

@@ -113,6 +113,19 @@ describe('AttioAdapter.pullContacts — deal entry pull', () => {
     expect(call[1][0].dealValue).toBeUndefined();
   });
 
+  it('stops prefetching after 200 pages of deal entries instead of paging forever', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    mockListListEntriesDetailed.mockImplementation(() =>
+      Promise.resolve({ entries: [{ entryId: 'e', personRecordId: 'person_1', values: {} }], nextCursor: 'next' })
+    );
+
+    await adapter.pullContacts(auth, 'list_1', makeConfig({ dealFieldMapping: dealMapping, attioDealListId: 'deallist_1' }));
+
+    expect(mockListListEntriesDetailed).toHaveBeenCalledTimes(200);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/more than 200 pages/i));
+    warnSpy.mockRestore();
+  });
+
   it('does not merge deal fields for a person with no matching list entry', async () => {
     mockListListEntriesDetailed.mockResolvedValue({
       entries: [{ entryId: 'entry_other', personRecordId: 'person_other', values: { deal_value: [{ value: '999' }] } }],

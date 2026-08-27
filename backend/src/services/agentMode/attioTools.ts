@@ -122,8 +122,14 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
         case 'COUNT': {
           if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES COUNT.' };
           const attioListId = await resolveAttioListId(userId, args.list_id, false);
-          const count = await svc.countListEntries(attioListId);
-          return { success: true, count };
+          const { count, capped } = await svc.countListEntries(attioListId);
+          return {
+            success: true,
+            count,
+            ...(capped
+              ? { capped: true, note: `This list has more than ${count} entries; the count was capped for performance and reflects a floor, not the exact total.` }
+              : {}),
+          };
         }
         case 'ADD_ENTRIES': {
           if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES ADD_ENTRIES.' };
