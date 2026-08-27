@@ -30,8 +30,16 @@ export async function ensureAttioWebhook(userId: string, accountId: string): Pro
       return; // already registered
     }
 
+    const baseUrl = process.env.BACKEND_URL;
+    if (!baseUrl) {
+      // Registering a localhost URL would still persist webhook_id, and the
+      // idempotency guard above would then permanently no-op every later
+      // attempt for this account — a silent, self-locking failure.
+      console.warn(`[Attio Webhook] BACKEND_URL unset — skipping registration for account ${accountId}`);
+      return;
+    }
     const svc = await AttioService.create(userId, accountId);
-    const targetUrl = `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/webhooks/attio`;
+    const targetUrl = `${baseUrl}/api/webhooks/attio`;
     const { webhookId, secret } = await svc.registerWebhook(targetUrl);
 
     if (!webhookId || !secret) {

@@ -37,12 +37,19 @@ const baseAccount = (overrides: Record<string, any> = {}) => ({
   },
 });
 
+const originalBackendUrl = process.env.BACKEND_URL;
+
 beforeEach(() => {
   jest.clearAllMocks();
+  process.env.BACKEND_URL = 'https://backend.example.com';
   mockUpdateAccountConfig.mockResolvedValue(undefined);
   mockAttioServiceCreate.mockResolvedValue({
     registerWebhook: (...a: any[]) => mockRegisterWebhook(...a),
   });
+});
+
+afterAll(() => {
+  process.env.BACKEND_URL = originalBackendUrl;
 });
 
 describe('ensureAttioWebhook', () => {
@@ -64,6 +71,17 @@ describe('ensureAttioWebhook', () => {
     await ensureAttioWebhook('user-1', 'acct-1');
     expect(mockAttioServiceCreate).not.toHaveBeenCalled();
     expect(mockRegisterWebhook).not.toHaveBeenCalled();
+  });
+
+  it('skips registration when BACKEND_URL is unset, rather than persisting an unusable localhost webhook', async () => {
+    delete process.env.BACKEND_URL;
+    mockGetAccountById.mockResolvedValue(baseAccount());
+    await ensureAttioWebhook('user-1', 'acct-1');
+    // Registering localhost would still persist webhook_id, and the
+    // idempotency guard would then permanently no-op every later retry.
+    expect(mockAttioServiceCreate).not.toHaveBeenCalled();
+    expect(mockRegisterWebhook).not.toHaveBeenCalled();
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
   });
 
   it('registers a webhook and persists webhook_id + secret on success', async () => {
