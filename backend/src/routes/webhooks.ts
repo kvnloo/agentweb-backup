@@ -1179,7 +1179,15 @@ router.post('/attio', (req: express.Request, res: express.Response) => {
       // id: { workspace_id, object_id, record_id, ... }, actor }] }. workspace_id
       // lives on each individual event's `id`, not at the top level — the original
       // stub's `event?.workspace_id` assumption never matched a real delivery.
-      const events: any[] = Array.isArray(payload?.events) ? payload.events : [payload];
+      const rawEvents: any[] = Array.isArray(payload?.events) ? payload.events : [payload];
+      // Real deliveries carry a handful of events at most; cap defensively so a
+      // malformed or oversized body can't fan out into an unbounded number of
+      // per-event Attio API calls and DB writes in processAttioWebhookJob.
+      const MAX_EVENTS_PER_DELIVERY = 200;
+      if (rawEvents.length > MAX_EVENTS_PER_DELIVERY) {
+        console.warn(`[Attio Webhook] Delivery carries ${rawEvents.length} events — processing only the first ${MAX_EVENTS_PER_DELIVERY}`);
+      }
+      const events = rawEvents.slice(0, MAX_EVENTS_PER_DELIVERY);
       const workspaceId: string = events[0]?.id?.workspace_id ?? '';
       if (!workspaceId) {
         console.warn('[Attio Webhook] No workspace_id on delivery — ignored');

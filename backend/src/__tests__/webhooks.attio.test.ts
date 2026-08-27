@@ -228,6 +228,21 @@ describe('POST /api/webhooks/attio — shared OAuth webhook', () => {
     );
   });
 
+  it('caps an oversized delivery at 200 events rather than processing an unbounded fan-out', async () => {
+    const body = {
+      webhook_id: 'wh-1',
+      events: Array.from({ length: 300 }, (_, i) => ({
+        event_type: 'record.updated',
+        id: { workspace_id: WORKSPACE_ID, object_id: 'obj-1', record_id: `rec-${i}` },
+        actor: { type: 'workspace-member', id: 'human-1' },
+      })),
+    };
+    await request(app).post('/api/webhooks/attio').set('attio-signature', makeSignature(body)).send(body);
+    await flushPromises();
+
+    expect(mockApplyAttioPersonEvent).toHaveBeenCalledTimes(200);
+  });
+
   it('ignores a delivery for an unknown workspace (no connected account)', async () => {
     mockGetAccountsByAttioWorkspaceId.mockResolvedValue([]);
     const body = { event_type: 'record.updated', id: { workspace_id: 'unknown-ws', record_id: 'rec-1' } };
