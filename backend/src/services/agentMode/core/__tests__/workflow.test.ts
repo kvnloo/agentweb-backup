@@ -146,6 +146,25 @@ describe('resolveStepParameters', () => {
     }
   });
 
+  it('does not let an unrelated ANSWERED question (a different kind) satisfy the gate, even when its payload happens to carry a same-named field', () => {
+    const step = makeStep({
+      requiredParameters: [{ key: 'objective', questionKind: 'workflow_meta_objective', payloadField: 'objective' }],
+    });
+    // Answered, but of a DIFFERENT kind — and its payload coincidentally has
+    // an `objective` field too. Before the fix, findQuestionByKind would
+    // return undefined (no match for 'workflow_meta_objective'), and
+    // checkQuestionGate(pending, undefined, archive) would fall through to
+    // accepting whatever question IS live regardless of kind — silently
+    // resolving `objective` from the wrong decision entirely.
+    const unrelatedAnswered = answeredQuestion('some_other_kind', { objective: 'WRONG_VALUE_FROM_UNRELATED_QUESTION' });
+    const result = resolveStepParameters(step, makeRun(), unrelatedAnswered, undefined);
+    expect(result.blocked).toBe(true);
+    if (result.blocked) {
+      expect(result.block.missingParameter).toBe('objective');
+      expect(result.block.questionKind).toBe('workflow_meta_objective');
+    }
+  });
+
   it('blocks while the matching question is still awaiting an answer', () => {
     const step = makeStep({
       requiredParameters: [{ key: 'objective', questionKind: 'workflow_meta_objective', payloadField: 'objective' }],

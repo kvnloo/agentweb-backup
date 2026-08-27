@@ -110,7 +110,7 @@ beforeEach(() => {
 describe('ENG-397 AC1 — in-order execution + persisted checkpoints', () => {
   it('executes steps in order, checkpointing entity IDs and verified state as each step completes', async () => {
     mockCreateCampaign.mockResolvedValue({ id: 'camp_1' });
-    mockGetCampaign.mockResolvedValue({ id: 'camp_1', objective: 'OUTCOME_LEADS' });
+    mockGetCampaign.mockResolvedValue({ id: 'camp_1', objective: 'OUTCOME_LEADS', daily_budget: 5000 });
 
     const definition = makeDefinition();
     const getSession = wireSessionStore({
@@ -186,7 +186,7 @@ describe('ENG-397 AC3 — blocks before mutation when a required parameter is un
 describe('ENG-397 AC4 — verification failure halts the run', () => {
   it('marks the run failed-at-step-1 with the discrepancy attached, and never runs the next step or retries', async () => {
     mockCreateCampaign.mockResolvedValue({ id: 'camp_1' });
-    mockGetCampaign.mockResolvedValue({ id: 'camp_1', objective: 'OUTCOME_TRAFFIC' }); // drift from requested OUTCOME_LEADS
+    mockGetCampaign.mockResolvedValue({ id: 'camp_1', objective: 'OUTCOME_TRAFFIC', daily_budget: 5000 }); // objective drift from requested OUTCOME_LEADS; budget matches so only objective mismatches
 
     const definition = makeDefinition();
     wireSessionStore({ workflowRun: buildWorkflowRunState({ runId: 'run_1', workflowId: definition.workflowId, createdAt: '2026-01-01T00:00:00.000Z', initialParameters: INITIAL_PARAMS }), answeredQuestions: answeredQuestionArchive() });
@@ -205,5 +205,52 @@ describe('ENG-397 AC4 — verification failure halts the run', () => {
     expect(second.kind).toBe('step_failed');
     expect(mockCreateCampaign).toHaveBeenCalledTimes(1);
     expect((definition.steps[1].execute as jest.Mock)).not.toHaveBeenCalled();
+  });
+});
+
+describe('ENG-397 hardening — a missing declared output fails the step instead of checkpointing "undefined"', () => {
+  it('fails the step when execute() omits a declared output, rather than writing the literal string "undefined" as an entity id', async () => {
+    const brokenStep: WorkflowStepDefinition = {
+      id: 'broken_step',
+      inputs: [],
+      outputs: ['thing_id'],
+      requiredParameters: [],
+      execute: jest.fn(async () => ({})), // forgets to return `thing_id`
+      verify: jest.fn(async (): Promise<import('../services/agentMode/core/workflow').WorkflowStepVerification> => ({ verified: true, verifiedFields: {} })),
+    };
+    const definition: WorkflowDefinition = { workflowId: 'broken_workflow', steps: [brokenStep] };
+    wireSessionStore({ workflowRun: buildWorkflowRunState({ runId: 'run_1', workflowId: definition.workflowId, createdAt: '2026-01-01T00:00:00.000Z' }) });
+
+    const outcome = await advanceWorkflow(SESSION_ID, definition);
+
+    expect(outcome.kind).toBe('step_failed');
+    if (outcome.kind !== 'step_failed') throw new Error('unreachable');
+    expect(outcome.run.status).toBe('failed');
+    expect(outcome.run.checkpoints[0].discrepancy).toEqual({ error: expect.stringContaining('thing_id') });
+    expect(outcome.run.checkpoints[0].entityIds).toBeUndefined();
+    // verify() never even runs — a missing output is a contract violation,
+    // not something worth reading back and comparing.
+    expect(brokenStep.verify as jest.Mock).not.toHaveBeenCalled();
+  });
+});
+
+describe('ENG-397 hardening — budget_mode is verified, not just gated', () => {
+  it('fails verification when campaign_budget_optimization was requested but Meta applied no daily_budget', async () => {
+    mockCreateCampaign.mockResolvedValue({ id: 'camp_1' });
+    mockGetCampaign.mockResolvedValue({ id: 'camp_1', objective: 'OUTCOME_LEADS' }); // no daily_budget in the read-back
+
+    const definition = makeDefinition();
+    wireSessionStore({
+      workflowRun: buildWorkflowRunState({ runId: 'run_1', workflowId: definition.workflowId, createdAt: '2026-01-01T00:00:00.000Z', initialParameters: INITIAL_PARAMS }),
+      answeredQuestions: answeredQuestionArchive(),
+    });
+
+    const outcome = await advanceWorkflow(SESSION_ID, definition);
+
+    expect(outcome.kind).toBe('step_failed');
+    if (outcome.kind !== 'step_failed') throw new Error('unreachable');
+    expect(outcome.run.checkpoints[0].discrepancy).toEqual([
+      { parameter: 'budget_mode', requested: 'campaign_budget_optimization', applied: null },
+    ]);
   });
 });
