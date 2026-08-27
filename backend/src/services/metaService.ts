@@ -1812,7 +1812,14 @@ export class MetaService {
    * own. For a read that is safe: no side effect is left half-applied, and the caller gets an
    * answer instead of hanging. That distinction is exactly why this is not applied to writes.
    */
-  private static async withReadDeadline<T>(op: () => Promise<T>, what: string): Promise<T> {
+  private static async withReadDeadline<T>(
+    op: () => Promise<T>,
+    what: string,
+    budgetMs: number = META_READ_CALL_TIMEOUT_MS,
+  ): Promise<T> {
+    // Never longer than the per-call ceiling, and never long enough to outlive a caller's own
+    // remaining budget. At least 1ms so a deadline is always a real one.
+    const limitMs = Math.max(1, Math.min(budgetMs, META_READ_CALL_TIMEOUT_MS));
     let timer: ReturnType<typeof setTimeout> | undefined;
     const inFlight = op();
 
@@ -1835,8 +1842,8 @@ export class MetaService {
         inFlight,
         new Promise<never>((_resolve, reject) => {
           timer = setTimeout(
-            () => reject(new Error(`Meta ${what} did not respond within ${META_READ_CALL_TIMEOUT_MS}ms`)),
-            META_READ_CALL_TIMEOUT_MS,
+            () => reject(new Error(`Meta ${what} did not respond within ${limitMs}ms`)),
+            limitMs,
           );
           // Never hold the event loop open just for this timer.
           (timer as any)?.unref?.();
@@ -1887,8 +1894,19 @@ export class MetaService {
         return { items, truncated: true, pagesFetched };
       }
       try {
-        // Replaces the cursor's contents with the next page, so accumulate as we go.
-        await MetaService.withReadDeadline(() => cursor.next(), 'page fetch');
+        /*
+         * Give the page only the budget the WALK still has.
+         *
+         * The wall-clock check above gates whether a new page STARTS; on its own that let a page
+         * beginning at 44s of a 45s budget run for a further META_READ_CALL_TIMEOUT_MS, overshooting
+         * the overall deadline by nearly the whole per-call ceiling. Clamping to whatever remains
+         * makes META_LIST_MAX_MS an actual bound on the walk rather than a bound on its start times.
+         */
+        await MetaService.withReadDeadline(
+          () => cursor.next(),
+          'page fetch',
+          deadline - Date.now(),
+        );
       } catch (e: any) {
         /*
          * A page-N failure must not throw away pages 1..N-1. Adding pagination added this

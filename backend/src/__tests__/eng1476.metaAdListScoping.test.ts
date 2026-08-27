@@ -571,6 +571,49 @@ describe('ENG-1476 listAds — pagination', () => {
       }
     });
 
+    /**
+     * The wall-clock check gates whether a page STARTS, not how long it may then run. Without
+     * clamping, a page beginning at 44s of a 45s budget could run a further full per-call ceiling
+     * — overshooting the walk's own deadline by nearly 30s. Each page now gets only what the walk
+     * has left, so META_LIST_MAX_MS bounds the WALK rather than merely its start times.
+     */
+    it('gives a late page only the budget the walk has left, not the full per-call ceiling', async () => {
+      jest.useFakeTimers();
+      let clock = 5_000_000;
+      const realNow = Date.now;
+      Date.now = () => clock;
+      try {
+        const cursor: any = [ad('1')];
+        let call = 0;
+        cursor.hasNext = () => true;
+        cursor.next = async () => {
+          call++;
+          if (call === 1) {
+            clock += 44_000;            // burn almost the whole 45s walk budget
+            cursor.length = 0;
+            cursor.push(ad('2'));
+            return cursor;
+          }
+          return new Promise(() => {}); // second page hangs
+        };
+        (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+          getAds: jest.fn().mockResolvedValue(cursor),
+        }));
+
+        const p = service.listAds('act123', 'tok');
+        // Only ~1s of budget remains. If the per-call ceiling were used instead, nothing would
+        // settle here and this advance would be far too small.
+        await jest.advanceTimersByTimeAsync(1_500);
+        const result = await p;
+
+        expect(result.truncated).toBe(true);
+        expect(result.ads.map((a: any) => a.id)).toEqual(['1', '2']);
+      } finally {
+        Date.now = realNow;
+        jest.useRealTimers();
+      }
+    });
+
     it('leaves no pending timer behind on the success path', async () => {
       jest.useFakeTimers();
       try {
