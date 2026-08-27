@@ -443,7 +443,36 @@ router.put('/config/:listId/:provider/pipeline', async (req: any, res) => {
     }
 
     const config = await externalCrmSyncService.changePipeline(userId, listId, provider, externalPipelineId);
-    res.json({ config });
+    // Allowlisted response, not the raw persisted config — same fields as
+    // PUT /config/:listId/:provider. changePipeline() builds its return value
+    // via a full `...config` spread, so returning it verbatim here leaked
+    // apiKeyEncrypted (manual-token configs) and the plaintext webhookSecret
+    // to any same-org CRM editor with destructive access to this list, not
+    // just the config's own creator (CodeRabbit finding).
+    res.json({
+      configured: true,
+      provider: config.provider,
+      accountId: config.accountId,
+      hasManualToken: !!config.apiKeyEncrypted,
+      autoSyncEnabled: config.autoSyncEnabled,
+      contactFieldMapping: config.contactFieldMapping,
+      dealFieldMapping: config.dealFieldMapping,
+      customFieldMapping: config.customFieldMapping,
+      companyFieldMapping: config.companyFieldMapping ?? [],
+      deleteOnPush: config.deleteOnPush ?? false,
+      deleteOnPull: config.deleteOnPull ?? false,
+      webhookEnabled: config.webhookEnabled ?? true,
+      listName: config.listName,
+      hubspotLifecycleStage: config.hubspotLifecycleStage,
+      hubspotMarkAsNonMarketing: config.hubspotMarkAsNonMarketing ?? false,
+      externalPipelineId: config.externalPipelineId,
+      attioDealListId: config.attioDealListId,
+      createdAt: config.createdAt,
+      updatedAt: config.updatedAt,
+      webhookUrl: config.webhookSecret
+        ? `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
+        : undefined,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to change pipeline' });
   }

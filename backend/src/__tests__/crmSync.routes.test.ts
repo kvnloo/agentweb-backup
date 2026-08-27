@@ -128,7 +128,36 @@ describe('PUT /api/crm-sync/config/:listId/:provider/pipeline — change pipelin
       .send({ externalPipelineId: 'new-pipe' })
       .expect(200);
     expect(externalCrmSyncService.changePipeline).toHaveBeenCalledWith('user-1', 'list-1', 'hubspot', 'new-pipe');
-    expect(res.body.config.externalPipelineId).toBe('new-pipe');
+    expect(res.body.externalPipelineId).toBe('new-pipe');
+  });
+
+  it('never returns credential fields, even when the persisted config carries them', async () => {
+    externalCrmSyncService.changePipeline.mockResolvedValueOnce({
+      provider: 'attio',
+      listId: 'list-1',
+      userId: 'user-1',
+      accountId: 'acct-1',
+      attioDealListId: 'new-list',
+      autoSyncEnabled: true,
+      apiKeyEncrypted: 'enc:super-secret-token',
+      webhookSecret: 'plaintext-webhook-secret',
+    });
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/attio/pipeline')
+      .send({ externalPipelineId: 'new-list' })
+      .expect(200);
+
+    expect(res.body.attioDealListId).toBe('new-list');
+    expect(res.body).not.toHaveProperty('apiKeyEncrypted');
+    expect(res.body).not.toHaveProperty('webhookSecret');
+    expect(res.body).not.toHaveProperty('config');
+    expect(JSON.stringify(res.body)).not.toMatch(/super-secret-token/);
+    expect(res.body.hasManualToken).toBe(true);
+    // webhookUrl intentionally embeds the secret as a query param — that's the
+    // callback URL an external service (Attio/HubSpot) calls back with, the
+    // same derivation GET/PUT config already use. Not a leak: the secret's
+    // *raw field* is what must never appear, and it doesn't.
+    expect(res.body.webhookUrl).toMatch(/secret=plaintext-webhook-secret/);
   });
 
   it('surfaces service errors as 500', async () => {
@@ -154,7 +183,7 @@ describe('PUT /api/crm-sync/config/:listId/:provider/pipeline — change pipelin
       .send({ externalPipelineId: 'new-list' })
       .expect(200);
     expect(externalCrmSyncService.changePipeline).toHaveBeenCalledWith('user-1', 'list-1', 'attio', 'new-list');
-    expect(res.body.config.attioDealListId).toBe('new-list');
+    expect(res.body.attioDealListId).toBe('new-list');
   });
 });
 
