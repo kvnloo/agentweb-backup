@@ -1021,7 +1021,15 @@ export const getAccountsByAttioWorkspaceId = async (
 ): Promise<Array<{ userId: string; account: ConnectedAccountConfig }>> => {
   try {
     const { userDb } = await import('./db');
-    const users = await userDb.getAllUsers();
+    // Deliberately scanWithFilter, not getAllUsers(): this runs on every
+    // incoming Attio webhook, unauthenticated until a candidate's signing key
+    // verifies below — getAllUsers() additionally starts three count queries
+    // (tasks/workflows/chat sessions) per user for admin-dashboard display,
+    // irrelevant here and multiplying the cost of every delivery. A full
+    // table scan is still unavoidable without a dedicated workspace-to-account
+    // index (a schema change, gated separately), but skipping the per-user
+    // fan-out removes the dominant, easily-avoidable cost.
+    const users = await userDb.scanWithFilter('attribute_exists(connected_accounts)', {});
     const matches: Array<{ userId: string; account: ConnectedAccountConfig }> = [];
 
     for (const user of users) {

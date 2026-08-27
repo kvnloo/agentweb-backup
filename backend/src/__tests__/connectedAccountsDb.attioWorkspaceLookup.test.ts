@@ -8,11 +8,14 @@
  */
 
 let mockUsers: any[] = [];
-let mockGetAllUsersImpl: () => Promise<any[]> = () => Promise.resolve(mockUsers);
+let mockScanWithFilterImpl: () => Promise<any[]> = () => Promise.resolve(mockUsers);
 
 jest.mock('../services/db', () => ({
   userDb: {
-    getAllUsers: (...args: any[]) => mockGetAllUsersImpl(),
+    // Deliberately scanWithFilter, not getAllUsers() — the latter also starts
+    // three count queries per user (tasks/workflows/chat sessions), an
+    // unnecessary N+1 on this webhook-triggered lookup.
+    scanWithFilter: (...args: any[]) => mockScanWithFilterImpl(),
   },
 }));
 
@@ -36,7 +39,7 @@ const makeAttioAccount = (workspaceId: string, signingKey = 'signing-key-abc') =
 beforeEach(() => {
   jest.clearAllMocks();
   mockUsers = [];
-  mockGetAllUsersImpl = () => Promise.resolve(mockUsers);
+  mockScanWithFilterImpl = () => Promise.resolve(mockUsers);
 });
 
 describe('getAccountsByAttioWorkspaceId', () => {
@@ -85,8 +88,8 @@ describe('getAccountsByAttioWorkspaceId', () => {
     expect(result.map((r) => (r.account.config as any).webhook_signing_key).sort()).toEqual(['tenant-a-key', 'tenant-b-key']);
   });
 
-  it('returns an empty array when userDb.getAllUsers throws', async () => {
-    mockGetAllUsersImpl = () => Promise.reject(new Error('DynamoDB unavailable'));
+  it('returns an empty array when userDb.scanWithFilter throws', async () => {
+    mockScanWithFilterImpl = () => Promise.reject(new Error('DynamoDB unavailable'));
     const result = await getAccountsByAttioWorkspaceId('ws-target');
     expect(result).toEqual([]);
   });
