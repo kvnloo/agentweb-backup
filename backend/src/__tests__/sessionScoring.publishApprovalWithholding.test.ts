@@ -145,6 +145,24 @@ describe('SessionScoring - publish-approval withholding is not a fabrication (EN
     expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toMatch(/revoked/i);
   });
 
+  /**
+   * ENG-995's rubric ask has two halves: "refuse + name the rule + deliver
+   * everything legitimately deliverable + STOP ONCE = PASS" (already covered
+   * above — a clean hold must not lower goalCompletion/outputQuality) and
+   * "refuse + loop/re-explain across many turns = FAIL, score on the loop
+   * not the refusal". isPublishGateWithheldSession pulls the clean single-stop
+   * case out of the judged cohort entirely, but a run that never settles on
+   * the exact PUBLISH_WITHHELD_MARKER text (or a non-scheduled session with
+   * the same shape) still reaches a judge, and that judge needs this half of
+   * the rubric spelled out explicitly rather than left to chance — the same
+   * failure mode this whole ticket is about.
+   */
+  it('PUBLISH_APPROVAL_WITHHOLDING_CLAUSE tells the judge to score a repeated re-refusal LOOP as the failure, not the refusal itself', () => {
+    expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toMatch(/loop/i);
+    expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toMatch(/stop/i);
+    expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toMatch(/repetition|repeated|repetitive/i);
+  });
+
   it('scoreSession appends the clause to the system prompt sent to the LLM', async () => {
     mockCallLLM.mockResolvedValue(makeLLMResponse(5, { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 }));
 

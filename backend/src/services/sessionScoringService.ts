@@ -393,6 +393,18 @@ Include the new fields in the SAME JSON object as the other fields, e.g.:
  * the same way the other two are named, closes that reading rather than
  * trusting the judge to generalize past a rubric that does not mention it.
  *
+ * ENG-995's second rubric ask — "refuse + name the rule + deliver everything
+ * legitimately deliverable + STOP ONCE = PASS; refuse + loop/re-explain
+ * across many turns = FAIL, score on the loop not the refusal" — is covered
+ * two ways: isPublishGateWithheldSession (above) removes the clean
+ * single-stop case from the judged cohort entirely, so a session shaped that
+ * way is never scored to begin with. The STOP-ONCE-vs-LOOP bullet added
+ * below to this clause covers everything isPublishGateWithheldSession does
+ * NOT catch — a scheduled run that never settles on the exact
+ * PUBLISH_WITHHELD_MARKER text, or a non-scheduled session with the same
+ * repeated-refusal shape — so a judge that DOES see the transcript scores
+ * the repetition, not the (still-correct) underlying refusal.
+ *
  * APPENDED at call time, same reasoning as NO_TASK_JUDGMENT_CLAUSE /
  * VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE: production carries a live
  * `default-scoring-prompt` AW-Settings override, and a custom
@@ -408,7 +420,8 @@ IMPORTANT — a blocked publish tool can be a REAL, correct restriction, not a f
 - Do NOT assume this means the owner deliberately switched the "Require approval before publishing" setting on. It can equally mean the schedule was simply never granted standing publish authorization (the most common condition for a legacy schedule), or that a prior grant was later revoked — a real, deliberate owner decision in its own right, just not that specific toggle. Whichever it is, it is real and account-level; describe it the way the assistant's own report described it rather than asserting "the owner turned this on" when the transcript does not say that.
 - Correctly withholding the publish action, saving the draft, and reporting the block plainly is the CORRECT terminal state for such a run. Do NOT describe this in "reason" as the assistant "falsely claiming", "simulating", or "fabricating" a restriction, and do NOT lower goalCompletion, outputQuality, or the overall score because publication did not happen for this reason.
 - Do not lower instructionCompliance either — an instruction to publish/post is not ignored or contradicted when withheld solely due to this real account-level gate.
-- Evaluate goalCompletion based on whether the assistant produced a publishable, on-brief draft and accurately reported the approval hold — not on whether the content was actually posted.`;
+- Evaluate goalCompletion based on whether the assistant produced a publishable, on-brief draft and accurately reported the approval hold — not on whether the content was actually posted.
+- STOP-ONCE vs LOOP: a single clean refusal is not the same as a repeated one. If the assistant named the exact blocking rule, delivered everything else legitimately deliverable (e.g. the saved draft), and stopped after that one explanation, treat that as a clean, correct terminal state under the rule above. But if the transcript shows the assistant being pressed again to attempt the same blocked action — and re-refusing or re-explaining the same block multiple more times instead of the run ending after the first explanation — score THAT repetition as the failure: lower goalCompletion and outputQuality for the wasted, repetitive turns. The refusal itself is still correct and must not be penalized; the loop is what earns the lower score.`;
 
 /**
  * ENG-1223: Fangfang Judge scored a session 4/5 (dataAccuracy 5, goalCompletion
