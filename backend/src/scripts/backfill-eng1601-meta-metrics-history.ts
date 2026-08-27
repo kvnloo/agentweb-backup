@@ -89,9 +89,22 @@ const UTM_EPOCH = '2026-07-02';
 /** Courtesy gap between days. Meta rate-limits per ad account, and 90 days is 90 insights calls. */
 const PER_DAY_PAUSE_MS = 750;
 
+/**
+ * Read a value option, refusing one that was supplied without a value.
+ *
+ * ⚠ A bare `--from` at the end of argv previously returned `undefined`, which fell through to the
+ * UTM-epoch default — so `--apply --from` (a typo) silently selected the FULL range and started a
+ * bulk write. A flag that is present but empty is a mistake, not a default: treat it as one. The
+ * next token being another flag is the same mistake with a different shape.
+ */
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
-  return i >= 0 ? process.argv[i + 1] : undefined;
+  if (i < 0) return undefined;
+  const v = process.argv[i + 1];
+  if (v === undefined || v.startsWith('--')) {
+    throw new Error(`--${name} was supplied without a value.`);
+  }
+  return v;
 }
 const has = (name: string) => process.argv.includes(`--${name}`);
 
@@ -99,9 +112,20 @@ function toDateStr(d: Date): string {
   return d.toISOString().split('T')[0];
 }
 
+/**
+ * ⚠ `Date.parse` NORMALISES an overflow date rather than rejecting it — `2026-09-31` silently
+ * becomes `2026-10-01`. Accepting that would make the script write a date nobody asked for, and
+ * for a value that is also compared as a STRING against the UTM epoch, a normalised date can land
+ * on the far side of a bound it appeared to satisfy. So the parsed date must round-trip back to
+ * exactly the input.
+ */
 function assertDateStr(v: string, label: string): string {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(v) || Number.isNaN(Date.parse(`${v}T00:00:00Z`))) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) {
     throw new Error(`${label} must be YYYY-MM-DD, got "${v}"`);
+  }
+  const parsed = new Date(`${v}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== v) {
+    throw new Error(`${label} is not a real calendar date: "${v}"`);
   }
   return v;
 }
@@ -139,9 +163,18 @@ async function main(): Promise<void> {
   }
 
   let dates = datesBetween(from, to);
-  const limit = Number(arg('limit') || 0);
-  // Newest first when limited: the recent tail is the part anyone is looking at.
-  if (limit > 0) dates = dates.slice(-limit);
+
+  // A non-numeric, negative or fractional --limit previously collapsed to 0, which means "no
+  // limit" — so a typo in the one flag intended to REDUCE blast radius silently removed it.
+  const rawLimit = arg('limit');
+  if (rawLimit !== undefined) {
+    const limit = Number(rawLimit);
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new Error(`--limit must be a positive whole number, got "${rawLimit}"`);
+    }
+    // Newest first: the recent tail is the part anyone is looking at.
+    dates = dates.slice(-limit);
+  }
 
   console.log(
     `[ENG-1601 backfill] ${apply ? 'APPLY' : 'DRY RUN (no metrics rows written, no Meta insights calls)'}`
@@ -205,7 +238,8 @@ async function main(): Promise<void> {
 
   let ok = 0;
   let failed = 0;
-  let rows = 0;
+  let campaignRows = 0;
+  let accountDayRows = 0;
   let attributed = 0;
   let unattributed = 0;
   const failures: string[] = [];
@@ -214,11 +248,17 @@ async function main(): Promise<void> {
     try {
       const r = await snapshotMetaMetricsForDate(userId, dateStr, credentials, leadsByDate, accountContext);
       ok++;
-      rows += r.rowsWritten;
+      // `rowsWritten` counts CAMPAIGN rows only — snapshotMetaMetricsForDate also always writes
+      // one account_day row, which its return value does not include. Reporting the raw number
+      // would say "0 row(s)" for a day that did write a row, which is exactly the kind of quiet
+      // undercount this whole line of work exists to remove.
+      campaignRows += r.rowsWritten;
+      accountDayRows += 1;
       attributed += r.leadCount;
       unattributed += r.unattributedLeadCount;
       console.log(
-        `  ${dateStr}: ${r.rowsWritten} row(s), ${r.leadCount} attributed, ${r.unattributedLeadCount} unattributed`
+        `  ${dateStr}: ${r.rowsWritten} campaign row(s) + 1 account-day row, ` +
+        `${r.leadCount} attributed, ${r.unattributedLeadCount} unattributed`
       );
     } catch (error: any) {
       // One bad day must not abort the run — the write is idempotent, so a later re-run fixes
@@ -231,7 +271,8 @@ async function main(): Promise<void> {
   }
 
   console.log(
-    `\n[ENG-1601 backfill] done. ${ok} day(s) written, ${failed} failed, ${rows} row(s) total, ` +
+    `\n[ENG-1601 backfill] done. ${ok} day(s) written, ${failed} failed, ` +
+    `${campaignRows + accountDayRows} row(s) total (${campaignRows} campaign + ${accountDayRows} account-day), ` +
     `${attributed} attributed / ${unattributed} unattributed lead(s).`
   );
   if (failed) {
