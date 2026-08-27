@@ -199,6 +199,46 @@ function resolvePlatform(entry: RequiredCallLedgerEntry | null | undefined): str
 }
 
 /**
+ * Does `entry` match a registered equivalence route FOR `requirement` — same
+ * tool, and (when the route names them) the same action/platform — regardless
+ * of `consentOnly` or success. This is the SHAPE check every consumer of
+ * `EQUIVALENT_PUBLISH_ROUTES` needs before applying its own further meaning:
+ * `callSatisfiesRequirement` below layers `consentOnly` + success on top for
+ * completion credit; `publishPressCircuitBreaker.ts`'s `classifyPublishStall`
+ * layers only success on top, deliberately NOT excluding `consentOnly` routes,
+ * because "a real write happened via an authorized alternate route" is true
+ * even when that route doesn't count toward literal completion credit — that
+ * asymmetry is the whole point of `consentOnly` (see its field doc above) and
+ * is exactly the ENG-1599 case: a schedule authorized only for
+ * `twitter_manage_post` that actually published via `post_on_connected_account`
+ * has genuinely published, even though the completion checker correctly never
+ * credits that call toward a `twitter_manage_post` requirement.
+ *
+ * ENG-1599 review (CodeRabbit): matching on `route.tool` alone — without this
+ * function's action/platform check — let an unrelated call satisfy the shape
+ * check. A `twitter_manage_post` REPLY (not `post_thread`) would have matched
+ * `post_on_connected_account`'s route, and a `post_on_connected_account` call
+ * to a non-Twitter platform would have matched `twitter_manage_post`'s route —
+ * in both cases treating an unrelated call as if it had achieved the specific
+ * outcome the route documents. Extracted here as ONE shape check so every
+ * consumer applies the identical qualifiers and can never drift apart.
+ */
+export function matchingEquivalentRoute(
+  requirement: string,
+  entry: RequiredCallLedgerEntry | null | undefined
+): EquivalentPublishRoute | null {
+  const name = typeof entry?.name === 'string' ? entry.name : '';
+  if (!name) return null;
+  const routes = EQUIVALENT_PUBLISH_ROUTES[requirement];
+  if (!routes) return null;
+  const route = routes.find((r) => r.tool === name);
+  if (!route) return null;
+  if (route.actions && !route.actions.includes(resolveAction(entry))) return null;
+  if (route.platforms && !route.platforms.includes(resolvePlatform(entry))) return null;
+  return route;
+}
+
+/**
  * Does this ledger entry satisfy one unit of `requirement`?
  *
  * An exact name match satisfies a non-publish requirement unconditionally
@@ -232,13 +272,8 @@ export function callSatisfiesRequirement(
   if (!name) return false;
   if (name === requirement) return isPublishName(name) ? toolCallSucceeded(entry) : true;
 
-  const routes = EQUIVALENT_PUBLISH_ROUTES[requirement];
-  if (!routes) return false;
-
-  const route = routes.find((r) => r.tool === name);
+  const route = matchingEquivalentRoute(requirement, entry);
   if (!route) return false;
-  if (route.actions && !route.actions.includes(resolveAction(entry))) return false;
-  if (route.platforms && !route.platforms.includes(resolvePlatform(entry))) return false;
   // A consentOnly route only widens what an AUTHORIZED schedule may call
   // (isPublishCallWithinAuthorizedScope); it never counts toward completion.
   if (route.consentOnly) return false;

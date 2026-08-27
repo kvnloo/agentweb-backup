@@ -3714,10 +3714,14 @@ export async function runVerifiedChat(
       // publish wrote nothing. But a failed publish is not silence either: it
       // means the model DID reach for the tool and the integration is broken, so
       // the attempted-but-unsuccessful names are reported separately.
+      //
+      // ENG-1599 review: kept as full ledger entries (name + arguments), not
+      // bare names — classifyPublishStall's route match needs each call's
+      // action/platform, not just its tool name, or an unrelated call (a
+      // twitter_manage_post REPLY, a post_on_connected_account to a different
+      // platform) could be mistaken for the specific outcome a route documents.
       const externalWritesSucceeded = publishIsTheOnlyThingLeft
-        ? allToolCalls
-            .filter((tc: any) => tc && typeof tc.name === 'string' && toolCallSucceeded(tc))
-            .map((tc: any) => tc.name as string)
+        ? allToolCalls.filter((tc: any) => tc && typeof tc.name === 'string' && toolCallSucceeded(tc))
         : [];
       const publishToolsAttempted = publishIsTheOnlyThingLeft
         ? allToolCalls
@@ -3752,7 +3756,7 @@ export async function runVerifiedChat(
             : toolFailing
             ? `the run DID call [${functionCallMisses.join(', ')}] and every call failed, so the ` +
               `integration is broken and pressing an erroring tool again cannot succeed`
-            : `the run already wrote externally via [${externalWritesSucceeded.join(', ')}], so the ` +
+            : `the run already wrote externally via [${externalWritesSucceeded.map((tc: any) => tc.name).join(', ')}], so the ` +
               `schedule's requiredFunctionCalls names a tool this run does not use and pressing cannot ` +
               `succeed`) +
           ` (ENG-947).`

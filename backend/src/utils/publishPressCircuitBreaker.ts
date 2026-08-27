@@ -1,5 +1,5 @@
 import { isPublishName } from './hardeningGaps';
-import { EQUIVALENT_PUBLISH_ROUTES } from './requiredCallSatisfaction';
+import { EQUIVALENT_PUBLISH_ROUTES, matchingEquivalentRoute, RequiredCallLedgerEntry } from './requiredCallSatisfaction';
 
 /**
  * ENG-947 — the publish-press circuit breaker.
@@ -170,11 +170,13 @@ export type PublishStallReason =
 /**
  * Decide whether to stop pressing, and if so, WHY. `null` means keep pressing.
  *
- * `externalWritesSucceeded` is the set of irreversible external writes this run
- * actually completed — publish tools and send/post tools alike (isPowerTool),
- * filtered by the caller to SUCCEEDED calls only. A failed publish wrote nothing,
- * so it must not suppress the approval signal; that filtering is the caller's job
- * because only it can see each call's error.
+ * `externalWritesSucceeded` is the FULL ledger entries (name + arguments) for
+ * every irreversible external write this run actually completed, filtered by
+ * the caller to SUCCEEDED calls only. A failed publish wrote nothing, so it
+ * must not suppress the approval signal; that filtering is the caller's job
+ * because only it can see each call's error. Full entries, not bare names,
+ * because `wroteSomethingElse` below needs each call's action/platform to
+ * match a route's qualifiers, not just its tool name (ENG-1599 review).
  *
  * A name that is itself still unmet is ignored: an unmet requirement is by
  * definition one the run did not satisfy, so counting it as evidence of a write
@@ -194,21 +196,32 @@ export type PublishStallReason =
  * under the wrong name, so every press between here and the budget is a second
  * chance to publish a duplicate, not a chance to fix anything.
  *
- * `wroteSomethingElse` below matches a succeeded write against `requiredCall
- * Satisfaction.ts`'s OWN `EQUIVALENT_PUBLISH_ROUTES` table — the same routes
- * `callSatisfiesRequirement` treats as the outcome-equivalent substitute for a
- * given requirement — rather than "any other isPowerTool call succeeded". A
- * caught-before-shipping version of this used the broader check and would have
- * stopped a CRM schedule mid-workflow (e.g. `enrich_leads_execute` succeeding
- * before `send_email_from_sender` was ever attempted) on a false mismatch,
- * because enrichment has no registered relationship to a send at all. Requiring
- * the succeeded name to be a documented route FOR one of the still-unmet
- * requirements means this can only fire when the two really are interchangeable.
+ * `wroteSomethingElse` below matches a succeeded write against
+ * `requiredCallSatisfaction.ts`'s shared `matchingEquivalentRoute` — the SAME
+ * tool + action + platform shape check `callSatisfiesRequirement` uses, so a
+ * call only counts here when it is genuinely the documented alternate route for
+ * one of the still-unmet requirements. Two things this deliberately gets right
+ * that an earlier version (caught in review) did not:
+ *  - route qualifiers matter, not just the tool name — a `twitter_manage_post`
+ *    REPLY does not satisfy `post_on_connected_account`'s route (only
+ *    `post_thread` does), and a `post_on_connected_account` call to a
+ *    non-Twitter platform does not satisfy `twitter_manage_post`'s route.
+ *    Matching on `route.tool` alone would have credited both as "wrote the
+ *    equivalent thing" and stopped the run before the actually-required
+ *    publish could happen.
+ *  - `consentOnly` is deliberately NOT excluded here (unlike
+ *    `callSatisfiesRequirement`, which always excludes it): a `consentOnly`
+ *    route only widens what a run may CALL, not what counts as fulfilling a
+ *    requirement — but a real write via that route still proves further
+ *    pressing is pointless, which is exactly the ENG-1599 case this module
+ *    exists for (post_on_connected_account succeeding never earns
+ *    twitter_manage_post completion credit, but it is still evidence the
+ *    schedule's requiredFunctionCalls names a tool this run does not use).
  */
 export function classifyPublishStall(params: {
   pressAttempt: number;
   unmetRequiredFunctions: string[];
-  externalWritesSucceeded: string[];
+  externalWritesSucceeded: RequiredCallLedgerEntry[];
   publishToolsAttempted?: string[];
   maxPressAttempts?: number;
 }): PublishStallReason | null {
@@ -216,12 +229,10 @@ export function classifyPublishStall(params: {
   if (!isPublishOnlyUnmet(unmetRequiredFunctions)) return null;
 
   const unmet = new Set(unmetRequiredFunctions);
-  const wroteSomethingElse = (externalWritesSucceeded || []).some((name) => {
-    if (typeof name !== 'string' || unmet.has(name)) return false;
-    return unmetRequiredFunctions.some((requirement) => {
-      const routes = EQUIVALENT_PUBLISH_ROUTES[requirement];
-      return Array.isArray(routes) && routes.some((route) => route.tool === name);
-    });
+  const wroteSomethingElse = (externalWritesSucceeded || []).some((entry) => {
+    const name = typeof entry?.name === 'string' ? entry.name : '';
+    if (!name || unmet.has(name)) return false;
+    return unmetRequiredFunctions.some((requirement) => Boolean(matchingEquivalentRoute(requirement, entry)));
   });
   if (wroteSomethingElse) return 'requirement-names-unused-publish-tool';
 
