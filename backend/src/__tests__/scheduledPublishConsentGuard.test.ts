@@ -134,6 +134,114 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
     });
   });
 
+  /**
+   * ENG-1616 — the reverse (ENG-1599) route requires trusting `args.platform`, but
+   * `postOnConnectedAccount` ignores `platform` outright once `account_id` is present,
+   * so the route fails closed on ANY account_id-bearing call. `list_connected_accounts`
+   * pairs every account_id with its platform and tells the model to use account_id once
+   * it knows it — so a call shaped `post_on_connected_account(account_id: '...')` is the
+   * ORDINARY way this route gets invoked, not an edge case. Session 672b3af7
+   * (2026-08-27, schedule 1d001fba-0fb7-4bcd-80f6-6041b244a442 — the exact schedule
+   * ENG-1599 itself was filed against, the very next day) hit exactly this: a standalone
+   * tweet via `post_on_connected_account(account_id: '1340767380')` was refused with
+   * "The owner authorized only: twitter_manage_post," even though the account really was
+   * the connected Twitter account.
+   */
+  describe('the ENG-1599 reverse route with account_id present (ENG-1616)', () => {
+    const SESSION_WITH_USER = { ...SCHEDULED_SESSION, userId: 'harsha-user-id' };
+    const TWITTER_ONLY_SCHEDULE = {
+      ...AUTHORIZED_SCHEDULE,
+      requiredFunctionCalls: ['twitter_manage_post'],
+      autopublishAuthorizedTools: ['twitter_manage_post'],
+    };
+    const TWITTER_ONLY_ADMISSION = {
+      authorized: true,
+      tools: ['twitter_manage_post'],
+      recordedAt: '2026-08-27T08:18:05.550Z',
+    };
+
+    it('ALLOWS a standalone tweet by account_id once the account is verified as the connected Twitter account', async () => {
+      const d = {
+        ...deps(
+          { ...SESSION_WITH_USER, publishAdmission: TWITTER_ONLY_ADMISSION },
+          TWITTER_ONLY_SCHEDULE
+        ),
+        resolveAccountPlatform: jest.fn(async () => 'twitter'),
+      };
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        d,
+        { account_id: '1340767380', content: 'one tweet' }
+      );
+      expect(refusal).toBeNull();
+      expect(d.resolveAccountPlatform).toHaveBeenCalledWith('1340767380', 'harsha-user-id');
+    });
+
+    it('still REFUSES when the resolved account is a DIFFERENT platform than the grant covers', async () => {
+      const d = {
+        ...deps(
+          { ...SESSION_WITH_USER, publishAdmission: TWITTER_ONLY_ADMISSION },
+          TWITTER_ONLY_SCHEDULE
+        ),
+        resolveAccountPlatform: jest.fn(async () => 'linkedin'),
+      };
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        d,
+        { account_id: 'li-account', content: 'one post' }
+      );
+      expect(refusal).not.toBeNull();
+    });
+
+    it('still fails CLOSED when no resolver is available (preserves the prior default)', async () => {
+      const d = deps(
+        { ...SESSION_WITH_USER, publishAdmission: TWITTER_ONLY_ADMISSION },
+        TWITTER_ONLY_SCHEDULE
+      );
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        d,
+        { account_id: '1340767380', content: 'one tweet' }
+      );
+      expect(refusal).not.toBeNull();
+    });
+
+    it('still fails CLOSED when the account lookup itself errors', async () => {
+      const d = {
+        ...deps(
+          { ...SESSION_WITH_USER, publishAdmission: TWITTER_ONLY_ADMISSION },
+          TWITTER_ONLY_SCHEDULE
+        ),
+        resolveAccountPlatform: jest.fn(async () => { throw new Error('throttled'); }),
+      };
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        d,
+        { account_id: '1340767380', content: 'one tweet' }
+      );
+      expect(refusal).not.toBeNull();
+    });
+
+    it('does not bother resolving the account when the exact tool name is already granted', async () => {
+      const d = {
+        ...deps(SCHEDULED_SESSION, AUTHORIZED_SCHEDULE),
+        resolveAccountPlatform: jest.fn(),
+      };
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        d,
+        { account_id: 'some-id', content: 'x' }
+      );
+      expect(refusal).toBeNull();
+      expect(d.resolveAccountPlatform).not.toHaveBeenCalled();
+    });
+  });
+
   // Greptile (security): re-reading live state closes the revocation window, but on
   // its own it also OPENS one in the other direction — a grant landing mid-run would
   // publish content that a draft-only run had already generated under a prompt
