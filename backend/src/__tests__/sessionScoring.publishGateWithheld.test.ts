@@ -195,6 +195,90 @@ describe('genuinely publish-gate-withheld scheduled runs are excluded from the j
     expect(result).toBeNull();
   });
 
+  // Live-verified against a real production session (ENG-1245, session
+  // 0e5af215-9c14-4ff3-806e-bbbd0984afaf, "Harsha Daily X Post (Autonomous)"):
+  // its actual final message wraps the marker sentence in an HTML paragraph, e.g.
+  // "...before publishing.</p>". The first version of the end-anchor (`\.?\s*$`,
+  // no allowance for a trailing closing tag) MISSED this real shape entirely — a
+  // regression that would have silently undone the whole ENG-995 fix for every
+  // real HTML-formatted report. This pins the corrected behavior.
+  it('still excludes when the marker sentence is wrapped in a trailing HTML paragraph tag (real production shape)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Draft and post today\'s update.' },
+      {
+        role: 'assistant',
+        content: 'Drafted the post.',
+        metadata: { toolCalls: [{ name: 'update_knowledge_base_file' }] },
+      } as any,
+      {
+        role: 'assistant',
+        content:
+          '<p>Status — nothing was posted. This schedule has "Require approval before publishing" turned ON.</p>\n\n' +
+          '<p>PUBLISH WITHHELD: this schedule requires approval before publishing.</p>',
+      },
+    ];
+
+    const result = await scoreSessionIfNeeded(withheldSession({ messages, messageCount: messages.length }));
+
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(result).toBeNull();
+  });
+
+  // CodeRabbit (PR #2660): the closing-tag pattern originally used bare letters
+  // (`[a-zA-Z]+`), which cannot match a digit — so a numbered heading like
+  // `</h3>` would fail the same way `</p>` failed before the first HTML fix.
+  // The SAME real production session (ENG-1245, 0e5af215-...) uses `<h3>`
+  // elsewhere in this exact report for its own section heading, so this isn't
+  // a hypothetical: the tag-name class must accept digits/hyphens too.
+  it('still excludes when the marker is wrapped in a numbered heading tag (e.g. </h3>)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Draft and post today\'s update.' },
+      {
+        role: 'assistant',
+        content: 'Drafted the post.',
+        metadata: { toolCalls: [{ name: 'update_knowledge_base_file' }] },
+      } as any,
+      {
+        role: 'assistant',
+        content:
+          '<h3>Run summary</h3>\n\n' +
+          'PUBLISH WITHHELD: this schedule requires approval before publishing.</h3>',
+      },
+    ];
+
+    const result = await scoreSessionIfNeeded(withheldSession({ messages, messageCount: messages.length }));
+
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(result).toBeNull();
+  });
+
+  // The closing-tag allowance must not swallow a genuinely NEW paragraph tacked
+  // on after the marker's own closing tag — that is still the re-explain/loop
+  // shape, just HTML-wrapped instead of plain text.
+  it('does NOT exclude when a new HTML paragraph follows the marker\'s own closing tag', async () => {
+    mockCallLLM.mockResolvedValue(makeLLMResponse(2, 'kept re-attempting after the marker', { goalCompletion: 2, dataAccuracy: 4, outputQuality: 3 }));
+
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Draft and post today\'s update.' },
+      {
+        role: 'assistant',
+        content: 'Drafted the post.',
+        metadata: { toolCalls: [{ name: 'update_knowledge_base_file' }] },
+      } as any,
+      {
+        role: 'assistant',
+        content:
+          '<p>PUBLISH WITHHELD: this schedule requires approval before publishing.</p>' +
+          '<p>Actually, let me try posting it anyway.</p>',
+      },
+    ];
+
+    const result = await scoreSessionIfNeeded(withheldSession({ messages, messageCount: messages.length }));
+
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(result?.score).toBe(2);
+  });
+
   it('does NOT exclude a run that was actually admitted as authorized to publish, even if it emits the marker (fabrication guard)', async () => {
     mockCallLLM.mockResolvedValue(makeLLMResponse(2, 'fabricated a withhold', { goalCompletion: 2, dataAccuracy: 5, outputQuality: 3 }));
 

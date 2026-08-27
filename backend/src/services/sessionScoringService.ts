@@ -760,11 +760,29 @@ function isTestScheduledSession(session: ChatSession): boolean {
 // ... has not been granted standing publish authorization. Actually, let me try
 // again." would still match — exactly the re-attempt/re-explain-across-turns shape
 // ENG-995's own rubric (see PUBLISH_APPROVAL_WITHHOLDING_CLAUSE's STOP-ONCE vs LOOP
-// bullet) says must NOT be treated as a clean, complete terminal state. Trailing
-// whitespace is still permitted — the prompt asks for the sentence "on its own
-// line", which can leave a trailing newline.
-const PUBLISH_WITHHELD_MARKER =
-  /PUBLISH WITHHELD:\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))\.?\s*$/i;
+// bullet) says must NOT be treated as a clean, complete terminal state.
+//
+// LIVE-VERIFIED AND CORRECTED (post-merge): pulled a real production session
+// matching this exact pattern (ENG-1245, session 0e5af215-9c14-4ff3-806e-
+// bbbd0984afaf, "Harsha Daily X Post (Autonomous)") and its actual final message
+// wraps the marker sentence in an HTML paragraph, e.g. "...before publishing.</p>"
+// — the initial `\.?\s*$` anchor (no allowance for a trailing closing tag) missed
+// that real shape entirely, which would have silently un-done the whole fix for
+// every real HTML-formatted report. Trailing whitespace AND trailing closing
+// HTML tags (e.g. `</p>`) are now both permitted after the sentence — but a new
+// opening tag or any other content still breaks the match, since "<p>" lacks the
+// closing slash the tag pattern requires.
+//
+// Tag-name character class is `[A-Za-z][A-Za-z0-9:-]*`, not bare letters
+// (CodeRabbit, PR #2660): the same real session's report uses `<h3>` elsewhere
+// for its own formatting, and a bare `[a-zA-Z]+` cannot match a digit — `</h3>`
+// (or any numbered heading, or a hyphenated custom element) would have silently
+// failed the same way the un-anchored-for-HTML version originally did.
+const HTML_CLOSING_TAG = '(?:\\s*<\\/[A-Za-z][A-Za-z0-9:-]*>)*';
+const PUBLISH_WITHHELD_MARKER = new RegExp(
+  `PUBLISH WITHHELD:\\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))\\.?${HTML_CLOSING_TAG}\\s*$`,
+  'i'
+);
 
 // The 'revoked' variant specifically — emitted only when a run that WAS admitted
 // authorized=true (publishAdmission) had that consent narrowed away mid-run by
@@ -772,9 +790,12 @@ const PUBLISH_WITHHELD_MARKER =
 // stamp taken before the first turn, so on its own it cannot tell a run that
 // stayed authorized throughout apart from one revoked partway through — only the
 // marker variant the prompt reserves for that exact case can. Anchored to
-// end-of-message for the same reason as PUBLISH_WITHHELD_MARKER above.
-const PUBLISH_WITHHELD_REVOKED_MARKER =
-  /PUBLISH WITHHELD:\s*this schedule's publish authorization has been revoked\.?\s*$/i;
+// end-of-message for the same reason as PUBLISH_WITHHELD_MARKER above, including
+// the same trailing-closing-tag allowance.
+const PUBLISH_WITHHELD_REVOKED_MARKER = new RegExp(
+  `PUBLISH WITHHELD:\\s*this schedule's publish authorization has been revoked\\.?${HTML_CLOSING_TAG}\\s*$`,
+  'i'
+);
 
 /**
  * ENG-995 — two scheduled sessions with IDENTICAL behavior (drafted the content,
