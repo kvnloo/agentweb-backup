@@ -358,6 +358,54 @@ describe('LIST_ENTRIES access control (list_id resolves to a real AgentWeb list)
   });
 });
 
+// Regression: the access check must fire even when the target AgentWeb list
+// hasn't synced to Attio yet (no attioDealListId cached) — previously the
+// gate only fired when `list && attioDealListId` were both truthy, so a
+// not-yet-synced list of another member fell through with zero access check
+// (harmless in practice only because it then 404s under the caller's own
+// Attio credentials, not because it was actually authorized).
+describe('LIST_ENTRIES access control (real AgentWeb list, not yet synced to Attio)', () => {
+  const AGENTWEB_LIST_ID = 'lead_list_unsynced';
+
+  beforeEach(() => {
+    const { crmDb } = require('../services/db');
+    crmDb.getLeadListById.mockResolvedValue({
+      listId: AGENTWEB_LIST_ID,
+      userId: 'other-user',
+      name: 'Unsynced List',
+      externalCrmSyncConfigs: {},
+    });
+  });
+
+  // getLeadListById.mockResolvedValue (not Once) is a lasting default that
+  // clearAllMocks() doesn't reset (it clears call history, not
+  // implementations) — restore the module's own default so later tests in
+  // this file that rely on "not an AgentWeb list" aren't contaminated.
+  afterEach(() => {
+    const { crmDb } = require('../services/db');
+    crmDb.getLeadListById.mockResolvedValue(null);
+  });
+
+  it('still calls the access check and denies a non-authorized caller, rather than falling through unchecked', async () => {
+    mockCanAccessCrmList.mockResolvedValueOnce(false);
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'COUNT', list_id: AGENTWEB_LIST_ID });
+
+    expect(mockCanAccessCrmList).toHaveBeenCalled();
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/CRM editor/i);
+    expect(mockCountListEntries).not.toHaveBeenCalled();
+  });
+
+  it('returns a clear error (not a raw-id fallthrough) when the caller is authorized but the list has no Attio deal list yet', async () => {
+    const result = await at({ entity_type: 'LIST_ENTRIES', action: 'COUNT', list_id: AGENTWEB_LIST_ID });
+
+    expect(mockCanAccessCrmList).toHaveBeenCalled();
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/hasn't synced to an Attio deal list yet/i);
+    expect(mockCountListEntries).not.toHaveBeenCalled();
+  });
+});
+
 // ─── LISTS ──────────────────────────────────────────────────────────────────
 
 describe('LISTS LIST', () => {

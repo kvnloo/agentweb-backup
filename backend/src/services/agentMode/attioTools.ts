@@ -79,14 +79,22 @@ async function resolveAttioService(userId: string, accountId?: string): Promise<
 async function resolveAttioListId(userId: string, candidateId: string, requireDestructive: boolean = false): Promise<string> {
   const { crmDb } = await import('../db');
   const list = await crmDb.getLeadListById(candidateId).catch(() => null) as any;
-  const attioDealListId = list?.externalCrmSyncConfigs?.attio?.attioDealListId;
-  if (list && attioDealListId) {
+  // Gate on `list` alone, not `list && attioDealListId` — the access check
+  // must fire whenever candidateId resolves to a real AgentWeb list owned by
+  // someone else, regardless of whether that list has synced to Attio yet.
+  // The narrower gate let a caller name another member's not-yet-synced
+  // AgentWeb list id and fall through with zero access check (harmless today
+  // only because the fallthrough then 404s against the caller's own Attio
+  // credentials — structurally fragile, not something to rely on).
+  if (list) {
     const { canAccessCrmList, canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('../crmAccessControl');
     const allowed = requireDestructive
       ? await canDestructiveCrmList(userId, list)
       : await canAccessCrmList(userId, list);
     if (!allowed) throw new Error(CRM_EDITOR_REQUIRED_MESSAGE);
-    return attioDealListId;
+    const attioDealListId = list.externalCrmSyncConfigs?.attio?.attioDealListId;
+    if (attioDealListId) return attioDealListId;
+    throw new Error(`List "${list.name || candidateId}" hasn't synced to an Attio deal list yet — push it once first.`);
   }
   return candidateId;
 }
