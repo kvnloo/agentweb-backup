@@ -70,6 +70,37 @@ describe('isPublishOnlyUnmet (ENG-947)', () => {
     expect(isPublishOnlyUnmet(undefined as any)).toBe(false);
     expect(isPublishOnlyUnmet([null as any])).toBe(false);
   });
+
+  /**
+   * ENG-1599 — scoped to tools with a KNOWN equivalence route
+   * (EQUIVALENT_PUBLISH_ROUTES), not the whole SEND_TOOLS/isPowerTool family.
+   * An earlier version of this fix used isPowerTool and was caught before
+   * shipping: it would have pulled delete_leads, enrich_leads_execute,
+   * import_leads_from_search, linkedin_outreach, twitter_outreach, and plain
+   * send_email/send_email_to_lead into the circuit breaker even though none of
+   * them has any documented alternate route to anything — so a successful call
+   * to one of them proves nothing about an unrelated still-unmet requirement.
+   * These must stay OUTSIDE isPublishOnlyUnmet, exactly as before that widening,
+   * so a schedule requiring one of them still gets the full 20-attempt budget.
+   */
+  it('does NOT cover tools with no known equivalence route, even though they are irreversible SEND_TOOLS', () => {
+    expect(isPublishOnlyUnmet(['delete_leads'])).toBe(false);
+    expect(isPublishOnlyUnmet(['delete_leads_by_filter'])).toBe(false);
+    expect(isPublishOnlyUnmet(['delete_lead_list'])).toBe(false);
+    expect(isPublishOnlyUnmet(['enrich_leads_execute'])).toBe(false);
+    expect(isPublishOnlyUnmet(['import_leads_from_search'])).toBe(false);
+    expect(isPublishOnlyUnmet(['linkedin_outreach'])).toBe(false);
+    expect(isPublishOnlyUnmet(['twitter_outreach'])).toBe(false);
+    expect(isPublishOnlyUnmet(['send_email'])).toBe(false);
+    expect(isPublishOnlyUnmet(['send_email_to_lead'])).toBe(false);
+  });
+
+  it('DOES cover tools that have a known equivalence route', () => {
+    expect(isPublishOnlyUnmet(['twitter_manage_post'])).toBe(true);
+    expect(isPublishOnlyUnmet(['post_thread'])).toBe(true);
+    expect(isPublishOnlyUnmet(['email'])).toBe(true);
+    expect(isPublishOnlyUnmet(['send_email_from_sender'])).toBe(true);
+  });
 });
 
 /**
@@ -197,5 +228,65 @@ describe('classifyPublishStall (ENG-947)', () => {
     expect(classify({ publishToolsAttempted: ['publish_landing_page_changes'] })).toBe(
       'held-for-approval',
     );
+  });
+
+  /**
+   * ENG-1599 regression — caught before shipping. A version of this fix widened
+   * `wroteSomethingElse` to "any succeeded isPowerTool call", which would have
+   * misfired on an ordinary CRM schedule: import_leads_from_search ->
+   * enrich_leads_execute -> send_email_from_sender, required only
+   * send_email_from_sender. Enrichment succeeding before the email was ever
+   * attempted has no registered relationship to a send at all — it is a
+   * different, earlier step in the SAME workflow, not an alternate route to the
+   * same outcome — so it must NOT be read as "the schedule's requiredFunctionCalls
+   * names a tool this run does not use". The run needs to keep pressing so the
+   * model can actually get to sending.
+   */
+  it('does NOT treat an unrelated successful CRM write as evidence a required send will never happen', () => {
+    expect(
+      classify({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['send_email_from_sender'],
+        externalWritesSucceeded: ['enrich_leads_execute'],
+      }),
+    ).toBeNull();
+    expect(
+      classify({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['send_email_from_sender'],
+        externalWritesSucceeded: ['import_leads_from_search', 'delete_leads_by_filter'],
+      }),
+    ).toBeNull();
+    // Even at full budget, still just a genuine withhold, not a mismatch —
+    // pressing was still worth doing.
+    expect(
+      classify({
+        unmetRequiredFunctions: ['send_email_from_sender'],
+        externalWritesSucceeded: ['enrich_leads_execute'],
+      }),
+    ).toBe('held-for-approval');
+  });
+
+  /**
+   * The legitimate mirror case: `email` and `send_email_from_sender` ARE a
+   * registered bidirectional pair (ENG-1276), so a succeeded `email` call
+   * genuinely does satisfy a `send_email_from_sender` requirement outcome —
+   * this must still report the mismatch immediately, same as the twitter pair.
+   */
+  it('still reports a mismatch for the registered email/send_email_from_sender pair', () => {
+    expect(
+      classify({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['send_email_from_sender'],
+        externalWritesSucceeded: ['email'],
+      }),
+    ).toBe('requirement-names-unused-publish-tool');
+    expect(
+      classify({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['email'],
+        externalWritesSucceeded: ['send_email_from_sender'],
+      }),
+    ).toBe('requirement-names-unused-publish-tool');
   });
 });
