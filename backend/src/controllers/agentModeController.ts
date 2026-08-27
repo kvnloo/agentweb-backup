@@ -3714,13 +3714,27 @@ export async function runVerifiedChat(
       // publish wrote nothing. But a failed publish is not silence either: it
       // means the model DID reach for the tool and the integration is broken, so
       // the attempted-but-unsuccessful names are reported separately.
+      //
+      // ENG-1599 review: kept as full ledger entries (name + arguments), not
+      // bare names — classifyPublishStall's route match needs each call's
+      // action/platform, not just its tool name, or an unrelated call (a
+      // twitter_manage_post REPLY, a post_on_connected_account to a different
+      // platform) could be mistaken for the specific outcome a route documents.
+      //
+      // ENG-1599 review: includes params.priorToolCalls, same as
+      // allActualFunctionCallsForReporting and skipLedgerToolCalls above — a
+      // resumed run's earlier segment can already have made the qualifying
+      // write (e.g. the consentOnly post_on_connected_account call this ticket
+      // is about), and allToolCalls alone only holds calls made AFTER the
+      // resume. Missing that write here would press the resumed segment to
+      // publish again, which is exactly the duplicate this breaker exists to
+      // prevent.
+      const ledgerCallsForThisTurn = [...(params.priorToolCalls ?? []), ...allToolCalls];
       const externalWritesSucceeded = publishIsTheOnlyThingLeft
-        ? allToolCalls
-            .filter((tc: any) => tc && typeof tc.name === 'string' && toolCallSucceeded(tc))
-            .map((tc: any) => tc.name as string)
+        ? ledgerCallsForThisTurn.filter((tc: any) => tc && typeof tc.name === 'string' && toolCallSucceeded(tc))
         : [];
       const publishToolsAttempted = publishIsTheOnlyThingLeft
-        ? allToolCalls
+        ? ledgerCallsForThisTurn
             .filter((tc: any) => tc && typeof tc.name === 'string' && !toolCallSucceeded(tc))
             .map((tc: any) => tc.name as string)
         : [];
@@ -3730,13 +3744,40 @@ export async function runVerifiedChat(
             unmetRequiredFunctions: functionCallMisses,
             externalWritesSucceeded,
             publishToolsAttempted,
+            // ENG-1599 review: the FULL held-to requirement set, not just the
+            // still-unmet subset — a schedule that requires BOTH names of an
+            // equivalence pair separately (e.g. post_on_connected_account AND
+            // twitter_manage_post) wants two distinct actions. Without this, a
+            // succeeded post_on_connected_account call (which already satisfies
+            // ITS OWN requirement, so it drops out of functionCallMisses) would
+            // be misread as "wrote something else" for the still-unmet
+            // twitter_manage_post requirement via the same reverse route, and
+            // stop the run before twitter_manage_post was ever attempted.
+            //
+            // Built fresh from the CURRENT requiredFunctions here, deliberately
+            // NOT the stale requiredFunctionNames const captured before the
+            // retry loop (narrowed by authorization revocation via the
+            // reassignments above) — unlike that const's own use in
+            // countCallsForRequirement, staleness is UNSAFE in this direction.
+            // There, a stale/wider set only ever WITHHOLDS completion credit
+            // more conservatively. Here, suppression means "keep pressing", so
+            // a stale/wider set would suppress a genuine mismatch and press a
+            // requirement whose sibling was since narrowed OUT — risking a
+            // second live publish through the tool that's still required.
+            heldToFunctionNames: new Set(requiredFunctions.map((reqFunc) => reqFunc.functionName)),
           })
         : null;
       if (publishStall) {
         const heldForApproval = publishStall === 'held-for-approval';
         const toolFailing = publishStall === 'publish-tool-failing';
+        const mismatch = publishStall === 'requirement-names-unused-publish-tool';
         console.warn(
-          `AgentMode runVerifiedChat: session ${sessionId} spent its publish-press budget ` +
+          `AgentMode runVerifiedChat: session ${sessionId} ` +
+          (mismatch
+            // ENG-1599: this cause fires as soon as it is detected, not once the
+            // press budget is spent — see classifyPublishStall.
+            ? `already published via a tool its requiredFunctionCalls does not name `
+            : `spent its publish-press budget `) +
           `(${publishPressAttempts}/${MAX_PUBLISH_PRESS_ATTEMPTS} press attempts, ${attempt} attempts overall) ` +
           `with [${functionCallMisses.join(', ')}] still unmet. ` +
           `Ending the run instead of re-pressing to ${maxAttempts} attempts — ` +
@@ -3746,7 +3787,7 @@ export async function runVerifiedChat(
             : toolFailing
             ? `the run DID call [${functionCallMisses.join(', ')}] and every call failed, so the ` +
               `integration is broken and pressing an erroring tool again cannot succeed`
-            : `the run already wrote externally via [${externalWritesSucceeded.join(', ')}], so the ` +
+            : `the run already wrote externally via [${externalWritesSucceeded.map((tc: any) => tc.name).join(', ')}], so the ` +
               `schedule's requiredFunctionCalls names a tool this run does not use and pressing cannot ` +
               `succeed`) +
           ` (ENG-947).`
