@@ -6,6 +6,26 @@ import { getAccountsByUserId, getAccountById } from './connectedAccountsDb';
 const _created = axios.create?.({ timeout: 15000 });
 const axiosInstance: typeof axios = (_created ?? axios) as typeof axios;
 
+// Retry-After parsing: HTTP spec allows either a delta-seconds integer or an
+// HTTP-date. Live-verified (ENG-1380, a real 429 triggered against Attio's
+// API) that Attio always sends the HTTP-date form (e.g. "Thu, 27 Aug 2026
+// 08:45:29 GMT") — unlike HubSpot's, which sends plain delta-seconds. A
+// naive parseInt() on a date string always yields NaN, silently discarding
+// Attio's actual instructed wait and falling back to the flat default every
+// time. Disambiguate on the header's shape rather than trying Date.parse()
+// first: Date.parse('0') and Date.parse('600') both return non-NaN (but
+// bogus) timestamps, so checking for a pure-digit string first is required
+// to keep delta-seconds inputs (still handled, for spec-compliance/safety)
+// from being misread as dates.
+function parseRetryAfterSeconds(headerValue: string | undefined): number {
+  if (!headerValue) return 10;
+  const trimmed = String(headerValue).trim();
+  if (/^\d+$/.test(trimmed)) return parseInt(trimmed, 10);
+  const asDate = Date.parse(trimmed);
+  if (!isNaN(asDate)) return Math.max(0, Math.ceil((asDate - Date.now()) / 1000));
+  return 10;
+}
+
 // Retry once on 429 — respect Retry-After header, default 10s. Mirrors
 // hubspotService.ts's identical interceptor.
 if (_created) {
@@ -15,8 +35,7 @@ if (_created) {
       const config = err?.config as any;
       if (err?.response?.status === 429 && config && !config.__attioRetried) {
         config.__attioRetried = true;
-        const parsed = parseInt(err.response.headers?.['retry-after'] ?? '10', 10);
-        const retryAfter = Math.min(isNaN(parsed) ? 10 : parsed, 60);
+        const retryAfter = Math.min(parseRetryAfterSeconds(err.response.headers?.['retry-after']), 60);
         await new Promise(r => setTimeout(r, retryAfter * 1000));
         return _created.request(config);
       }

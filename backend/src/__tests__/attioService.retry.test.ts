@@ -74,6 +74,46 @@ describe('AttioService — 429 retry interceptor', () => {
     jest.useRealTimers();
   });
 
+  it('parses an HTTP-date Retry-After (Attio\'s real format, live-verified ENG-1380 — not delta-seconds like HubSpot)', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-08-27T08:45:00.000Z'));
+    mockRetryRequest.mockResolvedValue({ data: 'ok' });
+
+    const config = { url: '/test' };
+    // 7 seconds ahead of the frozen "now" above.
+    const err = { response: { status: 429, headers: { 'retry-after': 'Thu, 27 Aug 2026 08:45:07 GMT' } }, config };
+
+    const promise = capturedRejectedHandler!(err);
+    await Promise.resolve();
+    jest.advanceTimersByTime(6999);
+    await Promise.resolve();
+    expect(mockRetryRequest).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(1);
+    await Promise.resolve();
+    await Promise.resolve();
+    await promise;
+
+    expect(mockRetryRequest).toHaveBeenCalledTimes(1);
+    jest.useRealTimers();
+  });
+
+  it('never mistakes a pure numeric Retry-After for a date (Date.parse("0")/("600") are non-NaN bogus timestamps)', async () => {
+    jest.useFakeTimers();
+    mockRetryRequest.mockResolvedValue({ data: 'ok' });
+
+    const config = { url: '/test' };
+    const err = { response: { status: 429, headers: { 'retry-after': '0' } }, config };
+
+    const promise = capturedRejectedHandler!(err);
+    jest.advanceTimersByTime(0);
+    await Promise.resolve();
+    await Promise.resolve();
+    await promise;
+
+    expect(mockRetryRequest).toHaveBeenCalledTimes(1);
+    jest.useRealTimers();
+  });
+
   it('defaults to 10s when Retry-After header is missing', async () => {
     jest.useFakeTimers();
     mockRetryRequest.mockResolvedValue({ data: 'ok' });
