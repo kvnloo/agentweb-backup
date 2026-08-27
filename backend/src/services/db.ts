@@ -6776,18 +6776,28 @@ export const crmDb = {
   },
 
   async getLeadByAttioRecordId(listId: string, recordId: string) {
+    // DynamoDB applies FilterExpression after the page read, not before, so a
+    // single query only sees the first ~1MB page — a match on a later page
+    // would be reported absent. Mirrors findLeadByLinkedinInList's bounded
+    // pagination for the same reason.
+    const MAX_PAGES = 20;
     try {
-      const params: any = {
-        TableName: `${TABLE_PREFIX}AW-Leads`,
-        KeyConditionExpression: 'listId = :listId',
-        FilterExpression: 'syncMetadata.attio_record_id = :recordId',
-        ExpressionAttributeValues: {
-          ':listId': listId,
-          ':recordId': recordId,
-        },
-      };
-      const result = await dynamodb.query(params).promise();
-      return result.Items?.[0] ?? null;
+      let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+      let pages = 0;
+      do {
+        const result = await dynamodb.query({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          KeyConditionExpression: 'listId = :listId',
+          FilterExpression: 'syncMetadata.attio_record_id = :recordId',
+          ExpressionAttributeValues: { ':listId': listId, ':recordId': recordId },
+          ExclusiveStartKey: lastEvaluatedKey,
+        }).promise();
+        const hit = result.Items?.[0];
+        if (hit) return hit;
+        lastEvaluatedKey = result.LastEvaluatedKey;
+        pages++;
+      } while (lastEvaluatedKey && pages < MAX_PAGES);
+      return null;
     } catch (error) {
       handleDynamoDbError(error, "getLeadByAttioRecordId");
       throw error;
@@ -6795,18 +6805,24 @@ export const crmDb = {
   },
 
   async getLeadByAttioListEntryId(listId: string, entryId: string) {
+    const MAX_PAGES = 20;
     try {
-      const params: any = {
-        TableName: `${TABLE_PREFIX}AW-Leads`,
-        KeyConditionExpression: 'listId = :listId',
-        FilterExpression: 'syncMetadata.attio_list_entry_id = :entryId',
-        ExpressionAttributeValues: {
-          ':listId': listId,
-          ':entryId': entryId,
-        },
-      };
-      const result = await dynamodb.query(params).promise();
-      return result.Items?.[0] ?? null;
+      let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+      let pages = 0;
+      do {
+        const result = await dynamodb.query({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          KeyConditionExpression: 'listId = :listId',
+          FilterExpression: 'syncMetadata.attio_list_entry_id = :entryId',
+          ExpressionAttributeValues: { ':listId': listId, ':entryId': entryId },
+          ExclusiveStartKey: lastEvaluatedKey,
+        }).promise();
+        const hit = result.Items?.[0];
+        if (hit) return hit;
+        lastEvaluatedKey = result.LastEvaluatedKey;
+        pages++;
+      } while (lastEvaluatedKey && pages < MAX_PAGES);
+      return null;
     } catch (error) {
       handleDynamoDbError(error, "getLeadByAttioListEntryId");
       throw error;
