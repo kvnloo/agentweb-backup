@@ -350,6 +350,25 @@ describe('ENG-1476 listAds — pagination', () => {
     expect(result.truncated).toBe(true);
   });
 
+  it('keeps earlier pages when a later page fails, and marks the result truncated', async () => {
+    // Pagination introduced this failure mode — before, there was no second request to fail.
+    // Throwing away good pages over a transient blip would be a regression caused by the fix.
+    const cursor: any = [ad('1'), ad('2')];
+    let calls = 0;
+    cursor.hasNext = () => true;
+    cursor.next = async () => { calls++; throw new Error('transient Meta 500'); };
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+      getAds: jest.fn().mockResolvedValue(cursor),
+    }));
+
+    const result = await service.listAds('act123', 'tok');
+
+    expect(calls).toBe(1);
+    expect(result.ads.map((a: any) => a.id)).toEqual(['1', '2']);
+    // Safe to return partial ONLY because truncated carries the "do not conclude absence" contract.
+    expect(result.truncated).toBe(true);
+  });
+
   it('asks Meta for a larger page than the 25 default', async () => {
     const getAds = jest.fn().mockResolvedValue(makeCursor([[ad('1')]]));
     (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAds }));

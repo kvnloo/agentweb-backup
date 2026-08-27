@@ -16541,14 +16541,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
          */
         const ignoredCampaignId = params?.campaign_id;
         if (ignoredCampaignId && result?.success) {
+          // Rebuilt rather than spread: `{...result, scopeIgnored}` appends the new key AFTER
+          // `creatives`, which puts it behind the S3 preview cut on exactly the large lists
+          // where it matters. Same field-order rule as listMetaAdsAds.
+          const { creatives, ...head } = result as any;
           return {
-            ...result,
-            scopeIgnored: { campaign_id: String(ignoredCampaignId) },
+            ...head,
             message:
               `${result.message} ⚠ campaign_id "${ignoredCampaignId}" was NOT applied — Meta exposes no ` +
               `campaign-scoped adcreatives edge, so this list is not limited to that campaign. ` +
               `Do NOT treat it as evidence about that campaign; use AD LIST with campaign_id instead, ` +
               `which returns each ad's creative inline.`,
+            scopeIgnored: { campaign_id: String(ignoredCampaignId) },
+            creatives,
           };
         }
         return result;

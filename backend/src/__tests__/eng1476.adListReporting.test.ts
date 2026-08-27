@@ -200,6 +200,15 @@ describe('ENG-1476 AD_CREATIVE LIST — an unsupportable scope is stated, never 
     expect(result.scopeIgnored).toEqual({ campaign_id: '120240930011430395' });
   });
 
+  it('keeps scopeIgnored ahead of the creatives payload so it survives the S3 preview cut', async () => {
+    const result: any = await agentModeService.manageMetaAdsAdCreatives(
+      'user123', 'LIST', '123456789', { campaign_id: 'camp_1' }
+    );
+    const json = JSON.stringify(result);
+    expect(json.indexOf('"scopeIgnored"')).toBeLessThan(json.indexOf('"creatives"'));
+    expect(json.indexOf('"message"')).toBeLessThan(json.indexOf('"creatives"'));
+  });
+
   it('stays quiet when no unsupported scope was requested', async () => {
     const result: any = await agentModeService.manageMetaAdsAdCreatives(
       'user123', 'LIST', '123456789', {}

@@ -1785,8 +1785,29 @@ export class MetaService {
         this.log(`Stopped paginating at the ${pageLimit}-page bound`, { pagesFetched, itemsSoFar: items.length });
         return { items, truncated: true, pagesFetched };
       }
-      // Replaces the cursor's contents with the next page, so accumulate as we go.
-      await cursor.next();
+      try {
+        // Replaces the cursor's contents with the next page, so accumulate as we go.
+        await cursor.next();
+      } catch (e: any) {
+        /*
+         * A page-N failure must not throw away pages 1..N-1. Adding pagination added this
+         * failure mode — before, there was no second request to fail — and discarding good
+         * data over a transient blip would be a regression introduced by the fix.
+         *
+         * Returning the partial set is safe precisely BECAUSE `truncated` exists: it carries
+         * the "this list is incomplete, do not conclude absence" contract that the rest of
+         * this change is built on. What would be unsafe is returning it as complete.
+         *
+         * Deliberately not logging the error object: the SDK attaches the request URL to
+         * FacebookRequestError, and a paged URL carries the access token in its query string.
+         */
+        this.log(`Pagination stopped early after a page error; returning a partial list`, {
+          pagesFetched,
+          itemsSoFar: items.length,
+          reason: typeof e?.message === 'string' ? e.message.slice(0, 200) : 'unknown',
+        });
+        return { items, truncated: true, pagesFetched };
+      }
       items.push(...cursor);
       pagesFetched++;
     }
