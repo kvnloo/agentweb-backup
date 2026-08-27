@@ -451,6 +451,21 @@ export class LinkedInOutreachService {
   static readonly SEARCH_CAPABILITY_CANARY_KEYWORDS = 'marketing';
 
   /**
+   * Concurrency cap for filterByCompanySize's per-employer lookups (ENG-1558
+   * follow-up). Each distinct employer costs two sequential outbound calls
+   * (resolve name -> id, then fetch the company profile), so an unthrottled
+   * `Promise.all` over a page with 15-20 distinct employers could fire
+   * 30-40 concurrent Unipile requests from a single search — an
+   * uncomfortable burst against the shared/platform-fallback account other
+   * users are also hitting. Chunking bounds it to
+   * `2 * COMPANY_SIZE_LOOKUP_CONCURRENCY` concurrent requests at a time,
+   * matching the plain chunked-Promise.all pattern already used elsewhere
+   * in this codebase for external lookups (e.g. emailDeliverabilityService's
+   * MX_LOOKUP_CONCURRENCY) rather than pulling in a semaphore/library.
+   */
+  static readonly COMPANY_SIZE_LOOKUP_CONCURRENCY = 5;
+
+  /**
    * People-search capability canary (ENG-975).
    *
    * An account can lose its people-search capability while leaving profile
@@ -1009,14 +1024,21 @@ export class LinkedInOutreachService {
    *
    * Structured ID filters (`company_id`, `location_id`, `industry_id`,
    * `school_id`) are forwarded as top-level body keys per Unipile's classic
-   * people-search schema (arrays of numeric IDs; `industry` is an object with
-   * include/exclude arrays). See https://developer.unipile.com/docs/linkedin-search.
+   * people-search schema — all four as flat arrays of numeric ID strings,
+   * `industry` included (ENG-1299: an earlier `{ include, exclude }` object
+   * shape for industry 400'd every structured search with "Expected union
+   * value", silently degrading to a keyword-only search that drops the
+   * industry/location constraints). See
+   * https://developer.unipile.com/docs/linkedin-search.
    *
    * When the caller passes free-text (e.g. `company: 'Microsoft'`) without the
    * matching `*_id`, this method calls UnipileSearchParamService.resolveTopId()
    * to look up the LinkedIn entity ID. Resolver miss (null) or resolver error
    * → fall back to the original `advanced_keywords` free-text behavior so the
-   * search never blocks on resolution failures.
+   * search never blocks on resolution failures. When that happens, the result
+   * carries `degraded: true` and `droppedFacets` (the facet names that
+   * couldn't be resolved to a structured ID) so callers get a deterministic
+   * signal instead of having to infer degradation themselves (ENG-1299).
    */
   async searchPeople(accountId: string, params: {
     keywords?: string;
@@ -1045,6 +1067,12 @@ export class LinkedInOutreachService {
       const client = await this.getClient();
 
       let body: any;
+      // Facet names whose free-text couldn't be resolved to an ID and fell
+      // back to `advanced_keywords` (keyword-only matching for that facet,
+      // not a true structured filter). Surfaced on the result as `degraded`
+      // so the caller has a deterministic signal instead of having to infer
+      // degradation from the request shape (ENG-1299).
+      let droppedFacets: string[] = [];
 
       if (cursor) {
         // Pagination: cursor wins over url because the cursor payload already
@@ -1089,7 +1117,7 @@ export class LinkedInOutreachService {
 
         if (resolvedCompanyId) body.company = [resolvedCompanyId];
         if (resolvedLocationId) body.location = [resolvedLocationId];
-        if (resolvedIndustryId) body.industry = { include: [resolvedIndustryId], exclude: [] };
+        if (resolvedIndustryId) body.industry = [resolvedIndustryId];
         if (resolvedSchoolId) body.school = [resolvedSchoolId];
 
         // Free-text fallback for anything that didn't resolve (and for title
@@ -1104,6 +1132,7 @@ export class LinkedInOutreachService {
         if (Object.keys(advanced).length > 0) {
           body.advanced_keywords = advanced;
         }
+        droppedFacets = Object.keys(advanced).filter((key) => key !== 'title');
       }
 
       const result = await client.request.send({
@@ -1114,6 +1143,9 @@ export class LinkedInOutreachService {
         body
       });
       this.log(`Search returned results`, { result });
+      if (droppedFacets.length > 0 && result && typeof result === 'object' && !Array.isArray(result)) {
+        return { ...result, degraded: true, droppedFacets };
+      }
       return result;
     } catch (error: any) {
       return this.handleError(error, 'searchPeople');
@@ -1128,6 +1160,111 @@ export class LinkedInOutreachService {
    */
   async resolveCompanyId(company: string, accountId: string): Promise<string | null> {
     return this.resolveSearchParamId('COMPANY', company, accountId);
+  }
+
+  /**
+   * Filter search-people result items by their current employer's headcount
+   * (ENG-1558). Unipile has no native headcount filter for the People search
+   * category — only for Companies — so this resolves each item's employer
+   * NAME (from `work_experience`, free text) to a company ID via the same
+   * cached resolver `searchPeople` itself uses, then reads `employee_count`
+   * off the cached company profile (UnipileCompanyService — 30-day TTL, same
+   * service the `get-company` tool action already uses). Both hops are
+   * already-cached lookups; nothing new to cache here.
+   *
+   * A candidate whose employer can't be resolved, or whose profile carries
+   * no employee_count, is EXCLUDED rather than silently let through — the
+   * caller explicitly asked for a size-filtered list, so an unverifiable
+   * result is worse than a smaller, honest one. `excludedUnverifiable`
+   * reports how many so the caller can be transparent about it (mirrors the
+   * ENG-1002 anonymizedFiltered pattern), the same way an out-of-network
+   * result or a reach limit gets reported instead of silently vanishing.
+   *
+   * No-op (returns items unchanged) when neither bound is given, so callers
+   * that never ask for this pay no extra latency or Unipile calls.
+   */
+  async filterByCompanySize(
+    items: any[],
+    range: { min?: number; max?: number },
+    accountId: string,
+  ): Promise<{ items: any[]; excludedUnverifiable: number }> {
+    // CodeRabbit: contradictory or negative bounds would otherwise silently
+    // exclude every verifiable candidate (min > max fails both comparisons
+    // for any real count) with no signal to the caller about why — fail
+    // fast instead of burning employer lookups on an unsatisfiable range.
+    if (
+      (range.min != null && range.min < 0) ||
+      (range.max != null && range.max < 0) ||
+      (range.min != null && range.max != null && range.min > range.max)
+    ) {
+      throw new Error('company_size_min and company_size_max must be non-negative and min must not exceed max');
+    }
+    if (range.min == null && range.max == null) return { items, excludedUnverifiable: 0 };
+
+    const employerOf = (item: any): string | null => {
+      const exp = Array.isArray(item?.work_experience) ? item.work_experience : [];
+      const current = exp.find((w: any) => w?.current) || exp[0];
+      return typeof current?.company === 'string' && current.company.trim()
+        ? current.company.trim()
+        : null;
+    };
+
+    // Resolve each DISTINCT employer once, not once per candidate — a page
+    // of results routinely has several candidates at the same company.
+    const uniqueNames = Array.from(
+      new Set(items.map(employerOf).filter((n): n is string => !!n)),
+    );
+
+    const headcountByName = new Map<string, number | null>();
+    const lookupOne = async (name: string) => {
+      try {
+        const companyId = await this.resolveCompanyId(name, accountId);
+        if (!companyId) { headcountByName.set(name, null); return; }
+        const { getUnipileCompanyService } = await import('./unipileCompanyServiceFactory');
+        // CodeRabbit: getCompanyProfile has no timeout of its own — one hung
+        // Unipile request would otherwise stall this whole lookup batch
+        // (Promise.all never settles until every member does). Bound it and
+        // treat a timeout as unverifiable, same as any other lookup failure.
+        const result = await LinkedInOutreachService.withTimeout(
+          getUnipileCompanyService().getCompany(companyId, accountId),
+          LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          `LinkedIn company lookup for ${companyId}`,
+        );
+        const count =
+          typeof result.rawData?.employee_count === 'number'
+            ? result.rawData.employee_count
+            : typeof result.rawData?.insights?.employeesCount?.totalCount === 'number'
+            ? result.rawData.insights.employeesCount.totalCount
+            : null;
+        headcountByName.set(name, count);
+      } catch (error: any) {
+        // A single company lookup failing (rate limit, transient 5xx) must
+        // not fail the whole search — treat that one employer as
+        // unverifiable, same as a resolver miss.
+        this.log(`Company size lookup failed for "${name}" — treating as unverifiable`, {
+          reason: error?.message,
+        });
+        headcountByName.set(name, null);
+      }
+    };
+    // Chunked, not one big Promise.all — see COMPANY_SIZE_LOOKUP_CONCURRENCY.
+    const CONCURRENCY = LinkedInOutreachService.COMPANY_SIZE_LOOKUP_CONCURRENCY;
+    for (let i = 0; i < uniqueNames.length; i += CONCURRENCY) {
+      const batch = uniqueNames.slice(i, i + CONCURRENCY);
+      await Promise.all(batch.map(lookupOne));
+    }
+
+    let excludedUnverifiable = 0;
+    const filtered = items.filter((item) => {
+      const name = employerOf(item);
+      const count = name ? headcountByName.get(name) ?? null : null;
+      if (count == null) { excludedUnverifiable++; return false; }
+      if (range.min != null && count < range.min) return false;
+      if (range.max != null && count > range.max) return false;
+      return true;
+    });
+
+    return { items: filtered, excludedUnverifiable };
   }
 
   private async resolveSearchParamId(

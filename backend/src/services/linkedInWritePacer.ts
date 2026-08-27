@@ -150,7 +150,12 @@ export type WriteSlot =
   | { allowed: true; waitedMs: number }
   | { allowed: false; reason: string; retryAfterMs: number };
 
-/** Test-only: drop all pacing state so each test starts from a clean slate. */
+/**
+ * Test-only: drop all pacing state so each test starts from a clean slate.
+ * Daily-volume state is no longer module-level (it's persisted by the caller
+ * and passed into `reserveDailyVolumeSlot` explicitly), so there's nothing of
+ * that kind left to reset here.
+ */
 export function __resetWritePacerForTests(): void {
   chainByAccount.clear();
   recentWritesByAccount.clear();
@@ -307,4 +312,200 @@ export async function reserveWriteSlot(
       queueDepthByAccount.set(accountId, depth);
     }
   }
+}
+
+/**
+ * DAILY send-volume ceiling (distinct from the hourly/burst pacer above).
+ *
+ * Before this, "5 invites / 10 messages per run" existed only as prose in the
+ * skill system prompts — advisory to the model, not enforced. The only
+ * code-enforced limit was the hourly ceiling above, a flat number shared
+ * across every write action type with no invite/message split at all.
+ *
+ * DELIBERATELY NOT auto-detected. LinkedIn's own developer API doesn't expose
+ * Premium status to us at all, and the only real signal Unipile offers
+ * (InMail credit balance) is an extra external call whose failure mode would
+ * be a silent, unverifiable guess about someone's real account — exactly the
+ * "hidden fallback" this design avoids. Instead: the account's own configured
+ * cap (`daily_invite_cap`, self-reported — set directly by the user in
+ * Settings, or by Emma asking "are you on LinkedIn Premium?" in a live turn
+ * and calling `linkedin_outreach` action `set-daily-invite-cap`) IS the
+ * number. Nothing here infers or guesses it.
+ *
+ * The system still enforces an ABSOLUTE ceiling (`dailyInviteAbsoluteMax`)
+ * regardless of what's configured — a safety backstop against a bad/malicious
+ * value, not a detection mechanism. Unset defaults to the conservative
+ * free-tier number (10) rather than the risky max, so an account nobody has
+ * asked yet never silently gets treated as Premium.
+ */
+
+/** Which of the two daily-volume classes a write action belongs to. */
+export type DailyVolumeClass = 'invite' | 'message';
+
+/**
+ * cancel-invitation and accept-invitation are account maintenance, not outbound
+ * send volume, so this rule doesn't apply to them — they stay governed by the
+ * hourly/burst pacer above only.
+ */
+function dailyVolumeClassFor(action: string): DailyVolumeClass | null {
+  if (action === 'send-invite') return 'invite';
+  if (action === 'send-message' || action === 'send-inmail') return 'message';
+  return null;
+}
+
+/** Conservative default when nobody has ever configured a cap for this account. */
+export const DEFAULT_DAILY_INVITE_CAP = 10;
+
+/**
+ * Hard system-wide ceiling on the daily invite cap — never exceeded no matter
+ * what a user/Emma configures. This IS Harsha's Premium number (30): the
+ * highest volume he's observed a real account safely sustain, so it doubles
+ * as both "what Premium gets" and "the absolute backstop everyone is clamped
+ * to." Off (0) under Jest so other suites calling send-invite repeatedly don't
+ * break; env-tunable for the same incident-response reason as `maxWritesPerHour`
+ * — 0 there is the operator escape hatch, NOT a valid self-reported cap (a user
+ * setting their own cap to 0 should mean "send nothing", handled separately
+ * below, not "unlimited").
+ */
+export const dailyInviteAbsoluteMax = (): number =>
+  envInt('LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX', isTestEnv() ? 0 : 30);
+
+/**
+ * Resolve the invite cap actually enforced for this account: the self-reported
+ * `configuredCap` if it's a non-negative number, else the conservative default
+ * — either way clamped to the absolute ceiling.
+ *
+ * Returns `Infinity` when the OPERATOR has disabled the whole mechanism
+ * (`dailyInviteAbsoluteMax() <= 0`, the incident-response escape hatch) — a
+ * distinct value from a USER explicitly configuring 0, which means "send
+ * nothing" and must stay a real, enforced zero, not get read as "unlimited."
+ * Collapsing those two into the same number was the bug in the first draft of
+ * this cap: a user setting their own cap to 0 would have been silently
+ * treated as no cap at all.
+ */
+export function resolveDailyInviteCap(configuredCap: number | null | undefined): number {
+  const absoluteMax = dailyInviteAbsoluteMax();
+  if (absoluteMax <= 0) return Infinity; // operator escape hatch: disabled entirely
+  if (typeof configuredCap === 'number' && Number.isFinite(configuredCap) && configuredCap >= 0) {
+    return Math.min(configuredCap, absoluteMax);
+  }
+  return Math.min(DEFAULT_DAILY_INVITE_CAP, absoluteMax);
+}
+
+/**
+ * Daily message ceiling — flat, not self-reported or Premium-dependent.
+ * send-message and send-inmail share one budget; InMail separately requires
+ * Premium + available credits to be attempted at all, enforced upstream in
+ * linkedInOutreachService, so this cap is not where Premium-gating for InMail
+ * belongs.
+ *
+ * Off by default under Jest — same reasoning as the caps above.
+ */
+export const dailyMessageCap = (): number =>
+  envInt('LINKEDIN_DAILY_MESSAGE_CAP', isTestEnv() ? 0 : 20);
+
+const DAY_MS = 24 * HOUR_MS;
+
+/**
+ * One class's daily-window counter. A FIXED window that renews from the first
+ * send after it expires, not a true sliding window — deliberately, so the
+ * persisted shape is two numbers instead of an array of up to 30 timestamps
+ * living forever in the account's config. Equivalent enough for a safety
+ * ceiling: it still guarantees no more than `cap` sends in any 24h window
+ * anchored at the first send of that window.
+ */
+export interface DailyVolumeWindowState {
+  count: number;
+  windowStartedAt: number; // epoch ms
+}
+
+/**
+ * Per-account daily-volume state, PERSISTED (CodeRabbit finding, 2026-08-25):
+ * this used to live in a module-level Map, which a backend process
+ * restart — which happens on every merge to `main`, i.e. routinely, multiple
+ * times a day — silently reset to empty, letting an account exceed its daily
+ * cap simply because a deploy landed mid-day. There is nothing per-account to
+ * key an in-memory store by that survives that; the account's own config
+ * (`LinkedInOutreachConfig.daily_volume`) is the durable store instead. This
+ * module stays pure — it takes the last-persisted state in and returns the
+ * next state out; the caller (`agentModeService.ts`) does the actual read
+ * before and write after, using `updateAccountConfig`'s compare-and-swap.
+ */
+export interface DailyVolumeState {
+  invite?: DailyVolumeWindowState;
+  message?: DailyVolumeWindowState;
+}
+
+export type DailyVolumeSlot =
+  | { allowed: true; nextState: DailyVolumeState }
+  | { allowed: false; reason: string; retryAfterMs: number };
+
+/**
+ * Check this account's daily invite/message budget against its persisted
+ * state, and — if allowed — return the incremented state for the caller to
+ * persist.
+ *
+ * Deliberately separate from `reserveWriteSlot`: that call paces BURSTS and a
+ * generic hourly ceiling shared across every write type; this one enforces the
+ * DAILY volume ceiling. A caller must pass BOTH checks — this one does not
+ * replace the hourly/burst pacer, it adds to it.
+ *
+ * `configuredInviteCap` is the account's own self-reported setting (set by the
+ * user directly, or by Emma after asking about Premium status) — see the
+ * module doc comment above for why this is self-reported rather than detected.
+ *
+ * Pure and synchronous, unlike `reserveWriteSlot` — no queueing (a daily cap is
+ * a hard stop for the rest of the day, not worth making a caller wait out) and
+ * no I/O (the caller owns persistence, so this stays trivially unit-testable).
+ */
+export function reserveDailyVolumeSlot(
+  action: string,
+  configuredInviteCap: number | null | undefined,
+  persistedState: DailyVolumeState | null | undefined,
+  deps: Partial<Pick<PacerDeps, 'now'>> = {},
+): DailyVolumeSlot {
+  const cls = dailyVolumeClassFor(action);
+  const carriedState = persistedState || {};
+  if (cls === null) return { allowed: true, nextState: carriedState };
+
+  const now = (deps.now ?? defaultDeps.now)();
+  const cap = cls === 'invite' ? resolveDailyInviteCap(configuredInviteCap) : dailyMessageCap();
+  // The two classes disable differently, on purpose. Messages are never
+  // self-reported — `cap <= 0` can only be the operator env-var escape hatch
+  // (including Jest's suppressed-by-default 0), so it means "unlimited" here,
+  // same convention as the hourly ceiling above. Invites ARE self-reported, so
+  // `resolveDailyInviteCap` already turned "operator disabled" into `Infinity`
+  // — a literal 0 reaching this point for an invite can only be a user's own
+  // "send nothing," which must stay a real block, not get read as unlimited.
+  if (cls === 'message' ? cap <= 0 : !Number.isFinite(cap)) {
+    return { allowed: true, nextState: carriedState };
+  }
+
+  const existingWindow = carriedState[cls];
+  const windowExpired = !existingWindow || now - existingWindow.windowStartedAt >= DAY_MS;
+  const currentCount = windowExpired ? 0 : existingWindow!.count;
+  const windowStartedAt = windowExpired ? now : existingWindow!.windowStartedAt;
+
+  if (currentCount >= cap) {
+    const label = cls === 'invite' ? 'LinkedIn connection request' : 'LinkedIn message';
+    const tierNote =
+      cls === 'invite'
+        ? cap >= dailyInviteAbsoluteMax()
+          ? ' (the system-wide maximum)'
+          : ' (this account\'s configured daily cap — raise it in Settings or ask Emma to update it if you have LinkedIn Premium)'
+        : '';
+    return {
+      allowed: false,
+      reason:
+        `This LinkedIn account has already sent ${currentCount} ${label}${currentCount === 1 ? '' : 's'} ` +
+        `in the last 24 hours, which is today's safety ceiling of ${cap}${tierNote}. ` +
+        `Remaining actions should be left for a later run.`,
+      retryAfterMs: Math.max(0, windowStartedAt + DAY_MS - now),
+    };
+  }
+
+  return {
+    allowed: true,
+    nextState: { ...carriedState, [cls]: { count: currentCount + 1, windowStartedAt } },
+  };
 }

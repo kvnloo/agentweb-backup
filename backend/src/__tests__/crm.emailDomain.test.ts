@@ -23,7 +23,14 @@ jest.mock('../controllers/templates', () => ({
 import { Request, Response } from 'express';
 import { userDb } from '../services/db';
 import { resendService } from '../services/resendService';
+import { claimEmailDomain, releaseEmailDomainClaim, EmailDomainAlreadyClaimedError } from '../services/emailDomainClaimService';
 import router from '../routes/crm';
+
+jest.mock('../services/emailDomainClaimService', () => ({
+  ...jest.requireActual('../services/emailDomainClaimService'),
+  claimEmailDomain: jest.fn().mockResolvedValue(undefined),
+  releaseEmailDomainClaim: jest.fn().mockResolvedValue(undefined),
+}));
 
 // Mock dependencies
 jest.mock('../services/db', () => ({
@@ -192,6 +199,26 @@ describe('CRM Email Domain Endpoints', () => {
       expect(mockResponse.json).toHaveBeenCalledWith({ message: 'This domain is already in use by another account' });
     });
 
+    it('goes through the atomic claim protocol too — a claim conflict wins even when the eventually-consistent scan missed it (CodeRabbit)', async () => {
+      // This legacy singular route previously bypassed claimEmailDomain() entirely, letting a
+      // concurrent request race past it the same way the plural route's own scan-only check
+      // could be raced — the getUsersByEmailDomain scan below finds nothing (simulating the
+      // TOCTOU gap: eventually consistent, or the race landed between this read and the
+      // write), but the atomic claim must still catch it.
+      mockRequest.body = { domain: 'raced.com' };
+      (userDb.getUsersByEmailDomain as jest.Mock).mockResolvedValue([]);
+      (claimEmailDomain as jest.Mock).mockRejectedValueOnce(
+        new EmailDomainAlreadyClaimedError('raced.com', 'other-user-id'),
+      );
+
+      const handle = getHandler('/email-domain', 'post');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(mockResponse.status).toHaveBeenCalledWith(409);
+      expect(resendService.createDomain).not.toHaveBeenCalled();
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
     it('should allow same user to re-register their domain', async () => {
       mockRequest.body = { domain: 'mycompany.com' };
       (userDb.getUsersByEmailDomain as jest.Mock).mockResolvedValue([
@@ -356,6 +383,38 @@ describe('CRM Email Domain Endpoints', () => {
       });
       const jsonCall = (mockResponse.json as jest.Mock).mock.calls[0][0];
       expect(jsonCall.message).toContain('reset');
+    });
+
+    it('releases the domain claim before clearing the user record (CodeRabbit)', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id',
+        emailDomain: 'old.com',
+        resendDomainId: 'domain-old',
+      });
+      (userDb.updateUser as jest.Mock).mockResolvedValue({});
+
+      const handle = getHandler('/email-domain', 'delete');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(releaseEmailDomainClaim).toHaveBeenCalledWith('old.com', 'test-user-id');
+    });
+
+    it('propagates a genuine claim-release failure as a 500 instead of clearing the user record anyway (CodeRabbit)', async () => {
+      // A domain deleted through this legacy route while still holding a confirmed claim
+      // (which never expires on its own) must not be silently orphaned — otherwise the domain
+      // becomes registrable through neither endpoint, by no one, forever.
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id',
+        emailDomain: 'old.com',
+        resendDomainId: 'domain-old',
+      });
+      (releaseEmailDomainClaim as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+
+      const handle = getHandler('/email-domain', 'delete');
+      await handle(mockRequest as Request, mockResponse as Response, mockNext);
+
+      expect(mockResponse.status).toHaveBeenCalledWith(500);
+      expect(userDb.updateUser).not.toHaveBeenCalled();
     });
 
     it('should work when only emailDomain is set (no resendDomainId)', async () => {

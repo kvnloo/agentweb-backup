@@ -52,6 +52,34 @@ describe('AgentModeService.extractMinimalToolResult — LinkedIn search-outage m
     );
   });
 
+  // ENG-1299 follow-up: same erasure problem, different marker — a resolver
+  // miss degrades a search-people facet to keyword-only matching, and
+  // searchPeople flags that on the result as degraded/droppedFacets. Without
+  // a branch here it fell through to the same `{}` default as the
+  // searchUnavailable case above.
+  it('preserves degraded/droppedFacets from a linkedin_outreach search-people resolver-miss response', () => {
+    const result = {
+      success: true,
+      data: {
+        object: 'LinkedinSearch',
+        items: [{ public_identifier: 'jdoe' }],
+        degraded: true,
+        droppedFacets: ['industry'],
+      },
+    };
+    expect(minimal(result, 'linkedin_outreach')).toEqual({
+      success: true,
+      degraded: true,
+      droppedFacets: ['industry'],
+    });
+  });
+
+  it('does NOT invent degraded for a clean linkedin_outreach search-people response', () => {
+    expect(
+      minimal({ success: true, data: { items: [{ public_identifier: 'jdoe' }] } }, 'linkedin_outreach'),
+    ).not.toHaveProperty('degraded');
+  });
+
   it('leaves unrelated tools untouched', () => {
     expect(minimal({ success: true, s3_url: 'https://x/y.html', message: 'ok', versioned_filename: 'y.html' }, 'update_html_file')).toEqual({
       success: true,

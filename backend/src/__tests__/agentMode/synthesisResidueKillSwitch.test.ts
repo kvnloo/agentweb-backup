@@ -73,3 +73,55 @@ describe('AgentMode — residue guard kill switch (ENG-1054)', () => {
     expect(snapshot.llmTurnsConsumed).toBe(2);
   });
 });
+
+/**
+ * ENG-1331's false-completion-claim correction now has its OWN kill switch
+ * (AGENT_FALSE_CLAIM_GUARD) instead of sharing AGENT_SYNTHESIS_RESIDUE_GUARD, so
+ * standing down the ENG-1054 residue guard above no longer silently disables this
+ * guard too, and vice versa.
+ */
+const FALSE_CLAIM_SCENARIO = {
+  message: 'Render the full 12-size IAB matrix for Variant 4.',
+  transcript: [
+    {
+      tool_calls: [
+        { id: 'c1', name: 'playwright_browser_take_screenshot', arguments: JSON.stringify({ filename: '300x250.png' }) },
+        { id: 'c2', name: 'playwright_browser_take_screenshot', arguments: JSON.stringify({ filename: '728x90.png' }) },
+        { id: 'c3', name: 'playwright_browser_take_screenshot', arguments: JSON.stringify({ filename: '160x600.png' }) },
+        { id: 'c4', name: 'playwright_browser_take_screenshot', arguments: JSON.stringify({ filename: '320x50.png' }) },
+      ],
+    },
+    { content: "All 12 sizes have been rendered, QA'd, and saved for Variant 4." },
+  ],
+  toolResults: {
+    playwright_browser_take_screenshot: { result: { success: true, screenshotUrl: 'https://s3.example.com/shot.png' } },
+  },
+};
+
+describe('AgentMode — false-completion-claim guard kill switch (ENG-1331)', () => {
+  let service: AgentModeService;
+  const original = process.env.AGENT_FALSE_CLAIM_GUARD;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new AgentModeService();
+    installStandardMockDeps();
+  });
+  afterEach(() => {
+    if (original === undefined) delete process.env.AGENT_FALSE_CLAIM_GUARD;
+    else process.env.AGENT_FALSE_CLAIM_GUARD = original;
+  });
+
+  it('guards by default (flag unset)', async () => {
+    delete process.env.AGENT_FALSE_CLAIM_GUARD;
+    const snapshot = await runScenario(service, FALSE_CLAIM_SCENARIO);
+    expect(snapshot.content).toContain('only 4 of 12');
+  });
+
+  it('=false restores the pre-fix behaviour exactly: the false "12" claim ships uncorrected', async () => {
+    process.env.AGENT_FALSE_CLAIM_GUARD = 'false';
+    const snapshot = await runScenario(service, FALSE_CLAIM_SCENARIO);
+    expect(snapshot.content).toBe("All 12 sizes have been rendered, QA'd, and saved for Variant 4.");
+    expect(snapshot.content).not.toContain('Correction');
+  });
+});
