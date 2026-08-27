@@ -219,7 +219,24 @@ export function resolveStepParameters(
     if (Object.prototype.hasOwnProperty.call(resolvedParameters, req.key)) continue;
 
     const candidate = findQuestionByKind(pending, archive, req.questionKind);
-    const gate = checkQuestionGate(pending, candidate?.questionId, archive);
+    if (!candidate) {
+      // Block explicitly here rather than calling checkQuestionGate with an
+      // undefined questionId: that gate treats a missing questionId as "any
+      // live pending question is acceptable," which would let an unrelated
+      // answered question (of a DIFFERENT kind) satisfy this requirement —
+      // exactly the class of wrong-answer-applied failure this module exists
+      // to prevent.
+      return {
+        blocked: true,
+        block: {
+          stepId: step.id,
+          missingParameter: req.key,
+          questionKind: req.questionKind,
+          reason: `No question of kind '${req.questionKind}' has been asked yet — the choice must be made first.`,
+        },
+      };
+    }
+    const gate = checkQuestionGate(pending, candidate.questionId, archive);
     if (!gate.allowed) {
       return {
         blocked: true,

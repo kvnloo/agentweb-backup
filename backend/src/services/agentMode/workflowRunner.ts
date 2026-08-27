@@ -90,6 +90,23 @@ export async function advanceWorkflow(sessionId: string, definition: WorkflowDef
     return { kind: 'step_failed', run: persisted.workflowRun };
   }
 
+  // A declared output execute() failed to return would otherwise checkpoint
+  // as the literal string "undefined" (String(undefined) === 'undefined')
+  // and get threaded into a later step's input as if it were a real entity
+  // ID. Fail loud here instead of trusting execute() honored its contract.
+  const missingOutputs = step.outputs.filter((k) => executeResult[k] === undefined || executeResult[k] === null);
+  if (missingOutputs.length > 0) {
+    const failedRun = recordStepFailure(
+      run,
+      step,
+      { error: `execute() did not return required output(s): ${missingOutputs.join(', ')}` },
+      at(),
+    );
+    const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, failedRun, { requireVersion: run.version });
+    if (!persisted?.workflowRun) return { kind: 'conflict', run };
+    return { kind: 'step_failed', run: persisted.workflowRun };
+  }
+
   const verification = await step.verify(executeResult, executionInput);
   if (!verification.verified) {
     const discrepancy = 'mismatches' in verification ? verification.mismatches : { error: verification.error };

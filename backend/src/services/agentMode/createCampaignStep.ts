@@ -61,8 +61,21 @@ export function buildCreateCampaignStep(deps: CreateCampaignStepDeps): WorkflowS
             applied: readBack.objective ?? null,
           });
         }
+        // budget_mode is gated as spend-bearing (requiredParameters above) —
+        // its read-back deserves the same scrutiny as objective, otherwise a
+        // create that silently dropped the budget still checkpoints verified.
+        if (params.budget_mode === 'campaign_budget_optimization' && !readBack.daily_budget) {
+          mismatches.push({
+            parameter: 'budget_mode',
+            requested: params.budget_mode,
+            applied: readBack.daily_budget ?? null,
+          });
+        }
         if (mismatches.length) return { verified: false, mismatches };
-        return { verified: true, verifiedFields: { objective: readBack.objective, id: readBack.id } };
+        return {
+          verified: true,
+          verifiedFields: { objective: readBack.objective, id: readBack.id, daily_budget: readBack.daily_budget ?? null },
+        };
       } catch (err: any) {
         return { verified: false, error: err?.message || 'read-back failed' };
       }
