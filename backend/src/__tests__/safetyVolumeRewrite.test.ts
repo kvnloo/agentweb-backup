@@ -92,6 +92,16 @@ describe('ENG-1631 safety-volume rewrite', () => {
       expect(out.systemPrompt).toContain('## FAILURE HANDLING\n- retry once');
     });
 
+    it('a MIXED prompt — exact stale block PLUS an extra hand-edited cap — still flags after rewrite', () => {
+      // The runner must check the POST-rewrite text: replacing only the part we
+      // recognise would otherwise leave the hand-edited cap active while the row
+      // vanishes from every report. (CodeRabbit on #2664; runner skips these.)
+      const mixed = `${STALE_BLOCK}\n\n## TEAM ADDENDUM\n- also never exceed 3 LinkedIn invites per run.`;
+      const out = rewriteSafetyVolume(mixed);
+      expect(out.applied).toEqual(['safetyVolumeBlock']);
+      expect(hasUnrecognizedSafetyVolumeProse(out.systemPrompt)).toBe(true);
+    });
+
     it('is idempotent — a second pass changes nothing and nothing is flagged', () => {
       const once = rewriteSafetyVolume(`x\n\n${STALE_BLOCK}\n`);
       const twice = rewriteSafetyVolume(once.systemPrompt);

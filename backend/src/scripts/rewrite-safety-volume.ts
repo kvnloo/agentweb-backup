@@ -76,6 +76,15 @@ async function main(): Promise<void> {
       continue;
     }
 
+    // A row can carry the exact stale block AND an additional hand-edited numeric
+    // cap. Rewriting only the part we recognise would leave that cap active while
+    // the row vanishes from every report — so check the POST-rewrite residue and
+    // route mixed rows to a human instead of half-rewriting them.
+    if (hasUnrecognizedSafetyVolumeProse(plan.systemPrompt)) {
+      needsHuman.push(`${skill.skillId} ${skill.name}`);
+      continue;
+    }
+
     console.log(`${apply ? "→" : "·"} ${skill.skillId} ${skill.name}`);
     console.log(`    rewrites: ${plan.applied.join(", ")}`);
 
@@ -93,6 +102,12 @@ async function main(): Promise<void> {
       const fresh = rewriteSafetyVolume(current.systemPrompt);
       if (!fresh.applied.length) {
         console.log("    ! prose no longer matches on re-read — skipping rather than writing a guess");
+        skipped++;
+        continue;
+      }
+      if (hasUnrecognizedSafetyVolumeProse(fresh.systemPrompt)) {
+        console.log("    ! unrecognized volume prose appeared on re-read — routing to human review");
+        needsHuman.push(`${skill.skillId} ${skill.name}`);
         skipped++;
         continue;
       }
