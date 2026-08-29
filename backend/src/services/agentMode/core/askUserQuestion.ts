@@ -324,15 +324,11 @@ const TYPED_TEXT_PROVENANCE = 'Resolved from typed user text.';
 const AFFIRMATIVE_OPTION_TERMS = /\b(?:approve|approved|yes|confirm|confirmed|proceed|continue)\b/i;
 const BARE_AFFIRMATIVE = /^(?:yes|yeah|yep|approved?|confirm(?:ed)?|looks good|go ahead|proceed|continue)(?:[\s,!.]+(?:looks good|please|thanks))?[\s!.]*$/i;
 
-function normalizedPhraseMatches(message: string, phrase: string): boolean {
-  const normalized = phrase.trim().toLowerCase();
-  if (normalized.length < 2) return false;
-  const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
-  return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(message);
-}
-
 function optionMatchesTypedText(option: AskUserQuestionOption, message: string): boolean {
-  return normalizedPhraseMatches(message, option.id) || normalizedPhraseMatches(message, option.label);
+  const normalizedMessage = message.trim().replace(/\s+/g, ' ').toLowerCase();
+  const matches = (candidate: string): boolean =>
+    candidate.trim().replace(/\s+/g, ' ').toLowerCase() === normalizedMessage;
+  return matches(option.id) || matches(option.label);
 }
 
 /**

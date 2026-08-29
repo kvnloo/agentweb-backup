@@ -570,4 +570,18 @@ describe('resolveTypedTextAnswer — unambiguous typed consent', () => {
     expect(resolveTypedTextAnswer(awaitingQuestion(), 'yes', AT)).toBeUndefined();
     expect(resolveTypedTextAnswer(awaitingQuestion(), 'leads or traffic', AT)).toBeUndefined();
   });
+
+  it('does not treat negated option mentions as consent', () => {
+    const approval = buildPendingUserQuestion({
+      questionId: 'q-approve', question: 'Approve the deployment?', createdAt: AT,
+      options: [
+        { id: 'approve', label: 'Approve', consequence: 'Proceed.', recommended: true, why: 'Ready.' },
+        { id: 'reject', label: 'Reject', consequence: 'Stop.' },
+      ],
+    });
+
+    expect(resolveTypedTextAnswer(approval, 'I do not approve this', AT)).toBeUndefined();
+    expect(resolveTypedTextAnswer(approval, 'do not proceed', AT)).toBeUndefined();
+    expect(resolveTypedTextAnswer(awaitingQuestion(), 'not leads', AT)).toBeUndefined();
+  });
 });
