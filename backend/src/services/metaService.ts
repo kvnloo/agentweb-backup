@@ -2289,8 +2289,9 @@ export class MetaService {
         'ad parent campaign',
       );
       const data: any = (result as any)?._data ?? result;
-      const selectedAccountId = String(adAccountId).replace(/^act_/, '');
-      if (String(data?.account_id ?? '').replace(/^act_/, '') !== selectedAccountId) return undefined;
+      const selectedAccountId = String(adAccountId).trim().replace(/^act_/, '');
+      const ownerAccountId = String(data?.account_id ?? '').trim().replace(/^act_/, '');
+      if (!selectedAccountId || !ownerAccountId || ownerAccountId !== selectedAccountId) return undefined;
       return typeof data?.campaign_id === 'string' && data.campaign_id ? data.campaign_id : undefined;
     } catch (error) {
       return this.handleError(error, 'getAdCampaignIdForAccount') as never;

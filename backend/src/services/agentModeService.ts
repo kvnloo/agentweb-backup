@@ -32,6 +32,7 @@ import {
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
@@ -19433,18 +19434,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // read away. A failed lookup falls through with the campaign still unset, so the
       // gate blocks loudly exactly as before: failure to verify is never permission to
       // proceed.
-      let gateCampaignId = campaign_id;
-      if (!gateCampaignId && entity_type === 'AD' && ad_id) {
-        try {
-          gateCampaignId = await metaService.getAdCampaignIdForAccount(
-            gateCreds.accessToken,
-            gateCreds.accountId,
-            ad_id,
-          );
-        } catch {
-          // Fall through to the gate's own no-campaign block.
-        }
-      }
+      const gateCampaignId = await resolveMetaActivationCampaignId({
+        entityType: entity_type,
+        campaignId: campaign_id,
+        adId: ad_id,
+        accessToken: gateCreds.accessToken,
+        accountId: gateCreds.accountId,
+        resolver: metaService,
+      });
       const gate = await runMetaTrackingGate(
         gateCreds,
         gateCampaignId,
