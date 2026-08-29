@@ -19436,10 +19436,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       let gateCampaignId = campaign_id;
       if (!gateCampaignId && entity_type === 'AD' && ad_id) {
         try {
-          const parentAd = await metaService.getAd(gateCreds.accessToken, ad_id);
-          if (parentAd && typeof parentAd.campaign_id === 'string' && parentAd.campaign_id) {
-            gateCampaignId = parentAd.campaign_id;
-          }
+          gateCampaignId = await metaService.getAdCampaignIdForAccount(
+            gateCreds.accessToken,
+            gateCreds.accountId,
+            ad_id,
+          );
         } catch {
           // Fall through to the gate's own no-campaign block.
         }

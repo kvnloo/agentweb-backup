@@ -347,15 +347,15 @@ describe('AD activation without campaign_id resolves its parent (ENG-1636)', () 
   it('resolves the parent campaign from the ad and hands it to the gate', async () => {
     (isMetaSpendStartingWrite as jest.Mock).mockReturnValue(true);
     (runMetaTrackingGate as jest.Mock).mockResolvedValue({ proceed: true });
-    const getAdSpy = jest.spyOn(metaService, 'getAd')
-      .mockResolvedValue({ id: AD, campaign_id: CAMPAIGN, adset_id: 'adset-1' } as any);
+    const getAdSpy = jest.spyOn(metaService, 'getAdCampaignIdForAccount')
+      .mockResolvedValue(CAMPAIGN);
     const adsSpy = jest.spyOn(service as any, 'manageMetaAdsAds').mockResolvedValue({ success: true });
 
     await service.callMetaMarketingApi(
       'user-1', 'AD', 'UPDATE', ACCOUNT, undefined, undefined, AD, { status: 'ACTIVE', confirm: true }, 'sess-1',
     );
 
-    expect(getAdSpy).toHaveBeenCalledWith('tok', AD);
+    expect(getAdSpy).toHaveBeenCalledWith('tok', ACCOUNT, AD);
     expect((runMetaTrackingGate as jest.Mock).mock.calls[0][1]).toBe(CAMPAIGN);
     expect(adsSpy).toHaveBeenCalled();
   });
@@ -369,7 +369,7 @@ describe('AD activation without campaign_id resolves its parent (ENG-1636)', () 
         error: 'Launch blocked: could not verify Meta tracking because no campaign was identified for this AD_UPDATE.',
       },
     });
-    jest.spyOn(metaService, 'getAd').mockRejectedValue(new Error('Graph read failed'));
+    jest.spyOn(metaService, 'getAdCampaignIdForAccount').mockRejectedValue(new Error('Graph read failed'));
     const adsSpy = jest.spyOn(service as any, 'manageMetaAdsAds').mockResolvedValue({ success: true });
 
     const res: any = await service.callMetaMarketingApi(
@@ -384,8 +384,8 @@ describe('AD activation without campaign_id resolves its parent (ENG-1636)', () 
   it('never resolves when campaign_id is already supplied', async () => {
     (isMetaSpendStartingWrite as jest.Mock).mockReturnValue(true);
     (runMetaTrackingGate as jest.Mock).mockResolvedValue({ proceed: true });
-    const getAdSpy = jest.spyOn(metaService, 'getAd')
-      .mockResolvedValue({ id: AD, campaign_id: 'a-different-campaign' } as any);
+    const getAdSpy = jest.spyOn(metaService, 'getAdCampaignIdForAccount')
+      .mockResolvedValue('a-different-campaign');
     jest.spyOn(service as any, 'manageMetaAdsAds').mockResolvedValue({ success: true });
 
     await service.callMetaMarketingApi(
