@@ -46,7 +46,7 @@
 
 /** One selectable option on the card. */
 export interface AskUserQuestionOption {
-  /** Stable id the frontend returns on selection (never re-parsed from prose). */
+  /** Stable id the frontend returns on a structured selection. */
   id: string;
   /** Short button label, e.g. "Leads". */
   label: string;
@@ -74,7 +74,7 @@ export interface AskUserQuestionAnswer {
   /** 'user' = explicit human selection; 'delegation' = explicit delegation click
    *  or a policy-permitted headless auto-take of the recommendation. */
   answeredBy: AskUserQuestionAnsweredBy;
-  /** For delegated answers: why the recommended option was taken (logged). */
+  /** Why this answer was resolved, for delegated recommendations or typed-text resolution. */
   rationale?: string;
   /** ISO timestamp the answer landed. */
   at: string;
@@ -320,6 +320,62 @@ export function resolveInboundAnswer(
   });
 }
 
+const TYPED_TEXT_PROVENANCE = 'Resolved from typed user text.';
+const AFFIRMATIVE_OPTION_TERMS = /\b(?:approve|approved|yes|confirm|confirmed|proceed|continue)\b/i;
+const BARE_AFFIRMATIVE = /^(?:yes|yeah|yep|approved?|confirm(?:ed)?|looks good|go ahead|proceed|continue)(?:[\s,!.]+(?:looks good|please|thanks))?[\s!.]*$/i;
+
+function normalizedPhraseMatches(message: string, phrase: string): boolean {
+  const normalized = phrase.trim().toLowerCase();
+  if (normalized.length < 2) return false;
+  const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+  return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(message);
+}
+
+function optionMatchesTypedText(option: AskUserQuestionOption, message: string): boolean {
+  return normalizedPhraseMatches(message, option.id) || normalizedPhraseMatches(message, option.label);
+}
+
+/**
+ * Resolve unambiguous user prose into the same human-attributed answer shape as
+ * a card click. A direct option-id/label match wins; otherwise only a bare
+ * affirmative can settle an approval-shaped card with exactly one affirmative
+ * option. Ambiguous or unrelated prose returns undefined so the controller
+ * retains the existing clear-and-re-ask behavior.
+ */
+export function resolveTypedTextAnswer(
+  pending: PendingUserQuestion | null | undefined,
+  messageText: string | null | undefined,
+  at: string,
+): PendingUserQuestion | undefined {
+  if (!pending || pending.status !== 'awaiting' || typeof messageText !== 'string') return undefined;
+  const message = messageText.trim();
+  if (!message) return undefined;
+
+  const directMatches = pending.options.filter((option) => optionMatchesTypedText(option, message));
+  if (directMatches.length === 1) {
+    return applyAnswer(pending, {
+      optionId: directMatches[0].id,
+      delegated: false,
+      answeredBy: 'user',
+      rationale: TYPED_TEXT_PROVENANCE,
+      at,
+    });
+  }
+  if (directMatches.length > 1 || !BARE_AFFIRMATIVE.test(message)) return undefined;
+
+  const affirmativeOptions = pending.options.filter((option) =>
+    AFFIRMATIVE_OPTION_TERMS.test(`${option.id} ${option.label}`),
+  );
+  if (affirmativeOptions.length !== 1) return undefined;
+  return applyAnswer(pending, {
+    optionId: affirmativeOptions[0].id,
+    delegated: false,
+    answeredBy: 'user',
+    rationale: TYPED_TEXT_PROVENANCE,
+    at,
+  });
+}
+
 /**
  * Resolve the answer's concrete machine payload for the consumer to apply
  * verbatim (deterministic — no model re-inference). Returns undefined if the
@@ -337,8 +393,8 @@ export function selectedPayload(question: PendingUserQuestion): Record<string, u
  * decide", where they never named an option themselves.
  *
  * This is appended to the LLM message content ONLY — never to the stored/displayed
- * user bubble (which stays "Let Emma decide" / the picked label). Returns null when
- * the question isn't answered or the chosen option can't be resolved (nothing to say).
+ * user bubble (which stays "Let Emma decide" / the typed text / the picked label). Returns
+ * null when the question isn't answered or the chosen option can't be resolved.
  */
 export function buildAnswerAcknowledgement(question: PendingUserQuestion): string | null {
   if (question.status !== 'answered' || !question.answer) return null;
@@ -360,11 +416,9 @@ export function buildAnswerAcknowledgement(question: PendingUserQuestion): strin
 }
 
 /**
- * ENG-396: a model-visible directive injected when the user TYPES a message instead of
- * clicking an open card. The typed reply abandons the question (it's cleared server-side),
- * and this tells Emma to re-ask that SAME question rather than infer a choice from the
- * prose or move on. Without it the model tends to treat "lets do traffic" as the answer
- * and advance — leaving the (immutable) question unanswered while the card says so.
+ * ENG-396: a model-visible directive injected when typed text does not unambiguously
+ * resolve an open card. The question is cleared server-side, and this tells Emma to
+ * re-ask THAT SAME question rather than infer a choice from ambiguous prose or move on.
  *
  * Appended to the LLM message content ONLY (never the displayed user bubble).
  */
@@ -387,7 +441,7 @@ export function buildReaskDirective(question: PendingUserQuestion): string {
  * confirmation-halt surfaces). The structured `options` on the tool result
  * drive the interactive card; this text is the accessible mirror. Deliberately
  * carries NO instruction on how to answer — the model must not be able to
- * self-resolve; only an inbound user selection does.
+ * self-resolve; only an inbound user action can.
  */
 export function renderQuestionPrompt(question: PendingUserQuestion): string {
   const lines = question.options.map((o, i) => {
