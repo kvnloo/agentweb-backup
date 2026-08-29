@@ -918,6 +918,10 @@ LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid deliv
     2. Show the user that resolved target verbatim (campaign name + ID, ad set name + ID, ad name, and any
        content/budget/status changes) and get EXPLICIT approval before proceeding.
     3. Only after the user approves, re-call with the SAME arguments plus params.confirm=true to execute.
+    4. When one user directive covers multiple gated writes with no data dependency between them (for example,
+       status changes across AD, AD_SET, and CAMPAIGN), emit ALL of those calls in ONE message so they confirm
+       as a single round. Split only on a real data dependency, such as creating a creative before an ad can
+       reference its creative_id.
   If the user's request could map to MORE THAN ONE campaign, ad set, or asset, do NOT guess — list the
   candidates and ask the user to disambiguate BEFORE calling. Never publish an ad into a campaign/ad set the
   user did not explicitly name, and never regenerate/edit an asset set without confirming which assets.
