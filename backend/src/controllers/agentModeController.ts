@@ -3433,9 +3433,12 @@ export async function runVerifiedChat(
               'drafts) and produce the final report.'
           : completionGateReason === 'budget'
             ? 'The previous run was cut short because it exhausted its processing-step ' +
-              'budget before it could produce the final deliverable. Using the data ' +
-              'already gathered, produce the final consolidated report now. Surface any ' +
-              'entities you could not fully research as actionable next steps.'
+              'budget before it could produce the final deliverable. Resume the requested ' +
+              'workflow from its first unfinished step and complete all unfinished steps ' +
+              'and entities, using tools as needed. Use the data already gathered, but do ' +
+              'not repeat completed writes or actions. Only after the remaining work is ' +
+              'complete, produce the final consolidated report. Surface any genuinely ' +
+              'blocked entities as actionable next steps.'
           : completionGateReason === 'confirmation'
             ? 'Your previous response paused to ask for confirmation or approval before ' +
               'proceeding, but this is an automated run with no human present to reply. ' +
