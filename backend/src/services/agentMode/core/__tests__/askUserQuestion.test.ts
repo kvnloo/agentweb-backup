@@ -25,6 +25,8 @@ import {
   renderQuestionPrompt,
   buildAnswerAcknowledgement,
   buildReaskDirective,
+  findQuestionByKind,
+  findAnsweredObjectiveCandidate,
   AskUserQuestionError,
   type AskUserQuestionOption,
   type AskUserQuestionInput,
@@ -72,6 +74,78 @@ function validInput(overrides: Partial<AskUserQuestionInput> = {}): AskUserQuest
 function awaitingQuestion(overrides: Partial<AskUserQuestionInput> = {}): PendingUserQuestion {
   return buildPendingUserQuestion(validInput(overrides));
 }
+
+function answeredObjectiveQuestion(overrides: Partial<AskUserQuestionInput> = {}): PendingUserQuestion {
+  return applyAnswer(awaitingQuestion(overrides), {
+    optionId: 'leads',
+    delegated: false,
+    answeredBy: 'user',
+    at: '2026-07-21T00:05:00.000Z',
+  });
+}
+
+describe('answered-question lookup', () => {
+  const lookupOptions = {
+    accountId: 'act-1',
+    validObjectives: ['OUTCOME_LEADS', 'OUTCOME_TRAFFIC'],
+    bindsLabel: (objective: string, text: string) =>
+      objective === 'OUTCOME_LEADS' ? /lead/i.test(text) : /traffic|landing/i.test(text),
+  };
+
+  it('findQuestionByKind checks the live slot before the archive', () => {
+    const live = awaitingQuestion({ kind: 'meta_objective:one' });
+    const archived = awaitingQuestion({ questionId: 'archived', kind: 'meta_objective:one' });
+    expect(findQuestionByKind(live, { archived }, 'meta_objective:one')).toBe(live);
+  });
+
+  it('findQuestionByKind falls back to the archive', () => {
+    const archived = awaitingQuestion({ questionId: 'archived', kind: 'meta_objective:one' });
+    expect(findQuestionByKind(null, { archived }, 'meta_objective:one')).toBe(archived);
+  });
+
+  it.each([
+    ['a bare objective kind', { kind: 'meta_objective' }],
+    ['a same-account scoped kind', { kind: 'meta_objective:act-1|old campaign' }],
+    ['no kind', { kind: undefined }],
+  ])('reuses an answered objective card with %s', (_label, overrides) => {
+    const card = answeredObjectiveQuestion(overrides);
+    expect(findAnsweredObjectiveCandidate(card, null, lookupOptions)).toMatchObject({
+      question: { questionId: card.questionId },
+      objective: 'OUTCOME_LEADS',
+    });
+  });
+
+  it('rejects a card scoped to a different ad account', () => {
+    const card = answeredObjectiveQuestion({ kind: 'meta_objective:act-2|old campaign' });
+    expect(findAnsweredObjectiveCandidate(card, null, lookupOptions)).toBeUndefined();
+  });
+
+  it('rejects a selected payload that does not bind to its label or consequence', () => {
+    const card = answeredObjectiveQuestion({
+      options: objectiveOptions().map((option) =>
+        option.id === 'leads' ? { ...option, payload: { objective: 'OUTCOME_TRAFFIC' } } : option,
+      ),
+    });
+    expect(findAnsweredObjectiveCandidate(card, null, lookupOptions)).toBeUndefined();
+  });
+
+  it('rejects unanswered cards and cards whose answer is not human-attributed', () => {
+    expect(findAnsweredObjectiveCandidate(awaitingQuestion(), null, lookupOptions)).toBeUndefined();
+    const invalid = answeredObjectiveQuestion();
+    (invalid.answer as any).answeredBy = 'model';
+    expect(findAnsweredObjectiveCandidate(invalid, null, lookupOptions)).toBeUndefined();
+  });
+
+  it('skips a source question that was already consumed', () => {
+    const card = answeredObjectiveQuestion();
+    expect(
+      findAnsweredObjectiveCandidate(card, null, {
+        ...lookupOptions,
+        consumedQuestionIds: new Set([card.questionId]),
+      }),
+    ).toBeUndefined();
+  });
+});
 
 describe('resolveRecommendedOptionId — structural validation', () => {
   it('returns the single recommended option id on a valid set', () => {

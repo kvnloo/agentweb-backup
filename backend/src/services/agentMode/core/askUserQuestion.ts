@@ -486,6 +486,72 @@ export function findQuestionByKind(
   return undefined;
 }
 
+export interface AnsweredObjectiveCandidateOptions {
+  accountId: string;
+  validObjectives: readonly string[];
+  bindsLabel: (objective: string, labelAndConsequence: string) => boolean;
+  consumedQuestionIds?: ReadonlySet<string>;
+}
+
+export function summarizeAnsweredObjectiveQuestions(
+  pending: PendingUserQuestion | null | undefined,
+  archive: Record<string, PendingUserQuestion> | null | undefined,
+  validObjectives: readonly string[],
+): { consumedQuestionIds: Set<string>; hasAnsweredObjectiveCard: boolean } {
+  const consumedQuestionIds = new Set<string>();
+  let hasAnsweredObjectiveCard = false;
+  for (const question of [pending, ...Object.values(archive ?? {})]) {
+    if (!question || question.status !== 'answered' || !question.answer) continue;
+    const chosen = question.options.find((option) => option.id === question.answer?.optionId);
+    const sourceQuestionId = chosen?.payload?.sourceQuestionId;
+    if (typeof sourceQuestionId === 'string') consumedQuestionIds.add(sourceQuestionId);
+    if (
+      question.kind === 'meta_objective' ||
+      question.kind?.startsWith('meta_objective:') ||
+      validObjectives.includes(String(chosen?.payload?.objective ?? ''))
+    ) {
+      hasAnsweredObjectiveCard = true;
+    }
+  }
+  return { consumedQuestionIds, hasAnsweredObjectiveCard };
+}
+
+/**
+ * Find a human-attributed objective answer whose producer did not know the
+ * campaign-specific correlator kind. Account scoping and label/payload binding
+ * keep this compatibility lookup narrower than a semantic text search.
+ */
+export function findAnsweredObjectiveCandidate(
+  pending: PendingUserQuestion | null | undefined,
+  archive: Record<string, PendingUserQuestion> | null | undefined,
+  options: AnsweredObjectiveCandidateOptions,
+): { question: PendingUserQuestion; objective: string } | undefined {
+  const candidates = [pending, ...Object.values(archive ?? {})].filter(
+    (question, index, all): question is PendingUserQuestion =>
+      Boolean(question) && all.findIndex((item) => item?.questionId === question?.questionId) === index,
+  );
+
+  for (const question of candidates) {
+    if (options.consumedQuestionIds?.has(question.questionId)) continue;
+    const gate = checkQuestionGate(question);
+    if (!gate.allowed) continue;
+
+    const kind = question.kind;
+    if (kind && kind !== 'meta_objective') {
+      if (!kind.startsWith('meta_objective:')) continue;
+      const scopedAccount = kind.slice('meta_objective:'.length).split('|', 1)[0];
+      if (scopedAccount !== options.accountId) continue;
+    }
+
+    const objective = (gate.payload as Record<string, unknown> | undefined)?.objective;
+    if (typeof objective !== 'string' || !options.validObjectives.includes(objective)) continue;
+    const selected = question.options.find((candidate) => candidate.id === gate.answer.optionId);
+    if (!selected || !options.bindsLabel(objective, `${selected.label} ${selected.consequence}`)) continue;
+    return { question, objective };
+  }
+  return undefined;
+}
+
 /**
  * ENG-400 (general-purpose, not Meta-specific): verify a claimed "the user
  * explicitly said this" bypass against the ACTUAL text of a message, rather
