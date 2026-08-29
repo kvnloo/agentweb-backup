@@ -136,6 +136,30 @@ function pendingObjectiveQuestion(): PendingUserQuestion {
   });
 }
 
+function pendingApprovalQuestion(): PendingUserQuestion {
+  return buildPendingUserQuestion({
+    questionId: 'q-deployment-approval',
+    question: 'Approve this deployment brief?',
+    options: [
+      {
+        id: 'approve',
+        label: 'Approve',
+        consequence: 'The approved deployment may proceed.',
+        recommended: true,
+        why: 'The brief matches the agreed scope.',
+      },
+      {
+        id: 'reject',
+        label: 'Reject',
+        consequence: 'The deployment remains blocked.',
+      },
+    ],
+    immutable: true,
+    allowEmmaDecide: false,
+    createdAt: '2026-08-29T00:00:00.000Z',
+  });
+}
+
 function sessionWith(pending: PendingUserQuestion | undefined) {
   return {
     sessionId,
@@ -319,11 +343,72 @@ describe('generateResponse — AskUserQuestion answer channel (ENG-396)', () => 
     expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
   });
 
-  it('a typed message while a question is awaiting RELEASES it (never infers from prose) so Emma can re-ask, then runs', async () => {
+  it('a typed option label resolves exactly one option, records typed-text provenance, and runs', async () => {
     mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(pendingObjectiveQuestion()) as any);
 
     const res = makeRes();
-    await agentModeController.generateResponse(makeReq({ userId: ownerId }, undefined, 'lets do lead'), res);
+    await agentModeController.generateResponse(makeReq({ userId: ownerId }, undefined, 'Leads'), res);
+
+    expect(res.statusCode).toBe(200);
+    expect((mockChatbotDb as any).updateSessionAskUserQuestion).toHaveBeenCalledWith(
+      sessionId,
+      expect.objectContaining({
+        status: 'answered',
+        answer: expect.objectContaining({
+          optionId: 'leads',
+          delegated: false,
+          answeredBy: 'user',
+          rationale: 'Resolved from typed user text.',
+        }),
+      }),
+      { requireStillAwaiting: 'q-objective-1' },
+    );
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('a typed alternative label resolves that exact option instead of re-asking', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(pendingObjectiveQuestion()) as any);
+
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq({ userId: ownerId }, undefined, 'Traffic'), res);
+
+    expect(res.statusCode).toBe(200);
+    const [, persisted] = (mockChatbotDb as any).updateSessionAskUserQuestion.mock.calls[0];
+    expect(persisted.answer).toMatchObject({
+      optionId: 'traffic',
+      delegated: false,
+      answeredBy: 'user',
+      rationale: 'Resolved from typed user text.',
+    });
+  });
+
+  it('a bare affirmative resolves an approval-shaped card and records typed-text provenance', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(pendingApprovalQuestion()) as any);
+
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq({ userId: ownerId }, undefined, 'Yes, looks good'), res);
+
+    expect(res.statusCode).toBe(200);
+    expect((mockChatbotDb as any).updateSessionAskUserQuestion).toHaveBeenCalledWith(
+      sessionId,
+      expect.objectContaining({
+        status: 'answered',
+        answer: expect.objectContaining({
+          optionId: 'approve',
+          delegated: false,
+          answeredBy: 'user',
+          rationale: 'Resolved from typed user text.',
+        }),
+      }),
+      { requireStillAwaiting: 'q-deployment-approval' },
+    );
+  });
+
+  it('a bare affirmative on a multi-choice card RELEASES it so Emma can re-ask, then runs', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(pendingObjectiveQuestion()) as any);
+
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq({ userId: ownerId }, undefined, 'yes'), res);
 
     expect(res.statusCode).toBe(200);
     // The open question is abandoned (cleared) — the prose is NOT parsed into an answer.
