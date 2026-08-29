@@ -19426,9 +19426,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
     if (isMetaSpendStartingWrite(entity_type, action, params)) {
       const gateCreds = await this.getMetaCredentials(userId, account_id);
+      // ENG-1636: an AD status flip usually arrives with only ad_id, but the gate needs
+      // the parent campaign to scope its tracking checks — and blocked such calls with
+      // "no campaign was identified" even though Meta carries campaign_id on the ad
+      // object. Resolve the parent instead of refusing a call whose campaign is one
+      // read away. A failed lookup falls through with the campaign still unset, so the
+      // gate blocks loudly exactly as before: failure to verify is never permission to
+      // proceed.
+      let gateCampaignId = campaign_id;
+      if (!gateCampaignId && entity_type === 'AD' && ad_id) {
+        try {
+          const parentAd = await metaService.getAd(gateCreds.accessToken, ad_id);
+          if (parentAd && typeof parentAd.campaign_id === 'string' && parentAd.campaign_id) {
+            gateCampaignId = parentAd.campaign_id;
+          }
+        } catch {
+          // Fall through to the gate's own no-campaign block.
+        }
+      }
       const gate = await runMetaTrackingGate(
         gateCreds,
-        campaign_id,
+        gateCampaignId,
         `${entity_type}_${action}`,
         overrideTrackingCheck,
         sessionId,
