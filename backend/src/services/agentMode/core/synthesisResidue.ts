@@ -679,28 +679,50 @@ export function detectFalseCompletionClaim(
  * Redundant when the model was already honest about it. That is the cheap direction to be wrong.
  */
 export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]): string | null {
-  const refused = new Set<string>();
-  const succeeded = new Set<string>();
+  const calls = toolCalls ?? [];
 
-  for (const call of toolCalls ?? []) {
-    const name = typeof call?.name === 'string' ? call.name : '';
-    if (!name) continue;
-    if (call?.error === undefined || call?.error === null) {
-      succeeded.add(name);
-      continue;
+  /*
+   * Index of the last SUCCESSFUL install_skills, or -1. Ordering matters: the gate error names
+   * install_skills as the remedy, so "tool gated, then installed, then the model moved on
+   * without re-running it" is the ORDINARY healthy path, not a missing capability. Firing on it
+   * would put a warning on routine turns, and a warning that shows up when nothing is wrong is
+   * one people learn to skip — exactly when it finally matters. The live case is distinguishable
+   * on a fact, not a guess: there the install was itself refused by subscription.
+   */
+  let lastInstallOk = -1;
+  calls.forEach((call, i) => {
+    if (call?.name === 'install_skills' && (call?.error === undefined || call?.error === null)) {
+      lastInstallOk = i;
     }
-    const err = call.error instanceof Error ? call.error : new Error(String(call.error));
-    if (classifyToolErrorClass(err) === 'tool_unavailable') refused.add(name);
+  });
+
+  const succeeded = new Set<string>();
+  for (const call of calls) {
+    const name = typeof call?.name === 'string' ? call.name : '';
+    if (name && (call?.error === undefined || call?.error === null)) succeeded.add(name);
   }
 
-  // A tool refused once and then installed and run is not an unavailable capability.
-  const unavailable = [...refused].filter((name) => !succeeded.has(name)).sort();
-  if (unavailable.length === 0) return null;
+  const unavailable = new Set<string>();
+  calls.forEach((call, i) => {
+    const name = typeof call?.name === 'string' ? call.name : '';
+    if (!name || call?.error === undefined || call?.error === null) return;
+    const err = call.error instanceof Error ? call.error : new Error(String(call.error));
+    if (classifyToolErrorClass(err) !== 'tool_unavailable') return;
+    // Ran successfully at some point in the turn — the capability is present.
+    if (succeeded.has(name)) return;
+    // A skill was installed AFTER this refusal, so the capability became obtainable and not
+    // re-running the tool was the model's choice, not a gap it papered over.
+    if (lastInstallOk > i) return;
+    unavailable.add(name);
+  });
 
-  const names = unavailable.map((n) => `\`${n}\``).join(', ');
+  if (unavailable.size === 0) return null;
+  const names = [...unavailable].sort();
+  const one = names.length === 1;
   return (
-    `⚠️ ${unavailable.length === 1 ? 'This capability was' : 'These capabilities were'} not available this turn and did not run: ${names}. ` +
-    `Anything below that would normally come from ${unavailable.length === 1 ? 'it' : 'them'} was not produced by ${unavailable.length === 1 ? 'that tool' : 'those tools'}.`
+    `⚠️ ${one ? 'This capability was' : 'These capabilities were'} not available this turn and did not run: ` +
+    `${names.map((n) => `\`${n}\``).join(', ')}. ` +
+    `Anything below that would normally come from ${one ? 'it' : 'them'} was not produced by ${one ? 'that tool' : 'those tools'}.`
   );
 }
 

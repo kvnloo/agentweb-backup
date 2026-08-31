@@ -39,6 +39,43 @@ describe('buildUnavailableCapabilityNotice', () => {
     expect(notice).toBeNull();
   });
 
+  it('says nothing when the gate was cleared by a successful install, even if the tool never ran', () => {
+    /*
+     * THE common healthy path, and the one this guard must not fire on: the gate error names
+     * install_skills as the remedy, so "tool gated -> skill installed -> model moved on without
+     * re-running that exact tool" is routine. Warning there would put a scary banner on ordinary
+     * turns, and a warning that appears when nothing is wrong is one people learn to skip —
+     * exactly when it finally matters.
+     */
+    const notice = buildUnavailableCapabilityNotice([
+      { name: 'audit_ad_utm_coverage', error: gateError('audit_ad_utm_coverage') },
+      { name: 'install_skills', result: { success: true } },
+      { name: 'call_meta_marketing_api', result: { success: true } },
+    ] as any);
+
+    expect(notice).toBeNull();
+  });
+
+  it('still fires when the install came BEFORE the refusal, not after it', () => {
+    // Installing some other skill earlier in the turn does not make this capability available.
+    const notice = buildUnavailableCapabilityNotice([
+      { name: 'install_skills', result: { success: true } },
+      { name: 'audit_ad_utm_coverage', error: gateError('audit_ad_utm_coverage') },
+    ] as any);
+
+    expect(notice).toContain('audit_ad_utm_coverage');
+  });
+
+  it('fires on the real trace: gate refusal followed by a FAILED install', () => {
+    const notice = buildUnavailableCapabilityNotice([
+      { name: 'audit_ad_utm_coverage', error: gateError('audit_ad_utm_coverage') },
+      { name: 'install_skills', error: 'The requested skills are not available with your current subscription.' },
+      { name: 'call_meta_marketing_api', result: { success: true } },
+    ] as any);
+
+    expect(notice).toContain('audit_ad_utm_coverage');
+  });
+
   it('says nothing on an ordinary turn', () => {
     expect(
       buildUnavailableCapabilityNotice([{ name: 'call_meta_marketing_api', result: { ok: true } }] as any),
