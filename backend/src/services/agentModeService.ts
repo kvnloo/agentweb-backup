@@ -35611,12 +35611,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
            * because the destructive argument here is the resource name.
            */
           const removalClaimed = args.confirm_conversion_action_removal === true;
-          const removalDigest = removalClaimed
-            ? computeTrackingOverrideDigest(getJwtSecret(), {
-                customer_id, entity_type, action,
-                conversion_action_resource_name: args.conversion_action_resource_name,
-              })
-            : '';
+          // Computed unconditionally, NOT only when the flag is claimed. The digest covers
+          // the call being disclosed, not the caller's intent to confirm — and the halt
+          // below has to hand back a usable token whether or not the flag was set. Gating
+          // it on the flag made the FIRST (unflagged) call disclose an empty string, which
+          // the model then replayed faithfully and was refused for, turning a two-step loop
+          // into three and making the token look broken. Issuing it here is not a weakening:
+          // the token is only ever returned alongside the disclosure of this exact resource
+          // name, which is what binds it.
+          const removalDigest = computeTrackingOverrideDigest(getJwtSecret(), {
+            customer_id, entity_type, action,
+            conversion_action_resource_name: args.conversion_action_resource_name,
+          });
           const removalApproved =
             removalClaimed && trackingOverrideTokenMatches(args.conversion_action_removal_token, removalDigest);
 
