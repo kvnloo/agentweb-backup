@@ -1,6 +1,6 @@
 import { isPublishName } from './hardeningGaps';
 import { resolvePublishAuthorized, SchedulePublishApprovalInput } from './schedulePublishApproval';
-import { EQUIVALENT_PUBLISH_ROUTES, normalizeAction } from './requiredCallSatisfaction';
+import { EQUIVALENT_PUBLISH_ROUTES, normalizeAction, normalizePlatform } from './requiredCallSatisfaction';
 
 /**
  * ENG-827 — resolving the unattended publish gate.
@@ -383,9 +383,22 @@ export function isPublishCallWithinAuthorizedScope(
 ): boolean {
   if (tools.includes(toolName)) return true;
   const action = normalizeAction(args?.action);
+  const platform = normalizePlatform(args?.platform);
+  // postOnConnectedAccount resolves the target account by `account_id` FIRST and
+  // ignores `platform` entirely whenever `account_id` is present (agentModeService.ts) —
+  // so `args.platform` only actually describes the account being posted to when no
+  // `account_id` is given. Trusting a caller-supplied `platform` alongside a
+  // caller-supplied `account_id` would let a mismatched account_id (e.g. a LinkedIn
+  // account) pass a platform-scoped grant by simply claiming platform:'twitter'. Like
+  // every other ambiguous case in this module, that fails closed rather than guessing.
+  const hasAccountId = args?.account_id !== undefined && args?.account_id !== null && args?.account_id !== '';
   return tools.some((required) => {
     const routes = EQUIVALENT_PUBLISH_ROUTES[required];
     if (!routes) return false;
-    return routes.some((route) => route.tool === toolName && (!route.actions || route.actions.includes(action)));
+    return routes.some((route) =>
+      route.tool === toolName &&
+      (!route.actions || route.actions.includes(action)) &&
+      (!route.platforms || (!hasAccountId && route.platforms.includes(platform)))
+    );
   });
 }

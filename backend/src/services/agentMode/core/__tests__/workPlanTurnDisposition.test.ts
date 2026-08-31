@@ -1,5 +1,6 @@
 import {
   decideWorkPlanTurnDisposition,
+  priorTurnNeedsWorkPlanDispositionRetry,
   snapshotWorkPlanTurn,
 } from '../workPlanTurnDisposition';
 
@@ -86,5 +87,50 @@ describe('workplan turn disposition', () => {
       pendingWorkPlanInput: { requestId: 42, status: 'awaiting' },
       pendingUserQuestion: { questionId: ['q-1'], status: 'awaiting' },
     })).toEqual({ hasWorkPlan: true, pendingStepCount: 2 });
+  });
+});
+
+// ENG-1626: a decision-card creation that fails twice (the in-turn retry above
+// already exhausted) leaves the customer with a canned "please retry" message
+// and no automatic way forward. The controller uses this predicate to
+// re-enforce the disposition check on the customer's NEXT turn, no matter what
+// they type, instead of requiring the literal phrase "retry creating the card".
+describe('priorTurnNeedsWorkPlanDispositionRetry', () => {
+  it('is true for an assistant message flagged retryable after disposition recovery failed', () => {
+    expect(priorTurnNeedsWorkPlanDispositionRetry({
+      role: 'assistant',
+      content: 'I couldn’t create the decision card needed to continue this step. Please retry.',
+      metadata: { workPlanDispositionFailure: { code: 'WORKPLAN_TURN_MISSING_DISPOSITION', retryable: true } },
+    })).toBe(true);
+  });
+
+  it('is false for a normal assistant message with no disposition failure', () => {
+    expect(priorTurnNeedsWorkPlanDispositionRetry({
+      role: 'assistant',
+      content: 'Step 3 is complete.',
+      metadata: { timestamp: '2026-08-27T17:18:00.000Z' },
+    })).toBe(false);
+  });
+
+  it('is false for a user message even if it happens to carry the same metadata shape', () => {
+    expect(priorTurnNeedsWorkPlanDispositionRetry({
+      role: 'user',
+      content: 'retry',
+      metadata: { workPlanDispositionFailure: { code: 'WORKPLAN_TURN_MISSING_DISPOSITION', retryable: true } },
+    })).toBe(false);
+  });
+
+  it('is false when retryable is explicitly false', () => {
+    expect(priorTurnNeedsWorkPlanDispositionRetry({
+      role: 'assistant',
+      metadata: { workPlanDispositionFailure: { code: 'WORKPLAN_TURN_MISSING_DISPOSITION', retryable: false } },
+    })).toBe(false);
+  });
+
+  it('is false for undefined/null/malformed input', () => {
+    expect(priorTurnNeedsWorkPlanDispositionRetry(undefined)).toBe(false);
+    expect(priorTurnNeedsWorkPlanDispositionRetry(null)).toBe(false);
+    expect(priorTurnNeedsWorkPlanDispositionRetry('not an object')).toBe(false);
+    expect(priorTurnNeedsWorkPlanDispositionRetry({ role: 'assistant' })).toBe(false);
   });
 });
