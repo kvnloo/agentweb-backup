@@ -58,6 +58,7 @@ import googleAdsAuthRoutes from "./routes/googleAdsAuth";
 import fathomAuthRoutes from "./routes/fathomAuth";
 import fathomWebhookRoutes from "./routes/fathomWebhook";
 import calendlyWebhookRoutes from "./routes/calendlyWebhook";
+import unipileWebhookRoutes from "./routes/unipileWebhook";
 // ENG-926 §C: registers the CRM -> Meta conversion relay's queue processor at boot. The
 // poller leaves a job claimed-but-unprocessed when no processor is registered for its
 // source, so this cannot be deferred to the first status transition of a process's life —
@@ -326,6 +327,7 @@ app.use("/api/image-models", imageModelsRoutes);
 app.use("/api/webhooks", webhookRoutes);
 app.use("/api/webhooks/fathom", fathomWebhookRoutes);
 app.use("/api/webhooks/calendly", calendlyWebhookRoutes);
+app.use("/api/webhooks/unipile", unipileWebhookRoutes);
 registerConversionRelayProcessor();
 app.use("/api", devEnvRoutes);
 app.use("/api/benchmark", benchmarkRoutes);

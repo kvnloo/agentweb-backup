@@ -77,7 +77,7 @@ const isInviteReconcileEnabled = (): boolean => process.env.LINKEDIN_INVITE_CRM_
  * to no single customer, so nothing that writes into a customer's CRM may act on
  * them.
  */
-async function getAllUnipileAccountIds(): Promise<{
+export async function getAllUnipileAccountIds(): Promise<{
   ids: string[];
   ownerByAccountId: Map<string, string>;
 }> {
