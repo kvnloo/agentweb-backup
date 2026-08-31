@@ -1129,7 +1129,9 @@ eb_budget_records() {
 
 # The script's own default, read rather than hardcoded: raising it there instead
 # of in the workflow is an equally valid fix and must keep this suite green.
-DEFAULT_SETTLE=$(sed -n 's/^EB_SETTLE_TIMEOUT_SECONDS="\${EB_SETTLE_TIMEOUT_SECONDS:-\([0-9]*\)}"/\1/p' "${EB_DEPLOY_SCRIPT}")
+DEFAULT_SETTLE=$(grep -m1 '^EB_SETTLE_TIMEOUT_SECONDS=' "${EB_DEPLOY_SCRIPT}")
+DEFAULT_SETTLE="${DEFAULT_SETTLE##*:-}"   # ...:-600}"  ->  600}"
+DEFAULT_SETTLE="${DEFAULT_SETTLE%%\}*}"   # 600}"       ->  600
 
 # EB's command Timeout on the Immutable environment. Waiting less than this
 # means failing a deploy while EB still considers the in-flight command live.
