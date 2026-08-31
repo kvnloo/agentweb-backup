@@ -350,6 +350,32 @@ describe('CRM Group Email Endpoints', () => {
 
       expect(mockRes.status).toHaveBeenCalledWith(400);
     });
+
+    it('ENG-1194: excludes malformed and provider-disallowed test-domain rows from eligibleCount/readyCount', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        listId: 'list-1',
+        userId: 'test-user-id',
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'valid@agentweb.pro' },
+          { leadId: '2', email: 'queue-verify@example.com' }, // provider-disallowed test domain
+          { leadId: '3', email: 'noTld@updates' }, // missing/invalid domain
+          { leadId: '4', email: 'harsha..v@agentweb.pro' }, // repeated-dot local part
+        ],
+        lastEvaluatedKey: undefined,
+      });
+
+      mockReq.body = { subject: 'Hello', htmlContent: '<p>No variables here</p>' };
+
+      const handler = findHandler('/lists/:listId/group-email/prepare', 'post');
+      await handler!(mockReq, mockRes);
+
+      const result = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(result.eligibleCount).toBe(1);
+      expect(result.readyCount).toBe(1);
+      expect(result.notReadyCount).toBe(0);
+    });
   });
 
   describe('POST /lists/:listId/group-email/send', () => {
