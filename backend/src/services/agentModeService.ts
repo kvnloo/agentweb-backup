@@ -1251,8 +1251,10 @@ export class AgentModeService {
   // success is captured without depending on the model calling the cookie tools).
   private browserCookieAutoState = createAutoPersistState();
   // ENG-1624: cached so a sub-folder-access error can name the service account
-  // to share with, without re-fetching the secret on every failure.
-  private driveServiceAccountCredentials: { client_email?: string } | null = null;
+  // to share with, without re-fetching the secret on every failure. Only the
+  // email is kept — the private key must never outlive the local
+  // getGoogleDriveClient() call that parses the secret.
+  private driveServiceAccountEmail: string | null = null;
   private toolRegistry: ToolRegistry;
   private mcpClientService: McpClientService;
   private static toolsRegistered: boolean = false;
@@ -21576,7 +21578,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production' ? 'prod/AgentWeb/Google/Share' : 'dev/AgentWeb/Google/Share';
     const credentials = JSON.parse(await getSecret(secretName));
-    this.driveServiceAccountCredentials = credentials;
+    this.driveServiceAccountEmail = credentials.client_email || null;
     const auth = new google.auth.GoogleAuth({
       credentials,
       scopes: ['https://www.googleapis.com/auth/drive.readonly'],
@@ -21585,7 +21587,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   private getGoogleDriveServiceAccountEmail(): string {
-    return this.driveServiceAccountCredentials?.client_email || 'the AgentWeb Google Drive service account';
+    return this.driveServiceAccountEmail || 'the AgentWeb Google Drive service account';
   }
 
   // ENG-1624: a registered gdrive: KB folder is authorized by its root ID only, but
@@ -21727,8 +21729,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const folders = await this.getUserGoogleDriveFolders(userId);
           if (folders.length > 0) {
             const drive = await this.getGoogleDriveClient();
-            // Build query: search across all shared folders
-            const parentClauses = folders.map(f => `'${f.folderId}' in parents`).join(' or ');
+            // Walk each registered root's whole folder tree (ENG-1624) so search
+            // covers files nested in sub-folders too, not just direct children.
+            const folderTrees = await Promise.all(
+              folders.map(f => this.getGoogleDriveFolderTreeIds(drive, f.folderId))
+            );
+            const allFolderIds = folderTrees.flatMap(t => t.folderIds);
+            const parentClauses = allFolderIds.map(id => `'${id}' in parents`).join(' or ');
             const driveResponse = await drive.files.list({
               q: `(${parentClauses}) and fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
               fields: 'files(id, name, mimeType, parents)',
@@ -22178,7 +22185,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // Walk the whole folder tree (ENG-1624): a registered folder is
               // authorized by its root ID, so its listing should include files
               // nested in sub-folders too, not just direct children.
-              const { folderIds } = await this.getGoogleDriveFolderTreeIds(drive, folder.folderId);
+              const { folderIds, restricted } = await this.getGoogleDriveFolderTreeIds(drive, folder.folderId);
               const parentClauses = folderIds.map(id => `'${id}' in parents`).join(' or ');
               // Exclude folder entries themselves — previously these showed up as
               // 0-byte files instead of being descended into.
@@ -22221,6 +22228,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 hasMore: driveOffset + driveLimit < totalMatchingFiles,
                 offset: driveOffset,
                 limit: driveLimit,
+                // ENG-1624: a sub-folder that couldn't be listed (e.g. an unshared
+                // shortcut target) previously shrank the listing with no signal to
+                // the caller. Name it so the caller can request access instead of
+                // silently seeing an incomplete file list.
+                ...(restricted.length > 0 && { inaccessibleFolders: restricted.map(r => r.name) }),
               });
             } catch (folderErr) {
               console.log(`AgentMode: Error listing files in Drive folder ${folder.name}:`, folderErr);
