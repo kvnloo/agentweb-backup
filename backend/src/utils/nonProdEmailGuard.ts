@@ -31,8 +31,26 @@
 
 const DEFAULT_ALLOWLIST = ['@example.com'];
 
-/** Marks a suppressed send in audit rows. Never a real provider id. */
+/** Marks a suppressed send. Never a real provider id. */
 export const SUPPRESSED_MESSAGE_ID = 'nonprod-suppressed';
+
+/**
+ * Whether a send result came from the guard rather than the provider.
+ *
+ * The distinction has to survive all the way to the audit layer. A suppressed
+ * send resolves with a string `id` so that `sendEmailStrict`'s "no messageId"
+ * check does not misread it as a provider failure — but a string id is exactly
+ * what every delivery-status consumer treats as proof of delivery. Without this
+ * predicate a blocked message is recorded as delivered, which is a worse
+ * failure than the one the guard prevents.
+ */
+export function isSuppressedSendResult(result: unknown): boolean {
+  return (
+    typeof result === 'object' &&
+    result !== null &&
+    (result as { id?: unknown }).id === SUPPRESSED_MESSAGE_ID
+  );
+}
 
 export function isNonProdEmailGuardActive(env: NodeJS.ProcessEnv = process.env): boolean {
   if (env.NODE_ENV === 'production') return false;
