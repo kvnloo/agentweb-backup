@@ -31,6 +31,20 @@ export function describeScope(scope: MetaListScope | undefined, opts: { campaign
  * A truncated list states its incompleteness in PROSE, not only in a boolean field, because a
  * field is easy to skip and the failure mode being prevented is a confident "it does not exist".
  */
+/**
+ * What a truncated list must warn the reader not to conclude — "an ad"/"a creative" for the
+ * two edges this originally shipped for, widened for ENG-1625's follow-up (campaigns, ad
+ * sets, custom audiences, pixels) rather than falling back to a generic, less pointed phrase.
+ */
+function absentNounFor(noun: string): string {
+  if (noun.startsWith('ad creative')) return 'a creative';
+  if (noun.startsWith('ad set')) return 'an ad set';
+  if (noun.startsWith('campaign')) return 'a campaign';
+  if (noun.startsWith('custom audience')) return 'a custom audience';
+  if (noun.startsWith('pixel')) return 'a pixel';
+  return 'an ad';
+}
+
 export function buildListMessage(args: {
   noun: string;
   totalCount: number;
@@ -42,7 +56,7 @@ export function buildListMessage(args: {
   if (args.truncated) {
     return (
       `Found ${args.totalCount} ${args.noun}${where}, but THIS LIST IS INCOMPLETE — Meta had more ` +
-      `results and the read stopped at its bound. Do NOT conclude ${args.noun.startsWith('ad creative') ? 'a creative' : 'an ad'} ` +
+      `results and the read stopped at its bound. Do NOT conclude ${absentNounFor(args.noun)} ` +
       `is absent from this list. Narrow the request with campaign_id or ad_set_id and ask again.`
     );
   }
@@ -77,7 +91,7 @@ export function describeIgnoredCampaignScope(campaignId: string): string {
  * quietly appending a field behind that cut.
  */
 export function buildListResult(args: {
-  payloadKey: 'ads' | 'creatives';
+  payloadKey: 'ads' | 'creatives' | 'campaigns' | 'adSets' | 'audiences' | 'pixels';
   payload: any[];
   message: string;
   truncated?: boolean;

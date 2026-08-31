@@ -50,6 +50,7 @@ If a production bug happens:
 | Integration | Contract | Status | Notes |
 | --- | --- | --- | --- |
 | Meta Ads / Facebook Marketing API | [meta-ads-contract.md](./meta-ads-contract.md) | Filled | Highest priority. Many shipped bugs came from payload shape, account resolution, and creative semantics. |
+| Google Ads — launch gate & conversion tags | [google-ads-launch-gate-contract.md](./google-ads-launch-gate-contract.md) | Filled | RULE 7.5 pre-flight gate, tag injection, bid-target and approval-binding contracts. Every failure mode here is silent. |
 | PR research index | [pr-research-index.md](./pr-research-index.md) | Filled | Traceability from shipped integration PRs to contract rules. |
 | Other integrations | [external-integrations-map.md](./external-integrations-map.md) | Map only | Source files and risks are identified; full contracts should be added as those areas are touched. |
 
