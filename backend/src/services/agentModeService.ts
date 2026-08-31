@@ -6027,6 +6027,33 @@ export class AgentModeService {
         confirmationPrompt: result.confirmationPrompt,
         confirmationDetail: result.confirmationDetail,
         summary: result.summary,
+        /*
+         * ENG-1526 / ENG-1322. Approval tokens have to survive the minimizer.
+         *
+         * A halt that withholds its own token is a dead end, not a loop. Both gates tell
+         * the model to replay the call "with the token exactly as returned here" — and
+         * this minimizer dropped it, because everything it does not name is discarded.
+         * So the model was handed an instruction it could not follow: the override could
+         * never be applied and the removal could never be completed, no matter how many
+         * times a user approved.
+         *
+         * It failed CLOSED, which is why nothing unsafe happened and why it went unnoticed
+         * — the tracking gate simply kept blocking. But ENG-1526's own claim that "the
+         * path is a loop, not a dead end" was not true in production, and a recovery path
+         * people cannot complete is one they route around.
+         *
+         * Found by driving the real agent, not the handler: handler-level tests call the
+         * dispatcher directly and never reach this function, so they proved the tokens
+         * were ISSUED while saying nothing about whether they were DELIVERED.
+         *
+         * Named explicitly rather than pattern-matched on `_token`: these two exist to be
+         * replayed by the caller, and a blanket rule would eventually relay a field that
+         * does not.
+         */
+        ...(result.tracking_override_token
+          ? { tracking_override_token: result.tracking_override_token } : {}),
+        ...(result.conversion_action_removal_token
+          ? { conversion_action_removal_token: result.conversion_action_removal_token } : {}),
       };
       // ENG-396: also preserve the structured AskUserQuestion payload so the chat
       // card can render its options and the frontend can post back a structured
