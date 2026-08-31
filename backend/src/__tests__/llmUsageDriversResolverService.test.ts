@@ -1242,6 +1242,60 @@ describe("ENG-1533 — `switchable` reflects this caller's real authority", () =
     expect(scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED)!.switchable).toBe(true);
   });
 
+  it("answers BOTH rows independently in ONE payload — own switchable, colleague's not", async () => {
+    // The case AC1-AC4 actually describe: a plain member reading a list that
+    // mixes their own work with a colleague's.
+    //
+    // Every other case in this block puts exactly ONE owner in play, which
+    // cannot distinguish a per-row authority lookup from a collapsed one —
+    // with a single owner both produce the same answer. Mutation-verified:
+    // replacing the per-owner lookup with one collapsed value,
+    //
+    //   switchable: meta ? ([...authorityByOwner.values()][0] ?? false) : false
+    //
+    // passes all six other cases here and fails only this one. That is a
+    // realistic regression — it is what "look the answer up once" refactors
+    // into — and without both answers side by side nothing would catch it.
+    const MY_SCHED = "sched-mine";
+    orgOf("member");
+    mockSchedules.mockImplementation(async (id: string) => {
+      if (id === "member-a") {
+        return [{ scheduleId: MY_SCHED, scheduleName: "My own scan", frequency: "daily" }];
+      }
+      if (id === "colleague") {
+        return [{ scheduleId: COLLEAGUE_SCHED, scheduleName: "Colleague's daily scan", frequency: "daily" }];
+      }
+      return [];
+    });
+    const spendOn = (scheduleId: string) => ({
+      userId: "billing-root",
+      sk: `2026-08-05#${OPUS}#agent_task:scheduled:${scheduleId}`,
+      date: "2026-08-05",
+      model: OPUS,
+      feature: `agent_task:scheduled:${scheduleId}`,
+      inputTokens: 500_000,
+      outputTokens: 100_000,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costMicroUsd: 20 * USD,
+      callCount: 8,
+      billingUserId: "billing-root",
+    });
+    mockQuery.mockResolvedValue([...opusLedger(), spendOn(COLLEAGUE_SCHED), spendOn(MY_SCHED)]);
+
+    const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+    const mine = scheduleDrivers.find((d) => d.scheduleId === MY_SCHED);
+    const theirs = scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED);
+
+    // Both rows are present: the member sees all pooled spend either way.
+    expect(mine).toBeDefined();
+    expect(theirs).toBeDefined();
+
+    // And the two authority answers differ within that one response.
+    expect(mine!.switchable).toBe(true);
+    expect(theirs!.switchable).toBe(false);
+  });
+
   it("marks a DELETED schedule unswitchable — no one can act on it, so no authority question arises", async () => {
     orgOf("admin");
     mockSchedules.mockResolvedValue([]);
