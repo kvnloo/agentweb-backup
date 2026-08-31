@@ -1,6 +1,7 @@
 import {
   attemptSessionScore,
   scoreSessionIfNeeded,
+  scoreSessionWithJudge,
   MAX_TRANSCRIPT_CHARS_FOR_SCORING,
   TRANSCRIPT_TRUNCATION_MARKER,
   scoringTimeoutMs,
@@ -72,6 +73,83 @@ function bigScheduledSession(turnChars: number, turns = 20) {
     messages,
   } as any;
 }
+
+/**
+ * Same shape as bigScheduledSession, but turn 0's assistant message carries a
+ * tool call — far enough back that it falls both outside the last-50-message
+ * scoring window (recentMessages) AND outside the truncated transcript's
+ * surviving head/tail once capped. Only the ENG-1223 tool-call manifest
+ * (built from the FULL, uncapped message list) can still see it.
+ */
+function bigScheduledSessionWithEarlyToolCall(turnChars: number, turns = 30) {
+  const session = bigScheduledSession(turnChars, turns);
+  // Turn 0's assistant message is messages[2] (system, turn0-user, turn0-assistant, ...).
+  session.messages[2] = {
+    ...session.messages[2],
+    tool_calls: [{ id: 'call_1', function: { name: 'search_leads' } }],
+  };
+  return session;
+}
+
+/**
+ * ENG-929 follow-up (hand-merge regression guard): scoreSession and
+ * scoreSessionWithJudge each independently compose conversationText from the
+ * ENG-1223 tool-call manifest (built from the FULL session) and this
+ * ticket's capped transcript (built from the windowed/truncated one). A
+ * future merge that silently drops either piece from either function would
+ * reintroduce a real, already-shipped bug: dropping the manifest
+ * reintroduces ENG-1223's fabrication-grounding gap; dropping the cap
+ * reintroduces this ticket's unbounded-timeout bug. Neither function shares
+ * code with the other, so each needs its own guard.
+ */
+describe('ENG-929 — manifest + transcript cap compose correctly (regression guard)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockCallLLM.mockResolvedValue(llmOk());
+  });
+
+  it('scoreSession: keeps the tool-call manifest AND the truncation marker together', async () => {
+    const session = bigScheduledSessionWithEarlyToolCall(5000, 30);
+
+    await scoreSessionIfNeeded(session);
+
+    const userTurn = (mockCallLLM.mock.calls[0][1] as any[]).find((m) => m.role === 'user');
+    // Manifest survives even though turn 0 (where the tool call lives) is
+    // outside both the 50-message window and the truncated transcript.
+    expect(userTurn.content).toContain('[TOOL CALL MANIFEST:');
+    expect(userTurn.content).toContain('search_leads');
+    // The size cap still applies — the manifest doesn't exempt the transcript.
+    expect(userTurn.content).toContain(TRANSCRIPT_TRUNCATION_MARKER);
+    // Manifest precedes the transcript, matching sessionScoringService's
+    // `${manifest.text}\n\n${capped.text}` composition.
+    expect(userTurn.content.indexOf('[TOOL CALL MANIFEST:')).toBeLessThan(
+      userTurn.content.indexOf(TRANSCRIPT_TRUNCATION_MARKER)
+    );
+  });
+
+  it('scoreSessionWithJudge: keeps the tool-call manifest AND the truncation marker together', async () => {
+    const session = bigScheduledSessionWithEarlyToolCall(5000, 30);
+    const judge = {
+      id: 'judge-1',
+      name: 'Test Judge',
+      systemPrompt: 'You are a test judge.',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    };
+
+    await scoreSessionWithJudge(session.messages, session.messageCount, judge, session.sessionType, {
+      sessionId: session.sessionId,
+    });
+
+    const userTurn = (mockCallLLM.mock.calls[0][1] as any[]).find((m) => m.role === 'user');
+    expect(userTurn.content).toContain('[TOOL CALL MANIFEST:');
+    expect(userTurn.content).toContain('search_leads');
+    expect(userTurn.content).toContain(TRANSCRIPT_TRUNCATION_MARKER);
+    expect(userTurn.content.indexOf('[TOOL CALL MANIFEST:')).toBeLessThan(
+      userTurn.content.indexOf(TRANSCRIPT_TRUNCATION_MARKER)
+    );
+  });
+});
 
 describe('ENG-929 — long transcripts must still be scorable', () => {
   beforeEach(() => {
