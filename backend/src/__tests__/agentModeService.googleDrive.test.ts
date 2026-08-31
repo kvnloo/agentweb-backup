@@ -1211,6 +1211,42 @@ describe('AgentModeService - Google Drive methods', () => {
         expect(mockDriveFiles.get).not.toHaveBeenCalled();
       });
 
+      it('still makes exactly one files.list call per batch at target=2, and still reports ambiguity (round-2 rework)', async () => {
+        const SUB_A = 'ratio-4x5';
+        const SUB_B = 'ratio-9x16';
+        let nameQueryCalls = 0;
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            if (q.includes(`'${ROOT}' in parents`)) {
+              return Promise.resolve({ data: { files: [{ id: SUB_A, name: '4x5' }, { id: SUB_B, name: '9x16' }] } });
+            }
+            return Promise.resolve({ data: { files: [] } });
+          }
+          if (q.includes("name = 'dup.png'")) {
+            nameQueryCalls++;
+            return Promise.resolve({
+              data: {
+                files: [
+                  { id: 'file-a', name: 'dup.png', mimeType: 'image/png', size: '10', parents: [SUB_A] },
+                  { id: 'file-b', name: 'dup.png', mimeType: 'image/png', size: '10', parents: [SUB_B] },
+                ],
+              },
+            });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'dup.png', USER_ID);
+
+        // folderIds = [ROOT, SUB_A, SUB_B] — 3 ids, one batch — so the in-batch
+        // pagination added for the totalFiles/hasMore fix must not turn this
+        // into more than one call: 2 matches at a target of 2 means the batch
+        // is genuinely done after the first page (no nextPageToken to follow).
+        expect(nameQueryCalls).toBe(1);
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/multiple/i);
+      });
+
       it('flags an incomplete scan — and does not claim absence — when a tree exceeds the folder cap', async () => {
         let depth = 0;
         mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
@@ -1368,6 +1404,143 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(gdriveKb.totalFiles).toBe(3);
       expect(gdriveKb.files.map((f: any) => f.fileName).sort()).toEqual(['a.png', 'b.png', 'c.png']);
       expect(gdriveKb.offset).toBe(0);
+    });
+
+    // ── Rework findings, round 2 (per-batch single-page cap) ───────────────────
+    //
+    // queryDriveFilesAcrossFolders fetched exactly one page per batch and never
+    // requested nextPageToken, so a batch holding more matches than that one page
+    // silently dropped the rest: totalFiles/hasMore could both read "complete"
+    // while most of the tree was missing. Fixed by pursuing a per-batch target
+    // via in-batch pagination; `files` was already correct (top-K-per-batch is a
+    // safe superset of the true top-K), only totalFiles/hasMore needed fixing.
+
+    it('follows nextPageToken within a batch when a full page indicates more results exist', async () => {
+      const PAGE1 = { id: 'file-p1', name: 'p1.png', mimeType: 'image/png', size: '10', modifiedTime: '2026-08-01T00:00:00Z' };
+      const PAGE2 = { id: 'file-p2', name: 'p2.png', mimeType: 'image/png', size: '10', modifiedTime: '2026-08-02T00:00:00Z' };
+      let finalCallCount = 0;
+      mockDriveFiles.list.mockImplementation(({ q, pageToken }: { q: string; pageToken?: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        finalCallCount++;
+        if (!pageToken) {
+          return Promise.resolve({ data: { files: [PAGE1], nextPageToken: 'tok-1' } });
+        }
+        return Promise.resolve({ data: { files: [PAGE2] } });
+      });
+
+      // limit: 2 → per-batch target = offset(0) + limit(2) + 1 = 3, so a 1-item
+      // first page with a token isn't yet at target and must be followed.
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive', limit: 2, offset: 0 });
+      const gdriveKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${ROOT}`);
+
+      expect(finalCallCount).toBe(2);
+      expect(gdriveKb.files.map((f: any) => f.fileName).sort()).toEqual(['p1.png', 'p2.png']);
+    });
+
+    it('reports hasMore=true when more than one page of matches exists (was silently false under the old single-page fetch)', async () => {
+      const FILES = Array.from({ length: 101 }, (_, i) => ({
+        id: `file-${i}`,
+        name: `file-${i}.png`,
+        mimeType: 'image/png',
+        size: '10',
+        modifiedTime: '2026-08-01T00:00:00Z',
+      }));
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        // Exactly 101 matches, no nextPageToken — genuinely exhaustive, and
+        // exceeds the default limit of 100.
+        return Promise.resolve({ data: { files: FILES } });
+      });
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+      const gdriveKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${ROOT}`);
+
+      expect(gdriveKb.hasMore).toBe(true);
+      expect(gdriveKb.files.length).toBe(100);
+      // Genuinely exhaustive (no token seen) — an exact total, not a lower bound.
+      expect(gdriveKb.totalFiles).toBe(101);
+      expect(gdriveKb.totalFilesIsLowerBound).toBeUndefined();
+    });
+
+    it('flags totalFiles as a lower bound — in both the field and the message — when the file query hits its per-batch target', async () => {
+      const FILES = Array.from({ length: 101 }, (_, i) => ({
+        id: `file-${i}`,
+        name: `file-${i}.png`,
+        mimeType: 'image/png',
+        size: '10',
+        modifiedTime: '2026-08-01T00:00:00Z',
+      }));
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        // 101 matches AND a token — the fetch stopped at its target with more
+        // genuinely available.
+        return Promise.resolve({ data: { files: FILES, nextPageToken: 'more-beyond' } });
+      });
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+      const gdriveKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${ROOT}`);
+
+      expect(gdriveKb.totalFilesIsLowerBound).toBe(true);
+      expect(gdriveKb.hasMore).toBe(true);
+      // The model reads prose, not just structured fields.
+      expect(result.totalFilesIsLowerBound).toBe(true);
+      expect(result.message).toMatch(/lower bound/i);
+    });
+
+    it('reports an exact total and no lower-bound marker when the true count is below the limit', async () => {
+      const FILES = [
+        { id: 'file-1', name: 'a.png', mimeType: 'image/png', size: '10', modifiedTime: '2026-08-01T00:00:00Z' },
+        { id: 'file-2', name: 'b.png', mimeType: 'image/png', size: '10', modifiedTime: '2026-08-02T00:00:00Z' },
+      ];
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        return Promise.resolve({ data: { files: FILES } }); // no nextPageToken — genuine exhaustion
+      });
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+      const gdriveKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${ROOT}`);
+
+      expect(gdriveKb.totalFiles).toBe(2);
+      expect(gdriveKb.hasMore).toBe(false);
+      expect(gdriveKb.totalFilesIsLowerBound).toBeUndefined();
+      expect(result.totalFilesIsLowerBound).toBeUndefined();
+      expect(result.message).not.toMatch(/lower bound/i);
+    });
+
+    it('stops pagination at the per-batch target instead of draining an enormous folder', async () => {
+      let callCount = 0;
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        callCount++;
+        // Drive keeps claiming there's more, 10 items at a time — an enormous
+        // (or pathological) folder. The walk must not drain it.
+        const files = Array.from({ length: 10 }, (_, i) => ({
+          id: `file-${callCount}-${i}`,
+          name: `f-${callCount}-${i}.png`,
+          mimeType: 'image/png',
+          size: '10',
+          modifiedTime: '2026-08-01T00:00:00Z',
+        }));
+        return Promise.resolve({ data: { files, nextPageToken: `tok-${callCount}` } });
+      });
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+      const gdriveKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${ROOT}`);
+
+      // Bounded — a handful of pages to reach the (offset+limit+1) target, not an
+      // unbounded/runaway fetch.
+      expect(callCount).toBeLessThanOrEqual(15);
+      expect(gdriveKb.totalFilesIsLowerBound).toBe(true);
     });
   });
 
