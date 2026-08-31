@@ -75,7 +75,11 @@ describe('AgentModeService - Meta Datasets (Match Quality)', () => {
       ];
 
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-      (metaService.listPixels as jest.Mock).mockResolvedValue(mockPixels);
+      (metaService.listPixels as jest.Mock).mockResolvedValue({
+        pixels: mockPixels,
+        truncated: false,
+        pagesFetched: 1,
+      });
 
       const result = await agentModeService.callMetaMarketingApi(
         'user123', 'DATASET', 'LIST', '123456789'
@@ -100,7 +104,7 @@ describe('AgentModeService - Meta Datasets (Match Quality)', () => {
 
     it('AC2: returns an empty list for an account with zero pixels, not an error', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-      (metaService.listPixels as jest.Mock).mockResolvedValue([]);
+      (metaService.listPixels as jest.Mock).mockResolvedValue({ pixels: [], truncated: false, pagesFetched: 1 });
 
       const result = await agentModeService.callMetaMarketingApi(
         'user123', 'DATASET', 'LIST', '123456789'
@@ -113,10 +117,14 @@ describe('AgentModeService - Meta Datasets (Match Quality)', () => {
 
     it('ENG-399 regression: never calls the dead per-pixel /datasets edge', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-      (metaService.listPixels as jest.Mock).mockResolvedValue([
-        { id: 'pixel_001', name: 'My Pixel' },
-        { id: 'pixel_002', name: 'Second Pixel' }
-      ]);
+      (metaService.listPixels as jest.Mock).mockResolvedValue({
+        pixels: [
+          { id: 'pixel_001', name: 'My Pixel' },
+          { id: 'pixel_002', name: 'Second Pixel' }
+        ],
+        truncated: false,
+        pagesFetched: 1,
+      });
 
       const result = await agentModeService.callMetaMarketingApi(
         'user123', 'DATASET', 'LIST', '123456789'
@@ -130,7 +138,11 @@ describe('AgentModeService - Meta Datasets (Match Quality)', () => {
 
     it('ENG-399 production repro: LIST succeeds even though the /datasets edge throws Meta #100', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-      (metaService.listPixels as jest.Mock).mockResolvedValue([{ id: 'pixel_001', name: 'My Pixel' }]);
+      (metaService.listPixels as jest.Mock).mockResolvedValue({
+        pixels: [{ id: 'pixel_001', name: 'My Pixel' }],
+        truncated: false,
+        pagesFetched: 1,
+      });
       // Exactly what Graph v25 returns for the removed edge, and what metaService.handleError
       // rethrows. Before the fix this rejection propagated and failed the entire LIST.
       (metaService as any).listDatasets.mockRejectedValue(
@@ -330,9 +342,11 @@ describe('AgentModeService - Meta Datasets (Match Quality)', () => {
 
     it('AC3: accepts a dataset_id taken straight from the fixed LIST output', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-      (metaService.listPixels as jest.Mock).mockResolvedValue([
-        { id: 'pixel_001', name: 'My Pixel', last_fired_time: '2026-07-19T10:00:00+0000' }
-      ]);
+      (metaService.listPixels as jest.Mock).mockResolvedValue({
+        pixels: [{ id: 'pixel_001', name: 'My Pixel', last_fired_time: '2026-07-19T10:00:00+0000' }],
+        truncated: false,
+        pagesFetched: 1,
+      });
 
       const listResult = await agentModeService.callMetaMarketingApi(
         'user123', 'DATASET', 'LIST', '123456789'

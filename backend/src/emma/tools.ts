@@ -6588,7 +6588,7 @@ emmaToolRegistry.register({
         content: {
           type: 'string',
           maxLength: 2000,
-          description: 'The fact to remember (max 2000 chars). Be specific and actionable.'
+          description: 'The fact to remember. Be specific and actionable. HARD LIMIT 2000 characters — content over it is REJECTED, not truncated. If you have more to record, split it into several save_memory calls of at most 2000 characters each rather than re-sending the same oversized text, which fails identically every time (ENG-908).'
         },
         category: {
           type: 'string',
@@ -6666,7 +6666,7 @@ emmaToolRegistry.register({
         content: {
           type: 'string',
           maxLength: 2000,
-          description: 'The org-wide fact to remember (max 2000 chars). Be specific and actionable.'
+          description: 'The org-wide fact to remember. Be specific and actionable. HARD LIMIT 2000 characters — content over it is REJECTED, not truncated. If you have more to record, split it into several save_org_memory calls of at most 2000 characters each rather than re-sending the same oversized text, which fails identically every time (ENG-831).'
         },
         category: {
           type: 'string',
@@ -8838,14 +8838,14 @@ ACTION MATRIX:
     order_id should be the SAME eventId the browser sent as transaction_id — Google dedupes the pair, which is what stops one lead counting twice across the two channels.
     A conversion_value REQUIRES a currency_code; without one Google assumes the account currency and misstates revenue.
     validate_only=true asks Google to check the payload and write nothing. Use it to rehearse a batch before committing it.
-  CONVERSION_ACTION → LIST, CREATE (name, category, counting_type; status?, primary_for_goal?, click_through_lookback_window_days?), UPDATE (conversion_action_resource_name; any of name/status/category/counting_type/primary_for_goal/click_through_lookback_window_days), REMOVE (conversion_action_resource_name, confirm_conversion_action_removal)
+  CONVERSION_ACTION → LIST, CREATE (name, category, counting_type; status?, primary_for_goal?, click_through_lookback_window_days?), UPDATE (conversion_action_resource_name; any of name/status/category/counting_type/primary_for_goal/click_through_lookback_window_days), REMOVE (conversion_action_resource_name, confirm_conversion_action_removal, conversion_action_removal_token)
     A CONVERSION_ACTION has NO PAUSED status — that is a campaign status and is rejected. It is always created ENABLED (omit status and it defaults there); Google deny-lists every other value on create.
     HIDDEN cannot be set through the API at all — Google assigns it, and sending it is rejected on both create and update. Do not suggest it.
-    To stop an action recording, use CONVERSION_ACTION REMOVE with confirm_conversion_action_removal=true. That is permanent and cannot be re-enabled, so confirm with the user first — but conversions already recorded stay in reporting, so it is not data loss.
+    To stop an action recording, use CONVERSION_ACTION REMOVE with confirm_conversion_action_removal=true. That is permanent and cannot be re-enabled, so it HALTS for a real user approval: the first call returns a disclosure plus conversion_action_removal_token, and only a replay carrying that token removes anything. You cannot approve this yourself by setting the flag. Conversions already recorded stay in reporting, so it is not data loss.
               counting_type is REQUIRED and never inferred: ONE_PER_CLICK counts one conversion per ad click (lead forms, sign-ups); MANY_PER_CLICK counts every conversion (purchases). Choosing wrong inflates reported conversions and silently misdirects smart bidding — nothing errors, so ASK the user rather than guessing.
               CREATE returns tag = {conversionId, conversionLabel, sendTo}, read back from the action's own tag snippets. That AW-<id>/<label> pair is what goes on the page — a resource name cannot be installed. If Google has not generated snippets yet, tag is null and tagUnavailable explains it; re-run LIST shortly to get it.
               CREATE and UPDATE both read the action back and return drift (fields Google stored differently from what was requested) plus driftWarning. Relay drift to the user — do not assume the write took.
-              REMOVE (conversion_action_resource_name; requires confirm_conversion_action_removal=true) stops the action recording permanently. Ask the user before setting the flag.
+              REMOVE (conversion_action_resource_name; requires confirm_conversion_action_removal=true AND a matching conversion_action_removal_token from the disclosure halt) stops the action recording permanently. The flag alone does nothing — a token minted for a DIFFERENT conversion action is refused too, so never reuse one.
   CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
               Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
@@ -8902,7 +8902,8 @@ ACTION MATRIX:
         counting_type: { type: 'string', enum: ['ONE_PER_CLICK', 'MANY_PER_CLICK'], description: 'CONVERSION_ACTION CREATE (required) / UPDATE. ONE_PER_CLICK counts one conversion per ad click (lead forms, sign-ups); MANY_PER_CLICK counts every conversion (purchases). NEVER guess — choosing wrong inflates reported conversions and silently misdirects smart bidding. Ask the user.' },
         primary_for_goal: { type: 'boolean', description: 'CONVERSION_ACTION CREATE/UPDATE: whether this action is a primary goal (counts toward the Conversions column and drives smart bidding).' },
         click_through_lookback_window_days: { type: 'number', description: 'CONVERSION_ACTION CREATE/UPDATE: how many days after an ad click a conversion still attributes to it.' },
-        confirm_conversion_action_removal: { type: 'boolean', description: 'Required true for CONVERSION_ACTION REMOVE. Removal is permanent — the action stops recording and cannot be re-enabled — so confirm with the user first. Conversions already recorded stay in reporting.' },
+        confirm_conversion_action_removal: { type: 'boolean', description: 'Required true for CONVERSION_ACTION REMOVE. NOT sufficient on its own: setting it returns a disclosure and a conversion_action_removal_token, and the removal only happens when you replay the same call carrying that token. Removal is permanent and cannot be re-enabled. Conversions already recorded stay in reporting.' },
+        conversion_action_removal_token: { type: 'string', description: 'CONVERSION_ACTION REMOVE only: replay the token returned by the disclosure halt, verbatim, after the USER has approved. Bound to that exact conversion action — a token for a different one is refused. Never mint, guess or reuse it.' },
         gclid: { type: 'string', description: 'OFFLINE_CONVERSION UPLOAD: the click id captured at first touch and stored on the lead. Without it there is no click to attribute the conversion to.' },
         conversion_at: { type: 'string', description: 'OFFLINE_CONVERSION UPLOAD: ISO 8601 timestamp of when the conversion HAPPENED, not when it was noticed. Future dates are rejected.' },
         conversion_value: { type: 'number', description: 'OFFLINE_CONVERSION UPLOAD: the conversion value. Requires currency_code.' },
@@ -9155,6 +9156,53 @@ TYPICAL WORKFLOW:
     const userId = context?.userId;
     if (!userId) return { success: false, error: 'Authentication required: no user context.' };
     return agentModeService.handleHubspotApi(userId, args);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'call_attio_api',
+  definition: {
+    name: 'call_attio_api',
+    description: `Read Attio lead counts and manage Attio lists, for CPL/attribution
+reporting and list-membership workflows.
+
+Attio has no equivalent of HubSpot's marketing-asset concepts (campaigns,
+emails, landing pages, workflows, social broadcasts) — this tool covers only
+lists and list entries, mirroring call_hubspot_api's CONTACT_LIST actions.
+
+ENTITY_TYPE + ACTION MATRIX:
+
+  LIST_ENTRIES → COUNT (list_id) | ADD_ENTRIES (list_id, record_ids) | REMOVE_ENTRIES (list_id, record_ids)
+               Entry-level actions scoped to one already-identified list.
+               COUNT returns the number of entries (e.g. for CPL = spend / count).
+               ADD_ENTRIES adds Attio Person record ids to the list.
+               REMOVE_ENTRIES removes Person record ids from the list (looks up
+               each person's entry in the list and deletes it).
+
+  LISTS → LIST | GET (list_id) | CREATE (name, object_type?)
+               Whole-list actions. LIST enumerates every list in the workspace.
+               CREATE makes a new list (object_type: 'people' or 'companies',
+               defaults to 'people'). There is no DELETE action — Attio's API
+               has no delete-list endpoint; a list can only be removed through
+               Attio's own UI.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        entity_type: { type: 'string', enum: ['LIST_ENTRIES', 'LISTS'], description: 'Attio resource to operate on.' },
+        action:      { type: 'string', enum: ['COUNT', 'ADD_ENTRIES', 'REMOVE_ENTRIES', 'LIST', 'GET', 'CREATE'], description: 'Action to perform. See ACTION MATRIX.' },
+        list_id:     { type: 'string', description: 'Required for LIST_ENTRIES COUNT/ADD_ENTRIES/REMOVE_ENTRIES and LISTS GET. For LIST_ENTRIES actions, pass the AgentWeb lead list\'s id (e.g. from get_lead_lists/get_lead_details) — it is automatically resolved to that list\'s connected Attio deal-list id; a raw Attio list id also works. For LISTS actions, always a raw Attio list id (e.g. from LISTS LIST) — never an AgentWeb list id.' },
+        record_ids:  { type: 'array', items: { type: 'string' }, maxItems: 100, description: 'Attio record ids (Person or Company, matching the target list). Required for LIST_ENTRIES ADD_ENTRIES/REMOVE_ENTRIES. Max 100 per call.' },
+        name:        { type: 'string', description: 'List display name. Required for LISTS CREATE.' },
+        object_type: { type: 'string', enum: ['people', 'companies'], description: 'What kind of records the new list holds. LISTS CREATE only. Defaults to "people".' },
+        account_id:  { type: 'string', description: 'Attio account ID. Required when the user has multiple Attio accounts connected — the error message will list them; ask the user which to use.' },
+      },
+      required: ['entity_type', 'action'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId;
+    if (!userId) return { success: false, error: 'Authentication required: no user context.' };
+    return agentModeService.handleAttioApi(userId, args);
   },
 });
 

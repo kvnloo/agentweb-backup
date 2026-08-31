@@ -198,7 +198,7 @@ describe('Meta — listAdsForUtmAudit reads every site createAdCreative writes',
       }),
     ]);
 
-    const ads = await metaService.listAdsForUtmAudit('1234567890', 'tok');
+    const { items: ads } = await metaService.listAdsForUtmAudit('1234567890', 'tok');
 
     expect(ads[0].destinationUrls).toEqual(
       expect.arrayContaining([
@@ -251,7 +251,7 @@ describe('Meta — listAdsForUtmAudit reads every site createAdCreative writes',
       }),
     ]);
 
-    const ads = await metaService.listAdsForUtmAudit('1234567890', 'tok');
+    const { items: ads } = await metaService.listAdsForUtmAudit('1234567890', 'tok');
 
     expect(ads[0].destinationUrls).toEqual([
       'https://example.com/feed-lp',
@@ -277,7 +277,7 @@ describe('Meta — listAdsForUtmAudit reads every site createAdCreative writes',
       }),
     ]);
 
-    const ads = await metaService.listAdsForUtmAudit('1234567890', 'tok');
+    const { items: ads } = await metaService.listAdsForUtmAudit('1234567890', 'tok');
 
     expect(ads[0].destinationUrls.sort()).toEqual([
       'https://example.com/link-cta',
@@ -293,7 +293,7 @@ describe('Meta — listAdsForUtmAudit reads every site createAdCreative writes',
       metaAd('ad1', 'c1', { id: 'cr1', url_tags: META_TAGS, link_url: 'https://example.com/x' }),
     ]);
 
-    const ads = await metaService.listAdsForUtmAudit('1234567890', 'tok');
+    const { items: ads } = await metaService.listAdsForUtmAudit('1234567890', 'tok');
     expect(ads[0].urlTags).toBe(META_TAGS);
   });
 
@@ -304,7 +304,7 @@ describe('Meta — listAdsForUtmAudit reads every site createAdCreative writes',
       metaAd('ad1', 'c1', { id: 'cr1', object_story_spec: { page_id: 'p1' } }),
     ]);
 
-    const ads = await metaService.listAdsForUtmAudit('1234567890', 'tok');
+    const { items: ads } = await metaService.listAdsForUtmAudit('1234567890', 'tok');
     expect(ads[0].destinationUrls).toEqual([]);
 
     const [report] = await auditCampaigns('meta', USER, '1234567890', metaAdReadPort);

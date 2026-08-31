@@ -450,3 +450,102 @@ describe('runScheduledChat — oncall-alert keying (ENG-145/146 class)', () => {
     expect(alert.dedupeKey).toBeUndefined();
   }, 30000);
 });
+
+describe('runScheduledChat — fully-blocked LinkedIn invite run pages oncall (ENG-1132 AC3 / ENG-1657)', () => {
+  const linkedInInviteSchedule = {
+    ...baseSchedule,
+    scheduleName: 'Daily LinkedIn invites',
+    requiredFunctionCalls: ['linkedin_outreach'],
+  };
+
+  it('fires exactly one oncall alert, via the existing disconnect-alert mechanism, for a fully-blocked run', async () => {
+    mockWorker.runInWorker.mockResolvedValue({
+      ...okResponse,
+      toolCalls: [{
+        name: 'linkedin_outreach',
+        arguments: { action: 'send-invite', account_id: 'unipile-acct-1' },
+        result: { success: false, error: 'Cannot resend yet — account-level invitation cooldown.' },
+      }],
+    } as any);
+
+    await runScheduledChat(linkedInInviteSchedule, mockUserId, false, 'run-linkedin-blocked-alert');
+    await flushAsync();
+
+    // Two oncall sites can fire for a validation-failed run (the AC3 block alert here,
+    // plus the pre-existing generic validation-fail alert) — this pins that the AC3
+    // site itself contributes exactly one call, using the same sendAgentModeOncallAlert
+    // mechanism the LinkedIn-disconnect alerts use, not a bespoke channel.
+    const blockAlerts = (sendAgentModeOncallAlert as jest.Mock).mock.calls
+      .map((call) => call[0])
+      .filter((params) => typeof params.dedupeKey === 'string' && params.dedupeKey.startsWith('linkedin_invite_blocked:'));
+    expect(blockAlerts).toHaveLength(1);
+    expect(blockAlerts[0]).toEqual(expect.objectContaining({
+      subject: expect.stringContaining('LinkedIn outreach run fully blocked'),
+      message: expect.stringContaining('account-level invitation cooldown'),
+      dedupeKey: 'linkedin_invite_blocked:unipile-acct-1',
+      dedupeWindowMs: 24 * 60 * 60 * 1000,
+    }));
+    expect(blockAlerts[0].context).toEqual(expect.objectContaining({
+      'Schedule ID': linkedInInviteSchedule.scheduleId,
+      'Account ID': 'unipile-acct-1',
+    }));
+  }, 30000);
+
+  it('does not page oncall for a test run (isTest=true), matching the pre-existing validation-alert exclusion', async () => {
+    mockWorker.runInWorker.mockResolvedValue({
+      ...okResponse,
+      toolCalls: [{
+        name: 'linkedin_outreach',
+        arguments: { action: 'send-invite', account_id: 'unipile-acct-2' },
+        result: { success: false, error: 'Cannot resend yet — account-level invitation cooldown.' },
+      }],
+    } as any);
+
+    await runScheduledChat(linkedInInviteSchedule, mockUserId, true, 'run-linkedin-blocked-test');
+    await flushAsync();
+
+    const blockAlerts = (sendAgentModeOncallAlert as jest.Mock).mock.calls
+      .map((call) => call[0])
+      .filter((params) => typeof params.dedupeKey === 'string' && params.dedupeKey.startsWith('linkedin_invite_blocked:'));
+    expect(blockAlerts).toHaveLength(0);
+  }, 30000);
+
+  it('does not page oncall when the run is not blocked', async () => {
+    mockWorker.runInWorker.mockResolvedValue({
+      ...okResponse,
+      toolCalls: [{
+        name: 'linkedin_outreach',
+        arguments: { action: 'send-invite', account_id: 'unipile-acct-3' },
+        result: { success: true },
+      }],
+    } as any);
+
+    await runScheduledChat(linkedInInviteSchedule, mockUserId, false, 'run-linkedin-ok');
+    await flushAsync();
+
+    const blockAlerts = (sendAgentModeOncallAlert as jest.Mock).mock.calls
+      .map((call) => call[0])
+      .filter((params) => typeof params.dedupeKey === 'string' && params.dedupeKey.startsWith('linkedin_invite_blocked:'));
+    expect(blockAlerts).toHaveLength(0);
+  }, 30000);
+
+  it('dedupes the account/day key when accountId is absent, falling back to the schedule id', async () => {
+    mockWorker.runInWorker.mockResolvedValue({
+      ...okResponse,
+      toolCalls: [{
+        name: 'linkedin_outreach',
+        arguments: { action: 'send-invite' },
+        result: { success: false, error: 'Cannot resend yet — account-level invitation cooldown.' },
+      }],
+    } as any);
+
+    await runScheduledChat(linkedInInviteSchedule, mockUserId, false, 'run-linkedin-no-account-id');
+    await flushAsync();
+
+    const blockAlerts = (sendAgentModeOncallAlert as jest.Mock).mock.calls
+      .map((call) => call[0])
+      .filter((params) => typeof params.dedupeKey === 'string' && params.dedupeKey.startsWith('linkedin_invite_blocked:'));
+    expect(blockAlerts).toHaveLength(1);
+    expect(blockAlerts[0].dedupeKey).toContain(`schedule:${linkedInInviteSchedule.scheduleId}`);
+  }, 30000);
+});
