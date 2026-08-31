@@ -5364,7 +5364,11 @@ export async function runScheduledChat(
           `Scheduled LinkedIn outreach run for schedule "${schedule.scheduleName}" attempted `
           + `send-invite and was fully blocked. ${linkedInInviteSendBlock.notice}`,
         sessionId,
-        dedupeKey: `linkedin_invite_blocked:${dedupeAccountKey}:${new Date().toISOString().slice(0, 10)}`,
+        // No date component: dedupeWindowMs alone enforces the rolling 24h
+        // suppression window, so an alert at 23:59 UTC and the next at 00:01
+        // UTC the following day correctly dedupe instead of bypassing on the
+        // UTC-midnight key rollover (CodeRabbit).
+        dedupeKey: `linkedin_invite_blocked:${dedupeAccountKey}`,
         dedupeWindowMs: 24 * 60 * 60 * 1000,
         context: {
           'Schedule ID': schedule.scheduleId,
@@ -5650,7 +5654,11 @@ export async function runScheduledChat(
         }
       })
         .catch(err => console.error('Failed to file scheduled-chat-failure issue:', err))
-        .then(() => sendAgentModeOncallAlert({
+        // A blocked-invite run already paged oncall above via the dedicated
+        // linkedin_invite_blocked alert — sending this generic alert too would
+        // double-page a single blocked run (CodeRabbit). The issue is still
+        // filed unconditionally above so tracking stays intact either way.
+        .then(() => linkedInInviteSendRequirementMissed ? undefined : sendAgentModeOncallAlert({
           subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
           message: scheduledChatFailureDescription,
           sessionId,

@@ -482,7 +482,7 @@ describe('runScheduledChat — fully-blocked LinkedIn invite run pages oncall (E
     expect(blockAlerts[0]).toEqual(expect.objectContaining({
       subject: expect.stringContaining('LinkedIn outreach run fully blocked'),
       message: expect.stringContaining('account-level invitation cooldown'),
-      dedupeKey: expect.stringMatching(/^linkedin_invite_blocked:unipile-acct-1:\d{4}-\d{2}-\d{2}$/),
+      dedupeKey: 'linkedin_invite_blocked:unipile-acct-1',
       dedupeWindowMs: 24 * 60 * 60 * 1000,
     }));
     expect(blockAlerts[0].context).toEqual(expect.objectContaining({
