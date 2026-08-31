@@ -40,11 +40,17 @@ async function metaAccessToken(): Promise<string> {
 export const metaAdReadPort: AdReadPort = {
   async listCampaigns(_userId: string, accountId: string) {
     const token = await metaAccessToken();
-    const { campaigns } = await metaService.listCampaigns(accountId, token);
-    return (campaigns ?? []).map((c: any) => ({
-      id: String(c.id),
-      name: c.name ?? "",
-    }));
+    // `truncated` is carried through rather than dropped: a bounded read means campaigns the
+    // audit never saw, so "all clean" would be a claim about an account it did not finish
+    // reading — the ENG-1584 sentence shape.
+    const { campaigns, truncated } = await metaService.listCampaigns(accountId, token);
+    return {
+      items: (campaigns ?? []).map((c: any) => ({
+        id: String(c.id),
+        name: c.name ?? "",
+      })),
+      truncated,
+    };
   },
 
   async listAdDestinations(_userId: string, accountId: string, campaignId: string) {
@@ -52,14 +58,18 @@ export const metaAdReadPort: AdReadPort = {
     // The campaignId is pushed down to Meta's `filtering` param so we do not refetch the whole
     // account's ads once per campaign. We ALSO filter here: if Meta ever ignores the filter, an
     // unfiltered response must not attribute another campaign's ads to this one.
-    const { items: ads } = await metaService.listAdsForUtmAudit(accountId, token, campaignId);
-    return ads
-      .filter((ad) => ad.campaignId === campaignId)
-      .map((ad) => ({
-        adId: ad.adId,
-        destinationUrls: ad.destinationUrls,
-        appendField: ad.urlTags, // Meta `url_tags`, appended to every link at delivery.
-      }));
+    const { items: ads, truncated } = await metaService.listAdsForUtmAudit(accountId, token, campaignId);
+    return {
+      items: ads
+        .filter((ad) => ad.campaignId === campaignId)
+        .map((ad) => ({
+          adId: ad.adId,
+          destinationUrls: ad.destinationUrls,
+          appendField: ad.urlTags, // Meta `url_tags`, appended to every link at delivery.
+        })),
+      // A campaign whose ad list stopped at a bound cannot be reported as fully tagged.
+      truncated,
+    };
   },
 };
 

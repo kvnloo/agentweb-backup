@@ -9487,24 +9487,43 @@ emmaToolRegistry.register({
       throw new Error('account_id is required — get it from list_connected_accounts.');
     }
 
+    // Reads behind this audit can stop at a page or wall-clock bound. Collect that here so a
+    // partial read is never presented as a clean bill of health.
+    const completeness: { incomplete?: boolean; campaignListIncomplete?: boolean } = {};
     const campaigns = await auditCampaigns(
       platform as AdPlatform,
       context.userId,
       accountId,
       port,
+      completeness,
     );
 
     const needingAction = campaigns.filter((c) => !c.tagged);
     const unreadableCount = campaigns.reduce((n, c) => n + c.unreadableAdIds.length, 0);
 
+    /*
+     * "All N campaign(s) carry UTM tracking" is a claim about everything, so it may only be
+     * made from a read that saw everything. Under truncation the audit found nothing wrong in
+     * the part it read, which is a different statement — and reporting the stronger one is
+     * exactly how a bounded read told a customer something did not exist (ENG-1584).
+     */
+    const incompleteNote = completeness.incomplete
+      ? (completeness.campaignListIncomplete
+          ? ` ⚠ The campaign list stopped at a read bound, so campaigns beyond it were never audited.`
+          : ` ⚠ At least one campaign's ad list stopped at a read bound, so some ads were never audited.`) +
+        ` Treat this as "nothing wrong in what was read", not a clean bill of health.`
+      : '';
+
     // Say the unreadable count out loud. Silently folding it into "untagged" would send
     // someone to swap a creative we never actually managed to read.
-    const message = needingAction.length === 0
-      ? `✅ All ${campaigns.length} campaign(s) on ${platform} carry UTM tracking. Nothing to opt in.`
+    const message = (needingAction.length === 0
+      ? (completeness.incomplete
+          ? `No UTM problems found in the ${campaigns.length} campaign(s) read on ${platform}.`
+          : `✅ All ${campaigns.length} campaign(s) on ${platform} carry UTM tracking. Nothing to opt in.`)
       : `${needingAction.length} of ${campaigns.length} campaign(s) on ${platform} need attention.` +
         (unreadableCount > 0
           ? ` ${unreadableCount} ad(s) were unreadable — their destination URL could not be parsed, so they need review by a human rather than an automatic fix.`
-          : '');
+          : '')) + incompleteNote;
 
     return {
       success: true,
@@ -9514,6 +9533,8 @@ emmaToolRegistry.register({
       totalCampaigns: campaigns.length,
       campaignsNeedingAction: needingAction.length,
       unreadableAdCount: unreadableCount,
+      ...(completeness.incomplete ? { readIncomplete: true } : {}),
+      ...(completeness.campaignListIncomplete ? { campaignListIncomplete: true } : {}),
       campaigns,
     };
   },
