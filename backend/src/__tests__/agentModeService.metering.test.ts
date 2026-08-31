@@ -386,16 +386,36 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     );
   });
 
-  it('does not retry a transient 429 after OpenRouter exhausts its provider fallbacks', async () => {
+  // ENG-1626: session b32ec8af (2026-08-26) — a single "429 Provider returned
+  // error" from OpenRouter (its own provider-fallback pool momentarily
+  // saturated for that model) killed an entire Slack-bridged session with zero
+  // retry anywhere in callLLM. This pair now pins ONE short-backoff retry of a
+  // fully-exhausted attempt, bounded so it can't itself spiral.
+  it('retries a transient 429 once and succeeds when the retry clears', async () => {
+    const rateLimitErr = Object.assign(new Error('Rate limit exceeded'), { status: 429 });
+    create.mockRejectedValueOnce(rateLimitErr).mockResolvedValueOnce(fakeResponse);
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+    jest.spyOn(svc as any, 'sleep').mockResolvedValue(undefined);
+
+    const result = await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(result).toBe(fakeResponse);
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it('gives up after exactly one retry when a transient 429 persists', async () => {
     const rateLimitErr = Object.assign(new Error('Rate limit exceeded'), { status: 429 });
     create.mockRejectedValue(rateLimitErr);
     (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+    jest.spyOn(svc as any, 'sleep').mockResolvedValue(undefined);
 
     await expect(svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
       usageContext: { userId: 'u1', feature: 'agent_task' },
     })).rejects.toBe(rateLimitErr);
 
-    expect(create).toHaveBeenCalledTimes(1);
+    expect(create).toHaveBeenCalledTimes(2);
   });
 
   it('does not retry a non-transient 402 (exhausted balance) — fails immediately', async () => {
