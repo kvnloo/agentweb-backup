@@ -1157,6 +1157,17 @@ export async function processAttioWebhookJob(payload: AttioJobPayload): Promise<
   // point at different Attio deal lists.
   const dealAttrCacheByListId = new Map<string, Map<string, string>>();
 
+  // CodeRabbit finding (ENG-1380): a per-event failure was recorded into
+  // lastSyncStatus but the job itself still resolved normally, so the
+  // durable job queue called markJobComplete instead of markJobFailed —
+  // a transient failure (Attio fetch error, DynamoDB delete error) was
+  // never retried by the queue's bounded-retry mechanism. OR'd across every
+  // list, not reset per-list, and only thrown after the loop below finishes
+  // — every matching list must still be fully attempted regardless of an
+  // earlier list's failure, exactly as before; only whether the job as a
+  // whole gets retried changes.
+  let anyJobEventFailed = false;
+
   for (const list of matchingLists) {
     const syncConfig = await externalCrmSyncService.getConfig(payload.userId, list.listId, 'attio');
     if (!syncConfig || syncConfig.webhookEnabled === false) continue;
@@ -1204,6 +1215,17 @@ export async function processAttioWebhookJob(payload: AttioJobPayload): Promise<
     if (appliedAnyEvent) {
       await externalCrmSyncService.updateSyncTimestamp(syncConfig, 'pull', !anyEventFailed);
     }
+    if (anyEventFailed) anyJobEventFailed = true;
+  }
+
+  // Thrown only after every matching list has been attempted — the caller's
+  // markJobFailed/retry path re-processes this same payload later. Safe to
+  // retry the whole delivery: every event application here (person create/
+  // update, list-entry field merge) is an idempotent upsert, so re-applying
+  // an event that already succeeded on a prior attempt is a no-op, not a
+  // duplicate side effect.
+  if (anyJobEventFailed) {
+    throw new Error('[Attio Webhook] One or more events failed to apply — see prior logs for detail');
   }
 }
 

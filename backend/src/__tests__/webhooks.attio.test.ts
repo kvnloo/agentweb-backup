@@ -356,6 +356,60 @@ describe('POST /api/webhooks/attio — shared OAuth webhook', () => {
     expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.objectContaining({ webhookEnabled: true }), 'pull', false);
   });
 
+  // CodeRabbit finding (ENG-1380): a failed event was recorded into
+  // lastSyncStatus but processAttioWebhookJob still resolved normally, so
+  // the durable job queue called markJobComplete instead of markJobFailed —
+  // a transient failure (e.g. an Attio fetch error) was never retried by the
+  // queue's bounded-retry mechanism.
+  describe('durable job retry on event failure', () => {
+    it('marks the job failed (not complete) when applyAttioPersonEvent throws', async () => {
+      mockApplyAttioPersonEvent.mockRejectedValueOnce(new Error('boom'));
+      const body = { event_type: 'record.updated', id: { workspace_id: WORKSPACE_ID, record_id: 'rec-1' } };
+      await request(app).post('/api/webhooks/attio').set('attio-signature', makeSignature(body)).send(body);
+      await flushPromises();
+
+      expect(mockMarkJobFailed).toHaveBeenCalledWith('attio_webhook', expect.any(String), expect.any(Error));
+      expect(mockMarkJobComplete).not.toHaveBeenCalled();
+    });
+
+    it('marks the job failed (not complete) when applyAttioPersonEvent returns false (caught-and-logged failure)', async () => {
+      mockApplyAttioPersonEvent.mockResolvedValueOnce(false);
+      const body = { event_type: 'record.updated', id: { workspace_id: WORKSPACE_ID, record_id: 'rec-1' } };
+      await request(app).post('/api/webhooks/attio').set('attio-signature', makeSignature(body)).send(body);
+      await flushPromises();
+
+      expect(mockMarkJobFailed).toHaveBeenCalledWith('attio_webhook', expect.any(String), expect.any(Error));
+      expect(mockMarkJobComplete).not.toHaveBeenCalled();
+      // The lastPullSyncAt/lastSyncStatus stamp still happens before the retry
+      // throw — a failure is visible in the CRM Sync dialog immediately, not
+      // only after retries are exhausted.
+      expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.objectContaining({ webhookEnabled: true }), 'pull', false);
+    });
+
+    it('marks the job complete (not failed) when every event succeeds', async () => {
+      const body = { event_type: 'record.updated', id: { workspace_id: WORKSPACE_ID, record_id: 'rec-1' } };
+      await request(app).post('/api/webhooks/attio').set('attio-signature', makeSignature(body)).send(body);
+      await flushPromises();
+
+      expect(mockMarkJobComplete).toHaveBeenCalledWith('attio_webhook', expect.any(String));
+      expect(mockMarkJobFailed).not.toHaveBeenCalled();
+    });
+
+    it('still processes every matching list even after an earlier list has a failed event', async () => {
+      const secondList = { listId: 'list-2', userId: USER_ID, externalCrmSyncConfigs: { attio: { accountId: ACCOUNT_ID } } };
+      mockGetLeadListsByUserId.mockResolvedValue([mockList, secondList]);
+      mockApplyAttioPersonEvent.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+
+      const body = { event_type: 'record.updated', id: { workspace_id: WORKSPACE_ID, record_id: 'rec-1' } };
+      await request(app).post('/api/webhooks/attio').set('attio-signature', makeSignature(body)).send(body);
+      await flushPromises();
+
+      const processedListIds = mockApplyAttioPersonEvent.mock.calls.map((c) => c[0]);
+      expect(processedListIds.sort()).toEqual(['list-1', 'list-2']);
+      expect(mockMarkJobFailed).toHaveBeenCalled();
+    });
+  });
+
   it('skips lists with webhookEnabled explicitly false', async () => {
     mockGetSyncConfig.mockResolvedValue({ webhookEnabled: false, dealFieldMapping: [] });
     const body = { event_type: 'record.updated', id: { workspace_id: WORKSPACE_ID, record_id: 'rec-1' } };
