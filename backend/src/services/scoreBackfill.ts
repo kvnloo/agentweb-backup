@@ -32,6 +32,21 @@ import {
 // session that was still running, one excluded by design, one the budget never
 // reached, and one whose scorer errored were indistinguishable to the caller.
 // The Daily Satisfaction Score Report therefore under-sampled silently.
+//
+// ENG-929 follow-up: dispatch smallest-session-first. The per-session scoring
+// timeout now scales up to 60s for a long transcript (see
+// sessionScoringService's SCORING_TIMEOUT_MAX_MS) instead of failing fast at a
+// flat 20s — good for getting a large session an actual score, but it means a
+// handful of large sessions can now consume much more of the shared wall-clock
+// budget each than before. Left in array order (whatever order the caller
+// fetched them in — typically newest-first, unrelated to size), a window with
+// a few large sessions up front could starve many small, fast sessions behind
+// them of any attempt at all. Sorting the DISPATCH order by estimated size
+// (ascending) means the budget clears as many sessions as possible before it
+// runs out, and defers the sessions most likely to eat the most budget to
+// last. `outcomes` is still written at each session's ORIGINAL index, so the
+// documented "same order as sessions passed in" contract is unaffected —
+// only which session a worker picks up next changes.
 
 const DEFAULT_CONCURRENCY = 6;
 const DEFAULT_BUDGET_MS = 4 * 60 * 1000; // 4 min < 5-min tool timeout
@@ -127,6 +142,17 @@ export async function backfillSessionScores(
   let next = 0;
   let scored = 0;
 
+  // Smallest-first dispatch order (see comment above) — a session's own
+  // outcome is still written to its ORIGINAL index below, so this only
+  // affects which session gets attempted next, never the returned order.
+  const dispatchOrder = sessions
+    .map((session, index) => ({
+      index,
+      size: (session as any).messageCount ?? (session as any).messages?.length ?? 0,
+    }))
+    .sort((a, b) => a.size - b.size)
+    .map((entry) => entry.index);
+
   // Pre-filled with the budget verdict so any session a worker never claims is
   // already reported as not-attempted rather than left undefined.
   const outcomes: SessionScoringOutcome[] = sessions.map((session) => ({
@@ -140,8 +166,9 @@ export async function backfillSessionScores(
       // Stop before claiming more work once the budget is spent, so the endpoint
       // returns ahead of the tool timeout.
       if (now() - start >= budgetMs) return;
-      const index = next++;
-      if (index >= total) return;
+      const dispatchPos = next++;
+      if (dispatchPos >= total) return;
+      const index = dispatchOrder[dispatchPos];
 
       const session = sessions[index];
       const outcome: SessionScoringOutcome = {
