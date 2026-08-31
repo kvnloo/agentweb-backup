@@ -964,7 +964,10 @@ describe('AgentModeService - Work Plan', () => {
           workPlan: {
             title: 'Plan',
             steps: [
-              { stepCount: 1, title: 'Optional intro', status: 'skipped' },
+              // Starts 'pending', not 'skipped' -- the call below must be a real
+              // status transition (ENG-1626's idempotency short-circuit treats a
+              // same-status call as a no-op and never reaches updateSessionWorkPlan).
+              { stepCount: 1, title: 'Optional intro', status: 'pending' },
               { stepCount: 2, title: 'Generate 3 images', status: 'pending', expectedAssetCount: 3 },
             ],
             createdAt: '2026-08-12T14:54:35.000Z',
@@ -1082,6 +1085,182 @@ describe('AgentModeService - Work Plan', () => {
         expect(result.insufficientAssets).toEqual([
           expect.objectContaining({ stepCount: 3, expected: 2, produced: 0 }),
         ]);
+      });
+    });
+
+    // ENG-1626: production session 822c1ed4 saw set_work_plan_status fail twice
+    // back-to-back with no system-level retry, while the customer watched the
+    // workplan progress bar stall with no explanation. A transient failure
+    // anywhere in the read-modify-write (session read or workPlan persist) should
+    // be retried once automatically before the tool reports failure.
+    describe('transient failure retry (ENG-1626)', () => {
+      const singleStepWorkPlan = () => ({
+        title: 'Plan',
+        steps: [{ stepCount: 1, title: 'Step 1', status: 'pending' as const }],
+        createdAt: '2026-08-27T17:00:00.000Z',
+        updatedAt: '2026-08-27T17:00:00.000Z',
+      });
+
+      it('retries once and succeeds after a transient (network) session read failure', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: singleStepWorkPlan(),
+        };
+
+        (chatbotDb.getChatSession as jest.Mock)
+          .mockRejectedValueOnce(new Error('socket hang up'))
+          .mockResolvedValueOnce(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.getChatSession).toHaveBeenCalledTimes(2);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(1);
+      });
+
+      it('retries once and succeeds after a transient (throttling/5xx) persist failure', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: singleStepWorkPlan(),
+        };
+
+        // Each read returns an independent clone -- like a real DynamoDB read,
+        // the retry's fresh read must not see the failed first attempt's local
+        // (never-persisted) mutation of workPlan.steps, which would otherwise
+        // make the ENG-1626 idempotency short-circuit mistake this retry for
+        // an already-applied ack-lost write.
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() =>
+          Promise.resolve(JSON.parse(JSON.stringify(mockSession)))
+        );
+        (chatbotDb.updateSessionWorkPlan as jest.Mock)
+          .mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException: 503 Service Unavailable'))
+          .mockResolvedValueOnce(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(2);
+      });
+
+      it('does NOT retry a non-transient (validation) exception — fails immediately with the real error', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: singleStepWorkPlan(),
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        // A real invalid_args pattern from toolErrorClassifier's classFromMessage
+        // ("arguments failed schema validation") — a model/data bug, not a
+        // transient blip.
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockRejectedValue(
+          new Error('set_work_plan_status arguments failed schema validation: notes must be a string.')
+        );
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('failed schema validation');
+        // Only ONE attempt — invalid_args is excluded by isRetryableErrorClass, so
+        // the classifier (not an unrecognized-fallback coincidence) is what keeps
+        // a validation bug from being retried and silently doubling the model's
+        // tool budget.
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(1);
+      });
+
+      it('gives up after a persistent transient failure and reports it as a normal failure', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: singleStepWorkPlan(),
+        };
+
+        // Same independent-clone-per-read reasoning as the persist-failure test
+        // above -- otherwise the first attempt's local mutation makes the
+        // ENG-1626 idempotency short-circuit skip the second attempt's persist
+        // call entirely.
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() =>
+          Promise.resolve(JSON.parse(JSON.stringify(mockSession)))
+        );
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockRejectedValue(new Error('ETIMEDOUT'));
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.message).toBe('Failed to update work plan status');
+        expect(result.error).toContain('ETIMEDOUT');
+        // Exactly two attempts total (one retry), never an unbounded retry loop.
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(2);
+      });
+
+      it('does not re-stamp resolvedAt or re-decrement counts on retry when attempt 1 actually committed (ack-lost)', async () => {
+        // The scenario the ENG-1626 idempotency guard exists for: attempt 1's
+        // updateSessionWorkPlan call commits server-side, but the client sees a
+        // transient error anyway (the ack itself was lost, not the write). The
+        // retry's fresh read sees the ALREADY-completed step. updateSessionWorkPlan
+        // itself is safe to call again (an unconditional SET, re-writing the same
+        // state) -- CodeRabbit's review on this PR flagged that the ORIGINAL guard
+        // over-corrected by skipping that entire write (and its post-write side
+        // effects: the decision-card input request, skill install), stranding the
+        // decision card. What must NOT repeat is the resolvedAt re-stamp and the
+        // calledFunctionCounts decrement -- this test pins THAT invariant.
+        const pendingSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: singleStepWorkPlan(),
+        };
+        const committedSession = {
+          ...pendingSession,
+          workPlan: {
+            ...pendingSession.workPlan,
+            steps: [{ stepCount: 1, title: 'Step 1', status: 'completed' as const, resolvedAt: '2026-08-27T17:00:05.000Z' }],
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock)
+          .mockResolvedValueOnce(JSON.parse(JSON.stringify(pendingSession)))
+          .mockResolvedValueOnce(JSON.parse(JSON.stringify(committedSession)));
+        // Attempt 1's persist call itself throws -- the caller never sees a
+        // successful response, even though (per the committedSession read above)
+        // the write actually landed. Attempt 2's persist call (the same
+        // already-applied state written back) succeeds.
+        (chatbotDb.updateSessionWorkPlan as jest.Mock)
+          .mockRejectedValueOnce(new Error('ETIMEDOUT'))
+          .mockResolvedValueOnce(committedSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.getChatSession).toHaveBeenCalledTimes(2);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(2);
+        // The retry's own write must carry the ORIGINAL committed resolvedAt, not
+        // a freshly-generated one -- a re-stamp here would shift the asset-count
+        // cutoff window for any later step.
+        const secondCallWorkPlan = (chatbotDb.updateSessionWorkPlan as jest.Mock).mock.calls[1][1];
+        expect(secondCallWorkPlan.steps[0].resolvedAt).toBe('2026-08-27T17:00:05.000Z');
       });
     });
   });
