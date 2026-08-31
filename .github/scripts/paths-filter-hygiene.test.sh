@@ -561,8 +561,12 @@ fi
   printf "              - 'backend/**'\n"
   printf "              - '.github/workflows/gate-nojobs.yml'\n"
 } >"${WORKDIR}/gate-nojobs.yml"
-if EXPECT_GATED_JOBS=1 python3 "${GATING_AUDITOR}" "${WORKDIR}/gate-nojobs.yml" \
-   | grep -q 'fail-open'; then
+nojobs_output=$(EXPECT_GATED_JOBS=1 python3 "${GATING_AUDITOR}" "${WORKDIR}/gate-nojobs.yml")
+# Here-string, not a pipe: `grep -q` exits on the first match, and under
+# `set -o pipefail` the writer's EPIPE would become the pipeline's status, so a
+# successful match would read as a failure. That is the shape
+# pipefail-hygiene.test.sh bans, and it caught this line.
+if grep -q 'fail-open' <<<"${nojobs_output}"; then
   pass "self-check: parsing zero gated jobs is reported, not passed"
 else
   fail "self-check: parsing zero gated jobs is reported, not passed" \
