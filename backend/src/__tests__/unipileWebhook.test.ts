@@ -161,6 +161,22 @@ describe('POST /api/webhooks/unipile/account-status', () => {
       expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
     });
 
+    it('a missing account_type is ignored (fails closed), not defaulted to LinkedIn', async () => {
+      // Built directly, not via payload() — its default parameter would silently
+      // resupply 'LINKEDIN' if passed `undefined`, defeating the point of this test.
+      const res = await post({ AccountStatus: { account_id: 'acc_1', message: 'CREDENTIALS' } }, headers);
+      expect(res.status).toBe(200);
+      expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
+    });
+
+    it('returns 500 (not a false 200/no-owner alert) when owner resolution itself fails, so Unipile retries', async () => {
+      mockGetAllUnipileAccountIds.mockRejectedValue(new Error('DynamoDB scan failed'));
+      const res = await post(payload('CREDENTIALS', 'acc_1'), headers);
+      expect(res.status).toBe(500);
+      expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
+      expect(mockSendAgentModeOncallAlert).not.toHaveBeenCalled();
+    });
+
     it('resolves to no owner when the account is unowned (site-wide), and still calls through with ownerUserId undefined', async () => {
       mockGetAllUnipileAccountIds.mockResolvedValue({ ids: ['acc_unowned'], ownerByAccountId: new Map() });
       const res = await post(payload('CREDENTIALS', 'acc_unowned'), headers);

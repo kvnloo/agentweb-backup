@@ -124,8 +124,14 @@ router.post('/account-status', async (req: express.Request, res: express.Respons
     return res.status(400).json({ error: 'Missing AccountStatus.account_id or .message' });
   }
 
-  if (status.account_type && status.account_type !== 'LINKEDIN') {
-    console.log(`${TAG} Ignoring non-LinkedIn account_type "${status.account_type}" for ${accountId}`);
+  // This webhook is registered unscoped (no account_ids filter — see the
+  // registration script), so deliveries for any platform Unipile supports
+  // (WhatsApp, Instagram, ...) reach this handler, not just LinkedIn. Require
+  // an exact match rather than only excluding a known non-LinkedIn value —
+  // a missing/malformed account_type must be ignored, not default to
+  // "treat as LinkedIn," matching the auth check's own fail-closed posture.
+  if (status.account_type !== 'LINKEDIN') {
+    console.log(`${TAG} Ignoring non-LinkedIn account_type "${status.account_type ?? '(missing)'}" for ${accountId}`);
     return res.status(200).json({ received: true });
   }
 
