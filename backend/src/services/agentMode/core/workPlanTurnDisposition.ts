@@ -76,6 +76,26 @@ function findPendingStepCount(steps: unknown): number | undefined {
   return undefined;
 }
 
+/**
+ * ENG-1626: true when `message` is the assistant's last turn and it ended with
+ * a workplan disposition failure (WORKPLAN_TURN_MISSING_DISPOSITION, e.g. a
+ * decision-card creation that silently failed) that this module already
+ * flagged as retryable. A production session hit this and the assistant told
+ * the customer "I couldn't create the decision card... Please retry" — the
+ * automatic in-turn retry above had already run once and failed again, so the
+ * only path forward was the customer typing the literal phrase "retry
+ * creating the card". The caller uses this to re-enforce the disposition
+ * check on the customer's NEXT turn regardless of what they actually typed,
+ * so the retry happens on its own instead of depending on that exact phrase.
+ */
+export function priorTurnNeedsWorkPlanDispositionRetry(message: unknown): boolean {
+  const record = asRecord(message);
+  if (!record || record.role !== 'assistant') return false;
+  const metadata = asRecord(record.metadata);
+  const failure = asRecord(metadata?.workPlanDispositionFailure);
+  return failure?.retryable === true;
+}
+
 export function decideWorkPlanTurnDisposition({
   before,
   after,
