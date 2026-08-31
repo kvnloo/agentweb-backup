@@ -512,14 +512,15 @@ describe('falseFailureReport', () => {
   describe('collectConfirmedArtifactUrls', () => {
     const T = (name: string, timestamp: string, content: any) => ({ role: 'tool', name, timestamp, content });
     const SUCCESS = (url: string) => JSON.stringify({ success: true, s3_url: url, message: 'ok' });
+    const REF = (url: string, name: string) => ({ url, name });
 
-    it('collects the URL from a confirmed update_html_file call at or after the turn start', () => {
+    it('collects the URL and tool name from a confirmed update_html_file call at or after the turn start', () => {
       expect(
         collectConfirmedArtifactUrls(
           [T('update_html_file', '2026-08-13T02:00:00Z', SUCCESS('https://s3/edited.html'))],
           Date.parse('2026-08-13T01:00:00Z'),
         ),
-      ).toEqual(['https://s3/edited.html']);
+      ).toEqual([REF('https://s3/edited.html', 'update_html_file')]);
     });
 
     it('parses the URL through the S3-offload header wrapper', () => {
@@ -531,7 +532,21 @@ describe('falseFailureReport', () => {
           [T('update_html_file', '2026-08-13T02:00:00Z', wrapped)],
           Date.parse('2026-08-13T01:00:00Z'),
         ),
-      ).toEqual(['https://s3/edited.html']);
+      ).toEqual([REF('https://s3/edited.html', 'update_html_file')]);
+    });
+
+    it('parses the URL through the storage-unavailable header wrapper', () => {
+      const wrapped =
+        '[Full response could NOT be stored (120 chars) — storage was unavailable, so there is no key to page through. '
+        + 'This message is the only copy: read what you need NOW. On a later turn only a short preview of it remains — '
+        + 'do NOT infer any detail that is not visible there, and re-run the source tool if you need the rest]\n\n'
+        + SUCCESS('https://s3/edited.html');
+      expect(
+        collectConfirmedArtifactUrls(
+          [T('create_html_file', '2026-08-13T02:00:00Z', wrapped)],
+          Date.parse('2026-08-13T01:00:00Z'),
+        ),
+      ).toEqual([REF('https://s3/edited.html', 'create_html_file')]);
     });
 
     it('ignores a call before the turn started, a failed call, and a non-artifact tool', () => {
@@ -552,7 +567,8 @@ describe('falseFailureReport', () => {
         T('update_html_file', '2026-08-13T02:00:00Z', SUCCESS('https://s3/edited.html')),
         T('update_html_file', '2026-08-13T02:05:00Z', SUCCESS('https://s3/edited.html')),
       ];
-      expect(collectConfirmedArtifactUrls(msgs, Date.parse('2026-08-13T01:00:00Z'))).toEqual(['https://s3/edited.html']);
+      expect(collectConfirmedArtifactUrls(msgs, Date.parse('2026-08-13T01:00:00Z')))
+        .toEqual([REF('https://s3/edited.html', 'update_html_file')]);
       expect(collectConfirmedArtifactUrls(msgs, null)).toEqual([]);
       expect(collectConfirmedArtifactUrls(msgs, NaN)).toEqual([]);
       expect(collectConfirmedArtifactUrls(null, Date.parse('2026-08-13T01:00:00Z'))).toEqual([]);
@@ -561,12 +577,31 @@ describe('falseFailureReport', () => {
 
   describe('appendConfirmedArtifactNotice', () => {
     const GENERIC = 'I encountered an error processing your request. Please try sending your message again.';
+    const UPDATE_REF = [{ url: 'https://s3/edited.html', name: 'update_html_file' }];
+    const CREATE_REF = [{ url: 'https://s3/new.html', name: 'create_html_file' }];
+    const TWO_UPDATE_REFS = [
+      { url: 'https://s3/a.html', name: 'update_html_file' },
+      { url: 'https://s3/b.html', name: 'update_html_file' },
+    ];
 
     it('adds the preview URL to the generic fallback, and does NOT tell the user not to re-run', () => {
-      const out = appendConfirmedArtifactNotice(GENERIC, ['https://s3/edited.html']);
+      const out = appendConfirmedArtifactNotice(GENERIC, UPDATE_REF);
       expect(out).toContain(GENERIC);
       expect(out).toContain('https://s3/edited.html');
       expect(out).not.toMatch(/do NOT re-run/i);
+      expect(out).toContain('updated your HTML file');
+    });
+
+    it('says "created" for a create_html_file/create_html_from_template artifact', () => {
+      const out = appendConfirmedArtifactNotice(GENERIC, CREATE_REF);
+      expect(out).toContain('created your HTML file');
+      expect(out).not.toContain('updated your HTML file');
+    });
+
+    it('pluralizes wording and the "them" pronoun for more than one artifact', () => {
+      const out = appendConfirmedArtifactNotice(GENERIC, TWO_UPDATE_REFS);
+      expect(out).toContain('updated your HTML files');
+      expect(out).toContain('view them here');
     });
 
     it('leaves the fallback alone when no artifact URL was confirmed', () => {
@@ -575,9 +610,9 @@ describe('falseFailureReport', () => {
     });
 
     it('is idempotent and leaves empty content alone', () => {
-      const once = appendConfirmedArtifactNotice(GENERIC, ['https://s3/edited.html']);
-      expect(appendConfirmedArtifactNotice(once, ['https://s3/edited.html'])).toBe(once);
-      expect(appendConfirmedArtifactNotice('', ['https://s3/edited.html'])).toBe('');
+      const once = appendConfirmedArtifactNotice(GENERIC, UPDATE_REF);
+      expect(appendConfirmedArtifactNotice(once, UPDATE_REF)).toBe(once);
+      expect(appendConfirmedArtifactNotice('', UPDATE_REF)).toBe('');
     });
 
     it('extends an existing publish/data-write correction rather than dropping it', () => {
@@ -585,22 +620,24 @@ describe('falseFailureReport', () => {
         GENERIC,
         ledgerFromSucceededFunctions({ publish_landing_page_changes: 1 }),
       );
-      const out = appendConfirmedArtifactNotice(withPublish, ['https://s3/edited.html']);
+      const out = appendConfirmedArtifactNotice(withPublish, UPDATE_REF);
       expect(out).toContain('published your landing-page changes');
       expect(out).toContain('https://s3/edited.html');
     });
   });
 
   describe('reconcileFalseArtifactFailure', () => {
+    const UPDATE_REF = [{ url: 'https://s3/edited.html', name: 'update_html_file' }];
+
     it('appends the URL when the message falsely claims the work was not saved', () => {
-      const out = reconcileFalseArtifactFailure(FALSE_FAILURE_TEXT, ['https://s3/edited.html']);
+      const out = reconcileFalseArtifactFailure(FALSE_FAILURE_TEXT, UPDATE_REF);
       expect(out).not.toBe(FALSE_FAILURE_TEXT);
       expect(out).toContain('https://s3/edited.html');
     });
 
     it('leaves a truthful message untouched', () => {
       const text = 'Your HTML file has been updated successfully.';
-      expect(reconcileFalseArtifactFailure(text, ['https://s3/edited.html'])).toBe(text);
+      expect(reconcileFalseArtifactFailure(text, UPDATE_REF)).toBe(text);
     });
 
     it('leaves the message untouched when no artifact URL was confirmed', () => {
