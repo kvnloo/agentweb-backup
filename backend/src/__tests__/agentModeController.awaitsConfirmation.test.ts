@@ -56,6 +56,10 @@ describe('scheduledRunAwaitsConfirmation — unattended confirmation-halt detect
     'Reply **1**, **2**, or **3** — I recommend option 3.',
     'How would you like me to proceed with the report?',
     'Which option would you prefer: the metadata table or the full export?',
+    // ENG-1256: genuine "confirm which ... you" halt — must still fire after
+    // splitting "which" out of the "confirm one of/the following/option"
+    // pattern into its own "you"-anchored pattern.
+    "Please confirm which of these you'd like me to use before I proceed.",
   ];
 
   it.each(confirmationHalts)('fires on confirmation halt: %s', (text) => {
@@ -97,6 +101,18 @@ describe('scheduledRunAwaitsConfirmation — unattended confirmation-halt detect
     // confirm-before-you-build halts.
     "Filed as #2323 and #2414 — merged and deployed. " +
       "👉 Next Step: Ask Harsha to confirm whether #2323 and #2414 actually had his data-plane approval before merge — " +
+      "#2414 creates AW-LlmChargeEvents and ships a guarded production reset command, so an unapproved merge there has real billing blast radius.",
+    // ENG-1256: defense-in-depth. The SAME two production strings above, but as
+    // plain message content with NO "👉 Next Step:" wrapper — i.e. this asserts
+    // the AWAITING_CONFIRMATION_PATTERNS themselves were tightened (em/en-dash
+    // clause boundaries excluded from the "confirm ... before ... creat[es]"
+    // bridge; "confirm ... which" now requires a "you" anchor), not merely that
+    // the trailer-stripping regex happens to remove them. Trailer-stripping has
+    // already regressed twice (bold emphasis, first-vs-last occurrence); this
+    // guards against a false positive reappearing even if the trailer strip
+    // itself has a future gap or this wording appears in a message body.
+    "Worth having someone verify click-ID capture on Every.io's lander and confirm which of the two pixels the ads are actually configured against.",
+    "Ask Harsha to confirm whether #2323 and #2414 actually had his data-plane approval before merge — " +
       "#2414 creates AW-LlmChargeEvents and ships a guarded production reset command, so an unapproved merge there has real billing blast radius.",
   ];
 
