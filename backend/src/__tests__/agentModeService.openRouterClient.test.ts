@@ -736,13 +736,21 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create.mock.calls[0][0]).not.toHaveProperty('cache_control');
   });
 
-  it('does not add an AgentWeb retry loop on top of OpenRouter provider fallback', async () => {
+  // ENG-1626 (was "does not add an AgentWeb retry loop on top of OpenRouter
+  // provider fallback" — session b32ec8af, 2026-08-26, showed that invariant
+  // was wrong: a single 429 that survives OpenRouter's own provider-fallback
+  // pool killed an entire session with no retry anywhere in callLLM). callLLM
+  // now retries a fully-exhausted transient failure exactly ONCE, bounded so
+  // it cannot itself compound with OpenRouter's fallback (getOpenRouterClient
+  // still pins maxRetries: 0 above — no SDK-level auto-retry).
+  it('retries a 429 that survives OpenRouter provider fallback exactly once, then gives up', async () => {
     const service = new AgentModeService();
     const error = Object.assign(new Error('rate limited'), { status: 429 });
     const create = jest.fn().mockRejectedValue(error);
     jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
       chat: { completions: { create } },
     } as any);
+    jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
 
     await expect(service.callLLM(
       'gpt-5.5',
@@ -750,7 +758,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       { taskClass: 'interactive_chat' } as any,
     )).rejects.toBe(error);
 
-    expect(create).toHaveBeenCalledTimes(1);
+    expect(create).toHaveBeenCalledTimes(2);
   });
 
   // 2026-08-19: was adminOnly: true on every new-roster entry (gated as

@@ -27,6 +27,7 @@
 
 import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
+import { ToolResultPolicyBlockedError } from '../../../utils/toolResultError';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
 import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
@@ -1330,8 +1331,18 @@ export async function executePreparedTools(
         duration,
       });
 
-      failedCounterUpdates[toolCall.function.name] =
-        (failedCounterUpdates[toolCall.function.name] || 0) + 1;
+      // ENG-1626 / ENG-1636: a ToolResultPolicyBlockedError (result.blocked===true
+      // + a reason, e.g. set_work_plan_status's out-of-order/missing-calls/
+      // insufficient-assets gates) is the tool refusing BY DESIGN, not a
+      // malfunction. agentToolGatewayService already excludes these from the
+      // repeated-failure breaker for the same reason; this counter feeds
+      // session.failedFunctions, the exact field the failure-cluster telemetry
+      // and this issue's "failed 2x" reading were built from, so it needs the
+      // same carve-out or a self-correcting gate refusal reads as an infra flake.
+      if (!(error instanceof ToolResultPolicyBlockedError)) {
+        failedCounterUpdates[toolCall.function.name] =
+          (failedCounterUpdates[toolCall.function.name] || 0) + 1;
+      }
 
       // ENG-124: the model-visible error carries (a) what failed (formatToolError
       // names the tool + reason, with per-tool fix text), and (b+c) an explicit
