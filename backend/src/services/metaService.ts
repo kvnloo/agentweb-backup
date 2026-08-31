@@ -2277,6 +2277,28 @@ export class MetaService {
   }
 
   /**
+   * Resolve an ad's parent campaign without crossing the selected ad-account boundary.
+   * Only the three ownership fields are requested, and the existing read deadline keeps
+   * a stalled Graph request on the launch gate's fail-closed path.
+   */
+  public async getAdCampaignIdForAccount(accessToken: string, adAccountId: string, adId: string): Promise<string | undefined> {
+    try {
+      this.initApi(accessToken);
+      const result = await MetaService.withReadDeadline(
+        () => new Ad(adId).get(['id', 'campaign_id', 'account_id']),
+        'ad parent campaign',
+      );
+      const data: any = (result as any)?._data ?? result;
+      const selectedAccountId = String(adAccountId).trim().replace(/^act_/, '');
+      const ownerAccountId = String(data?.account_id ?? '').trim().replace(/^act_/, '');
+      if (!selectedAccountId || !ownerAccountId || ownerAccountId !== selectedAccountId) return undefined;
+      return typeof data?.campaign_id === 'string' && data.campaign_id ? data.campaign_id : undefined;
+    } catch (error) {
+      return this.handleError(error, 'getAdCampaignIdForAccount') as never;
+    }
+  }
+
+  /**
    * Get a single ad creative with full details including object_story_spec
    */
   public async getAdCreative(accessToken: string, creativeId: string) {
