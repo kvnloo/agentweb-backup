@@ -136,6 +136,20 @@ describe('scheduledRunAwaitsConfirmation — unattended confirmation-halt detect
       "since #2414 creates AW-LlmChargeEvents and ships a guarded production reset command.",
     "The digest above is complete and accurate. " +
       "👉 Next Steps: Worth having someone verify click-ID capture on Every.io's lander and confirm which of the two pixels the ads are actually configured against.",
+    // ENG-1256: NEXT_STEP_TRAILER required the literal colon separator and did
+    // not strip a trailer that uses a dash instead (verified: "👉 Next Step —"
+    // bypassed stripping entirely, same class of gap as the plural-drift case
+    // above). A dash-labeled recommendation about a third party confirming
+    // something before an unrelated party's action must not fire.
+    "The digest above is complete and accurate. " +
+      "👉 Next Step — Ask Harsha to confirm before he continues merging #2323 and #2414.",
+    "The digest above is complete and accurate. " +
+      "👉 Next Step – Ask Harsha to confirm before he continues merging #2323 and #2414.",
+    "The digest above is complete and accurate. " +
+      "👉 Next Step - Ask Harsha to confirm before he continues merging #2323 and #2414.",
+    // Plural drift AND dash drift together — both gaps closed by the same regex.
+    "The digest above is complete and accurate. " +
+      "👉 Next Steps — Ask Harsha to confirm before he continues merging #2323 and #2414.",
   ];
 
   it.each(cleanOrActionable)('does NOT fire on clean/actionable report: %s', (text) => {
