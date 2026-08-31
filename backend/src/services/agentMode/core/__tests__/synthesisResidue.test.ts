@@ -88,8 +88,6 @@ describe('isUnusableSynthesis', () => {
         'Do not call any more tools.',
         "don't call any more tools",
         'DO NOT CALL ANY MORE TOOLS.',
-        'Stop calling tools.',
-        'No more tool calls.',
         'Stop all searching/pagination immediately.',
         '[SYSTEM WARNING] Do not call any more tools. Write your final answer now.',
       ]) {
@@ -101,6 +99,19 @@ describe('isUnusableSynthesis', () => {
       for (const real of [
         'I have finished the task and will not call any more tools unless you ask me to continue.',
         'As requested, here is a summary of what I found — no further tools were needed.',
+      ]) {
+        expect(isUnusableSynthesis(real)).toBe(false);
+      }
+    });
+
+    // "Stop calling tools" and "No more tool calls" were removed from the guard: no
+    // code path ever injects either phrase, and being anchored + under the residue
+    // length cap they could discard a genuine short answer that happens to open
+    // with similar wording.
+    it('does NOT flag a genuine answer that opens with similar-but-uninjected wording', () => {
+      for (const real of [
+        'Stop calling tools that are not needed — the report below is already complete.',
+        'No more tool calls were necessary; here are the results you asked for.',
       ]) {
         expect(isUnusableSynthesis(real)).toBe(false);
       }

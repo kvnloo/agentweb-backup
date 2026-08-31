@@ -60,9 +60,17 @@ const HISTORY_ECHO_PREFIX = /^\[(?:Result of \S+:|Previously called )/;
  * string "Do not call any more tools." A reply that opens with this phrasing is
  * the model parroting its own context, not answering, exactly like the history
  * echo above.
+ *
+ * Scoped to phrasing that actually appears in an injected nudge: "Do not call
+ * any more tools" (`buildTurnTimeBudgetNudge`, `turnTimeBudget.ts`) and "Stop
+ * all searching/pagination immediately" (the step-budget warning,
+ * `agentModeService.ts`). Earlier revisions also matched "stop calling tools"
+ * and "no more tool call(s)?", but no code path ever injects either phrase —
+ * being anchored-and-short, they risked misclassifying a genuine final answer
+ * that happens to open with similar wording as unusable synthesis.
  */
 const INTERNAL_DIRECTIVE_ECHO_RE =
-  /^(?:\[SYSTEM(?:\s+WARNING)?\]\s*)?(?:do\s*n[o']?t\s+call\s+any\s+(?:more|further)\s+tools|stop\s+calling\s+tools|no\s+more\s+tool\s+calls?|stop\s+all\s+searching(?:\s*\/\s*pagination)?)\b/i;
+  /^(?:\[SYSTEM(?:\s+WARNING)?\]\s*)?(?:do\s*n[o']?t\s+call\s+any\s+(?:more|further)\s+tools|stop\s+all\s+searching(?:\s*\/\s*pagination)?)\b/i;
 
 /**
  * ENG-1188: a gemini-3.1-pro-preview work-plan session generated and
