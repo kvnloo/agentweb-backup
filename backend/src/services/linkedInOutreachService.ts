@@ -1518,12 +1518,30 @@ export class LinkedInOutreachService {
   ): Promise<Array<{ id: string; provider_id: string; text: string | null; is_sender: 0 | 1; is_event: 0 | 1; sender_id: string; timestamp: string }>> {
     const client = await this.getClient();
 
-    // Step 1: find the chat between our account and this attendee
-    const chatsResult = await client.messaging.getAllChatsFromAttendee({
-      attendee_id: attendeeId,
-      account_id,
-      limit: 1,
-    });
+    // Step 1: find the chat between our account and this attendee.
+    // Unipile only has a chat_attendee record once a chat exists — a 1st-degree
+    // connection who has never been messaged has no such record, so this 404s
+    // instead of resolving with items: []. That is "no conversation yet", not a
+    // failure (ENG-1623), so classify it the same way handleError would and swallow
+    // only the NOT_FOUND case; anything else (auth/session/etc.) still propagates.
+    let chatsResult;
+    try {
+      chatsResult = await client.messaging.getAllChatsFromAttendee({
+        attendee_id: attendeeId,
+        account_id,
+        limit: 1,
+      });
+    } catch (error: any) {
+      try {
+        await this.handleError(error, 'getMessagesWithContact');
+      } catch (enhanced: any) {
+        if (enhanced?.structuredError?.classification === 'NOT_FOUND') {
+          this.log('getMessagesWithContact: no chat_attendee record yet (never messaged)', { attendeeId, account_id });
+          return [];
+        }
+        throw enhanced;
+      }
+    }
 
     if (!chatsResult?.items?.length) {
       this.log('getMessagesWithContact: no chat found for attendee', { attendeeId, account_id });
