@@ -1,3 +1,29 @@
+## ENG-1624: sub-folder KB traversal fix is correct; one commit's stated motivation isn't (2026-08-31)
+
+Independent re-verification against the live prod session (`822c1ed4-133e-4081-b8c9-ee43547fd463`,
+pulled from `AW-ChatSessions` + `AW-ChatMessages`, since the session record's own `messages` list is
+empty and the real transcript lives in the separate messages table) confirms the fix. The two actual
+failures — matching the session's own `failedFunctions` counter — were both
+`materialize_knowledge_base_asset`, at `2026-08-27T15:49:26Z` (file-not-found against the registered
+root) and `15:49:36Z` ("Not authorized" against the sub-folder itself). That's ~1.5h before the
+issue's stated "~17:19–17:24Z" window, which is actually when the deferred-ads deployment ran and
+step 9 completed with 0 ads — close to when the customer's Slack complaint landed (10:31 PDT =
+17:31Z), not when the tool itself failed. All four Drive KB call sites
+(`materializeKnowledgeBaseAsset`, `readGoogleDriveSharedFile`, `listKnowledgeBaseFiles`,
+`searchKnowledgeBase`) now route through `getGoogleDriveFolderTreeIds`; `tsc` and the 195 targeted
+tests pass post-merge with `main`.
+
+One inaccuracy survives in the commit log: `22bd000c6`'s message claims "search_knowledge_base was
+the call actually exercised by the failing Phoenix session." The transcript shows otherwise —
+`search_knowledge_base` was called exactly once in that session, at `18:55:59Z`, *after* Harsha's
+manual sub-folder registration had already unblocked `materialize` (`18:50–18:52Z`), for an
+unrelated query ("Do Not Say marketing guardrails") that Emma herself determined belonged to a
+different client's KB entry, not Phoenix's. The fix to `searchKnowledgeBase`'s Drive branch is still
+correct and worth keeping — same class of bug, independently confirmed by reading the code — the
+commit message's specific attribution to this session is just wrong. Left uncorrected in the commit
+itself (rewriting a pushed, already-in-PR commit isn't worth a force-push for a prose-only fix);
+noting the correction here instead.
+
 ## ENG-1484: two correct instructions can still lose to each other (2026-08-23)
 
 ENG-1478 (same day) fixed the Work Plan Capabilities section to tell Emma to check
