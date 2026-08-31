@@ -3,9 +3,19 @@ import {
   publishWithdrawnMidFlight,
   attachPublishRevalidation,
 } from '../utils/scheduledPublishConsentGuard';
+import { chatbotDb } from '../services/chatbotService';
+import { scheduleDb } from '../services/db';
+import { getAccountsWithOwnerIncludingOrgShared } from '../services/connectedAccountsDb';
 
 jest.mock('../services/chatbotService', () => ({ chatbotDb: { getChatSession: jest.fn() } }));
 jest.mock('../services/db', () => ({ scheduleDb: { getScheduleById: jest.fn() } }));
+// ENG-1616 — mocked so the default-deps integration test below (which deliberately
+// exercises defaultDeps() itself, not a hand-written mock) can control what account
+// list the real resolveAccountPlatform sees, without hitting DynamoDB.
+jest.mock('../services/connectedAccountsDb', () => ({
+  getAccountsWithOwnerIncludingOrgShared: jest.fn(),
+  SOCIAL_POSTING_PLATFORMS: ['twitter', 'linkedin', 'instagram', 'youtube'],
+}));
 
 /**
  * ENG-827 (Greptile) — a revocation that lands MID-TURN must stop the publish.
@@ -242,6 +252,58 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
       );
       expect(refusal).toBeNull();
       expect(d.resolveAccountPlatform).not.toHaveBeenCalled();
+    });
+
+    /**
+     * ENG-1616 — every test above supplies its OWN hand-written `resolveAccountPlatform`
+     * mock, so none of them ever runs `defaultDeps()`'s actual implementation: the
+     * dynamic `import('../services/connectedAccountsDb')`, the `SOCIAL_POSTING_PLATFORMS`
+     * filter, and the `.find()` by account_id. That is the one piece of new logic in this
+     * PR that isn't a pure function, and a typo in the import or an inverted filter there
+     * would ship green without this test. Omitting `deps` (4th positional arg not passed,
+     * i.e. undefined) makes `refuseUnauthorizedScheduledPublish` build its own deps via
+     * `defaultDeps()`, exercising the real wiring end to end.
+     */
+    it('defaultDeps().resolveAccountPlatform (the real implementation, not a mock) authorizes by account_id', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        ...SESSION_WITH_USER,
+        publishAdmission: TWITTER_ONLY_ADMISSION,
+      });
+      (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue(TWITTER_ONLY_SCHEDULE);
+      (getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([
+        { account_id: '1340767380', platform: 'twitter', account_name: '@harshmoney123' },
+        { account_id: 'other-id', platform: 'linkedin', account_name: 'unrelated' },
+      ]);
+
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        undefined,
+        { account_id: '1340767380', content: 'one tweet' }
+      );
+
+      expect(refusal).toBeNull();
+      expect(getAccountsWithOwnerIncludingOrgShared).toHaveBeenCalledWith('harsha-user-id');
+    });
+
+    it('defaultDeps().resolveAccountPlatform (the real implementation) still refuses when no account matches', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        ...SESSION_WITH_USER,
+        publishAdmission: TWITTER_ONLY_ADMISSION,
+      });
+      (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue(TWITTER_ONLY_SCHEDULE);
+      (getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([
+        { account_id: 'other-id', platform: 'linkedin', account_name: 'unrelated' },
+      ]);
+
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        undefined,
+        { account_id: '1340767380', content: 'one tweet' }
+      );
+
+      expect(refusal).not.toBeNull();
     });
   });
 
