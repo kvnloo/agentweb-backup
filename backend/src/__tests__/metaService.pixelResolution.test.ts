@@ -9,6 +9,14 @@
  * Must never throw: a Meta API hiccup, an unconnected account, or an ambiguous pixel set must
  * all resolve to `{ unresolved: true, reason }` so generation can proceed without tracking
  * (AC3 — fail loud, never fail generation).
+ *
+ * Pixel search now goes through `metaService.listPixels`, which wraps the Facebook Business
+ * SDK's `AdAccount.getAdsPixels()` — not a raw `fetch()` call. These tests spy on
+ * `metaService.listPixels` directly rather than `global.fetch` for that reason; a `fetch` mock
+ * never reaches the SDK's own HTTP layer, so every test that needed it to simulate a resolved
+ * pixel was silently exercising the REAL (uncredentialed, network-dependent) SDK call instead
+ * and failing. The `global.fetch` spy is kept only for the one test that pins "pixel resolution
+ * never falls back to a raw dataset-lookup HTTP call" — that invariant is still meaningful.
  */
 
 import { metaService } from '../services/metaService';
@@ -24,16 +32,21 @@ jest.mock('../services/metaAccountCredentials', () => ({
 
 import { getConnectedMetaAccountsList, getMetaAccountCredentials } from '../services/metaAccountCredentials';
 
+const pixelsResult = (pixels: any[]) => ({ pixels, truncated: false, pagesFetched: 1 });
+
 describe('resolveMetaPixelForUser', () => {
   let mockFetch: jest.SpyInstance;
+  let mockListPixels: jest.SpyInstance;
 
   beforeEach(() => {
     jest.clearAllMocks();
     mockFetch = jest.spyOn(global, 'fetch');
+    mockListPixels = jest.spyOn(metaService, 'listPixels');
   });
 
   afterEach(() => {
     mockFetch.mockRestore();
+    mockListPixels.mockRestore();
   });
 
   const user = { connected_accounts: [{ platform: 'facebook', config: { account_type: 'ad_account', access_token: 'tok' } }] };
@@ -59,7 +72,7 @@ describe('resolveMetaPixelForUser', () => {
   it('is unresolved when the one connected account has zero pixels', async () => {
     (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'acc1' }]);
     (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'acc1', accessToken: 'tok', accountName: 'Acc 1' });
-    mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [] }) });
+    mockListPixels.mockResolvedValue(pixelsResult([]));
 
     const result = await metaService.resolveMetaPixelForUser(user, 'user1');
     expect('unresolved' in result && result.unresolved).toBe(true);
@@ -68,10 +81,7 @@ describe('resolveMetaPixelForUser', () => {
   it('is unresolved when the one connected account has 2+ pixels (ambiguous)', async () => {
     (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'acc1' }]);
     (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'acc1', accessToken: 'tok', accountName: 'Acc 1' });
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: jest.fn().mockResolvedValue({ data: [{ id: 'px1' }, { id: 'px2' }] }),
-    });
+    mockListPixels.mockResolvedValue(pixelsResult([{ id: 'px1' }, { id: 'px2' }]));
 
     const result = await metaService.resolveMetaPixelForUser(user, 'user1');
     expect('unresolved' in result && result.unresolved).toBe(true);
@@ -89,10 +99,7 @@ describe('resolveMetaPixelForUser', () => {
   it('resolves pixelId + accountId when exactly one account has exactly one pixel', async () => {
     (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'acc1' }]);
     (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'acc1', accessToken: 'tok', accountName: 'Acc 1' });
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: jest.fn().mockResolvedValue({ data: [{ id: '1430870751246428', name: 'AgentWeb' }] }),
-    });
+    mockListPixels.mockResolvedValue(pixelsResult([{ id: '1430870751246428', name: 'AgentWeb' }]));
 
     const result = await metaService.resolveMetaPixelForUser(user, 'user1');
     expect(result).toEqual({ pixelId: '1430870751246428', accountId: 'acc1' });
@@ -101,10 +108,7 @@ describe('resolveMetaPixelForUser', () => {
   it('never calls the broken per-pixel listDatasets edge (pins the ENG-399 workaround)', async () => {
     (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'acc1' }]);
     (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'acc1', accessToken: 'tok', accountName: 'Acc 1' });
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: jest.fn().mockResolvedValue({ data: [{ id: 'px1' }] }),
-    });
+    mockListPixels.mockResolvedValue(pixelsResult([{ id: 'px1' }]));
 
     await metaService.resolveMetaPixelForUser(user, 'user1');
     const datasetCalls = mockFetch.mock.calls.filter((c: any[]) => String(c[0]).includes('/datasets'));
@@ -120,15 +124,15 @@ describe('resolveMetaPixelForUser', () => {
  * (the Calendly card's account/pixel dropdowns) always wins when present.
  */
 describe('resolveMetaPixelWithDefault', () => {
-  let mockFetch: jest.SpyInstance;
+  let mockListPixels: jest.SpyInstance;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    mockFetch = jest.spyOn(global, 'fetch');
+    mockListPixels = jest.spyOn(metaService, 'listPixels');
   });
 
   afterEach(() => {
-    mockFetch.mockRestore();
+    mockListPixels.mockRestore();
   });
 
   const user = { connected_accounts: [{ platform: 'facebook', config: { account_type: 'ad_account', access_token: 'tok' } }] };
@@ -147,9 +151,9 @@ describe('resolveMetaPixelWithDefault', () => {
 
     expect(result).toEqual({ pixelId: 'storedPixel', accountId: 'storedAcc' });
     // getConnectedMetaAccountsList IS now called (a local, already-loaded-record check).
-    // What must stay zero is Graph traffic: no credential fetch, no HTTP.
+    // What must stay zero is Graph traffic: no credential fetch, no pixel search call.
     expect(getMetaAccountCredentials).not.toHaveBeenCalled();
-    expect(mockFetch).not.toHaveBeenCalled();
+    expect(mockListPixels).not.toHaveBeenCalled();
   });
 
   it('defaults to the first connected account and its first pixel when nothing is stored', async () => {
@@ -158,10 +162,7 @@ describe('resolveMetaPixelWithDefault', () => {
       { accountId: 'acc2' },
     ]);
     (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'acc1', accessToken: 'tok', accountName: 'Acc 1' });
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: jest.fn().mockResolvedValue({ data: [{ id: 'firstPixel' }, { id: 'secondPixel' }] }),
-    });
+    mockListPixels.mockResolvedValue(pixelsResult([{ id: 'firstPixel' }, { id: 'secondPixel' }]));
 
     const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', undefined);
 
@@ -187,9 +188,9 @@ describe('resolveMetaPixelWithDefault', () => {
     (getMetaAccountCredentials as jest.Mock)
       .mockResolvedValueOnce({ accountId: 'acc1', accessToken: 'tok1', accountName: 'Acc 1' })
       .mockResolvedValueOnce({ accountId: 'acc2', accessToken: 'tok2', accountName: 'Acc 2' });
-    mockFetch
-      .mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ data: [] }) })
-      .mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'secondAccountPixel' }] }) });
+    mockListPixels
+      .mockResolvedValueOnce(pixelsResult([]))
+      .mockResolvedValueOnce(pixelsResult([{ id: 'secondAccountPixel' }]));
 
     const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', undefined);
 
@@ -204,7 +205,7 @@ describe('resolveMetaPixelWithDefault', () => {
     (getMetaAccountCredentials as jest.Mock)
       .mockResolvedValueOnce({ accountId: 'acc1', accessToken: 'tok1', accountName: 'Acc 1' })
       .mockResolvedValueOnce({ accountId: 'acc2', accessToken: 'tok2', accountName: 'Acc 2' });
-    mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [] }) });
+    mockListPixels.mockResolvedValue(pixelsResult([]));
 
     const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', undefined);
 
@@ -217,7 +218,7 @@ describe('resolveMetaPixelWithDefault', () => {
     (getMetaAccountCredentials as jest.Mock)
       .mockRejectedValueOnce(new Error('token expired'))
       .mockResolvedValueOnce({ accountId: 'acc2', accessToken: 'tok2', accountName: 'Acc 2' });
-    mockFetch.mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'workingPixel' }] }) });
+    mockListPixels.mockResolvedValueOnce(pixelsResult([{ id: 'workingPixel' }]));
 
     const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', undefined);
 
@@ -244,7 +245,7 @@ describe('resolveMetaPixelWithDefault', () => {
   it('falls through to the default search when the stored account is no longer connected', async () => {
     (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'stillConnected' }]);
     (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'stillConnected', accessToken: 'tok', accountName: 'Live' });
-    mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'healthyPixel' }] }) });
+    mockListPixels.mockResolvedValue(pixelsResult([{ id: 'healthyPixel' }]));
 
     const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', {
       pixelId: 'stalePixel',
@@ -257,7 +258,7 @@ describe('resolveMetaPixelWithDefault', () => {
   it('is unresolved (not stale-selected) when the stored account is gone and no other account has a pixel', async () => {
     (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'otherAcc' }]);
     (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'otherAcc', accessToken: 'tok', accountName: 'Other' });
-    mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [] }) });
+    mockListPixels.mockResolvedValue(pixelsResult([]));
 
     const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', {
       pixelId: 'stalePixel',
@@ -281,7 +282,7 @@ describe('resolveMetaPixelWithDefault', () => {
     // The connectivity check is local (reads the already-loaded user record). What must
     // NOT happen is a per-booking Graph round-trip just to confirm a stored choice.
     expect(getMetaAccountCredentials).not.toHaveBeenCalled();
-    expect(mockFetch).not.toHaveBeenCalled();
+    expect(mockListPixels).not.toHaveBeenCalled();
   });
 
   it('honors the stored pair when the connected-accounts list cannot be read, rather than discarding the choice', async () => {
@@ -308,14 +309,14 @@ describe('resolveMetaPixelWithDefault', () => {
 
       expect(result).toEqual({ pixelId: 'storedPixel', accountId: 'storedAcc' });
       expect(getMetaAccountCredentials).not.toHaveBeenCalled();
-      expect(mockFetch).not.toHaveBeenCalled();
+      expect(mockListPixels).not.toHaveBeenCalled();
     });
 
     it('falls through when the warm cache shows the stored pixel is gone', async () => {
       (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'storedAcc' }]);
       (getCachedPixels as jest.Mock).mockReturnValue([{ pixelId: 'someOtherPixel', accountId: 'storedAcc' }]);
       (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'storedAcc', accessToken: 'tok', accountName: 'Acc' });
-      mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'someOtherPixel' }] }) });
+      mockListPixels.mockResolvedValue(pixelsResult([{ id: 'someOtherPixel' }]));
 
       const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'deletedPixel', accountId: 'storedAcc' });
 
@@ -326,12 +327,12 @@ describe('resolveMetaPixelWithDefault', () => {
       (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'storedAcc' }]);
       (getCachedPixels as jest.Mock).mockReturnValue(null);
       (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'storedAcc', accessToken: 'tok', accountName: 'Acc' });
-      mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'storedPixel' }] }) });
+      mockListPixels.mockResolvedValue(pixelsResult([{ id: 'storedPixel' }]));
 
       const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
 
       expect(result).toEqual({ pixelId: 'storedPixel', accountId: 'storedAcc' });
-      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(mockListPixels).toHaveBeenCalledTimes(1);
     });
 
     it('falls through to another account when a cold check shows the stored pixel is gone', async () => {
@@ -341,10 +342,10 @@ describe('resolveMetaPixelWithDefault', () => {
         .mockResolvedValueOnce({ accountId: 'storedAcc', accessToken: 'tok', accountName: 'Stored' })
         .mockResolvedValueOnce({ accountId: 'storedAcc', accessToken: 'tok', accountName: 'Stored' })
         .mockResolvedValueOnce({ accountId: 'healthyAcc', accessToken: 'tok2', accountName: 'Healthy' });
-      mockFetch
-        .mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ data: [] }) })            // verification: gone
-        .mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ data: [] }) })            // storedAcc has none
-        .mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'live' }] }) });
+      mockListPixels
+        .mockResolvedValueOnce(pixelsResult([]))            // verification: gone
+        .mockResolvedValueOnce(pixelsResult([]))            // storedAcc has none in the general search
+        .mockResolvedValueOnce(pixelsResult([{ id: 'live' }]));
 
       const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'deletedPixel', accountId: 'storedAcc' });
 
@@ -356,7 +357,7 @@ describe('resolveMetaPixelWithDefault', () => {
       (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'storedAcc' }]);
       (getCachedPixels as jest.Mock).mockReturnValue(null);
       (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'storedAcc', accessToken: 'tok', accountName: 'Acc' });
-      mockFetch.mockRejectedValue(new Error('graph unreachable'));
+      mockListPixels.mockRejectedValue(new Error('graph unreachable'));
 
       const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
 
@@ -373,7 +374,7 @@ describe('resolveMetaPixelWithDefault', () => {
         .mockRejectedValueOnce(new Error('token revoked'))                                              // verification
         .mockRejectedValueOnce(new Error('token revoked'))                                              // storedAcc during search
         .mockResolvedValueOnce({ accountId: 'healthyAcc', accessToken: 'tok2', accountName: 'Healthy' });
-      mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'livePixel' }] }) });
+      mockListPixels.mockResolvedValue(pixelsResult([{ id: 'livePixel' }]));
 
       const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
 
@@ -384,7 +385,7 @@ describe('resolveMetaPixelWithDefault', () => {
   it('ignores a partially-stored value (pixelId without accountId) and falls through to the default', async () => {
     (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'acc1' }]);
     (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'acc1', accessToken: 'tok', accountName: 'Acc 1' });
-    mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'fallbackPixel' }] }) });
+    mockListPixels.mockResolvedValue(pixelsResult([{ id: 'fallbackPixel' }]));
 
     const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'orphanPixel' } as any);
 

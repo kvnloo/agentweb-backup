@@ -359,6 +359,7 @@ import {
   trackingOverrideTokenMatches,
 } from './metaLaunchGate';
 import { HubSpotService } from './hubspotService';
+import { handleAttioApi as handleAttioApiImpl } from './agentMode/attioTools';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
@@ -37127,6 +37128,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return { success: false, error: err?.message ?? 'HubSpot API call failed.', hubspotError: err?.response?.data ?? null, status: err?.response?.status ?? null };
     }
   }
+
+  /**
+   * Emma tool: read-only Attio lead counts, for CPL/attribution reporting,
+   * plus Attio list/list-entry management. Extracted to
+   * services/agentMode/attioTools.ts (self-contained, no monolith coupling)
+   * per this file's subtraction-biased complexity policy.
+   */
+  public async handleAttioApi(userId: string, args: any): Promise<any> {
+    return handleAttioApiImpl(userId, args);
+  }
+
 
 }
 

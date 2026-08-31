@@ -172,7 +172,12 @@ export const INTEGRATION_CONFIG = {
     authorizationUrl: 'https://app.attio.com/authorize',
     tokenUrl: 'https://app.attio.com/oauth/token',
     selfUrl: 'https://api.attio.com/v2/self',
-    scopes: [],
+    // Attio scopes are actually dashboard-configured on the registered app, not
+    // negotiated via this request-time param (confirmed against Attio's OAuth
+    // docs) — this array is inert for the /authorize call itself. It's kept in
+    // sync with the app's real dashboard scopes anyway for documentation value,
+    // and because getAttioConfig() forwards it verbatim into the /init request.
+    scopes: ['webhook:read-write'],
   },
 
   hubspot: {

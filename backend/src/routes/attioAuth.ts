@@ -6,6 +6,7 @@ import { getAttioConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
+import { NON_EXPIRING_TOKEN_TIMESTAMP } from '../utils/tokenUtils';
 
 const router = express.Router();
 
@@ -193,7 +194,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       config: {
         account_type: 'oauth',
         access_token: tokens.access_token,
-        token_expires_at: 9999999999999, // Attio tokens do not expire
+        token_expires_at: NON_EXPIRING_TOKEN_TIMESTAMP, // Attio tokens do not expire
         workspace_id: workspaceInfo.workspace_id,
         workspace_name: workspaceInfo.workspace_name,
       },

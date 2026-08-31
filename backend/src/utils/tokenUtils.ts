@@ -4,6 +4,9 @@
 
 export type TokenStatus = 'active' | 'expiring_soon' | 'expired' | 'disconnected';
 
+/** Sentinel `expires_at` used by providers whose tokens never expire (e.g. Attio). */
+export const NON_EXPIRING_TOKEN_TIMESTAMP = 9999999999999;
+
 /**
  * Get the status of a token based on its expiry time
  * @param expiresAt - Token expiry timestamp in milliseconds
@@ -28,6 +31,10 @@ export function getTokenStatus(expiresAt: number): TokenStatus {
  * @returns Human-readable string like "Expires in 5 days"
  */
 export function formatExpiryMessage(expiresAt: number): string {
+  if (expiresAt >= NON_EXPIRING_TOKEN_TIMESTAMP) {
+    return 'Connected';
+  }
+
   const now = Date.now();
   const diffMs = expiresAt - now;
 

@@ -107,37 +107,58 @@ describe('AttioService', () => {
   // ─── People ──────────────────────────────────────────────────────
 
   describe('listPeople', () => {
-    it('returns mapped people array', async () => {
-      mockAxiosPost.mockResolvedValue({ data: { data: [MOCK_PERSON_RECORD], next_cursor: undefined } });
+    // Attio's /objects/{object}/records/query endpoints use limit/offset
+    // pagination, not cursor — confirmed against Attio's own docs. There is
+    // no next_cursor in the response envelope at all; end-of-results is
+    // inferred purely from getting back fewer than `limit` records.
+    it('returns mapped people array, sending offset:0 on the first page', async () => {
+      mockAxiosPost.mockResolvedValue({ data: { data: [MOCK_PERSON_RECORD] } });
 
       const result = await service.listPeople();
 
       expect(mockAxiosPost).toHaveBeenCalledWith(
         'https://api.attio.com/v2/objects/people/records/query',
-        { limit: 50 },
+        { limit: 50, offset: 0 },
         expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer test-token' }) })
       );
       expect(result.people).toHaveLength(1);
       expect(result.people[0]).toMatchObject({ recordId: 'rec-person-1', email: 'john@acme.com', firstName: 'John' });
     });
 
-    it('passes cursor for pagination', async () => {
-      mockAxiosPost.mockResolvedValue({ data: { data: [], next_cursor: 'next-page' } });
+    it('passes an explicit offset for a later page', async () => {
+      mockAxiosPost.mockResolvedValue({ data: { data: [] } });
 
-      const result = await service.listPeople('some-cursor');
+      await service.listPeople(50);
 
       expect(mockAxiosPost).toHaveBeenCalledWith(
         expect.any(String),
-        { limit: 50, cursor: 'some-cursor' },
+        { limit: 50, offset: 50 },
         expect.any(Object)
       );
-      expect(result.nextCursor).toBe('next-page');
+    });
+
+    it('reports nextOffset when a full page comes back (there may be more)', async () => {
+      const fullPage = Array.from({ length: 50 }, () => MOCK_PERSON_RECORD);
+      mockAxiosPost.mockResolvedValue({ data: { data: fullPage } });
+
+      const result = await service.listPeople(0);
+
+      expect(result.nextOffset).toBe(50);
+    });
+
+    it('reports nextOffset:undefined for a short page (end of results)', async () => {
+      mockAxiosPost.mockResolvedValue({ data: { data: [MOCK_PERSON_RECORD] } });
+
+      const result = await service.listPeople(100);
+
+      expect(result.nextOffset).toBeUndefined();
     });
 
     it('returns empty array when no records', async () => {
       mockAxiosPost.mockResolvedValue({ data: { data: [] } });
       const result = await service.listPeople();
       expect(result.people).toHaveLength(0);
+      expect(result.nextOffset).toBeUndefined();
     });
   });
 
@@ -232,6 +253,24 @@ describe('AttioService', () => {
     it('throws on API error', async () => {
       mockAxiosDelete.mockRejectedValue(new Error('Not found'));
       await expect(service.deletePerson('bad-id')).rejects.toThrow('Not found');
+    });
+  });
+
+  describe('deleteListEntry', () => {
+    it('calls delete with the correct list and entry id', async () => {
+      mockAxiosDelete.mockResolvedValue({ data: {} });
+
+      await service.deleteListEntry('list-abc', 'entry-1');
+
+      expect(mockAxiosDelete).toHaveBeenCalledWith(
+        'https://api.attio.com/v2/lists/list-abc/entries/entry-1',
+        expect.any(Object)
+      );
+    });
+
+    it('throws on API error', async () => {
+      mockAxiosDelete.mockRejectedValue(new Error('Not found'));
+      await expect(service.deleteListEntry('list-abc', 'bad-entry')).rejects.toThrow('Not found');
     });
   });
 
@@ -403,6 +442,140 @@ describe('AttioService', () => {
         }),
         expect.any(Object)
       );
+    });
+
+    it('returns undefined when the response has no entry id', async () => {
+      mockAxiosPost.mockResolvedValue({ data: {} });
+
+      const entryId = await service.addPersonToList('list-abc', 'rec-person-1');
+
+      expect(entryId).toBeUndefined();
+    });
+
+    it('returns the new entry id extracted from the response', async () => {
+      mockAxiosPost.mockResolvedValue({ data: { data: { id: { entry_id: 'entry-1' } } } });
+
+      const entryId = await service.addPersonToList('list-abc', 'rec-person-1', {
+        industry: [{ value: 'SaaS' }],
+      });
+
+      expect(entryId).toBe('entry-1');
+    });
+  });
+
+  describe('countListEntries', () => {
+    it('propagates an error from the underlying request (e.g. invalid/unknown list)', async () => {
+      mockAxiosPost.mockRejectedValue(new Error('Not Found'));
+      await expect(service.countListEntries('bad-list')).rejects.toThrow('Not Found');
+    });
+
+    it('returns 0 for an empty list', async () => {
+      mockAxiosPost.mockResolvedValue({ data: { data: [] } });
+      const result = await service.countListEntries('list-abc');
+      expect(result).toEqual({ count: 0, capped: false });
+    });
+
+    it('sums entries across multiple pages, advancing offset by page size (limit/offset, not cursor)', async () => {
+      const fullPage = Array.from({ length: 50 }, (_, i) => ({ id: i }));
+      mockAxiosPost
+        .mockResolvedValueOnce({ data: { data: fullPage } })
+        .mockResolvedValueOnce({ data: { data: [{ id: 51 }] } });
+
+      const result = await service.countListEntries('list-abc');
+
+      expect(result).toEqual({ count: 51, capped: false });
+      expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+      expect(mockAxiosPost).toHaveBeenNthCalledWith(1, expect.any(String), { limit: 50, offset: 0 }, expect.any(Object));
+      expect(mockAxiosPost).toHaveBeenNthCalledWith(2, expect.any(String), { limit: 50, offset: 50 }, expect.any(Object));
+    });
+
+    it('stops after 200 pages and reports capped:true for a pathologically large list', async () => {
+      const fullPage = Array.from({ length: 50 }, (_, i) => ({ id: i }));
+      mockAxiosPost.mockImplementation(() => Promise.resolve({ data: { data: fullPage } }));
+
+      const result = await service.countListEntries('huge-list');
+
+      expect(result).toEqual({ count: 10000, capped: true });
+      expect(mockAxiosPost).toHaveBeenCalledTimes(200);
+    });
+  });
+
+  describe('listListEntriesDetailed', () => {
+    it('filters out an entry missing parent_record_id', async () => {
+      mockAxiosPost.mockResolvedValue({
+        data: {
+          data: [
+            { id: { entry_id: 'entry-1' }, entry_values: { deal_value: [{ value: '100' }] } },
+          ],
+        },
+      });
+      const { entries } = await service.listListEntriesDetailed('list-abc');
+      expect(entries).toHaveLength(0);
+    });
+
+    it('filters out an entry missing id.entry_id', async () => {
+      mockAxiosPost.mockResolvedValue({
+        data: { data: [{ parent_record_id: 'person-1', entry_values: {} }] },
+      });
+      const { entries } = await service.listListEntriesDetailed('list-abc');
+      expect(entries).toHaveLength(0);
+    });
+
+    it('extracts entryId, personRecordId, and values from a well-formed entry', async () => {
+      mockAxiosPost.mockResolvedValue({
+        data: {
+          data: [
+            {
+              id: { entry_id: 'entry-1' },
+              parent_record_id: 'person-1',
+              entry_values: { deal_value: [{ value: '100' }], deal_status: [{ status: 'open' }] },
+            },
+          ],
+        },
+      });
+
+      const { entries, nextOffset } = await service.listListEntriesDetailed('list-abc');
+
+      expect(entries).toEqual([
+        {
+          entryId: 'entry-1',
+          personRecordId: 'person-1',
+          values: { deal_value: [{ value: '100' }], deal_status: [{ status: 'open' }] },
+        },
+      ]);
+      // A 1-entry page is short of the 50-entry limit — end of results.
+      expect(nextOffset).toBeUndefined();
+    });
+
+    it('defaults values to {} when entry_values is absent', async () => {
+      mockAxiosPost.mockResolvedValue({
+        data: { data: [{ id: { entry_id: 'entry-1' }, parent_record_id: 'person-1' }] },
+      });
+      const { entries } = await service.listListEntriesDetailed('list-abc');
+      expect(entries[0].values).toEqual({});
+    });
+
+    it('passes the offset through to the underlying request', async () => {
+      mockAxiosPost.mockResolvedValue({ data: { data: [] } });
+      await service.listListEntriesDetailed('list-abc', 100);
+      expect(mockAxiosPost).toHaveBeenCalledWith(
+        expect.any(String),
+        { limit: 50, offset: 100 },
+        expect.any(Object)
+      );
+    });
+
+    it('reports nextOffset when a full page comes back (there may be more)', async () => {
+      const fullPage = Array.from({ length: 50 }, (_, i) => ({
+        id: { entry_id: `entry-${i}` },
+        parent_record_id: `person-${i}`,
+        entry_values: {},
+      }));
+      mockAxiosPost.mockResolvedValue({ data: { data: fullPage } });
+
+      const { nextOffset } = await service.listListEntriesDetailed('list-abc', 0);
+
+      expect(nextOffset).toBe(50);
     });
   });
 });
