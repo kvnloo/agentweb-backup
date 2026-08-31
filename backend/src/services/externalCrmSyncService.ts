@@ -61,6 +61,10 @@ export interface ExternalCrmSyncConfig {
   contactFieldMapping: FieldMapping[];
   dealFieldMapping: FieldMapping[];
   customFieldMapping: FieldMapping[];
+  // Attio-only, pull-only (see DEFAULT_ATTIO_COMPANY_MAPPING for why).
+  // Optional — configs saved before this field existed won't have it;
+  // readers must treat a missing value as an empty mapping.
+  companyFieldMapping?: FieldMapping[];
   // Delete sync options
   deleteOnPush?: boolean;   // Delete CRM record when a local lead is deleted
   deleteOnPull?: boolean;   // Mark local lead as removed when CRM record is deleted
@@ -79,6 +83,11 @@ export interface ExternalCrmSyncConfig {
   // Cached external IDs to skip redundant lookups
   externalPipelineId?: string;      // HubSpot deal pipeline ID
   hubspotDealStageMap?: Record<string, string>; // AgentWeb status value -> HubSpot stage ID
+  // Attio has no native Deal object — a Deal is represented as an entry in a
+  // dedicated Attio List (see attioAdapter.ts pushLeads). This is that List's ID,
+  // lazily resolved/created on first push and cached here (locked post-sync, same
+  // as externalPipelineId above).
+  attioDealListId?: string;
   // Sync state
   lastPushSyncAt?: string;
   lastPullSyncAt?: string;
@@ -147,6 +156,20 @@ export const DEFAULT_HUBSPOT_CONTACT_MAPPING: FieldMapping[] = [
   { agentwebField: 'linkedin', crmProperty: 'hs_linkedin_url', direction: 'push', enabled: true },
 ];
 
+// UTM/campaign attribution fields, surfaced as a default mapping for both
+// providers so Meta/Google/LinkedIn ad attribution survives the CRM handoff
+// without the user hand-configuring it. Leaf fields only — never the parent
+// `firstTouch`/`utm` object: mapping the object directly either pushes the
+// literal string "[object Object]" (HubSpot) or is silently skipped (Attio).
+// One-way ('push'): AgentWeb is attribution's source of truth, not the CRM.
+export const ATTRIBUTION_FIELD_MAPPING: FieldMapping[] = [
+  { agentwebField: 'utmSource', crmProperty: 'utm_source', direction: 'push', enabled: true },
+  { agentwebField: 'utmMedium', crmProperty: 'utm_medium', direction: 'push', enabled: true },
+  { agentwebField: 'firstTouch.utm.campaign', crmProperty: 'utm_campaign', direction: 'push', enabled: true },
+  { agentwebField: 'firstTouch.referrer', crmProperty: 'referrer', direction: 'push', enabled: true },
+  { agentwebField: 'firstTouch.landingUrl', crmProperty: 'landing_url', direction: 'push', enabled: true },
+];
+
 // 'notes' has no standard HubSpot contact property — pushed as a custom property
 // so ensureContactProperty runs before the push and creates it if absent.
 // HUBSPOT_LIST_IDENTITY_MAPPING (listName/listId) is defined in hubspotAdapter to
@@ -155,6 +178,7 @@ export const DEFAULT_HUBSPOT_CONTACT_MAPPING: FieldMapping[] = [
 export const DEFAULT_HUBSPOT_CUSTOM_MAPPING: FieldMapping[] = [
   { agentwebField: 'notes', crmProperty: 'notes', direction: 'both', enabled: true },
   ...HUBSPOT_LIST_IDENTITY_MAPPING,
+  ...ATTRIBUTION_FIELD_MAPPING,
 ];
 
 export const DEFAULT_HUBSPOT_DEAL_MAPPING: FieldMapping[] = [
@@ -179,7 +203,19 @@ export const DEFAULT_ATTIO_DEAL_MAPPING: FieldMapping[] = [];
 
 export const DEFAULT_ATTIO_CUSTOM_MAPPING: FieldMapping[] = [
   { agentwebField: 'notes', crmProperty: 'notes', direction: 'both', enabled: true },
+  ...ATTRIBUTION_FIELD_MAPPING,
 ];
+
+// Attio-only: maps a Person's linked Attio Company record's own attributes
+// (industry, employee range, ARR, custom company attributes, etc.) into lead
+// custom fields. Pull-only by design — company field mapping is not wired
+// into the real-time webhook auto-sync (a Company record change never fires
+// an event on the linked Person, so there's no reliable real-time trigger;
+// this rides on the same manual/periodic Pull that already re-resolves each
+// person's company fresh on every run). Opt-in — empty by default, same as
+// DEFAULT_ATTIO_DEAL_MAPPING. HubSpot has no equivalent: its "company" is a
+// flat string property directly on the Contact, not a separate object.
+export const DEFAULT_ATTIO_COMPANY_MAPPING: FieldMapping[] = [];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -239,11 +275,13 @@ export class ExternalCrmSyncService {
       contactFieldMapping?: FieldMapping[];
       dealFieldMapping?: FieldMapping[];
       customFieldMapping?: FieldMapping[];
+      companyFieldMapping?: FieldMapping[];
       deleteOnPush?: boolean;
       deleteOnPull?: boolean;
       webhookEnabled?: boolean;
-      // Pipeline selection — only honoured before first sync (server enforces the lock)
+      // Pipeline/list selection — only honoured before first sync (server enforces the lock)
       externalPipelineId?: string;   // HubSpot: chosen deal pipeline ID
+      attioDealListId?: string;      // Attio: chosen deal-list ID
       listName?: string;
       // HubSpot push constant applied to every synced contact
       hubspotLifecycleStage?: string | null;     // null/'' clears the override
@@ -265,19 +303,12 @@ export class ExternalCrmSyncService {
     const now = new Date().toISOString();
     const isHubspot = provider === 'hubspot';
 
-    let nextDealFieldMapping = updates.dealFieldMapping ?? existing?.dealFieldMapping
+    const nextDealFieldMapping = updates.dealFieldMapping ?? existing?.dealFieldMapping
       ?? (isHubspot ? DEFAULT_HUBSPOT_DEAL_MAPPING : DEFAULT_ATTIO_DEAL_MAPPING);
-    let nextCustomFieldMapping = updates.customFieldMapping ?? existing?.customFieldMapping
+    const nextCustomFieldMapping = updates.customFieldMapping ?? existing?.customFieldMapping
       ?? (isHubspot ? DEFAULT_HUBSPOT_CUSTOM_MAPPING : DEFAULT_ATTIO_CUSTOM_MAPPING);
-
-    // Attio has no separate "deal" object — deal mappings are stored as list-entry (custom) attrs.
-    // When saving for Attio, merge any deal mappings into customFieldMapping and clear dealFieldMapping.
-    if (!isHubspot && nextDealFieldMapping.length > 0) {
-      const existingCustomKeys = new Set(nextCustomFieldMapping.map((m: FieldMapping) => m.agentwebField));
-      const dealEntries = nextDealFieldMapping.filter((m: FieldMapping) => !existingCustomKeys.has(m.agentwebField));
-      nextCustomFieldMapping = [...nextCustomFieldMapping, ...dealEntries];
-      nextDealFieldMapping = [];
-    }
+    const nextCompanyFieldMapping = updates.companyFieldMapping ?? existing?.companyFieldMapping
+      ?? (isHubspot ? [] : DEFAULT_ATTIO_COMPANY_MAPPING);
 
     // HubSpot per-contact push constant. A non-CRM provider never carries it.
     // `null` is an explicit clear (→ undefined); `undefined` (key absent) preserves
@@ -309,6 +340,16 @@ export class ExternalCrmSyncService {
       ? existing?.externalPipelineId
       : (isHubspot ? (updates.externalPipelineId ?? existing?.externalPipelineId) : undefined);
 
+    // Attio deal-list ID. Pre-sync, the user can pre-select an existing Attio
+    // list from the picker (mirrors HubSpot's externalPipelineId pattern above)
+    // — otherwise it's resolved/created lazily by attioAdapter.pushLeads on
+    // first push. Once a sync has happened, it's locked (same lock as the
+    // HubSpot pipeline above); re-pointing post-sync goes through
+    // changePipeline instead, not a normal saveConfig update.
+    const resolvedAttioDealListId = alreadySynced
+      ? existing?.attioDealListId
+      : (!isHubspot ? (updates.attioDealListId ?? existing?.attioDealListId) : undefined);
+
     const config: ExternalCrmSyncConfig = {
       provider: provider as 'hubspot' | 'attio',
       listId,
@@ -323,6 +364,7 @@ export class ExternalCrmSyncService {
         ?? (isHubspot ? DEFAULT_HUBSPOT_CONTACT_MAPPING : DEFAULT_ATTIO_CONTACT_MAPPING),
       dealFieldMapping: nextDealFieldMapping,
       customFieldMapping: nextCustomFieldMapping,
+      companyFieldMapping: nextCompanyFieldMapping,
       deleteOnPush: updates.deleteOnPush ?? existing?.deleteOnPush ?? false,
       deleteOnPull: updates.deleteOnPull ?? existing?.deleteOnPull ?? false,
       webhookEnabled: updates.webhookEnabled ?? existing?.webhookEnabled ?? true,
@@ -331,6 +373,7 @@ export class ExternalCrmSyncService {
       hubspotMarkAsNonMarketing: resolveMarkAsNonMarketing(),
       externalPipelineId: resolvedExternalPipelineId,
       hubspotDealStageMap: existing?.hubspotDealStageMap,
+      attioDealListId: resolvedAttioDealListId,
       lastPushSyncAt: existing?.lastPushSyncAt,
       lastPullSyncAt: existing?.lastPullSyncAt,
       lastSyncStatus: existing?.lastSyncStatus,
@@ -423,6 +466,7 @@ export class ExternalCrmSyncService {
     contactFieldMapping: FieldMapping[];
     dealFieldMapping: FieldMapping[];
     customFieldMapping: FieldMapping[];
+    companyFieldMapping: FieldMapping[];
   }> {
     const isHubspot = provider === 'hubspot';
     if (isHubspot) {
@@ -430,12 +474,14 @@ export class ExternalCrmSyncService {
         contactFieldMapping: DEFAULT_HUBSPOT_CONTACT_MAPPING,
         dealFieldMapping: DEFAULT_HUBSPOT_DEAL_MAPPING,
         customFieldMapping: DEFAULT_HUBSPOT_CUSTOM_MAPPING,
+        companyFieldMapping: [],
       };
     } else {
       return {
         contactFieldMapping: DEFAULT_ATTIO_CONTACT_MAPPING,
         dealFieldMapping: DEFAULT_ATTIO_DEAL_MAPPING,
         customFieldMapping: DEFAULT_ATTIO_CUSTOM_MAPPING,
+        companyFieldMapping: DEFAULT_ATTIO_COMPANY_MAPPING,
       };
     }
   }
@@ -481,7 +527,19 @@ export class ExternalCrmSyncService {
     if (config.apiKeyEncrypted) return true;
     if (!config.accountId) return false;
     const account = await getAccountById(config.accountId, config.userId).catch(() => null);
-    return !!account;
+    if (!account) return false;
+    // Attio's per-workspace webhook registration can 403 on a missing OAuth
+    // scope (an account connected before webhook:read-write was requested) —
+    // ensureAttioWebhook flags this on the account itself rather than
+    // failing loudly, so without this check the account looks fully
+    // connected while real-time auto-pull is silently dead. Surface it the
+    // same way as a fully-missing account: reconnecting re-grants the scope
+    // and (createAccount replaces config wholesale on reconnect, not merges)
+    // clears both this flag and the stale webhook_id, so registration
+    // retries cleanly on the next config save. No-op for HubSpot/any
+    // provider that never sets this field.
+    if ((account.config as any)?.needs_reconnect) return false;
+    return true;
   }
 
   async testConnection(
@@ -581,11 +639,11 @@ export class ExternalCrmSyncService {
     provider: string,
     newPipelineId: string
   ): Promise<ExternalCrmSyncConfig> {
-    if (provider !== 'hubspot') {
-      throw new Error('Changing the deal pipeline is only supported for HubSpot.');
+    if (provider !== 'hubspot' && provider !== 'attio') {
+      throw new Error('Changing the deal pipeline/list is only supported for HubSpot and Attio.');
     }
     if (!newPipelineId) {
-      throw new Error('A target pipeline is required.');
+      throw new Error('A target pipeline/list is required.');
     }
 
     const config = await this.getConfig(userId, listId, provider);
@@ -594,22 +652,52 @@ export class ExternalCrmSyncService {
       throw new Error('No authentication configured for this list.');
     }
 
-    // Validate the target pipeline exists in the connected HubSpot account.
-    const svc = await this.getHubSpotService(this.resolveAuth(config));
-    const pipelines = await svc.listDealPipelines();
-    if (!pipelines.some(p => p.id === newPipelineId)) {
-      throw new Error(`Pipeline not found in HubSpot: ${newPipelineId}`);
+    if (provider === 'hubspot') {
+      // Validate the target pipeline exists in the connected HubSpot account.
+      const svc = await this.getHubSpotService(this.resolveAuth(config));
+      const pipelines = await svc.listDealPipelines();
+      if (!pipelines.some(p => p.id === newPipelineId)) {
+        throw new Error(`Pipeline not found in HubSpot: ${newPipelineId}`);
+      }
+
+      // Bypass the saveConfig "locked after sync" guard: write the new pipeline and
+      // clear the stale stage map so the next push recomputes it for the new pipeline.
+      const updated: ExternalCrmSyncConfig = {
+        ...config,
+        externalPipelineId: newPipelineId,
+        hubspotDealStageMap: undefined,
+        updatedAt: new Date().toISOString(),
+      };
+      await crmDb.setLeadListCrmSyncConfig(listId, provider, updated as any);
+      return updated;
     }
 
-    // Bypass the saveConfig "locked after sync" guard: write the new pipeline and
-    // clear the stale stage map so the next push recomputes it for the new pipeline.
+    // provider === 'attio'
+    const auth = this.resolveAuth(config);
+    const svc = auth.type === 'token' ? AttioService.fromToken(auth.apiKey!) : await AttioService.create(auth.userId!, auth.accountId!);
+    const lists = await svc.getAllLists();
+    if (!lists.some(l => l.id === newPipelineId)) {
+      throw new Error(`List not found in Attio: ${newPipelineId}`);
+    }
+
+    // Bypass the saveConfig "locked after sync" guard: write the new list.
     const updated: ExternalCrmSyncConfig = {
       ...config,
-      externalPipelineId: newPipelineId,
-      hubspotDealStageMap: undefined,
+      attioDealListId: newPipelineId,
       updatedAt: new Date().toISOString(),
     };
     await crmDb.setLeadListCrmSyncConfig(listId, provider, updated as any);
+
+    // Leads already synced to the OLD list carry a stale attio_list_entry_id
+    // pointing at an entry that doesn't exist in the NEW list. Deliberately
+    // NOT bulk-cleared here: an unbounded synchronous per-lead write loop
+    // inside this HTTP request can outlast the ~40s upstream proxy timeout
+    // on a large list (the same reason the push route moved to a background
+    // job — see routes/crmSync.ts), and a partial run would leave leads
+    // mid-cleanup with no retry. Instead, pushLeads's updateListEntry call
+    // treats a 404 (stale entry, wrong list) as "entry is gone, recreate it"
+    // via the same findListEntry/addPersonToList fallback an entry-less lead
+    // already uses — each lead repairs itself lazily on its own next push.
     return updated;
   }
 
@@ -631,7 +719,7 @@ export class ExternalCrmSyncService {
     userId: string,
     listId: string,
     provider: string,
-    options: { objectType?: 'contact' | 'deal'; accountId?: string; apiKey?: string }
+    options: { objectType?: 'contact' | 'deal' | 'company'; accountId?: string; apiKey?: string }
   ): Promise<{ properties: CrmProperty[] }> {
     if (!['hubspot', 'attio'].includes(provider)) {
       throw new Error(`Unsupported provider: "${provider}". Supported: hubspot, attio`);
@@ -662,12 +750,33 @@ export class ExternalCrmSyncService {
       return { properties: props.map(p => ({ name: p.name, label: p.label, type: p.type })) };
     }
 
-    // Attio: contacts use People attributes, while deal mappings use Deals attributes.
+    // Attio: contacts use People attributes, while deal mappings use the
+    // deal list's own attributes.
     const svc = auth.type === 'token'
       ? AttioService.fromToken(auth.apiKey!)
       : await AttioService.create(auth.userId!, auth.accountId!);
 
+    if (options.objectType === 'deal') {
+      const config = await this.getConfig(userId, listId, provider);
+      const dealListId = config?.attioDealListId;
+      // No deal list yet (nothing pushed with a deal mapping enabled) — fall
+      // back to an empty list; the dialog's mapping combobox already free-text
+      // falls back in this case, same as a HubSpot fetch failure does.
+      if (!dealListId) return { properties: [] };
+      const attrs = await svc.listListAttributes(dealListId);
+      return {
+        properties: attrs.map((a: any) => ({ name: a.api_slug, label: a.title, type: a.type })),
+      };
+    }
 
+    // Attio-only Company object attributes — powers the Company Field Mapping
+    // section (pull-only; see DEFAULT_ATTIO_COMPANY_MAPPING for why).
+    if (options.objectType === 'company') {
+      const attrs = await svc.getAllObjectAttributes('companies');
+      return {
+        properties: attrs.map(a => ({ name: a.api_slug, label: a.title, type: a.type })),
+      };
+    }
 
     // Attio: merge People object attributes + list-entry attributes
 
@@ -775,6 +884,27 @@ export class ExternalCrmSyncService {
       const svc = auth.type === 'token'
         ? AttioService.fromToken(auth.apiKey!)
         : await AttioService.create(auth.userId!, auth.accountId!);
+      // Symmetric with HubSpot's contact+deal deletion above — Attio's deal
+      // analog (a List Entry) must also be removed, or it's orphaned in the
+      // workspace. Non-critical: an entry-deletion failure shouldn't block
+      // deleting the Person record.
+      //
+      // Unlike HubSpot's deleteDeal (a standalone-object delete, unaffected
+      // by which pipeline the deal is currently in), an Attio List Entry
+      // lives inside a specific list — deleting it requires the list it's
+      // actually in, not whatever attioDealListId the config points at now.
+      // changePipeline re-points the config without migrating existing
+      // leads' pointers, so a lead not yet re-pushed since a re-point still
+      // has its entry in the OLD list. Prefer the list id stamped on the
+      // lead itself at write time; fall back to the config's current value
+      // only for a lead synced before this stamp existed.
+      const entryId = lead.syncMetadata?.attio_list_entry_id ?? lead.customFields?.attio_list_entry_id;
+      const entryListId = lead.syncMetadata?.attio_deal_list_id ?? lead.customFields?.attio_deal_list_id ?? config.attioDealListId;
+      if (entryId && entryListId) {
+        await svc.deleteListEntry(entryListId, entryId).catch(err =>
+          console.error(`[ExternalCrmSync] deleteLeadFromCrm: failed to delete list entry ${entryId}:`, err.message)
+        );
+      }
       const recordId = lead.syncMetadata?.attio_record_id ?? lead.customFields?.attio_record_id;
       if (recordId) {
         await svc.deletePerson(recordId);
@@ -1269,33 +1399,39 @@ export class ExternalCrmSyncService {
     return { category: 'connection', detail: fallback };
   }
 
-  private async updateSyncTimestamp(
+  // Public: also called from routes/webhooks.ts after a webhook-driven
+  // auto-pull applies successfully, so the CRM Sync dialog's "last pulled"
+  // timestamp reflects webhook activity, not only a manual Pull click.
+  async updateSyncTimestamp(
     config: ExternalCrmSyncConfig,
     direction: 'push' | 'pull',
     success: boolean
   ): Promise<void> {
+    // Genuinely atomic: a targeted DynamoDB nested-attribute update (see
+    // crmDb.updateLeadListCrmSyncStatus) touching only the sync-status
+    // fields, not a read-modify-write of the whole config entry. A prior
+    // version of this function read-modify-wrote the whole provider config
+    // (directly, then via a reload-before-write that only narrowed the
+    // race window) — both could still clobber a concurrent PUT /config
+    // save (field mapping changes, webhookEnabled toggle, etc.) landing in
+    // the gap. This has no such gap: the timestamp/status write and any
+    // concurrent field-mapping write touch disjoint attribute paths.
+    //
+    // `?? null` on the error fields: undefined (not explicitly set by the
+    // caller, e.g. a webhook job with no categorized error detail) maps to
+    // "remove" — matching this function's own prior behavior, where the
+    // whole-config overwrite always dropped an unset field regardless of
+    // what was previously stored. A caller that DOES set detailed error
+    // info on `config` before calling this (e.g. pushAllLeads's
+    // categorizeErrors result) has it persisted as-is.
     const now = new Date().toISOString();
-    if (direction === 'push') config.lastPushSyncAt = now;
-    else config.lastPullSyncAt = now;
-    config.lastSyncStatus = success ? 'success' : 'error';
-    if (success) {
-      config.lastSyncError = undefined;
-      config.lastSyncErrorCategory = undefined;
-      config.lastSyncErrorCount = undefined;
-    }
-    config.updatedAt = now;
-    await this.saveUpdatedConfig(config);
-  }
-
-  private mergeAttioEntryMappings(
-    customMappings: FieldMapping[] = [],
-    legacyDealMappings: FieldMapping[] = []
-  ): FieldMapping[] {
-    const merged = new Map<string, FieldMapping>();
-    for (const mapping of [...DEFAULT_ATTIO_CUSTOM_MAPPING, ...legacyDealMappings, ...customMappings]) {
-      merged.set(mapping.agentwebField, mapping);
-    }
-    return Array.from(merged.values());
+    await crmDb.updateLeadListCrmSyncStatus(config.listId, config.provider, {
+      ...(direction === 'push' ? { lastPushSyncAt: now } : { lastPullSyncAt: now }),
+      lastSyncStatus: success ? 'success' : 'error',
+      lastSyncError: success ? null : (config.lastSyncError ?? null),
+      lastSyncErrorCategory: success ? null : (config.lastSyncErrorCategory ?? null),
+      lastSyncErrorCount: success ? null : (config.lastSyncErrorCount ?? null),
+    });
   }
 
   private async syncHubSpotStatusOptions(

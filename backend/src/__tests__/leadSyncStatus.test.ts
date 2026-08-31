@@ -1,30 +1,48 @@
 import {
   resolveSyncStatus,
-  getHubspotConnection,
+  getExternalCrmConnection,
   getMappedAgentwebFields,
   mappedFieldChanged,
   buildSyncedMetadata,
+  buildSyncedMetadataBase,
   buildFailedMetadata,
 } from '../utils/leadSyncStatus';
 
-describe('getHubspotConnection', () => {
-  it('returns connected=false when no hubspot config on list', () => {
-    expect(getHubspotConnection({}).connected).toBe(false);
-    expect(getHubspotConnection({ externalCrmSyncConfigs: {} }).connected).toBe(false);
+describe('getExternalCrmConnection', () => {
+  it('returns connected=false, provider=null when no crm config on list', () => {
+    expect(getExternalCrmConnection({}).connected).toBe(false);
+    expect(getExternalCrmConnection({}).provider).toBeNull();
+    expect(getExternalCrmConnection({ externalCrmSyncConfigs: {} }).connected).toBe(false);
   });
 
-  it('returns connected=true with an OAuth accountId', () => {
+  it('returns connected=true, provider=hubspot with an OAuth accountId', () => {
     const list = { externalCrmSyncConfigs: { hubspot: { accountId: 'acc1', autoSyncEnabled: true } } };
-    const c = getHubspotConnection(list);
+    const c = getExternalCrmConnection(list);
     expect(c.connected).toBe(true);
+    expect(c.provider).toBe('hubspot');
     expect(c.autoSyncEnabled).toBe(true);
     expect(c.config).toBeTruthy();
   });
 
-  it('returns connected=true with a manual apiKeyEncrypted', () => {
+  it('returns connected=true, provider=hubspot with a manual apiKeyEncrypted', () => {
     const list = { externalCrmSyncConfigs: { hubspot: { apiKeyEncrypted: 'enc' } } };
-    expect(getHubspotConnection(list).connected).toBe(true);
-    expect(getHubspotConnection(list).autoSyncEnabled).toBe(false);
+    expect(getExternalCrmConnection(list).connected).toBe(true);
+    expect(getExternalCrmConnection(list).autoSyncEnabled).toBe(false);
+  });
+
+  it('returns connected=true, provider=attio when the list is Attio-connected instead', () => {
+    const list = { externalCrmSyncConfigs: { attio: { accountId: 'acc1', autoSyncEnabled: true } } };
+    const c = getExternalCrmConnection(list);
+    expect(c.connected).toBe(true);
+    expect(c.provider).toBe('attio');
+    expect(c.autoSyncEnabled).toBe(true);
+    expect(c.config).toBeTruthy();
+  });
+
+  it('returns connected=false, provider=null for an Attio config with no credentials', () => {
+    const list = { externalCrmSyncConfigs: { attio: {} } };
+    const c = getExternalCrmConnection(list);
+    expect(c.connected).toBe(false);
   });
 });
 
@@ -44,6 +62,10 @@ describe('resolveSyncStatus', () => {
 
   it('derives synced for a legacy lead with only a hubspot_deal_id (no contact id)', () => {
     expect(resolveSyncStatus({ syncMetadata: { hubspot_deal_id: 'd1' } }, true)).toBe('synced');
+  });
+
+  it('derives synced for an Attio lead with only attio_record_id and no persisted status', () => {
+    expect(resolveSyncStatus({ syncMetadata: { attio_record_id: 'p1' } }, true)).toBe('synced');
   });
 
   it('derives sync_pending for a connected lead never pushed', () => {
@@ -133,5 +155,38 @@ describe('buildSyncedMetadata / buildFailedMetadata', () => {
   it('builders tolerate undefined existing metadata', () => {
     expect(buildSyncedMetadata(undefined, 'c1', 'now').hubspot_contact_id).toBe('c1');
     expect(buildFailedMetadata(undefined, 'e').syncStatus).toBe('sync_failed');
+  });
+});
+
+describe('buildSyncedMetadataBase', () => {
+  it('sets synced + lastSyncedAt, clears syncError, and writes no id field (provider-agnostic)', () => {
+    const out = buildSyncedMetadataBase(
+      { attio_record_id: 'p1', syncError: 'old error' }, '2026-06-22T00:00:00.000Z',
+    );
+    expect(out).toEqual({
+      attio_record_id: 'p1',
+      syncStatus: 'synced',
+      lastSyncedAt: '2026-06-22T00:00:00.000Z',
+    });
+    expect('syncError' in out).toBe(false);
+    expect('hubspot_contact_id' in out).toBe(false);
+  });
+
+  it('tolerates undefined existing metadata', () => {
+    expect(buildSyncedMetadataBase(undefined, 'now')).toEqual({ syncStatus: 'synced', lastSyncedAt: 'now' });
+  });
+
+  it('buildSyncedMetadata still produces the exact same output as before this refactor', () => {
+    // Regression proof: buildSyncedMetadata's own contract must not change even
+    // though it now delegates to buildSyncedMetadataBase internally.
+    const out = buildSyncedMetadata(
+      { hubspot_deal_id: 'd1', syncError: 'old error' }, 'c1', '2026-06-22T00:00:00.000Z',
+    );
+    expect(out).toEqual({
+      hubspot_deal_id: 'd1',
+      hubspot_contact_id: 'c1',
+      syncStatus: 'synced',
+      lastSyncedAt: '2026-06-22T00:00:00.000Z',
+    });
   });
 });
