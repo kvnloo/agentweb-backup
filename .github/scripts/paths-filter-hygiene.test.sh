@@ -317,5 +317,258 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# ENG-1658 / ENG-743 — a filtered workflow must gate its own changes.
+#
+# The rule dorny/paths-filter makes easy to break: a job that only runs when
+# `backend/**` changed does not run when the thing that DECIDES what it does
+# changed. deploy.yml shipped that way — `eb-deploy.sh` IS the deploy, and a
+# change to it triggered no deploy. 21 commits touched deploy.yml or
+# eb-deploy.sh in the 34 days to 2026-08-31 and not one of them deployed; each
+# first executed on a later, unrelated PR, which is where a mistake in it would
+# surface and be attributed. tests.yml has carried
+# `.github/scripts/eb-deploy.sh` in its own backend filter since ENG-743 —
+# deploy.yml was the outlier.
+#
+# Two assertions, both derived from the workflow rather than hardcoded to
+# today's files:
+#
+#   A. A workflow that filters must be matched by one of its own filters.
+#   B. A job gated on `outputs.<f>` that runs `.github/scripts/<s>.sh` must
+#      have `<s>.sh` matched by filter `<f>`.
+#
+# Ungated jobs are exempt from B: they always run, so nothing can skip them.
+printf '\nENG-1658: workflows gate their own changes\n'
+
+GATING_AUDITOR="${WORKDIR}/audit_self_gating.py"
+cat >"${GATING_AUDITOR}" <<'AUDITPY'
+import os
+import re
+import sys
+
+# Each argument is a workflow file. Print one offender per line; print nothing
+# when every filtered workflow gates its own changes.
+
+
+def glob_to_re(pat):
+    # dorny/paths-filter patterns are picomatch globs, not literals.
+    # Matching by string equality would make '.github/**' fail to cover
+    # '.github/scripts/x.sh' and demand a redundant entry -- the rule would
+    # then be unsatisfiable for tests.yml's 'workflows' filter, which is
+    # already correct. '**' spans separators, '*' does not.
+    out = []
+    i = 0
+    while i < len(pat):
+        if pat.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pat[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        else:
+            out.append(re.escape(pat[i]))
+            i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+def parse_filters(lines):
+    # name -> [patterns], read from the 'filters: |' block scalar.
+    filters = {}
+    block_indent = None
+    name = None
+    for line in lines:
+        m = re.match(r"^(\s*)filters:\s*\|", line)
+        if m:
+            block_indent = len(m.group(1))
+            name = None
+            continue
+        if block_indent is None:
+            continue
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= block_indent:
+            block_indent = None
+            name = None
+            continue
+        if line.strip().startswith("#"):
+            continue
+        m_name = re.match(r"^\s*([A-Za-z0-9_-]+):\s*$", line)
+        if m_name:
+            name = m_name.group(1)
+            filters.setdefault(name, [])
+            continue
+        m_pat = re.match(r"^\s*-\s*['\"]?([^'\"]+)['\"]?\s*$", line)
+        if m_pat and name:
+            filters[name].append(m_pat.group(1).strip())
+    return filters
+
+
+def parse_jobs(lines):
+    # job -> {'if': str, 'scripts': [...]}, top-level jobs only.
+    jobs = {}
+    cur = None
+    in_jobs = False
+    for line in lines:
+        if re.match(r"^jobs:\s*$", line):
+            in_jobs = True
+            continue
+        if not in_jobs:
+            continue
+        m = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        if m:
+            cur = m.group(1)
+            jobs[cur] = {"if": "", "scripts": []}
+            continue
+        if cur is None:
+            continue
+        # A job-level `if:` sits at 4 spaces. A step's sits deeper and gates
+        # only that step, so it must not be read as the job's gate.
+        if re.match(r"^    if:", line):
+            jobs[cur]["if"] += " " + line.strip()
+        for sc in re.findall(r"(\.github/scripts/[A-Za-z0-9._-]+\.sh)", line):
+            jobs[cur]["scripts"].append(sc)
+    return jobs
+
+
+offenders = []
+audited_gated_jobs = 0
+
+for path in sys.argv[1:]:
+    lines = open(path).read().split("\n")
+    filters = parse_filters(lines)
+    if not filters:
+        continue
+    base = os.path.basename(path)
+    own = ".github/workflows/" + base
+
+    if not any(glob_to_re(p).match(own) for pats in filters.values() for p in pats):
+        offenders.append(
+            "%s: no filter matches its own path (%s), so changing it gates nothing"
+            % (base, own)
+        )
+
+    for job, d in parse_jobs(lines).items():
+        gates = re.findall(r"outputs\.([A-Za-z0-9_-]+)", d["if"])
+        if not gates:
+            continue
+        for f in gates:
+            if f not in filters:
+                continue
+            audited_gated_jobs += 1
+            for script in sorted(set(d["scripts"])):
+                if not any(glob_to_re(p).match(script) for p in filters[f]):
+                    offenders.append(
+                        "%s: job '%s' runs %s but filter '%s' does not match it"
+                        % (base, job, script, f)
+                    )
+
+# Fail-open guard: a parser that finds no gated job would report every repo
+# clean. Reported through the same channel so it cannot be overlooked.
+if os.environ.get("EXPECT_GATED_JOBS") and audited_gated_jobs == 0:
+    offenders.append("auditor parsed zero gated jobs (fail-open)")
+
+for o in sorted(set(offenders)):
+    print(o)
+AUDITPY
+
+gating_offenders=$(EXPECT_GATED_JOBS=1 python3 "${GATING_AUDITOR}" "${WORKFLOW_DIR}"/*.yml)
+if [ -z "${gating_offenders}" ]; then
+  pass "every filtered workflow gates its own changes"
+else
+  # One argument per offender: `fail` indents each, and a single multi-line
+  # argument would leave every line after the first flush against the margin.
+  gating_lines=()
+  while IFS= read -r gating_line; do
+    [ -n "${gating_line}" ] && gating_lines+=("${gating_line}")
+  done <<EOF
+${gating_offenders}
+EOF
+  fail "every filtered workflow gates its own changes" "${gating_lines[@]}"
+fi
+
+# Self-checks. Real exposure is zero once the fix lands, so each direction has
+# to be proven against a synthetic workflow -- otherwise a broken auditor and a
+# clean repo are indistinguishable, the fail-open shape this suite exists for.
+mk_gating_workflow() {
+  local dest="$1" patterns="$2" job_if="$3"
+  {
+    printf 'on: push\n'
+    printf 'jobs:\n'
+    printf '  detect-changes:\n'
+    printf '    steps:\n'
+    printf '      - uses: dorny/paths-filter@v4\n'
+    printf '        with:\n'
+    printf '          filters: |\n'
+    printf '            backend:\n'
+    printf '%s\n' "${patterns}"
+    printf '  deploy:\n'
+    printf '    if: %s\n' "${job_if}"
+    printf '    steps:\n'
+    printf '      - run: bash .github/scripts/eb-deploy.sh\n'
+  } >"${dest}"
+}
+
+GATED_IF="needs.detect-changes.outputs.backend == 'true'"
+
+# A gated job whose filter does not cover the script it runs — the ENG-1658 bug.
+mk_gating_workflow "${WORKDIR}/gate-bad.yml" "              - 'backend/**'" "${GATED_IF}"
+if [ -n "$(python3 "${GATING_AUDITOR}" "${WORKDIR}/gate-bad.yml")" ]; then
+  pass "self-check: a gated job whose filter misses its own script is flagged"
+else
+  fail "self-check: a gated job whose filter misses its own script is flagged" \
+    "the auditor passed the exact shape this rule exists to reject"
+fi
+
+# The same workflow with both paths listed — the rule must be satisfiable.
+mk_gating_workflow "${WORKDIR}/gate-good.yml" \
+"              - 'backend/**'
+              - '.github/workflows/gate-good.yml'
+              - '.github/scripts/eb-deploy.sh'" "${GATED_IF}"
+if [ -z "$(python3 "${GATING_AUDITOR}" "${WORKDIR}/gate-good.yml")" ]; then
+  pass "self-check: listing the script and the workflow satisfies the rule"
+else
+  fail "self-check: listing the script and the workflow satisfies the rule" \
+    "the auditor rejected a correctly-gated workflow, so the rule cannot be met"
+fi
+
+# A '**' pattern must count. tests.yml's `workflows` filter is '.github/**' and
+# is already correct; comparing literals would demand a redundant entry and
+# make this rule a nuisance rather than a check.
+mk_gating_workflow "${WORKDIR}/gate-glob.yml" "              - '.github/**'" "${GATED_IF}"
+if [ -z "$(python3 "${GATING_AUDITOR}" "${WORKDIR}/gate-glob.yml")" ]; then
+  pass "self-check: a '**' pattern covering the script satisfies the rule"
+else
+  fail "self-check: a '**' pattern covering the script satisfies the rule" \
+    "glob patterns are being compared as literals"
+fi
+
+# An ungated job always runs, so nothing can skip it and rule B must not fire.
+mk_gating_workflow "${WORKDIR}/gate-ungated.yml" \
+"              - 'backend/**'
+              - '.github/workflows/gate-ungated.yml'" "github.event_name == 'push'"
+if [ -z "$(python3 "${GATING_AUDITOR}" "${WORKDIR}/gate-ungated.yml")" ]; then
+  pass "self-check: an ungated job is exempt from the script rule"
+else
+  fail "self-check: an ungated job is exempt from the script rule" \
+    "a job that always runs cannot be skipped and must not be reported"
+fi
+
+# The fail-open guard itself must be able to fire.
+{
+  printf 'on: push\njobs:\n  x:\n    steps:\n'
+  printf '      - uses: dorny/paths-filter@v4\n        with:\n          filters: |\n'
+  printf '            backend:\n'
+  printf "              - 'backend/**'\n"
+  printf "              - '.github/workflows/gate-nojobs.yml'\n"
+} >"${WORKDIR}/gate-nojobs.yml"
+if EXPECT_GATED_JOBS=1 python3 "${GATING_AUDITOR}" "${WORKDIR}/gate-nojobs.yml" \
+   | grep -q 'fail-open'; then
+  pass "self-check: parsing zero gated jobs is reported, not passed"
+else
+  fail "self-check: parsing zero gated jobs is reported, not passed" \
+    "the fail-open guard cannot fire, so a dead parser reads as a clean repo"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\npaths-filter-hygiene: %d run, %d failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ] || exit 1

@@ -54,11 +54,37 @@ jobs:
         id: filter
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
+          # ENG-1658/ENG-743: what gates a deploy has to gate its own changes.
+          # `eb-deploy.sh` IS the deploy — it applies the version and decides
+          # whether the environment took it — and `deploy.yml` is what runs it,
+          # so a change to either is a change to the deploy. With `backend/**`
+          # alone neither triggered one: 21 commits touched these two files in
+          # the 34 days to 2026-08-31 and not one of them deployed. Each first
+          # executed on some later, unrelated PR, which is where a mistake in it
+          # would surface and be attributed. The ENG-878 chain is what that
+          # costs — five commits, three of them same-day fixes to the one
+          # before.
+          #
+          # Both filters list both paths on purpose. `partner-deploy` runs the
+          # same script under its own budgets, so the rule is uniform rather
+          # than backend-only; partner deploys take ~2 min. tests.yml has
+          # carried `.github/scripts/eb-deploy.sh` in its own backend filter
+          # since ENG-743 — deploy.yml was the outlier.
+          #
+          # Measured cost: +21 backend deploys per 34 days on a baseline of
+          # ~9.5/day (+6.5%), with 88 of the last 88 green.
+          #
+          # paths-filter-hygiene.test.sh asserts this both ways, so the gap
+          # cannot reopen quietly.
           filters: |
             backend:
               - 'backend/**'
+              - '.github/workflows/deploy.yml'
+              - '.github/scripts/eb-deploy.sh'
             partner:
               - 'partner-portal/**'
+              - '.github/workflows/deploy.yml'
+              - '.github/scripts/eb-deploy.sh'
 
       - name: Deploy all (manual trigger)
         if: github.event_name == 'workflow_dispatch'
