@@ -5633,6 +5633,79 @@ export const crmDb = {
   },
 
   /**
+   * Surgically updates only the sync-status fields of a CRM sync config,
+   * without reading and rewriting the rest of that provider's config entry
+   * (unlike setLeadListCrmSyncConfig's read-modify-write). Used by
+   * ExternalCrmSyncService.updateSyncTimestamp — a genuinely atomic
+   * DynamoDB nested-attribute UpdateExpression, so a concurrent PUT /config
+   * save (field mapping changes, webhookEnabled toggle, etc.) can never be
+   * clobbered by a status update racing it, regardless of timing. Safe to
+   * call as a targeted nested SET/REMOVE here specifically because the
+   * parent `externalCrmSyncConfigs.<provider>` map is guaranteed to already
+   * exist (this is only ever called after a successful getConfig lookup) —
+   * setLeadListCrmSyncConfig's read-modify-write exists to handle the
+   * different case of that parent map not yet existing.
+   */
+  async updateLeadListCrmSyncStatus(
+    listId: string,
+    provider: string,
+    fields: {
+      lastPushSyncAt?: string;
+      lastPullSyncAt?: string;
+      lastSyncStatus: 'success' | 'error';
+      // undefined = leave whatever's already stored untouched; null = remove
+      lastSyncError?: string | null;
+      lastSyncErrorCategory?: string | null;
+      lastSyncErrorCount?: number | null;
+    }
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    const setExpressions: string[] = [];
+    const removeExpressions: string[] = [];
+    const names: Record<string, string> = { '#ecs': 'externalCrmSyncConfigs', '#provider': provider, '#updatedAt': 'updatedAt' };
+    const values: Record<string, any> = { ':now': now };
+
+    const addSet = (field: string, value: any) => {
+      names[`#${field}`] = field;
+      values[`:${field}`] = value;
+      setExpressions.push(`#ecs.#provider.#${field} = :${field}`);
+    };
+    const addRemove = (field: string) => {
+      names[`#${field}`] = field;
+      removeExpressions.push(`#ecs.#provider.#${field}`);
+    };
+
+    if (fields.lastPushSyncAt !== undefined) addSet('lastPushSyncAt', fields.lastPushSyncAt);
+    if (fields.lastPullSyncAt !== undefined) addSet('lastPullSyncAt', fields.lastPullSyncAt);
+    addSet('lastSyncStatus', fields.lastSyncStatus);
+    addSet('updatedAt', now); // nested per-provider updatedAt, mirrors setLeadListCrmSyncConfig
+    setExpressions.push('#updatedAt = :now'); // top-level list updatedAt, same as setLeadListCrmSyncConfig
+
+    for (const key of ['lastSyncError', 'lastSyncErrorCategory', 'lastSyncErrorCount'] as const) {
+      const value = fields[key];
+      if (value === null) addRemove(key);
+      else if (value !== undefined) addSet(key, value);
+    }
+
+    const updateExpressionParts: string[] = [];
+    if (setExpressions.length > 0) updateExpressionParts.push(`SET ${setExpressions.join(', ')}`);
+    if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(', ')}`);
+
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        UpdateExpression: updateExpressionParts.join(' '),
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+      }).promise();
+    } catch (error: any) {
+      handleDynamoDbError(error, 'updateLeadListCrmSyncStatus');
+      throw error;
+    }
+  },
+
+  /**
    * v3.1 enrichment config — `enrichmentConfig` attribute on AW-LeadLists.
    * Per-list scoped. Returns null when no config has ever been saved (callers
    * should fall back to a default built from the list's field schema).

@@ -10,6 +10,7 @@ jest.mock('../services/db', () => ({
     updateLead: jest.fn(),
     batchCreateLeads: jest.fn(),
     setLeadListCrmSyncConfig: jest.fn().mockResolvedValue(undefined),
+    updateLeadListCrmSyncStatus: jest.fn().mockResolvedValue(undefined),
   },
   userDb: {
     // Default: users have no org, so only the config owner can access it.
@@ -869,83 +870,76 @@ describe('ExternalCrmSyncService', () => {
   });
 
   // ─── updateSyncTimestamp ────────────────────────────────────────────────────
-  // CodeRabbit-flagged: setLeadListCrmSyncConfig overwrites a provider's
-  // entire config entry wholesale (read-modify-write at the provider-map
-  // level, not per-field). Writing back the in-memory `config` this function
-  // is passed — which can be stale by the time a long-running push/pull/
-  // webhook job finishes — would silently clobber a concurrent PUT /config
-  // save that landed in between. updateSyncTimestamp must reload the latest
-  // config and merge only the status fields onto it.
+  // CodeRabbit-flagged (twice): setLeadListCrmSyncConfig overwrites a
+  // provider's entire config entry wholesale (read-modify-write at the
+  // provider-map level, not per-field). Writing back the in-memory `config`
+  // this function is passed — which can be stale by the time a long-running
+  // push/pull/webhook job finishes — would silently clobber a concurrent
+  // PUT /config save landing in between. A first fix (reload-then-write)
+  // only narrowed the race window without eliminating it; this now calls a
+  // genuinely atomic, targeted DynamoDB update (crmDb.updateLeadListCrmSyncStatus)
+  // that touches only the sync-status attribute paths, so there is no window
+  // at all for a concurrent field-mapping/webhookEnabled save to be lost.
 
   describe('updateSyncTimestamp', () => {
-    function mockListWithHubSpotConfig(cfg: ExternalCrmSyncConfig) {
-      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
-        listId: cfg.listId,
-        userId: cfg.userId,
-        externalCrmSyncConfigs: { hubspot: cfg },
-      });
-    }
+    it('calls the atomic status update with the push timestamp on success', async () => {
+      const cfg = makeConfig({ listId: 'list1', provider: 'hubspot' });
 
-    it('reloads the latest config and preserves a concurrent field change instead of clobbering it', async () => {
-      const stale = makeConfig({
-        contactFieldMapping: [{ agentwebField: 'email', crmProperty: 'email', direction: 'both', enabled: true }],
-      });
-      const concurrentlySaved = makeConfig({
-        contactFieldMapping: [
-          { agentwebField: 'email', crmProperty: 'email', direction: 'both', enabled: true },
-          { agentwebField: 'phone', crmProperty: 'phone', direction: 'both', enabled: true }, // added concurrently
-        ],
-      });
-      mockListWithHubSpotConfig(concurrentlySaved);
+      await service.updateSyncTimestamp(cfg, 'push', true);
 
-      await service.updateSyncTimestamp(stale, 'push', true);
-
-      const saved = (crmDb.setLeadListCrmSyncConfig as jest.Mock).mock.calls[0][2];
-      expect(saved.contactFieldMapping).toHaveLength(2); // the concurrent addition survived
-      expect(saved.lastPushSyncAt).toBeDefined();
-      expect(saved.lastSyncStatus).toBe('success');
+      expect(crmDb.updateLeadListCrmSyncStatus).toHaveBeenCalledWith('list1', 'hubspot', {
+        lastPushSyncAt: expect.any(String),
+        lastSyncStatus: 'success',
+        lastSyncError: null,
+        lastSyncErrorCategory: null,
+        lastSyncErrorCount: null,
+      });
+      // Never reads or rewrites the rest of the config — that's the whole point.
+      expect(crmDb.getLeadListById).not.toHaveBeenCalled();
+      expect(crmDb.setLeadListCrmSyncConfig).not.toHaveBeenCalled();
     });
 
-    it('falls back to the passed config when the reload finds nothing, rather than losing the update', async () => {
-      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
-      const cfg = makeConfig();
+    it('calls the atomic status update with the pull timestamp on success', async () => {
+      const cfg = makeConfig({ listId: 'list1', provider: 'attio' });
 
       await service.updateSyncTimestamp(cfg, 'pull', true);
 
-      const saved = (crmDb.setLeadListCrmSyncConfig as jest.Mock).mock.calls[0][2];
-      expect(saved.lastPullSyncAt).toBeDefined();
-      expect(saved.lastSyncStatus).toBe('success');
+      expect(crmDb.updateLeadListCrmSyncStatus).toHaveBeenCalledWith('list1', 'attio', {
+        lastPullSyncAt: expect.any(String),
+        lastSyncStatus: 'success',
+        lastSyncError: null,
+        lastSyncErrorCategory: null,
+        lastSyncErrorCount: null,
+      });
     });
 
-    it('carries the caller-set error detail onto the freshly reloaded config on failure', async () => {
+    it('persists caller-set error detail on failure', async () => {
       const cfg = makeConfig();
       cfg.lastSyncError = 'Some leads could not be synced';
       cfg.lastSyncErrorCategory = 'data';
       cfg.lastSyncErrorCount = 3;
-      // Reload returns a distinct object with none of that error detail set —
-      // simulating that only the CALLER (pushAllLeads) knows about it.
-      mockListWithHubSpotConfig(makeConfig());
 
       await service.updateSyncTimestamp(cfg, 'push', false);
 
-      const saved = (crmDb.setLeadListCrmSyncConfig as jest.Mock).mock.calls[0][2];
-      expect(saved.lastSyncStatus).toBe('error');
-      expect(saved.lastSyncError).toBe('Some leads could not be synced');
-      expect(saved.lastSyncErrorCategory).toBe('data');
-      expect(saved.lastSyncErrorCount).toBe(3);
+      expect(crmDb.updateLeadListCrmSyncStatus).toHaveBeenCalledWith(cfg.listId, cfg.provider, {
+        lastPushSyncAt: expect.any(String),
+        lastSyncStatus: 'error',
+        lastSyncError: 'Some leads could not be synced',
+        lastSyncErrorCategory: 'data',
+        lastSyncErrorCount: 3,
+      });
     });
 
-    it('clears error fields on the reloaded config when success:true', async () => {
-      const stale = makeConfig();
-      const reloaded = makeConfig({ lastSyncError: 'old error', lastSyncErrorCategory: 'data', lastSyncErrorCount: 1 });
-      mockListWithHubSpotConfig(reloaded);
+    it('removes error fields (passes null) on failure when the caller set no detail', async () => {
+      const cfg = makeConfig(); // no lastSyncError/*Category/*Count set
 
-      await service.updateSyncTimestamp(stale, 'push', true);
+      await service.updateSyncTimestamp(cfg, 'pull', false);
 
-      const saved = (crmDb.setLeadListCrmSyncConfig as jest.Mock).mock.calls[0][2];
-      expect(saved.lastSyncError).toBeUndefined();
-      expect(saved.lastSyncErrorCategory).toBeUndefined();
-      expect(saved.lastSyncErrorCount).toBeUndefined();
+      const call = (crmDb.updateLeadListCrmSyncStatus as jest.Mock).mock.calls[0][2];
+      expect(call.lastSyncStatus).toBe('error');
+      expect(call.lastSyncError).toBeNull();
+      expect(call.lastSyncErrorCategory).toBeNull();
+      expect(call.lastSyncErrorCount).toBeNull();
     });
   });
 
@@ -1249,7 +1243,7 @@ describe('ExternalCrmSyncService', () => {
       const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
 
       expect(result.errorCount).toBeGreaterThan(0);
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('error');
       expect(saved.lastSyncErrorCategory).toBe('data');
     });
@@ -1272,7 +1266,7 @@ describe('ExternalCrmSyncService', () => {
       const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
 
       expect(result.errorCount).toBe(3);
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncErrorCategory).toBe('data');
       expect(saved.lastSyncErrorCount).toBe(3);
     });
@@ -1300,13 +1294,16 @@ describe('ExternalCrmSyncService', () => {
       const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
 
       expect(result.errorCount).toBe(2);
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('error');
       // Connection wins; the surfaced message is the connection-shaped one.
       expect(saved.lastSyncErrorCategory).toBe('connection');
       expect(saved.lastSyncError).toMatch(/Authentication credentials not found/);
       // A connection failure isn't lead-scoped, so no per-lead count is recorded.
-      expect(saved.lastSyncErrorCount).toBeUndefined();
+      // updateLeadListCrmSyncStatus's failure path passes null (remove) for an
+      // unset count, not undefined — the old assertion targeted
+      // setLeadListCrmSyncConfig's full-object-omission shape.
+      expect(saved.lastSyncErrorCount).toBeNull();
     });
 
     it('resolves the HubSpot service once for a multi-chunk push, not per chunk', async () => {
@@ -1711,7 +1708,7 @@ describe('ExternalCrmSyncService', () => {
 
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', notes: 'x' }, 'hubspot', 'created');
 
-      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1);
+      const call = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1);
       expect(call).toBeDefined();
       const saved = call![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('error');
@@ -1727,7 +1724,7 @@ describe('ExternalCrmSyncService', () => {
 
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', notes: 'x' }, 'hubspot', 'created');
 
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncErrorCategory).toBe('connection');
     });
 
@@ -1737,7 +1734,7 @@ describe('ExternalCrmSyncService', () => {
       // An invalid email is caught per-lead into result.errors (no throw), errorCount=1.
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'not-an-email' }, 'hubspot', 'created');
 
-      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1);
+      const call = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1);
       expect(call).toBeDefined();
       const saved = call![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('error');
@@ -1751,7 +1748,7 @@ describe('ExternalCrmSyncService', () => {
       // connection is healthy, so reconnecting would not help — category 'data'.
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'not-an-email' }, 'hubspot', 'created');
 
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('error');
       expect(saved.lastSyncErrorCategory).toBe('data');
     });
@@ -1768,7 +1765,7 @@ describe('ExternalCrmSyncService', () => {
 
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'valid@example.com' }, 'hubspot', 'created');
 
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('error');
       expect(saved.lastSyncErrorCategory).toBe('connection');
     });
@@ -1780,11 +1777,14 @@ describe('ExternalCrmSyncService', () => {
 
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', firstName: 'Ada' }, 'hubspot', 'created');
 
-      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1);
+      const call = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1);
       expect(call).toBeDefined();
       const saved = call![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('success');
-      expect(saved.lastSyncError).toBeUndefined();
+      // updateLeadListCrmSyncStatus's success path passes null (remove), not
+      // undefined — the old assertion targeted setLeadListCrmSyncConfig's
+      // full-object-omission shape, which no longer applies here.
+      expect(saved.lastSyncError).toBeNull();
       expect(saved.lastPushSyncAt).toBeTruthy();
     });
 
@@ -1800,10 +1800,10 @@ describe('ExternalCrmSyncService', () => {
 
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', firstName: 'Ada' }, 'hubspot', 'created');
 
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('success');
-      expect(saved.lastSyncErrorCategory).toBeUndefined();
-      expect(saved.lastSyncErrorCount).toBeUndefined();
+      expect(saved.lastSyncErrorCategory).toBeNull();
+      expect(saved.lastSyncErrorCount).toBeNull();
     });
 
     // ─── per-lead status propagation (Task 2 supplies the behaviour) ──────────

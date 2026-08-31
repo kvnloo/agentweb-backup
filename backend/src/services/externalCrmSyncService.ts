@@ -1407,41 +1407,31 @@ export class ExternalCrmSyncService {
     direction: 'push' | 'pull',
     success: boolean
   ): Promise<void> {
+    // Genuinely atomic: a targeted DynamoDB nested-attribute update (see
+    // crmDb.updateLeadListCrmSyncStatus) touching only the sync-status
+    // fields, not a read-modify-write of the whole config entry. A prior
+    // version of this function read-modify-wrote the whole provider config
+    // (directly, then via a reload-before-write that only narrowed the
+    // race window) — both could still clobber a concurrent PUT /config
+    // save (field mapping changes, webhookEnabled toggle, etc.) landing in
+    // the gap. This has no such gap: the timestamp/status write and any
+    // concurrent field-mapping write touch disjoint attribute paths.
+    //
+    // `?? null` on the error fields: undefined (not explicitly set by the
+    // caller, e.g. a webhook job with no categorized error detail) maps to
+    // "remove" — matching this function's own prior behavior, where the
+    // whole-config overwrite always dropped an unset field regardless of
+    // what was previously stored. A caller that DOES set detailed error
+    // info on `config` before calling this (e.g. pushAllLeads's
+    // categorizeErrors result) has it persisted as-is.
     const now = new Date().toISOString();
-    // Reload the latest persisted config immediately before writing, rather
-    // than writing back the in-memory `config` this call was passed —
-    // saveUpdatedConfig/setLeadListCrmSyncConfig overwrites this provider's
-    // entire config entry wholesale (read-modify-write at the provider-map
-    // level, not per-field), and `config` can be stale by the time this
-    // runs: a webhook job processes up to 200 events with real API calls
-    // per list, and pushAllLeads/pullAllContacts run a full list sync.
-    // Writing the stale snapshot back verbatim would silently clobber a
-    // concurrent PUT /config save (field mapping changes, webhookEnabled
-    // toggle, etc.) that landed in between. Falls back to the passed
-    // `config` only if the reload itself fails or finds nothing (e.g. the
-    // config was deleted mid-operation) — worse than a perfectly atomic
-    // update, but better than losing the status update entirely.
-    const latest = await this.getConfig(config.userId, config.listId, config.provider).catch(() => null);
-    const target: ExternalCrmSyncConfig = latest ?? config;
-
-    if (direction === 'push') target.lastPushSyncAt = now;
-    else target.lastPullSyncAt = now;
-    target.lastSyncStatus = success ? 'success' : 'error';
-    if (success) {
-      target.lastSyncError = undefined;
-      target.lastSyncErrorCategory = undefined;
-      target.lastSyncErrorCount = undefined;
-    } else if (target !== config) {
-      // The caller may have stamped detailed error info onto its own
-      // `config` object right before calling this (e.g. pushAllLeads's
-      // categorizeErrors result) — the fresh reload won't have picked that
-      // up, so carry it over onto the object we're actually persisting.
-      target.lastSyncError = config.lastSyncError;
-      target.lastSyncErrorCategory = config.lastSyncErrorCategory;
-      target.lastSyncErrorCount = config.lastSyncErrorCount;
-    }
-    target.updatedAt = now;
-    await this.saveUpdatedConfig(target);
+    await crmDb.updateLeadListCrmSyncStatus(config.listId, config.provider, {
+      ...(direction === 'push' ? { lastPushSyncAt: now } : { lastPullSyncAt: now }),
+      lastSyncStatus: success ? 'success' : 'error',
+      lastSyncError: success ? null : (config.lastSyncError ?? null),
+      lastSyncErrorCategory: success ? null : (config.lastSyncErrorCategory ?? null),
+      lastSyncErrorCount: success ? null : (config.lastSyncErrorCount ?? null),
+    });
   }
 
   private async syncHubSpotStatusOptions(
