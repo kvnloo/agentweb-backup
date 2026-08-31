@@ -158,8 +158,16 @@ describe('AgentModeService - Empty Synthesis Retry', () => {
       'test-session'
     );
 
-    // Still exits — content stays empty but does not loop forever
-    expect(result.content).toBe('');
+    // Still exits — does not loop forever.
+    // ENG-1576: this used to assert `result.content` was `''`. That's stale —
+    // ENG-1054's "terminating turn stayed empty" fallback (agentModeService.ts, the
+    // synthesisResidueGuardEnabled branch keyed on !turnHadUsableText) was added
+    // specifically to stop a turn that did real work (a tool call succeeded here)
+    // from reaching the user as a blank, unexplained message. Truly empty content
+    // in this exact scenario is the bug that fallback exists to prevent, so a
+    // truthful action-ledger recap — not '' — is the correct, intentional result.
+    expect(result.content).toContain('built directly from the actions I actually ran');
+    expect(result.content).toContain('search_tool_response');
     // iter1 (tool call) + iter2 (empty, nudge injected) + iter3 (empty again, exits) = 3 calls
     expect(callLLMSpy).toHaveBeenCalledTimes(3);
   });

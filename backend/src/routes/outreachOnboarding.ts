@@ -246,6 +246,18 @@ router.post(
             message: result.message ?? "LinkedIn search failed",
             code: "unipile_error",
           });
+        case "search_unavailable":
+          // ENG-1559: a probeSearchCapability control query confirmed the
+          // account can't search at all right now — a platform outage, not
+          // "no prospects match this ICP". 503 (not 502) since this is our
+          // own capability check, not a raw upstream error passthrough. The
+          // FE's generic error-state handling (retry/skip) already applies;
+          // this message just tells the user the truth about why.
+          return res.status(503).json({
+            message:
+              "LinkedIn search is temporarily unavailable. Try again in a few minutes, or skip this step — Emma will still draft messages from the ICP.",
+            code: "search_unavailable",
+          });
         default:
           return res
             .status(500)

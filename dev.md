@@ -7524,3 +7524,18 @@ All three positive cases: Emma checked the plan catalog and proposed a matching 
 proceeding with the row's primary tool, in the same shape already verified in production for the
 LinkedIn row. Negative control: no spurious recommendation, no spurious tool calls, answered
 directly. Full transcripts in the ENG-1490 follow-up PR.
+
+## ENG-1643 — typed consent resolves only when deterministic (2026-08-29)
+
+An awaiting `ask_user_question` card used to clear whenever the owner typed text, even when that
+text was an unambiguous answer. The correction is a pure, controller-side resolver: one exact
+option id/label match is persisted as a normal `answeredBy: 'user'` answer; a bare affirmative is
+accepted only for a card with exactly one affirmative option (for example Approve/Reject). Bare
+affirmatives on multi-choice cards, ambiguous text, and unrelated text retain the prior
+clear-and-re-ask behavior.
+
+This is an intentional consent-correctness change, not a model-routing or prompt change. It keeps
+the existing optimistic `requireStillAwaiting` write condition, immutable-question gate,
+delegation invariant, and no-model-answerer invariant. Typed provenance uses the existing optional
+answer rationale field; it adds no table, schema, or new persistence path. Focused controller and
+primitive tests cover the three affirmative paths plus multi-choice/ambiguity controls.

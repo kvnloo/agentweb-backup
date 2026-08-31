@@ -33,6 +33,11 @@ const mockSearchPeople = jest.fn();
 // Named so a test can assert the ENG-975 outage probe was NOT consulted for a page
 // that our own anonymized filter emptied.
 const mockProbeSearchCapability = jest.fn().mockResolvedValue('ok');
+// ENG-1558: default mirrors the real no-op contract (unchanged items, zero
+// exclusions) — none of this file's tests pass company_size_min/max.
+const mockFilterByCompanySize = jest.fn(
+  async (...args: any[]) => ({ items: args[0], excludedUnverifiable: 0 }),
+);
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     resolveAccountIdWithSource: (...args: any[]) => mockResolveAccountIdWithSource(...args),
@@ -41,6 +46,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
     isAccountConnected: jest.fn().mockResolvedValue(true),
     probeAccountSession: jest.fn().mockResolvedValue('connected'),
     probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
+    filterByCompanySize: (...args: any[]) => mockFilterByCompanySize(...args),
     clearStatusCache: jest.fn(),
   },
 }));

@@ -201,6 +201,31 @@ describe('POST /api/settings/google-drive/folders', () => {
 
     expect(res.body.error).toBe('User not found');
   });
+
+  // Regression test for the Phoenix Technologies incident (2026-08-25): a folder
+  // living inside a Google Shared Drive returns 404 from the Drive API unless
+  // supportsAllDrives is passed, even when the folder is fully public — this is
+  // an API-level filter, unrelated to the folder's actual sharing/permissions.
+  it('should pass supportsAllDrives so folders inside a Shared Drive are found', async () => {
+    mockFilesGet.mockResolvedValue({
+      data: { id: 'folder-in-shared-drive', name: 'Shared Drive Folder', mimeType: 'application/vnd.google-apps.folder' },
+    });
+
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'user-123',
+      googleDriveFolders: [],
+    });
+    (userDb.updateUser as jest.Mock).mockResolvedValue({});
+
+    await request(app)
+      .post('/api/settings/google-drive/folders')
+      .send({ folderId: 'folder-in-shared-drive' })
+      .expect(200);
+
+    expect(mockFilesGet).toHaveBeenCalledWith(
+      expect.objectContaining({ fileId: 'folder-in-shared-drive', supportsAllDrives: true })
+    );
+  });
 });
 
 describe('DELETE /api/settings/google-drive/folders/:folderId', () => {
@@ -289,6 +314,26 @@ describe('GET /api/settings/google-drive/folders/:folderId/files', () => {
       size: 256,
       modifiedTime: '2024-01-02T00:00:00Z',
     });
+  });
+
+  // Regression test for the Phoenix Technologies incident (2026-08-25): listing
+  // files inside a Shared-Drive-hosted folder silently returns zero files
+  // unless supportsAllDrives + includeItemsFromAllDrives are passed.
+  it('should pass supportsAllDrives and includeItemsFromAllDrives when listing folder files', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'user-123',
+      googleDriveFolders: [{ folderId: 'folder-1', name: 'My Folder' }],
+    });
+
+    mockFilesList.mockResolvedValue({ data: { files: [] } });
+
+    await request(app)
+      .get('/api/settings/google-drive/folders/folder-1/files')
+      .expect(200);
+
+    expect(mockFilesList).toHaveBeenCalledWith(
+      expect.objectContaining({ supportsAllDrives: true, includeItemsFromAllDrives: true })
+    );
   });
 
   it('should return 403 when folder does not belong to user', async () => {

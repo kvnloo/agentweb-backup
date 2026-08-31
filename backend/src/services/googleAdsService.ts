@@ -63,11 +63,18 @@ export interface GoogleAdLeaf {
   loginCustomerId: string;
   /** True if this customerId is already a connected google_ads account for the user. */
   alreadyConnected?: boolean;
+  /**
+   * ENG-1362. Google's `test_account` flag — the ONLY thing that guarantees an account
+   * cannot serve ads and cannot spend. Captured at discovery so nothing downstream has to
+   * infer it from the account NAME, which guarantees nothing: a real, billable, ENABLED
+   * account named "Test" is exactly the case this exists to disambiguate.
+   */
+  testAccount?: boolean;
 }
 
 /** A node in the account-selection tree returned during OAuth finalize. */
 export type GoogleAdsAccountNode =
-  | { type: 'leaf'; customerId: string; name: string; currency: string; loginCustomerId: string; alreadyConnected?: boolean }
+  | { type: 'leaf'; customerId: string; name: string; currency: string; loginCustomerId: string; alreadyConnected?: boolean; testAccount?: boolean }
   | { type: 'manager'; customerId: string; name: string; children: GoogleAdLeaf[] };
 
 /**
@@ -367,7 +374,7 @@ export class GoogleAdsService {
       const customerId = resourceName.replace('customers/', '');
       try {
         const results = await this.search(customerId, accessToken,
-          'SELECT customer.id, customer.descriptive_name, customer.currency_code, customer.manager FROM customer LIMIT 1'
+          'SELECT customer.id, customer.descriptive_name, customer.currency_code, customer.manager, customer.test_account FROM customer LIMIT 1'
         );
         if (results.length === 0) continue;
         const c = results[0].customer;
@@ -391,6 +398,9 @@ export class GoogleAdsService {
             name: c.descriptiveName || customerId,
             currency: c.currencyCode || 'USD',
             loginCustomerId: id,
+            // Strict === true: anything Google did not affirmatively mark as a test
+            // account is billable, and an absent field must never read as safe.
+            testAccount: c.testAccount === true,
           });
         }
       } catch (err: any) {
@@ -403,7 +413,7 @@ export class GoogleAdsService {
     // Top-level leaves first (those not also managed by a discovered manager), then managers.
     for (const [id, leaf] of directLeaves) {
       if (!managedLeafIds.has(id)) {
-        nodes.push({ type: 'leaf', customerId: leaf.customerId, name: leaf.name, currency: leaf.currency, loginCustomerId: leaf.loginCustomerId });
+        nodes.push({ type: 'leaf', customerId: leaf.customerId, name: leaf.name, currency: leaf.currency, loginCustomerId: leaf.loginCustomerId, testAccount: leaf.testAccount });
       }
     }
     for (const m of managers) {
@@ -412,12 +422,47 @@ export class GoogleAdsService {
     return nodes;
   }
 
+  /**
+   * ENG-1362. Google's `test_account` flag for one connected account.
+   *
+   * Only needed for accounts connected BEFORE discovery started capturing it — new
+   * connections carry it in their stored config and never reach this. Cached for the
+   * life of the process because the flag is immutable: Google fixes it when the account
+   * is created and provides no way to change it afterwards.
+   *
+   * Returns `null` when the lookup fails, and callers must treat null as BILLABLE. An
+   * account we could not verify is not an account we may describe as safe — that is the
+   * whole point of reading the flag instead of the name.
+   */
+  private testAccountCache = new Map<string, boolean>();
+
+  async isTestAccount(userId: string, customerId: string): Promise<boolean | null> {
+    const cached = this.testAccountCache.get(customerId);
+    if (cached !== undefined) return cached;
+    try {
+      const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+      const rows = await this.search(
+        customerId, accessToken,
+        'SELECT customer.id, customer.test_account FROM customer LIMIT 1',
+        loginCustomerId,
+      );
+      const value = rows[0]?.customer?.testAccount === true;
+      this.testAccountCache.set(customerId, value);
+      return value;
+    } catch (err: any) {
+      // Deliberately not cached: a transient failure must not pin this account as
+      // "unknown" for the life of the process.
+      console.warn(`[GoogleAds] isTestAccount(${customerId}) failed; reporting unknown:`, err?.message || err);
+      return null;
+    }
+  }
+
   // Enumerate every enabled non-manager leaf under a manager (descendants at any depth,
   // flattened). login-customer-id must be the manager id for these queries and for all
   // later API calls against these leaves.
   private async listManagerLeaves(managerId: string, accessToken: string): Promise<GoogleAdLeaf[]> {
     const results = await this.search(managerId, accessToken,
-      "SELECT customer_client.id, customer_client.descriptive_name, customer_client.currency_code, customer_client.manager, customer_client.status FROM customer_client WHERE customer_client.manager = false AND customer_client.status = 'ENABLED'",
+      "SELECT customer_client.id, customer_client.descriptive_name, customer_client.currency_code, customer_client.manager, customer_client.status, customer_client.test_account FROM customer_client WHERE customer_client.manager = false AND customer_client.status = 'ENABLED'",
       managerId,
     );
     const leaves: GoogleAdLeaf[] = [];
@@ -433,6 +478,7 @@ export class GoogleAdsService {
         name: cc.descriptiveName || id,
         currency: cc.currencyCode || 'USD',
         loginCustomerId: managerId,
+        testAccount: cc.testAccount === true,
       });
     }
     return leaves;
@@ -443,7 +489,7 @@ export class GoogleAdsService {
     const out: GoogleAdLeaf[] = [];
     for (const n of nodes) {
       if (n.type === 'leaf') {
-        out.push({ customerId: n.customerId, name: n.name, currency: n.currency, loginCustomerId: n.loginCustomerId });
+        out.push({ customerId: n.customerId, name: n.name, currency: n.currency, loginCustomerId: n.loginCustomerId, testAccount: n.testAccount });
       } else {
         out.push(...n.children);
       }

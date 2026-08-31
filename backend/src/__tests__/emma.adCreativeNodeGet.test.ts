@@ -65,6 +65,28 @@ afterEach(() => {
 });
 
 describe('ENG-471 AC1 — AD_CREATIVE GET is exposed to the model', () => {
+  describe('ENG-1641 — confirmation batching instruction', () => {
+    const metaToolDescription = () =>
+      emmaToolRegistry.getTool('call_meta_marketing_api')!.definition.description;
+
+    it('tells the model to batch independent gated writes from one directive', () => {
+      expect(metaToolDescription()).toContain(
+        'When one user directive covers multiple gated writes with no data dependency between them',
+      );
+    });
+
+    it('requires independent gated writes to be emitted in one model message', () => {
+      expect(metaToolDescription()).toContain('emit ALL of those calls in ONE message');
+      expect(metaToolDescription()).toContain('as a single round');
+    });
+
+    it('allows separate messages only for real data dependencies', () => {
+      expect(metaToolDescription()).toContain(
+        'Split only on a real data dependency',
+      );
+    });
+  });
+
   it('declares GET in the tool action enum', () => {
     const schema = emmaToolRegistry.getTool('call_meta_marketing_api')!
       .definition.inputSchema.properties.action;

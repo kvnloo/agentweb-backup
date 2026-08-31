@@ -211,6 +211,13 @@ router.put("/:planId", async (req, res) => {
           if (Array.isArray(raw.requiredFunctionCalls)) out.requiredFunctionCalls = norm.requiredFunctionCalls;
           if (Array.isArray(raw.skillIds)) out.skillIds = norm.skillIds;
           if (has('expectedAssetCount')) out.expectedAssetCount = norm.expectedAssetCount;
+          // ENG-1331: same has()-gated pass-through as expectedAssetCount above —
+          // absent from this list, a merge-mode edit to any OTHER field would
+          // silently drop a step's expectedAssetCountTools (the exact ENG-889
+          // failure class this file's whole merge-supplied-builder exists to
+          // prevent, on the very field the doc comment above cites as a past
+          // victim of it).
+          if (has('expectedAssetCountTools')) out.expectedAssetCountTools = norm.expectedAssetCountTools;
           if (has('inputRequest')) out.inputRequest = norm.inputRequest;
           return out;
         });

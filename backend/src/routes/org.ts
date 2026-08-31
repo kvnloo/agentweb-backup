@@ -6,8 +6,21 @@ import { callerCan, can, roleOf } from "../services/orgAuthz";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
+import { getUserSubscriptionResolution } from "../services/subscriptionService";
 
 const router = Router();
+
+const ORGANIZATION_CREATION_TIERS = new Set([
+  "starter",
+  // Basic is the persisted label for the Starter checkout plan.
+  "basic",
+  "pro",
+  // Complete is the legacy paid label for the Pro checkout plan.
+  "complete",
+  "partner",
+  "super premium",
+  "managed",
+]);
 
 type MarketStrategy = NonNullable<Organization["marketStrategy"]>;
 type MarketIcp = MarketStrategy["icp"][number];
@@ -242,6 +255,10 @@ function deriveDomainFromEmail(email: string): string | undefined {
 
 function sanitizeConnectedAccountForOrgResponse(account: any): any {
   const safeConfig: Record<string, any> = {};
+  // Daily outreach limits are account-activity data, not org-shared connection
+  // metadata. The owner-facing account endpoint has its own explicit contract;
+  // this member-visible projection must not expose the cap, count, or window.
+  const privateOperationalKeys = new Set(['daily_invite_cap', 'daily_volume']);
   for (const [key, value] of Object.entries(account.config || {})) {
     const normalizedKey = key.toLowerCase();
     const looksCredentialLike =
@@ -251,7 +268,7 @@ function sanitizeConnectedAccountForOrgResponse(account: any): any {
       normalizedKey.includes("secret") ||
       normalizedKey === "api_key" ||
       normalizedKey === "apikey";
-    if (!looksCredentialLike) {
+    if (!looksCredentialLike && !privateOperationalKeys.has(normalizedKey)) {
       safeConfig[key] = value;
     }
   }
@@ -283,7 +300,10 @@ function sanitizeConnectedAccountForOrgResponse(account: any): any {
  * were not named in the ENG-953 report; they are the same disclosure class and
  * are covered here rather than left for a second incident.
  */
-function projectOrgForMemberResponse(org: any): Record<string, any> {
+function projectOrgForMemberResponse(
+  org: any,
+  includeDomainJoinRequestToken: boolean,
+): Record<string, any> {
   return {
     orgId: org.orgId,
     name: org.name,
@@ -352,6 +372,10 @@ function projectOrgForMemberResponse(org: any): Record<string, any> {
           userId: r?.userId,
           email: r?.email,
           requestedAt: r?.requestedAt,
+          // The settings UI needs this value to call the already-authorized
+          // approve/reject endpoints. It remains absent for ordinary members:
+          // only callers with `org:members:manage` can receive or use it.
+          ...(includeDomainJoinRequestToken ? { requestToken: r?.requestToken } : {}),
         }))
       : undefined,
 
@@ -376,6 +400,18 @@ router.post("/", async (req: Request, res: Response) => {
     const { name } = req.body;
     if (!name || typeof name !== "string" || name.trim().length === 0) {
       return res.status(400).json({ error: "Organization name is required" });
+    }
+
+    const { subscriptionType, resolved } = await getUserSubscriptionResolution(userId);
+    if (!resolved) {
+      return res.status(503).json({
+        error: "Subscription status is temporarily unavailable. Please try again.",
+      });
+    }
+    if (!ORGANIZATION_CREATION_TIERS.has(subscriptionType.trim().toLowerCase())) {
+      return res.status(403).json({
+        error: "A Starter plan or higher is required to create an organization.",
+      });
     }
 
     const now = new Date().toISOString();
@@ -454,11 +490,13 @@ router.get("/me", async (req: Request, res: Response) => {
     //
     // An explicit allowlist rather than a denylist, so a future Organization
     // field is absent here until someone deliberately adds it.
-    const callerRole = roleOf({ userId, orgId: user.orgId, orgRole: user.orgRole }, org);
+    const caller = { userId, orgId: user.orgId, orgRole: user.orgRole };
+    const callerRole = roleOf(caller, org);
+    const canManageMembers = can(caller, org, "org:members:manage");
     return res.json({
       success: true,
       data: {
-...projectOrgForMemberResponse(org),
+        ...projectOrgForMemberResponse(org, canManageMembers),
         members: safeMembers,
         // Server-computed capabilities. Clients must gate on these rather than
         // comparing orgRole themselves — that comparison is exactly what has to
@@ -466,11 +504,11 @@ router.get("/me", async (req: Request, res: Response) => {
         // portal would silently render an admin as a plain member.
         callerRole,
         capabilities: {
-          canManageOrg: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:configure"),
-          canManageMembers: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:members:manage"),
-          canManageContent: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:content:manage"),
-          canSeeAllAccounts: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:accounts:read"),
-          canDeleteOrg: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:delete"),
+          canManageOrg: can(caller, org, "org:configure"),
+          canManageMembers,
+          canManageContent: can(caller, org, "org:content:manage"),
+          canSeeAllAccounts: can(caller, org, "org:accounts:read"),
+          canDeleteOrg: can(caller, org, "org:delete"),
         },
       },
     });

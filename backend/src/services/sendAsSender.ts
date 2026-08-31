@@ -12,8 +12,12 @@
  */
 
 import { resendService } from './resendService';
-import { getEmailProvider, bootstrapEmailProviders, type SentEmailResult } from './emailProviderService';
+import { getEmailProvider, bootstrapEmailProviders, type IEmailService, type SentEmailResult } from './emailProviderService';
 import { CrmSender, SenderProvider, PROVIDER_TO_PLATFORM } from './crmSenderTypes';
+import { effectiveDailyLimit, SenderDailyLimitExceededError } from './senderUsageTracker';
+import { senderUsageTracker } from './senderUsageTrackerFactory';
+
+export { SenderDailyLimitExceededError };
 
 export interface SendAsSenderParams {
   to: string | string[];
@@ -66,6 +70,12 @@ export async function sendAsSender(
   sender: CrmSender,
   params: SendAsSenderParams,
 ): Promise<SendAsSenderResult> {
+  // Pre-flight: resolved/validated before reserving quota below, so none of it can be
+  // confused with an ambiguous dispatch-time failure. bootstrapEmailProviders() and
+  // getEmailProvider() belong here too, not just the sync checks — a registry-lookup or
+  // client-init failure proves just as little was dispatched as a missing connectedAccountId
+  // does, so it shouldn't needlessly consume a reservation either.
+  let mailboxProvider: IEmailService | null = null;
   if (sender.senderProvider === 'resend') {
     // resendService has never supported bcc (checked as of this branch: neither the
     // service nor any pre-existing caller ever wired it up) — fail loud instead of
@@ -73,6 +83,30 @@ export async function sendAsSender(
     if (params.bcc) {
       throw new SenderSendError(sender, 'This Resend sender does not support bcc.');
     }
+  } else {
+    const platform = resolvePlatform(sender);
+    await bootstrapEmailProviders();
+    mailboxProvider = getEmailProvider(platform);
+  }
+
+  // ENG-265: daily-cap/warmup check. `limit === null` means the sender has no cap
+  // configured — unchanged legacy behavior, no tracker call at all. reserveSend()
+  // atomically checks the limit AND consumes the slot in one operation (not a
+  // separate check-then-record pair, which would let concurrent sends all pass the
+  // check before any of them records).
+  const limit = effectiveDailyLimit(sender);
+  if (limit !== null) {
+    await senderUsageTracker.reserveSend(userId, sender.id, limit);
+  }
+
+  // No release-on-failure past this point, by design: once a dispatch is attempted, an
+  // error (thrown by the SDK, a timeout, a missing message id) does not prove the provider
+  // never sent it — a response can fail to reach this process after the message already
+  // went out. Releasing quota on that ambiguity would let a client-side retry exceed the
+  // sender's real daily limit. Same conservative (under- not over-sending) bias documented
+  // in senderUsageTrackerFactory.ts's release(): a reservation left consumed despite an
+  // unclear outcome is the safe direction to be wrong in.
+  if (sender.senderProvider === 'resend') {
     const from = sender.fromName ? `${sender.fromName} <${sender.email}>` : sender.email;
     const result = await resendService.sendEmail({
       from,
@@ -89,19 +123,9 @@ export async function sendAsSender(
     return { provider: 'resend', messageId: result.id };
   }
 
-  const platform = PROVIDER_TO_PLATFORM[sender.senderProvider];
-  if (!platform) {
-    throw new SenderSendError(sender, `Unsupported sender provider: ${sender.senderProvider}`);
-  }
-  if (!sender.connectedAccountId) {
-    throw new SenderSendError(sender, `${sender.senderProvider} sender is missing its connected account id.`);
-  }
-
-  await bootstrapEmailProviders();
   await waitForMailboxSendWindow();
 
-  const provider = getEmailProvider(platform);
-  const result: SentEmailResult = await provider.sendEmail(userId, sender.connectedAccountId, {
+  const result: SentEmailResult = await mailboxProvider!.sendEmail(userId, sender.connectedAccountId!, {
     to: params.to,
     subject: params.subject,
     body: params.html ?? params.text ?? '',
@@ -112,4 +136,15 @@ export async function sendAsSender(
   });
 
   return { provider: sender.senderProvider, messageId: result.messageId, threadId: result.threadId };
+}
+
+function resolvePlatform(sender: CrmSender) {
+  const platform = PROVIDER_TO_PLATFORM[sender.senderProvider];
+  if (!platform) {
+    throw new SenderSendError(sender, `Unsupported sender provider: ${sender.senderProvider}`);
+  }
+  if (!sender.connectedAccountId) {
+    throw new SenderSendError(sender, `${sender.senderProvider} sender is missing its connected account id.`);
+  }
+  return platform;
 }
