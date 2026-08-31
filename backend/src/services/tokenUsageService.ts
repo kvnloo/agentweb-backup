@@ -73,6 +73,25 @@ export async function resolveBillingUserId(userId: string): Promise<string> {
     return userId;
   }
 
+  // ENG-1215: the org can name an owner that does not resolve. Two shapes exist
+  // in real data: `ownerUserId` absent from the row entirely, and an id left
+  // dangling when the owner was deleted while members remained.
+  //
+  // Returning either one hands every caller a billing subject that
+  // `getUserTokenUsage` throws `User not found` on. That is not confined to the
+  // usage surfaces it was first seen on (a 500 from /usage-runway): this
+  // function also resolves the subject for `checkTokenUsage`, the gate on the
+  // chat path, so a member whose OWN record is perfectly healthy is locked out
+  // of the product by a defect in a row they cannot see.
+  //
+  // Fall back to the member's own partition, exactly as the `!org` case above
+  // does. There is no org counter to pool onto when the root does not exist, so
+  // the member is billed and quota'd on their own — the restrictive direction,
+  // never an uncapped one.
+  if (!org.ownerUserId) return userId;
+  const billingRoot = await userDb.getUserById(org.ownerUserId);
+  if (!billingRoot) return userId;
+
   return org.ownerUserId;
 }
 
