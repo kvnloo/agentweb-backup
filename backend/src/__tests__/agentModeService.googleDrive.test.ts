@@ -1247,6 +1247,73 @@ describe('AgentModeService - Google Drive methods', () => {
         expect(result.message).toMatch(/multiple/i);
       });
 
+      it('names a folder actually in the searched tree in the ambiguity message, even when a file lists an outside parent first', async () => {
+        const SUB_A = 'ratio-4x5';
+        const SUB_B = 'ratio-9x16';
+        const OUTSIDE = 'some-unrelated-folder-not-in-the-tree';
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            if (q.includes(`'${ROOT}' in parents`)) {
+              return Promise.resolve({ data: { files: [{ id: SUB_A, name: '4x5' }, { id: SUB_B, name: '9x16' }] } });
+            }
+            return Promise.resolve({ data: { files: [] } });
+          }
+          if (q.includes("name = 'dup.png'")) {
+            return Promise.resolve({
+              data: {
+                files: [
+                  // parents[0] is OUTSIDE the tree that was actually searched
+                  // — naming it would point someone at the wrong place.
+                  { id: 'file-a', name: 'dup.png', mimeType: 'image/png', size: '10', parents: [OUTSIDE, SUB_A] },
+                  { id: 'file-b', name: 'dup.png', mimeType: 'image/png', size: '10', parents: [SUB_B] },
+                ],
+              },
+            });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'dup.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('4x5');
+        expect(result.message).toContain('9x16');
+        expect(result.message).not.toContain(OUTSIDE);
+      });
+
+      it('materializes against a nested child root identifier exactly as before (regression guard)', async () => {
+        const PARENT = 'root-parent';
+        const CHILD = 'root-child';
+        (userDb.getUserById as jest.Mock).mockResolvedValue({
+          userId: USER_ID,
+          googleDriveFolders: [
+            { folderId: PARENT, name: 'Parent' },
+            { folderId: CHILD, name: 'Child' },
+          ],
+        });
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            return Promise.resolve({ data: { files: [] } }); // CHILD has no sub-folders of its own
+          }
+          if (q.includes("name = 'ad.png'")) {
+            return Promise.resolve({
+              data: { files: [{ id: 'file-1', name: 'ad.png', mimeType: 'image/png', size: '2048' }] },
+            });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+        mockDriveFiles.get.mockResolvedValue({ data: Buffer.from('fake-png-bytes') });
+
+        // Round 4 changes listKnowledgeBaseFiles' cross-root de-duplication —
+        // materialize's own per-call tree walk (rooted at whichever
+        // kb_identifier was passed) is untouched, so a saved reference to the
+        // nested child root must resolve exactly as it always has.
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${CHILD}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(true);
+        expect(result.url).toMatch(/^https:\/\//);
+      });
+
       it('flags an incomplete scan — and does not claim absence — when a tree exceeds the folder cap', async () => {
         let depth = 0;
         mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
@@ -1657,6 +1724,205 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(result.driveEnumerationFailed).toBe(true);
       expect(result.message).toMatch(/could not be enumerated/i);
       expect(result.message).not.toMatch(/^No Google Drive shared folders found here/);
+    });
+
+    // ── Rework findings, round 4 (cross-root duplicate listing) ────────────────
+    //
+    // This loop pushes one knowledgeBases entry per registered root with no
+    // cross-root de-duplication. Harmless while every query was direct-children
+    // only; not harmless once the tree walk means a parent root's listing
+    // legitimately includes a separately-registered descendant root's files too
+    // — exactly Harsha's Phoenix mitigation shape (registering the ratio
+    // sub-folders directly alongside the already-registered parent).
+
+    it('lists both a parent and a nested child root, counts each file once, and states the nesting', async () => {
+      const PARENT = 'root-parent';
+      const CHILD = 'root-child';
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: USER_ID,
+        googleDriveFolders: [
+          { folderId: PARENT, name: 'Parent Folder' },
+          { folderId: CHILD, name: 'Child Folder' },
+        ],
+      });
+
+      const FILE = { id: 'shared-file-1', name: 'a.png', mimeType: 'image/png', size: '10', modifiedTime: '2026-08-01T00:00:00Z' };
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          if (q.includes(`'${PARENT}' in parents`)) {
+            return Promise.resolve({ data: { files: [{ id: CHILD, name: 'Child Folder' }] } });
+          }
+          return Promise.resolve({ data: { files: [] } }); // CHILD has no sub-folders of its own
+        }
+        if (q.includes(`'${CHILD}' in parents`)) {
+          return Promise.resolve({ data: { files: [FILE] } });
+        }
+        return Promise.resolve({ data: { files: [] } });
+      });
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+
+      const parentKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${PARENT}`);
+      const childKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${CHILD}`);
+
+      // Must fail against the current (pre-fix) code: neither entry would be
+      // dropped, but totalFiles would double-count and nestedUnder wouldn't exist.
+      expect(parentKb).toBeDefined();
+      expect(childKb).toBeDefined();
+      expect(parentKb.files.map((f: any) => f.fileName)).toContain('a.png');
+      expect(childKb.files.map((f: any) => f.fileName)).toContain('a.png');
+      expect(childKb.nestedUnder).toBe(`gdrive:${PARENT}`);
+      expect(result.totalFiles).toBe(1);
+      expect(result.message).toMatch(/nested inside another registered source/i);
+    });
+
+    it('the real Phoenix shape — parent root plus three registered ratio sub-folders — reports the distinct file count, not a multiple of it', async () => {
+      // Real folder ids from the Phoenix session (ENG-1624), so this fixture
+      // stays traceable to the actual production account shape.
+      const PARENT = '13A2WhVZiHpGW-scMBT5gcQSeH7mHZkn3'; // "8-18-26 Insurance Angle Ads"
+      const SUB_4X5 = '1qG_eP4aG2yPu31ZAsAoGfFmqEqWHSd1t';
+      const SUB_9X16 = '1zKbdC-8e0QH65MV_5mcEbE0btCJaWYnu';
+      const SUB_1X1 = '1wSqSD7SYNnCd6K4VwEVg3BYL52ua95vZ';
+
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: USER_ID,
+        googleDriveFolders: [
+          { folderId: PARENT, name: '8-18-26 Insurance Angle Ads' },
+          { folderId: SUB_4X5, name: '8-18-26 Insurance Angle Ads / 4x5' },
+          { folderId: SUB_9X16, name: '8-18-26 Insurance Angle Ads / 9x16' },
+          { folderId: SUB_1X1, name: '8-18-26 Insurance Angle Ads / 1x1' },
+        ],
+      });
+
+      const filesFor = (suffix: string) => ([
+        { id: `BUSS-F-07-${suffix}`, name: `BUSS-F-07_iceberg-lifeboat_${suffix}.png`, mimeType: 'image/png', size: '4900000', modifiedTime: '2026-08-18T21:50:00Z' },
+        { id: `BUSS-H-07-${suffix}`, name: `BUSS-H-07_iceberg-lifeboat_${suffix}.png`, mimeType: 'image/png', size: '4800000', modifiedTime: '2026-08-18T21:51:00Z' },
+      ]);
+
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          if (q.includes(`'${PARENT}' in parents`)) {
+            return Promise.resolve({
+              data: {
+                files: [
+                  { id: SUB_4X5, name: '4x5' },
+                  { id: SUB_9X16, name: '9x16' },
+                  { id: SUB_1X1, name: '1x1' },
+                ],
+              },
+            });
+          }
+          return Promise.resolve({ data: { files: [] } }); // ratio folders have no sub-folders
+        }
+        let files: any[] = [];
+        if (q.includes(`'${SUB_4X5}' in parents`)) files = files.concat(filesFor('4x5'));
+        if (q.includes(`'${SUB_9X16}' in parents`)) files = files.concat(filesFor('9x16'));
+        if (q.includes(`'${SUB_1X1}' in parents`)) files = files.concat(filesFor('1x1'));
+        return Promise.resolve({ data: { files } });
+      });
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+
+      const parentKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${PARENT}`);
+      const sub4x5Kb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${SUB_4X5}`);
+
+      expect(parentKb.files.length).toBe(6);
+      expect(sub4x5Kb.files.length).toBe(2);
+      expect(sub4x5Kb.nestedUnder).toBe(`gdrive:${PARENT}`);
+      // 6 distinct creatives, not 6 (parent) + 2 + 2 + 2 (each ratio root) = 12.
+      expect(result.totalFiles).toBe(6);
+    });
+
+    it('two roots sharing a sub-tree through a multi-parent folder — no nesting claimed, no double count', async () => {
+      const ROOT_A = 'root-a';
+      const ROOT_B = 'root-b';
+      const SHARED = 'shared-child';
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: USER_ID,
+        googleDriveFolders: [
+          { folderId: ROOT_A, name: 'Root A' },
+          { folderId: ROOT_B, name: 'Root B' },
+        ],
+      });
+
+      const FILE = { id: 'shared-file', name: 'shared.png', mimeType: 'image/png', size: '10', modifiedTime: '2026-08-01T00:00:00Z' };
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          if (q.includes(`'${ROOT_A}' in parents`) || q.includes(`'${ROOT_B}' in parents`)) {
+            // Both roots independently discover the SAME child — a diamond,
+            // not an ancestor/descendant relationship between the two roots.
+            return Promise.resolve({ data: { files: [{ id: SHARED, name: 'shared' }] } });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        }
+        if (q.includes(`'${SHARED}' in parents`)) {
+          return Promise.resolve({ data: { files: [FILE] } });
+        }
+        return Promise.resolve({ data: { files: [] } });
+      });
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+
+      const kbA = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${ROOT_A}`);
+      const kbB = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${ROOT_B}`);
+
+      // Neither root's own id was discovered inside the other's tree — SHARED
+      // is a common descendant, not a containment relationship between A and B.
+      expect(kbA.nestedUnder).toBeUndefined();
+      expect(kbB.nestedUnder).toBeUndefined();
+      expect(kbA.files.map((f: any) => f.fileName)).toContain('shared.png');
+      expect(kbB.files.map((f: any) => f.fileName)).toContain('shared.png');
+      expect(result.totalFiles).toBe(1);
+    });
+
+    it('a nested-looking root whose ancestor scan was truncated — no nesting claimed, files still deduplicated', async () => {
+      jest.useFakeTimers();
+      try {
+        const PARENT = 'root-parent';
+        const CHILD = 'root-child'; // genuinely a descendant of PARENT, but PARENT's walk never reaches it
+        const DECOY = 'decoy-sibling';
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue({
+          userId: USER_ID,
+          googleDriveFolders: [
+            { folderId: PARENT, name: 'Parent' },
+            { folderId: CHILD, name: 'Child' },
+          ],
+        });
+
+        const FILE = { id: 'file-1', name: 'a.png', mimeType: 'image/png', size: '10', modifiedTime: '2026-08-01T00:00:00Z' };
+
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            if (q.includes(`'${PARENT}' in parents`)) {
+              // Discovering PARENT's one child costs enough time that the walk
+              // is truncated before it can ever descend into that child and
+              // find CHILD underneath it.
+              jest.advanceTimersByTime(20_000);
+              return Promise.resolve({ data: { files: [{ id: DECOY, name: 'decoy' }] } });
+            }
+            return Promise.resolve({ data: { files: [] } }); // CHILD's own walk (registered separately) is fast and clean
+          }
+          if (q.includes(`'${CHILD}' in parents`)) {
+            return Promise.resolve({ data: { files: [FILE] } });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+
+        const parentKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${PARENT}`);
+        const childKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${CHILD}`);
+
+        expect(parentKb.folderScanIncomplete).toBe(true);
+        // PARENT's walk never actually discovered CHILD, so no relationship
+        // is asserted — a scan that didn't observe something can't vouch for it.
+        expect(childKb.nestedUnder).toBeUndefined();
+        expect(childKb.files.map((f: any) => f.fileName)).toContain('a.png');
+        expect(result.totalFiles).toBe(1);
+      } finally {
+        jest.useRealTimers();
+      }
     });
   });
 
