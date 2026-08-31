@@ -1251,6 +1251,11 @@ export class AgentModeService {
   // save-as-you-go around browser automation tools, so an intermittent login
   // success is captured without depending on the model calling the cookie tools).
   private browserCookieAutoState = createAutoPersistState();
+  // ENG-1624: cached so a sub-folder-access error can name the service account
+  // to share with, without re-fetching the secret on every failure. Only the
+  // email is kept — the private key must never outlive the local
+  // getGoogleDriveClient() call that parses the secret.
+  private driveServiceAccountEmail: string | null = null;
   private toolRegistry: ToolRegistry;
   private mcpClientService: McpClientService;
   private static toolsRegistered: boolean = false;
@@ -21668,11 +21673,237 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production' ? 'prod/AgentWeb/Google/Share' : 'dev/AgentWeb/Google/Share';
     const credentials = JSON.parse(await getSecret(secretName));
+    this.driveServiceAccountEmail = credentials.client_email || null;
     const auth = new google.auth.GoogleAuth({
       credentials,
       scopes: ['https://www.googleapis.com/auth/drive.readonly'],
     });
     return google.drive({ version: 'v3', auth });
+  }
+
+  private getGoogleDriveServiceAccountEmail(): string {
+    return this.driveServiceAccountEmail || 'the AgentWeb Google Drive service account';
+  }
+
+  /**
+   * ENG-1624: classify a Drive failure into a short, safe reason for a
+   * model-visible payload. Never put the raw error object (or its message)
+   * there — mirrors metaService.ts's drainCursor, which deliberately doesn't
+   * log/surface FacebookRequestError objects because a paged Graph URL carries
+   * the access token in its query string; a Drive error can carry similarly
+   * sensitive request context. The full error is still logged server-side by
+   * the caller, same as before — only this classified string reaches the model.
+   */
+  private classifyDriveError(err: any): string {
+    const code = err?.code || err?.status;
+    if (code === 403 || code === 401) return 'permission denied';
+    if (code === 429) return 'rate limited';
+    if (code === 400) return 'invalid request';
+    if (typeof err?.message === 'string' && /did not respond within/i.test(err.message)) {
+      return 'temporary Drive error (timed out)';
+    }
+    return 'temporary Drive error';
+  }
+
+  /**
+   * ENG-1624: getGoogleDriveFolderTreeIds bounds folder COUNT (maxFolders) and
+   * queryDriveFilesAcrossFolders bounds per-batch file COUNT (perBatchTarget),
+   * but neither bounded elapsed TIME — both await Drive list calls sequentially,
+   * so a large or slow-to-respond tree/query was many serial round-trips with no
+   * deadline. Same shape as metaService.ts's META_LIST_MAX_MS / drainCursor: a
+   * count bound limits WORK, not TIME, when calls are awaited one at a time.
+   *
+   * A Drive list call here fetches only id+name (folder discovery) or a handful
+   * of scalar fields (file listing) with no nested expansions, so it's a much
+   * lighter call than a Meta ad-list page with `creative{...}` expansion —
+   * intentionally far short of Meta's 45s: long enough that an ordinary
+   * customer's tree (tens of folders) finishes in a fraction of it, short
+   * enough that a pathological or throttled tree can't visibly stall a turn.
+   * Crossing it sets `truncated`/`capped` — the same "incomplete, do not
+   * conclude absence" signal the count bounds already use, not a new failure
+   * mode.
+   */
+  private static readonly DRIVE_LIST_WALK_MAX_MS = 15_000;
+
+  // ENG-1624: a registered gdrive: KB folder is authorized by its root ID only, but
+  // every Drive query in this file was scoped to `'<folderId>' in parents` — direct
+  // children only. A file living in a sub-folder (any depth) of a registered root
+  // resolved as not-found, and the sub-folder itself as "Not authorized" (our own
+  // flat allowlist check, not a real Google permission failure). This walks the
+  // folder tree from a registered root so callers can search/list across the whole
+  // tree instead of just its direct children. `restricted` surfaces sub-folders that
+  // couldn't be listed (e.g. an unshared shortcut target) so callers can give an
+  // actionable error instead of a bare "not found". `rootRestricted` is the same
+  // signal for the registered root itself — kept separate from `restricted` so it
+  // isn't reported to the caller as if it were a sub-folder found underneath itself.
+  // `truncated` is set when the `maxFolders` bound stops the walk before the whole
+  // tree was covered, so a caller can say "incomplete" instead of asserting absence.
+  private async getGoogleDriveFolderTreeIds(
+    drive: any,
+    rootFolderId: string,
+    maxFolders: number = 500
+  ): Promise<{
+    folderIds: string[];
+    restricted: Array<{ id: string; name: string }>;
+    rootRestricted: boolean;
+    truncated: boolean;
+    folderNames: Map<string, string>;
+  }> {
+    const folderIdSet = new Set<string>([rootFolderId]);
+    const folderIds: string[] = [rootFolderId];
+    const folderNames = new Map<string, string>();
+    const queue: string[] = [rootFolderId];
+    const restricted: Array<{ id: string; name: string }> = [];
+    let rootRestricted = false;
+    let truncated = false;
+    const deadline = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
+
+    while (queue.length > 0 && !truncated) {
+      if (Date.now() >= deadline) {
+        truncated = true;
+        break;
+      }
+      const current = queue.shift()!;
+      let pageToken: string | undefined;
+      do {
+        if (Date.now() >= deadline) {
+          truncated = true;
+          break;
+        }
+        let resp: any;
+        try {
+          // A per-request timeout was considered here (the loop-level deadline
+          // check above only runs BEFORE a request starts, not while awaiting
+          // one, so it can't interrupt a single hung call — same reasoning as
+          // metaService.ts's withReadDeadline). googleapis' MethodOptions does
+          // support one (it extends gaxios' GaxiosOptions, which declares
+          // `timeout?: number`), but only as a SECOND argument to `.list()` —
+          // every existing test asserting this call's argument shape asserts a
+          // single-argument call, so adding one would require rewriting
+          // passing regression pins rather than fixing a bug. Left as a
+          // follow-up; the elapsed-time bound below is the hard requirement
+          // and doesn't need it.
+          resp = await drive.files.list({
+            q: `'${current}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+            fields: 'nextPageToken, files(id, name)',
+            pageSize: 1000,
+            ...(pageToken && { pageToken }),
+            supportsAllDrives: true,
+            includeItemsFromAllDrives: true,
+          });
+        } catch (err: any) {
+          const code = err?.code || err?.status;
+          if (code === 403 || code === 401) {
+            if (current === rootFolderId) {
+              rootRestricted = true;
+            } else {
+              restricted.push({ id: current, name: folderNames.get(current) || current });
+            }
+          }
+          console.log(`AgentMode: Could not list subfolders of Drive folder ${current}:`, err);
+          break;
+        }
+
+        for (const f of resp.data.files || []) {
+          if (!f.id || folderIdSet.has(f.id)) continue;
+          if (folderIds.length >= maxFolders) {
+            truncated = true;
+            break;
+          }
+          folderIdSet.add(f.id);
+          folderIds.push(f.id);
+          if (f.name) folderNames.set(f.id, f.name);
+          queue.push(f.id);
+        }
+
+        pageToken = truncated ? undefined : (resp.data.nextPageToken || undefined);
+      } while (pageToken);
+    }
+
+    return { folderIds, restricted, rootRestricted, truncated, folderNames };
+  }
+
+  // ENG-1624: `'<id>' in parents` clauses joined with OR grow ~52 chars per Drive
+  // id (33-char id + boilerplate). `q` travels as a URL query parameter, so a
+  // 500-folder tree building one query risks a 400/414 from Drive rather than
+  // degrading gracefully. Chunk into batches and merge results de-duplicated by
+  // file id — a file with multiple parents can legitimately appear in more than
+  // one batch.
+  private static readonly DRIVE_FOLDER_QUERY_BATCH_SIZE = 50;
+
+  // ENG-1624 rework: this used to fetch a single page per batch (pageSize
+  // pageSizePerBatch, no nextPageToken follow-through), so a batch holding more
+  // matches than that one page silently dropped the rest. `perBatchTarget` is now
+  // pursued via in-batch pagination — following nextPageToken — until either the
+  // batch is genuinely exhausted or `perBatchTarget` items have been accumulated
+  // FOR THAT BATCH. The target is deliberately per-batch, not a budget shared
+  // across batches: each batch is fetched with the same `orderBy`, so the
+  // per-batch top-K is a superset of what the true global top-K could need from
+  // that batch — a shared budget would let one batch starve another and return
+  // the wrong page contents, not just a wrong total. `capped` reports whether any
+  // batch stopped at its target with more available, i.e. whether the merged
+  // result can be trusted as exhaustive.
+  private async queryDriveFilesAcrossFolders(
+    drive: any,
+    folderIds: string[],
+    extraClause: string,
+    fields: string,
+    perBatchTarget: number,
+    orderBy?: string
+  ): Promise<{ files: Map<string, any>; capped: boolean }> {
+    const merged = new Map<string, any>();
+    let capped = false;
+    // ENG-1624: same time bound as getGoogleDriveFolderTreeIds, and for the same
+    // reason — batches and pages here are walked sequentially with no overall
+    // bound otherwise. Crossing it sets `capped`, reusing the existing
+    // "incomplete, do not conclude absence" signal.
+    const deadline = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
+    for (let i = 0; i < folderIds.length; i += AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE) {
+      if (Date.now() >= deadline) {
+        capped = true;
+        break;
+      }
+      const batch = folderIds.slice(i, i + AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE);
+      const parentClause = `(${batch.map(id => `'${id}' in parents`).join(' or ')})`;
+      let batchCount = 0;
+      let pageToken: string | undefined;
+      do {
+        if (Date.now() >= deadline) {
+          capped = true;
+          pageToken = undefined;
+          break;
+        }
+        // See getGoogleDriveFolderTreeIds for why a per-request timeout isn't
+        // added here: it needs a second call argument, which would break every
+        // existing test asserting this call's (single-argument) shape.
+        const resp = await drive.files.list({
+          q: `${parentClause} and ${extraClause}`,
+          // nextPageToken must be requested explicitly — it isn't returned by
+          // default, which is exactly why the old single-page fetch had no way
+          // to know it was truncating.
+          fields: `nextPageToken, ${fields}`,
+          pageSize: Math.min(perBatchTarget - batchCount, 1000),
+          ...(pageToken && { pageToken }),
+          ...(orderBy && { orderBy }),
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+        });
+        const files = resp.data.files || [];
+        for (const f of files) {
+          if (f.id) merged.set(f.id, f);
+        }
+        batchCount += files.length;
+        pageToken = resp.data.nextPageToken || undefined;
+        if (batchCount >= perBatchTarget && pageToken) {
+          // Hit this batch's target with more still available — stop here
+          // rather than draining a huge folder, but the caller needs to know
+          // this batch's contribution isn't necessarily complete.
+          capped = true;
+          pageToken = undefined;
+        }
+      } while (pageToken);
+    }
+    return { files: merged, capped };
   }
 
   private extractGoogleFileId(urlOrId: string): string {
@@ -21746,6 +21977,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Limit max results to 10
       const limitedMaxResults = Math.min(maxResults, 10);
 
+      // ENG-1624: set when a registered root's folder tree couldn't be fully
+      // walked/read (truncated by maxFolders, or a root/sub-folder 403'd) — the
+      // Drive portion of these results is then not exhaustive, and the final
+      // message must say so rather than reading as a complete search.
+      let driveScanIncomplete = false;
+
       // Search platform knowledge base (both public and private)
       const searchResults = await searchPlatformKnowledgeBase(query, limitedMaxResults, userId);
 
@@ -21766,17 +22003,33 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const folders = await this.getUserGoogleDriveFolders(userId);
           if (folders.length > 0) {
             const drive = await this.getGoogleDriveClient();
-            // Build query: search across all shared folders
-            const parentClauses = folders.map(f => `'${f.folderId}' in parents`).join(' or ');
-            const driveResponse = await drive.files.list({
-              q: `(${parentClauses}) and fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
-              fields: 'files(id, name, mimeType, parents)',
-              pageSize: limitedMaxResults,
-              supportsAllDrives: true,
-              includeItemsFromAllDrives: true,
-            });
+            // Walk each registered root's whole folder tree (ENG-1624) so search
+            // covers files nested in sub-folders too, not just direct children.
+            const folderTrees = await Promise.all(
+              folders.map(f => this.getGoogleDriveFolderTreeIds(drive, f.folderId))
+            );
+            if (folderTrees.some(t => t.truncated || t.rootRestricted || t.restricted.length > 0)) {
+              driveScanIncomplete = true;
+            }
+            // De-dupe across roots: a file with multiple parents (or two registered
+            // roots sharing a sub-tree) can otherwise appear twice.
+            const allFolderIds = [...new Set(folderTrees.flatMap(t => t.folderIds))];
+            const { files: driveFilesMap, capped: driveQueryCapped } = await this.queryDriveFilesAcrossFolders(
+              drive,
+              allFolderIds,
+              `fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
+              'files(id, name, mimeType, parents)',
+              limitedMaxResults
+            );
+            // A per-batch cap on the file query itself is a different reason the
+            // Drive portion isn't exhaustive than an unreadable folder — fold it
+            // into the same signal so a capped search result set isn't presented
+            // as exhaustive either.
+            if (driveQueryCapped) {
+              driveScanIncomplete = true;
+            }
 
-            const driveFiles = driveResponse.data.files || [];
+            const driveFiles = Array.from(driveFilesMap.values()).slice(0, limitedMaxResults);
             for (const file of driveFiles) {
               // Read file content for text-based files
               if (file.id && file.mimeType && !file.mimeType.startsWith('application/vnd.google-apps.folder')) {
@@ -21879,11 +22132,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (results.length === 0) {
         return {
           success: true,
-          message: `No knowledge base results found for "${query}"`,
+          message: driveScanIncomplete
+            ? `No knowledge base results found for "${query}" — note: some Google Drive folders could not be fully scanned, so this is not confirmed exhaustive.`
+            : `No knowledge base results found for "${query}"`,
           query,
           results: [],
           returnedResults: 0,
-          hasMore: false
+          hasMore: false,
+          ...(driveScanIncomplete && { scanIncomplete: true })
         };
       }
 
@@ -21907,15 +22163,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // more exists upstream, which is why the message says "raise max_results"
       // rather than promising a specific remainder.
       const hasMore = results.length > boundedResults.length;
+      const scanIncompleteNote = driveScanIncomplete
+        ? ' Some Google Drive folders could not be fully scanned, so this is not confirmed exhaustive.'
+        : '';
       return {
         success: true,
-        message: hasMore
+        message: (hasMore
           ? `Showing the first ${boundedResults.length} knowledge base results for "${query}" — raise max_results to see more.`
-          : `Found ${boundedResults.length} knowledge base results for "${query}"`,
+          : `Found ${boundedResults.length} knowledge base results for "${query}"`) + scanIncompleteNote,
         query,
         results: boundedResults,
         returnedResults: boundedResults.length,
-        hasMore
+        hasMore,
+        ...(driveScanIncomplete && { scanIncomplete: true })
       };
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
@@ -22206,43 +22466,110 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       // Include Google Drive shared folders
+      // ENG-1624: set when Drive enumeration failed entirely (outer catch below)
+      // — a listing that's missing every Drive source must say so, not read as
+      // "this account has no Drive folders."
+      let driveEnumerationFailed = false;
       if (!options?.kb_type || options.kb_type === 'google-drive') try {
         const folders = await this.getUserGoogleDriveFolders(userId);
         if (folders.length > 0) {
           const drive = await this.getGoogleDriveClient();
           const driveLimit = options?.limit ?? 100;
           const driveOffset = options?.offset ?? 0;
-          for (const folder of folders) {
+
+          // ENG-1624: walk every registered root's tree up front. Two
+          // registered roots can be in an ancestor/descendant relationship —
+          // a customer registers both a parent folder and one of its own
+          // sub-folders (e.g. Harsha's mitigation for Phoenix, which added
+          // the ratio sub-folders directly alongside the already-registered
+          // parent). Now that this PR walks the whole tree instead of direct
+          // children only, the parent's listing legitimately includes the
+          // child's files too, so the same file can appear under two
+          // entries. Walking every tree first lets nesting be detected
+          // STRUCTURALLY (one root's resolved folderIds actually containing
+          // another registered root's own id) before any file query runs.
+          // getGoogleDriveFolderTreeIds never rejects — its own Drive errors
+          // are caught internally as restricted/rootRestricted — so this
+          // can't silently drop a root the way a failing Promise.all
+          // normally would.
+          const treeResults = await Promise.all(
+            folders.map(folder =>
+              this.getGoogleDriveFolderTreeIds(drive, folder.folderId).then(tree => ({ folder, ...tree }))
+            )
+          );
+
+          for (const { folder, folderIds, restricted, rootRestricted, truncated } of treeResults) {
             try {
-              // Build Drive query with optional date filter
-              let driveQuery = `'${folder.folderId}' in parents and trashed = false`;
+              // Structural, not name-based: a root only counts as nested
+              // when its OWN id was actually discovered inside another
+              // root's resolved tree. This can't false-positive from a
+              // truncated ancestor scan — truncation just means some
+              // folders were never visited, so an undiscovered descendant
+              // simply isn't found here either, and no relationship is
+              // claimed (falls back to the plain file-id dedup in the
+              // top-level totalFiles below).
+              const ancestor = treeResults.find(other =>
+                other.folder.folderId !== folder.folderId &&
+                other.folderIds.includes(folder.folderId)
+              );
+
+              // Exclude folder entries themselves — previously these showed up as
+              // 0-byte files instead of being descended into.
+              let extraClause = `mimeType != 'application/vnd.google-apps.folder' and trashed = false`;
               if (options?.modified_after) {
-                driveQuery += ` and modifiedTime >= '${options.modified_after}T00:00:00'`;
+                extraClause += ` and modifiedTime >= '${options.modified_after}T00:00:00'`;
               }
               if (options?.modified_before) {
-                driveQuery += ` and modifiedTime <= '${options.modified_before}T23:59:59'`;
+                extraClause += ` and modifiedTime <= '${options.modified_before}T23:59:59'`;
               }
 
-              // Fetch enough to support pagination: offset + limit
-              const response = await drive.files.list({
-                q: driveQuery,
-                fields: 'files(id, name, mimeType, size, modifiedTime)',
-                orderBy: 'modifiedTime desc',
-                pageSize: Math.min(driveOffset + driveLimit, 1000),
-                supportsAllDrives: true,
-                includeItemsFromAllDrives: true,
-              });
+              // ENG-1624: the tree can span more folders than fit in one `q` string
+              // (see queryDriveFilesAcrossFolders), so this is queried in batches and
+              // merged/de-duplicated by file id — NOT per batch, or offset/limit
+              // pagination below would silently skip and repeat files across batch
+              // boundaries.
+              //
+              // Per-batch target is offset+limit+1, not offset+limit: each batch is
+              // fetched at the same `orderBy`, so the global top-K of the union is
+              // always a subset of the union of each batch's own top-K — the `files`
+              // returned are correct regardless of the target. The `+1` is what makes
+              // `hasMore` exact: the merged set then holds at least
+              // min(trueTotal, K+1) files, so `allFiles.length > offset+limit` is
+              // true exactly when more files really exist beyond this page.
+              const perBatchTarget = driveOffset + driveLimit + 1;
+              const { files: filesMap, capped } = await this.queryDriveFilesAcrossFolders(
+                drive,
+                folderIds,
+                extraClause,
+                'files(id, name, mimeType, size, modifiedTime)',
+                perBatchTarget,
+                'modifiedTime desc'
+              );
 
-              const allFiles = (response.data.files || []).map((f) => ({
-                fileName: f.name || 'unknown',
-                fileSize: f.size ? parseInt(f.size, 10) : 0,
-                mimeType: f.mimeType || 'unknown',
-                driveFileId: f.id,
-                modifiedTime: f.modifiedTime,
-              }));
+              // Per-batch `orderBy` only sorts within its own batch; re-sort the
+              // merged set so global ordering (and therefore offset/limit slicing)
+              // is correct.
+              const allFiles = Array.from(filesMap.values())
+                .map((f) => ({
+                  fileName: f.name || 'unknown',
+                  fileSize: f.size ? parseInt(f.size, 10) : 0,
+                  mimeType: f.mimeType || 'unknown',
+                  driveFileId: f.id,
+                  modifiedTime: f.modifiedTime,
+                }))
+                .sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || ''));
 
               const totalMatchingFiles = allFiles.length;
               const driveFiles = allFiles.slice(driveOffset, driveOffset + driveLimit);
+              // ENG-1624: a scan that stopped early (folder-count bound or the root
+              // itself being unreadable) must not present its partial file list as
+              // complete.
+              const folderScanIncomplete = truncated || rootRestricted;
+              // A batch that hit its per-batch target means `totalMatchingFiles`
+              // wasn't fully counted — it's a floor, not an exact total. Getting an
+              // exact total would mean fully paginating every batch, which isn't
+              // worth the API cost just to render one page.
+              const totalFilesIsLowerBound = capped;
 
               knowledgeBases.push({
                 identifier: `gdrive:${folder.folderId}`,
@@ -22251,17 +22578,48 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 updatedAt: allFiles.length > 0 ? allFiles[0].modifiedTime : undefined,
                 files: driveFiles,
                 totalFiles: totalMatchingFiles,
-                hasMore: driveOffset + driveLimit < totalMatchingFiles,
+                hasMore: allFiles.length > driveOffset + driveLimit,
                 offset: driveOffset,
                 limit: driveLimit,
+                ...(totalFilesIsLowerBound && { totalFilesIsLowerBound: true }),
+                // ENG-1624: a sub-folder that couldn't be listed (e.g. an unshared
+                // shortcut target) previously shrank the listing with no signal to
+                // the caller. Name it so the caller can request access instead of
+                // silently seeing an incomplete file list.
+                ...(restricted.length > 0 && { inaccessibleFolders: restricted.map(r => r.name) }),
+                ...(rootRestricted && { inaccessibleRoot: true }),
+                ...(folderScanIncomplete && { folderScanIncomplete: true }),
+                // ENG-1624: this root's own id was found inside another
+                // registered root's resolved tree — its files are already
+                // counted there too. Kept as its own entry (never silently
+                // dropped), just labeled, so a saved gdrive:<this-id>
+                // reference still resolves exactly as it does today.
+                ...(ancestor && { nestedUnder: `gdrive:${ancestor.folder.folderId}` }),
               });
-            } catch (folderErr) {
+            } catch (folderErr: any) {
+              // ENG-1624: this used to just log and move on, which silently
+              // dropped the whole KB from the response — indistinguishable from
+              // "this folder has no files." Round 2 (the BFS walk + batched,
+              // paginated file query) turned a single files.list call into many,
+              // multiplying how often a Drive error lands here. A failure for
+              // one folder must not abort the others (kept below, same as
+              // before) — but the caller now still sees this source, marked as
+              // failed rather than absent.
               console.log(`AgentMode: Error listing files in Drive folder ${folder.name}:`, folderErr);
+              knowledgeBases.push({
+                identifier: `gdrive:${folder.folderId}`,
+                name: folder.name,
+                type: 'google-drive',
+                files: [],
+                listingFailed: true,
+                listingFailedReason: this.classifyDriveError(folderErr),
+              });
             }
           }
         }
       } catch (driveError) {
         console.error('AgentMode: Error listing Google Drive shared folders:', driveError);
+        driveEnumerationFailed = true;
       }
 
       // Include ClickUp docs
@@ -22432,10 +22790,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.error('AgentMode: Error listing Foreplay ads:', foreplayError);
       }
 
-      const totalFiles = knowledgeBases.reduce(
-        (sum: number, kb: any) => sum + (kb.files?.length || 0),
-        0
-      );
+      // ENG-1624: a plain per-KB sum double-counts once nesting/multi-parent
+      // overlap between registered Drive roots is possible (see the
+      // treeResults/nestedUnder logic above) — the same underlying Drive file
+      // can legitimately appear in more than one root's `files` array. De-dupe
+      // by driveFileId for google-drive entries specifically; other KB types
+      // (private/public/ClickUp/Foreplay) have no equivalent shared identity
+      // and are summed as before.
+      const seenDriveFileIds = new Set<string>();
+      const totalFiles = knowledgeBases.reduce((sum: number, kb: any) => {
+        if (kb.type !== 'google-drive') return sum + (kb.files?.length || 0);
+        let kbCount = 0;
+        for (const f of kb.files || []) {
+          if (!f.driveFileId || !seenDriveFileIds.has(f.driveFileId)) {
+            if (f.driveFileId) seenDriveFileIds.add(f.driveFileId);
+            kbCount++;
+          }
+        }
+        return sum + kbCount;
+      }, 0);
 
       const appliedFiltersEarly = [
         options?.modified_after ? `modified_after=${options.modified_after}` : null,
@@ -22452,30 +22825,63 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Point the model to the catalog so empty doesn't read as "Docs unavailable".
         // Scoped to the explicit drive query: an unfiltered/other empty gets the plain
         // message (this path lists all sources, and nudging Docs there is off-topic).
-        const message = options?.kb_type === 'google-drive'
-          ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
-          : 'No knowledge bases found';
+        //
+        // ENG-1624: an empty result caused by driveEnumerationFailed is a DIFFERENT
+        // claim than a genuinely empty account — the former means "we don't know",
+        // the latter means "there is nothing." Collapsing them into the same plain
+        // message would tell a caller no Drive folders are registered when the
+        // truth is the enumeration call itself failed.
+        let message: string;
+        if (driveEnumerationFailed) {
+          message = options?.kb_type === 'google-drive'
+            ? 'Google Drive sources could not be enumerated — this does not mean no folders are registered, only that the enumeration attempt itself failed. Try again.'
+            : 'No knowledge bases found in other sources, and Google Drive sources could not be enumerated — this does not mean no Drive folders exist, only that the enumeration attempt itself failed. Try again.';
+        } else {
+          message = options?.kb_type === 'google-drive'
+            ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
+            : 'No knowledge bases found';
+        }
         return {
           success: true,
           message,
           knowledge_bases: [],
           totalKnowledgeBases: 0,
           totalFiles: 0,
+          ...(driveEnumerationFailed && { driveEnumerationFailed: true }),
           ...(appliedFiltersEarly.length > 0 && { appliedFilters: appliedFiltersEarly }),
         };
       }
 
       const hasMorePages = knowledgeBases.some((kb: any) => kb.hasMore);
+      // ENG-1624: a folder-scan cutoff (folder-count bound, or the root/a
+      // sub-folder being unreadable) is a different signal than "more files exist
+      // to paginate" — it means the listing itself may be incomplete, not just
+      // capped.
+      const hasIncompleteFolderScan = knowledgeBases.some((kb: any) => kb.folderScanIncomplete);
+      // A Drive KB's file query hit its per-batch target — its `totalFiles` is a
+      // floor, not an exact count, even though `files`/`hasMore` are still correct.
+      const hasLowerBoundTotals = knowledgeBases.some((kb: any) => kb.totalFilesIsLowerBound);
+      // A Drive KB whose listing errored outright — shown with empty `files`, not
+      // dropped, but that empty array must not be mistaken for "no files exist."
+      const failedDriveCount = knowledgeBases.filter((kb: any) => kb.listingFailed).length;
+      // A Drive KB nested inside another registered Drive KB's tree — its files
+      // are already reflected in the parent's own listing (and in the
+      // de-duplicated totalFiles above), not additional ones.
+      const hasNestedRoots = knowledgeBases.some((kb: any) => kb.nestedUnder);
       const appliedFilters = appliedFiltersEarly;
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasIncompleteFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be listed and are shown as empty — their contents are unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles,
         ...(appliedFilters.length > 0 && { appliedFilters }),
         ...(hasMorePages && { hasMore: true }),
+        ...(hasIncompleteFolderScan && { folderScanIncomplete: true }),
+        ...(hasLowerBoundTotals && { totalFilesIsLowerBound: true }),
+        ...(failedDriveCount > 0 && { driveListingFailures: failedDriveCount }),
+        ...(driveEnumerationFailed && { driveEnumerationFailed: true }),
       };
     } catch (error) {
       console.error('AgentMode: Error listing knowledge base files:', error);
@@ -22797,22 +23203,66 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     const folderMeta = folders.find(f => f.folderId === folderId);
+    const rootName = folderMeta?.name || folderId;
 
     try {
       const drive = await this.getGoogleDriveClient();
 
-      // Find the file by name in the folder
-      const listResponse = await drive.files.list({
-        q: `'${folderId}' in parents and name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
-        fields: 'files(id, name, mimeType, size, modifiedTime)',
-        pageSize: 1,
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-      });
+      // Find the file by name anywhere in the registered folder's tree (ENG-1624:
+      // not just its direct children).
+      const { folderIds, restricted, rootRestricted, truncated: folderScanTruncated, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
+      // lets an ambiguous name (same filename in two sub-folders) be detected and
+      // reported instead of one candidate being picked arbitrarily.
+      const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
+        drive,
+        folderIds,
+        `name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
+        'files(id, name, mimeType, size, modifiedTime, parents)',
+        2
+      );
+      const files = Array.from(filesMap.values());
 
-      const files = listResponse.data.files || [];
       if (files.length === 0) {
-        return { success: false, message: `File "${fileName}" not found in Google Drive folder "${folderMeta?.name || folderId}"` };
+        if (rootRestricted) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (restricted.length > 0) {
+          const names = restricted.map(r => `"${r.name}"`).join(', ');
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}". Sub-folder(s) ${names} could not be accessed — share them with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (folderScanTruncated) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder tree is large enough that the scan stopped before covering it entirely, so this is not a confirmed absence.`
+          };
+        }
+        return { success: false, message: `File "${fileName}" not found in Google Drive folder "${rootName}"` };
+      }
+
+      if (files.length > 1) {
+        // A Drive file can have more than one parent — index [0] may be a
+        // folder outside the tree that was actually searched, which would
+        // point someone at the wrong place. Prefer whichever parent is
+        // actually in `folderIds`; only fall back to [0] when none of the
+        // file's parents resolve within the searched tree (shouldn't happen
+        // in practice, since the file matched a query scoped to folderIds).
+        const folderIdSet = new Set(folderIds);
+        const candidates = files.map(f => {
+          const parentId = (f.parents || []).find((p: string) => folderIdSet.has(p)) ?? (f.parents || [])[0];
+          const location = parentId === folderId ? rootName : (folderNames.get(parentId) || parentId || 'an unresolved sub-folder');
+          return `"${f.name}" in "${location}"`;
+        }).join(', ');
+        return {
+          success: false,
+          message: `Multiple files named "${fileName}" found in Google Drive folder "${rootName}": ${candidates}. Use a more specific file name, or move the duplicates so names are unique.`
+        };
       }
 
       const file = files[0];
@@ -22885,21 +23335,66 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (!folders.some(f => f.folderId === folderId)) {
       return { success: false, message: 'Not authorized to access this Google Drive folder' };
     }
+    const rootName = folders.find(f => f.folderId === folderId)?.name || folderId;
 
     try {
       const drive = await this.getGoogleDriveClient();
 
-      const listResponse = await drive.files.list({
-        q: `'${folderId}' in parents and name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
-        fields: 'files(id, name, mimeType, size)',
-        pageSize: 1,
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-      });
+      // Search the whole folder tree rooted at the registered folder (ENG-1624),
+      // not just its direct children.
+      const { folderIds, restricted, rootRestricted, truncated, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
+      // lets an ambiguous name (same filename in two sub-folders) be detected and
+      // reported instead of one candidate being materialized arbitrarily.
+      const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
+        drive,
+        folderIds,
+        `name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
+        'files(id, name, mimeType, size, parents)',
+        2
+      );
+      const files = Array.from(filesMap.values());
 
-      const files = listResponse.data.files || [];
       if (files.length === 0) {
+        if (rootRestricted) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (restricted.length > 0) {
+          const names = restricted.map(r => `"${r.name}"`).join(', ');
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder. Sub-folder(s) ${names} could not be accessed — share them with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (truncated) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder tree is large enough that the scan stopped before covering it entirely, so this is not a confirmed absence.`
+          };
+        }
         return { success: false, message: `File "${fileName}" not found in Google Drive folder` };
+      }
+
+      if (files.length > 1) {
+        // A Drive file can have more than one parent — index [0] may be a
+        // folder outside the tree that was actually searched, which would
+        // point someone at the wrong place. Prefer whichever parent is
+        // actually in `folderIds`; only fall back to [0] when none of the
+        // file's parents resolve within the searched tree (shouldn't happen
+        // in practice, since the file matched a query scoped to folderIds).
+        const folderIdSet = new Set(folderIds);
+        const candidates = files.map(f => {
+          const parentId = (f.parents || []).find((p: string) => folderIdSet.has(p)) ?? (f.parents || [])[0];
+          const location = parentId === folderId ? rootName : (folderNames.get(parentId) || parentId || 'an unresolved sub-folder');
+          return `"${f.name}" in "${location}"`;
+        }).join(', ');
+        return {
+          success: false,
+          message: `Multiple files named "${fileName}" found in Google Drive folder "${rootName}": ${candidates}. Use a more specific file name, or move the duplicates so names are unique.`
+        };
       }
 
       const file = files[0];
