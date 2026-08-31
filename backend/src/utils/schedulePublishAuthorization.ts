@@ -385,10 +385,15 @@ export function narrowPublishAuthorization(
  * `list_connected_accounts` pairs every account_id with its platform and tells the
  * model to use account_id once it knows it, so a model that just looked up the
  * connected X account and calls `post_on_connected_account(account_id: '...')`
- * (no `platform`, or a redundant matching one) is the ORDINARY case, not an edge
- * case — session 672b3af7 (2026-08-27, this same schedule, the day after ENG-1599
- * shipped) hit exactly this: fails-closed-on-account_id made the ENG-1599 reverse
- * route unreachable for the realistic calling pattern it was built to cover.
+ * (no `platform`, or a redundant matching one) is a plausible calling pattern this
+ * route was built to cover — but prior to this change, ANY account_id-bearing call
+ * unconditionally failed the platform check (`!hasAccountId && ...`), regardless of
+ * whether the account was actually the authorized one. This is a proactive close of
+ * that gap, not a fix for an observed production failure: the account_id-shaped
+ * call has not been seen failing in production. (It is NOT the call that blocked
+ * session 672b3af7 on 2026-08-27 — that call passed `platform`, not `account_id`,
+ * and predates ENG-1599's merge later that same day by several hours; ENG-1599's
+ * own platform-only route already covers it.)
  */
 export function isPublishCallWithinAuthorizedScope(
   toolName: string,

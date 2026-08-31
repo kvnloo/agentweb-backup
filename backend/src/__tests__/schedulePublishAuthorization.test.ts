@@ -560,15 +560,21 @@ describe('isPublishCallWithinAuthorizedScope — fails closed when account_id is
 });
 
 /**
- * ENG-1616 — session 672b3af7 (2026-08-27, schedule
- * 1d001fba-0fb7-4bcd-80f6-6041b244a442, "Harsha Daily X Post (Autonomous)" — the
- * exact schedule ENG-1599 was filed against, the very next day). `list_connected_
- * accounts` pairs every account_id with its platform and the model is meant to use
- * account_id once it knows it, so a call like `post_on_connected_account(account_id:
- * '1340767380')` is the ORDINARY shape for this route, not an edge case — yet the
- * ENG-1599 fail-closed-on-account_id rule made it unreachable. The caller can now
- * pass the account_id's independently-verified platform (read from storage, not
- * attacker-controlled) to unlock the same route safely.
+ * ENG-1616 — `list_connected_accounts` pairs every account_id with its platform and
+ * the model is meant to use account_id once it knows it, so a call like
+ * `post_on_connected_account(account_id: '1340767380')` is a plausible shape for the
+ * ENG-1599 reverse route — but prior to this change, the route's platform check was
+ * hard-wired to fail whenever account_id was present, regardless of correctness. The
+ * caller can now pass the account_id's independently-verified platform (read from
+ * storage, not attacker-controlled) to unlock the same route safely.
+ *
+ * This is a proactive close of a logic gap, not a reproduction of an observed
+ * production failure — no account_id-shaped call has been seen hitting this refusal
+ * in production. (Session 672b3af7 on schedule 1d001fba-0fb7-4bcd-80f6-6041b244a442,
+ * 2026-08-27, is the incident ENG-1616 was filed from, but its actual blocked call
+ * passed `platform`, not `account_id`, and ran hours BEFORE ENG-1599 merged that same
+ * day — so it never exercised this route at all, in either its pre- or post-fix form.
+ * ENG-1599's own platform-only route already covers that call once ENG-1599 is live.)
  */
 describe('isPublishCallWithinAuthorizedScope — resolved account platform (ENG-1616)', () => {
   it('authorizes a standalone tweet by account_id once the caller has verified it is the connected Twitter account', () => {

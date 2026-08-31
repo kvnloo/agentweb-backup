@@ -137,15 +137,18 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
   /**
    * ENG-1616 — the reverse (ENG-1599) route requires trusting `args.platform`, but
    * `postOnConnectedAccount` ignores `platform` outright once `account_id` is present,
-   * so the route fails closed on ANY account_id-bearing call. `list_connected_accounts`
-   * pairs every account_id with its platform and tells the model to use account_id once
-   * it knows it — so a call shaped `post_on_connected_account(account_id: '...')` is the
-   * ORDINARY way this route gets invoked, not an edge case. Session 672b3af7
-   * (2026-08-27, schedule 1d001fba-0fb7-4bcd-80f6-6041b244a442 — the exact schedule
-   * ENG-1599 itself was filed against, the very next day) hit exactly this: a standalone
-   * tweet via `post_on_connected_account(account_id: '1340767380')` was refused with
-   * "The owner authorized only: twitter_manage_post," even though the account really was
-   * the connected Twitter account.
+   * so the route failed closed on ANY account_id-bearing call, regardless of whether
+   * the account was actually the authorized one. `list_connected_accounts` pairs every
+   * account_id with its platform and tells the model to use account_id once it knows
+   * it, so a call shaped `post_on_connected_account(account_id: '...')` is a plausible
+   * way this route gets invoked — this closes that gap proactively.
+   *
+   * This is NOT a reproduction of an observed production failure: no account_id-shaped
+   * call has been seen hitting this refusal in production. (Session 672b3af7 on
+   * schedule 1d001fba-0fb7-4bcd-80f6-6041b244a442, 2026-08-27 — the incident ENG-1616
+   * was filed from — is a different call: it passed `platform`, not `account_id`, and
+   * ran hours BEFORE ENG-1599 merged later that same day, so it never touched this
+   * route at all. ENG-1599's own platform-only route already covers it.)
    */
   describe('the ENG-1599 reverse route with account_id present (ENG-1616)', () => {
     const SESSION_WITH_USER = { ...SCHEDULED_SESSION, userId: 'harsha-user-id' };
