@@ -282,6 +282,13 @@ export class MetaService {
     'id', 'name', 'status', 'objective',
     'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap',
     'bid_strategy', 'start_time', 'stop_time',
+    // ENG-1625: both are real, documented Campaign GET fields (effective_status already
+    // used for ads at listAds) that a post-deploy read-back legitimately wants — status
+    // alone doesn't reflect ad-set/ad-level pausing, and special_ad_categories is a
+    // CREATE-time param worth verifying stuck. Missing from the allow-list, a request for
+    // either threw loudly (by design, ENG-398) rather than silently dropping — but that
+    // meant a routine verification read failed instead of just answering the question.
+    'effective_status', 'special_ad_categories',
   ] as const;
 
   private static readonly AD_SET_READ_FIELDS = [
