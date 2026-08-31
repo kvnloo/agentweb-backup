@@ -5570,22 +5570,36 @@ export const crmDb = {
    *
    * Pass config=null to REMOVE the provider key without touching the other provider.
    *
-   * CodeRabbit finding (ENG-1380): when the provider's config already exists,
-   * this used to replace externalCrmSyncConfigs.<provider> wholesale (read the
-   * map, merge in JS, write the whole map back) — a concurrent
-   * updateLeadListCrmSyncStatus nested-path write landing between the read and
-   * the write here would be silently clobbered by this call's stale snapshot
-   * of the sync-status fields. Now writes field-by-field via targeted nested
-   * paths instead (same convention as updateLeadListCrmSyncStatus), so this
-   * call only ever touches the specific keys present on `config` and can never
-   * stomp a sibling field a concurrent writer just set. The whole-map
-   * read-modify-write is kept ONLY for the provider's first-ever save, where
-   * externalCrmSyncConfigs.<provider> doesn't exist yet — DynamoDB's SET
-   * map.key fails against a not-yet-existing parent path (if_not_exists +
-   * nested path are evaluated simultaneously against the original item state,
-   * not sequentially), and no concurrent per-field writer can be racing a key
-   * that doesn't exist yet anyway, so a single whole-object write is both safe
-   * and simplest for that one case.
+   * CodeRabbit findings (ENG-1380), both now fixed:
+   *
+   * 1. This used to replace externalCrmSyncConfigs.<provider> — or, for a
+   *    provider's first-ever save, the WHOLE externalCrmSyncConfigs map,
+   *    including every other already-connected provider — wholesale (read,
+   *    merge in JS, write the whole thing back). A concurrent
+   *    updateLeadListCrmSyncStatus nested-path write for ANY provider
+   *    landing between the read and the write here would be silently
+   *    clobbered by this call's stale snapshot. Fixed by always writing via
+   *    targeted nested paths once externalCrmSyncConfigs exists as an
+   *    attribute at all — DynamoDB accepts a nested SET/REMOVE against an
+   *    EXISTING parent map whether or not the specific child key (this
+   *    provider) was already present in it, so no read-modify-write of
+   *    siblings is needed either way. The only case that still needs special
+   *    handling is externalCrmSyncConfigs not existing as an attribute on
+   *    the item AT ALL (the very first CRM connection ever made for this
+   *    list) — DynamoDB's nested SET requires the parent path to already
+   *    resolve, so that one case bootstraps the attribute with a
+   *    conditional write (attribute_not_exists) and falls through to the
+   *    same targeted-write path on a lost race, rather than ever doing an
+   *    unconditional wholesale replace.
+   *
+   * 2. The targeted per-field write used the field's own name as its
+   *    ExpressionAttributeNames alias (`#${field}`). Every real
+   *    ExternalCrmSyncConfig carries a `provider` field — iterating over it
+   *    silently overwrote the OTHER `#provider` alias already bound above to
+   *    the provider VALUE ('attio'/'hubspot'), corrupting every
+   *    #ecs.#provider.* path in the same expression. Fixed by using
+   *    collision-proof indexed aliases (#f0/:v0, #f1/:v1, ...) for the
+   *    per-field loop instead of the field's own name.
    */
   async setLeadListCrmSyncConfig(
     listId: string,
@@ -5593,67 +5607,8 @@ export const crmDb = {
     config: Record<string, any> | null
   ): Promise<void> {
     try {
-      let params: any;
-
-      if (config !== null) {
-        const current = await dynamodb.get({
-          TableName: `${TABLE_PREFIX}AW-LeadLists`,
-          Key: { listId },
-          ProjectionExpression: '#ecs',
-          ExpressionAttributeNames: { '#ecs': 'externalCrmSyncConfigs' },
-        }).promise();
-        const existingMap = (current.Item?.externalCrmSyncConfigs as Record<string, any>) ?? {};
-
-        if (existingMap[provider] === undefined) {
-          const mergedMap = { ...existingMap, [provider]: config };
-          params = {
-            TableName: `${TABLE_PREFIX}AW-LeadLists`,
-            Key: { listId },
-            UpdateExpression: 'SET #ecs = :mergedMap, #updatedAt = :now',
-            ExpressionAttributeNames: {
-              '#ecs': 'externalCrmSyncConfigs',
-              '#updatedAt': 'updatedAt',
-            },
-            ExpressionAttributeValues: {
-              ':mergedMap': mergedMap,
-              ':now': new Date().toISOString(),
-            },
-          };
-        } else {
-          const setExpressions: string[] = [];
-          const removeExpressions: string[] = [];
-          const names: Record<string, string> = { '#ecs': 'externalCrmSyncConfigs', '#provider': provider, '#updatedAt': 'updatedAt' };
-          const values: Record<string, any> = { ':now': new Date().toISOString() };
-
-          for (const [field, value] of Object.entries(config)) {
-            names[`#${field}`] = field;
-            if (value === undefined) {
-              // Matches the old wholesale-replace semantics: a field absent
-              // (or explicitly undefined) from `config` never persisted,
-              // since the whole provider sub-object was replaced by `config`
-              // as marshalled — undefined-valued keys are dropped on write.
-              removeExpressions.push(`#ecs.#provider.#${field}`);
-            } else {
-              values[`:${field}`] = value;
-              setExpressions.push(`#ecs.#provider.#${field} = :${field}`);
-            }
-          }
-          setExpressions.push('#updatedAt = :now');
-
-          const updateExpressionParts: string[] = [];
-          if (setExpressions.length > 0) updateExpressionParts.push(`SET ${setExpressions.join(', ')}`);
-          if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(', ')}`);
-
-          params = {
-            TableName: `${TABLE_PREFIX}AW-LeadLists`,
-            Key: { listId },
-            UpdateExpression: updateExpressionParts.join(' '),
-            ExpressionAttributeNames: names,
-            ExpressionAttributeValues: values,
-          };
-        }
-      } else {
-        params = {
+      if (config === null) {
+        await dynamodb.update({
           TableName: `${TABLE_PREFIX}AW-LeadLists`,
           Key: { listId },
           UpdateExpression: 'REMOVE #ecs.#provider SET #updatedAt = :now',
@@ -5665,10 +5620,75 @@ export const crmDb = {
           ExpressionAttributeValues: {
             ':now': new Date().toISOString(),
           },
-        };
+        }).promise();
+        return;
       }
 
-      await dynamodb.update(params).promise();
+      const current = await dynamodb.get({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        ProjectionExpression: '#ecs',
+        ExpressionAttributeNames: { '#ecs': 'externalCrmSyncConfigs' },
+      }).promise();
+      let hasEcs = current.Item?.externalCrmSyncConfigs !== undefined;
+
+      if (!hasEcs) {
+        try {
+          await dynamodb.update({
+            TableName: `${TABLE_PREFIX}AW-LeadLists`,
+            Key: { listId },
+            UpdateExpression: 'SET #ecs = :singleProviderMap, #updatedAt = :now',
+            ConditionExpression: 'attribute_not_exists(#ecs)',
+            ExpressionAttributeNames: { '#ecs': 'externalCrmSyncConfigs', '#updatedAt': 'updatedAt' },
+            ExpressionAttributeValues: {
+              ':singleProviderMap': { [provider]: config },
+              ':now': new Date().toISOString(),
+            },
+          }).promise();
+          return;
+        } catch (condError: any) {
+          if (condError?.code !== 'ConditionalCheckFailedException') throw condError;
+          // Someone else's concurrent first-ever-connection save for this
+          // list won the race — externalCrmSyncConfigs now exists, so fall
+          // through to the targeted per-field write below exactly as if
+          // we'd read it that way to begin with.
+          hasEcs = true;
+        }
+      }
+
+      const setExpressions: string[] = [];
+      const removeExpressions: string[] = [];
+      const names: Record<string, string> = { '#ecs': 'externalCrmSyncConfigs', '#provider': provider, '#updatedAt': 'updatedAt' };
+      const values: Record<string, any> = { ':now': new Date().toISOString() };
+
+      Object.entries(config).forEach(([field, value], i) => {
+        const nameAlias = `#f${i}`;
+        names[nameAlias] = field;
+        if (value === undefined) {
+          // Matches the old wholesale-replace semantics: a field absent
+          // (or explicitly undefined) from `config` never persisted, since
+          // the whole provider sub-object used to be replaced by `config`
+          // as marshalled — undefined-valued keys are dropped on write.
+          removeExpressions.push(`#ecs.#provider.${nameAlias}`);
+        } else {
+          const valueAlias = `:v${i}`;
+          values[valueAlias] = value;
+          setExpressions.push(`#ecs.#provider.${nameAlias} = ${valueAlias}`);
+        }
+      });
+      setExpressions.push('#updatedAt = :now');
+
+      const updateExpressionParts: string[] = [];
+      if (setExpressions.length > 0) updateExpressionParts.push(`SET ${setExpressions.join(', ')}`);
+      if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(', ')}`);
+
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        UpdateExpression: updateExpressionParts.join(' '),
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+      }).promise();
     } catch (error: any) {
       // If removing a nested key from a map that doesn't exist yet, DynamoDB throws
       // ValidationException. Treat it as a no-op — the config is already absent.
