@@ -260,8 +260,9 @@ describe('MetaService CAMPAIGN spend_cap read (ENG-785)', () => {
 
     const result = await service.listCampaigns(accountId, token, { campaignId: 'camp_9' });
 
-    // The ownership probe (`get(['account_id'])`) now precedes the field read, so assert on
-    // the field read itself rather than on call order — the invariant is unchanged.
+    // The single-entity read asks for `account_id` alongside the caller's fields in ONE call,
+    // so there is no separate probe; select the call that carries the field selection rather
+    // than relying on call order. The invariant pinned here is unchanged.
     const fieldCall = get.mock.calls.find(
       (c: any[]) => !(Array.isArray(c[0]) && c[0].length === 1 && c[0][0] === 'account_id'),
     );

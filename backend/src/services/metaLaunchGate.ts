@@ -403,6 +403,7 @@ export async function runMetaTrackingGate(
    */
   let adsTruncated = false;
   let accountWideTruncated = false;
+  let destinationCameFromRequest = false;
   try {
     const [{ items: ads, truncated: adsListTruncated }, { pixels }] = await Promise.all([
       metaService.listAdsForUtmAudit(accountId, accessToken, campaignId),
@@ -423,6 +424,9 @@ export async function runMetaTrackingGate(
      * That is the bypass this closes.
      */
     const fromRequest = [...(pendingDestinations ?? []), ...resolvedFromCreatives].filter(Boolean);
+    // Recorded for the truncation check below: when the destination came from the REQUEST, the
+    // ad list did not decide anything and its completeness is irrelevant.
+    destinationCameFromRequest = fromRequest.length > 0;
     /*
      * When this write names ONE ad and carries its own destination — a creative swap, most
      * often — that destination is what will actually serve after the write, and the ad list
@@ -515,11 +519,22 @@ export async function runMetaTrackingGate(
    * is unaffected — it is judged on that ad's own destination, which was either found or
    * handled by the not-found branch above.
    */
-  if (!adId && adsTruncated) {
+  /*
+   * `adId` is supplied only for an AD-entity write, so it is undefined for EVERY create — including
+   * an AD CREATE that carries its own destination in the request, and the audience/ad-set launch
+   * path that passes no adId at all. Gating on `!adId` alone therefore blocked creates whose
+   * destination was fully checkable, and told them to "activate a single ad instead", which cannot
+   * be done for an entity that does not exist yet.
+   *
+   * The completeness of the ad list only matters when the ad list is what the decision rests on.
+   * When the destination came from the request, it does not.
+   */
+  if (!adId && adsTruncated && !destinationCameFromRequest) {
     const message =
       `Launch blocked: could not verify Meta tracking because the ad list for campaign ${campaignId} ` +
-      `was too large to read completely, so some ads in this launch were never checked. Activate a ` +
-      `single ad instead, or use an explicit tracking-check override if you accept the risk.`;
+      `was too large to read completely, so some ads in this launch were never checked. Narrow the ` +
+      `launch to a single ad, supply the destination on the request, or use an explicit ` +
+      `tracking-check override if you accept the risk.`;
     await record(sessionId, {
       accountId, campaignId, action, outcome: override ? 'overridden' : 'blocked',
       urlResults: [], checkedAt: new Date().toISOString(),

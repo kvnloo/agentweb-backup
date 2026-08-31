@@ -682,24 +682,36 @@ export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]):
   const calls = toolCalls ?? [];
 
   /*
-   * Index of the last SUCCESSFUL install_skills, or -1. Ordering matters: the gate error names
-   * install_skills as the remedy, so "tool gated, then installed, then the model moved on
-   * without re-running it" is the ORDINARY healthy path, not a missing capability. Firing on it
-   * would put a warning on routine turns, and a warning that shows up when nothing is wrong is
-   * one people learn to skip — exactly when it finally matters. The live case is distinguishable
-   * on a fact, not a guess: there the install was itself refused by subscription.
+   * Fires only when the model ATTEMPTED to obtain the capability and could not.
+   *
+   * Two failure modes this narrowing exists for, both found in review:
+   *
+   *  - The gate refuses ANY name not in the session's allowed set, including one the model tried
+   *    speculatively and then simply did without. Warning there puts a banner above a perfectly
+   *    correct answer, and a warning that appears when nothing is wrong is one people learn to
+   *    skip — exactly when it finally matters. If no install was attempted, the model was not
+   *    blocked from something it needed.
+   *  - An install that FAILED is not always shaped as a throw: several `installSkills` paths
+   *    return `{ success: false, message }` with no `error` key at all. Keying "the install
+   *    worked" off a missing `error` therefore read a failed install as a success and disarmed
+   *    this notice on precisely the live incident it was written for. `isReportedFailure` is the
+   *    existing helper for that shape.
    */
-  let lastInstallOk = -1;
+  let installAttemptedAfter = -1;
+  let installSucceededAfter = -1;
   calls.forEach((call, i) => {
-    if (call?.name === 'install_skills' && (call?.error === undefined || call?.error === null)) {
-      lastInstallOk = i;
-    }
+    if (call?.name !== 'install_skills') return;
+    installAttemptedAfter = i;
+    const threw = call?.error !== undefined && call?.error !== null;
+    if (!threw && !isReportedFailure(call)) installSucceededAfter = i;
   });
 
   const succeeded = new Set<string>();
   for (const call of calls) {
     const name = typeof call?.name === 'string' ? call.name : '';
-    if (name && (call?.error === undefined || call?.error === null)) succeeded.add(name);
+    if (!name) continue;
+    const threw = call?.error !== undefined && call?.error !== null;
+    if (!threw && !isReportedFailure(call)) succeeded.add(name);
   }
 
   const unavailable = new Set<string>();
@@ -710,9 +722,10 @@ export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]):
     if (classifyToolErrorClass(err) !== 'tool_unavailable') return;
     // Ran successfully at some point in the turn — the capability is present.
     if (succeeded.has(name)) return;
-    // A skill was installed AFTER this refusal, so the capability became obtainable and not
-    // re-running the tool was the model's choice, not a gap it papered over.
-    if (lastInstallOk > i) return;
+    // Never tried to obtain it: doing without a speculative tool is not a missing capability.
+    if (installAttemptedAfter <= i) return;
+    // Obtained it and chose not to re-run the tool — the model's call, not a gap it papered over.
+    if (installSucceededAfter > i) return;
     unavailable.add(name);
   });
 

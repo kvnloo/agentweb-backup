@@ -2160,6 +2160,38 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(fullTextCall![0].q).toContain(`'${ROOT}' in parents`);
     });
 
+    it('reports an incomplete search — not an empty one — when a Drive request fails mid-read', async () => {
+      /*
+       * Regression guard. The per-request timeout can fire on a request the walk had not
+       * abandoned (the loop-level deadline only stops NEW requests). If that throw escapes
+       * queryDriveFilesAcrossFolders it reaches a caller that logs and continues, so every row
+       * already merged is discarded and the answer presents an empty result as a COMPLETE
+       * search — the ENG-1584 shape, caused by the guard against it. The helper must degrade
+       * the read to incomplete instead of throwing it away.
+       */
+      let fullTextAttempts = 0;
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes('mimeType')) {
+          // Tree walk succeeds, so there is a real tree to search.
+          if (q.includes(`'${ROOT}' in parents`)) {
+            return Promise.resolve({ data: { files: [{ id: SUB, name: '4x5' }] } });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        }
+        // The file query itself fails, the way an aborted request does.
+        fullTextAttempts += 1;
+        const err: any = new Error('The user aborted a request.');
+        err.code = 'ECONNABORTED';
+        return Promise.reject(err);
+      });
+
+      const result: any = await service.searchKnowledgeBase('iceberg', 5, USER_ID);
+
+      expect(fullTextAttempts).toBeGreaterThan(0);
+      // Whatever it says, it must not be a confident "nothing found".
+      expect(JSON.stringify(result)).toMatch(/incomplete|could not|not exhaustive|partial/i);
+    });
+
     it('does not present Drive results as exhaustive when a sub-folder could not be scanned', async () => {
       mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
         if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType')) {

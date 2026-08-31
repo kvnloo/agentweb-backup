@@ -56,14 +56,29 @@ describe('buildUnavailableCapabilityNotice', () => {
     expect(notice).toBeNull();
   });
 
-  it('still fires when the install came BEFORE the refusal, not after it', () => {
-    // Installing some other skill earlier in the turn does not make this capability available.
+  it('is silent when the model never tried to obtain the capability', () => {
+    /*
+     * Narrowed after review: the gate refuses ANY name not in the session's allowed set,
+     * including one the model tried speculatively and then simply did without. Warning there
+     * puts a banner above a correct answer. Attempting an install is the model's own signal
+     * that it needed the capability; an install of some OTHER skill beforehand is not that
+     * signal, so this stays silent.
+     */
     const notice = buildUnavailableCapabilityNotice([
       { name: 'install_skills', result: { success: true } },
-      { name: 'audit_ad_utm_coverage', error: gateError('audit_ad_utm_coverage') },
+      { name: 'search_web', error: gateError('search_web') },
     ] as any);
 
-    expect(notice).toContain('audit_ad_utm_coverage');
+    expect(notice).toBeNull();
+  });
+
+  it('is silent for a purely speculative gated call with no install attempt at all', () => {
+    const notice = buildUnavailableCapabilityNotice([
+      { name: 'search_web', error: gateError('search_web') },
+      { name: 'read_brand_guidelines', result: { ok: true } },
+    ] as any);
+
+    expect(notice).toBeNull();
   });
 
   it('fires on the real trace: gate refusal followed by a FAILED install', () => {
@@ -97,6 +112,7 @@ describe('buildUnavailableCapabilityNotice', () => {
       { name: 'b_tool', error: gateError('b_tool') },
       { name: 'a_tool', error: gateError('a_tool') },
       { name: 'b_tool', error: gateError('b_tool') },
+      { name: 'install_skills', result: { success: false, message: 'not available' } },
     ] as any);
 
     expect(notice).toContain('a_tool');
@@ -106,10 +122,25 @@ describe('buildUnavailableCapabilityNotice', () => {
     expect(notice!.match(/b_tool/g)).toHaveLength(1);
   });
 
+  it('fires when the failed install returned { success: false } instead of throwing', () => {
+    /*
+     * Several installSkills paths report failure as a RESULT, not a throw. Keying "the install
+     * worked" off a missing `error` read those as successes and disarmed this notice on exactly
+     * the live incident it exists for — the fixture below is the shape that hole hid behind.
+     */
+    const notice = buildUnavailableCapabilityNotice([
+      { name: 'audit_ad_utm_coverage', error: gateError('audit_ad_utm_coverage') },
+      { name: 'install_skills', result: { success: false, message: 'not available with your current subscription' } },
+    ] as any);
+
+    expect(notice).toContain('audit_ad_utm_coverage');
+  });
+
   it('warns that content below it did not come from the missing tool', () => {
     // The whole point: the reader must not take what follows as that tool's output.
     const notice = buildUnavailableCapabilityNotice([
       { name: 'audit_ad_utm_coverage', error: gateError('audit_ad_utm_coverage') },
+      { name: 'install_skills', error: 'The requested skills are not available with your current subscription.' },
     ] as any);
 
     expect(notice).toMatch(/was not produced by that tool/i);

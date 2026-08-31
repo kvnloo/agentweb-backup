@@ -5858,7 +5858,7 @@ export class AgentModeService {
   public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
       if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
-        return { message: "skillIds must be a non-empty array of skill IDs." };
+        return { success: false, message: "skillIds must be a non-empty array of skill IDs." };
       }
 
       const availableSkills = await this.getSkillsForDisplay([], userId);
@@ -5919,7 +5919,7 @@ export class AgentModeService {
       return result;
     } catch (error) {
       console.error('AgentMode: Error in installSkills:', error);
-      return { message: "An error occurred while installing skills." };
+      return { success: false, message: "An error occurred while installing skills." };
     }
   }
 
@@ -21851,17 +21851,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
         let resp: any;
         try {
-          // A per-request timeout was considered here (the loop-level deadline
-          // check above only runs BEFORE a request starts, not while awaiting
-          // one, so it can't interrupt a single hung call — same reasoning as
-          // metaService.ts's withReadDeadline). googleapis' MethodOptions does
-          // support one (it extends gaxios' GaxiosOptions, which declares
-          // `timeout?: number`), but only as a SECOND argument to `.list()` —
-          // every existing test asserting this call's argument shape asserts a
-          // single-argument call, so adding one would require rewriting
-          // passing regression pins rather than fixing a bug. Left as a
-          // follow-up; the elapsed-time bound below is the hard requirement
-          // and doesn't need it.
+          // Each request carries its own deadline (see driveRequestTimeout): the loop-level
+          // check above only runs BEFORE a request starts, so it cannot interrupt one already
+          // in flight. A failure here is caught below and reported as an incomplete walk.
           resp = await drive.files.list({
             q: `'${current}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
             fields: 'nextPageToken, files(id, name)',
@@ -21878,6 +21870,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             } else {
               restricted.push({ id: current, name: folderNames.get(current) || current });
             }
+          } else {
+            /*
+             * Not a permission answer — a timeout or transport failure. The walk did not finish,
+             * so the tree is partial and every conclusion drawn from it is provisional. Without
+             * this, a fired per-request timeout left `truncated` false and a caller reported a
+             * definitive "file not found" from a search that never completed.
+             */
+            truncated = true;
           }
           console.log(`AgentMode: Could not list subfolders of Drive folder ${current}:`, err);
           break;
@@ -21929,9 +21929,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     fields: string,
     perBatchTarget: number,
     orderBy?: string
-  ): Promise<{ files: Map<string, any>; capped: boolean }> {
+  ): Promise<{ files: Map<string, any>; capped: boolean; failed?: any }> {
     const merged = new Map<string, any>();
     let capped = false;
+    // Distinguished from `capped`: "we stopped at a bound" and "a request errored" are different
+    // facts and their callers need different things. The listing path reports a failed source as
+    // failed rather than merely short; the search path treats either as incomplete.
+    let failed: any;
     // ENG-1624: same time bound as getGoogleDriveFolderTreeIds, and for the same
     // reason — batches and pages here are walked sequentially with no overall
     // bound otherwise. Crossing it sets `capped`, reusing the existing
@@ -21952,10 +21956,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           pageToken = undefined;
           break;
         }
-        // See getGoogleDriveFolderTreeIds for why a per-request timeout isn't
-        // added here: it needs a second call argument, which would break every
-        // existing test asserting this call's (single-argument) shape.
-        const resp = await drive.files.list({
+        let resp: any;
+        try {
+          resp = await drive.files.list({
           q: `${parentClause} and ${extraClause}`,
           // nextPageToken must be requested explicitly — it isn't returned by
           // default, which is exactly why the old single-page fetch had no way
@@ -21966,7 +21969,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           ...(orderBy && { orderBy }),
           supportsAllDrives: true,
           includeItemsFromAllDrives: true,
-        }, { timeout: AgentModeService.driveRequestTimeout(deadline) });
+          }, { timeout: AgentModeService.driveRequestTimeout(deadline) });
+        } catch (err) {
+          /*
+           * A failed request — most likely the per-request timeout firing near the end of the
+           * budget — must degrade this read to INCOMPLETE, never discard it. Throwing here
+           * reaches callers that swallow it (searchKnowledgeBase logs and continues), so every
+           * row already merged would be dropped and the answer would present an empty result as
+           * a complete search: the exact defect this file is being changed to prevent, caused by
+           * the guard against it. `capped` is the signal the callers already surface.
+           */
+          console.log('AgentMode: Drive file query batch failed; reporting the read as incomplete:', err);
+          capped = true;
+          failed = err;
+          break;
+        }
         const files = resp.data.files || [];
         for (const f of files) {
           if (f.id) merged.set(f.id, f);
@@ -21982,7 +21999,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       } while (pageToken);
     }
-    return { files: merged, capped };
+    return { files: merged, capped, failed };
   }
 
   private extractGoogleFileId(urlOrId: string): string {
@@ -22616,7 +22633,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // min(trueTotal, K+1) files, so `allFiles.length > offset+limit` is
               // true exactly when more files really exist beyond this page.
               const perBatchTarget = driveOffset + driveLimit + 1;
-              const { files: filesMap, capped } = await this.queryDriveFilesAcrossFolders(
+              const { files: filesMap, capped, failed: queryFailed } = await this.queryDriveFilesAcrossFolders(
                 drive,
                 folderIds,
                 extraClause,
@@ -22661,6 +22678,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 offset: driveOffset,
                 limit: driveLimit,
                 ...(totalFilesIsLowerBound && { totalFilesIsLowerBound: true }),
+                // A request that errored means this source is not merely short, it is unreliable
+                // — reported as failed even when some rows were already merged, so an empty or
+                // partial list is never mistaken for the folder's true contents.
+                ...(queryFailed ? { listingFailed: true, listingFailedReason: this.classifyDriveError(queryFailed) } : {}),
                 // ENG-1624: a sub-folder that couldn't be listed (e.g. an unshared
                 // shortcut target) previously shrank the listing with no signal to
                 // the caller. Name it so the caller can request access instead of
