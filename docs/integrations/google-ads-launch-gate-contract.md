@@ -96,7 +96,7 @@ The lander's tag lives on the generated landing-page record:
   googleAdsConversionId: "AW-18192751758",
   googleAdsConversionLabel: "qAnwCOLmx-McEI65_eJD",
   googleAdsCustomerId: "2883029950",
-  googleAdsTrackingInstalled: true   // false means NO Google measurement shipped
+  googleAdsTrackingInstalled: true   // false = no Ads conversion can be recorded
 }
 ```
 
