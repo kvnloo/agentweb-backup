@@ -560,6 +560,81 @@ describe('isPublishCallWithinAuthorizedScope — fails closed when account_id is
 });
 
 /**
+ * ENG-1616 — `list_connected_accounts` pairs every account_id with its platform and
+ * the model is meant to use account_id once it knows it, so a call like
+ * `post_on_connected_account(account_id: '1340767380')` is a plausible shape for the
+ * ENG-1599 reverse route — but prior to this change, the route's platform check was
+ * hard-wired to fail whenever account_id was present, regardless of correctness. The
+ * caller can now pass the account_id's independently-verified platform (read from
+ * storage, not attacker-controlled) to unlock the same route safely.
+ *
+ * This is a proactive close of a logic gap, not a reproduction of an observed
+ * production failure — no account_id-shaped call has been seen hitting this refusal
+ * in production. (Session 672b3af7 on schedule 1d001fba-0fb7-4bcd-80f6-6041b244a442,
+ * 2026-08-27, is the incident ENG-1616 was filed from, but its actual blocked call
+ * passed `platform`, not `account_id`, and ran hours BEFORE ENG-1599 merged that same
+ * day — so it never exercised this route at all, in either its pre- or post-fix form.
+ * ENG-1599's own platform-only route already covers that call once ENG-1599 is live.)
+ */
+describe('isPublishCallWithinAuthorizedScope — resolved account platform (ENG-1616)', () => {
+  it('authorizes a standalone tweet by account_id once the caller has verified it is the connected Twitter account', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope(
+        'post_on_connected_account',
+        { account_id: '1340767380' },
+        ['twitter_manage_post'],
+        'twitter'
+      )
+    ).toBe(true);
+  });
+
+  it('still REFUSES when the verified platform is not one the grant\'s route covers', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope(
+        'post_on_connected_account',
+        { account_id: 'li-account' },
+        ['twitter_manage_post'],
+        'linkedin'
+      )
+    ).toBe(false);
+  });
+
+  it('ignores a caller-claimed platform that contradicts the verified one', () => {
+    // The handler ignores args.platform whenever account_id is present, so a claim
+    // here must not override the verified truth in either direction.
+    expect(
+      isPublishCallWithinAuthorizedScope(
+        'post_on_connected_account',
+        { account_id: 'li-account', platform: 'twitter' },
+        ['twitter_manage_post'],
+        'linkedin'
+      )
+    ).toBe(false);
+  });
+
+  it('still fails CLOSED when account_id is present but no verified platform was supplied', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope(
+        'post_on_connected_account',
+        { account_id: '1340767380', platform: 'twitter' },
+        ['twitter_manage_post']
+      )
+    ).toBe(false);
+  });
+
+  it('still fails CLOSED when the lookup came back empty (account not found)', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope(
+        'post_on_connected_account',
+        { account_id: 'unknown' },
+        ['twitter_manage_post'],
+        null
+      )
+    ).toBe(false);
+  });
+});
+
+/**
  * ENG-1245 — session 0e5af215 (2026-08-15) and every daily run since, through
  * today, told the owner "you turned ON Require approval before publishing,
  * turn it OFF to unblock." Verified against the live schedule record

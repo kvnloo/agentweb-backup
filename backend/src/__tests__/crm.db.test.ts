@@ -272,6 +272,31 @@ describe('CRM Database Service', () => {
       expect(putCall.Item.linkedin).toBe('https://www.linkedin.com/in/janedoe');
     });
 
+    it('surfaces utmSource/utmMedium in list.fieldNames so they are discoverable for CRM sync mapping', async () => {
+      const listId = 'list_123';
+      const leadData = {
+        email: 'test@example.com',
+        utmSource: 'google',
+        utmMedium: 'cpc',
+      };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.createLead(listId, leadData);
+
+      const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
+      const fieldNames = updateCall.ExpressionAttributeValues[':fieldNames'];
+      expect(fieldNames).toEqual(expect.arrayContaining(['utmSource', 'utmMedium']));
+    });
+
     it('should handle leads without email', async () => {
       const listId = 'list_123';
       const leadData = {

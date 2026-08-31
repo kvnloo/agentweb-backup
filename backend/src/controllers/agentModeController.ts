@@ -18,6 +18,7 @@ import { generateMarketingResponseWorkerService } from '../services/generateMark
 import { resolveInboundAnswer, resolveTypedTextAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { buildWorkPlanInputRequest, resolveWorkPlanInputAnswer, WorkPlanInputRequestError } from '../services/agentMode/core/workPlanInputRequest';
 import type { WorkPlanTurnDisposition } from '../services/agentMode/core/workPlanTurnDisposition';
+import { priorTurnNeedsWorkPlanDispositionRetry } from '../services/agentMode/core/workPlanTurnDisposition';
 import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
@@ -2617,13 +2618,34 @@ const AWAITING_CONFIRMATION_PATTERNS: RegExp[] = [
   // "Awaiting/wait for your confirmation/approval/go-ahead/sign-off/response before proceeding"
   /\b(?:await(?:ing)?|wait\s+for)\b[^\n.?!]*\b(?:confirmation|approval|sign-?off|go-?ahead|your\s+(?:go|response|reply|input|approval))\b/i,
   // "confirm to proceed" / "confirm before I continue/generate/build/send/deliver"
-  // (an explicit confirm-gate ahead of the deliverable action, not just "proceed")
-  /\bconfirm\b[^\n.?!]*\b(?:to|before)\b[^\n.?!]*\b(?:proceed|continu|generat|build|start|begin|send|creat|draft|deliver|run\b)/i,
+  // (an explicit confirm-gate ahead of the deliverable action, not just "proceed").
+  // ENG-1256: each bridge is bounded to a handful of WORDS, not an unbounded
+  // run of any character. Excluding only the em dash (an earlier version of
+  // this pattern) fixed the exact live repro string but not the underlying
+  // flaw: "confirm ... before ... <action>" bridging across an ENTIRELY
+  // separate clause is just as wrong when that clause is introduced by a
+  // comma ("... before merge, since #2414 creates ...") or any other
+  // separator — the dash was never the real signal, clause distance was. A
+  // genuine confirm-gate ("confirm before I proceed", "confirm to continue
+  // and I'll generate...") always has its gate verb within a couple of
+  // words; bounding the gap keeps those matching while rejecting a
+  // recommendation that merely mentions "confirm" and a verb from that list
+  // several clauses apart.
+  /\bconfirm\b\s+(?:[^\s.?!\n]+\s+){0,6}\b(?:to|before)\b\s+(?:[^\s.?!\n]+\s+){0,4}\b(?:proceed|continu|generat|build|start|begin|send|creat|draft|deliver|run\b)/i,
   // Numbered/lettered option prompt: "Reply 1 (…) or 2 (…)", "reply with option 2".
   // Opus emitted this exact form ("Reply 1 … or 2 …") instead of "Reply go" (ENG-369).
   /\breply\s+(?:with\s+)?(?:option\s+)?["'“]?\d\b/i,
-  // "please confirm one of these / the following / which option / your choice below"
-  /\bconfirm\b[^\n.?!]*\b(?:one of|which\b|the following|your\s+(?:choice|preference|selection)|these\b|option\b)/i,
+  // "please confirm one of these / the following / your choice below"
+  /\bconfirm\b[^\n.?!—–]*\b(?:one of|the following|your\s+(?:choice|preference|selection)|these\b|option\b)/i,
+  // "confirm which (option/approach) ... you'd like" — split out from the
+  // pattern above and scoped to require "you" in the same clause. ENG-1256:
+  // a bare "confirm ... which" (no "you" anchor) matched a finished report's
+  // "...confirm which of the two pixels the ads are actually configured
+  // against" (live repro) — a third party fact-check, not a question to the
+  // user. Requiring "you" distinguishes an actual human-directed choice
+  // ("confirm which of these you'd like") from prose that merely uses
+  // "which" to refer to something else entirely.
+  /\bconfirm\b[^\n.?!—–]*\bwhich\b[^\n.?!—–]*\byou\b/i,
   // "get/need/require/request your confirmation", "awaiting your confirmation"
   /\b(?:get|need|needs|require[sd]?|request(?:ing)?|await(?:ing)?)\s+(?:your\s+)?confirmation\b/i,
   // "need you to confirm/decide/choose/pick/select …" (asks the human to make the call)
@@ -2671,9 +2693,58 @@ function stripMarkdownEmphasis(content: string): string {
   return content.replace(/[*_`~]+/g, '').replace(/[^\S\n]+/g, ' ');
 }
 
+// ENG-1256: the system prompt (agentModeSystemPrompt.ts) MANDATES that every
+// single message — finished or not — end with "👉 Next Step: [1 recommended
+// action]". That line is a recommendation the model is addressing to whoever
+// acts on it next (often a THIRD PARTY, e.g. "Ask Harsha to confirm…", "Have
+// someone verify…"), not a question the model is asking the user to unblock
+// itself. Its wording is otherwise unconstrained prose, so it can innocently
+// contain words like "confirm" or "approval" and trip a keyword-shaped pattern
+// meant to catch the model halting for a reply (live repro: "confirm which of
+// the two pixels…" matched the "confirm one of/which/these/option" pattern).
+// A genuine mid-run halt asks its actual question in the message BODY, before
+// this trailer (see the ENG-480 scope-clarification tests), so excluding the
+// trailer from detection does not blind it to a real confirmation request.
+//
+// The mandated trailer is required to be the FINAL line of every message, but
+// live transcripts don't reliably preserve a literal newline before it (see
+// the ENG-1256 repro strings below), so this can't anchor on "^|\n". Instead
+// the trailing `(?:(?!👉?\s*next\s*steps?\s*:)[\s\S])*$` clause forbids the
+// matched suffix from containing another "next step(s):" occurrence, which
+// forces the regex engine to land on the LAST occurrence in the string (a
+// standard "match the final instance" technique for a non-global pattern).
+// Without it, a message that quotes/echoes an earlier "👉 Next Step:" line
+// before its real halt question would match at that EARLIER occurrence and
+// strip everything from there to end-of-string — silently deleting the
+// genuine halt question that follows it. The /u flag makes `👉?` optional as
+// a whole code point (👉 is a surrogate pair); without /u, only the trailing
+// low-surrogate code unit is optional and the high surrogate is a mandatory
+// literal, so a trailer without the emoji would fail to strip at all.
+// `steps?` tolerates plural drift ("👉 Next Steps:") — the mandated wording is
+// singular, but a model that pluralizes it would otherwise skip this pattern
+// entirely (verified live: bypasses stripping, so the trailer's prose reaches
+// the confirmation detector completely unstripped).
+//
+// ENG-1256: the label separator accepts a colon OR a dash (em/en/hyphen), not
+// just the mandated literal ":". "👉 Next Step — Ask Harsha to confirm..." is
+// at least as idiomatic an LLM label style as the colon the system prompt
+// specifies, and a colon-only regex left it completely unstripped (proven via
+// the same extracted-regex harness used for the dash/plural gaps above: a
+// short-bridge "confirm ... before ... continu[es]" recommendation inside a
+// "👉 Next Step — ..." trailer matched the confirmation-halt patterns exactly
+// like the colon case is designed NOT to). A bare period or no punctuation at
+// all is deliberately NOT included — those are far weaker signals that a line
+// is the boilerplate label rather than "next step" used as an ordinary noun
+// phrase in prose, and would risk stripping real message content.
+const NEXT_STEP_TRAILER = /👉?\s*next\s*steps?\s*[:\-–—]\s*(?:(?!👉?\s*next\s*steps?\s*[:\-–—])[\s\S])*$/iu;
+
+function stripNextStepTrailer(content: string): string {
+  return content.replace(NEXT_STEP_TRAILER, '');
+}
+
 export function scheduledRunAwaitsConfirmation(content: string): boolean {
   if (!content || typeof content !== 'string') return false;
-  const normalized = stripMarkdownEmphasis(content);
+  const normalized = stripMarkdownEmphasis(stripNextStepTrailer(content));
   return AWAITING_CONFIRMATION_PATTERNS.some((re) => re.test(normalized));
 }
 
@@ -2814,13 +2885,23 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
   if (!content || typeof content !== 'string') return false;
   // Fast path: the regex catches the common forms with zero LLM cost/latency.
   if (scheduledRunAwaitsConfirmation(content)) return true;
+  // ENG-1256: same exclusion as the regex path — the mandated "👉 Next Step:"
+  // trailer is USUALLY a recommendation, not a question to the user. But the
+  // system prompt's own scheduling-suggestion example (agentModeSystemPrompt.ts
+  // ~183-184) shows a genuine user-directed question CAN live entirely inside
+  // that line ("👉 Next Step: Want this to run automatically every week?...").
+  // So when stripping the trailer leaves nothing, any halt in this message can
+  // only be inside the trailer itself — judge the ORIGINAL unstripped content
+  // instead of short-circuiting to "no halt", or that whole class of halt goes
+  // permanently undetected by both the regex and this judge fallback.
+  const judgeableContent = stripNextStepTrailer(content).trim() || content;
   try {
     const llmPromise = agentModeService.callLLM(
       CONFIRMATION_JUDGE_MODEL,
       [
         { role: 'system', content: CONFIRMATION_JUDGE_SYSTEM },
         // The closing of the message is where a halt lives; cap input for cost.
-        { role: 'user', content: content.slice(-2500) },
+        { role: 'user', content: judgeableContent.slice(-2500) },
       ],
       { temperature: 0, max_completion_tokens: 3, taskClass: 'scheduled_background' }
     );
@@ -6664,7 +6745,17 @@ export async function generateSessionResponse(
   // Check if this is the first user message (excluding system message)
   const userMessages = session.messages?.filter(msg => msg.role === 'user') || [];
   const isFirstMessage = userMessages.length === 0;
+  // ENG-1626: if the immediately-preceding assistant turn failed to reach a
+  // structured workplan disposition (e.g. a decision-card creation that
+  // silently failed even after the in-turn retry), re-enforce the check on
+  // THIS turn too — regardless of what the customer typed — so the retry
+  // happens automatically instead of depending on them asking for it by name
+  // (production case: the customer had to type "Please retry creating the
+  // card" verbatim before anything happened).
+  const lastMessage = session.messages?.[session.messages.length - 1];
+  const priorTurnFailedDisposition = priorTurnNeedsWorkPlanDispositionRetry(lastMessage);
   const enforceWorkPlanDisposition = requireWorkPlanDisposition
+    || priorTurnFailedDisposition
     || (Boolean(session.workPlan) && isFirstMessage);
 
   // If this is the first message, add system message with version info first

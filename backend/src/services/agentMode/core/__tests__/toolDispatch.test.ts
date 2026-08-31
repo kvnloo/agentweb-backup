@@ -240,6 +240,34 @@ describe('executePreparedTools', () => {
     expect(result.pendingCounterUpdates).toEqual({});
   });
 
+  // ENG-1626: a ToolResultPolicyBlockedError is a tool refusing BY DESIGN (e.g.
+  // set_work_plan_status's out-of-order/missing-calls gates, which return
+  // {success:false, blocked:true, reason:'...'} without throwing). It downgrades
+  // to a model-visible error like any other, but must NOT feed failedCounterUpdates
+  // (session.failedFunctions) -- that field is what the failure-cluster telemetry
+  // and this issue's "set_work_plan_status failed 2x" reading were built from, so
+  // a self-correcting gate refusal must not read as an infra flake.
+  it('downgrades a ToolResultPolicyBlockedError result WITHOUT counting it as a failure', async () => {
+    const { ToolResultPolicyBlockedError } = require('../../../../utils/toolResultError');
+    const ports = makePorts({
+      toolResultError: (r: any) =>
+        r?.blocked === true ? new ToolResultPolicyBlockedError(r.message, r.reason) : null,
+      executePreparedAgentTool: async () => ({
+        success: false,
+        blocked: true,
+        reason: 'workplan_out_of_order',
+        message: 'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
+      }),
+    });
+    const input = makeInput([toolCall('a', 'set_work_plan_status', '{}')], ports);
+    const result = await executePreparedTools(input);
+
+    expect(input.toolCallsLedger[0].error).toBe(
+      'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
+    );
+    expect(result.failedCounterUpdates).toEqual({});
+  });
+
   it('offloads a large tool response to S3 and caps the in-memory copy', async () => {
     const big = 'Y'.repeat(15_000);
     const upload = jest.fn().mockResolvedValue({ success: true, key: 'tool-responses/sess-1/a.txt' });

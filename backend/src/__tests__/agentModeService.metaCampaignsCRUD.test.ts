@@ -61,14 +61,22 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
       ];
 
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-      (metaService.listCampaigns as jest.Mock).mockResolvedValue(mockCampaigns);
+      (metaService.listCampaigns as jest.Mock).mockResolvedValue({
+        campaigns: mockCampaigns,
+        truncated: false,
+        pagesFetched: 1,
+      });
 
       const result = await agentModeService.listMetaAdsCampaignsNew('user123');
 
       expect(result.success).toBe(true);
-      expect(result.message).toBe('Found 2 campaign(s)');
+      // ENG-1625: bare "Found N campaign(s)" was the ENG-1476/ENG-1584 sentence shape —
+      // the message now names scope and completeness explicitly.
+      expect(result.message).toBe('Found 2 campaign(s) in this ad account (complete list).');
       expect(result.campaigns).toEqual(mockCampaigns);
       expect(result.totalCount).toBe(2);
+      expect(result.complete).toBe(true);
+      expect(result.hasMore).toBe(false);
       expect(metaService.listCampaigns).toHaveBeenCalledWith('123456789', 'mock-access-token');
     });
 

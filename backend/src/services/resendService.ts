@@ -2,6 +2,11 @@ import { Resend } from 'resend';
 import { getSecret } from '../utils/secretsManager';
 import axios from 'axios';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
+import {
+  isNonProdEmailGuardActive,
+  partitionRecipients,
+  SUPPRESSED_MESSAGE_ID,
+} from '../utils/nonProdEmailGuard';
 
 /**
  * Parameters for a Resend send.
@@ -306,6 +311,46 @@ class ResendService {
    * for a failed send; a resolved promise means Resend accepted the email.
    */
   async sendEmail(params: ResendSendParams) {
+    // ENG-1215: the single chokepoint every send funnels through — this method,
+    // `sendSystemEmail` (which delegates here), and all 28 direct callers in
+    // emailService. Guarding here rather than at each call site is the whole
+    // point: a new sender added later is covered without anyone remembering to.
+    //
+    // In production this is a no-op. Everywhere else, `Dev-AW-Users` is a clone
+    // of production and holds real customer addresses, so mail is suppressed
+    // unless the recipient is explicitly allowlisted.
+    if (isNonProdEmailGuardActive()) {
+      const partition = partitionRecipients(params.to, params.cc);
+
+      if (partition.suppressEntirely) {
+        console.warn(
+          `[nonprod-email-guard] Suppressed "${params.subject}" to ` +
+            `${partition.blockedTo.join(', ') || '(no recipients)'}` +
+            `${partition.blockedCc.length ? ` cc ${partition.blockedCc.join(', ')}` : ''}` +
+            ` — NODE_ENV=${process.env.NODE_ENV || 'unset'}. ` +
+            'Set NONPROD_EMAIL_ALLOWLIST to permit an address, or ' +
+            'NONPROD_EMAIL_ALLOW_ALL=true for a deliberate delivery test.',
+        );
+        // A synthetic id, clearly labelled. `sendEmailStrict` throws without a
+        // string id, and a suppressed send is a deliberate outcome rather than
+        // a failure — but an audit row must never be able to pass this off as a
+        // real delivery.
+        return { id: SUPPRESSED_MESSAGE_ID, suppressed: true };
+      }
+
+      if (partition.blockedTo.length || partition.blockedCc.length) {
+        console.warn(
+          `[nonprod-email-guard] Dropped non-allowlisted recipients from ` +
+            `"${params.subject}": ${[...partition.blockedTo, ...partition.blockedCc].join(', ')}`,
+        );
+        return this.enqueueSend({
+          ...params,
+          to: partition.allowedTo,
+          cc: partition.allowedCc.length ? partition.allowedCc : undefined,
+        });
+      }
+    }
+
     return this.enqueueSend(params);
   }
 

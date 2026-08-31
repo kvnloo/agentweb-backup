@@ -980,13 +980,19 @@ describe("resolveBillingUserId - success cases", () => {
 describe("checkTokenUsage - org member uses owner quota", () => {
   it("checks against org owner allowance when called for org member", async () => {
     // member1 belongs to org1, owner is owner1
-    mockGetUserById
-      .mockResolvedValueOnce({ userId: "member1", email: "member@example.com", orgId: "org1", orgRole: "member" }) // resolveBillingUserId
-      .mockResolvedValueOnce({ userId: "owner1", email: "owner@example.com", orgId: "org1", orgRole: "owner",
+    // ENG-1215: keyed by id rather than a positional mockResolvedValueOnce
+    // chain. `resolveBillingUserId` now verifies the org owner resolves before
+    // returning it, which adds a getUserById call and silently shifted every
+    // value in the old chain by one. The assertions below are unchanged — only
+    // the mock's dependence on call ORDER is removed.
+    const rows: Record<string, any> = {
+      member1: { userId: "member1", email: "member@example.com", orgId: "org1", orgRole: "member" },
+      owner1: { userId: "owner1", email: "owner@example.com", orgId: "org1", orgRole: "owner",
         tokenUsage: { month: currentMonth(), totalTokens: 90000, totalCost: 9.0, resetDate: "2026-05-01T00:00:00.000Z" },
         tokenAllowanceBonus: 0,
-      }) // getUserTokenUsage
-      .mockResolvedValueOnce({ userId: "owner1", email: "owner@example.com", tokenAllowanceBonus: 0 }); // getUserTokenAllowance
+      },
+    };
+    mockGetUserById.mockImplementation(async (id: string) => rows[id] ?? null);
     mockGetOrgById.mockResolvedValue({ orgId: "org1", ownerUserId: "owner1", name: "Acme", maxMembers: 5, createdAt: "", updatedAt: "" });
     mockGetUserSubscriptionType.mockResolvedValue("Pro");
     mockGetSubscriptionTypeConfig.mockResolvedValue({
@@ -1005,13 +1011,19 @@ describe("checkTokenUsage - org member uses owner quota", () => {
   });
 
   it("blocks org member when org owner is at 100% usage", async () => {
-    mockGetUserById
-      .mockResolvedValueOnce({ userId: "member1", email: "member@example.com", orgId: "org1", orgRole: "member" })
-      .mockResolvedValueOnce({ userId: "owner1", email: "owner@example.com",
+    // ENG-1215: keyed by id rather than a positional mockResolvedValueOnce
+    // chain. `resolveBillingUserId` now verifies the org owner resolves before
+    // returning it, which adds a getUserById call and silently shifted every
+    // value in the old chain by one. The assertions below are unchanged — only
+    // the mock's dependence on call ORDER is removed.
+    const rows: Record<string, any> = {
+      member1: { userId: "member1", email: "member@example.com", orgId: "org1", orgRole: "member" },
+      owner1: { userId: "owner1", email: "owner@example.com",
         tokenUsage: { month: currentMonth(), totalTokens: 100000, totalCost: 10.0, resetDate: "2026-05-01T00:00:00.000Z" },
         tokenAllowanceBonus: 0,
-      })
-      .mockResolvedValueOnce({ userId: "owner1", email: "owner@example.com", tokenAllowanceBonus: 0 });
+      },
+    };
+    mockGetUserById.mockImplementation(async (id: string) => rows[id] ?? null);
     mockGetOrgById.mockResolvedValue({ orgId: "org1", ownerUserId: "owner1", name: "Acme", maxMembers: 5, createdAt: "", updatedAt: "" });
     mockGetUserSubscriptionType.mockResolvedValue("Basic");
     mockGetSubscriptionTypeConfig.mockResolvedValue({
@@ -1029,11 +1041,18 @@ describe("checkTokenUsage - org member uses owner quota", () => {
 
 describe("incrementUserTokenUsage - org member increments owner counter", () => {
   it("increments org owner's usage when called for org member", async () => {
-    mockGetUserById
-      .mockResolvedValueOnce({ userId: "member1", email: "member@example.com", orgId: "org1", orgRole: "member" }) // resolveBillingUserId
-      .mockResolvedValueOnce({ userId: "owner1", email: "owner@example.com",
+    // ENG-1215: keyed by id rather than a positional mockResolvedValueOnce
+    // chain. `resolveBillingUserId` now verifies the org owner resolves before
+    // returning it, which adds a getUserById call and silently shifted every
+    // value in the old chain by one. The assertions below are unchanged — only
+    // the mock's dependence on call ORDER is removed.
+    const rows: Record<string, any> = {
+      member1: { userId: "member1", email: "member@example.com", orgId: "org1", orgRole: "member" },
+      owner1: { userId: "owner1", email: "owner@example.com",
         tokenUsage: { month: currentMonth(), totalTokens: 5000, totalCost: 0.5, resetDate: "2026-05-01T00:00:00.000Z" },
-      }); // incrementUserTokenUsage reads owner
+      },
+    };
+    mockGetUserById.mockImplementation(async (id: string) => rows[id] ?? null);
     mockGetOrgById.mockResolvedValue({ orgId: "org1", ownerUserId: "owner1", name: "Acme", maxMembers: 5, createdAt: "", updatedAt: "" });
     mockApplyMonthlyChargeAtomic.mockResolvedValue("applied");
 

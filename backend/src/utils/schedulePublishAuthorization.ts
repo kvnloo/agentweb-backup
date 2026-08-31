@@ -375,30 +375,51 @@ export function narrowPublishAuthorization(
  * literal consent covers. Matching `EQUIVALENT_PUBLISH_ROUTES` exactly, action for
  * action, is what keeps this an outcome-equivalent substitution instead of a scope
  * widening.
+ *
+ * ENG-1616 — `resolvedAccountPlatform` is the account_id's REAL platform, looked up
+ * by the caller from storage (see `refuseUnauthorizedScheduledPublish`), for the
+ * case where `args.account_id` is present. It is NOT attacker-controlled — unlike
+ * `args.platform` — so it is safe to trust in place of the caller's own claim.
+ *
+ * `list_connected_accounts` pairs every account_id with its platform and tells the
+ * model to use account_id once it knows it, so a model that just looked up the
+ * connected X account and calls `post_on_connected_account(account_id: '...')`
+ * (no `platform`, or a redundant matching one) is a plausible calling pattern this
+ * route was built to cover — but prior to this change, ANY account_id-bearing call
+ * unconditionally failed the platform check (`!hasAccountId && ...`), regardless of
+ * whether the account was actually the authorized one. This is a proactive close of
+ * that gap, not a fix for an observed production failure: the account_id-shaped
+ * call has not been seen failing in production. (It is NOT the call that blocked
+ * session 672b3af7 on 2026-08-27 — that call passed `platform`, not `account_id`,
+ * and predates ENG-1599's merge later that same day by several hours; ENG-1599's
+ * own platform-only route already covers it.)
  */
 export function isPublishCallWithinAuthorizedScope(
   toolName: string,
   args: any,
-  tools: string[]
+  tools: string[],
+  resolvedAccountPlatform?: string | null
 ): boolean {
   if (tools.includes(toolName)) return true;
   const action = normalizeAction(args?.action);
-  const platform = normalizePlatform(args?.platform);
   // postOnConnectedAccount resolves the target account by `account_id` FIRST and
   // ignores `platform` entirely whenever `account_id` is present (agentModeService.ts) —
   // so `args.platform` only actually describes the account being posted to when no
   // `account_id` is given. Trusting a caller-supplied `platform` alongside a
   // caller-supplied `account_id` would let a mismatched account_id (e.g. a LinkedIn
-  // account) pass a platform-scoped grant by simply claiming platform:'twitter'. Like
-  // every other ambiguous case in this module, that fails closed rather than guessing.
+  // account) pass a platform-scoped grant by simply claiming platform:'twitter'. When
+  // the caller hands back the account_id's verified platform, use that instead; when
+  // it hasn't (or the lookup came back empty), still fail closed rather than guessing.
   const hasAccountId = args?.account_id !== undefined && args?.account_id !== null && args?.account_id !== '';
+  const platform = hasAccountId ? normalizePlatform(resolvedAccountPlatform) : normalizePlatform(args?.platform);
+  const platformKnown = !hasAccountId || typeof resolvedAccountPlatform === 'string';
   return tools.some((required) => {
     const routes = EQUIVALENT_PUBLISH_ROUTES[required];
     if (!routes) return false;
     return routes.some((route) =>
       route.tool === toolName &&
       (!route.actions || route.actions.includes(action)) &&
-      (!route.platforms || (!hasAccountId && route.platforms.includes(platform)))
+      (!route.platforms || (platformKnown && route.platforms.includes(platform)))
     );
   });
 }

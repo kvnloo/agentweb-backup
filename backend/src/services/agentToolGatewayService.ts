@@ -1037,6 +1037,13 @@ function classifyToolEffect(toolName: string, args: unknown): AgentToolEffect {
     return 'read';
   }
 
+  if (toolName === 'call_attio_api') {
+    const action = stringField(args, 'action').toUpperCase();
+    if (action === 'REMOVE_ENTRIES') return 'destructive';
+    if (action === 'CREATE' || action === 'ADD_ENTRIES') return 'internal_write';
+    return 'read';
+  }
+
   if (READ_TOOLS.has(toolName) || READ_PREFIXES.some((prefix) => toolName.startsWith(prefix))) return 'read';
   if (SIDE_EFFECTING_PREFIXES.some((prefix) => toolName.startsWith(prefix))) return 'internal_write';
   return 'unknown';
