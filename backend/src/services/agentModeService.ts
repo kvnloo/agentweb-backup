@@ -2616,46 +2616,76 @@ export class AgentModeService {
     const client = await this.getOpenRouterClient();
     const providerLabel = 'openrouter';
 
-    try {
-      const res = await client.chat.completions.create(
-        params,
-        { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
-      );
-      // Fire-and-forget usage metering; it must never break an LLM call.
+    // ENG-1626: params.provider.allow_fallbacks above already has OpenRouter retry
+    // across its own provider pool for THIS request before it ever surfaces an
+    // error to us -- getOpenRouterClient's maxRetries:0 exists precisely so an SDK
+    // auto-retry can't multiply with that in-flight fallback. This loop is a
+    // different thing: ONE retry of a *fully-exhausted* attempt, after a short
+    // backoff, for the narrow case where the exhaustion was momentary. Session
+    // b32ec8af (2026-08-26): a single "429 Provider returned error" from
+    // OpenRouter (all providers for that model saturated for an instant) killed
+    // an entire Slack-bridged session with zero retry anywhere in this path.
+    // `timeout` is deliberately excluded from the retryable set used elsewhere
+    // (isRetryableErrorClass) -- retrying a call that already burned up to
+    // timeoutMs would double the worst-case wall clock against the turn's own
+    // hard cap, trading one failure mode for a worse one.
+    const isRetryableLlmCallError = (error: unknown): boolean => {
+      const errorClass = classifyToolErrorClass(error);
+      return errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx';
+    };
+
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        const usage: any = (res as any)?.usage;
-        if (usage) {
-          const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
-          meterUserUsage({
-            userId: usageContext?.userId,
-            billingUserId: usageContext?.billingUserId,
-            sessionId: usageContext?.sessionId,
-            model,
-            provider: providerLabel,
-            feature: usageContext?.feature || 'agent_task',
-            eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
-            inputTokens: normalizedUsage.inputTokens,
-            outputTokens: normalizedUsage.outputTokens,
-            cacheReadTokens: normalizedUsage.cacheReadTokens,
-            cacheWriteTokens: normalizedUsage.cacheWriteTokens,
-            cacheWriteByTtl: usage.cache_creation_by_ttl,
-            costUsdOverride:
-              usage.is_byok !== true && typeof usage.cost === 'number'
-                ? usage.cost
-                : undefined,
-          });
+        const res = await client.chat.completions.create(
+          params,
+          { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
+        );
+        // Fire-and-forget usage metering; it must never break an LLM call.
+        try {
+          const usage: any = (res as any)?.usage;
+          if (usage) {
+            const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
+            meterUserUsage({
+              userId: usageContext?.userId,
+              billingUserId: usageContext?.billingUserId,
+              sessionId: usageContext?.sessionId,
+              model,
+              provider: providerLabel,
+              feature: usageContext?.feature || 'agent_task',
+              eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
+              inputTokens: normalizedUsage.inputTokens,
+              outputTokens: normalizedUsage.outputTokens,
+              cacheReadTokens: normalizedUsage.cacheReadTokens,
+              cacheWriteTokens: normalizedUsage.cacheWriteTokens,
+              cacheWriteByTtl: usage.cache_creation_by_ttl,
+              costUsdOverride:
+                usage.is_byok !== true && typeof usage.cost === 'number'
+                  ? usage.cost
+                  : undefined,
+            });
+          }
+        } catch {
+          // Metering must never break an LLM call.
         }
-      } catch {
-        // Metering must never break an LLM call.
+        return res;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 2 && isRetryableLlmCallError(error)) {
+          console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying once`, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          await this.sleep(1500);
+          continue;
+        }
+        break;
       }
-      return res;
-    } catch (error) {
-      console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined,
-      });
-      throw error;
     }
+    console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
+      error: lastError instanceof Error ? lastError.message : String(lastError),
+      stack: lastError instanceof Error ? lastError.stack : undefined,
+    });
+    throw lastError;
   }
 
   /**
