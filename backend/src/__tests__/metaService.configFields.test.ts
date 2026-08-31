@@ -30,6 +30,21 @@ jest.mock('../utils/secretsManager', () => ({
   getMetaCredentials: jest.fn(),
 }));
 
+/**
+ * ENG-1476 follow-up: a single-entity CAMPAIGN/AD_SET fetch now runs an ownership lookup
+ * (`node.get(['account_id'])`) before reading fields, because a node id is global and is not
+ * bounded by the selected ad account. Mock that the way Meta actually answers — `account_id`
+ * for the ownership probe, the entity payload for the field read — rather than returning the
+ * payload for both, which would let a fixture pass an ownership check no real account would.
+ */
+function mockNodeGet(accountId: string, data: Record<string, any>) {
+  return jest.fn().mockImplementation((f?: any) =>
+    Array.isArray(f) && f.length === 1 && f[0] === 'account_id'
+      ? Promise.resolve({ _data: { account_id: accountId } })
+      : Promise.resolve({ _data: data }),
+  );
+}
+
 describe('MetaService config-field reads (ENG-398)', () => {
   let service: MetaService;
   const token = 'mock_token';
@@ -57,7 +72,7 @@ describe('MetaService config-field reads (ENG-398)', () => {
   it('CAMPAIGN LIST honors campaign_id: fetches the single campaign, returns a one-element list', async () => {
     const getCampaigns = jest.fn();
     (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getCampaigns }));
-    const get = jest.fn().mockResolvedValue({ _data: { id: 'camp_9', bid_strategy: 'LOWEST_COST_WITHOUT_CAP' } });
+    const get = mockNodeGet(accountId, { id: 'camp_9', bid_strategy: 'LOWEST_COST_WITHOUT_CAP' });
     (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get }));
 
     const result = await service.listCampaigns(accountId, token, { campaignId: 'camp_9' });
@@ -111,9 +126,7 @@ describe('MetaService config-field reads (ENG-398)', () => {
   it('AD_SET LIST honors ad_set_id: fetches the single ad set, returns a one-element list', async () => {
     const getAdSets = jest.fn();
     (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAdSets }));
-    const get = jest.fn().mockResolvedValue({
-      _data: { id: 'as_9', optimization_goal: 'OFFSITE_CONVERSIONS', promoted_object: { pixel_id: 'px1', custom_event_type: 'LEAD' } },
-    });
+    const get = mockNodeGet(accountId, { id: 'as_9', optimization_goal: 'OFFSITE_CONVERSIONS', promoted_object: { pixel_id: 'px1', custom_event_type: 'LEAD' } });
     (AdSet as unknown as jest.Mock).mockImplementation(() => ({ get }));
 
     const result = await service.listAdSets(accountId, token, undefined, { adSetId: 'as_9' });
@@ -243,12 +256,17 @@ describe('MetaService CAMPAIGN spend_cap read (ENG-785)', () => {
   });
 
   it('CAMPAIGN LIST single-campaign read (campaign_id) includes spend_cap in the requested fields', async () => {
-    const get = jest.fn().mockResolvedValue({ _data: { id: 'camp_9', spend_cap: '5000' } });
+    const get = mockNodeGet(accountId, { id: 'camp_9', spend_cap: '5000' });
     (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get }));
 
     const result = await service.listCampaigns(accountId, token, { campaignId: 'camp_9' });
 
-    expect(get.mock.calls[0][0]).toEqual(expect.arrayContaining(['spend_cap']));
+    // The ownership probe (`get(['account_id'])`) now precedes the field read, so assert on
+    // the field read itself rather than on call order — the invariant is unchanged.
+    const fieldCall = get.mock.calls.find(
+      (c: any[]) => !(Array.isArray(c[0]) && c[0].length === 1 && c[0][0] === 'account_id'),
+    );
+    expect(fieldCall?.[0]).toEqual(expect.arrayContaining(['spend_cap']));
     expect(result).toEqual({
       campaigns: [{ id: 'camp_9', spend_cap: '5000' }],
       truncated: false,
@@ -325,9 +343,7 @@ describe('MetaService CAMPAIGN effective_status / special_ad_categories read (EN
   });
 
   it('CAMPAIGN LIST single-campaign read (campaign_id) honors effective_status and special_ad_categories', async () => {
-    const get = jest.fn().mockResolvedValue({
-      _data: { id: 'camp_9', effective_status: 'CAMPAIGN_PAUSED', special_ad_categories: ['NONE'] },
-    });
+    const get = mockNodeGet(accountId, { id: 'camp_9', effective_status: 'CAMPAIGN_PAUSED', special_ad_categories: ['NONE'] });
     (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get }));
 
     const result = await service.listCampaigns(accountId, token, {
