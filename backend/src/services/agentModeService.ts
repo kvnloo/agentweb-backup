@@ -1237,6 +1237,23 @@ function linkedInPublicIdFromUrl(url: string | undefined | null): string | null 
 /** Narrow local shape of a stored google_ads config (ENG-1362). */
 type GoogleAdsConfigShape = { customer_id: string; currency?: string; test_account?: boolean };
 
+/**
+ * Escape a value for interpolation into a Google Drive `q` string literal.
+ *
+ * Drive's query grammar requires BOTH `\` and `'` to be escaped inside a string. The call
+ * sites here escaped only the quote, so a backslash in a value survived verbatim: a file
+ * literally named `report\` produced `name = 'report\'`, whose trailing `\'` reads as an
+ * escaped quote, leaving the string unterminated — an opaque Drive 400 rather than a match.
+ * The same gap is what lets a crafted value manipulate quote parity and reach past the
+ * parent-folder clause the query is scoped by, so this is a correctness AND a scoping fix.
+ *
+ * Backslash MUST be replaced first: doing the quote first would then double-escape the
+ * backslashes it just introduced.
+ */
+function escapeDriveQueryValue(value: string): string {
+  return String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
   // ENG-1295 hardening: self-consistency cache for perform_data_analysis. Keyed by
@@ -22017,7 +22034,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             const { files: driveFilesMap, capped: driveQueryCapped } = await this.queryDriveFilesAcrossFolders(
               drive,
               allFolderIds,
-              `fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
+              `fullText contains '${escapeDriveQueryValue(query)}' and trashed = false`,
               'files(id, name, mimeType, parents)',
               limitedMaxResults
             );
@@ -23217,7 +23234,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
         drive,
         folderIds,
-        `name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
+        `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
         'files(id, name, mimeType, size, modifiedTime, parents)',
         2
       );
@@ -23349,7 +23366,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
         drive,
         folderIds,
-        `name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
+        `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
         'files(id, name, mimeType, size, parents)',
         2
       );
@@ -23831,7 +23848,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const drive = google.drive({ version: 'v3', auth });
 
-      const namePart = `name contains '${query.replace(/'/g, "\\'")}'`;
+      const namePart = `name contains '${escapeDriveQueryValue(query)}'`;
       const typePart = type === 'folder'
         ? ` and mimeType = 'application/vnd.google-apps.folder'`
         : type === 'file'
