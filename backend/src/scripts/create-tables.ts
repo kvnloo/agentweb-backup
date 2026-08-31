@@ -2115,6 +2115,55 @@ const createSocialEngagementTrackingTable = async () => {
   }
 };
 
+// ENG-916: per-campaign, per-day ad metrics + CRM lead-count snapshots.
+// New, empty, additive-only table — doesn't touch or migrate any existing data.
+//
+// NOT Meta-specific. One store serves Meta, Google Ads and LinkedIn Ads: the HASH key is
+// `${platform}#${accountId}#${campaignId}` because a single user holds several accounts on the
+// same platform (mvarma has two Meta ad accounts, in INR and USD), so platform+campaign alone
+// would collide. Ingestion stays per-platform — the three disagree on units, pagination and how
+// long a figure keeps moving (Meta settles at 28 days, Google attributes for up to 90) — but the
+// storage and everything reading it are shared.
+//
+// entityKey+date is the full key; the daily cron overwrites the settling window each run, which
+// is a deliberate idempotent overwrite, not a duplicate-prevention concern.
+const createAdsMetricsSnapshotsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AdsMetricsSnapshots`,
+    AttributeDefinitions: [
+      { AttributeName: 'entityKey', AttributeType: 'S' },
+      { AttributeName: 'date', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'entityKey', KeyType: 'HASH' },
+      { AttributeName: 'date', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'userId-date-index',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'date', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const createBrowserCookiesTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-BrowserCookies`,
@@ -2499,6 +2548,7 @@ const main = async () => {
     await createAccountMemoryTable();
     await createOrgMemoryTable();
     await createSocialEngagementTrackingTable();
+    await createAdsMetricsSnapshotsTable();
     await createBrowserCookiesTable();
     await createOrganizationsTable();
     await createScheduleTemplatesTable();

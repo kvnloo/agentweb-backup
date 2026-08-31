@@ -10,10 +10,10 @@ import bcrypt from 'bcryptjs';
 import http from 'http';
 import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
-import { generateChatResponse, chatbotDb } from './services/chatbotService';
-import { checkTokenUsage } from './services/tokenUsageService';
+import { chatbotDb } from './services/chatbotService';
 import { userDb } from './services/db';
 import { registerIo } from './services/sessionSockets';
+import { handleSocketChatMessage } from './services/chatSocketHandler';
 import {
   sendAudioChunk,
   sendAudioStreamEnd,
@@ -260,56 +260,13 @@ io.on('connection', (socket: Socket) => {
   });
 
   // Handle chat messages
-  socket.on('message', async (data: {
+  socket.on('message', (data: {
     sessionId: string;
     message: string;
     currentUrl?: string;
     pageContent?: string;
     portal?: 'customer' | 'partner';
-  }) => {
-    try {
-      // Get user ID from socket auth
-      const token = socket.handshake.auth.token;
-      if (!token) {
-        throw new Error('No authentication token provided');
-      }
-
-      const decoded = jwt.verify(token, getJwtSecret()) as { userId: string; isAdmin?: boolean; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
-      const userId = decoded.delegateAccess?.targetUserId || decoded.userId;
-      const isDelegatedAdmin = !!decoded.delegateAccess || decoded.isAdmin === true;
-
-      // Check token usage limits
-      const usageStatus = await checkTokenUsage(userId);
-      if (!usageStatus.allowed) {
-        socket.emit('error', {
-          message: 'Monthly token limit reached. Please contact support or upgrade your plan.',
-          code: 'TOKEN_LIMIT_EXCEEDED',
-          tokenUsage: usageStatus,
-        });
-        return;
-      }
-
-      const portalType = data.portal || 'partner';
-      const orgRole = portalType === 'customer' ? (await userDb.getUserById(userId))?.orgRole : undefined;
-      const response = await generateChatResponse(
-        data.sessionId,
-        data.message,
-        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id, isDelegatedAdmin, orgRole }
-      );
-
-      // Send response back to the client
-      const responseContent = typeof response === 'string' ? response : (response as any)?.content ?? '';
-      socket.emit('message', {
-        sessionId: data.sessionId,
-        content: responseContent
-      });
-    } catch (error) {
-      console.error('Error processing message:', error);
-      socket.emit('error', {
-        message: 'Failed to process message'
-      });
-    }
-  });
+  }) => handleSocketChatMessage(socket, data));
 
   // Implement automatic reconnection
   socket.on('reconnect_attempt', () => {
@@ -654,6 +611,38 @@ createTestAccount().then(async () => {
       }
 
 
+      // ENG-916: Meta Ads Metrics Snapshot — runs daily at 09:00 UTC (after
+      // ActivationCron at 08:00), re-pulling the last SETTLING_WINDOW_DAYS days each run
+      // (28, sized against Meta's documented insights-mutability window) so a stored row
+      // doesn't freeze while Meta is still revising it.
+      try {
+        const METRICS_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        const { runMetaMetricsSnapshot } = await import('./cron/metaMetricsSnapshotCron');
+
+        const nowForMetricsCron = new Date();
+        const nextMetricsRunUTC = new Date(nowForMetricsCron);
+        nextMetricsRunUTC.setUTCHours(9, 0, 0, 0);
+        if (nextMetricsRunUTC <= nowForMetricsCron) {
+          nextMetricsRunUTC.setUTCDate(nextMetricsRunUTC.getUTCDate() + 1);
+        }
+        const msUntilNextMetricsRun = nextMetricsRunUTC.getTime() - nowForMetricsCron.getTime();
+
+        console.log(`[MetaMetricsSnapshotCron] Initialized — first run at 09:00 UTC (in ${Math.round(msUntilNextMetricsRun / 60000)} min)`);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('MetaMetricsSnapshotCron', runMetaMetricsSnapshot())
+            .catch(e => console.error('[MetaMetricsSnapshotCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('MetaMetricsSnapshotCron', runMetaMetricsSnapshot())
+              .catch(e => console.error('[MetaMetricsSnapshotCron] Error:', e));
+          }, METRICS_SNAPSHOT_INTERVAL_MS);
+        }, msUntilNextMetricsRun);
+      } catch (error) {
+        console.error('[MetaMetricsSnapshotCron] Failed to initialize:', error);
+      }
+
+
       // Drip Sequence Worker — runs every 5 minutes
       try {
         const { processDueEnrollments } = await import('./services/dripSequenceWorker');
@@ -838,6 +827,35 @@ createTestAccount().then(async () => {
         console.log('[renewalIntegrationHealthCron] Initialized — running daily');
       } catch (error) {
         console.error('[renewalIntegrationHealthCron] Failed to initialize:', error);
+      }
+
+      // CRM Auto-Enrichment (ENG-88) — runs every 15 minutes.
+      // Ray's manual campaign-monitoring routine included clicking "renew"
+      // (the enrich-v3 engine) on managed-campaign lead lists by hand a
+      // couple of times. With Ray leaving, this keeps it happening without
+      // a human clicking anything — but ONLY for a list whose saved
+      // enrichmentConfig has explicitly opted in (`autoEnrich: true`, set
+      // via the existing PUT /lists/:listId/enrichment-config). Every
+      // other list's behavior is unchanged; nothing runs until a human
+      // flips that flag for a specific list.
+      try {
+        const { runCrmAutoEnrichmentCheck } = await import('./cron/crmAutoEnrichmentCron');
+        const CRM_AUTO_ENRICHMENT_INTERVAL_MS = 15 * 60 * 1000;
+        // Guard the initial run too, matching the interval callback below —
+        // a disabled-cron environment must not enrich real leads once on
+        // startup just because the guard was only on the recurring path.
+        if (isCronEnabled()) {
+          cronJobRegistry.track('crmAutoEnrichmentCron', runCrmAutoEnrichmentCheck())
+            .catch(e => console.error('[crmAutoEnrichmentCron] Error on first run:', e));
+        }
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('crmAutoEnrichmentCron', runCrmAutoEnrichmentCheck())
+            .catch(e => console.error('[crmAutoEnrichmentCron] Error:', e));
+        }, CRM_AUTO_ENRICHMENT_INTERVAL_MS);
+        console.log('[crmAutoEnrichmentCron] Initialized — running every 15 minutes (opt-in per list, default off)');
+      } catch (error) {
+        console.error('[crmAutoEnrichmentCron] Failed to initialize:', error);
       }
 
       // Skill Review Queue Digest (ENG-932) — runs daily.

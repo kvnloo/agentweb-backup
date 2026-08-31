@@ -1850,6 +1850,40 @@ describe('apiTools', () => {
       });
     });
 
+    it('ENG-1540: reports "active" (not "inactive") for a paid plan whose status was never backfilled', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        // A Pro account granted out-of-band (no Stripe subscription object ever
+        // synced `subscription_status` onto the record) — the xCures/Ed Mongiovi
+        // shape: real Pro access, but the field itself was never set.
+        if (opts.path === '/api/auth/me') return { email: 'paid@xcures.com', subscriptionType: 'Pro' };
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const result = await mcpToolRegistry.execute('get_account_status', {}, context);
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed.subscription_plan).toBe('Pro');
+      expect(parsed.subscription_status).toBe('active');
+    });
+
+    it('ENG-1540: treats an empty-string subscription_status as missing, same as auth.ts\'s sync trigger', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        // auth.ts's lazy Stripe sync guards on `!user.subscription_status`, which
+        // is true for '' as well as undefined — this default has to agree, or a
+        // stray '' would pass straight through unresolved instead of deriving
+        // a real status from the paid subscriptionType.
+        if (opts.path === '/api/auth/me') return { email: 'paid@xcures.com', subscriptionType: 'Pro', subscription_status: '' };
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const result = await mcpToolRegistry.execute('get_account_status', {}, context);
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed.subscription_status).toBe('active');
+    });
+
     it('should treat a missing/non-array keys payload as zero api keys', async () => {
       mockMcpFetch.mockImplementation(async (opts: any) => {
         if (opts.path === '/api/auth/me') return meResponse;

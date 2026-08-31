@@ -215,3 +215,62 @@ describe('callSatisfiesRequirement — suppresses the equivalence credit when bo
     expect(countCallsSatisfyingRequirement('twitter_manage_post', ledger, required)).toBe(1);
   });
 });
+
+/**
+ * ENG-1599 review — EQUIVALENT_PUBLISH_ROUTES.twitter_manage_post's route to
+ * post_on_connected_account (platforms: ['twitter']) is consentOnly: it widens what
+ * isPublishCallWithinAuthorizedScope authorizes a schedule to CALL, never what
+ * callSatisfiesRequirement credits toward having FULFILLED a requirement. A schedule
+ * that requires twitter_manage_post mandates the reply/quote-tweet/retweet/thread it
+ * names — crediting an unrelated standalone tweet through post_on_connected_account
+ * would reverse this module's own asymmetric-equivalence invariant (see the module
+ * docblock), even when the platform matches and the call succeeded.
+ */
+describe('callSatisfiesRequirement — twitter_manage_post is NOT satisfied by post_on_connected_account (ENG-1599, consentOnly)', () => {
+  const standaloneTweet = {
+    name: 'post_on_connected_account',
+    arguments: { platform: 'twitter' },
+    result: { success: true },
+  };
+
+  it('does NOT credit a successful, platform-matching standalone tweet', () => {
+    expect(callSatisfiesRequirement('twitter_manage_post', standaloneTweet)).toBe(false);
+  });
+
+  it('does NOT credit it for a non-matching platform either', () => {
+    expect(
+      callSatisfiesRequirement('twitter_manage_post', { ...standaloneTweet, arguments: { platform: 'linkedin' } })
+    ).toBe(false);
+  });
+
+  it('does NOT credit it when the call failed', () => {
+    expect(
+      callSatisfiesRequirement('twitter_manage_post', { ...standaloneTweet, result: { success: false } })
+    ).toBe(false);
+  });
+
+  it('does NOT credit it via a JSON-string arguments payload (resolvePlatform fallback)', () => {
+    expect(
+      callSatisfiesRequirement('twitter_manage_post', {
+        ...standaloneTweet,
+        arguments: JSON.stringify({ platform: 'twitter' }),
+      })
+    ).toBe(false);
+  });
+
+  it('does NOT credit it on malformed JSON arguments (resolvePlatform fallback)', () => {
+    expect(
+      callSatisfiesRequirement('twitter_manage_post', { ...standaloneTweet, arguments: '{not json' })
+    ).toBe(false);
+  });
+
+  it('countCallsSatisfyingRequirement never counts it either', () => {
+    expect(countCallsSatisfyingRequirement('twitter_manage_post', [standaloneTweet])).toBe(0);
+  });
+
+  it('requiredFunctionNames does not change the outcome — there is nothing to double-credit', () => {
+    expect(
+      callSatisfiesRequirement('twitter_manage_post', standaloneTweet, ['twitter_manage_post', 'post_on_connected_account'])
+    ).toBe(false);
+  });
+});

@@ -403,4 +403,80 @@ describe("estimateModelSavings — counterfactual repricing (ENG-1213 AC3)", () 
     );
     expect(est!.estimatedSavingsMicroUsd).toBeLessThan(0);
   });
+
+});
+
+describe("attributeCosts — a vendor call is not a model (ENG-1519)", () => {
+  // `recordVendorUsage` shares this ledger with token-priced LLM calls and
+  // namespaces the model slot as `{provider}:{operation}`, deliberately, so two
+  // vendors cannot collide on a `{date}#{model}#{feature}` sort key. Nothing in
+  // attribution could tell such a row apart, so `twitter:get_user_tweets` was
+  // aggregated as a model and shown to the customer as one — at 4% of a real
+  // account's cycle — in the very list whose purpose is recommending which
+  // model to switch.
+
+  it("keeps a per-unit vendor row out of byModel", () => {
+    const result = attributeCosts([
+      row({ model: "anthropic.claude-opus-5", costMicroUsd: 60 * USD }),
+      row({ model: "twitter:get_user_tweets", costMicroUsd: 4 * USD, provider: "twitter", unit: "call" }),
+    ]);
+
+    expect(result.byModel.map((d) => d.key)).toEqual(["anthropic.claude-opus-5"]);
+    expect(result.byVendor?.map((d) => d.key)).toEqual(["twitter:get_user_tweets"]);
+  });
+
+  it("still counts vendor spend toward the total and the books still balance", () => {
+    // The failure to avoid is turning a naming fix into a false claim that the
+    // ledger does not add up. Vendor spend IS attributed — to a vendor.
+    const result = attributeCosts([
+      row({ model: "anthropic.claude-opus-5", costMicroUsd: 60 * USD }),
+      row({ model: "twitter:get_user_tweets", costMicroUsd: 4 * USD, provider: "twitter", unit: "call" }),
+    ]);
+
+    expect(result.totalCostMicroUsd).toBe(64 * USD);
+    expect(result.unattributedMicroUsd).toBe(0);
+    expect(result.reconciles).toBe(true);
+  });
+
+  it("does not treat an LLM row that merely names its provider as a vendor call", () => {
+    // `isVendorEntry` requires BOTH fields for this reason: token-priced spend
+    // often carries a provider and is still a model.
+    const result = attributeCosts([
+      row({ model: "anthropic.claude-opus-5", costMicroUsd: 10 * USD, provider: "anthropic" }),
+    ]);
+
+    expect(result.byModel.map((d) => d.key)).toEqual(["anthropic.claude-opus-5"]);
+    expect(result.byVendor).toBeNull();
+  });
+
+  it("reports no vendor grouping at all when the cycle has none", () => {
+    const result = attributeCosts([row({ model: "anthropic.claude-opus-5", costMicroUsd: 10 * USD })]);
+    expect(result.byVendor).toBeNull();
+  });
+
+  it("still attributes a vendor row to its feature", () => {
+    // The spend is on the bill and the customer should still see WHAT it was
+    // for; only the claim that it is a model was wrong.
+    const result = attributeCosts([
+      row({ model: "twitter:get_user_tweets", feature: "x-account", costMicroUsd: 5 * USD, provider: "twitter", unit: "call" }),
+    ]);
+    expect(result.byFeature.map((d) => d.key)).toContain("x-account");
+  });
+
+  it("treats a vendor row with no feature as unattributed, like any other unplaceable row", () => {
+    // The vendor branch used to sit BEFORE the missing-dimension guard, so
+    // such a row counted toward `attributed` while appearing in neither
+    // `byFeature` nor `unattributedMicroUsd` — and `reconciles` still claimed
+    // the books balanced while the feature dimension had quietly lost it
+    // (CodeRabbit).
+    const result = attributeCosts([
+      row({ model: "anthropic.claude-opus-5", costMicroUsd: 10 * USD }),
+      row({ model: "twitter:get_user_tweets", feature: "", costMicroUsd: 4 * USD, provider: "twitter", unit: "call" }),
+    ]);
+
+    expect(result.byVendor).toBeNull();
+    expect(result.unattributedMicroUsd).toBe(4 * USD);
+    expect(result.totalCostMicroUsd).toBe(14 * USD);
+    expect(result.reconciles).toBe(true);
+  });
 });

@@ -208,6 +208,16 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'openrouter/deepseek/deepseek-v4-pro': withDerivedCache(0.657, 1.315), // live "62% off" promo; lowest-confidence entry in this batch — the promo makes list price hard to reconstruct cleanly, re-verify if this model becomes cost-sensitive
   'openrouter/deepseek/deepseek-v4-flash': withDerivedCache(0.068, 0.168), // was ~2x over live
   'openrouter/qwen/qwen3.8-max': withDerivedCache(2.0, 6.0),
+  // 2026-08-26: NOT the $0.35/$2.75 headline listing price — OpenRouter
+  // aggregates 10 upstream providers for this model ($0.35-$0.48 in,
+  // $2.55-$3.40 out; cheapest = Chutes, priciest = Io Net) and our
+  // callLLM() request has no `provider.sort: 'price'`, so routing is
+  // non-deterministic. Two live default-routed test calls both landed on
+  // Io Net (the priciest provider) at $0.48/$3.40. Using the 10-provider
+  // average ($0.43/$3.00) rather than the cheapest listing, to avoid
+  // systematically undercharging — re-verify if this model becomes
+  // cost-sensitive, same caveat as deepseek-v4-pro above.
+  'openrouter/qwen/qwen3.8-27b': withDerivedCache(0.43, 3.0),
   'openrouter/mistralai/mistral-small-2603': withDerivedCache(0.15, 0.6),
   'openrouter/moonshotai/kimi-k3': withDerivedCache(2.6, 13.0), // was $0.60/$2.50 — 4.8x under live; this is a frontier-tier model, not budget
   'openrouter/moonshotai/kimi-k2.7-code': withDerivedCache(0.67, 3.4),

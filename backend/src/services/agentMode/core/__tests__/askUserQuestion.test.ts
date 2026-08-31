@@ -20,6 +20,7 @@ import {
   buildPendingUserQuestion,
   applyAnswer,
   resolveInboundAnswer,
+  resolveTypedTextAnswer,
   selectedPayload,
   checkQuestionGate,
   renderQuestionPrompt,
@@ -541,5 +542,46 @@ describe('resolveInboundAnswer — the /generate structured answer channel', () 
     if (gate.allowed) {
       expect(gate.payload).toEqual({ objective: 'OUTCOME_LEADS', optimization_goal: 'OFFSITE_CONVERSIONS' });
     }
+  });
+});
+
+describe('resolveTypedTextAnswer — unambiguous typed consent', () => {
+  const AT = '2026-08-29T00:05:00.000Z';
+
+  it('resolves exactly one matching option and records typed-text provenance', () => {
+    const answered = resolveTypedTextAnswer(awaitingQuestion(), 'Leads', AT);
+    expect(answered?.answer).toMatchObject({
+      optionId: 'leads', delegated: false, answeredBy: 'user', rationale: 'Resolved from typed user text.', at: AT,
+    });
+  });
+
+  it('resolves a bare affirmative only for an approval-shaped card', () => {
+    const approval = buildPendingUserQuestion({
+      questionId: 'q-approve', question: 'Approve the deployment?', createdAt: AT,
+      options: [
+        { id: 'approve', label: 'Approve', consequence: 'Proceed.', recommended: true, why: 'Ready.' },
+        { id: 'reject', label: 'Reject', consequence: 'Stop.' },
+      ],
+    });
+    expect(resolveTypedTextAnswer(approval, 'yes, looks good', AT)?.answer).toMatchObject({ optionId: 'approve', answeredBy: 'user' });
+  });
+
+  it('does not turn bare affirmation or ambiguous option mentions into a multi-choice selection', () => {
+    expect(resolveTypedTextAnswer(awaitingQuestion(), 'yes', AT)).toBeUndefined();
+    expect(resolveTypedTextAnswer(awaitingQuestion(), 'leads or traffic', AT)).toBeUndefined();
+  });
+
+  it('does not treat negated option mentions as consent', () => {
+    const approval = buildPendingUserQuestion({
+      questionId: 'q-approve', question: 'Approve the deployment?', createdAt: AT,
+      options: [
+        { id: 'approve', label: 'Approve', consequence: 'Proceed.', recommended: true, why: 'Ready.' },
+        { id: 'reject', label: 'Reject', consequence: 'Stop.' },
+      ],
+    });
+
+    expect(resolveTypedTextAnswer(approval, 'I do not approve this', AT)).toBeUndefined();
+    expect(resolveTypedTextAnswer(approval, 'do not proceed', AT)).toBeUndefined();
+    expect(resolveTypedTextAnswer(awaitingQuestion(), 'not leads', AT)).toBeUndefined();
   });
 });

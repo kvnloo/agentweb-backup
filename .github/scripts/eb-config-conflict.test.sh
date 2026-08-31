@@ -132,8 +132,14 @@ check 'ENG-836: and the failure names both sides' 1 \
   'backend/.platform/nginx/conf.d/agent-mode-timeout.conf'
 check 'ENG-836: and tells the author how to fix it' 1 \
   'two sequential'
-check 'ENG-836: and warns that staging will not reproduce it' 1 \
-  'staging is AllAtOnce'
+# ENG-1184: this asserted the literal string 'staging is AllAtOnce'. That fact
+# stopped being true when ENG-1128 switched staging to Immutable on 2026-08-11,
+# and the test kept passing because it pinned the WORDING, not the claim. A
+# deployment policy lives in AWS, not in this repo, so no test here can verify
+# one; what this gate can honestly tell an author is that no staging run speaks
+# to this either way.
+check 'ENG-836: and warns that no staging run is evidence about this' 1 \
+  'No staging run is evidence either way'
 check 'ENG-836: and emits a GitHub error annotation' 1 \
   '::error::EB_CONFIG_CONFLICT'
 

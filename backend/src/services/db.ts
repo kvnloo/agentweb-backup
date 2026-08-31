@@ -1,4 +1,5 @@
 import AWS from "aws-sdk";
+import { assertMemoryContentWithinLimit } from '../utils/memoryContentLimit';
 import dotenv from "dotenv";
 import path from "path";
 import { S3 } from "aws-sdk";
@@ -152,13 +153,14 @@ export interface User {
   displayName?: string;
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
-  emailDomain?: string; // Email sender domain
-  resendDomainId?: string; // Resend domain ID for domain verification
+  emailDomain?: string; // @deprecated legacy single sending domain — kept for the task/subscriber-notification fallback sender (emailService.ts, dripSequenceWorker.ts legacyDefaultSender); CRM sending domains live in emailDomains[] (ENG-265)
+  resendDomainId?: string; // @deprecated Resend domain ID paired with the legacy emailDomain above
+  emailDomains?: Array<{ id: string; domain: string; status: string; addedAt: string }>; // Multiple verified Resend sending domains (ENG-265). id = Resend domain id.
+  emailDomainList?: string[]; // Denormalized domain names from emailDomains[], kept in sync on every write — lets getUsersByEmailDomain's Scan filter with contains() instead of pulling every row into app memory.
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels. Kept for backward-compat reads.
   slackChannels?: string[]; // Slack channels configured for this user (agent tools are restricted to these)
-  slackSuggestedRepliesDisabled?: boolean; // When true, suppress Slack suggested-reply (slack-triggered) sessions/emails for this user. Absent/false = enabled (default).
   slackShipNotifyDisabled?: boolean; // When true, suppress the Slack ping when an item this user reported ships (shipNotifyService). Absent/false = enabled (default).
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   landerUtmDefault?: import("../utils/landerUtm").UtmConfig; // Customer-level UTM default for generated landers (ENG-724); read/write only via landerUtmStore
@@ -470,6 +472,15 @@ export interface User {
    * other devices — are rejected by the auth middleware. Absent = 0.
    */
   sessionVersion?: number;
+  /**
+   * Monotonic revocation counter for DELEGATE tokens minted against this user
+   * (admin/contractor "access as customer"). Embedded as `dte` in every delegate
+   * token. Bumping it rejects every outstanding delegate token for this user
+   * without touching their own sessions — which `sessionVersion` cannot do, since
+   * that would log the customer out of their own devices as a side effect of a
+   * support-access cleanup. Absent = 0. See ENG-1506.
+   */
+  delegateTokenEpoch?: number;
   /**
    * Set when the account is created with a system-generated initial password
    * (e.g. admin creating a user from the waitlist). The user MUST set their own
@@ -1236,7 +1247,9 @@ export class UserDB {
       do {
         const params: AWS.DynamoDB.DocumentClient.ScanInput = {
           TableName: this.tableName,
-          FilterExpression: 'emailDomain = :emailDomain AND NOT begins_with(userId, :tombstone)',
+          // ENG-265: also matches a domain registered as one of several entries in emailDomains[]
+          // via the denormalized emailDomainList — see the field comment on User.emailDomainList.
+          FilterExpression: '(emailDomain = :emailDomain OR contains(emailDomainList, :emailDomain)) AND NOT begins_with(userId, :tombstone)',
           ExpressionAttributeValues: {
             ':emailDomain': normalizedDomain,
             ':tombstone': 'deleted_',
@@ -1685,6 +1698,42 @@ export class UserDB {
       return (result.Attributes as { sessionVersion: number }).sessionVersion;
     } catch (error) {
       handleDynamoDbError(error, "incrementSessionVersion");
+      throw error;
+    }
+  }
+
+  /**
+   * Atomically increment a user's delegateTokenEpoch, rejecting every delegate
+   * token minted against them with a prior value. Returns the new epoch.
+   *
+   * Deliberately separate from `sessionVersion`: revoking support access must not
+   * log the customer out of their own devices, and a customer changing their
+   * password should not be the only way to cut off a delegate token. Both signals
+   * are checked independently in the auth middleware.
+   *
+   * Same `if_not_exists` shape as incrementSessionVersion, so records predating
+   * the field are treated as 0 and bumped to 1.
+   */
+  async incrementDelegateTokenEpoch(userId: string): Promise<number> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+
+    const params = {
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression: "SET #dte = if_not_exists(#dte, :zero) + :one",
+      ExpressionAttributeNames: { "#dte": "delegateTokenEpoch" },
+      ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
+      ReturnValues: "UPDATED_NEW",
+    };
+
+    try {
+      const result = await this.docClient.update(params).promise();
+      return (result.Attributes as { delegateTokenEpoch: number }).delegateTokenEpoch;
+    } catch (error) {
+      handleDynamoDbError(error, "incrementDelegateTokenEpoch");
       throw error;
     }
   }
@@ -5197,6 +5246,30 @@ export const crmDb = {
     return items;
   },
 
+  /**
+   * Lists opted into the CRM auto-enrichment cron (ENG-88):
+   * `enrichmentConfig.autoEnrich === true`. Scoped scan, not a rename/reuse
+   * of getAllLeadLists — that function's minimal projection is depended on
+   * elsewhere, and this needs the enrichmentConfig attribute plus a filter.
+   * Cheap by design: `autoEnrich` is opt-in and expected to stay rare.
+   */
+  async getAutoEnrichEnabledLists(): Promise<Array<{ listId: string; userId: string }>> {
+    const items: any[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.scan({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        ProjectionExpression: 'listId, userId',
+        FilterExpression: 'enrichmentConfig.autoEnrich = :true',
+        ExpressionAttributeValues: { ':true': true },
+        ExclusiveStartKey: lastEvaluatedKey,
+      }).promise();
+      items.push(...(result.Items || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return items;
+  },
+
   // Returns true if userId owns the list OR has CRM read access to the owner's org lists.
   // Respects shareSettings.crm.enabled: when false, only the list owner, the org owner,
   // and listed crm.editors retain cross-member read access.
@@ -6326,6 +6399,64 @@ export const crmDb = {
     }
   },
 
+  // ENG-969 follow-up: leadId is minted once, globally (Date.now() + a random
+  // suffix — see createLead), never re-derived per list, so it never legitimately
+  // collides across two lists. Production session 6082779b-f9f1-4e38-a8eb-34abbc3da419
+  // showed an agent pair a valid lead_id with a stale list_id from an earlier step
+  // in the same run — a not-found on the requested list is as likely to mean "wrong
+  // list_id" as "no such lead". `candidateListIds` should already be access-scoped
+  // (e.g. via getLeadListsForUser) since any match here is returned as-is, with no
+  // further access check. Capped at 200 lists (8 BatchGetItem round trips) so a
+  // pathological org with hundreds of lists can't turn a single not-found into an
+  // unbounded scan.
+  async getLeadByIdAcrossLists(candidateListIds: string[], leadId: string) {
+    if (candidateListIds.length === 0) return null;
+    const MAX_CANDIDATE_LISTS = 200;
+    const BATCH_SIZE = 25;
+    // BatchGetItem can partially succeed and return the requested key in
+    // UnprocessedKeys (capacity limits, internal retries) — AWS's own docs
+    // require retrying those, with backoff, or a genuinely-existing lead can
+    // read as "not found" here. Bounded so contention degrades gracefully
+    // instead of retrying forever.
+    const MAX_UNPROCESSED_RETRIES = 3;
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const listIds = candidateListIds.slice(0, MAX_CANDIDATE_LISTS);
+
+    for (let i = 0; i < listIds.length; i += BATCH_SIZE) {
+      let keys: Array<{ listId: string; leadId: string }> = listIds
+        .slice(i, i + BATCH_SIZE)
+        .map(listId => ({ listId, leadId }));
+      let unprocessedAttempt = 0;
+
+      while (keys.length > 0) {
+        const params = {
+          RequestItems: {
+            [tableName]: { Keys: keys },
+          },
+        };
+        try {
+          const result = await dynamodb.batchGet(params).promise();
+          const items = (result.Responses?.[tableName] as any[]) || [];
+          if (items.length > 0) return items[0];
+
+          const unprocessed = result.UnprocessedKeys?.[tableName]?.Keys as
+            | Array<{ listId: string; leadId: string }>
+            | undefined;
+          if (!unprocessed || unprocessed.length === 0) break; // batch genuinely done, no match
+
+          unprocessedAttempt += 1;
+          if (unprocessedAttempt > MAX_UNPROCESSED_RETRIES) break; // give up on this batch's remainder
+          await new Promise(resolve => setTimeout(resolve, 50 * 2 ** (unprocessedAttempt - 1)));
+          keys = unprocessed;
+        } catch (error) {
+          handleDynamoDbError(error, "getLeadByIdAcrossLists");
+          throw error;
+        }
+      }
+    }
+    return null;
+  },
+
   /**
    * ENG-926 §C: atomically record that one Meta conversion event has been relayed.
    *
@@ -6851,6 +6982,8 @@ export const crmDb = {
     enrichmentMetadata?: Record<string, any>;
     /** ISO timestamp set when a LinkedIn connection invite is manually sent from the CRM. */
     linkedInInviteSentAt?: string | null;
+    /** ISO timestamp set when this account accepted an INBOUND LinkedIn invite from this lead — distinct from linkedInInviteSentAt (an outbound send), since the two are opposite real-world events. */
+    linkedInInviteAcceptedAt?: string | null;
     /** ENG-1026: pre-send identity cross-check stamp (ISO date + verified canonical URL). */
     linkedinIdentityVerifiedAt?: string | null;
     linkedinIdentityVerifiedUrl?: string | null;
@@ -7047,6 +7180,15 @@ export const crmDb = {
         } else {
           setExpressions.push('linkedInInviteSentAt = :linkedInInviteSentAt');
           expressionAttributeValues[':linkedInInviteSentAt'] = updates.linkedInInviteSentAt;
+        }
+      }
+
+      if (updates.linkedInInviteAcceptedAt !== undefined) {
+        if (updates.linkedInInviteAcceptedAt === null) {
+          removeExpressions.push('linkedInInviteAcceptedAt');
+        } else {
+          setExpressions.push('linkedInInviteAcceptedAt = :linkedInInviteAcceptedAt');
+          expressionAttributeValues[':linkedInInviteAcceptedAt'] = updates.linkedInInviteAcceptedAt;
         }
       }
 
@@ -9685,9 +9827,7 @@ export const accountMemoryDb = {
     // valid becomes invalid. Worst-case stored size roughly doubles (2,000
     // astral chars ≈ 8 KB UTF-8) — negligible against DynamoDB's 400 KB limit.
     // The other three memory guards below/above match this unit deliberately.
-    if (Array.from(content).length > 2000) {
-      throw new Error('Content must be 2000 characters or less');
-    }
+    assertMemoryContentWithinLimit(content);
 
     const { ulid } = await import('ulid');
     const now = new Date().toISOString();
@@ -9788,9 +9928,7 @@ export const accountMemoryDb = {
     }
     // Code points, not UTF-16 code units — same unit as the declared
     // `maxLength: 2000` and the addMemory guard (ENG-821).
-    if (updates.content !== undefined && Array.from(updates.content).length > 2000) {
-      throw new Error('Content must be 2000 characters or less');
-    }
+    if (updates.content !== undefined) assertMemoryContentWithinLimit(updates.content);
 
     const expressions: string[] = ['#updatedAt = :updatedAt'];
     const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
@@ -9854,9 +9992,7 @@ export const orgMemoryDb = {
     }
     // Code points, not UTF-16 code units — same unit as the declared
     // `maxLength: 2000` and the addMemory guard (ENG-821).
-    if (Array.from(content).length > 2000) {
-      throw new Error('Content must be 2000 characters or less');
-    }
+    assertMemoryContentWithinLimit(content);
 
     const { ulid } = await import('ulid');
     const now = new Date().toISOString();
@@ -9956,9 +10092,7 @@ export const orgMemoryDb = {
     }
     // Code points, not UTF-16 code units — same unit as the declared
     // `maxLength: 2000` and the addMemory guard (ENG-821).
-    if (updates.content !== undefined && Array.from(updates.content).length > 2000) {
-      throw new Error('Content must be 2000 characters or less');
-    }
+    if (updates.content !== undefined) assertMemoryContentWithinLimit(updates.content);
 
     const expressions: string[] = ['#updatedAt = :updatedAt'];
     const names: Record<string, string> = { '#updatedAt': 'updatedAt' };

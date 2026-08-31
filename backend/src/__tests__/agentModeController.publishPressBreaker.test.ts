@@ -297,41 +297,62 @@ describe('runScheduledChat — publish-press circuit breaker (ENG-947)', () => {
     expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
   });
 
-  it('reports a THREAD published via twitter_manage_post as a requirement mismatch, not held', async () => {
-    // The live production case as of 2026-08-12. Schedule 34154af9 "Kevin — X
-    // Evening Post" requires post_on_connected_account, but its prompt asks for a
-    // 2-3 tweet THREAD, so the model publishes with twitter_manage_post instead.
-    // Every run since 2026-08-10 ends at attempt 20 with summary "Thread
-    // Published": the thread IS live on X, and post_on_connected_account is still
-    // actual 0. Marking that held-for-approval would tell the owner to approve a
-    // post that already went out.
+  /**
+   * ENG-1599 review (CodeRabbit) correction: this used to mock
+   * `arguments: { action: 'post' }` — not a real API value; the actual tool only
+   * ever sends `post_thread`/`reply`/`quote_tweet`/`retweet`. That placeholder
+   * accidentally dodged completion crediting and forced the run down the
+   * mismatch path. With the REAL action, `callSatisfiesRequirement` already
+   * credits `twitter_manage_post`/`post_thread` toward a `post_on_connected_
+   * account` requirement (the ENG-1045 forward equivalence route, which
+   * predates this PR and was never in question) — so a genuine post_thread
+   * publish for THIS schedule (single required tool, no double-requirement
+   * suppression) correctly reports `success`, not a mismatch. That is the
+   * right outcome: the schedule's mandated content really did go out.
+   */
+  it('credits a THREAD published via twitter_manage_post as completing post_on_connected_account', async () => {
     mockWorker.runInWorker.mockResolvedValue(workerReply([
-      { name: 'twitter_manage_post', arguments: { action: 'post' } },
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread' } },
     ], 'Thread published.') as any);
 
     const result = await runScheduledChat(publishSchedule, 'kevin', true);
 
-    // Still capped — pressing for a tool the model has worked around is as futile
-    // as pressing for one it refused.
-    expect(result.attempt).toBe(MAX_PUBLISH_PRESS_ATTEMPTS);
-    // Still a failure — the requirement genuinely is unmet.
-    expect(result.status).toBe('failure');
-    // But NOT held for approval: nothing is waiting on the owner.
+    expect(result.attempt).toBe(1);
+    expect(result.status).toBe('success');
     expect((result as any).publishHeldForApproval).toBeUndefined();
-    expect((result as any).publishRequirementMismatch).toBe(true);
+    expect((result as any).publishRequirementMismatch).toBeUndefined();
   });
 
-  it('persists the mismatch marker, and never the held marker, on the stored result', async () => {
+  it('persists success, with neither the mismatch nor the held marker, on the stored result', async () => {
     mockWorker.runInWorker.mockResolvedValue(workerReply([
-      { name: 'twitter_manage_post', arguments: { action: 'post' } },
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread' } },
     ], 'Thread published.') as any);
 
     await runScheduledChat(publishSchedule, 'kevin', false);
 
     const stored = mockScheduleDb.addRunResult.mock.calls[0][1] as any;
-    expect(stored.publishRequirementMismatch).toBe(true);
+    expect(stored.status).toBe('success');
+    expect(stored.publishRequirementMismatch).toBeUndefined();
     expect(stored.publishHeldForApproval).toBeUndefined();
-    expect(stored.status).toBe('failure');
+  });
+
+  /**
+   * The genuine mismatch case (kept, corrected): a `twitter_manage_post` REPLY
+   * is neither a match for `post_on_connected_account`'s route (scoped to
+   * `post_thread` only — a reply to someone else's tweet is not "the
+   * schedule's own content going out") nor evidence the required tool was
+   * ever reached. Nothing was withheld and nothing was published toward THIS
+   * requirement, so it is a genuine, ordinary withhold — not a mismatch.
+   */
+  it('does not credit or misreport an unrelated twitter_manage_post action (a reply)', async () => {
+    mockWorker.runInWorker.mockResolvedValue(workerReply([
+      { name: 'twitter_manage_post', arguments: { action: 'reply' } },
+    ], 'Replied to a mention.') as any);
+
+    const result = await runScheduledChat(publishSchedule, 'kevin', true);
+
+    expect(result.status).toBe('failure');
+    expect((result as any).publishRequirementMismatch).toBeUndefined();
   });
 
   it('a FAILED thread publish is still held for approval — nothing went out', async () => {
@@ -339,7 +360,7 @@ describe('runScheduledChat — publish-press circuit breaker (ENG-947)', () => {
     // thread is not live and the owner really is the blocker, so the approval
     // signal must survive.
     mockWorker.runInWorker.mockResolvedValue(workerReply([
-      { name: 'twitter_manage_post', arguments: { action: 'post' }, error: 'rate limited' } as any,
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'rate limited' } as any,
     ], 'I could not publish.') as any);
 
     const result = await runScheduledChat(publishSchedule, 'kevin', true);
@@ -366,14 +387,21 @@ describe('runScheduledChat — publish-press circuit breaker (ENG-947)', () => {
 /**
  * ENG-947 — the real 2026-08-11 run of schedule 34154af9 "Kevin — X Evening
  * Post". requiredFunctionCalls names post_on_connected_account, but the prompt
- * asks for a 2-3 tweet THREAD, so the model published via twitter_manage_post
- * (once, successfully, summary "Thread Published") and never touched the named
- * tool. The requirement stayed unmet and the run pressed to attempt 20.
+ * asks for a 2-3 tweet THREAD, so the model published via twitter_manage_post.
  *
- * Stopping early is right. Calling it held-for-approval is not: the thread is
- * live on X, so that marker would tell the owner to approve something already
- * published, and would hide the thing they actually need to fix — the schedule's
- * required function.
+ * ENG-1599 review (CodeRabbit) correction: as originally written, this suite's
+ * mock used a placeholder `action: 'post'` — not a real API value — which
+ * accidentally dodged the pre-existing ENG-1045 forward equivalence route and
+ * forced every test here down the mismatch path. With the real `post_thread`
+ * action, `callSatisfiesRequirement` already credits a twitter_manage_post
+ * thread toward this schedule's single `post_on_connected_account` requirement
+ * (no double-requirement suppression applies here), so the run correctly
+ * reports success — the schedule's mandated content genuinely went out. The
+ * mismatch path this describe block was written to guard remains real and
+ * covered (see publishPressCircuitBreaker.test.ts's qualifier tests, and the
+ * "reply" case below), it just isn't reachable through THIS specific
+ * single-required-tool, matching-action shape — that shape is completion,
+ * not mismatch.
  */
 describe('runScheduledChat — published through a different tool (ENG-947)', () => {
   beforeEach(() => {
@@ -393,34 +421,43 @@ describe('runScheduledChat — published through a different tool (ENG-947)', ()
     mockScheduleDb.updateScheduleAfterRun.mockResolvedValue(undefined as any);
   });
 
-  it('reports a requirement mismatch, NOT held-for-approval, when the thread went out', async () => {
+  /**
+   * ENG-1599 review (CodeRabbit) correction: this used to mock a placeholder
+   * `action: 'post'`, not a real API value, which accidentally dodged the
+   * pre-existing ENG-1045 forward equivalence credit and forced the mismatch
+   * path. With the real `post_thread` action, `callSatisfiesRequirement`
+   * already credits this toward `post_on_connected_account` (single required
+   * tool here, so no double-requirement suppression applies) — so the run
+   * correctly reports success. See the identical correction and full
+   * explanation in the sibling describe block above.
+   */
+  it('credits a THREAD published via twitter_manage_post, does not report a mismatch', async () => {
     mockWorker.runInWorker.mockResolvedValue(
-      workerReply([{ name: 'twitter_manage_post', arguments: { action: 'post' } }], 'Thread published.') as any,
+      workerReply([{ name: 'twitter_manage_post', arguments: { action: 'post_thread' } }], 'Thread published.') as any,
     );
 
     const result = await runScheduledChat(publishSchedule, 'kevin', true);
 
-    expect(result.attempt).toBe(MAX_PUBLISH_PRESS_ATTEMPTS);
-    expect(result.functionCallMisses).toEqual(['post_on_connected_account']);
-    expect((result as any).publishRequirementMismatch).toBe(true);
+    expect(result.attempt).toBe(1);
+    expect(result.functionCallMisses).toEqual([]);
+    expect((result as any).publishRequirementMismatch).toBeUndefined();
     expect((result as any).publishHeldForApproval).toBeUndefined();
-    // Still a failure — the requirement genuinely is unmet and the owner must fix
-    // the schedule; it just is not waiting on their approval.
-    expect(result.status).toBe('failure');
+    expect(result.status).toBe('success');
   });
 
-  it('persists the mismatch marker, and never the held marker, on the stored run result', async () => {
+  it('persists success on the stored run result, with neither marker set', async () => {
     mockWorker.runInWorker.mockResolvedValue(
-      workerReply([{ name: 'twitter_manage_post', arguments: { action: 'post' } }], 'Thread published.') as any,
+      workerReply([{ name: 'twitter_manage_post', arguments: { action: 'post_thread' } }], 'Thread published.') as any,
     );
 
     await runScheduledChat(publishSchedule, 'kevin', true);
 
     expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith(
       'schedule-947',
-      expect.objectContaining({ status: 'failure', publishRequirementMismatch: true }),
+      expect.objectContaining({ status: 'success' }),
     );
     const stored = (mockScheduleDb.addRunResult as jest.Mock).mock.calls[0][1] as any;
+    expect(stored.publishRequirementMismatch).toBeUndefined();
     expect(stored.publishHeldForApproval).toBeUndefined();
   });
 

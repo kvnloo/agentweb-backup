@@ -29,7 +29,7 @@ jest.mock("../services/usageRecordDb", () => ({
   },
 }));
 jest.mock("../services/agentModeService", () => ({
-  agentModeService: { getSupportedModels: jest.fn() },
+  agentModeService: { getSupportedModels: jest.fn(), getSupportedModelsWithMetadata: jest.fn() },
 }));
 // Mocked explicitly: without it these tests still passed, but only because the
 // real `getUserById` swallows its own AWS error and returns undefined, so they
@@ -51,6 +51,7 @@ import {
   resolveUsageDrivers,
   toCustomerDrivers,
   previewUsageRunway,
+  BENCHMARK_COMPARABLE_MAX_DELTA,
 } from "../services/llmUsageDriversResolverService";
 import { getEffectiveLlmUsagePolicy } from "../services/llmUsagePolicyResolverService";
 import { usageRecordDb } from "../services/usageRecordDb";
@@ -66,6 +67,7 @@ const mockOrg = orgDb.getOrgById as jest.Mock;
 const mockMembers = orgDb.getOrgMembers as jest.Mock;
 const mockSchedules = scheduleDb.getSchedulesByUserId as jest.Mock;
 const mockModels = agentModeService.getSupportedModels as jest.Mock;
+const mockModelsMeta = agentModeService.getSupportedModelsWithMetadata as jest.Mock;
 const USD = 1_000_000;
 
 /** Default to a solo account. Call AFTER jest.clearAllMocks(), which wipes it. */
@@ -149,6 +151,9 @@ describe("recommendation telemetry (ENG-1210 AC12)", () => {
     mockPolicy.mockResolvedValue(policyFor());
     mockQuery.mockResolvedValue(opusLedger());
     mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+    // Default: no AA quality data known, so existing cases keep exercising the
+    // pre-ENG-1563 "unknown" path unless a case explicitly overrides this.
+    mockModelsMeta.mockResolvedValue([]);
     emitted.length = 0;
     __setUsageTelemetrySinkForTests((event, dimensions) => {
       emitted.push({ event, dimensions });
@@ -241,6 +246,9 @@ describe("recommendation honesty (ENG-1217 AC4/AC5/AC6)", () => {
     // Without this the catalog intersects to empty and no recommendation is
     // produced at all, which would make every assertion below vacuous.
     mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+    // Default: no AA quality data known, so existing cases keep exercising the
+    // pre-ENG-1563 "unknown" path unless a case explicitly overrides this.
+    mockModelsMeta.mockResolvedValue([]);
   });
 
   it("labels quality unknown, because no evaluation evidence exists", async () => {
@@ -336,6 +344,178 @@ describe("recommendation honesty (ENG-1217 AC4/AC5/AC6)", () => {
   });
 });
 
+/**
+ * ENG-1563 — ground quality.status in the real AA qualityScore signal
+ * instead of hardcoding "unknown" for every recommendation.
+ *
+ * The "recommendation honesty" suite above still covers the true no-data
+ * case (mockModelsMeta defaults to `[]` in every beforeEach, so those cases
+ * are unaffected by this work). These cases mock AA scores in explicitly and
+ * assert the benchmark_* tiers this issue's ACs require.
+ */
+describe("quality.status grounded in the AA Index (ENG-1563)", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBillingQuery.mockResolvedValue([]);
+    soloAccount();
+    mockPolicy.mockResolvedValue(policyFor());
+    mockQuery.mockResolvedValue(opusLedger());
+    mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+  });
+
+  /** A minimal SupportedModelInfo-shaped row — only the fields the resolver reads. */
+  const scored = (id: string, qualityScore: number) => ({
+    id,
+    name: id,
+    tier: "medium" as const,
+    description: "",
+    provider: "anthropic" as const,
+    qualityScore,
+    qualityScoreSource: "Artificial Analysis Intelligence Index v4.1.1",
+  });
+
+  /** Pins the catalog to exactly one candidate so top-level != alternative ambiguity can't leak into a threshold assertion. */
+  const singleCandidatePolicy = (toModel: string) =>
+    policyFor({ policy: { ...policyFor().policy, optimizedModelIds: [toModel] } });
+
+  it("AC1: quality.status is never 'unknown' when BOTH models have an AA qualityScore", async () => {
+    mockModelsMeta.mockResolvedValue([scored(OPUS, 80), scored(HAIKU, 40)]);
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const rec = recommendations.find((r) => r.toModel === HAIKU)!;
+
+    expect(rec.quality.status).not.toBe("unknown");
+    expect(["benchmark_comparable", "benchmark_lower"]).toContain(rec.quality.status);
+    expect(rec.quality.source).toBe("artificial_analysis");
+  });
+
+  it("AC2: benchmark_comparable copy names the source and disclaims task-specific verification", async () => {
+    mockModelsMeta.mockResolvedValue([scored(OPUS, 80), scored(HAIKU, 78)]); // delta 2 -> comparable
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const rec = recommendations.find((r) => r.toModel === HAIKU)!;
+
+    expect(rec.quality.status).toBe("benchmark_comparable");
+    expect(rec.quality.reason).toMatch(/independent benchmark/i);
+    expect(rec.quality.reason).toMatch(/not.*(tested|verified).*(your|specific) work/i);
+    // The hard rule (ENG-1200): never a claim that reads as tested-on-your-work
+    // or equivalent quality.
+    expect(rec.quality.reason.toLowerCase()).not.toMatch(/equivalent|tested on your work/);
+  });
+
+  it("AC2: benchmark_lower copy names the source, says lower, and disclaims task-specific verification", async () => {
+    mockModelsMeta.mockResolvedValue([scored(OPUS, 80), scored(HAIKU, 40)]); // delta 40 -> lower
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const rec = recommendations.find((r) => r.toModel === HAIKU)!;
+
+    expect(rec.quality.status).toBe("benchmark_lower");
+    expect(rec.quality.reason).toMatch(/independent benchmark/i);
+    expect(rec.quality.reason).toMatch(/lower/i);
+    expect(rec.quality.reason).toMatch(/not.*(tested|verified).*(your|specific) work/i);
+    expect(rec.quality.reason.toLowerCase()).not.toMatch(/equivalent|tested on your work/);
+  });
+
+  it("AC3: 'unknown' (source: none) still renders when the TARGET model has no AA score", async () => {
+    mockModelsMeta.mockResolvedValue([scored(OPUS, 80)]); // HAIKU unscored
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const rec = recommendations.find((r) => r.toModel === HAIKU)!;
+
+    expect(rec.quality.status).toBe("unknown");
+    expect(rec.quality.source).toBe("none");
+  });
+
+  it("AC3: 'unknown' (source: none) still renders when the SOURCE model has no AA score", async () => {
+    mockModelsMeta.mockResolvedValue([scored(HAIKU, 40)]); // OPUS (fromModel) unscored
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const rec = recommendations.find((r) => r.toModel === HAIKU)!;
+
+    expect(rec.quality.status).toBe("unknown");
+    expect(rec.quality.source).toBe("none");
+  });
+
+  it("AC3: 'unknown' when NEITHER side has a score (the pre-ENG-1563 default)", async () => {
+    mockModelsMeta.mockResolvedValue([]);
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(recommendations.length).toBeGreaterThan(0);
+    for (const r of recommendations) {
+      expect(r.quality.status).toBe("unknown");
+      expect(r.quality.source).toBe("none");
+    }
+  });
+
+  it("AC4: never blends an AA-derived value and a task-eval value into one field", async () => {
+    mockModelsMeta.mockResolvedValue([scored(OPUS, 80), scored(SONNET, 78), scored(HAIKU, 40)]);
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(recommendations.length).toBeGreaterThan(0);
+    for (const r of recommendations) {
+      // Exactly the three provenance fields — no numeric score smuggled onto
+      // `quality` that a future task-eval tier could later be averaged into.
+      expect(Object.keys(r.quality).sort()).toEqual(["reason", "source", "status"]);
+      // Alternatives never carry their own quality either — nothing to blend there.
+      for (const alt of r.alternatives) {
+        expect(alt).not.toHaveProperty("quality");
+      }
+    }
+  });
+
+  it("AC5: task_verified / source:task_eval are never emitted by this code path", async () => {
+    // Exercise all three branches (comparable, lower, unknown) in one sweep so
+    // no branch can sneak the reserved slot in.
+    mockModelsMeta.mockResolvedValue([scored(OPUS, 80), scored(SONNET, 78)]); // HAIKU unscored
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+
+    expect(recommendations.length).toBeGreaterThan(0);
+    for (const r of recommendations) {
+      expect(r.quality.status).not.toBe("task_verified");
+      expect(r.quality.source).not.toBe("task_eval");
+    }
+  });
+
+  it("threshold: a delta of exactly BENCHMARK_COMPARABLE_MAX_DELTA is still comparable", async () => {
+    mockPolicy.mockResolvedValue(singleCandidatePolicy(HAIKU));
+    mockModelsMeta.mockResolvedValue([
+      scored(OPUS, 80),
+      scored(HAIKU, 80 - BENCHMARK_COMPARABLE_MAX_DELTA),
+    ]);
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(recommendations[0].quality.status).toBe("benchmark_comparable");
+  });
+
+  it("threshold: one point past BENCHMARK_COMPARABLE_MAX_DELTA flips to lower", async () => {
+    mockPolicy.mockResolvedValue(singleCandidatePolicy(HAIKU));
+    mockModelsMeta.mockResolvedValue([
+      scored(OPUS, 80),
+      scored(HAIKU, 80 - BENCHMARK_COMPARABLE_MAX_DELTA - 1),
+    ]);
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(recommendations[0].quality.status).toBe("benchmark_lower");
+  });
+
+  it("a target rated HIGHER than the source is comparable, never penalised as 'lower'", async () => {
+    mockPolicy.mockResolvedValue(singleCandidatePolicy(HAIKU));
+    mockModelsMeta.mockResolvedValue([scored(OPUS, 40), scored(HAIKU, 80)]);
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(recommendations[0].quality.status).toBe("benchmark_comparable");
+  });
+
+  it("keeps the benchmark quality fields at the customer boundary, source included", async () => {
+    mockModelsMeta.mockResolvedValue([scored(OPUS, 80), scored(HAIKU, 40)]);
+
+    const customer = toCustomerDrivers(await resolveUsageDrivers("u1", { today: "2026-08-11" }));
+    const r = customer.recommendations.find((x) => x.toModel === HAIKU)!;
+    expect(r.quality.status).toBe("benchmark_lower");
+    expect(r.quality.source).toBe("artificial_analysis");
+  });
+});
+
 describe("resolveUsageDrivers", () => {
   it("caps recommendation confidence when the ledger cannot account for the counter", async () => {
     // Greptile, PR #2407: the driver resolver "consumes that incomplete ledger
@@ -391,6 +571,9 @@ describe("resolveUsageDrivers", () => {
     mockPolicy.mockResolvedValue(policyFor());
     mockQuery.mockResolvedValue(opusLedger());
     mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+    // Default: no AA quality data known, so existing cases keep exercising the
+    // pre-ENG-1563 "unknown" path unless a case explicitly overrides this.
+    mockModelsMeta.mockResolvedValue([]);
   });
 
   it("reads the ledger for the billing subject over the current cycle", async () => {
@@ -537,6 +720,7 @@ describe("resolveUsageDrivers", () => {
 
   it("drops a catalog model the account cannot actually invoke (AC5 'invocable')", async () => {
     mockModels.mockResolvedValue([OPUS, SONNET]); // HAIKU not available to this account
+    mockModelsMeta.mockResolvedValue([]);
     const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
     expect(recommendations.map((r) => r.toModel)).not.toContain(HAIKU);
     expect(recommendations.map((r) => r.toModel)).toContain(SONNET);
@@ -664,6 +848,7 @@ describe("resolveUsageDrivers", () => {
     // RECENT ones, which is exactly what trailing-seven exists to notice.
     const FLASH = "gemini-3.1-flash-lite";
     mockModels.mockResolvedValue([OPUS, FLASH]);
+    mockModelsMeta.mockResolvedValue([]);
     mockPolicy.mockResolvedValue(policyFor({
       policy: { ...policyFor().policy, optimizedModelIds: [FLASH], optimizedDefaultModel: FLASH },
     }));
@@ -736,6 +921,9 @@ describe("toCustomerDrivers — AC4 exposure boundary", () => {
     mockPolicy.mockResolvedValue(policyFor());
     mockQuery.mockResolvedValue(opusLedger());
     mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+    // Default: no AA quality data known, so existing cases keep exercising the
+    // pre-ENG-1563 "unknown" path unless a case explicitly overrides this.
+    mockModelsMeta.mockResolvedValue([]);
   });
 
   it("strips every internal dollar amount but keeps shares and day counts", async () => {
@@ -765,6 +953,53 @@ describe("toCustomerDrivers — AC4 exposure boundary", () => {
     expect(customer.scheduleDrivers[0]).toHaveProperty("scheduleExists", false);
     // And it stays customer-safe: a boolean about existence, no economics.
     expect(JSON.stringify(customer.scheduleDrivers)).not.toMatch(/MicroUsd/i);
+  });
+
+  it("ENG-1519: vendor spend CROSSES the boundary, so removing it from `byModel` does not hide it", async () => {
+    // The half of ENG-1519 that was missing. Keeping `twitter:get_user_tweets`
+    // out of `byModel` was correct — it is not a model and must never be
+    // offered as one to switch — but this boundary then dropped it entirely,
+    // so the model list silently covered less than the cycle with no sentence
+    // saying why. A wrong row traded for a blind spot is not a fix.
+    mockQuery.mockResolvedValue([
+      ...opusLedger(),
+      {
+        userId: "billing-root",
+        sk: "2026-08-05#twitter:get_user_tweets#agent_task",
+        date: "2026-08-05",
+        model: "twitter:get_user_tweets",
+        feature: "agent_task",
+        costMicroUsd: 20 * USD,
+        callCount: 40,
+        provider: "twitter",
+        unit: "call",
+        billingUserId: "billing-root",
+      },
+    ]);
+
+    const customer = toCustomerDrivers(await resolveUsageDrivers("u1", { today: "2026-08-11" }));
+
+    expect(customer.drivers!.byVendor).not.toBeNull();
+    expect(customer.drivers!.byVendor!.map((d) => d.key)).toEqual(["twitter:get_user_tweets"]);
+    expect(customer.drivers!.byVendor![0].callCount).toBe(40);
+    // It is a vendor INSTEAD of a model, never both — double-counting the same
+    // spend across two lists would overstate the cycle.
+    expect(customer.drivers!.byModel.map((d) => d.key)).not.toContain("twitter:get_user_tweets");
+    // Same denominator as every other grouping, so the shares are comparable.
+    expect(customer.drivers!.byVendor![0].shareOfTotal).toBeCloseTo(20 / 70, 5);
+    // And it stays inside the AC4 contract: shares and counts, no dollars.
+    expect(JSON.stringify(customer.drivers!.byVendor)).not.toMatch(/MicroUsd/i);
+  });
+
+  it("reports `byVendor` as null — not an empty list — for a cycle that bought nothing per-unit", async () => {
+    // Absence stated rather than rendered as zero: an empty array would let the
+    // UI draw a "Tools & data" heading over nothing, asserting the customer
+    // used tools and spent nothing on them.
+    mockQuery.mockResolvedValue(opusLedger());
+
+    const customer = toCustomerDrivers(await resolveUsageDrivers("u1", { today: "2026-08-11" }));
+
+    expect(customer.drivers!.byVendor).toBeNull();
   });
 });
 
@@ -810,6 +1045,9 @@ describe("previewUsageRunway — combined, non-persisted what-if (ENG-1217 AC2/A
     soloAccount();
     mockPolicy.mockResolvedValue(policyFor());
     mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+    // Default: no AA quality data known, so existing cases keep exercising the
+    // pre-ENG-1563 "unknown" path unless a case explicitly overrides this.
+    mockModelsMeta.mockResolvedValue([]);
     mockQuery.mockResolvedValue(twoDriverLedger());
   });
 
@@ -886,5 +1124,201 @@ describe("previewUsageRunway — combined, non-persisted what-if (ENG-1217 AC2/A
   it("carries no internal dollars", async () => {
     const preview = await previewUsageRunway("u1", [{ fromModel: OPUS, toModel: HAIKU }], { today: "2026-08-11" });
     expect(JSON.stringify(preview)).not.toMatch(/MicroUsd/);
+  });
+});
+
+/**
+ * ENG-1533 — a switch is offered only where it can actually succeed.
+ *
+ * `usage-drivers` pools schedules across every org member, so this list
+ * routinely shows a caller a colleague's work. `llmModelChangeService` refuses
+ * a plain member's write on it (correctly — ENG-1528), which left the UI
+ * offering a Confirm button whose only possible outcome was an error.
+ *
+ * The row stays visible either way: the spend is real and was billed to this
+ * account, and hiding it would recreate the blind spot ENG-1440 closed. What
+ * `switchable` changes is whether an ACTION is offered on it.
+ */
+describe("ENG-1533 — `switchable` reflects this caller's real authority", () => {
+  const COLLEAGUE_SCHED = "sched-colleague";
+
+  const orgOf = (callerRole: string) => {
+    mockUser.mockImplementation(async (id: string) => {
+      if (id === "member-a") return { userId: "member-a", orgId: "org-1", orgRole: callerRole };
+      if (id === "colleague") return { userId: "colleague", orgId: "org-1", orgRole: "member" };
+      return { userId: "billing-root", orgId: "org-1", orgRole: "owner" };
+    });
+    mockOrg.mockResolvedValue({ orgId: "org-1", ownerUserId: "billing-root" });
+    mockMembers.mockResolvedValue([
+      { userId: "billing-root" },
+      { userId: "member-a" },
+      { userId: "colleague" },
+    ]);
+    mockSchedules.mockImplementation(async (id: string) =>
+      id === "colleague"
+        ? [{ scheduleId: COLLEAGUE_SCHED, scheduleName: "Colleague's daily scan", frequency: "daily" }]
+        : [],
+    );
+  };
+
+  /** One cycle whose only schedule-attributed spend belongs to `colleague`. */
+  const colleaguesSpend = () => {
+    mockQuery.mockResolvedValue([
+      ...opusLedger(),
+      {
+        userId: "billing-root",
+        sk: `2026-08-05#${OPUS}#agent_task:scheduled:${COLLEAGUE_SCHED}`,
+        date: "2026-08-05",
+        model: OPUS,
+        feature: `agent_task:scheduled:${COLLEAGUE_SCHED}`,
+        inputTokens: 500_000,
+        outputTokens: 100_000,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costMicroUsd: 20 * USD,
+        callCount: 8,
+        billingUserId: "billing-root",
+      },
+    ]);
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBillingQuery.mockResolvedValue([]);
+    mockPolicy.mockResolvedValue(policyFor());
+    mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+    // Default: no AA quality data known, so existing cases keep exercising the
+    // pre-ENG-1563 "unknown" path unless a case explicitly overrides this.
+    mockModelsMeta.mockResolvedValue([]);
+  });
+
+  it("refuses to offer a switch on a COLLEAGUE's schedule to a plain member", async () => {
+    // The defect. The write path 403s this exact caller on this exact schedule,
+    // so offering the button could only ever produce an error.
+    orgOf("member");
+    colleaguesSpend();
+
+    const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+    const row = scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED);
+
+    expect(row).toBeDefined();
+    expect(row!.switchable).toBe(false);
+  });
+
+  it("still SHOWS the row to that member — only the action is withheld", async () => {
+    // Hiding it would recreate the ENG-1440 blind spot: the spend is real and
+    // was billed to this account, so it must stay accounted for.
+    orgOf("member");
+    colleaguesSpend();
+
+    const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+    const row = scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED)!;
+
+    expect(row.title).toBe("Colleague's daily scan");
+    expect(row.shareOfTotal).toBeGreaterThan(0);
+    expect(row.callCount).toBe(8);
+  });
+
+  it("offers it to an org ADMIN, who genuinely can apply it", async () => {
+    // The other half of ENG-1528: `org:content:manage` is held by owner+admin,
+    // so for them the button works and withholding it would be a false refusal.
+    orgOf("admin");
+    colleaguesSpend();
+
+    const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+    expect(scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED)!.switchable).toBe(true);
+  });
+
+  it("offers it on the caller's OWN schedule, which needs no org role at all", async () => {
+    orgOf("member");
+    mockSchedules.mockImplementation(async (id: string) =>
+      id === "member-a"
+        ? [{ scheduleId: COLLEAGUE_SCHED, scheduleName: "My own scan", frequency: "daily" }]
+        : [],
+    );
+    colleaguesSpend();
+
+    const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+    expect(scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED)!.switchable).toBe(true);
+  });
+
+  it("answers BOTH rows independently in ONE payload — own switchable, colleague's not", async () => {
+    // The case AC1-AC4 actually describe: a plain member reading a list that
+    // mixes their own work with a colleague's.
+    //
+    // Every other case in this block puts exactly ONE owner in play, which
+    // cannot distinguish a per-row authority lookup from a collapsed one —
+    // with a single owner both produce the same answer. Mutation-verified:
+    // replacing the per-owner lookup with one collapsed value,
+    //
+    //   switchable: meta ? ([...authorityByOwner.values()][0] ?? false) : false
+    //
+    // passes all six other cases here and fails only this one. That is a
+    // realistic regression — it is what "look the answer up once" refactors
+    // into — and without both answers side by side nothing would catch it.
+    const MY_SCHED = "sched-mine";
+    orgOf("member");
+    mockSchedules.mockImplementation(async (id: string) => {
+      if (id === "member-a") {
+        return [{ scheduleId: MY_SCHED, scheduleName: "My own scan", frequency: "daily" }];
+      }
+      if (id === "colleague") {
+        return [{ scheduleId: COLLEAGUE_SCHED, scheduleName: "Colleague's daily scan", frequency: "daily" }];
+      }
+      return [];
+    });
+    const spendOn = (scheduleId: string) => ({
+      userId: "billing-root",
+      sk: `2026-08-05#${OPUS}#agent_task:scheduled:${scheduleId}`,
+      date: "2026-08-05",
+      model: OPUS,
+      feature: `agent_task:scheduled:${scheduleId}`,
+      inputTokens: 500_000,
+      outputTokens: 100_000,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costMicroUsd: 20 * USD,
+      callCount: 8,
+      billingUserId: "billing-root",
+    });
+    mockQuery.mockResolvedValue([...opusLedger(), spendOn(COLLEAGUE_SCHED), spendOn(MY_SCHED)]);
+
+    const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+    const mine = scheduleDrivers.find((d) => d.scheduleId === MY_SCHED);
+    const theirs = scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED);
+
+    // Both rows are present: the member sees all pooled spend either way.
+    expect(mine).toBeDefined();
+    expect(theirs).toBeDefined();
+
+    // And the two authority answers differ within that one response.
+    expect(mine!.switchable).toBe(true);
+    expect(theirs!.switchable).toBe(false);
+  });
+
+  it("marks a DELETED schedule unswitchable — no one can act on it, so no authority question arises", async () => {
+    orgOf("admin");
+    mockSchedules.mockResolvedValue([]);
+    colleaguesSpend();
+
+    const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+    const row = scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED)!;
+
+    expect(row.scheduleExists).toBe(false);
+    expect(row.switchable).toBe(false);
+  });
+
+  it("CROSSES the customer boundary — without it the UI cannot tell the two rows apart", async () => {
+    // The ENG-1438 lesson applied: a flag the UI depends on that never reaches
+    // it is a fix that ships inert.
+    orgOf("member");
+    colleaguesSpend();
+
+    const customer = toCustomerDrivers(await resolveUsageDrivers("member-a", { today: "2026-08-11" }));
+    const row = customer.scheduleDrivers.find((d) => d.scheduleId === COLLEAGUE_SCHED)!;
+
+    expect(row).toHaveProperty("switchable", false);
+    // And it stays customer-safe: authority, no economics.
+    expect(JSON.stringify(customer.scheduleDrivers)).not.toMatch(/MicroUsd/i);
   });
 });

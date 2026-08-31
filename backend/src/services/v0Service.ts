@@ -1989,6 +1989,60 @@ async function addPageToExistingRepo(
           }
         }
 
+        // ENG-1524. Sibling of the deployLandingPage check, and it has to exist in BOTH
+        // places for the same reason the pixel check does: a sub-page has its own form
+        // component, and `subPageGoogleAds` above inherits the site's conversion pair, so
+        // the generated handler is expected to fire it. Adding this on one branch only is
+        // how the original gap happened.
+        //
+        // Post-remap file set (ENG-482), like the pixel check: previewFiles is v0's raw
+        // zip, and its scaffold layout.tsx can carry a gtag conversion that never ships —
+        // which would satisfy the inline-pattern arm against code the site never sees.
+        if (subPageGoogleAds) {
+          const adsCheck = validateGoogleAdsConversion(remapFilesForSubPage(previewFiles, slug, name));
+          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call missing for /${slug} (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
+
+            await guardedV0CorrectionMessage({
+              userId,
+              scopeId: existingPage.siteId ?? existingPage.id,
+              chatId: chatId!,
+              attempt: validationAttempt,
+              send: () => withRetry(
+                () => v0.chats.sendMessage({
+                  chatId: chatId!,
+                  message:
+                    "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
+                    "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
+                    "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
+                    "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
+                    "shared root layout. " +
+                    `Issue: ${adsCheck.reason}`,
+                }),
+                "v0 correction message (google ads conversion, sub-page)",
+                undefined, undefined, undefined,
+                { retryOnTimeout: false }
+              ),
+            });
+
+            versionId = await waitForCompletedV0Version(
+              v0,
+              chatId!,
+              "v0 correction (google ads conversion, sub-page)",
+              {
+                heartbeat: () => touchLandingPageRecord(id),
+                deadline: buildDeadline,
+                afterVersionId: versionId,
+              }
+            );
+
+            continue;
+          }
+          if (!adsCheck.ok) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call still missing for /${slug} after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
+          }
+        }
+
         if (leadListId && bridgeOutUrl) {
           // Same post-remap file set rationale as the pixel check above (ENG-482).
           const bridgeCheck = validateBridgeOutRedirect(remapFilesForSubPage(previewFiles, slug, name), bridgeOutUrl);
@@ -3081,6 +3135,58 @@ export async function deployLandingPage(
           }
         }
 
+        // ENG-1524. Same contract as the pixel check above, for the platform that had none.
+        // Gated on the conversion PAIR, not just the id: without a label the helper cannot
+        // fire anyway (ENG-1328), so demanding the call would be asking v0 to write
+        // something that does nothing.
+        if (record.googleAdsConversionId && record.googleAdsConversionLabel) {
+          const adsCheck = validateGoogleAdsConversion(previewFiles);
+          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call missing (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
+
+            await guardedV0CorrectionMessage({
+              userId,
+              scopeId: record.siteId ?? record.id,
+              chatId: record.v0ChatId!,
+              attempt: validationAttempt,
+              send: () => withRetry(
+                () => v0.chats.sendMessage({
+                  chatId: record.v0ChatId!,
+                  message:
+                    "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
+                    "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
+                    "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
+                    "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
+                    "root layout. " +
+                    `Issue: ${adsCheck.reason}`,
+                }),
+                "v0 correction message (google ads conversion)",
+                undefined, undefined, undefined,
+                { retryOnTimeout: false }
+              ),
+            });
+
+            versionId = await waitForCompletedV0Version(
+              v0,
+              record.v0ChatId!,
+              "v0 correction (google ads conversion)",
+              {
+                heartbeat: () => touchLandingPageRecord(id),
+                deadline: buildDeadline,
+                afterVersionId: versionId,
+              }
+            );
+
+            continue;
+          }
+          if (!adsCheck.ok) {
+            // Never fails generation, same as the pixel path: a lander that captures leads
+            // is worth more than one that refuses to exist. But this is the line that turns
+            // an invisible miss into a visible one.
+            console.warn(`[V0 SERVICE] Google Ads conversion call still missing after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
+          }
+        }
+
         if (record.leadListId && record.bridgeOutUrl) {
           const bridgeCheck = validateBridgeOutRedirect(previewFiles, record.bridgeOutUrl);
           if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
@@ -3183,7 +3289,24 @@ export async function deployLandingPage(
     // NB: `slug` above names the REPO. The page PATH is the record's own slug — the same
     // convention routes/domains.ts uses to build its domain map (`p.slug ? "/"+p.slug : "/"`).
     const pagePath = record.slug ? `/${record.slug}` : "/";
-    const listByPath: Record<string, string> = record.leadListId ? { [pagePath]: record.leadListId } : {};
+    // ENG-1543: `record` was snapshotted at this function's ENTRY (top of
+    // deployLandingPage), but everything above — the v0 version poll, download,
+    // validation, and correction retries — can run for up to V0_GENERATION_BUDGET_MS
+    // (20 min). A lead list attached via PATCH /generated/:id/lead-list during that
+    // window writes leadListId to DynamoDB immediately, but syncLeadCaptureForPage
+    // no-ops on it (page.githubRepoUrl isn't set yet, so it assumes generation "has it
+    // covered" — see that function's own comment). If this push then baked the STALE
+    // snapshot's leadListId into LIST_BY_PATH, that assumption would be false: the DB
+    // shows the newly-attached list, the deployed capture route still carries the old
+    // one (or none), and nothing ever re-syncs afterward — the page 422s "no lead list
+    // configured" forever despite a correct DB record. Re-read the CURRENT value right
+    // before baking it in so a concurrent attach always wins over a stale snapshot.
+    // Falls back to the entry snapshot only if the re-read itself comes back empty
+    // (e.g. the page was deleted mid-deploy) — never regresses to "no list" when the
+    // snapshot already had one.
+    const currentLeadListId =
+      (await getLandingPage(id, userId, false, /* consistentRead */ true))?.leadListId ?? record.leadListId;
+    const listByPath: Record<string, string> = currentLeadListId ? { [pagePath]: currentLeadListId } : {};
 
     // Resolve the Meta pixel to use, if one wasn't already manually set on this
     // record. A Meta API hiccup (or an unconnected/ambiguous account) must never fail
@@ -4061,6 +4184,62 @@ export function validatePixelLeadEvent(files: Array<{ path: string; content: Buf
 }
 
 /**
+ * ENG-1524. Does the generated form actually ask for the Google Ads conversion?
+ *
+ * The base gtag is injected deterministically into layout.tsx, so RULE 7.5 sees an `AW-`
+ * id and passes. What no check covered is whether anything ever FIRES a conversion: v0
+ * authors the submit handler, and `fireLeadTracking` takes `googleAds` as an argument it
+ * can simply omit.
+ *
+ * The failure that motivated this is silent in every indicator: v0 emits
+ * `fireLeadTracking({ email, eventId, pixelId })`, validatePixelLeadEvent passes because
+ * pixelId IS there, generation succeeds, googleAdsTrackingInstalled is set true, the
+ * pre-flight gate passes cleanly with no warning because the page genuinely carries the
+ * tag — and the campaign reports zero conversions for as long as it runs.
+ *
+ * v0Service's own comment argued no net was needed here because "v0 does not author the
+ * conversion call, it only passes two values into the platform-owned helper". It does not
+ * author the gtag call; it does author whether the helper is called and with which
+ * arguments, which is the part that breaks.
+ *
+ * Deliberately mirrors validatePixelLeadEvent rather than being stricter: presence of the
+ * argument, not placement. Whether the call sits on the success branch is a separate
+ * question this cannot answer from source (see ENG-1527).
+ */
+export function validateGoogleAdsConversion(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
+  const tsxSource = files
+    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    .map((f) => f.content.toString("utf-8"))
+    .join("\n");
+
+  // Two accepted shapes, checked with OR for the same reason the pixel validator does it:
+  // an existing page must keep validating true under whichever pattern it shipped with.
+  //   - the helper carrying the googleAds argument (what buildBrandEnrichedPrompt asks for)
+  //   - a hand-authored gtag conversion with a send_to (older pages, and pages the coding
+  //     agent wrote before the helper existed)
+  // Bounded [\s\S] window rather than the pixel validator's `[^}]*`: the argument the
+  // prompt asks for is `googleAds: { conversionId, conversionLabel }`, a NESTED object, so
+  // `[^}]*` stops at the first inner brace the moment any other object precedes it. The
+  // window also accepts property shorthand (`{ ..., googleAds }`), which is a legitimate
+  // shape if v0 hoists the pair to a const, and is bounded so a `googleAds` mention
+  // elsewhere in the file cannot satisfy the check.
+  const hasHelperPattern = /fireLeadTracking\([\s\S]{0,400}?\bgoogleAds\b/.test(tsxSource);
+  const hasInlinePattern = /gtag\(\s*['"]event['"]\s*,\s*['"]conversion['"]/.test(tsxSource);
+
+  if (!hasHelperPattern && !hasInlinePattern) {
+    return {
+      ok: false,
+      reason:
+        "No Google Ads conversion call found in the generated form component — " +
+        "expected fireLeadTracking({ googleAds }) (or a gtag('event','conversion') call). " +
+        "The base tag is installed, so the page will look tracked and report nothing.",
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
  * Check whether v0's generated form component actually redirects to the configured
  * bridge-out URL with the submitted email forwarded, per the prompt instruction added to
  * buildBrandEnrichedPrompt. Same "verify not guarantee" contract as validatePixelLeadEvent —
@@ -4298,6 +4477,9 @@ import type { NextRequest } from "next/server";
 import { DOMAIN_MAP } from "./domainMap";
 
 const COOKIE = "aw_first_touch";
+// ENG-1499. Last touch is a SEPARATE cookie, overwritten on every attributed
+// visit, where first touch is written once and never again.
+const LAST_COOKIE = "aw_last_touch";
 const MAX_AGE = 60 * 60 * 24 * 90; // 90 days
 
 export function middleware(req: NextRequest) {
@@ -4339,11 +4521,16 @@ export function middleware(req: NextRequest) {
   const PAGE_COOKIE = "aw_page";
   res.cookies.set(PAGE_COOKIE, targetPath || req.nextUrl.pathname, { path: "/", sameSite: "lax" });
 
-  // 3. First-touch attribution capture, on WHICHEVER response we are returning.
+  // 3. Attribution capture, on WHICHEVER response we are returning.
   //    (Returning the rewrite early here would silently kill attribution on every
   //    page that has a custom domain — which is most of the ones that matter.)
-  if (req.cookies.get(COOKIE)) return res;              // first-touch: never overwrite
-
+  //
+  //    ENG-1499: this used to return early when the first-touch cookie existed,
+  //    which meant a returning visitor's later campaign touch was never recorded
+  //    anywhere. lastTouch could therefore never differ from firstTouch for a
+  //    lander-captured lead, so last-touch reporting silently showed first-touch
+  //    numbers. The parse now happens BEFORE that decision, and the two cookies
+  //    are written under different rules.
   const sp = req.nextUrl.searchParams;
   const utm: Record<string, string> = {};
   for (const k of ["source", "medium", "campaign", "content", "term"]) {
@@ -4362,7 +4549,33 @@ export function middleware(req: NextRequest) {
   if (referrer && !referrer.includes(req.nextUrl.host)) touch.referrer = referrer;
   if (ref) touch.ref = ref;
 
-  res.cookies.set(COOKIE, JSON.stringify(touch), { maxAge: MAX_AGE, path: "/", sameSite: "lax" });
+  const serialized = JSON.stringify(touch);
+
+  // First touch: written once, never overwritten — the acquiring click is immutable.
+  // Written for ANY visit, tagged or not: direct traffic is a real acquisition
+  // channel, and firstTouch is deliberately not a proxy for "attributed" (ENG-308,
+  // and see LeadAttributionFields in utils/leadSchema.ts).
+  if (!req.cookies.get(COOKIE)) {
+    res.cookies.set(COOKIE, serialized, { maxAge: MAX_AGE, path: "/", sameSite: "lax" });
+  }
+
+  // Last touch: the most recent ATTRIBUTED visit, and only those. The gate is the
+  // difference between the two cookies, not a general filter — applying it to first
+  // touch as well would break the untagged-visit contract above.
+  //
+  // An ordinary internal navigation carries no utm, no click id, no ref and no
+  // external referrer. Letting one count as a touch would overwrite a real campaign
+  // last-touch with an empty one every time the visitor clicked through to a second
+  // page — turning a merely-useless field into an actively wrong one, which is worse
+  // than the bug this fixes.
+  const isAttributed =
+    Object.keys(utm).length > 0 ||
+    Object.keys(clickIds).length > 0 ||
+    Boolean(ref) ||
+    Boolean(touch.referrer);
+  if (isAttributed) {
+    res.cookies.set(LAST_COOKIE, serialized, { maxAge: MAX_AGE, path: "/", sameSite: "lax" });
+  }
   return res;
 }
 
@@ -4473,6 +4686,14 @@ export async function POST(req: Request) {
     const raw = (await cookies()).get("aw_first_touch")?.value;
     if (raw) { try { attribution = JSON.parse(raw); } catch {} }
 
+    // ENG-1499. Forwarded separately from the attribution field above (which is
+    // first touch) so the backend can tell "the click that acquired them" from
+    // "the click they came back on". Absent for a single-visit lead, and the
+    // backend falls back to first touch in that case rather than storing nothing.
+    let lastTouch: unknown;
+    const rawLast = (await cookies()).get("aw_last_touch")?.value;
+    if (rawLast) { try { lastTouch = JSON.parse(rawLast); } catch {} }
+
     // Meta's own first-party click-id cookies (set by the base Pixel snippet, already
     // platform-injected). Forwarded deterministically here — no v0-authored client code
     // needs to read or forward these itself.
@@ -4513,6 +4734,7 @@ export async function POST(req: Request) {
         source: "landing-page",
         capturedAtMs,
         ...(attribution ? { attribution } : {}),
+        ...(lastTouch ? { lastTouch } : {}),
         ...(PIXEL_ID ? { pixelId: PIXEL_ID, metaAccountId: META_ACCOUNT_ID } : {}),
         ...(fbp ? { fbp } : {}),
         ...(fbc ? { fbc } : {}),
@@ -5652,16 +5874,25 @@ async function finishIteration(
 
 /**
  * Get a single landing page by ID (scoped to user). Excludes archived unless requested.
+ *
+ * `consistentRead` defaults to false (DynamoDB eventually-consistent, half the RCU cost)
+ * — the right default for ordinary reads. Pass true for a caller that MUST observe a
+ * write that may have landed microseconds earlier, e.g. deployLandingPage's ENG-1543
+ * re-read of leadListId right before it's baked into the pushed capture route: an
+ * eventually-consistent read there could still return the pre-PATCH value and silently
+ * reintroduce the exact race this function call exists to close.
  */
 export async function getLandingPage(
   id: string,
   userId: string,
-  includeArchived = false
+  includeArchived = false,
+  consistentRead = false
 ): Promise<GeneratedLandingPage | null> {
   const result = await dynamodb
     .get({
       TableName: TABLE_NAME,
       Key: { id },
+      ConsistentRead: consistentRead,
     })
     .promise();
 
@@ -6086,10 +6317,26 @@ export async function updateLandingPageGoogleAds(
     const sets = ["googleAdsConversionId = :cid", "updatedAt = :now"];
     const values: Record<string, any> = { ":cid": conversionId, ":now": new Date().toISOString() };
     const removes: string[] = [];
-    if (conversionLabel) { sets.push("googleAdsConversionLabel = :lbl"); values[":lbl"] = conversionLabel; }
-    else removes.push("googleAdsConversionLabel");
-    if (customerId) { sets.push("googleAdsCustomerId = :cust"); values[":cust"] = customerId; }
-    else removes.push("googleAdsCustomerId");
+    // ENG-1525. `undefined` means the caller did not mention the field; `""` means they
+    // asked to clear it. Those are different requests and used to produce the same write.
+    //
+    // Re-posting just the conversion id — the natural "re-apply my tag" call, and what the
+    // route explicitly permits with only a warning — took the falsy branch and REMOVEd the
+    // label and customer id from this record and every sibling. The base tag survived, so
+    // RULE 7.5 still passed and the page still looked configured, while buildTrackingHelper
+    // (which fires only when id AND label are both present) went silent. A conversion pair
+    // destroyed behind a 200.
+    //
+    // The hazard was already known one branch away: the route rejects a NON-STRING label
+    // with a 400 because "a malformed request would strip a working conversion pair and
+    // leave an id that attributes nothing". An omitted label did exactly that, unguarded.
+    if (conversionLabel === undefined) { /* not mentioned — leave whatever is stored */ }
+    else if (conversionLabel === "") { removes.push("googleAdsConversionLabel"); }
+    else { sets.push("googleAdsConversionLabel = :lbl"); values[":lbl"] = conversionLabel; }
+
+    if (customerId === undefined) { /* not mentioned — leave whatever is stored */ }
+    else if (customerId === "") { removes.push("googleAdsCustomerId"); }
+    else { sets.push("googleAdsCustomerId = :cust"); values[":cust"] = customerId; }
     await dynamodb
       .update({
         TableName: TABLE_NAME,
@@ -6618,7 +6865,12 @@ async function readRepoFile(
  */
 export async function syncMiddlewareAndTrackingHelper(
   repoFullName: string,
-): Promise<{ committed: boolean; reason?: string; pushedCommitSha?: string; pushTimestampMs?: number }> {
+): Promise<{
+  committed: boolean;
+  reason?: string;
+  pushedCommitSha?: string;
+  pushTimestampMs?: number;
+}> {
   try {
     const { token: ghToken } = await getGitHubOrgToken();
     const ghHeaders = {
@@ -6763,6 +7015,33 @@ export function findOrphanedCaptureEntries(
   return orphans;
 }
 
+/**
+ * Returned when a caller that may not INSTALL a capture layer targets a repo that has none.
+ * Distinct from every other skip reason because it is not transient: retrying, redeploying
+ * or waiting changes nothing, so the message shown to a user must not promise otherwise.
+ */
+export const NO_CAPTURE_LAYER = "no-capture-layer";
+
+/**
+ * Present in every middleware `buildLandingPageMiddleware` emits — the platform's own
+ * first-touch cookie name. Used to prove a deployed `middleware.ts` is OURS before we
+ * overwrite it, so a bespoke repo's unrelated middleware is never clobbered.
+ */
+export const PLATFORM_MIDDLEWARE_MARKER = "aw_first_touch";
+
+/**
+ * Repos the platform generated and therefore owns the capture layer of. Platform repos are
+ * created as `lp-<slug>-<id>`; bespoke and v0-era customer sites are not.
+ *
+ * ⚠ A NAMING CONVENTION, NOT A CONTRACT — deliberately used only to decide whether the
+ * lead-list path may install into a repo that has no capture layer yet (the pre-ENG-309
+ * repair case). A repo misjudged here gets a WARNING instead of a silent install, which is
+ * the safe direction. Do not reuse this to decide anything that fails the other way.
+ */
+export function isPlatformGeneratedRepo(repoFullName: string): boolean {
+  return (repoFullName.split("/").pop() ?? "").startsWith("lp-");
+}
+
 export async function syncLeadCaptureFilesToRepo(
   repoFullName: string,
   /**
@@ -6778,7 +7057,21 @@ export async function syncLeadCaptureFilesToRepo(
   /** Threaded through to buildCaptureRoute — see its own doc comment. */
   pixelId?: string,
   metaAccountId?: string,
-): Promise<{ committed: boolean; reason?: string; pushedCommitSha?: string; pushTimestampMs?: number }> {
+): Promise<{
+  committed: boolean;
+  reason?: string;
+  pushedCommitSha?: string;
+  pushTimestampMs?: number;
+  /**
+   * True when app/api/capture/route.ts was NOT written because its deployed LIST_BY_PATH
+   * could not be parsed. Set on BOTH outcomes it can occur with — a commit that excluded the
+   * route, and an "up-to-date" no-op where the other files already matched. Neither
+   * `committed: true` nor `reason: "up-to-date"` therefore means the route carries the
+   * caller's requested pixel; a caller configuring tracking must check this flag or it
+   * reports success over a route it never wrote.
+   */
+  captureRouteSkipped?: boolean;
+}> {
   const MAX_ATTEMPTS = 2;
   let lastErr: any;
 
@@ -6801,6 +7094,48 @@ export async function syncLeadCaptureFilesToRepo(
         readRepoFile(repoFullName, "domainMap.ts", ghHeaders),
         readRepoFile(repoFullName, "lib/agentweb-track.ts", ghHeaders),
       ]);
+
+      // ⚠ NEVER INSTALL A CAPTURE LAYER INTO A REPO THE PLATFORM DOES NOT OWN.
+      // `middleware.ts` and `lib/agentweb-track.ts` below are written UNCONDITIONALLY, and
+      // `domainMap.ts` whenever absent — so on a repo without them this does not "sync", it
+      // INSTALLS, straight to `main` with no PR and an immediate redeploy.
+      //
+      // Four production repos are in that state and are NOT platform-generated:
+      // agentweb-landing-page (hireemma.ai, AgentWeb's own marketing site),
+      // v0-xc-ures-landing-page, v0-waldium-lander and v0-haven-ai-landing-page — the last
+      // two managed clients — 34 landing-page records between them. A ROOT middleware.ts on a
+      // Next.js app that has none changes request handling site-wide, and
+      // `app/api/capture/route.ts` collides with hireemma's own
+      // `app/(frontend)/api/capture/route.ts` — a collision that already broke that site once
+      // ("fix: fully comment out app/api/capture to resolve conflicting route").
+      //
+      // ⚠ OWNERSHIP IS A CAPTURE-SPECIFIC MARKER, NOT "a middleware.ts exists". A bespoke repo
+      // may legitimately have its OWN root middleware for auth, i18n or redirects, and keying
+      // on mere existence would let this OVERWRITE it — worse than the bug this guard exists
+      // for, because it destroys code rather than adding it. `lib/agentweb-track.ts` is a
+      // platform-only path, and the generated middleware always carries the platform's own
+      // `aw_first_touch` cookie name; requiring BOTH means we only ever rewrite files we wrote.
+      // (A capture-route marker would NOT do: v0-xc-ures-landing-page has an
+      // `app/api/capture/route.ts` of its own and would wrongly read as ours.)
+      const hasCaptureLayer =
+        existingTrackingHelper !== null &&
+        existingMiddleware !== null &&
+        existingMiddleware.includes(PLATFORM_MIDDLEWARE_MARKER);
+
+      // The floor: creating the layer is only ever allowed on a repo the platform generated.
+      // Deliberately enforced HERE rather than per-caller — all three callers act on repos
+      // that already exist (a fresh generation writes these files at repo-creation time and
+      // never reaches this function), so no caller has a legitimate reason to install into a
+      // repo we do not own, and none can opt out of this.
+      if (!hasCaptureLayer && !isPlatformGeneratedRepo(repoFullName)) {
+        console.warn(
+          `[V0 SERVICE] ⚠ ${repoFullName} carries no platform capture layer and is not a ` +
+            `platform-generated repo — skipping the sync entirely. Committing would CREATE or ` +
+            `OVERWRITE middleware.ts / app/api/capture/route.ts / lib/agentweb-track.ts on a ` +
+            `repo the platform does not own.`
+        );
+        return { committed: false, reason: NO_CAPTURE_LAYER };
+      }
 
       // Only write domainMap.ts if the repo has none. If it exists it may carry a real
       // subdomain map — clobbering it with {} would break the customer's routing.
@@ -6858,7 +7193,14 @@ export async function syncLeadCaptureFilesToRepo(
         console.log(
           `[V0 SERVICE] Lead-capture files already up to date in ${repoFullName} — skipping commit (no redeploy)`
         );
-        return { committed: false, reason: "up-to-date" };
+        // ⚠ "up-to-date" here can coexist with an UNREADABLE capture route: the other files
+        // matched and the route was never going to be written either way. Without the flag a
+        // caller configuring tracking sees a clean no-op over a route we did not touch.
+        return {
+          committed: false,
+          reason: "up-to-date",
+          ...(captureRouteUnreadable ? { captureRouteSkipped: true } : {}),
+        };
       }
 
       // ⚠ FAIL CLOSED ON A HAND-EDITED CAPTURE ROUTE. If the deployed file claims a page path
@@ -6908,7 +7250,12 @@ export async function syncLeadCaptureFilesToRepo(
               : "NO page of this site has a lead list — its forms will fail loudly"
           }`
         );
-        return { committed: true, pushedCommitSha, pushTimestampMs };
+        return {
+          committed: true,
+          pushedCommitSha,
+          pushTimestampMs,
+          ...(captureRouteUnreadable ? { captureRouteSkipped: true } : {}),
+        };
       } catch (err: any) {
         lastErr = err;
         const { retryable, reason } = isRetryableGithubPushError(err);
