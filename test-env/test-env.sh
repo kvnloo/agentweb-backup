@@ -257,6 +257,15 @@ EOF
 
   log "Launching environment: ${CYAN}$name${NC}"
 
+  # Reset per-invocation so a stale value from an earlier call in the same
+  # shell can never make cleanup_failed_launch touch someone else's resources.
+  INSTANCE_ID=""
+  SG_ID=""
+  LAUNCH_STATE_FILE="$(state_file_for "$name")"
+  # Installed before the security group exists so a failure creating the SG
+  # itself (or anything after) is still cleaned up, not just SSH timeouts.
+  trap 'cleanup_failed_launch' ERR
+
   # Detect developer's public IP
   log "Detecting your public IP..."
   MY_IP=$(curl -s --max-time 5 https://checkip.amazonaws.com | tr -d '[:space:]')
@@ -375,8 +384,6 @@ EOF
 
   log "Public IP: $PUBLIC_IP"
   save_state "$name"
-  LAUNCH_STATE_FILE="$(state_file_for "$name")"
-  trap 'cleanup_failed_launch' ERR
 
   # Wait for SSH
   log "Waiting for SSH to become available..."
