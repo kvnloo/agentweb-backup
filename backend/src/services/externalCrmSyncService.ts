@@ -1387,7 +1387,10 @@ export class ExternalCrmSyncService {
     return { category: 'connection', detail: fallback };
   }
 
-  private async updateSyncTimestamp(
+  // Public: also called from routes/webhooks.ts after a webhook-driven
+  // auto-pull applies successfully, so the CRM Sync dialog's "last pulled"
+  // timestamp reflects webhook activity, not only a manual Pull click.
+  async updateSyncTimestamp(
     config: ExternalCrmSyncConfig,
     direction: 'push' | 'pull',
     success: boolean

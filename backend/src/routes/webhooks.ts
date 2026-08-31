@@ -1161,14 +1161,27 @@ export async function processAttioWebhookJob(payload: AttioJobPayload): Promise<
     const syncConfig = await externalCrmSyncService.getConfig(payload.userId, list.listId, 'attio');
     if (!syncConfig || syncConfig.webhookEnabled === false) continue;
 
+    // Live-caught gap: a webhook-driven update applies correctly (the lead's
+    // data genuinely changes), but nothing stamped lastPullSyncAt/lastSyncStatus
+    // for it — only a manual "Pull" click did. The CRM Sync dialog's "last
+    // pulled" indicator looked permanently stale even while auto-pull was
+    // working. Stamp once per list per job (not per event) once at least one
+    // relevant event was actually attempted against it — set before the call,
+    // not after, so a thrown error still counts as an attempt (and correctly
+    // marks the stamp as a failure, not skips it entirely).
+    let appliedAnyEvent = false;
+    let anyEventFailed = false;
+
     for (const event of payload.events) {
       const eventType: string = event?.event_type ?? '';
       try {
         if (eventType.startsWith('record.')) {
+          appliedAnyEvent = true;
           await applyAttioPersonEvent(list.listId, syncConfig, svc, event, peopleAttrCache);
         } else if (eventType.startsWith('list-entry.')) {
           const entryId: string = event?.id?.entry_id ?? event?.data?.entry_id ?? '';
           if (entryId) {
+            appliedAnyEvent = true;
             const dealListId = syncConfig.attioDealListId;
             let dealAttrCache = dealListId ? dealAttrCacheByListId.get(dealListId) : undefined;
             if (dealListId && !dealAttrCache) {
@@ -1180,7 +1193,12 @@ export async function processAttioWebhookJob(payload: AttioJobPayload): Promise<
         }
       } catch (err: any) {
         console.error(`[Attio Webhook] Failed to apply ${eventType} to list ${list.listId}:`, err?.message ?? err);
+        anyEventFailed = true;
       }
+    }
+
+    if (appliedAnyEvent) {
+      await externalCrmSyncService.updateSyncTimestamp(syncConfig, 'pull', !anyEventFailed);
     }
   }
 }

@@ -27,10 +27,12 @@ jest.mock('../services/db', () => ({
   },
 }));
 
+const mockUpdateSyncTimestamp = jest.fn().mockResolvedValue(undefined);
 jest.mock('../services/externalCrmSyncService', () => ({
   externalCrmSyncService: {
     getConfig: jest.fn(),
     resolveAuthForList: jest.fn(),
+    updateSyncTimestamp: (...a: any[]) => mockUpdateSyncTimestamp(...a),
   },
 }));
 
@@ -300,6 +302,10 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
       'lead-3',
       expect.objectContaining({ firstName: 'Alice', lastName: 'Smith', title: 'CTO' })
     );
+    // Live-caught gap: a webhook-driven update applied the data change but
+    // never stamped lastPullSyncAt, so the CRM Sync dialog's "last pulled"
+    // indicator looked permanently stale even though auto-pull was working.
+    expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.anything(), 'pull', true);
   });
 
   it('skips Attio event for non-people objects (e.g. companies)', async () => {

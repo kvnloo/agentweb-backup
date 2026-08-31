@@ -233,6 +233,13 @@ async function handleAttioEvent(
   for (const event of events) {
     await applyAttioPersonEvent(listId, config, svc, event);
   }
+
+  // Stamp lastPullSyncAt/lastSyncStatus so the CRM Sync dialog reflects this
+  // webhook-driven auto-pull, not only a manual Pull click — same gap fixed
+  // for the shared OAuth-app endpoint's processAttioWebhookJob.
+  if (events.length > 0) {
+    await externalCrmSyncService.updateSyncTimestamp(config, 'pull', true);
+  }
 }
 
 export default router;

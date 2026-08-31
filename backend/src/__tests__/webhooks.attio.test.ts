@@ -66,9 +66,11 @@ jest.mock('../services/connectedAccountsDb', () => ({
 }));
 
 const mockGetSyncConfig = jest.fn();
+const mockUpdateSyncTimestamp = jest.fn().mockResolvedValue(undefined);
 jest.mock('../services/externalCrmSyncService', () => ({
   externalCrmSyncService: {
     getConfig: (...a: any[]) => mockGetSyncConfig(...a),
+    updateSyncTimestamp: (...a: any[]) => mockUpdateSyncTimestamp(...a),
   },
 }));
 
@@ -309,6 +311,10 @@ describe('POST /api/webhooks/attio — shared OAuth webhook', () => {
 
     expect(mockEnqueueJob).toHaveBeenCalled();
     expect(mockApplyAttioPersonEvent).toHaveBeenCalledWith(LIST_ID, expect.objectContaining({ webhookEnabled: true }), expect.anything(), expect.objectContaining({ event_type: 'record.updated' }), expect.any(Map));
+    // Live-caught gap: a webhook-driven update applied the data change but
+    // never stamped lastPullSyncAt, so the CRM Sync dialog's "last pulled"
+    // indicator looked permanently stale even though auto-pull was working.
+    expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.objectContaining({ webhookEnabled: true }), 'pull', true);
   });
 
   it('processes list-entry.* events by routing to AttioAdapter.applyListEntryWebhookEvent', async () => {
@@ -326,6 +332,25 @@ describe('POST /api/webhooks/attio — shared OAuth webhook', () => {
       // key a shared cache by — the call passes the 6th arg as undefined.
       undefined,
     );
+    expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.objectContaining({ webhookEnabled: true }), 'pull', true);
+  });
+
+  it('does not stamp lastPullSyncAt when no event actually matched a list (e.g. list-entry with no entryId)', async () => {
+    const body = { event_type: 'list-entry.updated', id: { workspace_id: WORKSPACE_ID } }; // no entry_id
+    await request(app).post('/api/webhooks/attio').set('attio-signature', makeSignature(body)).send(body);
+    await flushPromises();
+
+    expect(mockApplyListEntryWebhookEvent).not.toHaveBeenCalled();
+    expect(mockUpdateSyncTimestamp).not.toHaveBeenCalled();
+  });
+
+  it('stamps lastPullSyncAt with success:false when an event application throws', async () => {
+    mockApplyAttioPersonEvent.mockRejectedValueOnce(new Error('boom'));
+    const body = { event_type: 'record.updated', id: { workspace_id: WORKSPACE_ID, record_id: 'rec-1' } };
+    await request(app).post('/api/webhooks/attio').set('attio-signature', makeSignature(body)).send(body);
+    await flushPromises();
+
+    expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.objectContaining({ webhookEnabled: true }), 'pull', false);
   });
 
   it('skips lists with webhookEnabled explicitly false', async () => {
