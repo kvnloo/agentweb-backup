@@ -369,6 +369,25 @@ describe('executePreparedTools', () => {
     expect((ports as any).__execOrder).toEqual([]);
   });
 
+  // ENG-1477: create_html_file/save_file calls carrying a title or content
+  // value with an unescaped inner quote (a quoted phrase, or HTML markup
+  // like class="...") used to fail here with "Failed to parse arguments:
+  // Expected ',' or '}' after property value" even though the call was
+  // otherwise well-formed. The repair pass in parseToolCallArguments should
+  // recover it and let the call reach the gateway.
+  it('recovers a tool call whose arguments contain an unescaped inner quote', async () => {
+    const ports = makePorts({
+      executePreparedAgentTool: async (i: any) => ({ received: i.args }),
+    });
+    const raw = '{"title":"Phoenix FFL Merchants — "Creative Fatigue" Audit","content_draft":"<div class="header">Hi</div>"}';
+    const input = makeInput([toolCall('a', 'read_brand_guidelines', raw)], ports);
+    const result = await executePreparedTools(input);
+
+    expect(input.toolCallsLedger[0].error).toBeUndefined();
+    expect(result.failedCounterUpdates).toEqual({});
+    expect((ports as any).__execOrder).toEqual(['read_brand_guidelines']);
+  });
+
   it('sets skillsUpdated when install_skills is called', async () => {
     const ports = makePorts();
     const input = makeInput([toolCall('a', 'install_skills', '{}')], ports);
