@@ -6588,7 +6588,7 @@ emmaToolRegistry.register({
         content: {
           type: 'string',
           maxLength: 2000,
-          description: 'The fact to remember (max 2000 chars). Be specific and actionable.'
+          description: 'The fact to remember. Be specific and actionable. HARD LIMIT 2000 characters — content over it is REJECTED, not truncated. If you have more to record, split it into several save_memory calls of at most 2000 characters each rather than re-sending the same oversized text, which fails identically every time (ENG-908).'
         },
         category: {
           type: 'string',
@@ -6666,7 +6666,7 @@ emmaToolRegistry.register({
         content: {
           type: 'string',
           maxLength: 2000,
-          description: 'The org-wide fact to remember (max 2000 chars). Be specific and actionable.'
+          description: 'The org-wide fact to remember. Be specific and actionable. HARD LIMIT 2000 characters — content over it is REJECTED, not truncated. If you have more to record, split it into several save_org_memory calls of at most 2000 characters each rather than re-sending the same oversized text, which fails identically every time (ENG-831).'
         },
         category: {
           type: 'string',
