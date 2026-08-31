@@ -202,8 +202,10 @@ describe('CRM Group Email Endpoints', () => {
         noEmailCount: 1,
         undeliverableCount: 0,
         riskyCount: 0,
+        invalidCount: 0,
         undeliverableEmails: [],
         riskyEmails: [],
+        invalidEmails: [],
       });
     });
 
@@ -233,9 +235,38 @@ describe('CRM Group Email Endpoints', () => {
         noEmailCount: 0,
         undeliverableCount: 0,
         riskyCount: 0,
+        invalidCount: 0,
         undeliverableEmails: [],
         riskyEmails: [],
+        invalidEmails: [],
       });
+    });
+
+    it('ENG-1194: reports malformed and provider-disallowed test-domain rows as invalid, excluded from eligible', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        listId: 'list-1',
+        userId: 'test-user-id',
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'valid@agentweb.pro' },
+          { leadId: '2', email: 'queue-verify@example.com' }, // provider-disallowed test domain
+          { leadId: '3', email: 'noTld@updates' }, // missing/invalid domain
+          { leadId: '4', email: 'harsha..v@agentweb.pro' }, // repeated-dot local part
+        ],
+        lastEvaluatedKey: undefined,
+      });
+
+      const handler = findHandler('/lists/:listId/group-email/preview', 'post');
+      await handler!(mockReq, mockRes);
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.totalLeads).toBe(4);
+      expect(response.invalidCount).toBe(3);
+      expect(response.eligibleLeads).toBe(1);
+      expect(response.invalidEmails.sort()).toEqual(
+        ['queue-verify@example.com', 'noTld@updates', 'harsha..v@agentweb.pro'].sort(),
+      );
     });
   });
 
@@ -387,6 +418,42 @@ describe('CRM Group Email Endpoints', () => {
       const response = (mockRes.json as jest.Mock).mock.calls[0][0];
       expect(response.sent).toBe(1);
       expect(response.skippedUnsubscribed).toBe(1);
+    });
+
+    it('ENG-1194: skips malformed and provider-disallowed test-domain leads by default, never attempting them', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        listId: 'list-1',
+        userId: 'test-user-id',
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'valid@agentweb.pro' },
+          { leadId: '2', email: 'queue-verify@example.com' },
+          { leadId: '3', email: 'noTld@updates' },
+          { leadId: '4', email: 'harsha..v@agentweb.pro' },
+        ],
+        lastEvaluatedKey: undefined,
+      });
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg-1' });
+
+      mockReq.body = {
+        senderEmail: 'me@test.com',
+        senderName: 'Me',
+        subject: 'Hi',
+        htmlContent: '<p>Hello</p>',
+      };
+
+      const handler = findHandler('/lists/:listId/group-email/send', 'post');
+      await handler!(mockReq, mockRes);
+
+      expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
+      const call = (resendService.sendEmail as jest.Mock).mock.calls[0][0];
+      expect(call.to).toBe('valid@agentweb.pro');
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.sent).toBe(1);
+      expect(response.total).toBe(1);
+      expect(response.skippedInvalid).toBe(3);
     });
 
     it('should emit progress via socket when socketId provided', async () => {
