@@ -394,11 +394,21 @@ export async function runMetaTrackingGate(
 
   let destinationUrls: string[] = [];
   let pixelIds: string[] = [];
+  /*
+   * Whether the ad read that fed `destinationUrls` covered the whole campaign. A bounded read
+   * (page cap or wall-clock) returns a PARTIAL ad list, and this gate's whole job is deciding
+   * from that list what a launch would send traffic to. Concluding "nothing to measure" — or
+   * "everything I measured was fine" — from a list that stopped early is inferring safety from
+   * an incomplete lookup, the move AC4 forbids everywhere else here.
+   */
+  let adsTruncated = false;
+  let accountWideTruncated = false;
   try {
-    const [{ items: ads }, { pixels }] = await Promise.all([
+    const [{ items: ads, truncated: adsListTruncated }, { pixels }] = await Promise.all([
       metaService.listAdsForUtmAudit(accountId, accessToken, campaignId),
       metaService.listPixels(accountId, accessToken),
     ]);
+    adsTruncated = !!adsListTruncated;
     /*
      * Activating ONE ad is judged on that ad's own destination. Checking the whole
      * campaign would block an ad whose page is fine because a sibling ad's page is not —
@@ -458,7 +468,9 @@ export async function runMetaTrackingGate(
      * on the miss.
      */
     try {
-      const { items: accountWide } = await metaService.listAdsForUtmAudit(accountId, accessToken, undefined as any);
+      const { items: accountWide, truncated: accountWideListTruncated } =
+        await metaService.listAdsForUtmAudit(accountId, accessToken, undefined as any);
+      accountWideTruncated = !!accountWideListTruncated;
       const named = (accountWide ?? []).filter((a: any) => String(a?.adId) === String(adId));
       const found = named.flatMap((a: any) => a?.destinationUrls ?? []).filter(Boolean);
       if (found.length > 0) {
@@ -469,11 +481,22 @@ export async function runMetaTrackingGate(
     }
   }
   if (adId && destinationUrls.length === 0) {
-    const message =
-      `Launch blocked: could not verify Meta tracking because ad ${adId} was not found in campaign ` +
-      `${campaignId}. The ad this launch would activate may belong to a different campaign, so the ` +
-      `check cannot tell where it sends people. Retry with the campaign that actually contains the ad, ` +
-      `supply the destination on the request, or use an explicit tracking-check override.`;
+    /*
+     * "Not found in a partial search" is not "not there". If either read stopped at its bound
+     * the ad may simply never have been looked at, and saying it "may belong to a different
+     * campaign" sends the reader to fix a cause that is not theirs — the ENG-1636 failure,
+     * where a pre-flight named a remedy that did not match the real reason.
+     */
+    const searchWasIncomplete = adsTruncated || accountWideTruncated;
+    const message = searchWasIncomplete
+      ? `Launch blocked: could not verify Meta tracking for ad ${adId}. The ad list for campaign ` +
+        `${campaignId} was too large to read completely, so the ad was not necessarily absent — it ` +
+        `may simply not have been reached. Narrow the request to the ad set that contains the ad, ` +
+        `supply the destination on the request, or use an explicit tracking-check override.`
+      : `Launch blocked: could not verify Meta tracking because ad ${adId} was not found in campaign ` +
+        `${campaignId}. The ad this launch would activate may belong to a different campaign, so the ` +
+        `check cannot tell where it sends people. Retry with the campaign that actually contains the ad, ` +
+        `supply the destination on the request, or use an explicit tracking-check override.`;
     await record(sessionId, {
       accountId, campaignId, action, outcome: override ? 'overridden' : 'blocked',
       urlResults: [], checkedAt: new Date().toISOString(),
@@ -484,6 +507,30 @@ export async function runMetaTrackingGate(
       blockResult: { success: false, blocked: true, reason: 'tracking_preflight', error: message, trackingCheck: { measured: false, urlResults: [] } },
     };
   }
+  /*
+   * Campaign/ad-set-level activation puts EVERY ad in scope live at once, so it is judged on
+   * the whole campaign's destinations. A truncated ad list means some of those ads were never
+   * read: passing here would clear a launch whose unread ads may point at unmeasurable pages,
+   * and an empty `destinationUrls` may just be the pages we never fetched. Ad-level activation
+   * is unaffected — it is judged on that ad's own destination, which was either found or
+   * handled by the not-found branch above.
+   */
+  if (!adId && adsTruncated) {
+    const message =
+      `Launch blocked: could not verify Meta tracking because the ad list for campaign ${campaignId} ` +
+      `was too large to read completely, so some ads in this launch were never checked. Activate a ` +
+      `single ad instead, or use an explicit tracking-check override if you accept the risk.`;
+    await record(sessionId, {
+      accountId, campaignId, action, outcome: override ? 'overridden' : 'blocked',
+      urlResults: [], checkedAt: new Date().toISOString(),
+    });
+    if (override) return { proceed: true };
+    return {
+      proceed: false,
+      blockResult: { success: false, blocked: true, reason: 'tracking_preflight', error: message, trackingCheck: { measured: false, urlResults: [] } },
+    };
+  }
+
   if (destinationUrls.length === 0) return { proceed: true };
 
   const gate = await preflightMetaTrackingGate(destinationUrls, pixelIds);
