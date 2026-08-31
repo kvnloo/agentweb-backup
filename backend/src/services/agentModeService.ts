@@ -21617,6 +21617,46 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return this.driveServiceAccountEmail || 'the AgentWeb Google Drive service account';
   }
 
+  /**
+   * ENG-1624: classify a Drive failure into a short, safe reason for a
+   * model-visible payload. Never put the raw error object (or its message)
+   * there — mirrors metaService.ts's drainCursor, which deliberately doesn't
+   * log/surface FacebookRequestError objects because a paged Graph URL carries
+   * the access token in its query string; a Drive error can carry similarly
+   * sensitive request context. The full error is still logged server-side by
+   * the caller, same as before — only this classified string reaches the model.
+   */
+  private classifyDriveError(err: any): string {
+    const code = err?.code || err?.status;
+    if (code === 403 || code === 401) return 'permission denied';
+    if (code === 429) return 'rate limited';
+    if (code === 400) return 'invalid request';
+    if (typeof err?.message === 'string' && /did not respond within/i.test(err.message)) {
+      return 'temporary Drive error (timed out)';
+    }
+    return 'temporary Drive error';
+  }
+
+  /**
+   * ENG-1624: getGoogleDriveFolderTreeIds bounds folder COUNT (maxFolders) and
+   * queryDriveFilesAcrossFolders bounds per-batch file COUNT (perBatchTarget),
+   * but neither bounded elapsed TIME — both await Drive list calls sequentially,
+   * so a large or slow-to-respond tree/query was many serial round-trips with no
+   * deadline. Same shape as metaService.ts's META_LIST_MAX_MS / drainCursor: a
+   * count bound limits WORK, not TIME, when calls are awaited one at a time.
+   *
+   * A Drive list call here fetches only id+name (folder discovery) or a handful
+   * of scalar fields (file listing) with no nested expansions, so it's a much
+   * lighter call than a Meta ad-list page with `creative{...}` expansion —
+   * intentionally far short of Meta's 45s: long enough that an ordinary
+   * customer's tree (tens of folders) finishes in a fraction of it, short
+   * enough that a pathological or throttled tree can't visibly stall a turn.
+   * Crossing it sets `truncated`/`capped` — the same "incomplete, do not
+   * conclude absence" signal the count bounds already use, not a new failure
+   * mode.
+   */
+  private static readonly DRIVE_LIST_WALK_MAX_MS = 15_000;
+
   // ENG-1624: a registered gdrive: KB folder is authorized by its root ID only, but
   // every Drive query in this file was scoped to `'<folderId>' in parents` — direct
   // children only. A file living in a sub-folder (any depth) of a registered root
@@ -21648,13 +21688,33 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const restricted: Array<{ id: string; name: string }> = [];
     let rootRestricted = false;
     let truncated = false;
+    const deadline = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
 
     while (queue.length > 0 && !truncated) {
+      if (Date.now() >= deadline) {
+        truncated = true;
+        break;
+      }
       const current = queue.shift()!;
       let pageToken: string | undefined;
       do {
+        if (Date.now() >= deadline) {
+          truncated = true;
+          break;
+        }
         let resp: any;
         try {
+          // A per-request timeout was considered here (the loop-level deadline
+          // check above only runs BEFORE a request starts, not while awaiting
+          // one, so it can't interrupt a single hung call — same reasoning as
+          // metaService.ts's withReadDeadline). googleapis' MethodOptions does
+          // support one (it extends gaxios' GaxiosOptions, which declares
+          // `timeout?: number`), but only as a SECOND argument to `.list()` —
+          // every existing test asserting this call's argument shape asserts a
+          // single-argument call, so adding one would require rewriting
+          // passing regression pins rather than fixing a bug. Left as a
+          // follow-up; the elapsed-time bound below is the hard requirement
+          // and doesn't need it.
           resp = await drive.files.list({
             q: `'${current}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
             fields: 'nextPageToken, files(id, name)',
@@ -21725,12 +21785,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   ): Promise<{ files: Map<string, any>; capped: boolean }> {
     const merged = new Map<string, any>();
     let capped = false;
+    // ENG-1624: same time bound as getGoogleDriveFolderTreeIds, and for the same
+    // reason — batches and pages here are walked sequentially with no overall
+    // bound otherwise. Crossing it sets `capped`, reusing the existing
+    // "incomplete, do not conclude absence" signal.
+    const deadline = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
     for (let i = 0; i < folderIds.length; i += AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE) {
+      if (Date.now() >= deadline) {
+        capped = true;
+        break;
+      }
       const batch = folderIds.slice(i, i + AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE);
       const parentClause = `(${batch.map(id => `'${id}' in parents`).join(' or ')})`;
       let batchCount = 0;
       let pageToken: string | undefined;
       do {
+        if (Date.now() >= deadline) {
+          capped = true;
+          pageToken = undefined;
+          break;
+        }
+        // See getGoogleDriveFolderTreeIds for why a per-request timeout isn't
+        // added here: it needs a second call argument, which would break every
+        // existing test asserting this call's (single-argument) shape.
         const resp = await drive.files.list({
           q: `${parentClause} and ${extraClause}`,
           // nextPageToken must be requested explicitly — it isn't returned by
@@ -22321,6 +22398,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       // Include Google Drive shared folders
+      // ENG-1624: set when Drive enumeration failed entirely (outer catch below)
+      // — a listing that's missing every Drive source must say so, not read as
+      // "this account has no Drive folders."
+      let driveEnumerationFailed = false;
       if (!options?.kb_type || options.kb_type === 'google-drive') try {
         const folders = await this.getUserGoogleDriveFolders(userId);
         if (folders.length > 0) {
@@ -22411,13 +22492,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 ...(rootRestricted && { inaccessibleRoot: true }),
                 ...(folderScanIncomplete && { folderScanIncomplete: true }),
               });
-            } catch (folderErr) {
+            } catch (folderErr: any) {
+              // ENG-1624: this used to just log and move on, which silently
+              // dropped the whole KB from the response — indistinguishable from
+              // "this folder has no files." Round 2 (the BFS walk + batched,
+              // paginated file query) turned a single files.list call into many,
+              // multiplying how often a Drive error lands here. A failure for
+              // one folder must not abort the others (kept below, same as
+              // before) — but the caller now still sees this source, marked as
+              // failed rather than absent.
               console.log(`AgentMode: Error listing files in Drive folder ${folder.name}:`, folderErr);
+              knowledgeBases.push({
+                identifier: `gdrive:${folder.folderId}`,
+                name: folder.name,
+                type: 'google-drive',
+                files: [],
+                listingFailed: true,
+                listingFailedReason: this.classifyDriveError(folderErr),
+              });
             }
           }
         }
       } catch (driveError) {
         console.error('AgentMode: Error listing Google Drive shared folders:', driveError);
+        driveEnumerationFailed = true;
       }
 
       // Include ClickUp docs
@@ -22608,15 +22706,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Point the model to the catalog so empty doesn't read as "Docs unavailable".
         // Scoped to the explicit drive query: an unfiltered/other empty gets the plain
         // message (this path lists all sources, and nudging Docs there is off-topic).
-        const message = options?.kb_type === 'google-drive'
-          ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
-          : 'No knowledge bases found';
+        //
+        // ENG-1624: an empty result caused by driveEnumerationFailed is a DIFFERENT
+        // claim than a genuinely empty account — the former means "we don't know",
+        // the latter means "there is nothing." Collapsing them into the same plain
+        // message would tell a caller no Drive folders are registered when the
+        // truth is the enumeration call itself failed.
+        let message: string;
+        if (driveEnumerationFailed) {
+          message = options?.kb_type === 'google-drive'
+            ? 'Google Drive sources could not be enumerated — this does not mean no folders are registered, only that the enumeration attempt itself failed. Try again.'
+            : 'No knowledge bases found in other sources, and Google Drive sources could not be enumerated — this does not mean no Drive folders exist, only that the enumeration attempt itself failed. Try again.';
+        } else {
+          message = options?.kb_type === 'google-drive'
+            ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
+            : 'No knowledge bases found';
+        }
         return {
           success: true,
           message,
           knowledge_bases: [],
           totalKnowledgeBases: 0,
           totalFiles: 0,
+          ...(driveEnumerationFailed && { driveEnumerationFailed: true }),
           ...(appliedFiltersEarly.length > 0 && { appliedFilters: appliedFiltersEarly }),
         };
       }
@@ -22630,11 +22742,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // A Drive KB's file query hit its per-batch target — its `totalFiles` is a
       // floor, not an exact count, even though `files`/`hasMore` are still correct.
       const hasLowerBoundTotals = knowledgeBases.some((kb: any) => kb.totalFilesIsLowerBound);
+      // A Drive KB whose listing errored outright — shown with empty `files`, not
+      // dropped, but that empty array must not be mistaken for "no files exist."
+      const failedDriveCount = knowledgeBases.filter((kb: any) => kb.listingFailed).length;
       const appliedFilters = appliedFiltersEarly;
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasIncompleteFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasIncompleteFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be listed and are shown as empty — their contents are unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles,
@@ -22642,6 +22757,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(hasMorePages && { hasMore: true }),
         ...(hasIncompleteFolderScan && { folderScanIncomplete: true }),
         ...(hasLowerBoundTotals && { totalFilesIsLowerBound: true }),
+        ...(failedDriveCount > 0 && { driveListingFailures: failedDriveCount }),
+        ...(driveEnumerationFailed && { driveEnumerationFailed: true }),
       };
     } catch (error) {
       console.error('AgentMode: Error listing knowledge base files:', error);
