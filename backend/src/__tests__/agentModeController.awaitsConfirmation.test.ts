@@ -114,6 +114,28 @@ describe('scheduledRunAwaitsConfirmation — unattended confirmation-halt detect
     "Worth having someone verify click-ID capture on Every.io's lander and confirm which of the two pixels the ads are actually configured against.",
     "Ask Harsha to confirm whether #2323 and #2414 actually had his data-plane approval before merge — " +
       "#2414 creates AW-LlmChargeEvents and ships a guarded production reset command, so an unapproved merge there has real billing blast radius.",
+    // ENG-1256: an earlier version of this fix only excluded the em dash
+    // character from the "confirm ... before ... creat[es]" bridge, which
+    // defeated the ONE production string that happened to use an em dash but
+    // left the underlying flaw (unbounded-distance clause bridging) intact —
+    // any other clause separator reproduces the same false positive. Proven
+    // live: swapping the em dash for ", since" still matched pre-fix.
+    "Ask Harsha to confirm whether #2323 and #2414 actually had his data-plane approval before merge, " +
+      "since #2414 creates AW-LlmChargeEvents and ships a guarded production reset command, so an unapproved merge there has real billing blast radius.",
+    "Ask Harsha to confirm whether #2323 and #2414 actually had his data-plane approval before merge " +
+      "and creates AW-LlmChargeEvents as part of the same migration.",
+    // ENG-1256: NEXT_STEP_TRAILER required the literal singular "step" and
+    // did not strip a pluralized "👉 Next Steps:" trailer AT ALL (verified: a
+    // model that pluralizes the mandated line bypasses trailer-stripping
+    // entirely, so the false-positive prose below reaches the detector
+    // completely unstripped). Combined with the comma-separated wording
+    // above, this reproduces the original bug through a second, independent
+    // route if either gap alone were still open.
+    "The digest above is complete and accurate. " +
+      "👉 Next Steps: Ask Harsha to confirm whether #2323 and #2414 actually had his data-plane approval before merge, " +
+      "since #2414 creates AW-LlmChargeEvents and ships a guarded production reset command.",
+    "The digest above is complete and accurate. " +
+      "👉 Next Steps: Worth having someone verify click-ID capture on Every.io's lander and confirm which of the two pixels the ads are actually configured against.",
   ];
 
   it.each(cleanOrActionable)('does NOT fire on clean/actionable report: %s', (text) => {
