@@ -403,6 +403,10 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
 
     expect(result).toBe(fakeResponse);
     expect(create).toHaveBeenCalledTimes(2);
+    // The failed first attempt must never be metered -- meterUserUsage only runs
+    // after a successful `create()` return, so a retry can raise `create` calls
+    // without ever double-billing the customer for the discarded attempt.
+    expect(mockMeterUser).toHaveBeenCalledTimes(1);
   });
 
   it('gives up after exactly one retry when a transient 429 persists', async () => {

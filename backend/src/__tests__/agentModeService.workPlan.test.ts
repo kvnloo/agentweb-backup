@@ -1211,6 +1211,47 @@ describe('AgentModeService - Work Plan', () => {
         // Exactly two attempts total (one retry), never an unbounded retry loop.
         expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(2);
       });
+
+      it('short-circuits the retry without a second persist when attempt 1 actually committed (ack-lost)', async () => {
+        // The scenario the ENG-1626 idempotency short-circuit exists for: attempt
+        // 1's updateSessionWorkPlan call commits server-side, but the client sees
+        // a transient error anyway (the ack itself was lost, not the write). The
+        // retry's fresh read must see the ALREADY-completed step and report
+        // success without re-running the mutation -- otherwise it would re-decrement
+        // an already-decremented calledFunctionCounts and re-stamp resolvedAt.
+        const pendingSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: singleStepWorkPlan(),
+        };
+        const committedSession = {
+          ...pendingSession,
+          workPlan: {
+            ...pendingSession.workPlan,
+            steps: [{ stepCount: 1, title: 'Step 1', status: 'completed' as const, resolvedAt: '2026-08-27T17:00:05.000Z' }],
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock)
+          .mockResolvedValueOnce(JSON.parse(JSON.stringify(pendingSession)))
+          .mockResolvedValueOnce(JSON.parse(JSON.stringify(committedSession)));
+        // Attempt 1's persist call itself throws -- the caller never sees a
+        // successful response, even though (per the committedSession read above)
+        // the write actually landed.
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockRejectedValue(new Error('ETIMEDOUT'));
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.getChatSession).toHaveBeenCalledTimes(2);
+        // Called ONCE (attempt 1's own persist call, which the mock rejects) --
+        // the short-circuit must prevent a SECOND call on the retry.
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(1);
+      });
     });
   });
 
