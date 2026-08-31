@@ -60,6 +60,19 @@ describe('ENG-1476 buildListMessage', () => {
       .toContain('Do NOT conclude a creative is absent');
   });
 
+  // ENG-1625 — widened absentNounFor beyond the original ad/creative pair so the same
+  // "do not conclude X is absent" prose is pointed at the right noun for every list edge
+  // this follow-up fixed, not a generic fallback.
+  it.each([
+    ['campaign(s)', 'a campaign is absent'],
+    ['ad set(s)', 'an ad set is absent'],
+    ['custom audience(s)', 'a custom audience is absent'],
+    ['pixel(s)', 'a pixel is absent'],
+  ])('says the right noun for %s', (noun, expected) => {
+    expect(buildListMessage({ noun, totalCount: 5, truncated: true, campaignScopable: false }))
+      .toContain(`Do NOT conclude ${expected}`);
+  });
+
   it('never claims completeness for a zero-result truncated read', () => {
     // "Found 0" plus "complete" is the most dangerous sentence this module can produce.
     const m = buildListMessage({ noun: 'ad(s)', totalCount: 0, truncated: true, campaignScopable: true });
@@ -122,4 +135,22 @@ describe('ENG-1476 buildListResult', () => {
     expect(partial.complete).toBe(false);
     expect(partial.hasMore).toBe(true);
   });
+
+  // ENG-1625 — payloadKey widened from 'ads' | 'creatives' to also cover the campaign, ad
+  // set, custom audience, and pixel list edges fixed in this follow-up. Same field-order
+  // guarantee applies to all of them — the S3 offload cut does not care which noun a large
+  // list happens to be.
+  it.each(['campaigns', 'adSets', 'audiences', 'pixels'] as const)(
+    'serializes completeness fields ahead of the %s payload too',
+    (payloadKey) => {
+      const json = JSON.stringify(buildListResult({
+        payloadKey, payload: big, message: 'm', truncated: true,
+      }));
+      const payloadIndex = json.indexOf(`"${payloadKey}"`);
+      for (const field of ['"message"', '"complete"', '"hasMore"', '"totalCount"']) {
+        expect(json.indexOf(field)).toBeGreaterThan(-1);
+        expect(json.indexOf(field)).toBeLessThan(payloadIndex);
+      }
+    },
+  );
 });

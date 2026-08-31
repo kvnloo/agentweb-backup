@@ -106,12 +106,12 @@ afterAll(async () => {
 describe('PUT /api/crm-sync/config/:listId/:provider/pipeline — change pipeline', () => {
   const { externalCrmSyncService } = require('../services/externalCrmSyncService');
 
-  it('rejects a non-hubspot provider with 400', async () => {
+  it('rejects an unsupported provider with 400', async () => {
     const res = await request(app)
-      .put('/api/crm-sync/config/list-1/attio/pipeline')
+      .put('/api/crm-sync/config/list-1/salesforce/pipeline')
       .send({ externalPipelineId: 'p1' })
       .expect(400);
-    expect(res.body.error).toMatch(/only supported for HubSpot/i);
+    expect(res.body.error).toMatch(/hubspot and attio/i);
   });
 
   it('rejects a missing externalPipelineId with 400', async () => {
@@ -128,7 +128,35 @@ describe('PUT /api/crm-sync/config/:listId/:provider/pipeline — change pipelin
       .send({ externalPipelineId: 'new-pipe' })
       .expect(200);
     expect(externalCrmSyncService.changePipeline).toHaveBeenCalledWith('user-1', 'list-1', 'hubspot', 'new-pipe');
-    expect(res.body.config.externalPipelineId).toBe('new-pipe');
+    expect(res.body.externalPipelineId).toBe('new-pipe');
+  });
+
+  it('never returns credential fields, even when the persisted config carries them', async () => {
+    externalCrmSyncService.changePipeline.mockResolvedValueOnce({
+      provider: 'attio',
+      listId: 'list-1',
+      userId: 'user-1',
+      accountId: 'acct-1',
+      attioDealListId: 'new-list',
+      autoSyncEnabled: true,
+      apiKeyEncrypted: 'enc:super-secret-token',
+      webhookSecret: 'plaintext-webhook-secret',
+    });
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/attio/pipeline')
+      .send({ externalPipelineId: 'new-list' })
+      .expect(200);
+
+    expect(res.body.attioDealListId).toBe('new-list');
+    expect(res.body).not.toHaveProperty('apiKeyEncrypted');
+    expect(res.body).not.toHaveProperty('webhookSecret');
+    expect(res.body).not.toHaveProperty('config');
+    expect(JSON.stringify(res.body)).not.toMatch(/super-secret-token|plaintext-webhook-secret/);
+    expect(res.body.hasManualToken).toBe(true);
+    // This response never includes webhookUrl at all (unlike GET/PUT config)
+    // — the frontend's handleChangePipeline ignores this response entirely,
+    // so a secret-bearing URL here would be pure unnecessary exposure.
+    expect(res.body).not.toHaveProperty('webhookUrl');
   });
 
   it('surfaces service errors as 500', async () => {
@@ -138,6 +166,23 @@ describe('PUT /api/crm-sync/config/:listId/:provider/pipeline — change pipelin
       .send({ externalPipelineId: 'nope' })
       .expect(500);
     expect(res.body.error).toMatch(/not found/i);
+  });
+
+  it('changes the Attio deal list and returns the updated config', async () => {
+    externalCrmSyncService.changePipeline.mockResolvedValueOnce({
+      provider: 'attio',
+      listId: 'list-1',
+      userId: 'user-1',
+      accountId: 'acct-1',
+      attioDealListId: 'new-list',
+      autoSyncEnabled: true,
+    });
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/attio/pipeline')
+      .send({ externalPipelineId: 'new-list' })
+      .expect(200);
+    expect(externalCrmSyncService.changePipeline).toHaveBeenCalledWith('user-1', 'list-1', 'attio', 'new-list');
+    expect(res.body.attioDealListId).toBe('new-list');
   });
 });
 
@@ -512,6 +557,55 @@ describe('Org-aware access control on CRM sync routes', () => {
       await request(app).get('/api/crm-sync/config/list-1/hubspot').expect(200);
 
       expect(externalCrmSyncService.ensureWebhookSecret).toHaveBeenCalledWith('user-1', 'list-1', 'hubspot', legacyConfig);
+    });
+  });
+
+  // Companion to the backfill gate above, for the field itself: webhookUrl
+  // embeds the plaintext webhookSecret, the sole auth for this list's public
+  // webhook endpoint. A same-org member with mere read access (this route's
+  // own gate) must not receive it just because they can view the config.
+  describe('webhookUrl is only returned to a privileged (editor-level) caller', () => {
+    const configWithSecret = {
+      configured: true,
+      provider: 'hubspot',
+      accountId: 'acc-1',
+      contactFieldMapping: [],
+      dealFieldMapping: [],
+      customFieldMapping: [],
+      webhookSecret: 'real-secret',
+    };
+
+    beforeEach(() => {
+      crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
+      externalCrmSyncService.getConfig.mockResolvedValue(configWithSecret);
+      externalCrmSyncService.isAccountConnected.mockResolvedValue(true);
+    });
+
+    it('omits webhookUrl for a same-org member who is not the owner and not a CRM editor', async () => {
+      setSameOrgUsers();
+      orgDb.getOrgById.mockResolvedValue(orgWithCrm());
+
+      const res = await request(app).get('/api/crm-sync/config/list-1/hubspot').expect(200);
+
+      expect(res.body.webhookUrl).toBeUndefined();
+      expect(JSON.stringify(res.body)).not.toMatch(/real-secret/);
+    });
+
+    it('includes webhookUrl for a listed crm.editor', async () => {
+      setSameOrgUsers();
+      orgDb.getOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: true, editors: ['user-1'] } } }));
+
+      const res = await request(app).get('/api/crm-sync/config/list-1/hubspot').expect(200);
+
+      expect(res.body.webhookUrl).toMatch(/secret=real-secret/);
+    });
+
+    it('includes webhookUrl for the list owner themself', async () => {
+      crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' });
+
+      const res = await request(app).get('/api/crm-sync/config/list-1/hubspot').expect(200);
+
+      expect(res.body.webhookUrl).toMatch(/secret=real-secret/);
     });
   });
 

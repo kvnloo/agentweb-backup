@@ -247,12 +247,18 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
         ];
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-        (metaService.listCustomAudiences as jest.Mock).mockResolvedValue(mockAudiences);
+        (metaService.listCustomAudiences as jest.Mock).mockResolvedValue({
+          audiences: mockAudiences,
+          truncated: false,
+          pagesFetched: 1,
+        });
 
         const result = await agentModeService.manageMetaCustomAudiences('user123', 'LIST', '123456789', {});
 
         expect(result.success).toBe(true);
-        expect(result.message).toBe('Found 2 custom audience(s)');
+        // ENG-1625: bare "Found N custom audience(s)" was the ENG-1476/ENG-1584 sentence
+        // shape — the message now names scope and completeness explicitly.
+        expect(result.message).toBe('Found 2 custom audience(s) in this ad account (complete list).');
         expect(result.audiences).toEqual(mockAudiences);
       });
     });
