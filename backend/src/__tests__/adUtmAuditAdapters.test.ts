@@ -107,7 +107,7 @@ import { metaService } from '../services/metaService';
 import { googleAdsService } from '../services/googleAdsService';
 import * as linkedInAdsService from '../services/linkedInAdsService';
 import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../services/adUtmAuditAdapters';
-import { auditCampaigns } from '../services/adUtmAuditService';
+import { auditCampaigns, readPortResult } from '../services/adUtmAuditService';
 import { getAccountsWithOwnerIncludingOrgShared } from '../services/connectedAccountsDb';
 
 const USER = 'user-1';
@@ -321,8 +321,11 @@ describe('Meta — listAdsForUtmAudit reads every site createAdCreative writes',
       metaAd('ad2', 'c2', { id: 'cr2', link_url: 'https://example.com/b' }), // other campaign
     ]);
 
-    const ads = await metaAdReadPort.listAdDestinations(USER, '1234567890', 'c1');
-    expect(ads.map((a) => a.adId)).toEqual(['ad1']);
+    // The Meta port now reports read completeness alongside the rows (see PortRead), so the
+    // adapter returns `{ items, truncated }`. The invariant under test — that an ad from
+    // another campaign is filtered out — is unchanged.
+    const ads = readPortResult(await metaAdReadPort.listAdDestinations(USER, '1234567890', 'c1'));
+    expect(ads.items.map((a) => a.adId)).toEqual(['ad1']);
   });
 });
 
