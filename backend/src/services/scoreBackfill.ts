@@ -1,8 +1,10 @@
 import { ChatSession } from "./chatbotService";
 import {
-  scoreSessionIfNeeded,
+  attemptSessionScore,
   scoreSessionWithJudgeIfNeeded,
   ScoringJudge,
+  ScoringSkipReason,
+  SessionScoringAttempt,
 } from "./sessionScoringService";
 
 // ENG-291: get_chat_history with sync=true used to score every session in the
@@ -24,6 +26,12 @@ import {
 //     which would be unsafe on Elastic Beanstalk (the process can be recycled).
 //   - Scores are applied IN-MEMORY onto the passed session objects, so the
 //     caller no longer needs a second re-fetch loop.
+//
+// ENG-929: it also reports a per-session OUTCOME. Everything that is not a score
+// used to collapse into the same observable — `satisfactionScore: null` — so a
+// session that was still running, one excluded by design, one the budget never
+// reached, and one whose scorer errored were indistinguishable to the caller.
+// The Daily Satisfaction Score Report therefore under-sampled silently.
 
 const DEFAULT_CONCURRENCY = 6;
 const DEFAULT_BUDGET_MS = 4 * 60 * 1000; // 4 min < 5-min tool timeout
@@ -41,7 +49,7 @@ export interface BackfillScoresOptions {
   /** Injectable clock for deterministic tests. Defaults to Date.now. */
   now?: () => number;
   /** Test seam / override for the per-session satisfaction scorer. */
-  scoreSession?: (session: ChatSession) => Promise<ChatSession["satisfactionScore"] | null>;
+  scoreSession?: (session: ChatSession) => Promise<SessionScoringAttempt>;
   /** Test seam / override for the per-judge scorer. */
   scoreWithJudge?: (
     session: ChatSession,
@@ -51,6 +59,31 @@ export interface BackfillScoresOptions {
   onError?: (session: ChatSession, error: unknown) => void;
 }
 
+/**
+ * What happened to ONE session in this run (ENG-929).
+ *
+ * Before this existed, every non-outcome collapsed into the same observable —
+ * `satisfactionScore: null` on the returned session — so a caller (the Daily
+ * Satisfaction Score Report) could not tell an in-flight run from a scorer that
+ * timed out. Four completed, expensive sessions were silently missing from the
+ * report because of it. Each session now carries an explicit verdict:
+ *
+ *  - `scored`        — a fresh satisfaction score was written this run
+ *  - `skipped`       — deliberately not scored; `reason` says which rule applied
+ *  - `failed`        — scoring was attempted and errored; `reason` is the error
+ *  - `not-attempted` — the wall-clock budget ran out before this session
+ */
+export type SessionScoringStatus = "scored" | "skipped" | "failed" | "not-attempted";
+
+export interface SessionScoringOutcome {
+  sessionId: string;
+  status: SessionScoringStatus;
+  /** Skip rule, error message, or budget note — absent only for `scored`. */
+  reason?: ScoringSkipReason | string;
+  /** Per-judge errors, keyed by judge id. Present only when a judge failed. */
+  judgeErrors?: Record<string, string>;
+}
+
 export interface BackfillScoresResult {
   /** Sessions dispatched (attempted) this run — includes ones whose scorer threw. */
   scored: number;
@@ -58,7 +91,14 @@ export interface BackfillScoresResult {
   skipped: number;
   /** True when the budget was exhausted before every session was dispatched. */
   timedOut: boolean;
+  /** Per-session verdict, in the same order as the sessions passed in. */
+  outcomes: SessionScoringOutcome[];
 }
+
+const BUDGET_EXHAUSTED_REASON = "scoring budget exhausted";
+
+const errorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
 
 /**
  * Score the given sessions (default + all judges) with bounded concurrency under a
@@ -71,7 +111,7 @@ export async function backfillSessionScores(
 ): Promise<BackfillScoresResult> {
   const total = sessions.length;
   if (total === 0) {
-    return { scored: 0, skipped: 0, timedOut: false };
+    return { scored: 0, skipped: 0, timedOut: false, outcomes: [] };
   }
 
   const concurrency = Math.max(
@@ -80,12 +120,20 @@ export async function backfillSessionScores(
   );
   const budgetMs = options.budgetMs ?? envInt("CHAT_HISTORY_SYNC_SCORE_BUDGET_MS", DEFAULT_BUDGET_MS);
   const now = options.now ?? Date.now;
-  const scoreSession = options.scoreSession ?? scoreSessionIfNeeded;
+  const scoreSession = options.scoreSession ?? attemptSessionScore;
   const scoreWithJudge = options.scoreWithJudge ?? scoreSessionWithJudgeIfNeeded;
 
   const start = now();
   let next = 0;
   let scored = 0;
+
+  // Pre-filled with the budget verdict so any session a worker never claims is
+  // already reported as not-attempted rather than left undefined.
+  const outcomes: SessionScoringOutcome[] = sessions.map((session) => ({
+    sessionId: (session as any).sessionId,
+    status: "not-attempted",
+    reason: BUDGET_EXHAUSTED_REASON,
+  }));
 
   const worker = async (): Promise<void> => {
     while (true) {
@@ -96,18 +144,42 @@ export async function backfillSessionScores(
       if (index >= total) return;
 
       const session = sessions[index];
+      const outcome: SessionScoringOutcome = {
+        sessionId: (session as any).sessionId,
+        status: "scored",
+      };
+
       try {
-        const satisfaction = await scoreSession(session);
-        if (satisfaction) session.satisfactionScore = satisfaction;
-        for (const judge of judges) {
+        const attempt = await scoreSession(session);
+        if (attempt?.score) {
+          session.satisfactionScore = attempt.score;
+        } else {
+          outcome.status = "skipped";
+          outcome.reason = attempt?.skipReason;
+        }
+      } catch (error) {
+        // A satisfaction-scoring failure must NOT abort this session's judges:
+        // they are independent calls, and letting one failure take all of them
+        // out is why a timed-out session lost its satisfaction score AND every
+        // judge score at once (ENG-929).
+        outcome.status = "failed";
+        outcome.reason = errorMessage(error);
+        options.onError?.(session, error);
+      }
+
+      for (const judge of judges) {
+        try {
           const judgeScore = await scoreWithJudge(session, judge);
           if (judgeScore) {
             (session.judgeScores ??= {})[judge.id] = judgeScore;
           }
+        } catch (error) {
+          (outcome.judgeErrors ??= {})[judge.id] = errorMessage(error);
+          options.onError?.(session, error);
         }
-      } catch (error) {
-        options.onError?.(session, error);
       }
+
+      outcomes[index] = outcome;
       scored++;
     }
   };
@@ -116,5 +188,5 @@ export async function backfillSessionScores(
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
   const skipped = total - scored;
-  return { scored, skipped, timedOut: skipped > 0 };
+  return { scored, skipped, timedOut: skipped > 0, outcomes };
 }
