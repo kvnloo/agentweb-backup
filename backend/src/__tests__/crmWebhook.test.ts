@@ -308,6 +308,41 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.anything(), 'pull', true);
   });
 
+  // CodeRabbit-flagged: without a per-event try/catch, a throw from
+  // applyAttioPersonEvent aborted the loop AND skipped updateSyncTimestamp
+  // entirely (the throw propagates past it) — a failed delivery left
+  // lastPullSyncAt/lastSyncStatus silently stale with zero indication
+  // anything went wrong, reintroducing the exact invisible-failure problem
+  // the stamp exists to prevent.
+  it('stamps lastPullSyncAt with success:false when applying the Attio event throws', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue(mockConfig('attio'));
+    mockAttioGetPersonValues.mockResolvedValue({
+      email_addresses: [{ email_address: 'attio@company.com' }],
+      name: [{ first_name: 'Alice', last_name: 'Smith' }],
+    });
+    const existingLead = { leadId: 'lead-3', email: 'attio@company.com', firstName: 'Alice' };
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existingLead);
+    (crmDb.updateLead as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+
+    const event = {
+      event_type: 'record.updated',
+      workspace_id: 'ws-abc',
+      data: {
+        object: { slug: 'people' },
+        record: { id: { record_id: 'rec-xyz' } },
+      },
+    };
+
+    const res = await request(app)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send(event);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.anything(), 'pull', false);
+  });
+
   it('skips Attio event for non-people objects (e.g. companies)', async () => {
     (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue(mockConfig('attio'));
 

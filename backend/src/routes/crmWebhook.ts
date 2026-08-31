@@ -230,15 +230,26 @@ async function handleAttioEvent(
     ? AttioService.fromToken(auth.apiKey!)
     : await AttioService.create(auth.userId!, auth.accountId!);
 
+  // Per-event try/catch — without it, a single throw aborted the whole loop
+  // AND skipped the updateSyncTimestamp call below entirely (the throw
+  // propagates past it), so a failed delivery left lastPullSyncAt/
+  // lastSyncStatus silently stale instead of showing the failure — exactly
+  // the invisible-failure problem this stamp exists to prevent.
+  let anyEventFailed = false;
   for (const event of events) {
-    await applyAttioPersonEvent(listId, config, svc, event);
+    try {
+      await applyAttioPersonEvent(listId, config, svc, event);
+    } catch (err: any) {
+      console.error(`[CrmWebhook] Failed to apply Attio event for list ${listId}:`, err?.message ?? err);
+      anyEventFailed = true;
+    }
   }
 
   // Stamp lastPullSyncAt/lastSyncStatus so the CRM Sync dialog reflects this
   // webhook-driven auto-pull, not only a manual Pull click — same gap fixed
   // for the shared OAuth-app endpoint's processAttioWebhookJob.
   if (events.length > 0) {
-    await externalCrmSyncService.updateSyncTimestamp(config, 'pull', true);
+    await externalCrmSyncService.updateSyncTimestamp(config, 'pull', !anyEventFailed);
   }
 }
 
