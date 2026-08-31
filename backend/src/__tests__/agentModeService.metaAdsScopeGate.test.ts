@@ -176,9 +176,11 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
         id: 'user1',
         connected_accounts: [metaAccount({ granted_scopes: ['ads_read', 'pages_show_list'] })],
       });
-      (metaService.listCampaigns as jest.Mock).mockResolvedValue([
-        { id: '120241445300020585', name: 'AgentWeb Broad Targeting' },
-      ]);
+      (metaService.listCampaigns as jest.Mock).mockResolvedValue({
+        campaigns: [{ id: '120241445300020585', name: 'AgentWeb Broad Targeting' }],
+        truncated: false,
+        pagesFetched: 1,
+      });
 
       const result = await agentModeService.listMetaAdsCampaignsNew('user1');
 
@@ -192,7 +194,7 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
         id: 'user1',
         connected_accounts: [metaAccount({ granted_scopes: ['ads_management'] })],
       });
-      (metaService.listCampaigns as jest.Mock).mockResolvedValue([]);
+      (metaService.listCampaigns as jest.Mock).mockResolvedValue({ campaigns: [], truncated: false, pagesFetched: 1 });
 
       const result = await agentModeService.listMetaAdsCampaignsNew('user1');
 
@@ -209,7 +211,7 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
           metaAccount({ scopes: ['ads_management', 'ads_read', 'pages_show_list'] }),
         ],
       });
-      (metaService.listCampaigns as jest.Mock).mockResolvedValue([{ id: 'c1' }]);
+      (metaService.listCampaigns as jest.Mock).mockResolvedValue({ campaigns: [{ id: 'c1' }], truncated: false, pagesFetched: 1 });
 
       const result = await agentModeService.listMetaAdsCampaignsNew('user1');
 
@@ -410,7 +412,7 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       expect(meta.capability_warning).toBeUndefined();
 
       // And a subsequent read still reaches Meta rather than being gated off.
-      (metaService.listCampaigns as jest.Mock).mockResolvedValue([{ id: 'c1' }]);
+      (metaService.listCampaigns as jest.Mock).mockResolvedValue({ campaigns: [{ id: 'c1' }], truncated: false, pagesFetched: 1 });
       const retry = await agentModeService.listMetaAdsCampaignsNew('user1');
       expect(retry.success).toBe(true);
     });

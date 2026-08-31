@@ -87,12 +87,19 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         ];
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-        (metaService.listAdSets as jest.Mock).mockResolvedValue(mockAdSets);
+        (metaService.listAdSets as jest.Mock).mockResolvedValue({
+          adSets: mockAdSets,
+          truncated: false,
+          pagesFetched: 1,
+          scope: {},
+        });
 
         const result = await agentModeService.listMetaAdsAdSets('user123');
 
         expect(result.success).toBe(true);
-        expect(result.message).toBe('Found 2 ad set(s)');
+        // ENG-1625: bare "Found N ad set(s)" was the ENG-1476/ENG-1584 sentence shape — the
+        // message now names scope and completeness explicitly.
+        expect(result.message).toBe('Found 2 ad set(s) in this ad account (complete list).');
         expect(result.adSets).toEqual(mockAdSets);
         expect(result.totalCount).toBe(2);
       });

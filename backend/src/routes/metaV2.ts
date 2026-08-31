@@ -148,7 +148,7 @@ router.get('/campaigns-and-adsets', async (req, res) => {
 
     const { accountId: resolvedAccountId, accessToken } = await getMetaAccountCredentials(user, userId, accountId);
 
-    const [campaigns, adSets, pages] = await Promise.all([
+    const [{ campaigns }, { adSets }, pages] = await Promise.all([
       metaService.listCampaigns(resolvedAccountId, accessToken),
       metaService.listAdSets(resolvedAccountId, accessToken),
       metaService.getPages(accessToken),
@@ -205,7 +205,7 @@ router.get('/pixels', async (req, res) => {
       accounts.map(async (acc: any) => {
         try {
           const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, acc.accountId);
-          const pixels = await metaService.listPixels(accountId, accessToken);
+          const { pixels } = await metaService.listPixels(accountId, accessToken);
           return (pixels || []).map((p: any) => ({ pixelId: p.id, accountId, accountName: acc.accountName }));
         } catch (err) {
           console.error(`[MetaV2] /pixels: skipping account ${acc.accountId} (lookup failed):`, err);

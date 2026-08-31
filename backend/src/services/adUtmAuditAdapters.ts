@@ -40,7 +40,7 @@ async function metaAccessToken(): Promise<string> {
 export const metaAdReadPort: AdReadPort = {
   async listCampaigns(_userId: string, accountId: string) {
     const token = await metaAccessToken();
-    const campaigns = await metaService.listCampaigns(accountId, token);
+    const { campaigns } = await metaService.listCampaigns(accountId, token);
     return (campaigns ?? []).map((c: any) => ({
       id: String(c.id),
       name: c.name ?? "",
@@ -52,7 +52,7 @@ export const metaAdReadPort: AdReadPort = {
     // The campaignId is pushed down to Meta's `filtering` param so we do not refetch the whole
     // account's ads once per campaign. We ALSO filter here: if Meta ever ignores the filter, an
     // unfiltered response must not attribute another campaign's ads to this one.
-    const ads = await metaService.listAdsForUtmAudit(accountId, token, campaignId);
+    const { items: ads } = await metaService.listAdsForUtmAudit(accountId, token, campaignId);
     return ads
       .filter((ad) => ad.campaignId === campaignId)
       .map((ad) => ({

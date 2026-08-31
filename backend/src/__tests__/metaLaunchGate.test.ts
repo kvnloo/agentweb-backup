@@ -37,8 +37,8 @@ const creds = { accountId: ACCOUNT, accessToken: 'tok' };
 describe('Meta launch gate (ENG-941)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockListPixels.mockResolvedValue([{ id: PIXEL, name: 'Test Pixel' }]);
-    mockListAds.mockResolvedValue([{ adId: 'a1', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/lp'] }]);
+    mockListPixels.mockResolvedValue({ pixels: [{ id: PIXEL, name: 'Test Pixel' }], truncated: false, pagesFetched: 1 });
+    mockListAds.mockResolvedValue({ items: [{ adId: 'a1', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/lp'] }], truncated: false, pagesFetched: 1 });
     mockPreflight.mockResolvedValue({ ok: true, results: [], blockedUrls: [], message: '' });
   });
 
@@ -72,23 +72,23 @@ describe('Meta launch gate (ENG-941)', () => {
   });
 
   it('passes the ad account\'s own pixel ids into the check', async () => {
-    mockListPixels.mockResolvedValue([{ id: PIXEL }, { id: '999' }]);
+    mockListPixels.mockResolvedValue({ pixels: [{ id: PIXEL }, { id: '999' }], truncated: false, pagesFetched: 1 });
     await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-1');
     expect(mockPreflight).toHaveBeenCalledWith(['https://site.example/lp'], [PIXEL, '999']);
   });
 
   it('gathers destinations across every ad in the campaign', async () => {
-    mockListAds.mockResolvedValue([
+    mockListAds.mockResolvedValue({ items: [
       { adId: 'a1', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/one'] },
       { adId: 'a2', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/two', 'https://site.example/one'] },
-    ]);
+    ], truncated: false, pagesFetched: 1 });
     await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-1');
     const urls = mockPreflight.mock.calls[0][0];
     expect(urls).toEqual(expect.arrayContaining(['https://site.example/one', 'https://site.example/two']));
   });
 
   it('proceeds when the campaign has no serving destinations yet — nothing to gate', async () => {
-    mockListAds.mockResolvedValue([]);
+    mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'CREATE', false, 'sess-1');
     expect(out.proceed).toBe(true);
     expect(mockPreflight).not.toHaveBeenCalled();
@@ -252,19 +252,19 @@ describe('scoping and bypass fixes (ENG-941)', () => {
   });
 
   it('judges a single ad on its own destination, not its siblings', async () => {
-    mockListAds.mockResolvedValue([
+    mockListAds.mockResolvedValue({ items: [
       { adId: 'ad-good', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/good'] },
       { adId: 'ad-bad', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/bad'] },
-    ]);
+    ], truncated: false, pagesFetched: 1 });
     await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_UPDATE', false, 'sess-1', {}, 'ad-good');
     expect(mockPreflight).toHaveBeenCalledWith(['https://site.example/good'], [PIXEL]);
   });
 
   it('checks the whole campaign when no single ad is named', async () => {
-    mockListAds.mockResolvedValue([
+    mockListAds.mockResolvedValue({ items: [
       { adId: 'ad-good', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/good'] },
       { adId: 'ad-bad', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/bad'] },
-    ]);
+    ], truncated: false, pagesFetched: 1 });
     await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_SET_UPDATE', false, 'sess-1');
     const urls = mockPreflight.mock.calls[0][0];
     expect(urls).toEqual(['https://site.example/good', 'https://site.example/bad']);
@@ -302,9 +302,9 @@ describe('Greptile findings (ENG-941)', () => {
   });
 
   it('checks a newly created ad\'s own destination, not just the existing campaign ads', async () => {
-    mockListAds.mockResolvedValue([
+    mockListAds.mockResolvedValue({ items: [
       { adId: 'existing', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/already-fine'] },
-    ]);
+    ], truncated: false, pagesFetched: 1 });
     await _runMetaTrackingGateForTest(
       creds, CAMPAIGN, 'AD_CREATE', false, 'sess-1', {}, undefined, ['https://site.example/brand-new'],
     );
@@ -346,9 +346,9 @@ describe('referenced creative destinations (ENG-941)', () => {
   });
 
   it('uses the swapped-in destination instead of the ad\'s current one', async () => {
-    mockListAds.mockResolvedValue([
+    mockListAds.mockResolvedValue({ items: [
       { adId: 'ad-42', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/old'] },
-    ]);
+    ], truncated: false, pagesFetched: 1 });
     await _runMetaTrackingGateForTest(
       creds, CAMPAIGN, 'AD_UPDATE', false, 'sess-1',
       { resolveCreativeDestinations: jest.fn().mockResolvedValue(['https://site.example/new']) },
@@ -358,7 +358,7 @@ describe('referenced creative destinations (ENG-941)', () => {
   });
 
   it('resolves a referenced creative to its destination and checks it', async () => {
-    mockListAds.mockResolvedValue([]);
+    mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     const resolveCreativeDestinations = jest.fn().mockResolvedValue(['https://site.example/referenced']);
     await _runMetaTrackingGateForTest(
       creds, CAMPAIGN, 'AD_CREATE', false, 'sess-1',
@@ -369,7 +369,7 @@ describe('referenced creative destinations (ENG-941)', () => {
   });
 
   it('blocks when a referenced creative cannot be resolved — an unreadable destination is not a measured one', async () => {
-    mockListAds.mockResolvedValue([]);
+    mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     const resolveCreativeDestinations = jest.fn().mockRejectedValue(new Error('Graph 400'));
     const out = await _runMetaTrackingGateForTest(
       creds, CAMPAIGN, 'AD_CREATE', false, 'sess-1',
@@ -382,7 +382,7 @@ describe('referenced creative destinations (ENG-941)', () => {
   });
 
   it('blocks when a referenced creative resolves to no destination at all — the shape was not understood', async () => {
-    mockListAds.mockResolvedValue([]);
+    mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     const out = await _runMetaTrackingGateForTest(
       creds, CAMPAIGN, 'AD_CREATE', false, 'sess-1',
       { resolveCreativeDestinations: jest.fn().mockResolvedValue([]) }, undefined, [], ['120299'],
@@ -392,7 +392,7 @@ describe('referenced creative destinations (ENG-941)', () => {
   });
 
   it('still honours an explicit override when a creative cannot be resolved', async () => {
-    mockListAds.mockResolvedValue([]);
+    mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     const out = await _runMetaTrackingGateForTest(
       creds, CAMPAIGN, 'AD_CREATE', true, 'sess-1',
       { resolveCreativeDestinations: jest.fn().mockRejectedValue(new Error('Graph 400')) }, undefined, [], ['120299'],
@@ -446,9 +446,9 @@ describe('inline creative swap on AD UPDATE (ENG-941)', () => {
   });
 
   it('checks the inline new destination rather than the ad\'s current one', async () => {
-    mockListAds.mockResolvedValue([
+    mockListAds.mockResolvedValue({ items: [
       { adId: 'ad-42', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/old'] },
-    ]);
+    ], truncated: false, pagesFetched: 1 });
     await _runMetaTrackingGateForTest(
       creds, CAMPAIGN, 'AD_UPDATE', false, 'sess-1', {}, 'ad-42', ['https://site.example/new'],
     );
@@ -535,9 +535,9 @@ describe('destination aliases on AD writes (ENG-941)', () => {
  */
 describe('named-ad scoping must not silently pass (ENG-941)', () => {
   it('blocks when the named ad is not in the campaign being checked', async () => {
-    mockListAds.mockResolvedValue([
+    mockListAds.mockResolvedValue({ items: [
       { adId: 'someone-else', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/other'] },
-    ]);
+    ], truncated: false, pagesFetched: 1 });
     const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42');
     expect(out.proceed).toBe(false);
     expect(out.blockResult.error).toContain('ad-42');
@@ -546,7 +546,7 @@ describe('named-ad scoping must not silently pass (ENG-941)', () => {
   });
 
   it('proceeds when the copy carries its own destination, which is what will serve', async () => {
-    mockListAds.mockResolvedValue([]);
+    mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     await _runMetaTrackingGateForTest(
       creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42', ['https://site.example/new'],
     );
@@ -554,13 +554,13 @@ describe('named-ad scoping must not silently pass (ENG-941)', () => {
   });
 
   it('still lets a campaign with nothing serving through when no single ad was named', async () => {
-    mockListAds.mockResolvedValue([]);
+    mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'CAMPAIGN_UPDATE', false, 'sess-1');
     expect(out.proceed).toBe(true);
   });
 
   it('honours an explicit override when the named ad cannot be found', async () => {
-    mockListAds.mockResolvedValue([]);
+    mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', true, 'sess-1', {}, 'ad-42');
     expect(out.proceed).toBe(true);
     expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'overridden' }));
@@ -577,26 +577,26 @@ describe('named-ad scoping must not silently pass (ENG-941)', () => {
 describe('named-ad lookup falls back to the account before blocking (ENG-941)', () => {
   it('verifies a copy whose source ad lives in a different campaign', async () => {
     mockListAds
-      .mockResolvedValueOnce([]) // campaign-scoped: source ad is not in this campaign
-      .mockResolvedValueOnce([   // account-wide: it is right here
+      .mockResolvedValueOnce({ items: [], truncated: false, pagesFetched: 1 }) // campaign-scoped: source ad is not in this campaign
+      .mockResolvedValueOnce({ items: [   // account-wide: it is right here
         { adId: 'ad-42', campaignId: 'other-campaign', destinationUrls: ['https://site.example/source'] },
-      ]);
+      ], truncated: false, pagesFetched: 1 });
     const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42');
     expect(out.proceed).toBe(true);
     expect(mockPreflight.mock.calls[0][0]).toEqual(['https://site.example/source']);
   });
 
   it('still blocks when the ad cannot be found anywhere on the account', async () => {
-    mockListAds.mockResolvedValue([]);
+    mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42');
     expect(out.proceed).toBe(false);
     expect(out.blockResult.error).toContain('ad-42');
   });
 
   it('does not pay for the account-wide lookup when the campaign scope already found the ad', async () => {
-    mockListAds.mockResolvedValue([
+    mockListAds.mockResolvedValue({ items: [
       { adId: 'ad-42', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/lp'] },
-    ]);
+    ], truncated: false, pagesFetched: 1 });
     await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42');
     expect(mockListAds).toHaveBeenCalledTimes(1);
   });
