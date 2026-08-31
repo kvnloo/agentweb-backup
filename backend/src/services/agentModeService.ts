@@ -16950,7 +16950,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           // discovery impossible in-product (ENG-399). The pixel id is the dataset id that
           // GET_MATCH_QUALITY consumes, so derive it directly and issue no per-pixel call at all.
           // Same conclusion the lander pixel resolver already reached (metaService.ts).
-          const pixels = await metaService.listPixels(accountId, accessToken);
+          const { pixels, truncated } = await metaService.listPixels(accountId, accessToken);
           const results = pixels.map((pixel: any) => ({
             pixel_id: pixel.id,
             pixel_name: pixel.name,
@@ -16958,11 +16958,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             dataset_id: pixel.id,
             datasets: [{ id: pixel.id, name: pixel.name }]
           }));
-          return {
-            success: true,
-            message: `Found ${pixels.length} pixel(s); each pixel id doubles as its dataset id for GET_MATCH_QUALITY`,
-            pixels: results
-          };
+          // ENG-1625 follow-up: this used to be `Found ${pixels.length} pixel(s)` with no
+          // bound — the exact ENG-1476/ENG-1584 sentence shape.
+          return buildListResult({
+            payloadKey: 'pixels',
+            payload: results,
+            message: `${buildListMessage({
+              noun: 'pixel(s)',
+              totalCount: results.length,
+              truncated,
+              campaignScopable: false,
+            })} Each pixel id doubles as its dataset id for GET_MATCH_QUALITY.`,
+            truncated,
+          }) as MetaApiResult;
         }
         case 'GET_MATCH_QUALITY': {
           const datasetId = params.dataset_id;
@@ -17089,17 +17097,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // budget_remaining, bid_strategy), the intended ENG-398 change, for every plain LIST
       // caller regardless of this branch.
       const hasSelector = Boolean(options.campaignId || options.fields);
-      const campaigns = (hasSelector
+      const result = hasSelector
         ? await metaService.listCampaigns(accountId, accessToken, options)
-        : await metaService.listCampaigns(accountId, accessToken)) || [];
-      const totalCount = Array.isArray(campaigns) ? campaigns.length : 0;
+        : await metaService.listCampaigns(accountId, accessToken);
+      const campaigns = result?.campaigns ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} campaign(s)`,
-        campaigns: campaigns,
-        totalCount: totalCount
-      };
+      // ENG-1625 follow-up: this used to be `Found ${totalCount} campaign(s)` with no scope
+      // or bound — the exact ENG-1476/ENG-1584 sentence shape. Assembled via buildListResult
+      // so completeness metadata precedes the payload (S3 offload cut — see metaListScope.ts).
+      return buildListResult({
+        payloadKey: 'campaigns',
+        payload: campaigns,
+        message: buildListMessage({
+          noun: 'campaign(s)',
+          totalCount: campaigns.length,
+          truncated: result?.truncated,
+          // Campaign LIST has no parent scope to name (it either lists the whole account or
+          // fetches one campaign by id, never "campaigns scoped to X").
+          campaignScopable: false,
+        }),
+        truncated: result?.truncated,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       // A permission refusal from Meta is not a "no campaigns" result — throw the
@@ -17283,17 +17301,28 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // billing_event, destination_type, promoted_object, bid_strategy), the intended
       // ENG-398 change, for every plain LIST caller regardless of this branch.
       const hasSelector = Boolean(options.adSetId || options.fields);
-      const adSets = (hasSelector
+      const result = hasSelector
         ? await metaService.listAdSets(accountId, accessToken, campaignId, options)
-        : await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
-      const totalCount = Array.isArray(adSets) ? adSets.length : 0;
+        : await metaService.listAdSets(accountId, accessToken, campaignId);
+      const adSets = result?.adSets ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} ad set(s)`,
-        adSets: adSets,
-        totalCount: totalCount
-      };
+      // ENG-1625 follow-up: this used to be `Found ${totalCount} ad set(s)` with no scope or
+      // bound — the exact ENG-1476/ENG-1584 sentence shape, and campaign_id scoping went
+      // through a bare param Meta's docs do not list as supported on this edge (fixed in
+      // metaService.listAdSets to go through the campaign node instead).
+      return buildListResult({
+        payloadKey: 'adSets',
+        payload: adSets,
+        message: buildListMessage({
+          noun: 'ad set(s)',
+          totalCount: adSets.length,
+          scope: result?.scope,
+          truncated: result?.truncated,
+          campaignScopable: true,
+        }),
+        truncated: result?.truncated,
+        scope: result?.scope,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ad sets:', error);
@@ -19581,13 +19610,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       switch (action) {
         case 'LIST': {
-          const result = await metaService.listCustomAudiences(accountId, accessToken);
-          const audiences = Array.isArray(result) ? result : [];
-          return {
-            success: true,
-            message: `Found ${audiences.length} custom audience(s)`,
-            audiences: audiences
-          };
+          const { audiences, truncated } = await metaService.listCustomAudiences(accountId, accessToken);
+          // ENG-1625 follow-up: this used to be `Found ${audiences.length} custom audience(s)`
+          // with no bound — the exact ENG-1476/ENG-1584 sentence shape (the old code also
+          // hard-capped at 50 with no truncation signal past that cap).
+          return buildListResult({
+            payloadKey: 'audiences',
+            payload: audiences,
+            message: buildListMessage({
+              noun: 'custom audience(s)',
+              totalCount: audiences.length,
+              truncated,
+              campaignScopable: false,
+            }),
+            truncated,
+          }) as MetaApiResult;
         }
         case 'CREATE': {
           // Validate required fields
