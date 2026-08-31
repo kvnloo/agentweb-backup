@@ -51,7 +51,7 @@ export interface ScheduledPublishGuardDeps {
 }
 
 async function defaultDeps(): Promise<ScheduledPublishGuardDeps> {
-  const [{ chatbotDb }, { scheduleDb }, { getAccountsWithOwnerIncludingOrgShared }] = await Promise.all([
+  const [{ chatbotDb }, { scheduleDb }, { getAccountsWithOwnerIncludingOrgShared, SOCIAL_POSTING_PLATFORMS }] = await Promise.all([
     import('../services/chatbotService'),
     import('../services/db'),
     import('../services/connectedAccountsDb'),
@@ -63,9 +63,10 @@ async function defaultDeps(): Promise<ScheduledPublishGuardDeps> {
       const accounts = await getAccountsWithOwnerIncludingOrgShared(userId);
       // account_id alone does not identify an account — the same id can sit on two
       // platforms — so narrow to social-posting platforms first, mirroring
-      // postOnConnectedAccount's own socialAccounts filter.
+      // postOnConnectedAccount's own socialAccounts filter (SOCIAL_POSTING_PLATFORMS
+      // is the single shared source for that allowlist — see its doc comment).
       const socialAccounts = accounts.filter((a) =>
-        ['twitter', 'linkedin', 'instagram', 'youtube'].includes(a.platform)
+        (SOCIAL_POSTING_PLATFORMS as readonly string[]).includes(a.platform)
       );
       return socialAccounts.find((a) => a.account_id === accountId)?.platform ?? null;
     },
