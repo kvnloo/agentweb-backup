@@ -964,7 +964,10 @@ describe('AgentModeService - Work Plan', () => {
           workPlan: {
             title: 'Plan',
             steps: [
-              { stepCount: 1, title: 'Optional intro', status: 'skipped' },
+              // Starts 'pending', not 'skipped' -- the call below must be a real
+              // status transition (ENG-1626's idempotency short-circuit treats a
+              // same-status call as a no-op and never reaches updateSessionWorkPlan).
+              { stepCount: 1, title: 'Optional intro', status: 'pending' },
               { stepCount: 2, title: 'Generate 3 images', status: 'pending', expectedAssetCount: 3 },
             ],
             createdAt: '2026-08-12T14:54:35.000Z',
@@ -1129,7 +1132,14 @@ describe('AgentModeService - Work Plan', () => {
           workPlan: singleStepWorkPlan(),
         };
 
-        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        // Each read returns an independent clone -- like a real DynamoDB read,
+        // the retry's fresh read must not see the failed first attempt's local
+        // (never-persisted) mutation of workPlan.steps, which would otherwise
+        // make the ENG-1626 idempotency short-circuit mistake this retry for
+        // an already-applied ack-lost write.
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() =>
+          Promise.resolve(JSON.parse(JSON.stringify(mockSession)))
+        );
         (chatbotDb.updateSessionWorkPlan as jest.Mock)
           .mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException: 503 Service Unavailable'))
           .mockResolvedValueOnce(mockSession);
@@ -1148,30 +1158,28 @@ describe('AgentModeService - Work Plan', () => {
           sessionId: mockSessionId,
           userId: mockUserId,
           messages: [],
-          workPlan: {
-            title: 'Plan',
-            // Deliberately out-of-order stepCount so updateSessionWorkPlan throws
-            // its own validation error — a model/data bug, not a transient blip.
-            steps: [{ stepCount: 2, title: 'Step 1', status: 'pending' as const }],
-            createdAt: '2026-08-27T17:00:00.000Z',
-            updatedAt: '2026-08-27T17:00:00.000Z',
-          },
+          workPlan: singleStepWorkPlan(),
         };
 
         (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        // A real invalid_args pattern from toolErrorClassifier's classFromMessage
+        // ("arguments failed schema validation") — a model/data bug, not a
+        // transient blip.
         (chatbotDb.updateSessionWorkPlan as jest.Mock).mockRejectedValue(
-          new Error('Invalid stepCount at index 0: expected 1 but got 2.')
+          new Error('set_work_plan_status arguments failed schema validation: notes must be a string.')
         );
 
         const result = await (agentModeService as any).setWorkPlanStatus(
-          [{ stepCount: 2, status: 'completed' }],
+          [{ stepCount: 1, status: 'completed' }],
           mockSessionId
         );
 
         expect(result.success).toBe(false);
-        expect(result.error).toContain('Invalid stepCount');
-        // Only ONE attempt — a validation bug will not be fixed by retrying the
-        // identical call, so it should not silently double the model's tool budget.
+        expect(result.error).toContain('failed schema validation');
+        // Only ONE attempt — invalid_args is excluded by isRetryableErrorClass, so
+        // the classifier (not an unrecognized-fallback coincidence) is what keeps
+        // a validation bug from being retried and silently doubling the model's
+        // tool budget.
         expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(1);
       });
 
@@ -1183,7 +1191,13 @@ describe('AgentModeService - Work Plan', () => {
           workPlan: singleStepWorkPlan(),
         };
 
-        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        // Same independent-clone-per-read reasoning as the persist-failure test
+        // above -- otherwise the first attempt's local mutation makes the
+        // ENG-1626 idempotency short-circuit skip the second attempt's persist
+        // call entirely.
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() =>
+          Promise.resolve(JSON.parse(JSON.stringify(mockSession)))
+        );
         (chatbotDb.updateSessionWorkPlan as jest.Mock).mockRejectedValue(new Error('ETIMEDOUT'));
 
         const result = await (agentModeService as any).setWorkPlanStatus(
