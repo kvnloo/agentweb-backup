@@ -18,6 +18,7 @@
 
 import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from './termination';
 import { buildTurnTimeBudgetNudge } from '../../../utils/turnTimeBudget';
+import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 
 /**
  * Residue is short by nature — it is the tail of a structure the model failed to
@@ -657,6 +658,52 @@ export function detectFalseCompletionClaim(
  * very count the correction is stating (e.g. "only 4 of 12" next to a list that
  * includes 40 unrelated successes from earlier steps).
  */
+/**
+ * A line stating, as fact, that a capability could not run this turn — or null when every tool
+ * that was refused later succeeded.
+ *
+ * PREPENDED by the caller, and deliberately UNCONDITIONAL rather than gated on detecting a false
+ * claim in the prose. Both of those are the lessons from the live case this exists for: a
+ * delegated session where the skill gate refused `audit_ad_utm_coverage`, `install_skills` was
+ * refused by subscription, and the model then ran an unrelated AD LIST and presented a confident
+ * "UTM Tagging Audit Summary — PASS, 6/6 ads tagged" table built from it. A correction WAS
+ * produced by `buildFalseClaimCorrectionFooter` — but appended below the fabricated table, and
+ * only because that particular claim happened to carry a checkable number.
+ *
+ * So this does not try to decide whether the answer claims the tool ran. Whether a tool was
+ * refused by the gate and never afterwards succeeded is a FACT already in the ledger, needing no
+ * inference, so it cannot false-positive: it only ever states something that definitively
+ * happened. And a claim phrased in a way no detector anticipates is exactly the case a
+ * conditional guard misses, which is why this one is not conditional.
+ *
+ * Redundant when the model was already honest about it. That is the cheap direction to be wrong.
+ */
+export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]): string | null {
+  const refused = new Set<string>();
+  const succeeded = new Set<string>();
+
+  for (const call of toolCalls ?? []) {
+    const name = typeof call?.name === 'string' ? call.name : '';
+    if (!name) continue;
+    if (call?.error === undefined || call?.error === null) {
+      succeeded.add(name);
+      continue;
+    }
+    const err = call.error instanceof Error ? call.error : new Error(String(call.error));
+    if (classifyToolErrorClass(err) === 'tool_unavailable') refused.add(name);
+  }
+
+  // A tool refused once and then installed and run is not an unavailable capability.
+  const unavailable = [...refused].filter((name) => !succeeded.has(name)).sort();
+  if (unavailable.length === 0) return null;
+
+  const names = unavailable.map((n) => `\`${n}\``).join(', ');
+  return (
+    `⚠️ ${unavailable.length === 1 ? 'This capability was' : 'These capabilities were'} not available this turn and did not run: ${names}. ` +
+    `Anything below that would normally come from ${unavailable.length === 1 ? 'it' : 'them'} was not produced by ${unavailable.length === 1 ? 'that tool' : 'those tools'}.`
+  );
+}
+
 export function buildFalseClaimCorrectionFooter(
   claim: FalseCompletionClaim,
   toolCalls: ExecutedToolCall[],

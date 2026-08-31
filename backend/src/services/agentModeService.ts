@@ -46,7 +46,7 @@ import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoAssetUrl,
@@ -4086,6 +4086,30 @@ export class AgentModeService {
                 `${falseClaim.actual} succeeded asset-producing call(s) in session ${sessionId} — appending a correction`
               );
               content = `${content}\n\n${buildFalseClaimCorrectionFooter(falseClaim, toolCalls)}`;
+              if (responseMessage) responseMessage.content = content;
+            }
+          }
+
+          /*
+           * A capability the skill gate refused, and which never afterwards succeeded, is
+           * stated ABOVE the answer — unconditionally, not gated on detecting a false claim.
+           *
+           * The false-claim guard above already existed when a live delegated session produced
+           * a fabricated "UTM Tagging Audit Summary — PASS, 6/6 ads tagged" table after
+           * `audit_ad_utm_coverage` was gated and `install_skills` was refused by subscription.
+           * It caught that one only because the claim carried a checkable number, and it put the
+           * correction BELOW the fabricated table. Both are why this is prepended and why it
+           * does not try to decide whether the prose claims the tool ran: that a tool was
+           * refused and never succeeded is a fact in the ledger, so this cannot false-positive.
+           */
+          if (content) {
+            const unavailableNotice = buildUnavailableCapabilityNotice(toolCalls);
+            if (unavailableNotice) {
+              console.warn(
+                `AgentMode: a gated tool never succeeded in session ${sessionId} — prepending an ` +
+                `unavailable-capability notice so the answer cannot read as that tool's output`
+              );
+              content = `${unavailableNotice}\n\n${content}`;
               if (responseMessage) responseMessage.content = content;
             }
           }
