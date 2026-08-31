@@ -5865,9 +5865,21 @@ export class AgentModeService {
 
       if (!installedNames.length) {
         if (rejectedSkillIds.length > 0) {
-          return { message: "The requested skills are not available with your current subscription." };
+          /*
+           * `success: false` matters as much as the text: the success path returns
+           * `success: true`, so a bare `{ message }` left `success` undefined and this refusal
+           * did not necessarily read as a hard failure. Combined with a gated tool upstream,
+           * that is how a model ends up substituting another tool's output and presenting it
+           * as the gated tool's result.
+           */
+          return {
+            success: false,
+            message: "The requested skills are not available with your current subscription."
+              + " Tell the user plainly that this capability is not on their plan."
+              + " Do NOT substitute a different tool's output for the tool that needed this skill, and do not describe that tool as having run.",
+          };
         }
-        return { message: "No valid skills found for the provided IDs." };
+        return { success: false, message: "No valid skills found for the provided IDs." };
       }
 
       const result: any = {
