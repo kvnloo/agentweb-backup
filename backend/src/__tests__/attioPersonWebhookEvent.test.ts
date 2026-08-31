@@ -484,4 +484,68 @@ describe('applyAttioPersonEvent', () => {
     expect(svc.getPersonValues).not.toHaveBeenCalled();
     expect(mockDeleteLead).toHaveBeenCalledWith('list-1', 'lead-2');
   });
+
+  // CodeRabbit finding (ENG-1380): these internal try/catches log-and-return
+  // rather than rethrow, so a caller relying on a caught exception to detect
+  // failure (crmWebhook.ts / webhooks.ts's per-event try/catch) never saw it
+  // and stamped lastPullSyncAt/lastSyncStatus as a false 'success'. The
+  // return value, not just an uncaught throw, is the failure signal callers
+  // must check.
+  describe('return-value failure signalling', () => {
+    it('returns false (not a throw) when getPersonValues fails for a create/update event', async () => {
+      const svc = makeSvc({});
+      svc.getPersonValues.mockRejectedValue(new Error('Attio 500'));
+
+      await expect(
+        applyAttioPersonEvent('list-1', baseConfig, svc as any, {
+          event_type: 'record.created',
+          id: { record_id: 'rec-1' },
+        })
+      ).resolves.toBe(false);
+    });
+
+    it('returns false (not a throw) when deleteLead fails for a record.deleted event', async () => {
+      const svc = makeSvc({});
+      mockGetLeadByAttioRecordId.mockResolvedValue({ leadId: 'lead-2' });
+      mockDeleteLead.mockRejectedValue(new Error('DynamoDB conditional check failed'));
+
+      await expect(
+        applyAttioPersonEvent('list-1', baseConfig, svc as any, {
+          event_type: 'record.deleted',
+          id: { record_id: 'rec-1' },
+        })
+      ).resolves.toBe(false);
+    });
+
+    it('returns true on a successful create', async () => {
+      const svc = makeSvc({ email_addresses: [{ email_address: 'a@b.com' }] });
+      mockGetLeadByAttioRecordId.mockResolvedValue(null);
+      mockGetLeadByEmail.mockResolvedValue(null);
+      mockCreateLead.mockResolvedValue({ leadId: 'new-1' });
+
+      await expect(
+        applyAttioPersonEvent('list-1', baseConfig, svc as any, {
+          event_type: 'record.created',
+          id: { record_id: 'rec-1' },
+        })
+      ).resolves.toBe(true);
+    });
+
+    it('returns true for an intentional no-op (irrelevant event_type)', async () => {
+      const svc = makeSvc({});
+      await expect(
+        applyAttioPersonEvent('list-1', baseConfig, svc as any, { event_type: 'record.attribute.updated', id: { record_id: 'rec-1' } })
+      ).resolves.toBe(true);
+    });
+
+    it('returns true for an intentional no-op (deleteOnPull disabled)', async () => {
+      const svc = makeSvc({});
+      await expect(
+        applyAttioPersonEvent('list-1', { ...baseConfig, deleteOnPull: false }, svc as any, {
+          event_type: 'record.deleted',
+          id: { record_id: 'rec-1' },
+        })
+      ).resolves.toBe(true);
+    });
+  });
 });

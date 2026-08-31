@@ -171,7 +171,10 @@ describe('POST /api/webhooks/attio — shared OAuth webhook', () => {
     mockEnqueueJob.mockResolvedValue('enqueued');
     mockMarkJobComplete.mockResolvedValue(undefined);
     mockMarkJobFailed.mockResolvedValue(undefined);
-    mockApplyAttioPersonEvent.mockResolvedValue(undefined);
+    // true = applied successfully; applyAttioPersonEvent now signals failure
+    // via its return value, not only a throw (ENG-1380) — an undefined
+    // default here would falsely flag every event as failed.
+    mockApplyAttioPersonEvent.mockResolvedValue(true);
     mockApplyListEntryWebhookEvent.mockResolvedValue(undefined);
   });
 

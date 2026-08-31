@@ -21,6 +21,16 @@ import { mergeCustomFields } from './customFieldsGuard';
  * equal to our own Attio app's client_id — NOT `actor.type: 'api-token'`,
  * which the original assumption in this codebase had checked and which
  * never actually matched.
+ *
+ * Returns `false` only for a genuine failure to apply the event (fetch or
+ * deletion threw) — every other early return (irrelevant event type, wrong
+ * object type, self-authored echo, deleteOnPull disabled, no email on the
+ * record) is an intentional no-op and returns `true`. CodeRabbit correctly
+ * flagged (ENG-1380) that these internal try/catches log-and-return rather
+ * than rethrow, so a caller relying on a caught exception to detect failure
+ * (the per-event try/catch in crmWebhook.ts/webhooks.ts) never saw it and
+ * stamped lastPullSyncAt/lastSyncStatus as a false 'success'. Callers must
+ * check this return value, not just catch.
  */
 export async function applyAttioPersonEvent(
   listId: string,
@@ -35,7 +45,7 @@ export async function applyAttioPersonEvent(
   // a time (the per-list webhook endpoint) can omit this and it's fetched
   // internally, unchanged from before.
   sharedAttrCache?: Map<string, string>,
-): Promise<void> {
+): Promise<boolean> {
   const eventType: string = event?.event_type ?? '';
   const recordId: string = event?.data?.record?.id?.record_id ?? event?.id?.record_id ?? '';
   const actorType: string = event?.actor?.type ?? event?.data?.actor?.type ?? '';
@@ -48,20 +58,20 @@ export async function applyAttioPersonEvent(
   const objectId: string = event?.id?.object_id ?? event?.data?.object?.id ?? '';
 
   const relevant = ['record.created', 'record.updated', 'record.deleted'].includes(eventType);
-  if (!relevant || !recordId) return;
+  if (!relevant || !recordId) return true;
 
   // Only process People records — skip Companies and other object types.
   let objectSlug = objectSlugDirect;
   if (!objectSlug && objectId) {
     objectSlug = (await svc.getObjectSlug(objectId).catch(() => null)) ?? '';
   }
-  if (objectSlug && objectSlug !== 'people') return;
+  if (objectSlug && objectSlug !== 'people') return true;
 
   if (actorType === 'app') {
     const { clientId } = await getAttioConfig();
     if (actorId === clientId) {
       console.log(`[AttioWebhook] Skipping self-authored event for recordId=${recordId}`);
-      return;
+      return true;
     }
   }
   // Note: AttioService.fromToken (manual/PAT) connections write as actor.type
@@ -74,7 +84,7 @@ export async function applyAttioPersonEvent(
   if (eventType === 'record.deleted') {
     if (!config.deleteOnPull) {
       console.log(`[AttioWebhook] deletion event for recordId=${recordId} ignored (deleteOnPull is disabled)`);
-      return;
+      return true;
     }
     try {
       // Live-caught bug (ENG-1380): a deleted record can no longer be
@@ -89,10 +99,11 @@ export async function applyAttioPersonEvent(
         await crmDb.deleteLead(listId, lead.leadId);
         console.log(`[AttioWebhook] Deleted lead ${lead.leadId} from list ${listId}`);
       }
+      return true;
     } catch (err: any) {
       console.error(`[AttioWebhook] Failed to process deletion for recordId=${recordId}:`, err?.message);
+      return false;
     }
-    return;
   }
 
   let values: Record<string, any>;
@@ -100,7 +111,7 @@ export async function applyAttioPersonEvent(
     values = await svc.getPersonValues(recordId);
   } catch (err: any) {
     console.error(`[AttioWebhook] Failed to fetch person values for recordId=${recordId}:`, err?.message);
-    return;
+    return false;
   }
 
   // Config-driven field extraction, mirroring attioAdapter.ts's pullContacts
@@ -158,7 +169,7 @@ export async function applyAttioPersonEvent(
   const email: string | undefined = leadData.email;
   if (!email) {
     console.log(`[AttioWebhook] No email for recordId=${recordId}, skipping`);
-    return;
+    return true;
   }
   delete leadData.email; // used only as the lookup key / stamped separately below
 
@@ -207,4 +218,5 @@ export async function applyAttioPersonEvent(
       console.log(`[AttioWebhook] Updated lead ${lead.leadId} in list ${listId}`);
     }
   }
+  return true;
 }

@@ -240,9 +240,14 @@ async function handleAttioEvent(
 
     // Per-event try/catch — without it, a single throw aborted the whole
     // loop and skipped every remaining event, not just the failed one.
+    // applyAttioPersonEvent also catches its own fetch/deletion failures
+    // internally and returns false rather than throwing (CodeRabbit finding,
+    // ENG-1380) — the boolean check below, not just the catch, is what
+    // detects those.
     for (const event of events) {
       try {
-        await applyAttioPersonEvent(listId, config, svc, event);
+        const applied = await applyAttioPersonEvent(listId, config, svc, event);
+        if (!applied) anyEventFailed = true;
       } catch (err: any) {
         console.error(`[CrmWebhook] Failed to apply Attio event for list ${listId}:`, err?.message ?? err);
         anyEventFailed = true;

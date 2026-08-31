@@ -1177,7 +1177,11 @@ export async function processAttioWebhookJob(payload: AttioJobPayload): Promise<
       try {
         if (eventType.startsWith('record.')) {
           appliedAnyEvent = true;
-          await applyAttioPersonEvent(list.listId, syncConfig, svc, event, peopleAttrCache);
+          // applyAttioPersonEvent catches its own fetch/deletion failures
+          // internally and returns false rather than throwing (CodeRabbit
+          // finding, ENG-1380) — check the return value, not just the catch.
+          const applied = await applyAttioPersonEvent(list.listId, syncConfig, svc, event, peopleAttrCache);
+          if (!applied) anyEventFailed = true;
         } else if (eventType.startsWith('list-entry.')) {
           const entryId: string = event?.id?.entry_id ?? event?.data?.entry_id ?? '';
           if (entryId) {
