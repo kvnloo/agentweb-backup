@@ -31,17 +31,16 @@ jest.mock('../utils/secretsManager', () => ({
 }));
 
 /**
- * ENG-1476 follow-up: a single-entity CAMPAIGN/AD_SET fetch now runs an ownership lookup
- * (`node.get(['account_id'])`) before reading fields, because a node id is global and is not
- * bounded by the selected ad account. Mock that the way Meta actually answers — `account_id`
- * for the ownership probe, the entity payload for the field read — rather than returning the
- * payload for both, which would let a fixture pass an ownership check no real account would.
+ * ENG-1476 follow-up: a single-entity CAMPAIGN/AD_SET fetch verifies ownership because a node id
+ * is global and is not bounded by the selected ad account. It requests `account_id` alongside the
+ * caller's fields, so Graph answers both in ONE response — mock it that way rather than omitting
+ * the field, which would let a fixture fail a check no real account would.
  */
 function mockNodeGet(accountId: string, data: Record<string, any>) {
-  return jest.fn().mockImplementation((f?: any) =>
-    Array.isArray(f) && f.length === 1 && f[0] === 'account_id'
-      ? Promise.resolve({ _data: { account_id: accountId } })
-      : Promise.resolve({ _data: data }),
+  // The single-entity read asks for `account_id` ALONGSIDE the caller's fields and checks
+  // ownership from that same response, so Graph answers both in one payload.
+  return jest.fn().mockImplementation(() =>
+    Promise.resolve({ _data: { ...data, account_id: accountId } }),
   );
 }
 
@@ -351,7 +350,9 @@ describe('MetaService CAMPAIGN effective_status / special_ad_categories read (EN
       fields: 'effective_status,special_ad_categories',
     });
 
-    expect(get).toHaveBeenCalledWith(['effective_status', 'special_ad_categories']);
+    // The single-entity read also asks for `account_id` to verify ownership in the same call.
+    // What this pins is that the caller's selection is honoured, not the exact array.
+    expect(get).toHaveBeenCalledWith(expect.arrayContaining(['effective_status', 'special_ad_categories']));
     expect(result).toEqual({
       campaigns: [{ id: 'camp_9', effective_status: 'CAMPAIGN_PAUSED', special_ad_categories: ['NONE'] }],
       truncated: false,

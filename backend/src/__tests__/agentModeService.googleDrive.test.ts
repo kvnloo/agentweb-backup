@@ -1151,7 +1151,22 @@ describe('AgentModeService - Google Drive methods', () => {
         expect(mockDriveFiles.list).toHaveBeenCalled();
         for (const call of mockDriveFiles.list.mock.calls) {
           expect(call[1]).toEqual(expect.objectContaining({ timeout: expect.any(Number) }));
+          // Derived from the walk's REMAINING budget, so it can never be longer than the walk
+          // itself would allow — a per-request timeout must not outlive the bound it protects.
           expect(call[1].timeout).toBeGreaterThan(0);
+          expect(call[1].timeout).toBeLessThanOrEqual(15_000);
+        }
+      });
+
+      it('never sends timeout: 0, which gaxios reads as no timeout at all', async () => {
+        // A budget that has all but expired must still floor above zero: `timeout: 0` would
+        // silently restore the unbounded request this exists to prevent.
+        mockDriveFiles.list.mockImplementation(() => Promise.resolve({ data: { files: [] } }));
+
+        await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        for (const call of mockDriveFiles.list.mock.calls) {
+          expect(call[1].timeout).toBeGreaterThanOrEqual(1_000);
         }
       });
 

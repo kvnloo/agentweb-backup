@@ -1260,12 +1260,21 @@ export class MetaService {
         const campaign = new Campaign(wantedId);
         // A node id is global — `new Campaign(id)` is NOT bounded by the ad account the way
         // the `/act_X/` edge is, and one Meta OAuth token routinely spans several ad accounts.
-        // Without this the selected-account scope is advisory: a caller could read a campaign
-        // from an account it never selected. Same boundary the campaign-scoped list path
-        // already enforces below; this single-entity path just never got it.
-        await this.assertNodeInAccount(campaign, wantedId, 'Campaign', adAccountId);
-        const result = await MetaService.withReadDeadline<any>(() => campaign.get(fields), 'single campaign fetch');
-        return { campaigns: [result._data], truncated: false, pagesFetched: 1 };
+        // Without a check the selected-account scope is advisory: a caller could read a campaign
+        // from an account it never selected.
+        //
+        // `account_id` is requested ALONGSIDE the caller's fields so ownership is answered by the
+        // same response as the payload — one round trip, and no separate probe that could fail on
+        // its own and refuse a read which would otherwise have succeeded.
+        const result = await MetaService.withReadDeadline<any>(
+          () => campaign.get(MetaService.withOwnershipField(fields)),
+          'single campaign fetch',
+        );
+        const data = { ...(result?._data ?? {}) };
+        MetaService.assertOwnedByAccount(data.account_id, wantedId, 'Campaign', adAccountId);
+        // Requested for the check, not by the caller — do not change the payload shape.
+        if (!fields.includes('account_id')) delete data.account_id;
+        return { campaigns: [data], truncated: false, pagesFetched: 1 };
       }
       const account = new AdAccount(`act_${adAccountId}`);
       const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
@@ -1397,10 +1406,17 @@ export class MetaService {
         const wantedId = MetaService.resolveScopeId(options.adSetId, 'ad_set_id')!;
         this.log(`Fetching single ad set ${wantedId}`, { fields });
         const adSet = new AdSet(wantedId);
-        // Same global-node-id boundary as the single-campaign fetch above.
-        await this.assertNodeInAccount(adSet, wantedId, 'Ad set', adAccountId);
-        const result = await MetaService.withReadDeadline<any>(() => adSet.get(fields), 'single ad set fetch');
-        return { adSets: [result._data], truncated: false, pagesFetched: 1, scope: { adSetId: wantedId } };
+        // Same global-node-id boundary, and the same one-round-trip check, as the single
+        // campaign fetch above.
+        const result = await MetaService.withReadDeadline<any>(
+          () => adSet.get(MetaService.withOwnershipField(fields)),
+          'single ad set fetch',
+        );
+        const data = { ...(result?._data ?? {}) };
+        MetaService.assertOwnedByAccount(data.account_id, wantedId, 'Ad set', adAccountId);
+        // Requested for the check, not by the caller — do not change the payload shape.
+        if (!fields.includes('account_id')) delete data.account_id;
+        return { adSets: [data], truncated: false, pagesFetched: 1, scope: { adSetId: wantedId } };
       }
 
       const wantedCampaign = MetaService.resolveScopeId(campaignId, 'campaign_id');
@@ -2056,6 +2072,11 @@ export class MetaService {
    *
    * `undefined`/`null` means "not supplied" and legitimately selects the broader source.
    */
+  /** Add `account_id` to a field selection so a single-entity read can verify its own ownership. */
+  private static withOwnershipField(fields: string[]): string[] {
+    return fields.includes('account_id') ? fields : [...fields, 'account_id'];
+  }
+
   private static resolveScopeId(value: unknown, label: string): string | undefined {
     if (value === undefined || value === null) return undefined;
     const trimmed = String(value).trim();
@@ -2108,8 +2129,27 @@ export class MetaService {
       );
     }
 
+    MetaService.assertOwnedByAccount(data.account_id, nodeId, nodeLabel, adAccountId);
+  }
+
+  /**
+   * Compare an ALREADY-READ `account_id` against the selected ad account and refuse a mismatch.
+   *
+   * Split out of `assertNodeInAccount` so a caller about to read the node anyway can request
+   * `account_id` in the SAME call and check it here — one round trip instead of two. That
+   * matters on the single-entity paths: a separate probe would double the Graph calls on a
+   * routine read-back path AND add a failure mode of its own, refusing a read that would
+   * otherwise have succeeded because the probe blipped. Edge-scoped callers still need
+   * `assertNodeInAccount`, having no payload response to fold the field into.
+   */
+  private static assertOwnedByAccount(
+    ownerAccountId: unknown,
+    nodeId: string,
+    nodeLabel: string,
+    adAccountId: string,
+  ): void {
     const norm = (id: unknown) => String(id ?? '').replace(/^act_/, '').trim();
-    const owner = norm(data.account_id);
+    const owner = norm(ownerAccountId);
     const selected = norm(adAccountId);
 
     /*
@@ -2125,7 +2165,8 @@ export class MetaService {
     const refuse = (serverDetail: string): never => {
       console.warn(`[MetaService] scope ownership refused: ${serverDetail}`);
       throw new Error(
-        `The requested ${nodeLabel.toLowerCase()} is not available in the selected ad account.`,
+        `The requested ${nodeLabel.toLowerCase()} is not available in the selected ad account. ` +
+        `If it belongs to a different ad account, select that account and try again.`,
       );
     };
 

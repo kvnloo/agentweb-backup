@@ -21755,20 +21755,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private static readonly DRIVE_LIST_WALK_MAX_MS = 15_000;
 
   /**
-   * ENG-1476 follow-up: per-REQUEST deadline, distinct from the walk-wide one above.
+   * ENG-1476 follow-up: per-REQUEST deadline, derived from the walk-wide one rather than fixed.
    *
-   * `DRIVE_LIST_WALK_MAX_MS` is checked BETWEEN requests, so it bounds how many calls the
-   * walk makes but cannot interrupt one call that has already been issued and never answers
-   * — Node's fetch applies no default deadline. Same reasoning as `metaService`'s
-   * `withReadDeadline` sitting alongside `META_LIST_MAX_MS`: a count/elapsed bound limits the
-   * WORK, a per-call timeout is what stops a single stalled read from holding the turn.
+   * `DRIVE_LIST_WALK_MAX_MS` is checked BETWEEN requests, so it bounds how many calls the walk
+   * makes but cannot interrupt one already issued that never answers — Node's fetch applies no
+   * default deadline. Same reasoning as `metaService`'s `withReadDeadline` sitting alongside
+   * `META_LIST_MAX_MS`: an elapsed bound limits the WORK, a per-call timeout is what stops a
+   * single stalled read from holding the turn.
    *
-   * googleapis' `MethodOptions` extends gaxios' `GaxiosOptions`, so `timeout` is accepted as
-   * the SECOND argument to a method. Comfortably above a healthy Drive listing and well
-   * inside the walk bound, so a hung call surfaces as a retryable error rather than as the
-   * whole walk silently consuming its budget on one request.
+   * Deliberately the REMAINING walk budget, not a fixed ceiling. A fixed value (10s was the
+   * first attempt) is arbitrary in both directions: too low fails a legitimately slow call that
+   * the walk still had time for — a read that used to succeed now errors — and too high is
+   * meaningless, since the walk stops at its own deadline anyway. Deriving it means a request
+   * can use exactly the time the walk still has and no more, so this can never fail a call the
+   * walk would not have abandoned regardless.
+   *
+   * googleapis' `MethodOptions` extends gaxios' `GaxiosOptions`, so `timeout` is accepted as the
+   * SECOND argument to a method. The floor keeps a near-expired budget from sending `timeout: 0`,
+   * which gaxios reads as "no timeout".
    */
-  private static readonly DRIVE_REQUEST_TIMEOUT_MS = 10_000;
+  private static readonly DRIVE_REQUEST_TIMEOUT_FLOOR_MS = 1_000;
+
+  private static driveRequestTimeout(deadline: number): number {
+    return Math.max(AgentModeService.DRIVE_REQUEST_TIMEOUT_FLOOR_MS, deadline - Date.now());
+  }
 
   // ENG-1624: a registered gdrive: KB folder is authorized by its root ID only, but
   // every Drive query in this file was scoped to `'<folderId>' in parents` — direct
@@ -21835,7 +21845,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             ...(pageToken && { pageToken }),
             supportsAllDrives: true,
             includeItemsFromAllDrives: true,
-          }, { timeout: AgentModeService.DRIVE_REQUEST_TIMEOUT_MS });
+          }, { timeout: AgentModeService.driveRequestTimeout(deadline) });
         } catch (err: any) {
           const code = err?.code || err?.status;
           if (code === 403 || code === 401) {
@@ -21932,7 +21942,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           ...(orderBy && { orderBy }),
           supportsAllDrives: true,
           includeItemsFromAllDrives: true,
-        }, { timeout: AgentModeService.DRIVE_REQUEST_TIMEOUT_MS });
+        }, { timeout: AgentModeService.driveRequestTimeout(deadline) });
         const files = resp.data.files || [];
         for (const f of files) {
           if (f.id) merged.set(f.id, f);

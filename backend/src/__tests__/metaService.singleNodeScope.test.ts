@@ -25,13 +25,10 @@ jest.mock('facebook-nodejs-business-sdk', () => ({
 }));
 jest.mock('../utils/secretsManager', () => ({ getMetaCredentials: jest.fn() }));
 
-/** Answers `account_id` for the ownership probe and the payload for the field read — the
- *  shape the real Graph API returns for these two distinct calls. */
+/** Graph answers the payload and `account_id` in one response, because the read asks for both. */
 function nodeGet(ownerAccountId: string, data: Record<string, any>) {
-  return jest.fn().mockImplementation((f?: any) =>
-    Array.isArray(f) && f.length === 1 && f[0] === 'account_id'
-      ? Promise.resolve({ _data: { account_id: ownerAccountId } })
-      : Promise.resolve({ _data: data }),
+  return jest.fn().mockImplementation(() =>
+    Promise.resolve({ _data: { ...data, account_id: ownerAccountId } }),
   );
 }
 
@@ -65,18 +62,19 @@ describe('single-entity Meta node reads are bounded by the selected ad account',
     ).rejects.toThrow(expect.not.stringContaining(OTHER_TENANT) as any);
   });
 
-  it('CAMPAIGN single fetch: does NOT read fields from a node it refused', async () => {
-    const get = nodeGet(OTHER_TENANT, { id: 'camp_9', name: 'leaked?' });
+  it('CAMPAIGN single fetch: verifies ownership in ONE Graph call, not a separate probe', () => {
+    // A separate ownership probe would double the Graph calls on a routine read-back path and
+    // add a failure mode of its own — a blip on the probe refusing a read that would otherwise
+    // have succeeded. Ownership is answered by the same response as the payload.
+    const get = nodeGet(SELECTED, { id: 'camp_9', name: 'Mine' });
     (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get }));
 
-    await expect(
-      service.listCampaigns(SELECTED, token, { campaignId: 'camp_9' }),
-    ).rejects.toThrow();
-    // Only the ownership probe may have run — never the payload read.
-    const fieldReads = get.mock.calls.filter(
-      (c: any[]) => !(Array.isArray(c[0]) && c[0].length === 1 && c[0][0] === 'account_id'),
-    );
-    expect(fieldReads).toHaveLength(0);
+    return service.listCampaigns(SELECTED, token, { campaignId: 'camp_9' }).then((result) => {
+      expect(get).toHaveBeenCalledTimes(1);
+      expect(get.mock.calls[0][0]).toEqual(expect.arrayContaining(['account_id']));
+      // ...and the field requested for the check is not handed back to the caller.
+      expect(result.campaigns[0]).not.toHaveProperty('account_id');
+    });
   });
 
   it('CAMPAIGN single fetch: still returns a campaign owned by the selected account', async () => {
