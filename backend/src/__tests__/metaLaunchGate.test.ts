@@ -42,6 +42,83 @@ describe('Meta launch gate (ENG-941)', () => {
     mockPreflight.mockResolvedValue({ ok: true, results: [], blockedUrls: [], message: '' });
   });
 
+  /*
+   * ENG-1476 follow-up. metaService's list reads report `truncated` when a page/wall-clock
+   * bound stops them short. This gate decides from that ad list what a launch would send
+   * traffic to, so a partial list means some ads in scope were never checked. It used to
+   * discard the flag entirely and judge the launch on whatever it happened to receive.
+   */
+  describe('a truncated ad read is not a clean read', () => {
+    it('blocks a campaign-level activation when the ad list stopped at its bound', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t');
+
+      // An empty destination list from a truncated read is "we did not fetch them", not
+      // "there are none" — the old code returned proceed:true here.
+      expect(out.proceed).toBe(false);
+      expect(out.blockResult.error).toMatch(/too large to read completely/i);
+      expect(mockRecord).toHaveBeenCalledWith('sess-t', expect.objectContaining({ outcome: 'blocked' }));
+    });
+
+    it('blocks even when some destinations were found, because the rest were never read', async () => {
+      mockListAds.mockResolvedValue({
+        items: [{ adId: 'a1', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/lp'] }],
+        truncated: true,
+        pagesFetched: 25,
+      });
+      mockPreflight.mockResolvedValue({ ok: true, results: [], blockedUrls: [], message: '' });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t');
+
+      expect(out.proceed).toBe(false);
+      expect(out.blockResult.error).toMatch(/never checked/i);
+    });
+
+    it('still honours an explicit override, recorded as overridden rather than passed', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', true, 'sess-t');
+
+      expect(out.proceed).toBe(true);
+      expect(mockRecord).toHaveBeenCalledWith('sess-t', expect.objectContaining({ outcome: 'overridden' }));
+    });
+
+    it('does not block a complete read that legitimately has nothing to measure', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t');
+
+      // Guards the opposite error: a campaign with no ads yet must still pass.
+      expect(out.proceed).toBe(true);
+    });
+
+    it('does not block an AD-level activation, which is judged on that ad alone', async () => {
+      mockListAds.mockResolvedValue({
+        items: [{ adId: 'a1', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/lp'] }],
+        truncated: true,
+        pagesFetched: 25,
+      });
+      mockPreflight.mockResolvedValue({ ok: true, results: [], blockedUrls: [], message: '' });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t', {}, 'a1');
+
+      expect(out.proceed).toBe(true);
+    });
+
+    it('says the search was incomplete — not that the ad is elsewhere — when a named ad is missed', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t', {}, 'a-missing');
+
+      expect(out.proceed).toBe(false);
+      // ENG-1636's lesson: a pre-flight that names the wrong remedy sends the reader to fix
+      // a cause that is not theirs.
+      expect(out.blockResult.error).toMatch(/not necessarily absent|not have been reached/i);
+      expect(out.blockResult.error).not.toMatch(/may belong to a different campaign/i);
+    });
+  });
+
   it('proceeds and records a pass when every destination is measured', async () => {
     const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-1');
     expect(out.proceed).toBe(true);
