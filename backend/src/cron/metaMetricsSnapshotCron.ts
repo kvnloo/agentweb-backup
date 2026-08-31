@@ -90,7 +90,16 @@ function toDateStr(d: Date): string {
  * indexing by date is strictly less work and changes no behaviour — a date with no leads simply has
  * no entry, which the caller reads as an empty list exactly as before.
  */
-async function getLeadsByDateForUser(userId: string): Promise<Map<string, any[]>> {
+export async function getLeadsByDateForUser(
+  userId: string,
+  /**
+   * Optional inclusive date window. Leads outside it are DISCARDED while paging rather than
+   * retained — the cron wants every day in its settling window so it passes nothing, but a
+   * backfill processing two days has no reason to hold the account's entire lead history in
+   * memory. Purely a retention bound: the same pages are read either way.
+   */
+  bounds?: { from: string; to: string }
+): Promise<Map<string, any[]>> {
   const byDate = new Map<string, any[]>();
   const leadLists = await crmDb.getLeadListsByUserId(userId);
   for (const list of leadLists) {
@@ -100,6 +109,7 @@ async function getLeadsByDateForUser(userId: string): Promise<Map<string, any[]>
       for (const lead of items) {
         const leadDate = (lead.createdAt || "").split("T")[0];
         if (!leadDate) continue;
+        if (bounds && (leadDate < bounds.from || leadDate > bounds.to)) continue;
         const bucket = byDate.get(leadDate);
         if (bucket) bucket.push(lead);
         else byDate.set(leadDate, [lead]);
@@ -150,10 +160,17 @@ export interface SnapshotResult {
 /**
  * Shared per-day snapshot logic — pulls Meta's campaign-level insights for exactly one
  * date (dynamic campaign discovery, never a hardcoded list), joins against that day's
- * CRM leads by exact `campaignId` === `firstTouch.utm.campaign` string equality
- * (empirically verified for Haven's real ad traffic, not assumed), and writes one row
- * per campaign Meta reported activity for. Also usable by a future backfill script
- * without duplicating this logic.
+ * CRM leads by exact `campaignId` string equality against the campaign id resolved by
+ * `promoteAttributionFromCustomFields` (empirically verified for Haven's real ad traffic,
+ * not assumed), and writes one row per campaign Meta reported activity for. Also usable
+ * by a backfill script without duplicating this logic —
+ * `scripts/backfill-eng1601-meta-metrics-history.ts` does exactly that.
+ *
+ * ⚠ This previously read `firstTouch.utm.campaign` DIRECTLY, and this comment said so. That
+ * dropped 36% of attributable leads, because the id lives in `customFields` for leads that
+ * have no `firstTouch` at all (ENG-1601). The comment is called out rather than quietly
+ * corrected because it survived the fix by two commits, and a stale contract sitting above an
+ * exported function is precisely what a backfill author would build against.
  */
 export interface ResolvedMetaCredentials {
   accountId: string;
@@ -215,7 +232,17 @@ export async function snapshotMetaMetricsForDate(
   dateStr: string,
   resolvedCredentials?: ResolvedMetaCredentials,
   leadsByDate?: Map<string, any[]>,
-  accountContext?: MetaAccountContext
+  accountContext?: MetaAccountContext,
+  /**
+   * What produced this row. Defaults to "daily" so the cron is unchanged; a backfill passes
+   * "backfill" so the data plane can tell a replayed row from a same-day one. Without it a
+   * rewritten history is indistinguishable from what the cron observed live — which matters
+   * precisely because a backfill OVERWRITES.
+   *
+   * Appended LAST on purpose: this function is called positionally, so inserting a parameter
+   * anywhere else silently shifts every existing caller's arguments.
+   */
+  snapshotSource: "daily" | "backfill" = "daily"
 ): Promise<SnapshotResult> {
   // Credentials are resolved ONCE PER RUN by runMetaMetricsSnapshot and passed in, because
   // getMetaAccountCredentials reads the user record and can refresh + PERSIST the Meta token
@@ -424,7 +451,7 @@ export async function snapshotMetaMetricsForDate(
         cpm: parseFloat(c.cpm) || 0,
         frequency: parseFloat(c.frequency) || 0,
       },
-      snapshotSource: "daily",
+      snapshotSource,
       capturedAt,
     });
   }
@@ -465,7 +492,7 @@ export async function snapshotMetaMetricsForDate(
     unattributedLeadCount,
     campaignsReported: campaignRows.length,
     platformMetrics: {},
-    snapshotSource: "daily",
+    snapshotSource,
     capturedAt,
   });
 

@@ -203,6 +203,50 @@ describe('runScheduledChat — deterministic completion gate', () => {
     expect(result).toEqual(expect.objectContaining({ status: 'success' }));
   });
 
+  it('ENG-1640: resumes unfinished workflow steps before asking for the final report', async () => {
+    let call = 0;
+    mockWorker.runInWorker.mockImplementation(() => Promise.resolve(
+      ++call === 1
+        ? { ...workerResult('Inbox triage complete; sourcing did not run.'), truncatedByStepBudget: true }
+        : workerResult('Sourcing complete. Final report below.')
+    ));
+
+    await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    const continuation = mockWorker.runInWorker.mock.calls[1][0].messageContent as string;
+    expect(continuation).toMatch(/resume.*first unfinished|complete all unfinished/i);
+    expect(continuation.indexOf('unfinished')).toBeLessThan(continuation.indexOf('final consolidated report'));
+  });
+
+  it('ENG-1640: permits tools in the budget continuation instead of restricting it to already-gathered data', async () => {
+    let call = 0;
+    mockWorker.runInWorker.mockImplementation(() => Promise.resolve(
+      ++call === 1
+        ? { ...workerResult('Housekeeping complete; the sourcing step was starved.'), truncatedByStepBudget: true }
+        : workerResult('Sourcing complete with tool evidence.')
+    ));
+
+    await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    const continuation = mockWorker.runInWorker.mock.calls[1][0].messageContent as string;
+    expect(continuation).toMatch(/using tools as needed/i);
+    expect(continuation).not.toMatch(/using the data already gathered, produce the final/i);
+  });
+
+  it('ENG-1640: tells the continuation not to replay completed writes or actions', async () => {
+    let call = 0;
+    mockWorker.runInWorker.mockImplementation(() => Promise.resolve(
+      ++call === 1
+        ? { ...workerResult('Three DMs sent; sourcing did not run.'), truncatedByStepBudget: true }
+        : workerResult('Sourcing complete without duplicate sends.')
+    ));
+
+    await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    const continuation = mockWorker.runInWorker.mock.calls[1][0].messageContent as string;
+    expect(continuation).toMatch(/do not repeat completed (?:writes|steps|actions)/i);
+  });
+
   it('does NOT issue a continuation when the first turn is already complete', async () => {
     mockWorker.runInWorker.mockResolvedValue(
       workerResult('All three events completed. Consolidated report below.')
