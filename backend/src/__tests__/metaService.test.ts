@@ -321,7 +321,8 @@ describe('MetaService', () => {
             const result = await service.listAdCreatives(mockAdAccountId, mockAccessToken);
 
             expect(mockGetCreatives).toHaveBeenCalled();
-            expect(result).toEqual([{ id: 'creative_1', name: 'Creative 1' }]);
+            expect(result.creatives).toEqual([{ id: 'creative_1', name: 'Creative 1' }]);
+            expect(result.truncated).toBe(false);
         });
 
         it('should create an ad creative', async () => {
@@ -497,7 +498,10 @@ describe('MetaService', () => {
                     effective_status: expect.arrayContaining(['ACTIVE', 'PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED'])
                 })
             );
-            expect(result).toEqual([{ id: 'ad_1', name: 'Ad 1', effective_status: 'ACTIVE' }]);
+            expect(result.ads).toEqual([{ id: 'ad_1', name: 'Ad 1', effective_status: 'ACTIVE' }]);
+            // Unscoped, single page, nothing left behind (ENG-1476).
+            expect(result.truncated).toBe(false);
+            expect(result.scope).toEqual({});
         });
 
         it('should include CAMPAIGN_PAUSED and ADSET_PAUSED ads when listing', async () => {
@@ -513,25 +517,38 @@ describe('MetaService', () => {
 
             const result = await service.listAds(mockAdAccountId, mockAccessToken);
 
-            expect(result).toHaveLength(3);
-            expect(result.map((a: any) => a.effective_status)).toEqual(
+            expect(result.ads).toHaveLength(3);
+            expect(result.ads.map((a: any) => a.effective_status)).toEqual(
                 expect.arrayContaining(['ACTIVE', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED'])
             );
         });
 
-        it('should filter by adset_id when provided', async () => {
+        /**
+         * ENG-1476: this test previously asserted `params.adset_id` was sent — i.e. it PINNED the
+         * defect. Meta silently ignores `adset_id` as a bare param on the /act_X/ads edge and
+         * returns the whole account, so the filter looked applied and never was. Scoping now goes
+         * through the ad set NODE (/{adset_id}/ads), where it cannot be ignored.
+         */
+        it('scopes to the ad set NODE, never a bare adset_id param', async () => {
             const mockAds = [{ _data: { id: 'ad_1', name: 'Ad 1', effective_status: 'PAUSED' } }];
-            const mockGetAds = jest.fn().mockResolvedValue(mockAds);
-            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
-                getAds: mockGetAds,
+            const adSetGetAds = jest.fn().mockResolvedValue(mockAds);
+            const accountGetAds = jest.fn().mockResolvedValue([]);
+            (AdSet as unknown as jest.Mock).mockImplementation(() => ({
+                getAds: adSetGetAds,
+                // The tenancy guard reads the node's owning account before listing through it:
+                // an ad-set id is global and one Meta token can reach several ad accounts.
+                get: jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } }),
             }));
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAds: accountGetAds }));
 
-            await service.listAds(mockAdAccountId, mockAccessToken, 'adset_999');
+            const result = await service.listAds(mockAdAccountId, mockAccessToken, 'adset_999');
 
-            expect(mockGetAds).toHaveBeenCalledWith(
-                expect.any(Array),
-                expect.objectContaining({ adset_id: 'adset_999' })
-            );
+            expect(AdSet).toHaveBeenCalledWith('adset_999');
+            expect(adSetGetAds).toHaveBeenCalled();
+            // The account edge must not be touched at all — that was the account-wide leak.
+            expect(accountGetAds).not.toHaveBeenCalled();
+            expect(adSetGetAds.mock.calls[0][1]).not.toHaveProperty('adset_id');
+            expect(result.scope).toEqual({ adSetId: 'adset_999' });
         });
 
         it('should create an ad', async () => {

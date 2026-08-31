@@ -1,6 +1,20 @@
 import axios from 'axios';
 import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
+import { applyLeadMetrics, finalizeLeadCosts } from '../utils/metaActionFamilies';
 import { parse as parseCsv } from 'csv-parse/sync';
+import {
+  parseCsvProvenance,
+  tokenizeCsvHeaderCell,
+  findCsvIdNameCollisions,
+  checkCsvIdGrounding,
+  estimateRowsIn,
+  buildDataAnalysisCacheKey,
+} from './agentMode/csvProvenance';
+import {
+  buildListMessage,
+  buildListResult,
+  describeIgnoredCampaignScope,
+} from './agentMode/metaListScope';
 import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
@@ -18,6 +32,7 @@ import {
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
@@ -40,10 +55,12 @@ import {
   promptCreatesLogo,
   promptRequestsLogo,
 } from './agentMode/brandLogo';
-import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory } from './agentMode/core/toolDispatch';
+import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
+import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
+import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
@@ -316,7 +333,13 @@ import {
   usableProfileUrl,
   withoutFabricatedProfileFields,
 } from '../utils/linkedInAnonymizedProfile';
-import { PACED_WRITE_ACTIONS, reserveWriteSlot } from './linkedInWritePacer';
+import { PACED_WRITE_ACTIONS } from './linkedInWritePacer';
+import {
+  paceLinkedInWrite,
+  resolveLinkedInAccountForWrite,
+  setDailyInviteCap,
+  type ResolvedLinkedInAccount,
+} from './agentMode/linkedInDailyVolumeGate';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -1215,6 +1238,14 @@ type GoogleAdsConfigShape = { customer_id: string; currency?: string; test_accou
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
+  // ENG-1295 hardening: self-consistency cache for perform_data_analysis. Keyed by
+  // userId + a hash of the exact (file_urls, analysis_instruction) pair, so a
+  // literal repeat of the same call can be checked against its own prior grouping-
+  // key result instead of silently returning a contradictory answer. Bounded size
+  // and TTL since this lives on the long-running singleton service instance.
+  private dataAnalysisConsistencyCache: Map<string, { groupingKeyValues: string[]; timestamp: number }> = new Map();
+  private readonly DATA_ANALYSIS_CONSISTENCY_CACHE_MAX = 500;
+  private readonly DATA_ANALYSIS_CONSISTENCY_TTL_MS = 30 * 60 * 1000; // 30 minutes
   // ENG-475: deterministic browser-session persistence (auto load-at-start /
   // save-as-you-go around browser automation tools, so an intermittent login
   // success is captured without depending on the model calling the cookie tools).
@@ -2245,6 +2276,14 @@ export class AgentModeService {
     // entry ($0.068/$0.168) already matches the real 0423 snapshot.
     'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "DeepSeek V4 Flash 0423" page (the snapshot this OpenRouter id actually resolves to), snapshot 2026-08-19' },
     'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, qualityScore: 58, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // 2026-08-26 (ENG-1604): added after live cost+quality research — AA
+    // Intelligence Index 52 (v4.1.1, measured, not estimated), #1 of 138
+    // models in its size class, roughly matching DeepSeek V4 Pro's quality
+    // (53) at about half the input price. Skipped sibling candidates:
+    // qwen3-coder-next (AA 21, coding-only, deferred by Harsha this pass),
+    // qwen3-max/qwen3-max-thinking/qwen3-vl-235b (AA "estimated", not
+    // measured, or AA-flagged deprecated).
+    'openrouter/qwen/qwen3.8-27b': { name: 'Qwen3.8 27B', provider: 'qwen', tier: 'medium', description: 'Alibaba\'s efficient open-weight model, leading in its size class', client: null, supportsTemperature: true, qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-26' },
     'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, qualityScore: 20, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, qualityScore: 60, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
@@ -3299,6 +3338,12 @@ export class AgentModeService {
       // coincidentally-identical request is never mistaken for a duplicate.
       const mediaCallKeysThisRun = seedMediaCallKeysFromHistory(sessionHistory as any, Date.now() - 60 * 60 * 1000);
 
+      // ENG-426: session-wide search-call budget. Seeded from the WHOLE persisted session
+      // history (not time-bounded — a new session already starts this at 0, which is
+      // AgentMode's equivalent of Claude Code's `/clear`) and accumulated across this run's
+      // iterations below, mirroring the media-asset run-total pattern just above.
+      let searchCallCountThisRun = seedSearchCallCountFromHistory(sessionHistory as any);
+
       // ENG-907: whole-turn WALL-CLOCK budget — the analogue of the step budget below.
       // A broad research turn can stay far under `maxIterations` and still burn the whole
       // 10-minute controller cap issuing discovery calls; when the cap fires the run is
@@ -3909,6 +3954,22 @@ export class AgentModeService {
           // never claim a false success. Gated on the per-turn flag, not on `content`:
           // `content` still holds any earlier turn's text and would suppress this.
           if (synthesisResidueGuardEnabled && synthesisResidueDropped) {
+            // ENG-1576 correction: an earlier revision of this PR added
+            // `!truncatedByTimeBudget` here too (matching the sibling plain-empty
+            // branch below, prompted by a CodeRabbit question about whether the two
+            // flags can coincide — they can). That was wrong for THIS branch and got
+            // reverted before merge finished rolling out: `synthesisResidueDropped`
+            // covers ENG-1188's echoed-nudge detection too (isUnusableSynthesis →
+            // isNudgeEcho, including the wall-clock nudge specifically), and
+            // ENG-1188's whole point is that an echoed nudge must NEVER reach the
+            // user — the ledger recap must win even when the turn is also
+            // time-budget-truncated. `nudgeEchoRecovery.test.ts`'s "recovers with
+            // the executed-action ledger when the forced synthesis turn echoes the
+            // time-budget nudge" case pins exactly this combination. Excluding
+            // truncatedByTimeBudget here silently broke that guarantee for one of
+            // the four nudges ENG-1188 exists to cover. The sibling branch below
+            // (plain emptiness, no residue detected at all) has no such guarantee
+            // attached to it and keeps its own truncatedByTimeBudget exclusion.
             if (!turnHadUsableText) {
               console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
               content = buildExecutedActionsFallback(toolCalls);
@@ -3926,7 +3987,7 @@ export class AgentModeService {
               }
             }
             if (responseMessage) responseMessage.content = content;
-          } else if (synthesisResidueGuardEnabled && !turnHadUsableText && toolCalls.length > 0) {
+          } else if (synthesisResidueGuardEnabled && !turnHadUsableText && toolCalls.length > 0 && !truncatedByTimeBudget) {
             // Same failure family as the residue case above (a synthesis the run could
             // not produce), just without residue text to detect: the bounded
             // empty-synthesis nudge (MAX_EMPTY_SYNTHESIS_RETRIES) above already asked
@@ -3944,6 +4005,15 @@ export class AgentModeService {
             // non-empty for the rest of the turn even though the iteration actually
             // terminating here came back with nothing, silently disarming this fallback
             // and shipping the stale narration as if it answered the empty turn.
+            //
+            // ENG-1576: also excludes a wall-clock-forced final synthesis
+            // (`truncatedByTimeBudget`) — that path has its own, more specific fallback
+            // below (`TURN_TIME_BUDGET_FALLBACK_CONTENT`, gated on `!content`). Setting
+            // `content` here unconditionally made this generic ledger recap win every
+            // time regardless of truncation reason, silently pre-empting the time-limit
+            // message the user actually needs to see (found via ENG-426 verification:
+            // turnTimeBudgetTruncation.test.ts pinned the time-limit message and this
+            // branch was clobbering it before the post-loop check ever ran).
             console.warn(`AgentMode: Terminating turn stayed empty after ${emptySynthesisRetries} nudge retr${emptySynthesisRetries === 1 ? 'y' : 'ies'} in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
             content = buildExecutedActionsFallback(toolCalls);
             if (responseMessage) responseMessage.content = content;
@@ -4110,6 +4180,7 @@ export class AgentModeService {
           longestMediaCallMsThisRun,
           priorMediaCallKeys: mediaCallKeysThisRun,
           approvedRevisionImageSources,
+          priorSearchCallCount: searchCallCountThisRun,
           ports: {
             evaluateAgentToolPolicy,
             validateAndRepairToolArgs,
@@ -4149,6 +4220,9 @@ export class AgentModeService {
         // Carry the running per-run media-asset total forward so the next iteration's
         // budget decision knows whether this run has already produced ≥1 asset.
         mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
+        // ENG-426: carry the run-wide search-call count forward so the next iteration's
+        // budget check sees calls made earlier THIS turn, on top of prior-turn history.
+        searchCallCountThisRun += dispatchResult.searchCallsThisIteration;
         // ENG-510: carry the run-wide longest media-call latency forward so the next
         // iteration's adaptive hard-cap reserve uses real observed durations.
         longestMediaCallMsThisRun = Math.max(longestMediaCallMsThisRun, dispatchResult.longestMediaCallMs ?? 0);
@@ -4461,6 +4535,43 @@ export class AgentModeService {
           // waiting on — the failure mode this prevents is a silent overclaim, which
           // is strictly less bad than losing the message.
           console.warn('AgentMode: unconsumed-cursor notice failed', cursorError);
+        }
+      }
+
+      // ENG-1565: model resolution reads ONLY the request's llmModel field (the
+      // picker) — no code path parses chat text for an intent to switch/reassess
+      // models. So a message like "reassess using a new model" is inert by
+      // construction, and previously ran on the same model with no acknowledgement
+      // that nothing changed (production evidence: session
+      // e6c9e693-ff33-4883-a18a-9d674b4074c4, audited on ENG-426).
+      //
+      // Same shape as the reconcilers above: deterministic, append-only, patched
+      // into the last assistant message. `llmModel` here is already the model
+      // resolved for THIS turn; `findLastAssistantModel(sessionHistory)` is the
+      // model that generated the turn before it — comparing the two (rather than
+      // assuming chat text can never change the model) correctly stays silent if
+      // the picker was ALSO flipped in this same request, which really would
+      // change the model despite the chat text.
+      //
+      // Kill switch: set AGENT_MODEL_REASSESS_ACK=false to disable. Absent means ON.
+      if (content && !wasCancelled && !mockMode
+          && process.env.AGENT_MODEL_REASSESS_ACK !== 'false') {
+        try {
+          const modelBefore = findLastAssistantModel(sessionHistory as any);
+          const reconciled = reconcileModelReassessAck(content, messageContent, modelBefore, llmModel);
+          if (reconciled !== content) {
+            content = reconciled;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                break;
+              }
+            }
+          }
+        } catch (modelReassessError) {
+          // Advisory, same reasoning as the cursor notice above: never block
+          // delivery of a reply the user is waiting on over this note.
+          console.warn('AgentMode: model-reassess acknowledgement failed', modelReassessError);
         }
       }
 
@@ -5241,6 +5352,13 @@ export class AgentModeService {
     'search_knowledge_base',
     'list_knowledge_base_files',
     'read_knowledge_base_files',
+    // Sibling of read_knowledge_base_files for images/video — same gate class as
+    // ENG-152/ENG-260 below: without this, materializing a KB image/video is
+    // invisible on any subscription tier whose allowedSkills doesn't unlock
+    // __other_skills__ (confirmed live: Gemini correctly named the tool, then
+    // reported it "not available on your subscription" because installing
+    // __other_skills__ itself was rejected).
+    'materialize_knowledge_base_asset',
     'you_search_web',         // Explicit You.com web search
     'you_search_news',        // Explicit You.com news search
 
@@ -5446,9 +5564,14 @@ export class AgentModeService {
    * Excludes foundation tools and admin-only tools.
    */
   private getUnassociatedTools(publishedSkills: any[]): { name: string; description: string }[] {
-    // Collect all tool names used by any published skill
+    // Collect all tool names used by any published skill. Callers (e.g.
+    // loadAuthorizedSkillCatalog) pass a catalog that also mixes in unpublished
+    // private/org-shared skills for install purposes — those must NOT count here,
+    // or a single draft skill nobody published can silently steal a tool out of
+    // the shared __other_skills__ bundle for an entire org (ENG-1237).
     const associatedToolNames = new Set<string>();
     publishedSkills.forEach(skill => {
+      if (skill.isPublished !== true) return;
       skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
     });
 
@@ -5617,12 +5740,18 @@ export class AgentModeService {
     if (isWildcard || allowedSet.has(OTHER_SKILLS_VIRTUAL_ID)) {
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
       if (unassociatedTools.length > 0) {
+        // ENG-1237 follow-up: an unpublished/org-shared skill's own card already
+        // lists its toolNames above, and (correctly, post-ENG-1237) no longer
+        // removes those tools from this pool. Only trim the DISPLAY copy here —
+        // installability (the length check above) and execution (buildSkillContext,
+        // which never sees this per-user catalog) stay keyed on the real pool.
+        const displayedToolNames = new Set(skills.flatMap(s => s.toolNames));
         skills.push({
           skillId: OTHER_SKILLS_VIRTUAL_ID,
           name: 'Other Skills',
           description: 'Tools not associated with any specific skill',
           installed: installedIds.has(OTHER_SKILLS_VIRTUAL_ID),
-          toolNames: unassociatedTools.map(t => t.name)
+          toolNames: unassociatedTools.map(t => t.name).filter(name => !displayedToolNames.has(name))
         });
       }
     }
@@ -5897,6 +6026,33 @@ export class AgentModeService {
         confirmationPrompt: result.confirmationPrompt,
         confirmationDetail: result.confirmationDetail,
         summary: result.summary,
+        /*
+         * ENG-1526 / ENG-1322. Approval tokens have to survive the minimizer.
+         *
+         * A halt that withholds its own token is a dead end, not a loop. Both gates tell
+         * the model to replay the call "with the token exactly as returned here" — and
+         * this minimizer dropped it, because everything it does not name is discarded.
+         * So the model was handed an instruction it could not follow: the override could
+         * never be applied and the removal could never be completed, no matter how many
+         * times a user approved.
+         *
+         * It failed CLOSED, which is why nothing unsafe happened and why it went unnoticed
+         * — the tracking gate simply kept blocking. But ENG-1526's own claim that "the
+         * path is a loop, not a dead end" was not true in production, and a recovery path
+         * people cannot complete is one they route around.
+         *
+         * Found by driving the real agent, not the handler: handler-level tests call the
+         * dispatcher directly and never reach this function, so they proved the tokens
+         * were ISSUED while saying nothing about whether they were DELIVERED.
+         *
+         * Named explicitly rather than pattern-matched on `_token`: these two exist to be
+         * replayed by the caller, and a blanket rule would eventually relay a field that
+         * does not.
+         */
+        ...(result.tracking_override_token
+          ? { tracking_override_token: result.tracking_override_token } : {}),
+        ...(result.conversion_action_removal_token
+          ? { conversion_action_removal_token: result.conversion_action_removal_token } : {}),
       };
       // ENG-396: also preserve the structured AskUserQuestion payload so the chat
       // card can render its options and the frontend can post back a structured
@@ -5984,6 +6140,17 @@ export class AgentModeService {
     // query has confirmed the outage, so it can never fire on an honest empty.
     if (result && result.searchUnavailable === true) {
       return { searchUnavailable: true, message: 'LinkedIn people search is unavailable for this account' };
+    }
+
+    // ENG-1299 follow-up: same problem as the searchUnavailable marker above —
+    // linkedin_outreach has no branch below, so its stored tool-ledger result is
+    // the `{}` default, which erases the degraded/droppedFacets signal
+    // (searchPeople sets it when a resolver miss falls a facet back to
+    // keyword-only matching). Preserve it so post-hoc reconciliation can tell a
+    // search was filter-degraded, not just look at the live turn where the
+    // agent already sees the full spread result.
+    if (toolName === 'linkedin_outreach' && result?.data?.degraded === true) {
+      return { success: result?.success, degraded: true, droppedFacets: result.data.droppedFacets };
     }
 
     // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
@@ -8513,6 +8680,21 @@ export class AgentModeService {
     return { cleanedText, links };
   }
 
+  /** ENG-1295: bound the self-consistency cache so the long-lived singleton doesn't grow unboundedly. */
+  private pruneDataAnalysisConsistencyCache(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.dataAnalysisConsistencyCache) {
+      if (now - entry.timestamp > this.DATA_ANALYSIS_CONSISTENCY_TTL_MS) {
+        this.dataAnalysisConsistencyCache.delete(key);
+      }
+    }
+    while (this.dataAnalysisConsistencyCache.size > this.DATA_ANALYSIS_CONSISTENCY_CACHE_MAX) {
+      const oldestKey = this.dataAnalysisConsistencyCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.dataAnalysisConsistencyCache.delete(oldestKey);
+    }
+  }
+
   public async performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
     try {
       const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
@@ -8631,6 +8813,9 @@ export class AgentModeService {
       // Human-readable source description per file, parallel to fileParts, used to
       // build the filename manifest in the prompt.
       const fileSources: string[] = [];
+      // Decoded raw content per file, parallel to fileSources — kept only for the
+      // ENG-1295 provenance stub's rows_in estimate, not sent anywhere else.
+      const fileRawContents: string[] = [];
       let totalSize = 0;
 
       for (const fileUrl of urlsToProcess) {
@@ -8674,6 +8859,7 @@ export class AgentModeService {
               }
             });
             fileSources.push(fileUrl);
+            fileRawContents.push(s3Content);
             continue;
           }
 
@@ -8712,6 +8898,7 @@ export class AgentModeService {
               }
             });
             fileSources.push(fileUrl);
+            fileRawContents.push(s3Content);
             continue;
           }
 
@@ -8734,7 +8921,8 @@ export class AgentModeService {
           // Send to Gemini as text/csv so the file materializes on the sandbox
           // filesystem (see SANDBOX_FILE_MIME note above). The actual content may
           // be CSV, JSON, or plain text — the model is told this in the prompt.
-          const base64Content = Buffer.from(fileData).toString('base64');
+          const fileBuffer = Buffer.from(fileData);
+          const base64Content = fileBuffer.toString('base64');
 
           fileParts.push({
             inlineData: {
@@ -8743,6 +8931,7 @@ export class AgentModeService {
             }
           });
           fileSources.push(fileUrl);
+          fileRawContents.push(fileBuffer.toString('utf-8'));
 
         } catch (error) {
           console.error(`Error processing file ${fileUrl}:`, error);
@@ -8826,6 +9015,15 @@ export class AgentModeService {
       // the post-loop block) — folding every intermediate code stdout into the
       // analysis would bury the real summary under print()-debugging noise.
       const codeExecOutputs: string[] = [];
+      // ENG-1295: the generated CSV text (if any), kept separately from resultParts
+      // so the provenance stub and self-consistency check below can parse it.
+      let generatedCsvText: string | null = null;
+      // ENG-1600: Gemini can return more than one text/csv inline part. Every one is shown to
+      // the caller as Computed Data, but only one can back the provenance stub and the
+      // cross-call cache. Comparing an arbitrary part against a previous run's arbitrary part
+      // fabricates an inconsistency and hard-rejects a correct analysis, so the count is
+      // tracked and the comparison is skipped when it exceeds one.
+      let generatedCsvPartCount = 0;
 
       // Extract parts from response
       const responseParts = candidates[0].content.parts || [];
@@ -8862,10 +9060,37 @@ export class AgentModeService {
         // Handle inline data (images/charts from code execution) (handle both camelCase and snake_case)
         if ((part as any).inlineData && (part as any).inlineData.data) {
           const mimeType = (part as any).inlineData.mimeType || 'image/png';
-          if (!mimeType.startsWith('image/')) {
+          if (mimeType === 'text/csv') {
+            // Gemini's code-execution sandbox returns generated tabular data (e.g. a
+            // df.to_csv() write) as an inlineData part with mimeType text/csv rather
+            // than through stdout/codeExecutionResult. Discarding this — as the old
+            // code did for every non-image inlineData — left the caller with only the
+            // model's separate narrative `text` summary, ungrounded by the real
+            // computed output. That is how perform_data_analysis reported hallucinated
+            // ad-group names and contradictory row counts (ENG-1295).
+            codeExecuted = true;
+            try {
+              const csvText = Buffer.from((part as any).inlineData.data, 'base64').toString('utf-8').trim();
+              if (csvText) {
+                resultParts.push(`**Computed Data:**\n${csvText}`);
+                generatedCsvText = csvText;
+                generatedCsvPartCount++;
+                // ENG-1295 follow-up: this Gemini response shape is rare and non-deterministic, so it
+                // could not be re-triggered on demand to confirm the fix still fires in real traffic.
+                // A positive signal here means the next organic occurrence shows up in CloudWatch.
+                console.log('AgentMode: performDataAnalysis surfaced generated CSV via inlineData (mimeType=text/csv)');
+              }
+            } catch (error) {
+              console.error('AgentMode: performDataAnalysis error decoding generated CSV inlineData:', error);
+            }
+          } else if (!mimeType.startsWith('image/')) {
             // Gemini returned non-image data (e.g. Vega-Lite JSON from altair) — skip it
             console.warn(`AgentMode: performDataAnalysis skipping non-image inlineData with mimeType=${mimeType}`);
           } else {
+            // A rendered chart image is itself proof that code actually ran in the
+            // sandbox (ENG-1295 hard guard below) — set this regardless of whether
+            // the subsequent S3 upload succeeds.
+            codeExecuted = true;
             try {
               const imageData = (part as any).inlineData.data;
 
@@ -8893,10 +9118,30 @@ export class AgentModeService {
         } else if ((part as any).inline_data && (part as any).inline_data.data) {
           // Handle snake_case format
           const mimeType = (part as any).inline_data.mimeType || (part as any).inline_data.mime_type || 'image/png';
-          if (!mimeType.startsWith('image/')) {
+          if (mimeType === 'text/csv') {
+            // See the camelCase inlineData branch above (ENG-1295): a generated CSV
+            // must be surfaced, not discarded, or the caller only sees the model's
+            // ungrounded narrative summary.
+            codeExecuted = true;
+            try {
+              const csvText = Buffer.from((part as any).inline_data.data, 'base64').toString('utf-8').trim();
+              if (csvText) {
+                resultParts.push(`**Computed Data:**\n${csvText}`);
+                generatedCsvText = csvText;
+                generatedCsvPartCount++;
+                // ENG-1295 follow-up: snake_case variant of the same rare shape — logged separately
+                // so the two branches are distinguishable in CloudWatch.
+                console.log('AgentMode: performDataAnalysis surfaced generated CSV via inline_data (mimeType=text/csv)');
+              }
+            } catch (error) {
+              console.error('AgentMode: performDataAnalysis error decoding generated CSV inline_data (snake_case):', error);
+            }
+          } else if (!mimeType.startsWith('image/')) {
             // Gemini returned non-image data (e.g. Vega-Lite JSON from altair) — skip it
             console.warn(`AgentMode: performDataAnalysis skipping non-image inline_data with mimeType=${mimeType}`);
           } else {
+            // See the camelCase branch above — a rendered chart proves code executed.
+            codeExecuted = true;
             try {
               const imageData = (part as any).inline_data.data;
 
@@ -8922,6 +9167,30 @@ export class AgentModeService {
             }
           }
         }
+      }
+
+      // ENG-1295 hard guard: real external data was supplied (file_urls resolved to
+      // at least one sandbox file) but nothing in the response shows code actually
+      // executing over it — no generated CSV, no rendered image, no codeExecutionResult
+      // stdout. A bare narrative `text` part in this case is unverifiable prose about
+      // data the model never touched — exactly how perform_data_analysis reported
+      // hallucinated ad-group names and contradictory counts in prod session d789c175.
+      // Reject rather than pass it off as computed output. Calls with no file_urls are
+      // unaffected: there is no external tabular data to hallucinate about, so
+      // inline-only summarization remains a legitimate use of this tool.
+      if (fileParts.length > 0 && !codeExecuted) {
+        console.warn(
+          `AgentMode: performDataAnalysis got narrative text with no verified code execution over ${fileParts.length} supplied file(s) (model=${modelName})`
+        );
+        return {
+          success: false,
+          message:
+            'The analysis model returned a narrative summary without any verified code execution over the supplied file_urls — ' +
+            'this cannot be trusted as computed output and was not returned. Retry with a more explicit instruction that forces ' +
+            'Python code execution over the file(s) (e.g. "You MUST read and parse the file(s) with Python and print exact ' +
+            'computed values — do not summarize without computing").',
+          error: 'execution_failed'
+        };
       }
 
       // Fallback narrative: the model produced executed-code output but no
@@ -8964,6 +9233,105 @@ export class AgentModeService {
         };
       }
 
+      // ENG-1295 hardening: cross-call self-consistency and a provenance stub
+      // (including intra-CSV id/name collision and source-grounding checks) for
+      // generated CSV data.
+      if (generatedCsvText) {
+        const provenance = parseCsvProvenance(generatedCsvText);
+        if (provenance) {
+          // 1. Cross-call self-consistency: an exact repeat call whose grouping-key
+          // set changed since its last run.
+          const cacheKey = buildDataAnalysisCacheKey(userId, urlsToProcess, analysisInstruction);
+          // ENG-1600: with several CSV parts, `provenance` describes only one of them and which
+          // one depends on part order. Comparing that against a previous run — which may have
+          // captured a different part — is a fabricated inconsistency, and this check hard-rejects.
+          const comparable = generatedCsvPartCount <= 1;
+          const prior = comparable ? this.dataAnalysisConsistencyCache.get(cacheKey) : undefined;
+          if (prior) {
+            const priorSet = new Set(prior.groupingKeyValues);
+            const currentSet = new Set(provenance.groupingKeyValues);
+            const isConsistent = priorSet.size === currentSet.size &&
+              [...priorSet].every(v => currentSet.has(v));
+            if (!isConsistent) {
+              console.warn(
+                `AgentMode: performDataAnalysis inconsistent result on an identical repeat call (userId=${userId}): ` +
+                `prior grouping keys=[${prior.groupingKeyValues.join(', ')}] vs current=[${provenance.groupingKeyValues.join(', ')}]`
+              );
+              return {
+                success: false,
+                message:
+                  'This exact analysis call (identical file_urls and analysis_instruction) previously returned a DIFFERENT set of ' +
+                  'result names than this run — the data-analysis model is not consistently computing over the real data, so ' +
+                  'neither result can be trusted. Do NOT retry with the identical arguments. Instead, re-run grouping strictly by ' +
+                  'a stable ID field (not a name) so the result is verifiable against the source data.',
+                error: 'inconsistent_result'
+              };
+            }
+          }
+          // Only cache a single-part result: storing one arbitrary part of a multi-part answer
+          // would poison the NEXT call's comparison exactly the same way.
+          if (comparable) {
+            this.dataAnalysisConsistencyCache.set(cacheKey, { groupingKeyValues: provenance.groupingKeyValues, timestamp: Date.now() });
+            this.pruneDataAnalysisConsistencyCache();
+          }
+
+          // 2. Provenance stub: cheap-to-verify rows_in / rows_out / distinct
+          // grouping-key values, so the caller doesn't have to trust the narrative
+          // summary about what the tool actually computed. Includes two
+          // informational (not hard-reject) caveats:
+          // - id grounding: a distinct id in the CSV that can't be found anywhere
+          //   in the raw source file(s) — a substring miss can also mean the
+          //   model reformatted the id, so this doesn't block a possibly-correct
+          //   result.
+          // - id/name collisions: the same id mapped to more than one name within
+          //   this CSV (the exact shape of the prod hallucination). Deliberately
+          //   NOT a hard reject — a real entity (an ad group, a CRM lead's
+          //   company) can legitimately be renamed within a query's date window,
+          //   which produces this same shape from genuinely correct data. We
+          //   can't tell "renamed" apart from "fabricated" from the CSV alone, so
+          //   this is surfaced for the caller to judge rather than risking a hard
+          //   failure on a correct result.
+          const rowsInPerFile = fileRawContents.map(c => estimateRowsIn(c)).filter((n): n is number => n !== null);
+          const rowsIn = rowsInPerFile.length > 0 ? rowsInPerFile.reduce((a, b) => a + b, 0) : null;
+          const MAX_DISTINCT_VALUES_SHOWN = 25;
+          const distinctPreview = provenance.groupingKeyValues.slice(0, MAX_DISTINCT_VALUES_SHOWN);
+          const moreCount = provenance.groupingKeyValues.length - distinctPreview.length;
+          const grounding = checkCsvIdGrounding(provenance.header, provenance.rows, fileRawContents);
+          const collisions = findCsvIdNameCollisions(provenance.header, provenance.rows);
+          if (collisions.length > 0) {
+            console.warn(
+              `AgentMode: performDataAnalysis intra-CSV id/name collision (userId=${userId}, informational): ` +
+              collisions.map(c => `id=${c.id} names=[${c.names.join(', ')}]`).join('; ')
+            );
+          }
+          resultParts.push(
+            `**Provenance:**\n` +
+            `rows_in: ${rowsIn !== null ? rowsIn : 'unknown (no parsable input file)'}\n` +
+            `rows_out: ${provenance.rowsOut}\n` +
+            `distinct grouping-key values (${provenance.groupingKeyValues.length}): ${distinctPreview.join(', ')}` +
+            (moreCount > 0 ? ` … (+${moreCount} more)` : '') +
+            (grounding && grounding.unverified > 0
+              ? `\n⚠️ ${grounding.unverified} of ${grounding.checked} id(s) in this result could not be found in the raw source file(s) — treat those rows as unverified.`
+              : '') +
+            (collisions.length > 0
+              ? `\n⚠️ ${collisions.length} id(s) map to more than one name within this result — e.g. id "${collisions[0].id}" as [${collisions[0].names.join(', ')}]. ` +
+                'This can mean the source entity was renamed during the query window, or that a row was fabricated/corrupted — verify before trusting these names.'
+              : '')
+          );
+
+          // 3. Explicit untrusted-narrative caveat: make it part of the tool's own
+          // contract that the free-form prose has not been cross-checked, rather
+          // than relying on the calling agent to know to verify it independently
+          // (the ad-hoc behavior that happened to save prod session d789c175).
+          if (hasNarrativeText) {
+            resultParts.push(
+              '**Note:** The prose above has not been independently verified. Treat **Computed Data** and **Provenance** as ' +
+              'the trusted, verified source — cross-check any names, ids, or counts mentioned in the prose against them before repeating them.'
+            );
+          }
+        }
+      }
+
       // Combine all results
       const analysisResult = resultParts.join('\n\n');
 
@@ -8984,6 +9352,13 @@ export class AgentModeService {
         /payload size exceeds|request too large|too large|exceeds.*limit/i.test(errorMessage);
       const isTimeout = (error as any)?.code === 'ECONNABORTED' ||
         /timeout|timed out|ETIMEDOUT/i.test(errorMessage);
+      // ENG-1295 (recommendation #4): a raw Gemini 400/422 that ISN'T already
+      // classified as payload-too-large is an invalid-argument rejection (e.g. a
+      // malformed file_urls entry, an unfetchable reference, or a request the
+      // sandbox otherwise refused). Previously this fell through to the generic
+      // "check that the file URLs are accessible" message with no distinct error
+      // code — the exact ambiguous failure hit in prod session 97a28948.
+      const isInvalidArgument = !isPayloadTooLarge && (statusCode === 400 || statusCode === 422);
       if (isPayloadTooLarge) {
         return {
           success: false,
@@ -8996,6 +9371,13 @@ export class AgentModeService {
           success: false,
           message: `The data analysis timed out — the dataset or analysis task is too large for a single call. Break it into smaller pieces: (1) split the data into smaller subsets, (2) call perform_data_analysis separately for each subset with a focused analysis_instruction, then (3) synthesize the individual results into a final summary.`,
           error: errorMessage
+        };
+      }
+      if (isInvalidArgument) {
+        return {
+          success: false,
+          message: `The data analysis request was rejected as invalid by the model API (HTTP ${statusCode}). This usually means a file_urls entry could not be read or parsed, or the request violated a sandbox limit. Verify each file_urls entry is a real, fetchable S3 URL or tool-response key, and that analysis_instruction does not reference unsupported content. Do NOT blindly retry the identical call — fix the arguments first.`,
+          error: 'invalid_argument'
         };
       }
       return {
@@ -11390,7 +11772,7 @@ export class AgentModeService {
       const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
 
       // Verify list ownership (org members can access lists owned by other org members)
-      const list = await crmDb.getLeadListById(listId);
+      let list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
@@ -11399,9 +11781,29 @@ export class AgentModeService {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
-      const lead = await crmDb.getLeadById(listId, leadId);
+      const requestedListId = listId;
+      let lead = await crmDb.getLeadById(listId, leadId);
+      let correctedListId: string | null = null;
+      if (!lead) {
+        // ENG-969 follow-up: the requested list_id may just be stale/wrong
+        // rather than the lead not existing at all. See leadRecovery.ts for
+        // the full rationale (tiering, retry, and why it always fails safe).
+        const found = await recoverLeadFromWrongList(crmDb, userId, requestedListId, leadId);
+        if (found) {
+          lead = found;
+          listId = found.listId;
+          correctedListId = found.listId;
+        }
+      }
       if (!lead) {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
+      }
+      if (correctedListId) {
+        // Point `list` at the list the lead actually belongs to (never mutate the
+        // fetched record in place) — downstream code reads list.linkedInAccountId,
+        // which is per-list.
+        const correctedList = await crmDb.getLeadListById(correctedListId);
+        if (correctedList) list = correctedList;
       }
 
       // Per-field provenance sidecar — lets the agent answer "where does this
@@ -11473,8 +11875,14 @@ export class AgentModeService {
       return {
         success: true,
         message: `Lead details for ${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+        // Tell the caller the list_id it passed was wrong so it corrects its own
+        // working state for later calls, instead of repeating the same mismatch.
+        ...(correctedListId
+          ? { note: `list_id "${requestedListId}" does not contain this lead. Corrected to its actual list_id "${correctedListId}" — use that for future calls with lead_id "${leadId}".` }
+          : {}),
         lead: {
           leadId: lead.leadId,
+          listId: lead.listId,
           email: lead.email || '',
           firstName: lead.firstName || '',
           lastName: lead.lastName || '',
@@ -12568,45 +12976,50 @@ export class AgentModeService {
 
       // Accept both shapes — see note in sendEmailFromConfiguredSender.
       const leadSenderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
+      const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+      if (leadSenderProvider !== 'resend' && !connectedAccountId) {
+        return {
+          success: false,
+          message: `${providerLabel(leadSenderProvider)} sender misconfigured`,
+          error: `The ${providerLabel(leadSenderProvider)} sender is missing its connected account id`,
+        };
+      }
 
-      if (leadSenderProvider !== 'resend') {
-        // Send through the customer's own connected mailbox (Gmail / Outlook)
-        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
-        if (!connectedAccountId) {
-          return {
-            success: false,
-            message: `${providerLabel(leadSenderProvider)} sender misconfigured`,
-            error: `The ${providerLabel(leadSenderProvider)} sender is missing its connected account id`,
-          };
-        }
-        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
-        await bootstrapEmailProviders();
-        const provider = getEmailProvider(leadSenderProvider);
-        const body = draft.htmlContent || draft.textContent || '';
+      // ENG-265: route through sendAsSender (not the provider APIs directly) so this
+      // chat-driven send is subject to the same daily-cap/warmup enforcement as every
+      // other send path. resolveSenderForSend gives the authoritative CrmSender
+      // (dailyLimit/warmupStartedAt included) — the same lookup crm.ts's send routes use.
+      const { resolveSenderForSend } = await import('./crmSenderService');
+      const { sendAsSender, SenderDailyLimitExceededError } = await import('./sendAsSender');
+      // Fail closed rather than falling back to a synthesized sender: resolveSenderForSend
+      // re-reads the persisted config, so a null here means the sender that existed a moment
+      // ago (from getCrmSenders) is now gone — a real (if narrow) race, not a legitimate
+      // ad-hoc-sender case. A synthesized fallback would carry no dailyLimit/warmupStartedAt
+      // and sendAsSender would treat it as uncapped, silently skipping enforcement.
+      const crmSender = await resolveSenderForSend(senderOwnerUserId, sender.id, sender.email);
+      if (!crmSender) {
+        return {
+          success: false,
+          message: 'Sender no longer available',
+          error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
+        };
+      }
+
+      try {
         // senderOwnerUserId, not userId: the connected account belongs to whoever owns the
         // sender config, and a refreshed/rotated token must be written back to them (ENG-299).
-        const sendResult = await provider.sendEmail(senderOwnerUserId, connectedAccountId, {
-          to: lead.email,
-          subject: draft.subject,
-          body,
-          isHtml: !!draft.htmlContent,
-        });
-        emailId = sendResult.messageId;
-      } else {
-        // Send via Resend (custom domain sender)
-        const { resendService } = await import('./resendService');
-        const from = `${sender.fromName} <${sender.email}>`;
-        const result = await resendService.sendEmail({
-          from,
+        const sendResult = await sendAsSender(senderOwnerUserId, crmSender, {
           to: lead.email,
           subject: draft.subject,
           html: draft.htmlContent,
-          text: draft.textContent
+          text: draft.textContent,
         });
-        if (!result) {
-          return { success: false, message: 'Email send failed', error: 'Failed to send email via Resend' };
+        emailId = sendResult.messageId;
+      } catch (error) {
+        if (error instanceof SenderDailyLimitExceededError) {
+          return { success: false, message: 'Daily sending limit reached', error: error.message };
         }
-        emailId = result.id;
+        throw error;
       }
 
       // Clear the draft after successful send
@@ -12744,62 +13157,61 @@ export class AgentModeService {
       // persisted key. A sender resolved outside loadSenderConfig may only carry the latter.
       const senderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
 
-      if (senderProvider !== 'resend') {
-        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
-        if (!connectedAccountId) {
-          return {
-            success: false,
-            message: `${providerLabel(senderProvider)} sender misconfigured`,
-            error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
-          };
-        }
-        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
-        const label = providerLabel(senderProvider);
-        await bootstrapEmailProviders();
-        const provider = getEmailProvider(senderProvider);
-        const body = htmlBody || textBody || '';
-        try {
-          const sendResult = await provider.sendEmail(userId, connectedAccountId, {
-            to,
-            subject: params.subject,
-            body,
-            isHtml: !!htmlBody,
-          });
-          emailId = sendResult.messageId;
-        } catch (providerErr: any) {
-          // Translate OAuth failures into an actionable message that names the
-          // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
-          // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
-          // configured"). Nearly all are resolved by reconnecting in Settings.
-          const raw = providerErr instanceof Error ? providerErr.message : String(providerErr);
-          const needsReconnect = /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
-          if (needsReconnect) {
-            return {
-              success: false,
-              message: `${label} sender needs reconnecting`,
-              error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
-            };
-          }
-          return {
-            success: false,
-            message: `${label} send failed`,
-            error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
-          };
-        }
-      } else {
-        const { resendService } = await import('./resendService');
-        const from = `${sender.fromName} <${sender.email}>`;
-        const result = await resendService.sendEmail({
-          from,
+      const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+      if (senderProvider !== 'resend' && !connectedAccountId) {
+        return {
+          success: false,
+          message: `${providerLabel(senderProvider)} sender misconfigured`,
+          error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
+        };
+      }
+      const label = providerLabel(senderProvider);
+
+      // ENG-265: route through sendAsSender so this chat-driven ad-hoc send is subject
+      // to the same daily-cap/warmup enforcement as every other send path.
+      const { resolveSenderForSend } = await import('./crmSenderService');
+      const { sendAsSender, SenderDailyLimitExceededError } = await import('./sendAsSender');
+      // Fail closed rather than falling back to a synthesized sender — see the matching
+      // comment in sendEmailToLead for why a null here must not become an uncapped send.
+      const crmSender = await resolveSenderForSend(userId, sender.id, sender.email);
+      if (!crmSender) {
+        return {
+          success: false,
+          message: 'Sender no longer available',
+          error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
+        };
+      }
+
+      try {
+        const sendResult = await sendAsSender(userId, crmSender, {
           to,
           subject: params.subject,
           html: htmlBody,
           text: textBody,
         });
-        if (!result) {
-          return { success: false, message: 'Email send failed', error: `Failed to send email to "${to}" via the configured sender ${sender.email}. This is often caused by an invalid or rejected recipient address, or the sender domain not being verified. Please double-check the recipient address.` };
+        emailId = sendResult.messageId;
+      } catch (error: any) {
+        if (error instanceof SenderDailyLimitExceededError) {
+          return { success: false, message: 'Daily sending limit reached', error: error.message };
         }
-        emailId = result.id;
+        // Translate OAuth failures into an actionable message that names the
+        // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
+        // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
+        // configured"). Nearly all are resolved by reconnecting in Settings.
+        const raw = error instanceof Error ? error.message : String(error);
+        const needsReconnect = senderProvider !== 'resend' && /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
+        if (needsReconnect) {
+          return {
+            success: false,
+            message: `${label} sender needs reconnecting`,
+            error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
+          };
+        }
+        return {
+          success: false,
+          message: `${label} send failed`,
+          error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
+        };
       }
 
       return {
@@ -16157,10 +16569,40 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}, ad_set_id?: string, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
-      case 'LIST':
-        return this.listMetaAdsAdCreatives(userId, account_id);
+      case 'LIST': {
+        // ENG-1476: ad_set_id never reached this edge either. Meta has no campaign->adcreatives
+        // edge, so campaign scoping is deliberately absent — use AD LIST with campaign_id, which
+        // returns creative{...} inline on each ad.
+        const result = await this.listMetaAdsAdCreatives(userId, account_id, ad_set_id ?? params?.ad_set_id);
+
+        /*
+         * If a caller supplied campaign_id anyway, say so. Returning an account-wide list
+         * labelled "(complete list)" while quietly discarding the requested scope is the exact
+         * defect this PR exists to remove — it would just be wearing a different hat. The scope
+         * is unsupportable here, so the honest move is to name it, not to drop it silently.
+         */
+        // Both spellings. The tool executor passes campaign_id POSITIONALLY into
+        // callMetaMarketingApi, never nested in params — reading only params here made this
+        // warning unreachable on the one path that actually matters.
+        const ignoredCampaignId = campaign_id ?? params?.campaign_id;
+        if (ignoredCampaignId && result?.success) {
+          // Rebuilt via buildListResult rather than spread: `{...result, scopeIgnored}` appends
+          // the new key AFTER `creatives`, putting it behind the S3 preview cut on exactly the
+          // large lists where it matters.
+          const r = result as any;
+          return buildListResult({
+            payloadKey: 'creatives',
+            payload: r.creatives ?? [],
+            message: `${r.message}${describeIgnoredCampaignScope(String(ignoredCampaignId))}`,
+            truncated: r.hasMore,
+            scope: r.scope,
+            scopeIgnored: { campaign_id: String(ignoredCampaignId) },
+          }) as MetaApiResult;
+        }
+        return result;
+      }
       case 'GET': {
         // Read ONE creative back by id (ENG-471). The service method has existed
         // and is already used by COPY_AD/RETAG_UTM — only the model-facing
@@ -16229,10 +16671,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsAds(userId, ad_set_id, account_id);
+        // ENG-1476: campaign_id used to stop here — it was never a parameter of this method,
+        // so an explicitly campaign-scoped LIST silently became an account-wide one. Accept it
+        // from the top-level argument or from params, since callers have used both spellings.
+        return this.listMetaAdsAds(userId, ad_set_id ?? params?.ad_set_id, account_id, campaign_id ?? params?.campaign_id);
       case 'CREATE':
         return this.createMetaAdsAd(userId, { ...params, account_id, adset_id: ad_set_id });
       case 'UPDATE':
@@ -17118,18 +17563,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsAdCreatives(userId: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAdCreatives(userId: string, account_id?: string, adSetId?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const creatives = (await metaService.listAdCreatives(accountId, accessToken)) || [];
-      const totalCount = Array.isArray(creatives) ? creatives.length : 0;
+      const result = await metaService.listAdCreatives(accountId, accessToken, { adSetId });
+      const creatives = result?.creatives ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} ad creative(s)`,
-        creatives: creatives,
-        totalCount: totalCount
-      };
+      return buildListResult({
+        payloadKey: 'creatives',
+        payload: creatives,
+        message: buildListMessage({
+          noun: 'ad creative(s)',
+          totalCount: creatives.length,
+          scope: result?.scope,
+          truncated: result?.truncated,
+          // Meta has no campaign->adcreatives edge, so a campaign scope is never applied here.
+          campaignScopable: false,
+        }),
+        truncated: result?.truncated,
+        scope: result?.scope,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ad creatives:', error);
@@ -17221,18 +17674,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsAds(userId: string, adSetId?: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAds(userId: string, adSetId?: string, account_id?: string, campaignId?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const ads = (await metaService.listAds(accountId, accessToken, adSetId)) || [];
-      const totalCount = Array.isArray(ads) ? ads.length : 0;
+      const result = await metaService.listAds(accountId, accessToken, adSetId, { campaignId });
+      const ads = result?.ads ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} ad(s)`,
-        ads: ads,
-        totalCount: totalCount
-      };
+      // Message shape and field order both live in agentMode/metaListScope.ts — see that module
+      // for why completeness must precede the payload (the S3 preview cut).
+      return buildListResult({
+        payloadKey: 'ads',
+        payload: ads,
+        message: buildListMessage({
+          noun: 'ad(s)',
+          totalCount: ads.length,
+          scope: result?.scope,
+          truncated: result?.truncated,
+          campaignScopable: true,
+        }),
+        truncated: result?.truncated,
+        scope: result?.scope,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ads:', error);
@@ -18992,9 +19454,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
     if (isMetaSpendStartingWrite(entity_type, action, params)) {
       const gateCreds = await this.getMetaCredentials(userId, account_id);
+      // ENG-1636: an AD status flip usually arrives with only ad_id, but the gate needs
+      // the parent campaign to scope its tracking checks — and blocked such calls with
+      // "no campaign was identified" even though Meta carries campaign_id on the ad
+      // object. Resolve the parent instead of refusing a call whose campaign is one
+      // read away. A failed lookup falls through with the campaign still unset, so the
+      // gate blocks loudly exactly as before: failure to verify is never permission to
+      // proceed.
+      const gateCampaignId = await resolveMetaActivationCampaignId({
+        entityType: entity_type,
+        campaignId: campaign_id,
+        adId: ad_id,
+        accessToken: gateCreds.accessToken,
+        accountId: gateCreds.accountId,
+        resolver: metaService,
+      });
       const gate = await runMetaTrackingGate(
         gateCreds,
-        campaign_id,
+        gateCampaignId,
         `${entity_type}_${action}`,
         overrideTrackingCheck,
         sessionId,
@@ -19027,10 +19504,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return this.manageMetaAdsAdSets(userId, action as any, account_id, campaign_id, ad_set_id, params);
 
       case 'AD_CREATIVE':
-        return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params);
+        // campaign_id is forwarded so AD_CREATIVE LIST can SAY it cannot honour it, rather than
+        // dropping it silently — the same threading the AD case below does (ENG-1476).
+        return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params, ad_set_id, campaign_id);
 
       case 'AD':
-        return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params);
+        // campaign_id is forwarded here (ENG-1476). It was already in scope for the tracking
+        // gate above and was simply never handed to the AD handler, which is why an
+        // AD LIST scoped to a campaign returned the entire account instead.
+        return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params, campaign_id);
 
       case 'CUSTOM_AUDIENCE':
         return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
@@ -20351,19 +20833,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  // Action type mappings (shared across all processing functions)
-  private readonly FORM_ACTIONS = new Set([
-    'leadgen',
-    'on_facebook_lead',
-    'onsite_conversion.lead_form',
-    'offsite_conversion.fb_pixel_custom',
-    'offsite_conversion.fb_pixel_lead'
-  ]);
-  private readonly WEBSITE_ACTIONS = new Set([
-    'website_lead',
-    'lead'
-  ]);
-
   // Helper function to process campaign data from Meta API
   private processCampaignData(campaigns: any[], insights: any[], adSets: any[]): any[] {
     const campaignMap = new Map();
@@ -20412,27 +20881,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         campaign.reach = parseInt(insight.reach) || 0;
 
         // Process lead generation metrics from actions and cost_per_action_type
-        if (insight.actions && Array.isArray(insight.actions)) {
-          for (const action of insight.actions) {
-            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-              campaign.websiteLeads += parseInt(action.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(action.action_type)) {
-              campaign.formLeads += parseInt(action.value) || 0;
-            }
-          }
-        }
-
-        if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
-          for (const costAction of insight.cost_per_action_type) {
-            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-              campaign.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(costAction.action_type)) {
-              campaign.costPerFormLead = parseFloat(costAction.value) || 0;
-            }
-          }
-        }
+        applyLeadMetrics(campaign, insight);
       }
     }
 
@@ -20448,19 +20897,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         campaign.frequency = campaign.impressions / campaign.reach;
       }
 
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (campaign.websiteLeads > 0) {
-        campaign.formLeads = 0; // Set form submissions to 0 when website leads exist
-        campaign.costPerWebsiteLead = campaign.costPerWebsiteLead || (campaign.spend / campaign.websiteLeads);
-        campaign.costPerFormLead = 0;
-      } else if (campaign.formLeads > 0) {
-        campaign.costPerFormLead = campaign.costPerFormLead || (campaign.spend / campaign.formLeads);
-      }
-
-      campaign.totalLeads = (campaign.websiteLeads || 0) + (campaign.formLeads || 0);
-      if (campaign.totalLeads > 0) {
-        campaign.costPerLead = campaign.spend / campaign.totalLeads;
-      }
+      // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
+      // longer need to suppress form leads. That suppression is what reported every Instant
+      // Form lead as a website lead on any account that also had website conversions.
+      finalizeLeadCosts(campaign);
     }
 
     // Return all campaigns regardless of activity
@@ -20514,27 +20954,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         adSet.reach = parseInt(insight.reach) || 0;
 
         // Process lead generation metrics from actions and cost_per_action_type
-        if (insight.actions && Array.isArray(insight.actions)) {
-          for (const action of insight.actions) {
-            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-              adSet.websiteLeads += parseInt(action.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(action.action_type)) {
-              adSet.formLeads += parseInt(action.value) || 0;
-            }
-          }
-        }
-
-        if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
-          for (const costAction of insight.cost_per_action_type) {
-            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-              adSet.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(costAction.action_type)) {
-              adSet.costPerFormLead = parseFloat(costAction.value) || 0;
-            }
-          }
-        }
+        applyLeadMetrics(adSet, insight);
       }
     }
 
@@ -20550,19 +20970,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         adSet.frequency = adSet.impressions / adSet.reach;
       }
 
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (adSet.websiteLeads > 0) {
-        adSet.formLeads = 0; // Set form submissions to 0 when website leads exist
-        adSet.costPerWebsiteLead = adSet.costPerWebsiteLead || (adSet.spend / adSet.websiteLeads);
-        adSet.costPerFormLead = 0;
-      } else if (adSet.formLeads > 0) {
-        adSet.costPerFormLead = adSet.costPerFormLead || (adSet.spend / adSet.formLeads);
-      }
-
-      adSet.totalLeads = (adSet.websiteLeads || 0) + (adSet.formLeads || 0);
-      if (adSet.totalLeads > 0) {
-        adSet.costPerLead = adSet.spend / adSet.totalLeads;
-      }
+      // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
+      // longer need to suppress form leads. That suppression is what reported every Instant
+      // Form lead as a website lead on any account that also had website conversions.
+      finalizeLeadCosts(adSet);
     }
 
     // Return all ad sets regardless of activity
@@ -20625,27 +21036,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ad.reach += parseInt(insight.reach) || 0;
 
         // Process lead generation metrics from actions and cost_per_action_type
-        if (insight.actions && Array.isArray(insight.actions)) {
-          for (const action of insight.actions) {
-            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-              ad.websiteLeads += parseInt(action.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(action.action_type)) {
-              ad.formLeads += parseInt(action.value) || 0;
-            }
-          }
-        }
-
-        if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
-          for (const costAction of insight.cost_per_action_type) {
-            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-              ad.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(costAction.action_type)) {
-              ad.costPerFormLead = parseFloat(costAction.value) || 0;
-            }
-          }
-        }
+        applyLeadMetrics(ad, insight);
       }
     }
 
@@ -20661,19 +21052,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ad.frequency = ad.impressions / ad.reach;
       }
 
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (ad.websiteLeads > 0) {
-        ad.formLeads = 0; // Set form submissions to 0 when website leads exist
-        ad.costPerWebsiteLead = ad.costPerWebsiteLead || (ad.spend / ad.websiteLeads);
-        ad.costPerFormLead = 0;
-      } else if (ad.formLeads > 0) {
-        ad.costPerFormLead = ad.costPerFormLead || (ad.spend / ad.formLeads);
-      }
-
-      ad.totalLeads = (ad.websiteLeads || 0) + (ad.formLeads || 0);
-      if (ad.totalLeads > 0) {
-        ad.costPerLead = ad.spend / ad.totalLeads;
-      }
+      // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
+      // longer need to suppress form leads. That suppression is what reported every Instant
+      // Form lead as a website lead on any account that also had website conversions.
+      finalizeLeadCosts(ad);
     }
 
     // Return all ads regardless of activity
@@ -20729,33 +21111,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
 
       // Process lead generation metrics from actions and cost_per_action_type
-      if (item.actions && Array.isArray(item.actions)) {
-        for (const action of item.actions) {
-          if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-            processedItem.websiteLeads += parseInt(action.value) || 0;
-          }
-          if (this.FORM_ACTIONS.has(action.action_type)) {
-            processedItem.formLeads += parseInt(action.value) || 0;
-          }
-        }
-      }
+      applyLeadMetrics(processedItem, item);
 
-      if (item.cost_per_action_type && Array.isArray(item.cost_per_action_type)) {
-        for (const costAction of item.cost_per_action_type) {
-          if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-            processedItem.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-          }
-          if (this.FORM_ACTIONS.has(costAction.action_type)) {
-            processedItem.costPerFormLead = parseFloat(costAction.value) || 0;
-          }
-        }
-      }
-
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (processedItem.websiteLeads > 0) {
-        processedItem.formLeads = 0; // Set form submissions to 0 when website leads exist
-        processedItem.costPerFormLead = 0;
-      }
+      // ENG-1575: buckets are disjoint (see applyLeadMetrics) — no suppression needed.
 
       // Calculate totals
       processedItem.totalLeads = (processedItem.websiteLeads || 0) + (processedItem.formLeads || 0);
@@ -21346,6 +21704,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               q: `(${parentClauses}) and fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
               fields: 'files(id, name, mimeType, parents)',
               pageSize: limitedMaxResults,
+              supportsAllDrives: true,
+              includeItemsFromAllDrives: true,
             });
 
             const driveFiles = driveResponse.data.files || [];
@@ -21801,6 +22161,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 fields: 'files(id, name, mimeType, size, modifiedTime)',
                 orderBy: 'modifiedTime desc',
                 pageSize: Math.min(driveOffset + driveLimit, 1000),
+                supportsAllDrives: true,
+                includeItemsFromAllDrives: true,
               });
 
               const allFiles = (response.data.files || []).map((f) => ({
@@ -22153,7 +22515,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       content = Buffer.from(res.data);
     } else {
       // Binary files — download directly
-      const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
+      const res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'arraybuffer' });
       content = Buffer.from(res.data);
     }
 
@@ -22376,6 +22738,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         q: `'${folderId}' in parents and name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
         fields: 'files(id, name, mimeType, size, modifiedTime)',
         pageSize: 1,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
       });
 
       const files = listResponse.data.files || [];
@@ -22412,6 +22776,129 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: `Failed to read Google Drive file "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+      };
+    }
+  }
+
+  // Maximum bytes materialize_knowledge_base_asset will download/upload for one file.
+  private static readonly MATERIALIZE_ASSET_MAX_BYTES = 200 * 1024 * 1024;
+
+  /**
+   * Turn an image/video file from a connected Google Drive knowledge base
+   * folder into a real, hosted S3 asset with a usable URL.
+   *
+   * readGoogleDriveSharedFile / readGoogleDriveFileContent are text-oriented:
+   * a binary file falls through to `content.toString('base64')` inside a
+   * knowledge-base tool response capped at 1,000,000 characters, which
+   * silently truncates (and corrupts) anything but a tiny file, and nothing
+   * downstream consumes that base64 blob anyway (ad-creative tools need a
+   * real image_url/image_hash/video_id). This bypasses that path entirely:
+   * download raw bytes -> upload to S3 -> return a URL other tools can use
+   * directly, mirroring the existing removeC2PAFromImage upload pattern.
+   */
+  public async materializeKnowledgeBaseAsset(
+    kbIdentifier: string,
+    fileName: string,
+    userId: string
+  ): Promise<any> {
+    if (!kbIdentifier || !fileName) {
+      return { success: false, message: 'kb_identifier and file_name are required' };
+    }
+
+    if (!kbIdentifier.startsWith('gdrive:')) {
+      return {
+        success: false,
+        message: 'materialize_knowledge_base_asset currently only supports Google Drive knowledge base sources (kb_identifier starting with "gdrive:")'
+      };
+    }
+
+    const folderId = kbIdentifier.replace('gdrive:', '');
+    const folders = await this.getUserGoogleDriveFolders(userId);
+    if (!folders.some(f => f.folderId === folderId)) {
+      return { success: false, message: 'Not authorized to access this Google Drive folder' };
+    }
+
+    try {
+      const drive = await this.getGoogleDriveClient();
+
+      const listResponse = await drive.files.list({
+        q: `'${folderId}' in parents and name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
+        fields: 'files(id, name, mimeType, size)',
+        pageSize: 1,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+      });
+
+      const files = listResponse.data.files || [];
+      if (files.length === 0) {
+        return { success: false, message: `File "${fileName}" not found in Google Drive folder` };
+      }
+
+      const file = files[0];
+      const mimeType = file.mimeType || '';
+      if (!mimeType.startsWith('image/') && !mimeType.startsWith('video/')) {
+        return {
+          success: false,
+          message: `"${fileName}" is a ${mimeType || 'unknown type'} file. materialize_knowledge_base_asset only handles images/videos — use read_knowledge_base_files for text/document content.`
+        };
+      }
+
+      const size = file.size ? parseInt(file.size, 10) : 0;
+      if (size > AgentModeService.MATERIALIZE_ASSET_MAX_BYTES) {
+        return {
+          success: false,
+          message: `"${fileName}" is ${Math.round(size / (1024 * 1024))}MB, over the ${AgentModeService.MATERIALIZE_ASSET_MAX_BYTES / (1024 * 1024)}MB limit for asset materialization`
+        };
+      }
+
+      const mediaResponse = await drive.files.get(
+        { fileId: file.id!, alt: 'media', supportsAllDrives: true },
+        { responseType: 'arraybuffer' }
+      );
+      const buffer = Buffer.from(mediaResponse.data as any);
+
+      // Drive's reported `size` can be missing/stale (e.g. 0 during virus-scan) —
+      // re-check the actual downloaded bytes so an oversized file can't slip
+      // through on bad metadata and get uploaded/reported with a wrong size.
+      if (buffer.length > AgentModeService.MATERIALIZE_ASSET_MAX_BYTES) {
+        return {
+          success: false,
+          message: `"${fileName}" is ${Math.round(buffer.length / (1024 * 1024))}MB, over the ${AgentModeService.MATERIALIZE_ASSET_MAX_BYTES / (1024 * 1024)}MB limit for asset materialization`
+        };
+      }
+
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const uploadResult = await uploadFileToS3(buffer, file.name || fileName, userId, mimeType);
+
+      if (!uploadResult.success || !uploadResult.url) {
+        return {
+          success: false,
+          message: uploadResult.error || 'Failed to upload asset to S3',
+          error: uploadResult.error || 's3_upload_failed'
+        };
+      }
+
+      return {
+        success: true,
+        message: `Materialized "${fileName}" from Google Drive as a hosted asset.`,
+        url: uploadResult.url,
+        file_name: file.name || fileName,
+        mime_type: mimeType,
+        size,
+        kb_identifier: kbIdentifier
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error materializing knowledge base asset:', error);
+      const code = error?.code || error?.status;
+      if (code === 404) {
+        return { success: false, message: `File "${fileName}" not found or not accessible` };
+      }
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Access denied reading this Google Drive file' };
+      }
+      return {
+        success: false,
+        message: `Failed to materialize "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
       };
     }
   }
@@ -22612,7 +23099,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     const readWithDrive = async (driveClient: any) => {
-      const meta = await driveClient.files.get({ fileId, fields: 'id,name,mimeType,modifiedTime' });
+      const meta = await driveClient.files.get({ fileId, fields: 'id,name,mimeType,modifiedTime', supportsAllDrives: true });
       const { name, mimeType, modifiedTime } = meta.data;
       const isGoogleNative =
         mimeType === 'application/vnd.google-apps.document' ||
@@ -22710,6 +23197,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         fields: 'files(id,name,mimeType,modifiedTime,webViewLink),nextPageToken',
         orderBy: 'name',
         pageSize: 100,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
       });
 
       const files = resp.data.files || [];
@@ -22792,6 +23281,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         fields: 'files(id,name,mimeType,webViewLink,parents)',
         orderBy: 'modifiedTime desc',
         pageSize: 20,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
       });
 
       const files = resp.data.files || [];
@@ -31973,6 +32464,94 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     };
   }
 
+  /**
+   * ENG-1558 follow-up: classic search-people results almost never carry
+   * `work_experience` (confirmed live — every item across two production
+   * test searches omitted it; see outreachProspectPreviewService's own
+   * "search results often omit it" comment), so calling
+   * filterByCompanySize directly on raw search items resolves an employer
+   * for ~0% of candidates and excludes everyone as unverifiable regardless
+   * of the requested bounds. importLeadsFromSearch already avoids this with
+   * a 4-tier resolution chain (work_experience → title-regex → batched LLM
+   * → Unipile getProfile) before its own company-size filter; this mirrors
+   * that same chain for the single search-people call so the two paths
+   * agree, and reshapes the result as `work_experience` since that's what
+   * filterByCompanySize's employerOf() reads.
+   */
+  private async resolveEmployersForSizeFilter(
+    items: any[],
+    accountId: string,
+    userId: string,
+  ): Promise<Array<{ work_experience: Array<{ company: string; current: true }> }>> {
+    const names: Array<string | null> = items.map((item: any) => {
+      if (item?.work_experience?.length) {
+        const current = item.work_experience.find((w: any) => w?.current) || item.work_experience[0];
+        if (current?.company) return current.company;
+      }
+      return null;
+    });
+
+    items.forEach((item: any, i: number) => {
+      if (!names[i] && typeof item?.headline === 'string') {
+        const parsed = parseCompanyFromTitle(item.headline);
+        if (parsed) names[i] = parsed;
+      }
+    });
+
+    const llmIndices: number[] = [];
+    const llmTitles: string[] = [];
+    items.forEach((item: any, i: number) => {
+      if (!names[i] && typeof item?.headline === 'string' && item.headline) {
+        llmIndices.push(i);
+        llmTitles.push(item.headline);
+      }
+    });
+    if (llmTitles.length > 0) {
+      try {
+        const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, this, userId);
+        for (let k = 0; k < llmIndices.length; k++) {
+          const v = results[k];
+          if (v && v !== 'NONE') names[llmIndices[k]] = v;
+        }
+      } catch (e: any) {
+        console.warn('[resolveEmployersForSizeFilter] LLM batch company-parse failed:', e?.message ?? String(e));
+      }
+    }
+
+    // CodeRabbit: an unbounded Promise.all here would let one hung Unipile
+    // request stall the whole interactive search-people turn — the same
+    // failure mode filterByCompanySize already guards against with a timeout
+    // + chunked concurrency. Mirror that here rather than reintroducing it.
+    const lookupTargets = items
+      .map((item: any, i: number) => ({ item, i }))
+      .filter(({ item, i }) => !names[i] && item?.public_identifier && accountId);
+    for (let start = 0; start < lookupTargets.length; start += EMPLOYER_PROFILE_LOOKUP_CONCURRENCY) {
+      const batch = lookupTargets.slice(start, start + EMPLOYER_PROFILE_LOOKUP_CONCURRENCY);
+      await Promise.all(batch.map(async ({ item, i }) => {
+        try {
+          const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
+          const profile = await withTimeoutOrReject(
+            getUnipileProfileService().getProfile(item.public_identifier, accountId),
+            EMPLOYER_PROFILE_LOOKUP_TIMEOUT_MS,
+            `LinkedIn profile lookup for ${item.public_identifier}`,
+          );
+          const raw = (profile as any)?.rawData ?? profile;
+          const exp = raw?.work_experience;
+          if (Array.isArray(exp) && exp.length) {
+            const cur = exp.find((w: any) => w?.current) || exp[0];
+            if (cur?.company) names[i] = cur.company;
+          }
+        } catch (e: any) {
+          console.warn('[resolveEmployersForSizeFilter] getProfile fallback failed:', e?.message ?? String(e));
+        }
+      }));
+    }
+
+    return names.map((name) => ({
+      work_experience: name ? [{ company: name, current: true as const }] : [],
+    }));
+  }
+
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
@@ -31985,11 +32564,25 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // Same set the pacer uses, deliberately not a second hand-maintained copy: a
     // sixth write action added to one list and not the other would be either
     // silently unpaced or silently unauthorized.
-    if (PACED_WRITE_ACTIONS.has(action)) {
-      const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
-      const userAccounts = await getAccountsByUserIdIncludingOrgShared(userId);
-      const authorized = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
-      if (!authorized) {
+    //
+    // Also resolves the account's owner + daily-cap config here (via
+    // resolveLinkedInAccountForWrite — services/agentMode/linkedInDailyVolumeGate.ts),
+    // from the same lookup this authorization check already needs, avoiding a
+    // second DB read. The daily cap is self-reported (set directly by the user
+    // in Settings, or by Emma via the set-daily-invite-cap action after asking
+    // about Premium status), never auto-detected — see linkedInWritePacer.ts's
+    // module doc comment for why. Unset defaults to the conservative free-tier
+    // number, never to the Premium max. The resolved owner may differ from the
+    // calling user for an org-shared account — writes below go through the
+    // owner's record, not the caller's.
+    // set-daily-invite-cap shares this same ownership check (a config write on
+    // the account still needs to be the caller's own/shared account) but is
+    // deliberately NOT in PACED_WRITE_ACTIONS — it doesn't touch LinkedIn at
+    // all, so none of the burst/hourly/daily send-pacing below applies to it.
+    let resolvedLinkedInAccount: ResolvedLinkedInAccount | null = null;
+    if (PACED_WRITE_ACTIONS.has(action) || action === 'set-daily-invite-cap') {
+      resolvedLinkedInAccount = await resolveLinkedInAccountForWrite(userId, account_id);
+      if (!resolvedLinkedInAccount) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
       }
     }
@@ -32092,26 +32685,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // batch of already-invited leads would both crawl and eat the hourly ceiling
     // that the genuinely-new invites later in the same run need. Each case below
     // therefore calls this immediately before its own Unipile write.
+    // Daily-volume + hourly/burst pacing lives in
+    // services/agentMode/linkedInDailyVolumeGate.ts — see that module's doc
+    // comment for the ownership and check-ordering fixes it encodes.
     const paceWrite = async (): Promise<{ refusal: any } | null> => {
       if (!PACED_WRITE_ACTIONS.has(action)) return null;
-      const slot = await reserveWriteSlot(account_id);
-      if (slot.allowed) return null;
-      console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by write pacer — ${slot.reason}`);
-      return {
-        refusal: {
-          success: false,
-          message: 'LinkedIn write actions are being paced',
-          error: [
-            slot.reason,
-            '',
-            'This is a deliberate safety limit on our side, not a LinkedIn rejection: sending or',
-            'withdrawing too quickly is what causes LinkedIn to revoke the account\'s session, which',
-            'blocks ALL outreach until the account owner manually reconnects.',
-            '',
-            'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
-          ].join('\n'),
-        },
-      };
+      const result = await paceLinkedInWrite(action, resolvedLinkedInAccount!, account_id);
+      return result.refusal ? { refusal: result.refusal } : null;
     };
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
@@ -32126,6 +32706,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             keywords, search_url, title, company, cursor,
             company_id, location, location_id,
             industry, industry_id, school, school_id,
+            company_size_min, company_size_max,
           } = args;
           // Unipile classic search needs at least one of keywords/search_url/cursor.
           // The downstream linkedInOutreachService.searchPeople synthesizes keywords
@@ -32169,7 +32750,47 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // count has to be reported, or the agent is left guessing which of three
             // very different situations it is in.
             const anonymizedFiltered = searchResult.items.length - usableItems.length;
-            const trimmedItems = usableItems.map((item: any) => {
+            // ENG-1558: Unipile has no native headcount filter for people search
+            // (only for its Companies category), so a company-size ask is applied
+            // as a post-filter here — resolve each candidate's current employer
+            // and drop those outside the requested range (or unverifiable). No-op
+            // (zero extra Unipile/LLM calls) when the caller didn't ask for it.
+            //
+            // Classic search-people items almost never carry `work_experience`
+            // (confirmed live, ENG-1558 follow-up), so the employer has to be
+            // resolved first via the same tiered chain importLeadsFromSearch
+            // uses — otherwise every candidate reads as unverifiable and the
+            // filter excludes 100% of results regardless of the bounds asked for.
+            const wantsSizeFilter = company_size_min != null || company_size_max != null;
+            let sizeFilterInput = usableItems;
+            if (wantsSizeFilter) {
+              const resolved = await this.resolveEmployersForSizeFilter(usableItems, account_id, userId);
+              // CodeRabbit: only fill in the synthetic work_experience when the
+              // item didn't already carry a usable one — otherwise this
+              // overwrites a real Tier-1 work_experience (with `position`, etc.)
+              // with the resolver's bare { company, current } shape, silently
+              // dropping fields for the rare item that already had them. The
+              // "usable" check has to match the current/first-entry semantics
+              // resolveEmployersForSizeFilter's Tier 1 and filterByCompanySize's
+              // employerOf() both use — a bare .some() across every entry can
+              // keep an item whose CURRENT entry has no company, discarding a
+              // real resolved value and later reading as unverifiable anyway.
+              const hasCurrentCompany = (item: any): boolean => {
+                const exp = Array.isArray(item?.work_experience) ? item.work_experience : [];
+                const current = exp.find((w: any) => w?.current) || exp[0];
+                return !!current?.company;
+              };
+              sizeFilterInput = usableItems.map((item: any, i: number) => (
+                hasCurrentCompany(item) ? item : { ...item, ...resolved[i] }
+              ));
+            }
+            const { items: sizedItems, excludedUnverifiable: companySizeFiltered } =
+              await linkedInOutreachService.filterByCompanySize(
+                sizeFilterInput,
+                { min: company_size_min, max: company_size_max },
+                account_id,
+              );
+            const trimmedItems = sizedItems.map((item: any) => {
               const trimmed: any = {
                 provider_id: item.provider_id,
                 public_identifier: item.public_identifier,
@@ -32195,6 +32816,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               ...searchResult,
               items: trimmedItems,
               ...(anonymizedFiltered > 0 ? { anonymizedFiltered } : {}),
+              ...(companySizeFiltered > 0 ? { companySizeFiltered } : {}),
             });
             if (trimmedItems.length === 0 && anonymizedFiltered > 0) {
               // Say plainly what happened, so this does not get reported to the
@@ -32205,6 +32827,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                   `All ${anonymizedFiltered} result(s) were anonymized by LinkedIn (out-of-network), so none are usable. ` +
                   `The search itself worked — this is a reach limit, not an outage and not an empty niche. ` +
                   `Broaden the query, or search from an account whose network covers these people.`,
+                data: searchData,
+              };
+            }
+            if (trimmedItems.length === 0 && companySizeFiltered > 0) {
+              // Same transparency principle as the anonymized case above: a
+              // company-size ask that excluded every real candidate is a
+              // narrow-niche result, not an empty search and not an outage.
+              return {
+                success: true,
+                message:
+                  `Found candidates, but excluded all ${companySizeFiltered} of them because their employer's size ` +
+                  `either fell outside the requested range or couldn't be verified. The search itself worked — ` +
+                  `try widening the company_size range, or drop it to see the unfiltered results.`,
                 data: searchData,
               };
             }
@@ -32373,9 +33008,84 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const sharedSecret = args.shared_secret;
           if (!invitationId) throw new Error('invitation_id is required for accept-invitation');
           if (!sharedSecret) throw new Error('shared_secret is required for accept-invitation (use the value from list-received-invitations)');
+
+          // ENG-1595 identity binding: resolve the invitee's identity from Unipile's
+          // OWN received-invitations record for THIS invitationId, before accepting —
+          // never from caller-supplied profile_url/provider_id/name args. Those are
+          // LLM-supplied and unverified against invitation_id; unlike send-invite
+          // (where the supplied identity IS the send target by construction), a
+          // mismatched pair here would accept invitation A but mirror the CRM write
+          // onto an unrelated person B. Bounded scan: received invitations are a
+          // live feed, not something to page through unboundedly on a request path.
+          let acceptedSenderProfile: { public_id?: string; provider_id?: string; full_name?: string } | null = null;
+          try {
+            const MAX_PAGES = 5;
+            let cursor: string | undefined;
+            for (let page = 0; page < MAX_PAGES && !acceptedSenderProfile; page++) {
+              const received = await linkedInOutreachService.listReceivedInvitations(account_id, cursor);
+              const items = Array.isArray(received?.items) ? received.items : [];
+              const match = items.find((it: any) => String(it?.id) === String(invitationId));
+              if (match) {
+                acceptedSenderProfile = match.sender_profile || null;
+                break;
+              }
+              cursor = received?.cursor;
+              if (!cursor) break;
+            }
+          } catch (lookupErr) {
+            console.warn(`[AgentMode] accept-invitation: could not verify sender identity for invitation ${invitationId} (CRM mirror will be skipped):`, lookupErr);
+          }
+
           const acceptPaced = await paceWrite();
           if (acceptPaced) return acceptPaced.refusal;
           const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, account_id, sharedSecret);
+
+          // ENG-1595: mirror the now-accepted INBOUND connection into the CRM, same
+          // best-effort pattern send-invite uses below — an accepted connection must
+          // be as findable/engageable as one this account invited, or name-based CRM
+          // search silently misses a real, legitimate contact (the reported symptom).
+          // No-ops cleanly when identity couldn't be verified or list can't be
+          // resolved — mirrors nothing rather than guessing or trusting the caller.
+          //
+          // Deliberately NOT falling back to resolveListIdForAccount here (unlike
+          // send-invite). Sending an invite is always a deliberate targeting action —
+          // the account-bound list is a safe default. Accepting an inbound request is
+          // not: it could be a genuine prospect or an unrelated personal connection,
+          // and the account owner never decided "every accept is a lead." Only mirror
+          // when the caller explicitly names a list_id — i.e. when the task driving
+          // this run has actually judged this specific person relevant.
+          try {
+            const publicId = acceptedSenderProfile?.public_id;
+            const mirrorProfileUrl = publicId ? `https://www.linkedin.com/in/${publicId}/` : null;
+            if (mirrorProfileUrl) {
+              const { mirrorLinkedInInviteToCrm, splitInvitedUserName, INVITE_ACCEPTED_EVENT } = await import('./linkedInInviteCrmMirror');
+              const mirrorListId = args.list_id;
+              if (mirrorListId) {
+                const { crmDb } = await import('./db');
+                const mirrorList = await crmDb.getLeadListById(mirrorListId);
+                const { canDestructiveCrmList } = await import('./crmAccessControl');
+                if (mirrorList && (await canDestructiveCrmList(userId, mirrorList))) {
+                  const { firstName, lastName } = splitInvitedUserName(acceptedSenderProfile?.full_name);
+                  await mirrorLinkedInInviteToCrm({
+                    userId,
+                    listId: mirrorListId,
+                    linkedinUrl: mirrorProfileUrl,
+                    leadId: args.lead_id,
+                    firstName,
+                    lastName,
+                    accountId: account_id,
+                    invitationId,
+                    eventType: INVITE_ACCEPTED_EVENT,
+                  });
+                } else {
+                  console.warn(`[AgentMode] accept-invitation: skipping CRM mirror — list ${mirrorListId} not accessible to user ${userId}`);
+                }
+              }
+            }
+          } catch (mirrorErr) {
+            console.warn('[AgentMode] accept-invitation: failed to mirror accepted connection to CRM (non-fatal):', mirrorErr);
+          }
+
           return { success: true, data: acceptResult };
         }
 
@@ -32898,8 +33608,32 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           };
         }
 
+        case 'set-daily-invite-cap': {
+          // Self-reported, not detected — see linkedInWritePacer.ts's module doc
+          // comment for why this is a direct question to the user rather than an
+          // API probe. Use this ONLY after the user has told you, in THIS
+          // conversation, whether their connected LinkedIn account has Premium —
+          // never guess, never infer it from anything else, and never call this
+          // for an unattended/scheduled run (there's no one to ask).
+          // Writes through the account OWNER's record, not necessarily the
+          // caller's — see linkedInDailyVolumeGate.ts's module doc comment.
+          const clampedCap = await setDailyInviteCap(
+            resolvedLinkedInAccount!,
+            account_id,
+            args.daily_invite_cap,
+          );
+          return {
+            success: true,
+            data: {
+              account_id,
+              daily_invite_cap: clampedCap,
+              ...(clampedCap !== Number(args.daily_invite_cap) ? { note: `Requested ${args.daily_invite_cap} was clamped to the system-wide maximum of ${clampedCap}.` } : {}),
+            },
+          };
+        }
+
         default: {
-          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters'];
+          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters','set-daily-invite-cap'];
           throw new Error(`Unsupported LinkedIn outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }
       }
@@ -33865,11 +34599,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
      *  lead back to the persona that sourced it. Distinct from the
      *  `lead.icpMatch` scoring field (post-import scoring). */
     icpSource?: string;
+    /** ENG-1558: post-filter on each lead's resolved employer headcount —
+     *  same semantics as search-people's company_size_min/max. Applied AFTER
+     *  the 4-tier company-resolution chain below (not on raw work_experience
+     *  alone), so a lead whose company only resolved via title-parse/LLM/
+     *  profile fallback is still correctly sized instead of excluded early. */
+    company_size_min?: number;
+    company_size_max?: number;
   }): Promise<any> {
     const {
       listId, keywords, search_url, title, company, company_id,
       location, location_id, industry, industry_id, school, school_id,
       cursor, limit = 20, auto_enrich = false, icpSource,
+      company_size_min, company_size_max,
     } = args;
 
     if (!listId) return { success: false, error: 'listId is required' };
@@ -33964,6 +34706,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const allCreated: Array<{ leadId: string; email?: string; lead?: any }> = [];
     // Out-of-network "LinkedIn Member" hits dropped before the write.
     let anonymizedSkipped = 0;
+    // ENG-1558: leads dropped by the company_size_min/max post-filter
+    // (outside the requested range, or an unverifiable employer).
+    let companySizeFiltered = 0;
+    // ENG-1558 follow-up: consecutive pages the size filter emptied
+    // completely. A narrow company_size range against a market where it's
+    // genuinely rare could otherwise burn all MAX_ITERATIONS pages — each
+    // costing a full searchPeople call plus per-employer lookups — before
+    // giving up. Bail out well before that once the filter has clearly
+    // proven unproductive, rather than paying the full cap's cost every time.
+    let consecutiveEmptiedBySizeFilter = 0;
+    const SIZE_FILTER_EARLY_EXIT_AFTER = 3;
+    let earlyExitOnSizeFilter = false;
 
     while (iterationCount < MAX_ITERATIONS) {
       iterationCount++;
@@ -34085,7 +34839,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         candidates.push({ lead: leads[i], item: items[i] });
       }
-      const importable: any[] = candidates.map((c) => c.lead);
+      let importable: any[] = candidates.map((c) => c.lead);
       if (importable.length === 0) {
         if (!nextCursor) break;
         continue;
@@ -34129,6 +34883,49 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           console.warn('[importLeadsFromSearch] getProfile fallback failed:', e?.message ?? String(e));
         }
       }));
+
+      // Phase 3.5 (ENG-1558): company-size post-filter, run AFTER every
+      // resolution tier above so lead.company reflects the best available
+      // employer name — filtering on Tier-1 (work_experience) alone, like
+      // search-people does, would wrongly exclude leads whose company only
+      // resolved via title-parse/LLM/profile fallback. Adapts each lead's
+      // flat `.company` string into the work_experience shape
+      // filterByCompanySize expects, tagging each with its array index so
+      // the kept subset can be mapped back without disturbing `importable`'s
+      // order (batchCreateLeads' returned sourceIndex must match).
+      if (company_size_min != null || company_size_max != null) {
+        const preFilterCount = importable.length;
+        const sizableItems = importable.map((lead: any, idx: number) => ({
+          __idx: idx,
+          work_experience: lead.company ? [{ company: lead.company, current: true }] : [],
+        }));
+        const { items: kept } = await linkedInOutreachService.filterByCompanySize(
+          sizableItems,
+          { min: company_size_min, max: company_size_max },
+          accountId,
+        );
+        const keepIdx = new Set(kept.map((it: any) => it.__idx));
+        companySizeFiltered += importable.length - keepIdx.size;
+        importable = importable.filter((_: any, i: number) => keepIdx.has(i));
+
+        if (preFilterCount > 0 && importable.length === 0) {
+          consecutiveEmptiedBySizeFilter++;
+          if (consecutiveEmptiedBySizeFilter >= SIZE_FILTER_EARLY_EXIT_AFTER) {
+            // The filter has proven unproductive several pages running —
+            // stop paying for more searchPeople + per-employer lookup calls
+            // rather than grinding to MAX_ITERATIONS on a range that's
+            // clearly not matching this market.
+            earlyExitOnSizeFilter = true;
+            break;
+          }
+        } else {
+          consecutiveEmptiedBySizeFilter = 0;
+        }
+      }
+      if (importable.length === 0) {
+        if (!nextCursor) break;
+        continue;
+      }
 
       const result = await crmDb.batchCreateLeads(listId, importable);
       cumulativeNew += result.newCount ?? 0;
@@ -34209,14 +35006,29 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       iterations: iterationCount,
       trimmed: trimmedCount,
       anonymizedSkipped,
+      companySizeFiltered,
       safetyCapHit,
     };
     if (searchError) response.searchError = searchError;
     if (searchUnavailable) response.searchUnavailable = true;
+    if (earlyExitOnSizeFilter) response.earlyExitOnSizeFilter = true;
     if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
       response.message = 'No results found for the given search criteria.';
+    } else if (earlyExitOnSizeFilter) {
+      // ENG-1558 follow-up: distinct from (and takes priority over) the
+      // generic "excluded all, search exhausted normally" message below —
+      // this stopped BEFORE exhausting, so there may be more matches the
+      // cursor can still reach.
+      response.message = cumulativeNew > 0
+        ? `Imported ${cumulativeNew} lead(s), then stopped early after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where the company_size filter excluded every result. There may be more matches — resume from the returned cursor, or widen the range.`
+        : `Stopped after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where every result was excluded by the company_size filter (out of range, or an unverifiable employer) — this looks like a narrow niche for this market, not an empty search. Widen the company_size range, or drop it to import the unfiltered results.`;
     } else if (cumulativeNew === 0 && anonymizedSkipped > 0 && !searchError) {
       response.message = `${anonymizedSkipped} search result(s) were out-of-network LinkedIn profiles with no name or profile URL and were not imported. Widen the search or connect a LinkedIn account with closer network reach.`;
+    } else if (cumulativeNew === 0 && companySizeFiltered > 0 && !searchError) {
+      // ENG-1558: same transparency principle as the anonymized-skip case
+      // above — a company-size ask that excluded every candidate is a
+      // narrow-niche result, not an empty search and not an outage.
+      response.message = `${companySizeFiltered} search result(s) were excluded because their employer's size either fell outside the requested range or couldn't be verified. Widen the company_size range, or drop it to import the unfiltered results.`;
     }
     // Preview strictly the records that were written and survived trimming.
     response.importedLeads = allCreated.slice(0, 5).map((c) => c.lead).filter(Boolean);
@@ -34806,13 +35618,66 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
            * recording, and conversions already recorded stay in reporting, exactly as a
            * REMOVED campaign still returns its historical metrics.
            */
-          if (args.confirm_conversion_action_removal !== true) {
+          /*
+           * ENG-1322 follow-up. The removal flag is BOUND to a disclosed approval, exactly
+           * as ENG-1526 bound override_tracking_check.
+           *
+           * `confirm_conversion_action_removal: true` used to be sufficient on its own, and
+           * the model sets its own arguments — so the only thing standing between a model
+           * that decided to "clean up" a conversion action and a permanent, unrecoverable
+           * removal was a sentence in the tool description asking it not to. ENG-941 already
+           * wrote down why that is not a control: "an override the model can introduce after
+           * approval is not user-granted, whatever the tool description says." This is the
+           * same shape guarding a strictly worse outcome — a removed conversion action cannot
+           * be re-enabled, and every campaign bidding toward it stops counting it.
+           *
+           * So: a claimed removal with no matching token HALTS and discloses, and issues an
+           * HMAC over this exact call. Only a replay presenting that token removes anything.
+           * A forged token, or a token minted for a DIFFERENT conversion action, falls back
+           * into a fresh disclosure rather than proceeding — which is the case that matters,
+           * because the destructive argument here is the resource name.
+           */
+          const removalClaimed = args.confirm_conversion_action_removal === true;
+          // Computed unconditionally, NOT only when the flag is claimed. The digest covers
+          // the call being disclosed, not the caller's intent to confirm — and the halt
+          // below has to hand back a usable token whether or not the flag was set. Gating
+          // it on the flag made the FIRST (unflagged) call disclose an empty string, which
+          // the model then replayed faithfully and was refused for, turning a two-step loop
+          // into three and making the token look broken. Issuing it here is not a weakening:
+          // the token is only ever returned alongside the disclosure of this exact resource
+          // name, which is what binds it.
+          const removalDigest = computeTrackingOverrideDigest(getJwtSecret(), {
+            customer_id, entity_type, action,
+            conversion_action_resource_name: args.conversion_action_resource_name,
+          });
+          const removalApproved =
+            removalClaimed && trackingOverrideTokenMatches(args.conversion_action_removal_token, removalDigest);
+
+          if (!removalApproved) {
+            const target = args.conversion_action_resource_name;
             return {
-              success: false,
-              error: 'CONVERSION_ACTION REMOVE stops this conversion action recording, permanently — '
-                + 'it cannot be re-enabled afterwards, and any campaign bidding toward it as a goal '
-                + 'will stop counting it. Conversions already recorded stay in your reports. Confirm '
-                + 'with the user, then retry with confirm_conversion_action_removal=true.',
+              success: true,
+              requiresConfirmation: true,
+              awaitingUserConfirmation: true,
+              summary: `Permanently stop conversion action ${target} from recording`,
+              confirmationPrompt:
+                `This PERMANENTLY stops a Google Ads conversion action from recording.\n\n`
+                + `It cannot be re-enabled afterwards, and any campaign bidding toward it as a `
+                + `goal will stop counting it — which changes how those campaigns bid. `
+                + `Conversions it already recorded stay in your reports, so this is not data `
+                + `loss, but it is not reversible either.\n\n`
+                + `Conversion action: ${target}\n\n`
+                + `Reply "yes" / "confirm" to remove it, or tell me to leave it alone.`,
+              confirmationDetail: `Permanently stop conversion action ${target} from recording`,
+              message:
+                `CONVERSION_ACTION REMOVE permanently stops ${target} recording and cannot be `
+                + `undone. Show the user the warning above and get explicit approval — do not `
+                + `decide this yourself. Once approved, call call_google_ads_api again with the `
+                + `same arguments PLUS conversion_action_removal_token exactly as returned here; `
+                + `without it nothing is removed.`,
+              // Only issued alongside a disclosure of this exact resource name, so the token
+              // can only ever approve the removal the user was actually shown.
+              conversion_action_removal_token: removalDigest,
             };
           }
           await googleAdsService.removeConversionAction(userId, customer_id, args.conversion_action_resource_name);
@@ -35638,6 +36503,34 @@ function computeFindLeadsCriteriaHash(filters: {
   // SHA-1 of canonical JSON, truncated to 16 hex chars — collision risk is
   // negligible for the per-list cardinality we expect here.
   return require('crypto').createHash('sha1').update(JSON.stringify(obj)).digest('hex').slice(0, 16);
+}
+
+// Mirrors LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS /
+// COMPANY_SIZE_LOOKUP_CONCURRENCY (kept as separate local constants rather
+// than importing that class here — this file already reaches the singleton
+// via the top-level `linkedInOutreachService` import, and the class itself
+// is only ever pulled in via dynamic import for a handful of static helpers).
+const EMPLOYER_PROFILE_LOOKUP_TIMEOUT_MS = 30_000;
+const EMPLOYER_PROFILE_LOOKUP_CONCURRENCY = 5;
+
+/**
+ * Races a promise against a timeout, mirroring
+ * LinkedInOutreachService's private withTimeout (not accessible from here) —
+ * used so a single hung Unipile call can't stall an interactive chat turn.
+ * The timer is unref'd so it never keeps the process alive.
+ */
+function withTimeoutOrReject<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err: any = new Error(`${label} timed out after ${ms}ms`);
+      err.isTimeout = true;
+      err.classification = 'TIMEOUT_ERROR';
+      reject(err);
+    }, ms);
+    if (typeof (timer as any).unref === 'function') (timer as any).unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 /**

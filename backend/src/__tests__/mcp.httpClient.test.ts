@@ -197,6 +197,45 @@ describe('httpClient', () => {
     });
   });
 
+  describe('overrideToken (ENG-1596 — admin client_id scoping)', () => {
+    it('uses overrideToken as the Bearer token directly, skipping self-call minting', async () => {
+      const mockResponse = {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: () => Promise.resolve({ tasks: [] }),
+      };
+      global.fetch = jest.fn().mockResolvedValue(mockResponse) as any;
+
+      const preMintedToken = jwt.sign({ userId: 'target-client-1', delegateAccess: { adminUserId: 'admin-1' } }, 'test-secret');
+
+      await mcpFetch({
+        method: 'GET',
+        path: '/api/tasks',
+        context: { userId: 'admin-1', overrideToken: preMintedToken },
+      });
+
+      const [, options] = (global.fetch as jest.Mock).mock.calls[0];
+      expect(options.headers.Authorization).toBe(`Bearer ${preMintedToken}`);
+      // No self-call token minting means no DB lookup of the caller.
+      expect(mockUserDb.getUserById).not.toHaveBeenCalled();
+    });
+
+    it('does not require userId/agentUserId in context when overrideToken is present', async () => {
+      const mockResponse = {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: () => Promise.resolve({}),
+      };
+      global.fetch = jest.fn().mockResolvedValue(mockResponse) as any;
+
+      await expect(
+        mcpFetch({ method: 'GET', path: '/api/test', context: { overrideToken: 'some.jwt.token' } })
+      ).resolves.toEqual({});
+    });
+  });
+
   describe('clearUserCache', () => {
     it('should clear cached users', async () => {
       const mockResponse = {

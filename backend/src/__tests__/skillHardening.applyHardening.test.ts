@@ -123,6 +123,13 @@ describe("planSkillChange", () => {
       addTools: ["list_connected_accounts"],
     });
     expect(res.appended).toEqual(["safety"]);
+    // requiredTools stays list_connected_accounts only (reverted, CodeRabbit
+    // finding 2026-08-25): the universal safety block must not instruct
+    // calling linkedin_outreach, since it's applied to skills that don't all
+    // carry that tool (Blindspot 5 — a skill without it would get a prompt
+    // instructing a tool call it can't make). Skills that DO send LinkedIn
+    // outreach carry their own additive daily-cap instruction instead — see
+    // seed-eng617-leadgen-skills.ts's LINKEDIN_PREMIUM_CAP_ASK.
     expect(res.addedTools).toEqual(["list_connected_accounts"]);
     expect(res.skill.systemPrompt).toContain(BLOCKS.safety.marker);
   });

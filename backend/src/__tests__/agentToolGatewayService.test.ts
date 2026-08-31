@@ -1878,6 +1878,104 @@ describe('agentToolGatewayService', () => {
       expect(execute).not.toHaveBeenCalled();
     });
 
+    it('ENG-969: three not-found get_lead_details for different leads do not block a corrected, valid call', async () => {
+      const runId = 'run-eng969';
+      // Three different (list_id, lead_id) pairs each return a structured
+      // not-found failure — a normal per-entity outcome, not a spiral.
+      for (let i = 0; i < 3; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_lead_details',
+          args: { list_id: `wrong-list-${i}`, lead_id: `lead-${i}` },
+          runId,
+          execute: () => Promise.resolve({
+            success: false,
+            message: 'Lead not found',
+            error: 'The specified lead does not exist in this list',
+          }),
+        });
+        expect(outcome.status).toBe('success'); // structured failure, not a thrown error
+      }
+
+      // A later call with corrected, valid list_id + lead_id must still execute.
+      const execute = jest.fn().mockResolvedValue({ success: true, lead: { id: 'lead-real' } });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_lead_details',
+        args: { list_id: 'correct-list', lead_id: 'lead-real' },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('ENG-969: still trips when the SAME get_lead_details lead fails repeatedly', async () => {
+      const runId = 'run-eng969-same';
+      const args = { list_id: 'list-a', lead_id: 'lead-a' };
+      for (let i = 0; i < 3; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_lead_details',
+          args,
+          runId,
+          execute: () => Promise.resolve({
+            success: false,
+            message: 'Lead not found',
+            error: 'The specified lead does not exist in this list',
+          }),
+        });
+        expect(outcome.status).toBe('success');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_lead_details',
+        args,
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-969: a "|" inside list_id/lead_id does not make two DIFFERENT pairs share a breaker bucket (CodeRabbit, PR #2611)', async () => {
+      // ("a|b", "c") and ("a", "b|c") both join to the string "a|b|c" — a plain
+      // delimiter-joined hash input would collapse these into one bucket. The
+      // JSON-encoded hash keeps them distinct.
+      const runId = 'run-eng969-delimiter';
+      const notFound = () => Promise.resolve({
+        success: false,
+        message: 'Lead not found',
+        error: 'The specified lead does not exist in this list',
+      });
+
+      for (let i = 0; i < 3; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_lead_details',
+          args: { list_id: 'a|b', lead_id: 'c' },
+          runId,
+          execute: notFound,
+        });
+        expect(outcome.status).toBe('success');
+      }
+
+      // A DIFFERENT pair that happens to join to the identical delimited string
+      // must NOT be blocked by the three failures above.
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_lead_details',
+        args: { list_id: 'a', lead_id: 'b|c' },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
     // ENG-291: the Daily Satisfaction Score Report calls get_chat_history over a
     // 24h window with sync=true (on-the-fly score generation). That heavy request
     // timed out twice, tripping the SESSION-scoped timeout aggregate at threshold
@@ -2609,5 +2707,122 @@ describe('ENG-1048: maxLength rejections say how far over the argument is', () =
     });
 
     expect(result.status).toBe('valid');
+  });
+});
+
+/*
+ * ENG-1636 — the breaker locked call_meta_marketing_api for a whole run after six
+ * identical tracking-preflight REFUSALS, then refused the corrected retry the refusal
+ * itself asked for, and every read-back with it (Phoenix, session 822c1ed4, 2026-08-28).
+ * Two properties fix that class: failures scope to one (entity, action, target) so a
+ * bucket cannot lock the tool, and a deliberate policy refusal is not a failure at all.
+ */
+describe('ENG-1636 — call_meta_marketing_api breaker scope and policy refusals', () => {
+  beforeEach(() => {
+    _resetAgentToolFailureBreaker();
+  });
+
+  const failing = (message: string) => () => Promise.reject(new Error(message));
+  const preflightBlock = () => Promise.resolve({
+    success: false,
+    blocked: true,
+    reason: 'tracking_preflight',
+    error: 'Launch blocked: could not verify Meta tracking because no campaign was identified for this AD_UPDATE.',
+  });
+  const adUpdate = (adId: string, extra: Record<string, unknown> = {}) => ({
+    entity_type: 'AD', action: 'UPDATE', account_id: 'act_1', ad_id: adId, params: { status: 'ACTIVE' }, ...extra,
+  });
+
+  it('scopes failures to one target: ad A tripping does not block ad B', async () => {
+    const runId = 'run-1636-scope';
+    for (let i = 0; i < 3; i += 1) {
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'call_meta_marketing_api', args: adUpdate('ad-A'), runId,
+        execute: failing('Meta API error: boom'),
+      });
+      expect(outcome.status).toBe('error');
+    }
+    const blockedA = await executeAgentToolThroughGateway({
+      toolName: 'call_meta_marketing_api', args: adUpdate('ad-A'), runId,
+      execute: jest.fn().mockResolvedValue({ success: true }),
+    });
+    expect(blockedA.status).toBe('error');
+    if (blockedA.status === 'error') expect(blockedA.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+
+    const executeB = jest.fn().mockResolvedValue({ success: true });
+    const outcomeB = await executeAgentToolThroughGateway({
+      toolName: 'call_meta_marketing_api', args: adUpdate('ad-B'), runId, execute: executeB,
+    });
+    expect(outcomeB.status).toBe('success');
+    expect(executeB).toHaveBeenCalled();
+  });
+
+  it('a read-back survives a tripped write bucket for the same tool', async () => {
+    const runId = 'run-1636-read';
+    for (let i = 0; i < 3; i += 1) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_meta_marketing_api', args: adUpdate('ad-A'), runId,
+        execute: failing('Meta API error: boom'),
+      });
+    }
+    const executeRead = jest.fn().mockResolvedValue({ success: true, ads: [] });
+    const read = await executeAgentToolThroughGateway({
+      toolName: 'call_meta_marketing_api',
+      args: { entity_type: 'AD', action: 'LIST', account_id: 'act_1', campaign_id: 'cmp-1' },
+      runId,
+      execute: executeRead,
+    });
+    expect(read.status).toBe('success');
+    expect(executeRead).toHaveBeenCalled();
+  });
+
+  it('a structured policy refusal does not count toward the breaker', async () => {
+    const runId = 'run-1636-refusal';
+    for (let i = 0; i < 5; i += 1) {
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'call_meta_marketing_api', args: adUpdate('ad-A'), runId, execute: preflightBlock,
+      });
+      // The refusal payload still reaches the dispatcher as a structured result.
+      expect(outcome.status).toBe('success');
+    }
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const corrected = await executeAgentToolThroughGateway({
+      toolName: 'call_meta_marketing_api', args: adUpdate('ad-A', { campaign_id: 'cmp-1' }), runId, execute,
+    });
+    expect(corrected.status).toBe('success');
+    expect(execute).toHaveBeenCalled();
+  });
+
+  it('the Phoenix shape: six per-ad refusals, then the corrected retry executes', async () => {
+    const runId = 'run-1636-phoenix';
+    for (const ad of ['a1', 'a2', 'a3', 'a4', 'a5', 'a6']) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_meta_marketing_api', args: adUpdate(ad), runId, execute: preflightBlock,
+      });
+    }
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const retry = await executeAgentToolThroughGateway({
+      toolName: 'call_meta_marketing_api', args: adUpdate('a1', { campaign_id: 'cmp-1' }), runId, execute,
+    });
+    expect(retry.status).toBe('success');
+    expect(execute).toHaveBeenCalled();
+  });
+
+  it('genuine structured failures still trip at the standard threshold', async () => {
+    const runId = 'run-1636-genuine';
+    for (let i = 0; i < 3; i += 1) {
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'call_meta_marketing_api', args: adUpdate('ad-A'), runId,
+        execute: () => Promise.resolve({ success: false, error: 'Meta API error: boom' }),
+      });
+      expect(outcome.status).toBe('success');
+    }
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const blocked = await executeAgentToolThroughGateway({
+      toolName: 'call_meta_marketing_api', args: adUpdate('ad-A'), runId, execute,
+    });
+    expect(blocked.status).toBe('error');
+    if (blocked.status === 'error') expect(blocked.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+    expect(execute).not.toHaveBeenCalled();
   });
 });
