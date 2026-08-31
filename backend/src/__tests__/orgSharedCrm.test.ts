@@ -172,7 +172,7 @@ jest.mock("../utils/emailVariables", () => ({
 }));
 jest.mock("../utils/leadContactStatus", () => ({ isDoNotContact: jest.fn() }));
 jest.mock("../utils/leadSyncStatus", () => ({
-  getHubspotConnection: jest.fn(),
+  getExternalCrmConnection: jest.fn(),
   getMappedAgentwebFields: jest.fn(),
   mappedFieldChanged: jest.fn(),
   resolveSyncStatus: jest.fn(),

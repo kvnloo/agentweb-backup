@@ -65,7 +65,11 @@ describe('MetaService config-field reads (ENG-398)', () => {
     expect(Campaign).toHaveBeenCalledWith('camp_9');
     expect(get).toHaveBeenCalled();
     expect(getCampaigns).not.toHaveBeenCalled(); // did not list the whole account
-    expect(result).toEqual([{ id: 'camp_9', bid_strategy: 'LOWEST_COST_WITHOUT_CAP' }]);
+    expect(result).toEqual({
+      campaigns: [{ id: 'camp_9', bid_strategy: 'LOWEST_COST_WITHOUT_CAP' }],
+      truncated: false,
+      pagesFetched: 1,
+    });
   });
 
   it('CAMPAIGN LIST honors an explicit supported fields selection verbatim', async () => {
@@ -74,7 +78,8 @@ describe('MetaService config-field reads (ENG-398)', () => {
 
     await service.listCampaigns(accountId, token, { fields: 'daily_budget,bid_strategy' });
 
-    expect(getCampaigns).toHaveBeenCalledWith(['daily_budget', 'bid_strategy']);
+    // ENG-1625: LIST now paginates, so every account-edge call also carries a page-size limit.
+    expect(getCampaigns).toHaveBeenCalledWith(['daily_budget', 'bid_strategy'], { limit: 100 });
   });
 
   it('CAMPAIGN LIST rejects an unsupported field LOUDLY and never calls Graph', async () => {
@@ -116,9 +121,14 @@ describe('MetaService config-field reads (ENG-398)', () => {
     expect(AdSet).toHaveBeenCalledWith('as_9');
     expect(get).toHaveBeenCalled();
     expect(getAdSets).not.toHaveBeenCalled();
-    expect(result).toEqual([
-      { id: 'as_9', optimization_goal: 'OFFSITE_CONVERSIONS', promoted_object: { pixel_id: 'px1', custom_event_type: 'LEAD' } },
-    ]);
+    expect(result).toEqual({
+      adSets: [
+        { id: 'as_9', optimization_goal: 'OFFSITE_CONVERSIONS', promoted_object: { pixel_id: 'px1', custom_event_type: 'LEAD' } },
+      ],
+      truncated: false,
+      pagesFetched: 1,
+      scope: { adSetId: 'as_9' },
+    });
   });
 
   it('AD_SET LIST honors an explicit supported fields selection verbatim', async () => {
@@ -127,16 +137,50 @@ describe('MetaService config-field reads (ENG-398)', () => {
 
     await service.listAdSets(accountId, token, undefined, { fields: 'optimization_goal,promoted_object' });
 
-    expect(getAdSets).toHaveBeenCalledWith(['optimization_goal', 'promoted_object'], {});
+    // ENG-1625: LIST now paginates, so every account-edge call also carries a page-size limit.
+    expect(getAdSets).toHaveBeenCalledWith(['optimization_goal', 'promoted_object'], { limit: 100 });
   });
 
-  it('AD_SET LIST still forwards the campaign_id filter to Graph', async () => {
-    const getAdSets = jest.fn().mockResolvedValue([]);
-    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAdSets }));
+  /*
+   * ENG-1625 — this pinned the exact ENG-1476 defect shape for ad sets: Meta's own docs for
+   * the account-level adsets edge list only date_preset/effective_status/is_completed/
+   * time_range as supported params, campaign_id is not among them, so a bare `campaign_id`
+   * param here is likely silently ignored the same way a bare adset_id/campaign_id was on
+   * the ads edge. Scoping now goes through the campaign NODE edge instead (the same fix
+   * listAds already applies), which makes the scope structurally impossible to ignore.
+   */
+  it('AD_SET LIST scopes a campaign_id through the campaign NODE edge, never a bare param on the account edge', async () => {
+    const accountGetAdSets = jest.fn();
+    const campaignGetAdSets = jest.fn().mockResolvedValue([]);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAdSets: accountGetAdSets }));
+    (Campaign as unknown as jest.Mock).mockImplementation(() => ({
+      getAdSets: campaignGetAdSets,
+      get: jest.fn().mockResolvedValue({ _data: { account_id: accountId } }),
+    }));
 
-    await service.listAdSets(accountId, token, 'camp_123');
+    const result = await service.listAdSets(accountId, token, 'camp_123');
 
-    expect(getAdSets).toHaveBeenCalledWith(expect.any(Array), { campaign_id: 'camp_123' });
+    expect(Campaign).toHaveBeenCalledWith('camp_123');
+    expect(campaignGetAdSets).toHaveBeenCalled();
+    // The exact regression: campaign scope used to fall through to an account-wide list via
+    // a bare, silently-ignored campaign_id param.
+    expect(accountGetAdSets).not.toHaveBeenCalled();
+    const params = campaignGetAdSets.mock.calls[0][1];
+    expect(params).not.toHaveProperty('campaign_id');
+    expect(result.scope).toEqual({ campaignId: 'camp_123' });
+  });
+
+  it('AD_SET LIST refuses a campaign that belongs to a different ad account', async () => {
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAdSets: jest.fn() }));
+    const campaignGetAdSets = jest.fn();
+    (Campaign as unknown as jest.Mock).mockImplementation(() => ({
+      getAdSets: campaignGetAdSets,
+      get: jest.fn().mockResolvedValue({ _data: { account_id: '999_other' } }),
+    }));
+
+    await expect(service.listAdSets(accountId, token, 'camp_from_B'))
+      .rejects.toThrow(/The requested campaign is not available in the selected ad account/);
+    expect(campaignGetAdSets).not.toHaveBeenCalled();
   });
 
   it('AD_SET LIST rejects an unsupported field LOUDLY and never calls Graph', async () => {
@@ -179,7 +223,8 @@ describe('MetaService CAMPAIGN spend_cap read (ENG-785)', () => {
 
     await service.listCampaigns(accountId, token, { fields: 'spend_cap,budget_remaining' });
 
-    expect(getCampaigns).toHaveBeenCalledWith(['spend_cap', 'budget_remaining']);
+    // ENG-1625: LIST now paginates, so every account-edge call also carries a page-size limit.
+    expect(getCampaigns).toHaveBeenCalledWith(['spend_cap', 'budget_remaining'], { limit: 100 });
   });
 
   it('CAMPAIGN LIST passes spend_cap through from the Graph response unmodified', async () => {
@@ -190,7 +235,11 @@ describe('MetaService CAMPAIGN spend_cap read (ENG-785)', () => {
 
     const result = await service.listCampaigns(accountId, token);
 
-    expect(result).toEqual([{ id: 'c1', spend_cap: '92200', budget_remaining: '150' }]);
+    expect(result).toEqual({
+      campaigns: [{ id: 'c1', spend_cap: '92200', budget_remaining: '150' }],
+      truncated: false,
+      pagesFetched: 1,
+    });
   });
 
   it('CAMPAIGN LIST single-campaign read (campaign_id) includes spend_cap in the requested fields', async () => {
@@ -200,7 +249,11 @@ describe('MetaService CAMPAIGN spend_cap read (ENG-785)', () => {
     const result = await service.listCampaigns(accountId, token, { campaignId: 'camp_9' });
 
     expect(get.mock.calls[0][0]).toEqual(expect.arrayContaining(['spend_cap']));
-    expect(result).toEqual([{ id: 'camp_9', spend_cap: '5000' }]);
+    expect(result).toEqual({
+      campaigns: [{ id: 'camp_9', spend_cap: '5000' }],
+      truncated: false,
+      pagesFetched: 1,
+    });
   });
 
   it('CAMPAIGN LIST still rejects unknown fields LOUDLY after the widening (ENG-398 regression pin)', async () => {
@@ -219,7 +272,7 @@ describe('MetaService CAMPAIGN spend_cap read (ENG-785)', () => {
 
     await service.listCampaigns(accountId, token, { fields: ' , ' });
 
-    expect(getCampaigns).toHaveBeenCalledWith(expect.arrayContaining(['spend_cap', 'budget_remaining']));
+    expect(getCampaigns.mock.calls[0][0]).toEqual(expect.arrayContaining(['spend_cap', 'budget_remaining']));
   });
 
   it('CAMPAIGN LIST propagates Graph errors with structured context', async () => {
@@ -255,7 +308,8 @@ describe('MetaService CAMPAIGN effective_status / special_ad_categories read (EN
 
     await service.listCampaigns(accountId, token, { fields: 'effective_status,special_ad_categories' });
 
-    expect(getCampaigns).toHaveBeenCalledWith(['effective_status', 'special_ad_categories']);
+    // ENG-1625: LIST now paginates, so every account-edge call also carries a page-size limit.
+    expect(getCampaigns).toHaveBeenCalledWith(['effective_status', 'special_ad_categories'], { limit: 100 });
   });
 
   it('CAMPAIGN LIST default now includes effective_status and special_ad_categories', async () => {
@@ -282,7 +336,11 @@ describe('MetaService CAMPAIGN effective_status / special_ad_categories read (EN
     });
 
     expect(get).toHaveBeenCalledWith(['effective_status', 'special_ad_categories']);
-    expect(result).toEqual([{ id: 'camp_9', effective_status: 'CAMPAIGN_PAUSED', special_ad_categories: ['NONE'] }]);
+    expect(result).toEqual({
+      campaigns: [{ id: 'camp_9', effective_status: 'CAMPAIGN_PAUSED', special_ad_categories: ['NONE'] }],
+      truncated: false,
+      pagesFetched: 1,
+    });
   });
 
   it('CAMPAIGN LIST still rejects unknown fields LOUDLY after the widening (ENG-398 regression pin)', async () => {
