@@ -156,11 +156,22 @@ describe('ENG-693 vendor dimension — behavioral contract', () => {
       expect(materializeRow(updateParams(1)).provider).toBe('remotion');
     });
 
-    it('leaves the {date}#{model}#{feature} sort-key FORMAT unchanged (out of scope to alter)', async () => {
+    it('carries the payer as a FOURTH sort-key segment (ENG-1210 superseded ENG-693 scope)', async () => {
+      // ENG-693 deliberately left the key at {date}#{model}#{feature} because
+      // changing it was out of scope for THAT ticket -- a scope boundary, not a
+      // correctness constraint. ENG-1210 then found a correctness reason: with the
+      // payer as a plain attribute written by unconditional SET, a mid-day billing
+      // transition left one row holding two payers' counters, stamped with
+      // whichever call wrote last.
+      //
+      // The vendor dimension is unaffected: vendors are still separated by the
+      // MODEL slot ('v0:generate'), exactly as the test above asserts.
       await recordVendorUsage(v0Ctx);
       const sk: string = updateParams().Key.sk;
-      expect(sk.split('#')).toHaveLength(3);
-      expect(sk).toBe('' + new Date().toISOString().slice(0, 10) + '#v0:generate#landing-page');
+      expect(sk.split('#')).toHaveLength(4);
+      expect(sk).toBe(
+        '' + new Date().toISOString().slice(0, 10) + '#v0:generate#landing-page#owner-1',
+      );
     });
   });
 
@@ -355,7 +366,10 @@ describe('ENG-693 vendor dimension — behavioral contract', () => {
     it('defaults a missing feature to "unknown" instead of writing an empty key segment', async () => {
       const { feature, ...noFeature } = v0Ctx;
       await recordVendorUsage(noFeature as any);
-      expect(updateParams().Key.sk.endsWith('#unknown')).toBe(true);
+      // The feature slot is no longer last -- the payer follows it -- so assert the
+      // SLOT, not the suffix. An empty segment here would silently merge every
+      // feature-less vendor row for a day into one aggregate.
+      expect(updateParams().Key.sk.split('#')[2]).toBe('unknown');
     });
 
     it('carries onBehalfOf when present and omits it otherwise', async () => {
@@ -400,9 +414,12 @@ describe('ENG-693 vendor dimension — behavioral contract', () => {
     it('keys the LLM row exactly as before — model slot untouched, not namespaced', async () => {
       await recordUsage(llmCtx);
       const date = new Date().toISOString().slice(0, 10);
+      // The point of this case is that the MODEL slot is not namespaced for LLM
+      // rows the way it is for vendor rows. The payer segment is common to both
+      // and does not affect that distinction.
       expect(updateParams().Key).toEqual({
         userId: 'user-1',
-        sk: `${date}#anthropic.claude-sonnet-4-6#agent-chat`,
+        sk: `${date}#anthropic.claude-sonnet-4-6#agent-chat#owner-1`,
       });
     });
 

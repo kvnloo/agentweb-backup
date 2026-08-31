@@ -1,4 +1,5 @@
-import { toolResultError } from '../utils/toolResultError';
+import { createHash } from 'crypto';
+import { toolResultError, ToolResultPolicyBlockedError } from '../utils/toolResultError';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { isFastTripErrorClass } from './agentMode/core/errorRetryability';
 
@@ -296,8 +297,55 @@ function chatHistoryFailureScope(args: unknown): string {
   return `sync=${sync}|limit=${limit}|hours=${hours}`;
 }
 
+// ENG-969: get_lead_details returns a structured not-found failure ("The
+// specified lead does not exist in this list") for a lead_id/list_id pair
+// that doesn't resolve — a normal per-entity outcome, not a retry spiral.
+// Verified in production session 6082779b-f9f1-4e38-a8eb-34abbc3da419: three
+// DIFFERENT lead ids each 404'd against the wrong list (unscoped, so all
+// three shared the tool-wide '' bucket) and tripped the breaker at threshold
+// 3, permanently blocking every later call in the run — including ones with
+// corrected, valid list_id + lead_id. Scope by the target lead (exactly like
+// the ENG-182/ENG-313 LinkedIn per-recipient scoping above) so a miss on one
+// lead doesn't block a call for a different lead; a genuine repeat on the
+// SAME lead still trips.
+function leadDetailsFailureScope(args: unknown): string {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const record = args as Record<string, unknown>;
+  const listId = typeof record.list_id === 'string' ? record.list_id.trim() : '';
+  const leadId = typeof record.lead_id === 'string' ? record.lead_id.trim() : '';
+  // Hash rather than slice to ERROR_KEY_LENGTH: two DIFFERENT (list_id, lead_id)
+  // pairs must never collapse into the same breaker bucket just because they
+  // share a long common prefix — a truncated slice could otherwise merge
+  // unrelated targets and reintroduce the exact cross-lead blocking this scope
+  // exists to prevent. JSON-encode the pair rather than joining with a plain
+  // "|" delimiter: list_id/lead_id are caller-controlled strings, so a literal
+  // "|" inside one could make two DIFFERENT pairs (e.g. ("a|b","c") and
+  // ("a","b|c")) hash identically — JSON.stringify's quoting makes the
+  // boundary between the two values unambiguous regardless of content.
+  return createHash('sha256').update(JSON.stringify([listId, leadId])).digest('hex');
+}
+
+// ENG-1636: scope Meta failures to one (entity, action, target) so a bucket cannot
+// lock the whole tool — six per-ad tracking-preflight refusals froze every read-back
+// and the corrected retry for the rest of the run (Phoenix, session 822c1ed4). Most
+// specific id wins so an AD write and an account-wide LIST never share a bucket.
+// JSON-encode like the lead scope above: ids are caller-controlled strings, so a
+// plain delimiter could make two different targets collide into one scope.
+function metaMarketingFailureScope(args: unknown): string {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const record = args as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+  const entity = str(record.entity_type).toUpperCase();
+  const action = str(record.action).toUpperCase();
+  const target = str(record.ad_id) || str(record.ad_set_id) || str(record.campaign_id) || str(record.account_id);
+  if (!entity && !action && !target) return '';
+  return createHash('sha256').update(JSON.stringify([entity, action, target])).digest('hex');
+}
+
 function failureScope(toolName: string, args: unknown): string {
   if (toolName === 'get_chat_history') return chatHistoryFailureScope(args);
+  if (toolName === 'get_lead_details') return leadDetailsFailureScope(args);
+  if (toolName === 'call_meta_marketing_api') return metaMarketingFailureScope(args);
   if (toolName !== 'linkedin_outreach') return '';
   if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
   const record = args as Record<string, unknown>;
@@ -419,9 +467,24 @@ function findTrippedSessionTimeout(
  * (budgetScopeId) bucket, not just the per-run one. True for the pre-existing
  * expensive-media budget tools, and now also for any timeout-class failure
  * (ENG-167 follow-up) — a tool that's timing out is a session-wide signal, not
- * a per-run one, since the model retries it across separate user turns/runs. */
+ * a per-run one, since the model retries it across separate user turns/runs.
+ *
+ * ENG-1220: a rate_limit-class failure on a media tool (gpt-image-2 429s) is
+ * transient — the gateway's own retryability guidance tells the model to wait
+ * and retry it. Counting it toward the tiny (2) session-wide media budget the
+ * same as a permanent failure (safety-filter rejection, invalid args) locked
+ * generate_image for the rest of the session even though the rate limit clears.
+ * Exclude rate_limit specifically so a real retry spiral (any other class)
+ * still trips the budget, but a temporary 429 does not. Hard-quota exhaustion
+ * (OpenAI/Azure `insufficient_quota`, "exceeded your current quota") is also
+ * 429-shaped but permanent, not transient — classifyToolErrorClass buckets it
+ * as 'quota_exceeded', a distinct class from 'rate_limit', so it is NOT
+ * exempted here and still counts toward the session-wide media budget. */
 function shouldTrackInSessionScope(toolName: string, error: unknown): boolean {
-  return mediaFailureBudget(toolName) != null || classifyToolErrorClass(error) === 'timeout';
+  if (mediaFailureBudget(toolName) != null) {
+    return classifyToolErrorClass(error) !== 'rate_limit';
+  }
+  return classifyToolErrorClass(error) === 'timeout';
 }
 
 function mediaFailureBudget(toolName: string): number | null {
@@ -874,9 +937,19 @@ export async function executeAgentToolThroughGateway(
     // failure exactly like the catch path; do NOT clear prior failure counts.
     const structuredFailure = toolResultError(result);
     if (structuredFailure) {
-      if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, input.args, structuredFailure);
+      // ENG-1636: a ToolResultPolicyBlockedError is a gate refusing BY DESIGN
+      // (blocked:true + reason — `by_design` per toolFailureType). The refusal names
+      // its own remedy and invites a corrected call; counting it as a malfunction let
+      // six identical pre-flight refusals trip the breaker and refuse that exact
+      // corrected retry. Deliberate refusals are not failures; nothing is recorded —
+      // and nothing is cleared either, since a refusal is not a success.
+      const deliberateRefusal = structuredFailure instanceof ToolResultPolicyBlockedError;
+      if (!deliberateRefusal && input.runId) {
+        recordToolFailure(input.runId, policyDecision.toolName, input.args, structuredFailure);
+      }
       if (
-        input.budgetScopeId
+        !deliberateRefusal
+        && input.budgetScopeId
         && input.budgetScopeId !== input.runId
         && shouldTrackInSessionScope(policyDecision.toolName, structuredFailure)
       ) {

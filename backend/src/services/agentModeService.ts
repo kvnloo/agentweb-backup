@@ -1,5 +1,20 @@
 import axios from 'axios';
+import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
+import { applyLeadMetrics, finalizeLeadCosts } from '../utils/metaActionFamilies';
 import { parse as parseCsv } from 'csv-parse/sync';
+import {
+  parseCsvProvenance,
+  tokenizeCsvHeaderCell,
+  findCsvIdNameCollisions,
+  checkCsvIdGrounding,
+  estimateRowsIn,
+  buildDataAnalysisCacheKey,
+} from './agentMode/csvProvenance';
+import {
+  buildListMessage,
+  buildListResult,
+  describeIgnoredCampaignScope,
+} from './agentMode/metaListScope';
 import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
@@ -8,9 +23,16 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
+import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
+import {
+  decideWorkPlanTurnDisposition,
+  snapshotWorkPlanTurn,
+  type WorkPlanTurnDisposition,
+} from './agentMode/core/workPlanTurnDisposition';
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
@@ -22,25 +44,31 @@ import {
 import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
-import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
+import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
+import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
+  getPersistedBrandLogoAssetUrl,
   getPersistedBrandLogoUrlForUser,
   missingBrandLogoToolResult,
   promptCreatesLogo,
   promptRequestsLogo,
 } from './agentMode/brandLogo';
-import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
+import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
+import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
+import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
+import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 import { resolveOrgProfileField } from './orgProfileResolver';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
-import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization } from '../utils/schedulePublishAuthorization';
+import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization, describePublishAuthorizationWithholdReason, PublishAuthorizationWithholdReason } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
+import { meteringFeature } from './llmUsageAttributionService';
 import { RunEmitter } from './agentMode/streamEvents';
 // ENG-1002: the anonymized-hit rule lives in one place so the import tool and
 // the outreach-onboarding prospect preview cannot drift apart.
@@ -56,6 +84,13 @@ import {
 } from './agentMode/core/askUserQuestion';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
+import {
+  DEFAULT_NEW_CHAT_HERO_GREETING,
+  NEW_CHAT_HERO_GREETING_SETTING,
+  NewChatHeroGreeting,
+  parseNewChatHeroGreetingSetting,
+  validateNewChatHeroGreeting,
+} from '../utils/newChatHeroGreeting';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { createWriteStream, promises as fs, default as fsSync } from 'fs';
@@ -72,9 +107,9 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
-import { BEDROCK_BEARER_TOKEN_MODELS, bedrockCacheTtl, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import {
   getModelPrice,
+  costScoreFromPrice,
   cacheWriteCost,
   CacheWriteByTtl,
   imageGenerationCostUsd,
@@ -99,6 +134,11 @@ import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
+import {
+  applyOpenRouterCacheBreakpoints,
+  resolveOpenRouterUpstreamModelId,
+  type GatewayTaskClass,
+} from '../utils/openRouterGatewayContract';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -195,13 +235,6 @@ export const TOOL_RESPONSE_S3_THRESHOLD = CONTEXT_TRIM_TOOL_CONTENT_LIMIT;
 // increase normal-turn cost.
 export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
 
-// ENG-907: sentinel resolved by `withSynthesisRetryDeadline` when a forced-synthesis backup
-// call outlives the time left. A unique symbol so it can never collide with a real response.
-const SYNTHESIS_RETRY_TIMED_OUT = Symbol('synthesis-retry-timed-out');
-// Slack left between the bounded retry and the caller's cap, so the turn still has room to
-// persist and return its partial answer after giving up on the retry.
-const SYNTHESIS_RETRY_MARGIN_MS = 5_000;
-
 // Max size of a NON-HTML content_draft that create_html_file will attempt to
 // render into HTML in a single internal LLM call. The render (llmService
 // generateHTML) has a hard 5-minute per-call Bedrock timeout, retried 3x — an
@@ -294,6 +327,19 @@ export function pressesIrreversiblePublishWrite(text: string): boolean {
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
+import {
+  isAnonymizedIdentifier,
+  usablePublicIdentifier,
+  usableProfileUrl,
+  withoutFabricatedProfileFields,
+} from '../utils/linkedInAnonymizedProfile';
+import { PACED_WRITE_ACTIONS } from './linkedInWritePacer';
+import {
+  paceLinkedInWrite,
+  resolveLinkedInAccountForWrite,
+  setDailyInviteCap,
+  type ResolvedLinkedInAccount,
+} from './agentMode/linkedInDailyVolumeGate';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -321,7 +367,7 @@ import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
-import { computeRunVerdict } from '../loops/instances/agent-mode/runRecorder';
+import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
 // OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
 import {
   endChatSpan,
@@ -349,6 +395,7 @@ import {
   validateAndRepairToolArgs,
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { isRetryableErrorClass } from './agentMode/core/errorRetryability';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
@@ -377,15 +424,6 @@ import {
   META_GOAL_BID_STRATEGY_MAP,
   META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
-
-// Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
-// Used for updateEmailDraftForLead to match generateBlogContent pattern
-const openai = new OpenAI({
-  apiKey: process.env.AZURE_OPENAI_API_KEY,
-  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-  defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
-  defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
-});
 
 /**
  * Self-learning loop telemetry for agent-mode tool calls.
@@ -506,7 +544,7 @@ function recordAgentModeRunStarted(
 
 function recordAgentModeRunCompleted(
   runId: string,
-  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean },
+  info: RunTerminalInfo,
 ): void {
   endInvokeAgentSpan(runId, {
     verdict: computeRunVerdict({
@@ -515,6 +553,7 @@ function recordAgentModeRunCompleted(
       failedToolCalls: info.failedToolCalls ?? 0,
       maxSameToolFailures: info.maxSameToolFailures,
     }).verdict,
+    responseModel: info.llmModel,
   });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
@@ -541,9 +580,9 @@ function recordAgentModeClaimCheckError(runId: string, sessionId: string, error:
 
 function recordAgentModeRunFailed(
   runId: string,
-  info: { error: unknown; toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
+  info: RunTerminalInfo & { error: unknown },
 ): void {
-  endInvokeAgentSpan(runId, { verdict: 'failed', error: info.error });
+  endInvokeAgentSpan(runId, { verdict: 'failed', error: info.error, responseModel: info.llmModel });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runFailed(runId, info);
@@ -814,6 +853,161 @@ interface LLMModelConfig {
   maxTools?: number;
   /** True to restrict model to admin users only */
   adminOnly?: boolean;
+  /** Internal workload model: callable by services but never selectable in the customer picker. */
+  internalOnly?: boolean;
+  /**
+   * Usage/cost tier for the model picker UI. Only used as a fallback when
+   * getModelPrice() has no entry for this model — otherwise the picker's
+   * tier grouping is derived live from the computed cost score (see
+   * TIER_COST_SCORE_BANDS). Unset defaults to 'medium'.
+   */
+  tier?: ModelTier;
+  /** Short, user-facing one-line description shown next to the model name in the picker. */
+  description?: string;
+  /** Clean, user-facing display name for the picker — e.g. "Grok 4.6", not the raw id. */
+  name?: string;
+  /** Underlying lab, for picking the right provider icon in the picker. Unset defaults to 'other'. */
+  provider?: ModelProvider;
+  /**
+   * True for a superseded version of a model family still kept selectable for
+   * session/schedule continuity (see LEGACY_MODEL_ALIASES and resolveGenerationModel —
+   * this flag only affects picker visibility grouping, never generation). The picker
+   * UI tucks these behind a "Show more" row instead of hiding them from new selection
+   * entirely (that's what adminOnly is for).
+   *
+   * Hand-set here for models superseded for reasons other than pure
+   * dominance (e.g. a straight version retirement). getSupportedModelsWithMetadata
+   * ALSO computes legacy live for any model that a same-`family` model
+   * strictly dominates (see deriveDominanceLegacyIds) — this field and that
+   * computation combine with OR, never override each other.
+   */
+  legacy?: boolean;
+  /**
+   * Groups models that are genuinely the same product line across
+   * generations (e.g. every "GPT-5.x balanced chat" deployment, or every
+   * Claude Opus release) for automatic same-family dominance detection.
+   * Deliberately narrow and hand-assigned — NOT "same provider": Claude
+   * Opus and Claude Sonnet, or Gemini Pro and Gemini Flash, are different
+   * product tiers serving different jobs, not generations of the same
+   * model, so they must never share a family or a stronger sibling tier
+   * would wrongly hide a still-useful different-tier model. Omitted
+   * (no family) means this model is never auto-dominated.
+   */
+  family?: string;
+  /**
+   * Benchmark-derived quality score, 0-100, higher = stronger. Omitted
+   * entirely when there is insufficient benchmark evidence for this model —
+   * never estimated or invented. Does NOT get lowered merely because a
+   * model is `legacy`; legacy affects picker visibility grouping only, not
+   * how good the model actually is.
+   */
+  qualityScore?: number;
+  /** Methodology/source note for qualityScore — benchmark name, source
+   *  version, and evaluation date (e.g. "Artificial Analysis Intelligence
+   *  Index, snapshot 2026-08-19"). Surfaced in the picker's quality tooltip. */
+  qualityScoreSource?: string;
+  // No costScore/costScoreSource field here (unlike qualityScore) — cost is
+  // fully derivable from MODEL_PRICING (see getSupportedModelsWithMetadata),
+  // so it is computed live rather than duplicated as a second hand-typed
+  // number that can drift from what we actually bill.
+}
+
+/** Usage/cost tiers surfaced in the model picker, ordered most- to least-expensive. */
+export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_cheap';
+
+/**
+ * Cost-score band boundaries backing the picker's tier buckets (Harsha's
+ * exact thresholds, revised 2026-08-19 after reviewing the live numbers) —
+ * inclusive lower bound, ordered highest band first. costScore is 0-100 and
+ * higher = more expensive (see costScoreFromPrice), so a model's tier is
+ * simply whichever band its own cost score falls in. Tier IDs (ultra_premium/
+ * ultra_cheap) are unchanged from earlier — only the numeric boundaries and
+ * the frontend's DISPLAY labels moved ("Flagship"/"Very Cheap", see
+ * modelTiers.ts TIER_LABELS); no backend API contract change.
+ */
+export const TIER_COST_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minCostScore: number }> = [
+  { tier: 'ultra_premium', minCostScore: 71 },
+  { tier: 'pro', minCostScore: 64 },
+  { tier: 'medium', minCostScore: 51 },
+  { tier: 'cheap', minCostScore: 31 },
+  { tier: 'ultra_cheap', minCostScore: 0 },
+];
+
+/** Derives a model's picker tier bucket from its cost score. */
+export function tierFromCostScore(costScore: number): ModelTier {
+  const band = TIER_COST_SCORE_BANDS.find((b) => costScore >= b.minCostScore);
+  // TIER_COST_SCORE_BANDS' last band has minCostScore: 0, which matches any
+  // costScore >= 0 — so `band` is only undefined for a negative/NaN input.
+  return band?.tier ?? 'ultra_cheap';
+}
+
+/** Cheapest-to-most-expensive numeric rank of each tier, for dominance comparison. */
+const TIER_RANK: Record<ModelTier, number> = {
+  ultra_cheap: 0,
+  cheap: 1,
+  medium: 2,
+  pro: 3,
+  ultra_premium: 4,
+};
+
+export interface DominanceCandidate {
+  id: string;
+  /** LLMModelConfig.family — omitted candidates are never auto-dominated. */
+  family?: string;
+  tier: ModelTier;
+  qualityScore?: number;
+  /** The model's OWN static legacy flag (not the final computed one) — only
+   *  a candidate that was not already legacy can dominate another. */
+  legacy: boolean;
+}
+
+/**
+ * Ids that should be treated as legacy because a same-`family`, originally
+ * non-legacy sibling is at least as cheap (same-or-lower cost tier band) AND
+ * at least as good (same-or-higher quality score), strictly so in at least
+ * one dimension — e.g. GPT-5.6 Luna (ultra_cheap, quality 52) strictly beats
+ * GPT-5.4 Nano (ultra_cheap, quality 40): same band, higher quality, so Nano
+ * is dominated. Comparison is scoped to `family`, never "same provider" —
+ * Claude Opus and Claude Sonnet are different product tiers, not
+ * generations of one model, so a stronger Opus must never hide Sonnet.
+ */
+export function deriveDominanceLegacyIds(candidates: DominanceCandidate[]): Set<string> {
+  const dominated = new Set<string>();
+  for (const a of candidates) {
+    if (!a.family || typeof a.qualityScore !== 'number') continue;
+    const beatenBySibling = candidates.some((b) => {
+      if (b.id === a.id || b.family !== a.family || b.legacy || typeof b.qualityScore !== 'number') {
+        return false;
+      }
+      const cheaperOrEqual = TIER_RANK[b.tier] <= TIER_RANK[a.tier];
+      const betterOrEqualQuality = b.qualityScore >= a.qualityScore!;
+      const strictlyBetter = TIER_RANK[b.tier] < TIER_RANK[a.tier] || b.qualityScore > a.qualityScore!;
+      return cheaperOrEqual && betterOrEqualQuality && strictlyBetter;
+    });
+    if (beatenBySibling) dominated.add(a.id);
+  }
+  return dominated;
+}
+
+/** Underlying lab a model is from, for picking the right provider icon in the picker. */
+export type ModelProvider =
+  | 'anthropic' | 'openai' | 'google' | 'xai' | 'deepseek' | 'qwen' | 'mistral' | 'moonshot' | 'zai' | 'other';
+
+/** Metadata for a model as returned to the frontend picker. */
+export interface SupportedModelInfo {
+  id: string;
+  name: string;
+  tier: ModelTier;
+  description: string;
+  provider: ModelProvider;
+  /** True for a superseded version the picker should tuck behind "Show more". Omitted (not `false`) for a current/primary model. */
+  legacy?: true;
+  /** 0-100, higher = stronger. Omitted when there's no benchmark evidence — never a guess. */
+  qualityScore?: number;
+  qualityScoreSource?: string;
+  /** 0-100, higher = more expensive. Omitted when pricing isn't available. */
+  costScore?: number;
+  costScoreSource?: string;
 }
 
 // Type for LLM call options
@@ -826,6 +1020,8 @@ const PROMPT_CACHE_DEFAULT_TTL_MS = 5 * 60 * 1000;
 interface LLMCallOptions {
   tools?: any[] | null;
   tool_choice?: 'auto' | 'none' | any | null;
+  /** Execute search through OpenRouter's provider-independent server tool. */
+  webSearch?: boolean;
   max_completion_tokens?: number | null;
   temperature?: number | null;
   response_format?: { type: 'text' | 'json_object' } | null;
@@ -849,6 +1045,66 @@ interface LLMCallOptions {
    * behaviour instead of silently buying the 2x rate.
    */
   humanPaced?: boolean;
+  /** Stable product taxonomy used by the reversible OpenRouter cutover canary. */
+  taskClass?: GatewayTaskClass;
+  /** Per-request transport deadline for bounded background and judge calls. */
+  timeoutMs?: number;
+  /** Ordered logical model fallbacks executed by OpenRouter, never by AgentWeb. */
+  fallbackModels?: string[];
+}
+
+function nonNegativeTokenCount(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(0, Math.round(value))
+    : 0;
+}
+
+/**
+ * Convert an OpenAI-compatible usage object into the ledger's disjoint token
+ * dimensions. OpenRouter follows OpenAI's contract: `prompt_tokens` includes
+ * cache reads/writes and `prompt_tokens_details` identifies those subsets. Our
+ * ledger prices uncached input, cache reads, and cache writes separately, so
+ * forwarding the inclusive prompt total double-counts the cached portion.
+ *
+ * Provider-native Bedrock/Vertex adapters already report uncached input and
+ * cache reads as disjoint counters; their existing semantics stay unchanged.
+ * External counters are finite/non-negative and the OpenRouter cache subset is
+ * bounded by its prompt total so malformed provider data cannot inflate usage.
+ */
+function normalizeCallUsageTokens(usage: any, provider: string): {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+} {
+  const promptTokens = nonNegativeTokenCount(usage?.prompt_tokens);
+  const outputTokens = nonNegativeTokenCount(usage?.completion_tokens);
+  const providerCacheReadTokens = nonNegativeTokenCount(usage?.cache_read_input_tokens);
+  const openAiCacheReadTokens = nonNegativeTokenCount(usage?.prompt_tokens_details?.cached_tokens);
+  const reportedCacheReadTokens = providerCacheReadTokens || openAiCacheReadTokens;
+  const providerCacheWriteTokens = nonNegativeTokenCount(usage?.cache_creation_input_tokens);
+  const openAiCacheWriteTokens = nonNegativeTokenCount(usage?.prompt_tokens_details?.cache_write_tokens);
+
+  if (provider !== 'openrouter') {
+    return {
+      inputTokens: promptTokens,
+      outputTokens,
+      cacheReadTokens: reportedCacheReadTokens,
+      cacheWriteTokens: providerCacheWriteTokens,
+    };
+  }
+
+  const cacheReadTokens = Math.min(promptTokens, reportedCacheReadTokens);
+  const remainingPromptTokens = promptTokens - cacheReadTokens;
+  const reportedCacheWriteTokens = providerCacheWriteTokens || openAiCacheWriteTokens;
+  const cacheWriteTokens = Math.min(remainingPromptTokens, reportedCacheWriteTokens);
+
+  return {
+    inputTokens: remainingPromptTokens - cacheWriteTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+  };
 }
 
 // Diagnosis agent configuration
@@ -873,12 +1129,19 @@ const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'b
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
 
 // Legacy model ids persisted by sessions/schedules created before a model was
-// renamed. Maps the old id to its current registry key so old sessions keep
-// working instead of throwing "Invalid model". Opus 4.8 was renamed from the
-// bare Vertex id "claude-opus-4-8" to the Bedrock id "anthropic.claude-opus-4-8"
-// in commit c86c8ec1.
+// renamed or fully retired. Maps the old id to its current registry key so old
+// sessions/schedules keep working instead of throwing "Invalid model". Opus 4.8
+// was renamed from the bare Vertex id "claude-opus-4-8" to the Bedrock id
+// "anthropic.claude-opus-4-8" in commit c86c8ec1. gpt-5-chat-2 and gpt-5.2-chat
+// were removed from the registry 2026-08-19 (Azure deployment retired/deprecated
+// during the migration off the Rui-owned Azure resource — see the registry
+// comment above the gpt-5.4 entry) and redirected to gpt-5.5, the current
+// non-legacy top of the same gpt5-chat family.
 const LEGACY_MODEL_ALIASES: Record<string, string> = {
   'claude-opus-4-8': 'anthropic.claude-opus-4-8',
+  'gpt-5-chat-2': 'gpt-5.5',
+  'gpt-5.2-chat': 'gpt-5.5',
+  'gemini-2.5-flash': 'gemini-3.1-flash-lite',
 };
 
 // Context passed to the diagnosis agent when the main agent fails
@@ -971,12 +1234,28 @@ function linkedInPublicIdFromUrl(url: string | undefined | null): string | null 
 }
 
 
+/** Narrow local shape of a stored google_ads config (ENG-1362). */
+type GoogleAdsConfigShape = { customer_id: string; currency?: string; test_account?: boolean };
+
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
+  // ENG-1295 hardening: self-consistency cache for perform_data_analysis. Keyed by
+  // userId + a hash of the exact (file_urls, analysis_instruction) pair, so a
+  // literal repeat of the same call can be checked against its own prior grouping-
+  // key result instead of silently returning a contradictory answer. Bounded size
+  // and TTL since this lives on the long-running singleton service instance.
+  private dataAnalysisConsistencyCache: Map<string, { groupingKeyValues: string[]; timestamp: number }> = new Map();
+  private readonly DATA_ANALYSIS_CONSISTENCY_CACHE_MAX = 500;
+  private readonly DATA_ANALYSIS_CONSISTENCY_TTL_MS = 30 * 60 * 1000; // 30 minutes
   // ENG-475: deterministic browser-session persistence (auto load-at-start /
   // save-as-you-go around browser automation tools, so an intermittent login
   // success is captured without depending on the model calling the cookie tools).
   private browserCookieAutoState = createAutoPersistState();
+  // ENG-1624: cached so a sub-folder-access error can name the service account
+  // to share with, without re-fetching the secret on every failure. Only the
+  // email is kept — the private key must never outlive the local
+  // getGoogleDriveClient() call that parses the secret.
+  private driveServiceAccountEmail: string | null = null;
   private toolRegistry: ToolRegistry;
   private mcpClientService: McpClientService;
   private static toolsRegistered: boolean = false;
@@ -985,14 +1264,18 @@ export class AgentModeService {
   private readonly FILE_CACHE_MAX_AGE_MS = 3600000; // 1 hour TTL
   private readonly FILE_CACHE_CLEANUP_INTERVAL_MS = 600000; // Cleanup every 10 minutes
   // ENG-759: the default chat model. Opus 5 and Opus 4.8 are both $5/$25, so this
-  // is a capability upgrade at no cost change. Opus 5 is AccessDenied on our
-  // default AWS account and reachable ONLY through the bearer-token account, so it
-  // MUST stay in BEDROCK_BEARER_TOKEN_MODELS — see utils/bedrockInferenceProfiles.
+  // is a capability upgrade at no cost change. Its selected provider is now
+  // owned by OpenRouter rather than by an AgentWeb Bedrock account.
   // This literal is the last-resort fallback; the effective default is the
   // `agent_mode_default_model` setting when one is configured (getDefaultModel).
   // It previously read 'gpt-5.5', which meant a missing/invalid setting silently
-  // dropped every chat onto an Azure GPT deployment instead of the intended Claude.
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'anthropic.claude-opus-5';
+  // dropped every chat onto a GPT route instead of the intended Claude.
+  // 2026-08-19 (Harsha, live picker review): Auto/default moved off Opus,
+  // through GLM 5.2 and GPT-5.6 Luna, to Gemini 3.7 Flash — Google's newest
+  // Flash-line model (GA 2026-08-13), cheap ($0.75/$3.75 per 1M, Google's own
+  // direct rate — not a multi-provider OpenRouter blend), and it dominates
+  // every other model in the `gemini-flash` family band for band.
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.7-flash';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -1577,8 +1860,10 @@ export class AgentModeService {
   // Model for the internal dedup judge (report_product_issues duplicate detection).
   // Sourced from settings so it is NOT pinned to a model that goes stale; admin can
   // point `agent_mode_dedup_judge_model` at a cheap/fast model. Falls back to the
-  // configurable default model. TODO(ENG-9): route this call through OpenRouter so
-  // model choice becomes gateway/routing config rather than provider-specific.
+  // configurable default model. ENG-9: this already becomes gateway/routing config
+  // for free — setting this to an `openrouter/<provider>/<model>` id routes through
+  // OpenRouter the same as any other prefix (see getClientForModel), no code change
+  // needed at this call site.
   async getDedupJudgeModel(): Promise<string> {
     return (
       (await this.resolveConfiguredModel('agent_mode_dedup_judge_model', 'dedup judge')) ??
@@ -1743,914 +2028,66 @@ export class AgentModeService {
     );
   }
 
-  async getBackupModel(
-    primaryModel: string,
-    // undefined = preserve the admin-managed global fallback. A string or null is
-    // an explicit dispatch policy: use only that model, or do not retry at all.
-    // This distinction prevents optimized-mode requests from escaping to a premium
-    // global backup after the admission policy selected a cheaper model.
-    transientFallbackModel?: string | null,
-  ): Promise<string | null> {
-    if (transientFallbackModel !== undefined) {
-      return transientFallbackModel &&
-        transientFallbackModel !== primaryModel &&
-        Boolean(this.llmModels[transientFallbackModel])
-        ? transientFallbackModel
-        : null;
-    }
-    try {
-      const setting = await settingsService.getSetting('agent_mode_backup_model');
-      const configured = setting?.settingValue?.trim();
-      if (configured && this.llmModels[configured] && configured !== primaryModel) {
-        return configured;
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting backup model setting:', error);
-    }
-    return null;
-  }
-
-  // Helper method to create Azure OpenAI client for a specific deployment
-  private getAzureOpenAIClient(deploymentName: string): OpenAI {
-    return new OpenAI({
-      apiKey: process.env.AZURE_OPENAI_API_KEY,
-      baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${deploymentName}`,
-      defaultQuery: {
-        "api-version": process.env.AZURE_OPENAI_API_VERSION_AGENT_MODE || process.env.AZURE_OPENAI_API_VERSION || "2025-01-01-preview",
-      },
-      defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
-    });
-  }
-
-  private gemini_client: OpenAI | null = null;
-  private gemini_client_promise: Promise<OpenAI> | null = null;
+  private openrouter_client: OpenAI | null = null;
+  private openrouter_client_promise: Promise<OpenAI> | null = null;
   private vertex_client: any | null = null;
   private vertex_client_promise: Promise<any> | null = null;
 
-  // ENG-737: native @google/genai adapter — the only Gemini transport agent-mode
-  // calls use. It filters chain-of-thought at the source (thinkingConfig.
-  // includeThoughts=false + part.thought), so no reasoning leak is possible by
-  // construction — no heuristic, no fallback transport that could reintroduce it.
-  private gemini_native_client: any | null = null;
-  private gemini_native_sdk_promise: Promise<any> | null = null;
-  private gemini_api_key_promise: Promise<string> | null = null;
-
-  /** Resolve the Gemini API key from env or secrets (cached; shared by both clients). */
-  private async getGeminiApiKey(): Promise<string> {
-    if (this.gemini_api_key_promise) return this.gemini_api_key_promise;
-    this.gemini_api_key_promise = (async () => {
-      let geminiApiKey = process.env.GEMINI_API_KEY;
-      if (!geminiApiKey) {
-        const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-        geminiApiKey = await getSecret(`${environment}/AgentWeb/GeminiAPIKey`);
-      }
-      if (!geminiApiKey || !geminiApiKey.trim()) {
-        throw new Error('Gemini API key is empty or not found in env/secrets');
-      }
-      return geminiApiKey.trim();
-    })().catch((err) => {
-      this.gemini_api_key_promise = null; // allow retry on transient secret failures
-      throw err;
-    });
-    return this.gemini_api_key_promise;
-  }
-
-  // Helper method to get Gemini client (lazy-loaded from secrets manager)
-  public async getGeminiClient(): Promise<OpenAI> {
-    // Return cached client if available
-    if (this.gemini_client) {
-      return this.gemini_client;
+  // OpenRouter is an OpenAI-compatible endpoint. HTTP-Referer/X-Title identify
+  // the app for OpenRouter's own analytics
+  // (openrouter.ai/docs/app-attribution); they carry no auth meaning.
+  public async getOpenRouterClient(): Promise<OpenAI> {
+    if (this.openrouter_client) {
+      return this.openrouter_client;
+    }
+    if (this.openrouter_client_promise) {
+      return this.openrouter_client_promise;
     }
 
-    // If already initializing, wait for that promise
-    if (this.gemini_client_promise) {
-      return this.gemini_client_promise;
-    }
-
-    // Initialize client
-    this.gemini_client_promise = (async () => {
+    this.openrouter_client_promise = (async () => {
       try {
-        let geminiApiKey = process.env.GEMINI_API_KEY;
+        let openRouterApiKey = process.env.OPENROUTER_API_KEY;
 
-        if (!geminiApiKey) {
+        if (!openRouterApiKey) {
           const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-          const geminiSecretName = `${environment}/AgentWeb/GeminiAPIKey`;
-          geminiApiKey = await getSecret(geminiSecretName);
+          openRouterApiKey = await getSecret(`${environment}/AgentWeb/OpenRouter`);
         }
 
-        if (!geminiApiKey || !geminiApiKey.trim()) {
-          throw new Error('Gemini API key is empty or not found in env/secrets');
+        if (!openRouterApiKey || !openRouterApiKey.trim()) {
+          throw new Error('OpenRouter API key is empty or not found in env/secrets');
         }
 
-        this.gemini_client = new OpenAI({
-          apiKey: geminiApiKey.trim(),
-          baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+        this.openrouter_client = new OpenAI({
+          apiKey: openRouterApiKey.trim(),
+          baseURL: 'https://openrouter.ai/api/v1',
+          // OpenRouter owns provider retry/fallback. SDK retries here would
+          // multiply with the gateway's own routing attempts.
+          maxRetries: 0,
+          timeout: 5 * 60 * 1000,
+          defaultHeaders: {
+            'HTTP-Referer': 'https://app.agentweb.pro',
+            'X-Title': 'AgentWeb',
+          },
         });
 
-        return this.gemini_client;
+        return this.openrouter_client;
       } catch (error) {
-        console.error('Error initializing Gemini client:', error);
-        this.gemini_client_promise = null; // Reset promise on error
+        console.error('Error initializing OpenRouter client:', error);
+        this.openrouter_client_promise = null; // Reset promise on error
         throw error;
       }
     })();
 
-    return this.gemini_client_promise;
+    return this.openrouter_client_promise;
   }
 
-  /**
-   * ENG-737: native @google/genai client wrapper for gemini agent calls, presenting
-   * the same OpenAI-shaped `chat.completions.create` surface as getGeminiClient.
-   * Unlike the compat endpoint, this filters chain-of-thought natively
-   * (thinkingConfig.includeThoughts=false + part.thought), so no reasoning leaks —
-   * structurally, not via a heuristic. This is the only transport agent-mode
-   * Gemini calls use; there is deliberately no fallback to the OpenAI-compat
-   * endpoint, because that endpoint flattens thought parts into plain text and
-   * reintroduces the exact leak this client exists to prevent.
-   */
-  public getGeminiNativeClient(): any {
-    if (this.gemini_native_client) return this.gemini_native_client;
-    this.gemini_native_client = createGeminiNativeClient({
-      defaultMaxTokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
-      getClient: () => {
-        // Cache the SDK client so each agent turn reuses it (the key fetch is
-        // already cached); reset the promise on failure so a transient secret
-        // error can be retried.
-        if (this.gemini_native_sdk_promise) return this.gemini_native_sdk_promise;
-        this.gemini_native_sdk_promise = (async () => {
-          const { GoogleGenAI } = await import('@google/genai');
-          const apiKey = await this.getGeminiApiKey();
-          return new GoogleGenAI({ apiKey });
-        })().catch((err) => {
-          this.gemini_native_sdk_promise = null;
-          throw err;
-        });
-        return this.gemini_native_sdk_promise;
-      },
-    });
-    return this.gemini_native_client;
-  }
-
-  public async getVertexClient(modelId: string): Promise<any> {
-    if (this.vertex_client) return this.vertex_client;
-    if (this.vertex_client_promise) return this.vertex_client_promise;
-
-    this.vertex_client_promise = (async () => {
-      try {
-        const { GoogleAuth } = await import('google-auth-library');
-        const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-        const secretString = await getSecret(`${environment}/AgentWeb/Google/Vertex`);
-        const credentials = JSON.parse(secretString);
-        const auth = new GoogleAuth({
-          credentials,
-          scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-        });
-        const projectId = credentials.project_id;
-        const VERTEX_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
-
-        const client = {
-          _auth: auth,
-          _projectId: projectId,
-          chat: {
-            completions: {
-              create: async (params: any) => {
-                const token = await auth.getAccessToken();
-                const url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/global/publishers/anthropic/models/${modelId}:rawPredict`;
-
-                // Convert OpenAI-format messages to Anthropic format
-                const systemParts: string[] = [];
-                const messages: any[] = [];
-                for (const msg of params.messages) {
-                  if (msg.role === 'system') {
-                    systemParts.push(typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content));
-                  } else if (msg.role === 'assistant') {
-                    const content: any[] = [];
-                    if (msg.content) {
-                      const text = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-                      if (text) content.push({ type: 'text', text });
-                    }
-                    // Convert OpenAI tool_calls → Anthropic tool_use blocks
-                    if (Array.isArray(msg.tool_calls)) {
-                      for (const tc of msg.tool_calls) {
-                        content.push({
-                          type: 'tool_use',
-                          id: tc.id,
-                          name: tc.function.name,
-                          input: (() => { try { return JSON.parse(tc.function.arguments); } catch { return {}; } })(),
-                        });
-                      }
-                    }
-                    if (content.length > 0) messages.push({ role: 'assistant', content });
-                  } else if (msg.role === 'user') {
-                    // Convert OpenAI-style content (incl. image_url blocks) to Anthropic-native
-                    // blocks. Passing image_url through verbatim triggers a Vertex 400.
-                    const content = AgentModeService.convertContentToAnthropicBlocks(msg.content);
-                    messages.push({ role: 'user', content });
-                  } else if (msg.role === 'tool') {
-                    // Append tool result to the last user message or create a new one
-                    const toolResult = {
-                      type: 'tool_result',
-                      tool_use_id: msg.tool_call_id,
-                      content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
-                    };
-                    const lastMsg = messages[messages.length - 1];
-                    if (lastMsg?.role === 'user') {
-                      lastMsg.content.push(toolResult);
-                    } else {
-                      messages.push({ role: 'user', content: [toolResult] });
-                    }
-                  }
-                }
-
-                // Merge consecutive same-role messages (Anthropic requires alternating roles)
-                const merged: any[] = [];
-                for (const msg of messages) {
-                  const prev = merged[merged.length - 1];
-                  if (prev && prev.role === msg.role) {
-                    prev.content = [...prev.content, ...msg.content];
-                  } else {
-                    merged.push({ ...msg, content: [...msg.content] });
-                  }
-                }
-
-                const body: any = {
-                  anthropic_version: 'vertex-2023-10-16',
-                  max_tokens: params.max_completion_tokens || AGENT_MODE_MAX_OUTPUT_TOKENS,
-                  messages: merged,
-                };
-                if (systemParts.length > 0) body.system = systemParts.join('\n');
-                if (params.temperature !== undefined) body.temperature = params.temperature;
-                if (params.tools && params.tools.length > 0) {
-                  body.tools = params.tools.map((t: any) => ({
-                    name: t.function.name,
-                    description: t.function.description || t.function.name,
-                    input_schema: t.function.parameters,
-                  }));
-                }
-
-                const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), VERTEX_REQUEST_TIMEOUT_MS);
-                let response: Response;
-                try {
-                  response = await fetch(url, {
-                    method: 'POST',
-                    headers: {
-                      'Authorization': `Bearer ${token}`,
-                      'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(body),
-                    signal: controller.signal,
-                  });
-                } finally {
-                  clearTimeout(timeout);
-                }
-
-                if (!response.ok) {
-                  const errText = await response.text();
-                  const err: any = new Error(`Vertex AI error ${response.status}: ${errText}`);
-                  err.status = response.status;
-                  throw err;
-                }
-
-                const data: any = await response.json();
-
-                // Convert Anthropic response format to OpenAI format
-                let messageContent = '';
-                let toolCalls: any[] | null = null;
-                if (data.content) {
-                  const textParts: string[] = [];
-                  const toolUseParts: any[] = [];
-                  for (const block of data.content) {
-                    if (block.type === 'text') {
-                      textParts.push(block.text);
-                    } else if (block.type === 'tool_use') {
-                      toolUseParts.push({
-                        id: block.id,
-                        type: 'function',
-                        function: {
-                          name: block.name,
-                          arguments: JSON.stringify(block.input),
-                        },
-                      });
-                    }
-                  }
-                  messageContent = textParts.join('\n');
-                  if (toolUseParts.length > 0) toolCalls = toolUseParts;
-                }
-
-                const usage = data.usage || {};
-                // A max_tokens stop with a tool_use block means the tool call
-                // was truncated mid-argument (e.g. create_html_file's large
-                // content_draft), so its JSON is incomplete and would fail
-                // schema validation with a dropped required arg — the ENG-403
-                // "content_draft is required" retry loop. Do NOT surface it as a
-                // completed tool_calls finish; report finish_reason='length'
-                // with no tool_calls so the main loop's max-tokens continuation
-                // path asks the model to continue.
-                const truncatedToolCall = data.stop_reason === 'max_tokens' && !!toolCalls;
-                return {
-                  choices: [{
-                    message: {
-                      role: 'assistant',
-                      content: messageContent || null,
-                      ...(toolCalls && !truncatedToolCall && { tool_calls: toolCalls }),
-                    },
-                    finish_reason: data.stop_reason === 'max_tokens'
-                      ? 'length'
-                      : (data.stop_reason === 'tool_use' ? 'tool_calls' : 'stop'),
-                    stop_reason: data.stop_reason,
-                  }],
-                  usage: {
-                    prompt_tokens: usage.input_tokens || 0,
-                    completion_tokens: usage.output_tokens || 0,
-                    total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
-                  },
-                };
-              },
-            },
-          },
-        };
-
-        this.vertex_client = client;
-        return client;
-      } catch (error) {
-        console.error('Error initializing Vertex AI client:', error);
-        this.vertex_client_promise = null;
-        throw error;
-      }
-    })();
-
-    return this.vertex_client_promise;
-  }
-
-  public async getClientForModel(model: string): Promise<any> {
-    if (model.startsWith('anthropic.')) {
-      return this.getBedrockClient(model);
-    }
-    if (model.startsWith('gpt-')) {
-      return this.getAzureOpenAIClient(model);
-    }
-    if (model.startsWith('claude-')) {
-      return this.getVertexClient(model);
-    }
-    return this.getGeminiClient();
-  }
-
-  /**
-   * ENG-893: models that have already reported a TTL other than the one we
-   * asked for. Log-once, so a persistent downgrade does not spam every turn.
-   */
-  private static readonly cacheTtlDowngradeWarned = new Set<string>();
-
-  /** Test seam — reset the log-once guard. */
-  public static __resetCacheTtlDowngradeWarnsForTests(): void {
-    AgentModeService.cacheTtlDowngradeWarned.clear();
-  }
-
-  private static warnCacheTtlDowngradeOnce(
-    modelId: string,
-    requestedTtl: string,
-    appliedTtls: string[]
-  ): void {
-    if (AgentModeService.cacheTtlDowngradeWarned.has(modelId)) return;
-    AgentModeService.cacheTtlDowngradeWarned.add(modelId);
-    console.warn(
-      `AgentMode: Bedrock did NOT honour the requested prompt-cache TTL for "${modelId}" ` +
-        `— asked for '${requestedTtl}', got '${appliedTtls.join(',') || 'none'}'. ` +
-        `Cost is still billed at the applied rate, but the extended-TTL saving is not being realised: ` +
-        `remove this model from BEDROCK_EXTENDED_CACHE_TTL_MODELS (ENG-893).`
-    );
-  }
-
-  public async getBedrockClient(modelId: string): Promise<any> {
-    // Use the Bedrock Converse API directly (instead of LangChain) to support
-    // Anthropic prompt caching via cachePoint markers. This saves 30-50% on
-    // input token costs by caching the system prompt and conversation prefix.
-    const { BedrockRuntimeClient, ConverseCommand } = await import('@aws-sdk/client-bedrock-runtime');
-
-    const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
-    const BEDROCK_REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per request
-
-    // Opus 4.8 is served from a separate AWS account (231030591963) that the app's
-    // default IAM credentials (992382574572) cannot reach. Authenticate that model
-    // with a long-term Bedrock API key (bearer token) instead of SigV4, scoped to a
-    // dedicated client so all other models keep using the default credential chain.
-    // Models served from the separate Bedrock account (231030591963) reached via
-    // a long-term API key (bearer token) rather than the app's default SigV4 creds.
-    const usesBearerToken = BEDROCK_BEARER_TOKEN_MODELS.has(modelId);
-    let bedrockClient: any;
-    if (usesBearerToken) {
-      const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-      const bearerToken = (await getSecret(`${environment}/AgentWeb/Bedrock/ApiKey`)).trim();
-      bedrockClient = new BedrockRuntimeClient({
-        region,
-        token: { token: bearerToken },
-        authSchemePreference: ['httpBearerAuth'],
-        requestHandler: {
-          connectionTimeout: 10_000,
-          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
-        } as any,
-      });
-    } else {
-      // Pin SigV4 explicitly. If AWS_BEARER_TOKEN_BEDROCK is present in the
-      // environment (e.g. cloud-dev boxes set it for the Claude Code CLI), the
-      // SDK would otherwise default to bearer-first auth and send that token —
-      // scoped to the Opus 4.8 account (231030591963) — for every Bedrock call,
-      // 403ing models like Sonnet/Opus 4.6 that live in the default account.
-      bedrockClient = new BedrockRuntimeClient({
-        region,
-        authSchemePreference: ['sigv4'],
-        credentials: process.env.AWS_ACCESS_KEY_ID ? {
-          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
-        } : undefined,
-        requestHandler: {
-          connectionTimeout: 10_000, // 10s to establish connection
-          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
-        } as any,
-      });
-    }
-
-    // Map certain model IDs to their corresponding inference profile ARNs
-    // Note: Newer Claude models require using inference profiles for cross-region access
-    const actualModelId = resolveBedrockModelId(modelId);
-
-    // ENG-893: human-paced conversations idle past the default 5-minute
-    // prompt-cache TTL between turns, re-writing the whole prefix at 1.25x
-    // input instead of reading it back at 0.1x. Ask for the 1-hour TTL on the
-    // models we have verified honour it. Bedrock does NOT reject an unsupported
-    // `ttl`, so the allowlist guards against silent mispricing, not a crash.
-    //
-    // Resolved PER CALL, never captured here: this client is memoised on the
-    // model registry and shared by every session in the process, so a TTL baked
-    // into the closure would leak one session's pacing to all the others.
-    const modelSupportsExtendedTtl = bedrockCacheTtl(modelId);
-
-    // Create OpenAI-compatible wrapper using direct Converse API
-    return {
-      chat: {
-        completions: {
-          create: async (params: any) => {
-            // Convert OpenAI messages to Bedrock Converse format
-            const { system, messages } = AgentModeService.convertToBedrockConverse(params.messages);
-
-            // ENG-893: a 1-hour write costs 2x input where a 5-minute write
-            // costs 1.25x, and a cache HIT refreshes the TTL for free. So the
-            // extended TTL only pays for itself when turns are far enough apart
-            // to have expired the 5-minute window. Machine-paced runs (scheduled
-            // reports, loops) fire their turns back-to-back and never expire it,
-            // so asking for 1h there is a pure 60% surcharge on every write —
-            // measured at +43% of cache-write spend across the ten costliest
-            // scheduled sessions. This mirrors AWS's own guidance: keep the
-            // 5-minute cache for prompts reused more often than every 5 minutes.
-            const cacheTtl = params.humanPaced ? modelSupportsExtendedTtl : undefined;
-            // A fresh object per call site: the two checkpoints must not alias.
-            const cachePointBlock = () => ({
-              cachePoint: cacheTtl ? { type: 'default', ttl: cacheTtl } : { type: 'default' },
-            });
-
-            // --- Prompt caching ---
-            // Add cache point after system prompt (~3.5K tokens cached on every call)
-            if (system.length > 0) {
-              system.push(cachePointBlock());
-            }
-            // Add cache point before the last message to cache the conversation prefix.
-            // Within the tool-call iteration loop, each subsequent call only pays full
-            // price for the newest exchange; all prior turns hit the cache.
-            // Both checkpoints carry the SAME ttl: Bedrock requires longer-TTL
-            // checkpoints to precede shorter ones, and mixing them here would
-            // leave the (much larger) history on the 5-minute expiry anyway.
-            if (messages.length > 2) {
-              const pivotMsg = messages[messages.length - 2];
-              pivotMsg.content = [...pivotMsg.content, cachePointBlock()];
-            }
-
-            // Convert tools to Bedrock toolConfig format
-            const toolConfig = params.tools && params.tools.length > 0 ? {
-              tools: params.tools.map((tool: any) => ({
-                toolSpec: {
-                  name: tool.function.name,
-                  description: tool.function.description || tool.function.name,
-                  inputSchema: { json: AgentModeService.sanitizeSchemaForBedrock(tool.function.parameters) },
-                }
-              }))
-            } : undefined;
-
-            // Send the Converse request
-            const command = new ConverseCommand({
-              modelId: actualModelId,
-              system,
-              messages,
-              ...(toolConfig && { toolConfig }),
-              inferenceConfig: {
-                maxTokens: params.max_completion_tokens || AGENT_MODE_MAX_OUTPUT_TOKENS,
-                ...(params.temperature !== undefined && { temperature: params.temperature }),
-              },
-            });
-
-            const response = await bedrockClient.send(command, {
-              abortSignal: AbortSignal.timeout(BEDROCK_REQUEST_TIMEOUT_MS),
-            });
-
-            // Extract response content
-            const outputMessage = response.output?.message;
-            let messageContent = '';
-            let toolCalls: any[] | null = null;
-
-            if (outputMessage?.content) {
-              const textParts: string[] = [];
-              const toolUseParts: any[] = [];
-
-              for (const block of outputMessage.content) {
-                if ('text' in block && block.text) {
-                  textParts.push(block.text);
-                } else if ('toolUse' in block && block.toolUse) {
-                  toolUseParts.push({
-                    id: block.toolUse.toolUseId || `call_${Date.now()}_${toolUseParts.length}`,
-                    type: 'function',
-                    function: {
-                      name: block.toolUse.name,
-                      arguments: JSON.stringify(block.toolUse.input),
-                    },
-                  });
-                }
-              }
-
-              messageContent = textParts.join('\n');
-              if (toolUseParts.length > 0) {
-                toolCalls = toolUseParts;
-              }
-            }
-
-            // Extract usage — includes cache metrics when prompt caching is active
-            const usage = response.usage || {} as any;
-            const inputTokens = usage.inputTokens || 0;
-            const outputTokens = usage.outputTokens || 0;
-            const cacheReadTokens = usage.cacheReadInputTokens || 0;
-            const cacheWriteTokens = usage.cacheWriteInputTokens || 0;
-
-            // ENG-893: cacheDetails breaks the write down by the TTL Bedrock
-            // actually applied. It is both the prod-log proof that the 1-hour
-            // checkpoint was honoured rather than silently ignored, AND what the
-            // ledger bills against — asking for `ttl: '1h'` does not guarantee
-            // getting it, so we price what came back.
-            const cacheWriteByTtl: Record<string, number> | undefined =
-              Array.isArray(usage.cacheDetails) && usage.cacheDetails.length > 0
-                ? usage.cacheDetails.reduce((acc: Record<string, number>, d: any) => {
-                    const ttl = typeof d?.ttl === 'string' ? d.ttl : undefined;
-                    const tokens = Number(d?.inputTokens) || 0;
-                    if (ttl && tokens > 0) acc[ttl] = (acc[ttl] || 0) + tokens;
-                    return acc;
-                  }, {})
-                : undefined;
-
-            // ENG-893: we allowlist the 1-hour TTL per model from live probes,
-            // and for Sonnet 4.6 / Opus 4.6 those probes contradict AWS's
-            // published "5 minutes only" table. Billing is already safe either
-            // way (we charge the TTL that came back), but a silent downgrade
-            // would quietly cost us the savings — so say so, once per model,
-            // rather than assuming the measurement holds forever.
-            if (cacheTtl && cacheWriteByTtl && !cacheWriteByTtl[cacheTtl]) {
-              AgentModeService.warnCacheTtlDowngradeOnce(
-                modelId,
-                cacheTtl,
-                Object.keys(cacheWriteByTtl)
-              );
-            }
-
-            if (cacheReadTokens > 0 || cacheWriteTokens > 0) {
-              const ttlBreakdown = Object.entries(cacheWriteByTtl || {})
-                .map(([ttl, tokens]) => `${ttl}:${tokens}`)
-                .join(',');
-              console.log(`AgentMode: Bedrock cache — read: ${cacheReadTokens}, write: ${cacheWriteTokens}${ttlBreakdown ? ` (${ttlBreakdown})` : ''}, uncached input: ${inputTokens}, output: ${outputTokens}`);
-            }
-
-            const stopReason: string = response.stopReason || '';
-
-            // A max_tokens stop with a tool_use block means the tool call was
-            // truncated mid-argument (e.g. create_html_file's content_draft),
-            // so its JSON is incomplete and would fail schema validation with a
-            // dropped required arg — the ENG-403 "content_draft is required"
-            // retry loop. Do NOT surface it as a completed tool_calls finish;
-            // report finish_reason='length' with no tool_calls so the main
-            // loop's max-tokens continuation path asks the model to continue.
-            const truncatedToolCall = stopReason === 'max_tokens' && !!toolCalls;
-
-            // Convert response to OpenAI format
-            return {
-              id: `bedrock-${Date.now()}`,
-              object: 'chat.completion',
-              created: Math.floor(Date.now() / 1000),
-              model: modelId,
-              choices: [{
-                index: 0,
-                message: {
-                  role: 'assistant',
-                  content: messageContent,
-                  tool_calls: truncatedToolCall ? null : toolCalls,
-                },
-                finish_reason: stopReason === 'max_tokens' ? 'length' : (toolCalls ? 'tool_calls' : 'stop'),
-                stop_reason: stopReason || (toolCalls ? 'tool_use' : 'end_turn'),
-              }],
-              usage: {
-                prompt_tokens: inputTokens,
-                completion_tokens: outputTokens,
-                total_tokens: inputTokens + outputTokens,
-                cache_read_input_tokens: cacheReadTokens,
-                cache_creation_input_tokens: cacheWriteTokens,
-                // ENG-893: the TTL Bedrock actually applied per write bucket, so
-                // cost is billed at the honoured rate rather than the one we asked
-                // for. Undefined when the response carried no breakdown.
-                cache_creation_by_ttl: cacheWriteByTtl,
-              },
-            };
-          },
-        },
-      },
-    };
-  }
-
-  /**
-   * Sanitize a JSON Schema for Bedrock Converse API compatibility.
-   * Bedrock rejects schemas with anyOf/oneOf/allOf, $schema, const, $ref/$defs.
-   * anyOf/oneOf with const values are flattened to enum; others are stripped.
-   */
-  static sanitizeSchemaForBedrock(schema: any): any {
-    if (!schema || typeof schema !== 'object') return schema;
-
-    const sanitizeNode = (node: any): any => {
-      if (!node || typeof node !== 'object' || Array.isArray(node)) return node;
-
-      const result: any = {};
-
-      for (const [key, value] of Object.entries(node)) {
-        // Drop JSON Schema meta fields and unsupported keywords
-        if (key === '$schema' || key === '$defs' || key === '$ref' || key === 'const') continue;
-
-        if ((key === 'anyOf' || key === 'oneOf') && Array.isArray(value)) {
-          // If all branches are {type: string, const: X}, flatten to enum
-          const consts = (value as any[]).filter((b: any) => b && b.const !== undefined).map((b: any) => b.const);
-          const nonConst = (value as any[]).filter((b: any) => !b || b.const === undefined);
-          if (consts.length > 0 && nonConst.length === 0) {
-            result.type = 'string';
-            result.enum = consts;
-          } else if (consts.length > 0 && nonConst.length === 1 && nonConst[0]?.type === 'string') {
-            // Mix of consts + plain string (open-ended enum): just use type string
-            result.type = 'string';
-          }
-          // else: drop the anyOf/oneOf entirely (no safe representation for Bedrock)
-          continue;
-        }
-
-        if (key === 'allOf' && Array.isArray(value)) {
-          // Merge allOf branches into the result object
-          for (const branch of value as any[]) {
-            Object.assign(result, sanitizeNode(branch));
-          }
-          continue;
-        }
-
-        if (key === 'properties' && typeof value === 'object' && value !== null) {
-          result.properties = Object.fromEntries(
-            Object.entries(value as object).map(([k, v]) => [k, sanitizeNode(v)])
-          );
-          continue;
-        }
-
-        if (key === 'items') {
-          result.items = sanitizeNode(value);
-          continue;
-        }
-
-        result[key] = value;
-      }
-
-      return result;
-    };
-
-    return sanitizeNode(schema);
-  }
-
-  /**
-   * Convert OpenAI-format messages to Bedrock Converse API format.
-   * Handles system extraction, role alternation, and tool call/result grouping.
-   */
-  static convertToBedrockConverse(openaiMessages: any[]): { system: any[], messages: any[] } {
-    const system: any[] = [];
-    const messages: any[] = [];
-
-    // Find the index of the last screenshot tool message so we only include the image
-    // for the most recent screenshot. Earlier screenshots are pruned to a text placeholder
-    // to prevent Bedrock 400 errors from request payload size exceeding limits (~6MB for 20 screenshots).
-    let lastScreenshotMsgIdx = -1;
-    for (let i = openaiMessages.length - 1; i >= 0; i--) {
-      const m = openaiMessages[i];
-      if (m.role === 'tool' && Array.isArray(m.content) &&
-          m.content.some((c: any) => c.type === 'image_url')) {
-        lastScreenshotMsgIdx = i;
-        break;
-      }
-    }
-
-    for (let msgIdx = 0; msgIdx < openaiMessages.length; msgIdx++) {
-      const msg = openaiMessages[msgIdx];
-      if (msg.role === 'system') {
-        const text = typeof msg.content === 'string'
-          ? msg.content
-          : Array.isArray(msg.content)
-            ? msg.content.map((c: any) => typeof c === 'string' ? c : c.text || '').filter(Boolean).join('\n')
-            : String(msg.content || '');
-        if (text) system.push({ text });
-        continue;
-      }
-
-      let role: string;
-      let contentBlocks: any[] = [];
-
-      if (msg.role === 'user') {
-        role = 'user';
-        contentBlocks = AgentModeService.convertContentToBedrockBlocks(msg.content);
-      } else if (msg.role === 'assistant') {
-        role = 'assistant';
-        // Text content
-        if (msg.content) {
-          const textContent = typeof msg.content === 'string'
-            ? msg.content
-            : Array.isArray(msg.content)
-              ? msg.content.map((c: any) => typeof c === 'string' ? c : c.text || '').filter(Boolean).join('\n')
-              : String(msg.content);
-          if (textContent) contentBlocks.push({ text: textContent });
-        }
-        // Tool use blocks
-        // Guard against tool_calls stored as a JSON string (legacy/corrupt data)
-        const toolCallsArray = typeof msg.tool_calls === 'string'
-          ? (() => { try { return JSON.parse(msg.tool_calls); } catch { return []; } })()
-          : msg.tool_calls;
-        if (toolCallsArray && toolCallsArray.length > 0) {
-          for (const tc of toolCallsArray) {
-            if (!tc?.function) continue;
-            let input: any;
-            try {
-              input = typeof tc.function.arguments === 'string'
-                ? JSON.parse(tc.function.arguments)
-                : tc.function.arguments;
-            } catch {
-              input = { raw: tc.function.arguments };
-            }
-            contentBlocks.push({
-              toolUse: {
-                toolUseId: tc.id,
-                name: tc.function.name,
-                input,
-              }
-            });
-          }
-        }
-        // Bedrock rejects blank text blocks — use a non-empty placeholder if the assistant
-        // message has neither text content nor tool calls (e.g. stored with empty content field).
-        if (contentBlocks.length === 0) contentBlocks.push({ text: '...' });
-      } else if (msg.role === 'tool') {
-        // Tool results become user messages with toolResult blocks
-        role = 'user';
-        // Content may be a string or a multipart array (e.g. screenshot with image)
-        let toolResultContent: any[];
-        if (Array.isArray(msg.content)) {
-          toolResultContent = [];
-          // Only include the screenshot image for the most recent screenshot message.
-          // Earlier screenshots are replaced with a text placeholder to prevent Bedrock
-          // 400 errors from accumulated base64 payloads in long sessions.
-          const includeImage = msgIdx === lastScreenshotMsgIdx;
-          for (const item of msg.content) {
-            if (item.type === 'text') {
-              toolResultContent.push({ text: item.text });
-            } else if (item.type === 'image_url') {
-              if (!includeImage) {
-                // Older screenshot — replace with text placeholder to save payload space
-                toolResultContent.push({ text: '[Screenshot captured — image omitted from context to reduce payload size]' });
-                continue;
-              }
-              const url = item.image_url?.url || '';
-              if (url.startsWith('data:')) {
-                const dataUriMatch = url.match(/^data:image\/([\w+]+)(?:;[^;]*)*;base64,(.+)$/s);
-                if (dataUriMatch) {
-                  const rawFormat = dataUriMatch[1].toLowerCase();
-                  const format = (rawFormat === 'jpg' ? 'jpeg' : rawFormat) as string;
-                  const VALID_BEDROCK_FORMATS = new Set(['jpeg', 'png', 'gif', 'webp']);
-                  toolResultContent.push({
-                    image: {
-                      format: VALID_BEDROCK_FORMATS.has(format) ? format : 'jpeg',
-                      source: { bytes: Buffer.from(dataUriMatch[2], 'base64') },
-                    }
-                  });
-                }
-              }
-            }
-          }
-          // Bedrock rejects empty text blocks — fall back to a placeholder
-          if (toolResultContent.length === 0) toolResultContent = [{ text: '(empty)' }];
-        } else {
-          toolResultContent = [{ text: String(msg.content || '(empty)') }];
-        }
-        contentBlocks.push({
-          toolResult: {
-            toolUseId: msg.tool_call_id,
-            content: toolResultContent,
-          }
-        });
-      } else {
-        role = 'user';
-        contentBlocks = [{ text: String(msg.content || '') }];
-      }
-
-      // Merge consecutive same-role messages (required by Bedrock Converse API)
-      if (messages.length > 0 && messages[messages.length - 1].role === role) {
-        messages[messages.length - 1].content.push(...contentBlocks);
-      } else {
-        messages.push({ role, content: contentBlocks });
-      }
-    }
-
-    // Bedrock requires first message to be user role
-    if (messages.length > 0 && messages[0].role !== 'user') {
-      messages.unshift({ role: 'user', content: [{ text: '.' }] });
-    }
-
-    return { system, messages };
-  }
-
-  /**
-   * Convert OpenAI content (string, array, or object) to Bedrock content blocks.
-   */
-  private static convertContentToBedrockBlocks(content: any): any[] {
-    if (!content) return [{ text: '' }];
-    if (typeof content === 'string') return [{ text: content }];
-    if (Array.isArray(content)) {
-      const blocks: any[] = [];
-      for (const item of content) {
-        if (typeof item === 'string') {
-          blocks.push({ text: item });
-        } else if (item.type === 'text') {
-          blocks.push({ text: item.text });
-        } else if (item.type === 'image_url') {
-          const url = item.image_url?.url || '';
-          if (url.startsWith('data:')) {
-            // Support data URIs with possible extra params: data:image/png;charset=utf-8;base64,...
-            // or the standard form: data:image/png;base64,...
-            // Extract just the mime type subtype (e.g. "png", "jpeg") and the base64 data
-            const dataUriMatch = url.match(/^data:image\/([\w+]+)(?:;[^;]*)*;base64,(.+)$/s);
-            if (dataUriMatch) {
-              const rawFormat = dataUriMatch[1].toLowerCase();
-              const format = rawFormat === 'jpg' ? 'jpeg' : rawFormat;
-              const VALID_BEDROCK_FORMATS = new Set(['jpeg', 'png', 'gif', 'webp']);
-              if (VALID_BEDROCK_FORMATS.has(format)) {
-                blocks.push({
-                  image: {
-                    format,
-                    source: { bytes: Buffer.from(dataUriMatch[2], 'base64') },
-                  }
-                });
-              } else {
-                // Unsupported format — convert to JPEG-labeled generic binary; Bedrock may still handle it
-                console.warn(`AgentMode: Bedrock image format "${format}" not in valid set, trying as jpeg`);
-                blocks.push({
-                  image: {
-                    format: 'jpeg',
-                    source: { bytes: Buffer.from(dataUriMatch[2], 'base64') },
-                  }
-                });
-              }
-            } else {
-              console.warn(`AgentMode: Could not parse data URI for Bedrock image block, url prefix="${url.substring(0, 60)}"`);
-            }
-          } else if (url) {
-            blocks.push({ text: `[Image: ${url}]` });
-          }
-        } else {
-          blocks.push({ text: JSON.stringify(item) });
-        }
-      }
-      return blocks.length > 0 ? blocks : [{ text: '.' }];
-    }
-    return [{ text: String(content) }];
-  }
-
-  /**
-   * Convert OpenAI-format content (string, array, or object) to Anthropic-native
-   * content blocks.
-   *
-   * Critically, OpenAI-style `{ type: 'image_url', image_url: { url } }` blocks are
-   * converted to Anthropic `{ type: 'image', source: {...} }` blocks. The Anthropic
-   * Messages API — including Claude models served via Google Vertex AI — rejects the
-   * `image_url` tag with: 400 "Input tag 'image_url' found using 'type' does not match
-   * expected tags (image, document, ...)". Data URIs become base64 image sources;
-   * public http(s) URLs become url image sources.
-   */
+  /** Convert OpenAI-format content into Anthropic-native content blocks. */
   private static convertContentToAnthropicBlocks(content: any): any[] {
     if (content === null || content === undefined) return [{ type: 'text', text: '' }];
     if (typeof content === 'string') return [{ type: 'text', text: content }];
     if (!Array.isArray(content)) return [{ type: 'text', text: String(content) }];
 
-    const VALID_ANTHROPIC_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+    const validMediaTypes = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
     const blocks: any[] = [];
     for (const item of content) {
       if (typeof item === 'string') {
@@ -2662,25 +2099,22 @@ export class AgentModeService {
       } else if (item.type === 'image_url') {
         const url = item.image_url?.url || '';
         if (url.startsWith('data:')) {
-          // data:image/png;base64,... (allow extra params before ;base64,)
-          const m = url.match(/^data:(image\/[\w+.-]+)(?:;[^;]*)*;base64,(.+)$/s);
-          if (m) {
-            let mediaType = m[1].toLowerCase();
+          const match = url.match(/^data:(image\/[\w+.-]+)(?:;[^;]*)*;base64,(.+)$/s);
+          if (match) {
+            let mediaType = match[1].toLowerCase();
             if (mediaType === 'image/jpg') mediaType = 'image/jpeg';
-            if (!VALID_ANTHROPIC_MEDIA_TYPES.has(mediaType)) mediaType = 'image/jpeg';
+            if (!validMediaTypes.has(mediaType)) mediaType = 'image/jpeg';
             blocks.push({
               type: 'image',
-              source: { type: 'base64', media_type: mediaType, data: m[2] },
+              source: { type: 'base64', media_type: mediaType, data: match[2] },
             });
           } else {
             console.warn(`AgentMode: Could not parse data URI for Anthropic image block, url prefix="${url.substring(0, 60)}"`);
           }
         } else if (url) {
-          // Public URL — Anthropic supports url image sources directly
           blocks.push({ type: 'image', source: { type: 'url', url } });
         }
       } else if (item.type === 'image' || item.type === 'tool_result' || item.type === 'tool_use' || item.type === 'document') {
-        // Already an Anthropic-native block — pass through unchanged
         blocks.push(item);
       } else {
         blocks.push({ type: 'text', text: JSON.stringify(item) });
@@ -2689,87 +2123,64 @@ export class AgentModeService {
     return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
   }
 
-  /** Media types the Anthropic Messages / Bedrock Converse vision APIs decode natively. */
+  /** Media types the vision APIs decode natively. */
   private static readonly VISION_NATIVE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
   /**
-   * Ensure an image buffer is in a format the vision APIs can actually decode, and
-   * that the returned content-type matches the real bytes (ENG-370).
-   *
-   * Uploaded logos frequently arrive as either (a) a format Claude/Bedrock cannot
-   * read — HEIC, AVIF, TIFF, BMP, SVG — or (b) a supported format mislabeled by S3
-   * with a generic/incorrect content-type (commonly `application/octet-stream` when
-   * the browser omits it). Both used to fail silently: the downstream block
-   * converters relabel an unknown type to `image/jpeg` WITHOUT re-encoding, so the
-   * declared media type no longer matches the bytes and the API returns 400; and a
-   * non-`image/*` content-type produced a data URI the `image/` regex dropped
-   * entirely, so the model never saw the image. describe_image would then burn many
-   * retries/workarounds and still fail.
-   *
-   * This decodes the actual bytes with sharp: if they are already a native format it
-   * just corrects the label (no re-encode); otherwise it re-encodes to PNG so the
-   * bytes always match a supported media type. Animated inputs (animated AVIF/HEIC)
-   * re-encode to their first frame — enough to describe a logo.
-   *
-   * On a decode failure it returns the input unchanged (best effort) but sets
-   * `undecodable: true` so the caller can fast-fail with re-upload guidance instead
-   * of burning vision retries on bytes no vision API can read either (ENG-370).
+   * Normalize uploaded image bytes to a vision-decodable representation. This
+   * remains local image hygiene; text/tool model routing is handled separately.
    */
   private static async normalizeImageForVision(
     buffer: Buffer,
-    contentType: string
+    contentType: string,
   ): Promise<{ buffer: Buffer; contentType: string; undecodable?: boolean; detectedFormat?: string }> {
-    let ct = (contentType || '').toLowerCase().trim();
-    if (ct === 'image/jpg') ct = 'image/jpeg';
-    if (AgentModeService.VISION_NATIVE_MEDIA_TYPES.has(ct)) {
-      return { buffer, contentType: ct };
+    let normalizedContentType = (contentType || '').toLowerCase().trim();
+    if (normalizedContentType === 'image/jpg') normalizedContentType = 'image/jpeg';
+    if (AgentModeService.VISION_NATIVE_MEDIA_TYPES.has(normalizedContentType)) {
+      return { buffer, contentType: normalizedContentType };
     }
+
     try {
       const sharp = (await import('sharp')).default;
       const metadata = await sharp(buffer).metadata();
-      const sharpFormatToMedia: Record<string, string> = {
-        jpeg: 'image/jpeg',
-        png: 'image/png',
-        gif: 'image/gif',
-        webp: 'image/webp',
+      const mediaTypeByFormat: Record<string, string> = {
+        jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
       };
-      const detected = metadata.format ? sharpFormatToMedia[metadata.format] : undefined;
-      if (detected) {
-        // Bytes are already vision-native; only the content-type header was wrong/missing.
-        return { buffer, contentType: detected, detectedFormat: metadata.format };
+      const detectedContentType = metadata.format ? mediaTypeByFormat[metadata.format] : undefined;
+      if (detectedContentType) {
+        return { buffer, contentType: detectedContentType, detectedFormat: metadata.format };
       }
-      // Genuinely unsupported encoding (heic/heif/avif/tiff/bmp/svg/...). Convert to PNG.
-      // sharp(buffer) reads only the first frame by default, so animated inputs
-      // collapse to a single describable frame here (no `{ animated: true }`).
+
       const png = await sharp(buffer).png().toBuffer();
-      console.log(
-        `AgentMode: normalizeImageForVision converted "${ct || 'unknown'}" (sharp format "${metadata.format}") to image/png, ${png.length} bytes`
-      );
       return { buffer: png, contentType: 'image/png', detectedFormat: metadata.format };
     } catch (err) {
       console.error(
         'AgentMode: normalizeImageForVision failed to decode/convert image; using original:',
-        err instanceof Error ? err.message : err
+        err instanceof Error ? err.message : err,
       );
-      // sharp could not decode the bytes at all — a corrupt file or a codec even
-      // sharp lacks. The vision APIs decode a strict subset of what sharp handles,
-      // so they cannot read it either. Flag it undecodable so the caller fast-fails.
-      // Only fall back to a native default when we have no usable label at all, so a
-      // missing/empty content-type never yields a `data:;base64,...` URI (ENG-370).
       return { buffer, contentType: contentType || 'image/png', undecodable: true };
     }
   }
 
   private llmModels: Record<string, LLMModelConfig> = {
-    // List openai models - create client dynamically for each deployment
-    // Azure OpenAI enforces a 128-tool limit per request
+    // Logical model metadata only. `callLLM` resolves every text/tool request
+    // through OpenRouter; no provider client is constructed from this registry.
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
-    'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
-    'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
-    'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
-    'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
+    // gpt-5-chat-2 and gpt-5.2-chat REMOVED 2026-08-19 as part of migrating off
+    // the Rui-owned Azure resource (ai-ruiwangwarm...) onto agentweb-openrouter-byok:
+    // gpt-5-chat-2 is no longer in Azure's deployable model catalog at all;
+    // gpt-5.2-chat's Azure inference cutoff was 2026-06-29 (fully deprecated,
+    // no working deployment possible on any resource). Both were already
+    // legacy:true and the two lowest-quality entries in the gpt5-chat family.
+    // Safe to remove ONLY because LEGACY_MODEL_ALIASES now redirects both ids
+    // to gpt-5.5 (see below) — a paused schedule/session still holding the old
+    // id resolves forward instead of throwing "Invalid model". Do not delete a
+    // registry entry without an alias first; that was exactly the caution the
+    // prior version of this comment existed to enforce.
+    'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // List gemini models - client will be lazy-loaded
     // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
     // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
@@ -2778,38 +2189,229 @@ export class AgentModeService {
     // gemini-3.1-pro-preview (below), which is the newest Gemini Pro that exists.
     // Its price entry is intentionally left in place — a rate for a removed model is
     // harmless, a missing rate for a live one is not.
-    'gemini-3-flash-preview': { client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.1-pro-preview': { client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.1-flash-lite': { client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.5-flash': { client: null, supportsTemperature: true, supportsVision: true },
+    // 2026-08-19: Harsha — "the preview gemini models should be moved to
+    // legacy asap." Static legacy: true (not dominance-derived — "preview"
+    // status isn't something a cost/quality comparison would ever catch on
+    // its own; this is a policy call that preview builds shouldn't be a
+    // default-visible pick regardless of how they benchmark).
+    // resolveGenerationModel/resolveFallbackModel are untouched — an
+    // existing session or schedule pinned to either id is unaffected.
+    // Google accepts at most 128 function declarations per request. This limit
+    // applies whether Gemini is reached directly or through OpenRouter: the
+    // gateway can fail over transports, but it cannot make an invalid upstream
+    // request valid. Fresh Emma sidebar sessions expose the legacy full tool
+    // catalog, so omitting this cap made Gemini fail deterministically with 400.
+    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // 2026-08-19: Gemini 3.7 Flash (GA, released 2026-08-13) added — verified
+    // live against three independent sources (ai.google.dev/deepmind.google/
+    // blog.google, OpenRouter, Artificial Analysis), no Gemini 3.7 Pro or
+    // Flash-Lite exists. Google shipped 3.6 Flash first, then 3.7 Flash on top
+    // of it — 3.6 is deliberately skipped (never added to this registry) since
+    // 3.7 supersedes it outright. `family: 'gemini-flash'` (shared with 3.5
+    // Flash, NOT 3.1 Flash Lite — Lite is a distinct "lightest/fastest"
+    // positioning, same reasoning as gpt5-chat vs gpt5-nano) lets the
+    // dominance rule do its job: 3.7 Flash is both cheaper (cost tier 'cheap'
+    // vs 3.5's 'medium') and higher quality (56 vs 52) than 3.5 Flash, so 3.5
+    // Flash is now correctly auto-flagged legacy.
+    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
+    // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
+    // the suffix after the prefix passed straight through as OpenRouter's own model
+    // string, so a new upstream model is one registry line, not new routing code.
+    //
+    // Flags below are sourced from a live GET /api/v1/models[/…/endpoints] snapshot
+    // (2026-08-17), not guessed:
+    // - supportsTemperature: mirrors each model's `supported_parameters` value.
+    // - maxTools: deliberately OMITTED for every OpenRouter entry, including this
+    //   one — unlike Azure's documented 128-tool cap, OpenRouter's models AND
+    //   endpoints APIs expose no numeric tool-call limit for any model (checked
+    //   both), so setting a number here would be a guess, not evidence. (The
+    //   128 previously on this line was exactly that guess, copied from the Azure
+    //   convention without verification — removed.)
+    // - supportsVision: deliberately OMITTED even where `architecture.modality`
+    //   reports image/video input — this codebase's own convention for the flag
+    //   (see LLMModelConfig.supportsVision above) requires empirical verification
+    //   against the real describe_image path, which none of these have had yet.
+    //   Metadata-only vision support is not the bar this flag uses elsewhere.
+    // - adminOnly: OMITTED for every OpenRouter entry below (2026-08-19: was
+    //   `true` on each, gated as unproven-in-our-stack — Harsha: "i'm fine to
+    //   include open source / open router stuff for all users not just
+    //   isadmin". Client construction is the same lazy-loaded OpenRouter path
+    //   already used successfully by gpt-4o-mini above.) This does NOT apply
+    //   to non-OpenRouter adminOnly entries elsewhere in this registry (e.g.
+    //   anthropic.claude-opus-4-6-v1), which are gated for unrelated reasons.
+    'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 7, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // Workload-specific research agent. It is intentionally callable only from
+    // DeepResearchService, not exposed as a general chat-picker model.
+    'openrouter/perplexity/sonar-deep-research': { client: null, supportsTemperature: true, internalOnly: true },
+    'openrouter/perplexity/sonar-pro-search': { client: null, supportsTemperature: true, internalOnly: true },
+    // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
+    // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
+    // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
+    // deprecated, score collapsed 53→38, now below GLM-5.2/DeepSeek-V4-Pro/
+    // Kimi-K2.6 at a similar price), mistral-large-2512 (AA Index 16, weakest
+    // score checked), llama-4-maverick (AA Index 14, a year old, Meta has since
+    // moved to proprietary Muse Spark/Code), llama-4-scout (lowest cheap-tier
+    // score; Meta shipped Llama 5 in April 2026, making this a full generation
+    // behind), llama-3.1-8b-instruct (older sibling of the same superseded
+    // family), qwen3.7-flash (no coding-benchmark coverage — it's vision-language,
+    // not a coding model — and its pricing tiers up sharply past 32K-token
+    // prompts). qwen3.8-max is KEPT despite losing head-to-head to grok-4.6 at
+    // the same $2/$6 price — it's Alibaba's only current non-deprecated entrant
+    // (Qwen3.7 Max is independently confirmed deprecated too), so it stays for
+    // lab/family redundancy, not because it's the top pick in its tier.
+    // kimi-k2.6 is SWAPPED for kimi-k2.7-code (live-verified pricing/flags, not
+    // reused from the third pass).
+    //
+    // Net result: Meta/Llama has ZERO entrants after this cleanup. OpenRouter's
+    // catalog has no meta-llama/llama-5* listed as of this snapshot (checked
+    // live) — this is a real, currently-unfillable gap, not an oversight.
+    'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // 2026-08-19: qualityScore corrected 52 -> 40. The 52 belonged to a
+    // DIFFERENT, newer snapshot ("DeepSeek V4 Flash 0731, Max Effort") —
+    // this registry id resolves on OpenRouter to "DeepSeek V4 Flash 0423",
+    // whose real AA Intelligence Index score is 40 (confirmed live against
+    // AA's own page + independent coverage). Not a stale-number issue like
+    // the Kimi K3 pricing catch — the wrong model's score was attached to
+    // the model we actually invoke. Pricing is unaffected: our MODEL_PRICING
+    // entry ($0.068/$0.168) already matches the real 0423 snapshot.
+    'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "DeepSeek V4 Flash 0423" page (the snapshot this OpenRouter id actually resolves to), snapshot 2026-08-19' },
+    'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, qualityScore: 58, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // 2026-08-26 (ENG-1604): added after live cost+quality research — AA
+    // Intelligence Index 52 (v4.1.1, measured, not estimated), #1 of 138
+    // models in its size class, roughly matching DeepSeek V4 Pro's quality
+    // (53) at about half the input price. Skipped sibling candidates:
+    // qwen3-coder-next (AA 21, coding-only, deferred by Harsha this pass),
+    // qwen3-max/qwen3-max-thinking/qwen3-vl-235b (AA "estimated", not
+    // measured, or AA-flagged deprecated).
+    'openrouter/qwen/qwen3.8-27b': { name: 'Qwen3.8 27B', provider: 'qwen', tier: 'medium', description: 'Alibaba\'s efficient open-weight model, leading in its size class', client: null, supportsTemperature: true, qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-26' },
+    'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, qualityScore: 20, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, qualityScore: 60, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 23, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // 2026-08-19: OpenAI's GPT-5.6 three-tier family (Sol/Terra/Luna, launched
+    // 2026-07-09), added via OpenRouter — live-confirmed slugs and pricing at
+    // openrouter.ai/openai/gpt-5.6-{sol,terra,luna}. adminOnly per the
+    // existing convention for unverified-in-our-stack OpenRouter entries.
+    // Sol: AA Coding Agent Index leader (80) but behind Opus 5 on 9/12
+    // tracked benchmarks including SWE-bench Pro and ARC-AGI-3 — pro tier,
+    // not ultra_premium. Terra: GPT-5.5-competitive quality at ~half cost —
+    // replaces gpt-5.5 as the default GPT-5.x picker row. Luna: cheap/fast,
+    // ~24 benchmark points per API dollar at launch pricing — ultra_cheap.
+    // 2026-08-19: NOT in the 'gpt5-chat' family (unlike Terra/5.5/5.4/etc) —
+    // its own description marks it as a distinct specialized/premium
+    // positioning ("Frontier coding and agentic work"), not a generation of
+    // the "Balanced general-purpose model" line the rest of that family
+    // shares verbatim in their description text. Lumping it in wrongly
+    // flagged GPT-5.6 Terra as legacy: Sol's OpenRouter price is currently
+    // on a promotional discount that happens to land it in the same cost
+    // band as Terra, so same-family dominance concluded Terra was
+    // redundant — a coincidence of a volatile promo price, not a real
+    // "Terra is superseded" fact. Same principle as keeping Kimi K3 out of
+    // a family with Kimi K2.7-Code (a coding-specialized sibling).
+    'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: false, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: false, qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
-    'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
-    'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true, supportsVision: true },
-    'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true, adminOnly: true, supportsVision: true },
+    // 2026-08-19: all four below are `legacy` (picker-grouping only, see
+    // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still
+    // referenced by live TaskSchedules/ChatSessions (opus-4-8 and sonnet-4-6
+    // have active schedules touching them the same day this was written), so
+    // NOT deleted and NOT adminOnly — customers can still select them via
+    // "Show more", they're just no longer the default row per tier.
+    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 37, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true, legacy: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
     // temperature is deprecated for this model
-    'anthropic.claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true, legacy: true , qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
     // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
     // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
     // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
     // deprecated for this model") — verified against live Bedrock, not assumed.
-    'anthropic.claude-opus-5': { client: null, supportsTemperature: false, supportsVision: true },
-    'anthropic.claude-sonnet-5': { client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-opus-5': { name: 'Claude Opus 5', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 63, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // Haiku 4.5 still accepts temperature (also live-verified).
-    'anthropic.claude-haiku-4-5-20251001-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 30, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
-    const models = Object.keys(this.llmModels).filter(m => isAdmin || !this.llmModels[m].adminOnly);
+    const models = Object.keys(this.llmModels).filter(
+      m => !this.llmModels[m].internalOnly && (isAdmin || !this.llmModels[m].adminOnly),
+    );
     const defaultModel = await this.getDefaultModel();
     // Put the default model first so frontends that use [0] pick the right one
     if (defaultModel && models.includes(defaultModel)) {
       return [defaultModel, ...models.filter(m => m !== defaultModel)];
     }
     return models;
+  }
+
+  /**
+   * Same entitlement/ordering as getSupportedModels, decorated with tier + description
+   * for the model-picker UI. Excludes live-voice models (isLive) — they are never
+   * selectable through the HTTP generate picker (see callLLM's isLive guard).
+   * Untiered entries default to 'medium' with a generic description rather than being
+   * dropped, so a newly-added model is never silently invisible in the picker.
+   *
+   * costScore is computed live from MODEL_PRICING (via getModelPrice +
+   * costScoreFromPrice) rather than read off the config — see the
+   * LLMModelConfig comment for why. tier is then derived from that same
+   * costScore via tierFromCostScore, so the picker's section headers always
+   * agree with the cost meter it's grouping by. Only when a model has no
+   * MODEL_PRICING entry (so costScore can't be computed) does tier fall back
+   * to the config's static field, and costScore/costScoreSource are omitted.
+   */
+  async getSupportedModelsWithMetadata(isAdmin: boolean = false): Promise<SupportedModelInfo[]> {
+    const ids = await this.getSupportedModels(isAdmin);
+    const visibleIds = ids.filter(id => !this.llmModels[id]?.isLive);
+
+    const enriched = visibleIds.map(id => {
+      const config = this.llmModels[id];
+      const price = getModelPrice(id);
+      const costScore = price ? costScoreFromPrice(price) : undefined;
+      return {
+        id,
+        name: config?.name ?? id,
+        tier: typeof costScore === 'number' ? tierFromCostScore(costScore) : (config?.tier ?? 'medium'),
+        description: config?.description ?? 'General-purpose model',
+        provider: config?.provider ?? 'other',
+        family: config?.family,
+        staticLegacy: config?.legacy === true,
+        qualityScore: config?.qualityScore,
+        qualityScoreSource: config?.qualityScoreSource,
+        costScore,
+      };
+    });
+
+    const dominatedIds = deriveDominanceLegacyIds(
+      enriched.map(e => ({ id: e.id, family: e.family, tier: e.tier, qualityScore: e.qualityScore, legacy: e.staticLegacy })),
+    );
+
+    return enriched.map(e => ({
+      id: e.id,
+      name: e.name,
+      tier: e.tier,
+      description: e.description,
+      provider: e.provider,
+      ...(e.staticLegacy || dominatedIds.has(e.id) ? { legacy: true as const } : {}),
+      ...(typeof e.qualityScore === 'number' ? { qualityScore: e.qualityScore } : {}),
+      ...(e.qualityScoreSource ? { qualityScoreSource: e.qualityScoreSource } : {}),
+      ...(typeof e.costScore === 'number'
+        ? {
+            costScore: e.costScore,
+            costScoreSource:
+              'AgentWeb blended rate (75% input / 25% output), computed live from the real per-token billing price table (llmPricing.ts MODEL_PRICING) — never a separately hand-typed number',
+          }
+        : {}),
+    }));
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
@@ -2864,8 +2466,8 @@ export class AgentModeService {
   /**
    * Resolve the model to fall back to when a requested id is unavailable.
    * Normally this is the configured default_model, but if that itself has been
-   * removed from the allow-list (e.g. a stale AZURE_OPENAI_DEPLOYMENT_AGENT_MODE
-   * env override pinning a retired deployment) returning it would just re-throw
+   * removed from the allow-list (e.g. a stale legacy configuration pinning a
+   * retired model) returning it would just re-throw
    * "Invalid model" inside callLLM. Guard against that by validating the default
    * and falling back to a known-good served model otherwise (ENG-46).
    */
@@ -2879,39 +2481,6 @@ export class AgentModeService {
       `falling back to known-good model '${knownGoodModel}'.`
     );
     return knownGoodModel;
-  }
-
-  /**
-   * ENG-907: bound a permitted forced-synthesis backup call to the wall-clock time that is
-   * actually left, rather than trusting the duration estimate that admitted it.
-   *
-   * The estimate is drawn from calls this run already made, and the backup is by definition
-   * a DIFFERENT model — it can be slower than anything measured. If it overruns, the
-   * controller's cap fires and rejects the whole generation, discarding the partial answer
-   * this feature exists to deliver. So stop waiting with time still on the clock and let the
-   * caller fall back to that partial answer.
-   *
-   * Resolves to `SYNTHESIS_RETRY_TIMED_OUT` instead of rejecting, so the timeout is not
-   * mistaken for a model error and misclassified. The in-flight request is left to settle on
-   * its own — there is no abort plumbing through the provider adapters, and the turn is ending
-   * regardless — but its rejection is swallowed so it cannot surface as an unhandled one.
-   * With no deadline the call is awaited unchanged.
-   */
-  private async withSynthesisRetryDeadline(call: Promise<any>, deadlineMs?: number): Promise<any> {
-    if (deadlineMs === undefined) return call;
-    let timer: NodeJS.Timeout | undefined;
-    try {
-      return await Promise.race([
-        call,
-        new Promise((resolve) => {
-          timer = setTimeout(() => resolve(SYNTHESIS_RETRY_TIMED_OUT), deadlineMs);
-        }),
-      ]);
-    } finally {
-      if (timer) clearTimeout(timer);
-      // The loser of the race is still in flight; never let it become an unhandled rejection.
-      void Promise.resolve(call).catch(() => {});
-    }
   }
 
   async callLLM(
@@ -2928,122 +2497,177 @@ export class AgentModeService {
       throw new Error(`Invalid model '${model}'. Available models: ${availableModels}`);
     }
 
+    // Live models use WebSocket via liveVoiceService — callLLM is not applicable.
+    // Keep this exception outside the text/tool gateway contract.
+    if (this.llmModels[model].isLive) {
+      throw new Error(`Model '${model}' is a live voice model. Use the Socket.IO live:start event instead of the HTTP generate endpoint.`);
+    }
+
     // Extract options with defaults
     const {
       tools = null,
       tool_choice = null,
+      webSearch = false,
       max_completion_tokens = null,
       temperature = null,
-      response_format = { type: "text" },
+      response_format = null,
       usageContext = null,
-      humanPaced = false
+      humanPaced = false,
+      timeoutMs,
+      fallbackModels,
     } = options || {};
 
+    // AgentWeb owns model selection; OpenRouter owns transport, provider
+    // throttling, and provider fallback for every text/tool call.
+    const upstreamModel = resolveOpenRouterUpstreamModelId(model);
     const params: any = {
-      model: model,
+      model: upstreamModel,
       messages: messages,
-      response_format: response_format || { type: "text" },
     };
-
-    // ENG-893: cache-TTL hint for the Bedrock Converse wrapper, which reads it
-    // off `params` and never forwards it to ConverseCommand. Set ONLY for
-    // Bedrock models: `params` is handed verbatim to
-    // `client.chat.completions.create()` for every provider, and the OpenAI SDK
-    // forwards unknown body fields to the API — Azure OpenAI rejects an
-    // unrecognised argument with a 400, which would break every GPT turn.
-    if (model.startsWith('anthropic.')) {
-      params.humanPaced = humanPaced;
+    // Omit the no-op text default unless a caller actually requests
+    // structured JSON: require_parameters must not exclude a model such as
+    // Sonar Deep Research merely because it does not advertise response_format.
+    if (response_format) {
+      params.response_format = response_format;
     }
 
-    // Only add tools and tool_choice if tools are provided
-    if (tools && tools.length > 0) {
+    params.provider = { allow_fallbacks: true, require_parameters: true };
+    // OpenRouter reports its own billed amount as zero for BYOK requests even
+    // though the upstream provider still bills the inference. Request the
+    // routing flag so metering can distinguish BYOK from a genuinely free call.
+    params.usage = { include: true };
+    // Apply compression only when the request exceeds the selected context
+    // window; this keeps context handling at the gateway boundary.
+    params.plugins = [{ id: 'context-compression' }];
+    if (fallbackModels?.length) {
+      params.models = fallbackModels.map((fallbackModel) => {
+        const normalizedFallback = this.normalizeModelId(fallbackModel);
+        if (!normalizedFallback || !this.llmModels[normalizedFallback]) {
+          throw new Error(`Invalid OpenRouter fallback model '${fallbackModel}'`);
+        }
+        return resolveOpenRouterUpstreamModelId(normalizedFallback);
+      });
+    }
+    if (usageContext?.sessionId && usageContext.sessionId.length <= 256) {
+      params.session_id = usageContext.sessionId;
+    }
+    if (upstreamModel.startsWith('anthropic/')) {
+      // Explicit content-block breakpoints retain OpenRouter's full Anthropic,
+      // Bedrock, and Vertex fallback pool. Its top-level automatic cache flag
+      // would silently restrict this request to Anthropic first-party only.
+      params.messages = applyOpenRouterCacheBreakpoints(messages, humanPaced);
+    }
+
+    // Function tools and OpenRouter server tools share one wire-level array.
+    // Server-side web search forces the gateway above and must not be run by a
+    // provider-native adapter, which is the final ENG-1432 dual-path removal.
+    const callerTools = tools && tools.length > 0 ? tools : [];
+    let boundedTools = callerTools;
+    if (callerTools.length > 0) {
       const maxTools = this.llmModels[model].maxTools;
-      if (maxTools && tools.length > maxTools) {
-        console.warn(`AgentMode: callLLM truncating tools for model "${model}": ${tools.length} tools exceeds limit of ${maxTools}. Keeping first ${maxTools}.`);
-        params.tools = tools.slice(0, maxTools);
-      } else {
-        params.tools = tools;
+      const callerToolLimit = typeof maxTools === 'number'
+        ? Math.max(0, maxTools - (webSearch ? 1 : 0))
+        : undefined;
+      if (callerToolLimit !== undefined && callerTools.length > callerToolLimit) {
+        console.warn(
+          `AgentMode: callLLM truncating tools for model "${model}": ${callerTools.length} caller tools exceeds limit of ${callerToolLimit}` +
+          `${webSearch ? ' after reserving one web-search slot' : ''}. Keeping first ${callerToolLimit}.`,
+        );
+        boundedTools = callerTools.slice(0, callerToolLimit);
       }
+    }
+    // OpenRouter normalizes the transport, but the selected provider still
+    // validates its own function-declaration schema. Preserve non-function
+    // server tools rather than trying to sanitize a nonexistent `.function`.
+    const normalizedCallerTools = upstreamModel.startsWith('google/gemini-')
+      ? boundedTools.map((tool: any) => tool?.type === 'function' ? ({
+          ...tool,
+          function: {
+            ...tool.function,
+            parameters: sanitizeGeminiSchema(tool.function?.parameters) || {
+              type: 'object',
+              properties: {},
+            },
+          },
+        }) : tool)
+      : boundedTools;
+    const requestTools = webSearch
+      ? [...normalizedCallerTools, { type: 'openrouter:web_search' }]
+      : normalizedCallerTools;
+    if (requestTools.length > 0) {
+      params.tools = requestTools;
+    }
+    // A server-only tool is selected by OpenRouter. Preserve the historical
+    // `auto` default only for caller-supplied function tools.
+    if (callerTools.length > 0) {
       params.tool_choice = tool_choice || 'auto';
     }
 
     // Only add max_completion_tokens if specified
     if (max_completion_tokens) {
-      params.max_completion_tokens = max_completion_tokens;
+      params.max_tokens = max_completion_tokens;
     }
 
-    // Only add temperature if model supports it and value is provided
-    if (this.llmModels[model].supportsTemperature && temperature !== null) {
+    // OpenRouter's metadata marks GPT-5.x temperature unsupported.
+    const gatewaySupportsTemperature = !upstreamModel.startsWith('openai/gpt-5.');
+    if (
+      this.llmModels[model].supportsTemperature &&
+      gatewaySupportsTemperature &&
+      temperature !== null
+    ) {
       params.temperature = temperature;
     }
 
-    // Live models use WebSocket via liveVoiceService — callLLM is not applicable
-    if (this.llmModels[model].isLive) {
-      throw new Error(`Model '${model}' is a live voice model. Use the Socket.IO live:start event instead of the HTTP generate endpoint.`);
-    }
+    const client = await this.getOpenRouterClient();
+    const providerLabel = 'openrouter';
 
-    // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed
-    let client = this.llmModels[model].client;
-    if (model.startsWith('gemini-')) {
-      // ENG-737: always the native adapter — no fallback transport, resolved
-      // per-call (not cached on the registry).
-      client = this.getGeminiNativeClient();
-    } else if (!client) {
-      if (model.startsWith('anthropic.')) {
-        client = await this.getBedrockClient(model);
-        this.llmModels[model].client = client;
-      } else if (model.startsWith('claude-')) {
-        client = await this.getVertexClient(model);
-        this.llmModels[model].client = client;
-      } else {
-        throw new Error(`Client not initialized for model: ${model}`);
-      }
-    }
+    // ENG-1626: params.provider.allow_fallbacks above already has OpenRouter retry
+    // across its own provider pool for THIS request before it ever surfaces an
+    // error to us -- getOpenRouterClient's maxRetries:0 exists precisely so an SDK
+    // auto-retry can't multiply with that in-flight fallback. This loop is a
+    // different thing: ONE retry of a *fully-exhausted* attempt, after a short
+    // backoff, for the narrow case where the exhaustion was momentary. Session
+    // b32ec8af (2026-08-26): a single "429 Provider returned error" from
+    // OpenRouter (all providers for that model saturated for an instant) killed
+    // an entire Slack-bridged session with zero retry anywhere in this path.
+    // `timeout` is deliberately excluded from the retryable set used elsewhere
+    // (isRetryableErrorClass) -- retrying a call that already burned up to
+    // timeoutMs would double the worst-case wall clock against the turn's own
+    // hard cap, trading one failure mode for a worse one.
+    const isRetryableLlmCallError = (error: unknown): boolean => {
+      const errorClass = classifyToolErrorClass(error);
+      return errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx';
+    };
 
-    if (!client) {
-      throw new Error(`Failed to initialize client for model: ${model}`);
-    }
-
-    // Retry loop with exponential backoff for transient LLM errors (503, 429, timeouts)
-    const maxAttempts = 3;
-    const baseDelayMs = 2000;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        const res = await client.chat.completions.create(params);
-        // Shadow usage metering (Ship 1): every client returned above (Azure
-        // OpenAI, Gemini OpenAI-compat, Bedrock Converse wrapper, Vertex
-        // wrapper) responds in OpenAI shape, so `res.usage` is the single
-        // observation point — including the Bedrock ConverseCommand path,
-        // whose cache metrics surface as cache_read/creation_input_tokens.
-        // Fire-and-forget + fail-open: never awaited, never throws.
+        const res = await client.chat.completions.create(
+          params,
+          { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
+        );
+        // Fire-and-forget usage metering; it must never break an LLM call.
         try {
           const usage: any = (res as any)?.usage;
           if (usage) {
-            // ENG-200: meter the main agent turn — record shadow burn AND charge
-            // the per-user cost cap when a real user is attributable (org members
-            // resolve to the owner). Cost (incl. cache tokens) is computed once
-            // here; no separate deduction path exists for this call, so this is
-            // the single charge point. No userId → burn-only "system" record.
+            const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
             meterUserUsage({
               userId: usageContext?.userId,
+              billingUserId: usageContext?.billingUserId,
               sessionId: usageContext?.sessionId,
               model,
-              provider: model.startsWith('gemini-') ? 'gemini'
-                : model.startsWith('anthropic.') ? 'bedrock'
-                : model.startsWith('claude-') ? 'vertex'
-                : 'azure-openai',
+              provider: providerLabel,
               feature: usageContext?.feature || 'agent_task',
-              // ENG-1251: the response's own id is stable across a retried/
-              // re-processed response and distinct across real calls — closes
-              // the "retries defeat charge dedup" Greptile P1 for the highest-
-              // volume metering site in the codebase.
               eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
-              inputTokens: usage.prompt_tokens || 0,
-              outputTokens: usage.completion_tokens || 0,
-              cacheReadTokens: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,
-              cacheWriteTokens: usage.cache_creation_input_tokens || 0,
-              // ENG-893: bill writes at the TTL Bedrock applied, not the one asked for.
+              inputTokens: normalizedUsage.inputTokens,
+              outputTokens: normalizedUsage.outputTokens,
+              cacheReadTokens: normalizedUsage.cacheReadTokens,
+              cacheWriteTokens: normalizedUsage.cacheWriteTokens,
               cacheWriteByTtl: usage.cache_creation_by_ttl,
+              costUsdOverride:
+                usage.is_byok !== true && typeof usage.cost === 'number'
+                  ? usage.cost
+                  : undefined,
             });
           }
         } catch {
@@ -3051,45 +2675,22 @@ export class AgentModeService {
         }
         return res;
       } catch (error) {
-        const isLastAttempt = attempt >= maxAttempts;
-
-        // Log Gemini-specific errors with more context for debugging
-        if (model.startsWith('gemini-')) {
-          console.error(`AgentMode: Gemini API error on attempt ${attempt}/${maxAttempts}:`, {
-            model,
+        lastError = error;
+        if (attempt < 2 && isRetryableLlmCallError(error)) {
+          console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying once`, {
             error: error instanceof Error ? error.message : String(error),
-            errorName: error instanceof Error ? error.name : 'Unknown',
-            isTransient: isTransientLLMError(error),
-            willRetry: !isLastAttempt && isTransientLLMError(error),
-            messageCount: messages.length,
-            hasTools: tools && tools.length > 0
           });
+          await this.sleep(1500);
+          continue;
         }
-
-        if (!isTransientLLMError(error) || isLastAttempt) {
-          // On last attempt or non-transient error, log full error details
-          if (isLastAttempt || !isTransientLLMError(error)) {
-            console.error(`AgentMode: callLLM failed for model "${model}":`, {
-              error: error instanceof Error ? error.message : String(error),
-              stack: error instanceof Error ? error.stack : undefined,
-              attempt,
-              maxAttempts
-            });
-          }
-          throw error;
-        }
-        const jitterMs = Math.floor(Math.random() * 500);
-        const delayMs = baseDelayMs * Math.pow(2, attempt - 1) + jitterMs;
-        console.warn(
-          `AgentMode: callLLM retry ${attempt}/${maxAttempts} for model "${model}" after ${delayMs}ms due to:`,
-          error instanceof Error ? error.message : error
-        );
-        await this.sleep(delayMs);
+        break;
       }
     }
-
-    // Unreachable, but TypeScript needs it
-    throw new Error('callLLM: unexpected code path');
+    console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
+      error: lastError instanceof Error ? lastError.message : String(lastError),
+      stack: lastError instanceof Error ? lastError.stack : undefined,
+    });
+    throw lastError;
   }
 
   /**
@@ -3147,39 +2748,6 @@ export class AgentModeService {
     }
 
     return isTransientLLMError(error) || /timed out|timeout|overloaded|upstream|network/i.test(message);
-  }
-
-  /**
-   * Should describe_image retry a failed vision call on the OTHER provider?
-   *
-   * This is a superset of isRetryableMediaToolError, and deliberately local to
-   * describe_image. That classifier answers "would this same call succeed if
-   * repeated", so it rejects credential/permission failures — correctly, since
-   * hammering the same model with a bad key is pointless. But describe_image's
-   * fallback switches providers entirely (Gemini -> Bedrock Claude), which
-   * authenticate separately, so a provider-scoped 401/403 is precisely the case
-   * where the other provider WOULD answer. Without this, one bad Gemini key
-   * hard-fails every describe_image call while Bedrock sits healthy beside it —
-   * the same "provider rejection surfaces as a broken tool" shape as ENG-834.
-   *
-   * NOT widened in the shared classifier: image generation relies on its current
-   * narrowness (ENG-510), and switching image models changes output semantics in
-   * a way switching vision models does not.
-   *
-   * Payload rejections (400 INVALID_ARGUMENT) stay excluded — the image is
-   * already normalised and downscaled by the time we call, so a second provider
-   * would only double the latency and cost. Recovery is still observable:
-   * describeImage returns fallbackUsed + primaryError, so a broken key is
-   * diagnosable from the session record rather than silently papered over.
-   */
-  private isVisionFallbackWorthy(error: unknown): boolean {
-    if (this.isRetryableMediaToolError(error)) return true;
-    if (!error) return false;
-    const e = error as any;
-    const status = e?.status ?? e?.$metadata?.httpStatusCode ?? e?.response?.status;
-    if (status === 401 || status === 403) return true;
-    const message = error instanceof Error ? error.message : String(error);
-    return /permission.?denied|unauthenticated|api key not valid/i.test(message);
   }
 
   private getImageGenerationFallbackModel(
@@ -3251,7 +2819,9 @@ export class AgentModeService {
    * ordinary state of every draft-only run, and also the state of a run whose stamp
    * could not be written (which the runner downgrades to draft-only for this reason).
    */
-  private async resolveScheduledPublishAuthorization(currentSession: any): Promise<SchedulePublishAuthorization> {
+  private async resolveScheduledPublishAuthorization(
+    currentSession: any
+  ): Promise<SchedulePublishAuthorization & { reason?: PublishAuthorizationWithholdReason }> {
     if (currentSession?.sessionType !== 'scheduled') return { authorized: true, tools: [] };
     const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
     if (!scheduleId) {
@@ -3263,8 +2833,16 @@ export class AgentModeService {
     try {
       // resolveSchedulePublishAuthorization returns unauthorized for a null/deleted
       // schedule too, so a vanished record withholds rather than publishes.
-      const live = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(scheduleId));
-      return narrowPublishAuthorization(readAdmittedAuthorization(currentSession), live);
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      const live = resolveSchedulePublishAuthorization(schedule);
+      const resolved = narrowPublishAuthorization(readAdmittedAuthorization(currentSession), live);
+      // ENG-1245: attach WHY, read straight off the live schedule record, so the
+      // prompt can tell the owner the true blocker instead of unconditionally
+      // naming "Require approval before publishing" (see
+      // describePublishAuthorizationWithholdReason for why that was wrong for
+      // Harsha's schedule and every other legacy schedule never granted standing
+      // publish authorization).
+      return resolved.authorized ? resolved : { ...resolved, reason: describePublishAuthorizationWithholdReason(schedule) };
     } catch (error) {
       console.error(
         `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding publish authorization for this turn rather than publishing unverified:`,
@@ -3272,11 +2850,6 @@ export class AgentModeService {
       );
       return { authorized: false, tools: [] };
     }
-  }
-
-  private getVisionFallbackModel(primaryModel: string): string | undefined {
-    const fallbackOrder = ['anthropic.claude-opus-4-8', 'gemini-3-flash-preview', 'gpt-5.4-nano'];
-    return fallbackOrder.find((model) => model !== primaryModel && this.llmModels[model]?.supportsVision === true);
   }
 
   /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
@@ -3328,14 +2901,14 @@ export class AgentModeService {
     // required-function checker holds; absent on the interactive path, which resolves
     // per turn below.
     publishAuthorizationOverride?: SchedulePublishAuthorization,
-    // Cost-policy-owned retry target. undefined preserves the global admin backup;
-    // null explicitly disables retry. Optimized callers always send string|null.
-    transientFallbackModel?: string | null,
     // ENG-936: approved source URLs for image revisions. When provided, the
     // preflight gate rejects confirm=true `generate_image` calls that attempt to
     // edit an unapproved source URL.
     approvedRevisionImageSources?: string[],
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number }> {
+    // Workplan progression turns must end in persisted structured state rather
+    // than a provider-dependent prose question buried at the end of a response.
+    requireWorkPlanDisposition: boolean = false,
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -3347,6 +2920,11 @@ export class AgentModeService {
     let _persistedResponseCount = 0;
     const agentRuntimeRunId = buildAgentRuntimeRunId(sessionId);
     const runEmitter = new RunEmitter(agentRuntimeRunId, () => {}, onProgress);
+    // Hoisted above the try so BOTH terminal paths can report it (ENG-1210 AC14):
+    // the model the run actually began under, after id resolution but before any
+    // backup-model substitution. The catch below cannot see try-scoped locals, and
+    // a run that fails after substituting is exactly the case worth distinguishing.
+    let originalLlmModel: string | undefined;
     recordAgentModeRunStarted(agentRuntimeRunId, {
       llmModel,
       userId,
@@ -3369,9 +2947,7 @@ export class AgentModeService {
         // than silently masked (ENG-46).
         recordAgentModeModelFallback(agentRuntimeRunId, sessionId, requestedLlmModel, llmModel);
       }
-      // Track backup model usage
-      const originalLlmModel = llmModel;
-      let backupModelUsed = false;
+      originalLlmModel = llmModel;
 
       // Track memory usage for optimization
       const startMemory = process.memoryUsage();
@@ -3379,12 +2955,33 @@ export class AgentModeService {
 
       // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
       const { userDb: userDbForAdmin } = await import('./db');
+      // Lazy-imported for the same reason usageRecorderService lazy-requires it:
+      // tokenUsageService pulls in the db -> aws config graph, and a static import
+      // here would drag it into every suite that mocks this module.
+      //
+      // Everything is swallowed to the acting user. Several legacy suites replace
+      // this module with a partial mock that defines only `incrementUserTokenUsage`,
+      // so the export can genuinely be missing — and beyond that, a descriptive
+      // ledger attribute must never be the reason a customer's response fails.
+      // `userId` is the value the row carried before this existed, so the
+      // degraded path is the old behaviour exactly.
+      const resolveBillingSubject = async (): Promise<string> => {
+        try {
+          const { resolveBillingUserId } = await import('./tokenUsageService');
+          if (typeof resolveBillingUserId !== 'function') return userId;
+          return (await resolveBillingUserId(userId)) || userId;
+        } catch (err) {
+          console.error(`[AgentMode] Failed to resolve billing user for ${userId}:`, err);
+          return userId;
+        }
+      };
       let [
         currentSession,
         userAllowedSkillIds,
         publishedSkills,
         baseSystemPrompt,
-        currentUser
+        currentUser,
+        billingUserId
       ] = await Promise.all([
         chatbotDb.getChatSession(sessionId),
         getAllowedSkills(userId),
@@ -3393,7 +2990,18 @@ export class AgentModeService {
         userDbForAdmin.getUserById(userId).catch((err) => {
           console.error(`[AgentMode] Failed to fetch user ${userId} for admin check:`, err);
           return null;
-        })
+        }),
+        // ENG-1217: who this response's spend is BILLED to, resolved once and
+        // stamped on every ledger row it writes. The ledger has always carried a
+        // `billingUserId` attribute and this path has never filled it, so an org
+        // member's rows claimed they paid for themselves while
+        // `incrementUserTokenUsage` was charging the org root — the two stores
+        // disagreed, and a reader had nothing but today's membership to go on.
+        //
+        // Resolved here rather than inside `recordUsage` because it costs two
+        // reads: once per response is free alongside this fetch, once per LLM
+        // call would not be.
+        resolveBillingSubject()
       ]);
 
       // Log if user not found (indicates orphaned schedule or deleted user)
@@ -3407,6 +3015,7 @@ export class AgentModeService {
       const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
 
       const workPlan = currentSession?.workPlan;
+      const workPlanTurnBefore = snapshotWorkPlanTurn(currentSession);
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
 
       // 2. Initialize Context Variables
@@ -3451,7 +3060,15 @@ export class AgentModeService {
       const publishAuthorization =
         publishAuthorizationOverride ?? (await this.resolveScheduledPublishAuthorization(currentSession));
       const publishAuthorized = publishAuthorization.authorized;
-      const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType, publishAuthorized);
+      // ENG-1245: reason is only ever present on the withheld branch, and only when
+      // resolveScheduledPublishAuthorization derived it (an override supplied by a
+      // caller elsewhere carries no reason, so this falls back to the pre-existing,
+      // genuine-hold text — see getScheduledSessionOverride's default).
+      const sessionTypeLabel = getScheduledSessionOverride(
+        currentSession?.sessionType,
+        publishAuthorized,
+        (publishAuthorization as { reason?: PublishAuthorizationWithholdReason }).reason
+      );
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
       ];
@@ -3518,8 +3135,11 @@ export class AgentModeService {
               console.error('Failed to backfill account memory embedding:', e)
             );
           });
+          // ENG-1310: no longer headed "facts" — these are unverified notes from prior
+          // sessions (buildMemoryContextMessage bookends them with a staleness caution
+          // that itself dictates how to label any figure not re-verified this session).
           const accountMemoryMessage = buildMemoryContextMessage(
-            'Account Memory (facts from previous sessions):',
+            'Account Memory (unverified notes from previous sessions):',
             relevantMemories,
             new Date()
           );
@@ -3539,7 +3159,7 @@ export class AgentModeService {
               );
             });
             const orgMemoryMessage = buildMemoryContextMessage(
-              `Organization Memory (shared facts for "${org.name}"):`,
+              `Organization Memory (unverified shared notes for "${org.name}"):`,
               relevantOrgMemories,
               new Date()
             );
@@ -3668,7 +3288,7 @@ export class AgentModeService {
           role: 'system',
           content: `[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
 1. STOP asking for that information immediately — do not restate the same clarification again under any circumstances.
-2. To gather context on your own, you may ONLY call the read-only context tools read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Do NOT call install_skills or any other setup/configuration tool, and do NOT take any irreversible action, just to appear productive.
+2. To make progress, you may call ANY read-only or verification tool available to you in this session — this includes data-source reads (analytics, ads, CRM, search-console, and similar reporting tools) as well as read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Verification tools are NEVER restricted by this directive: if the repeated message is asking you to check or verify something (e.g. "don't guess", "verify first"), call the tool that actually checks it rather than answering from memory. Do NOT call install_skills or any tool that writes, publishes, sends, or otherwise changes external state, and do NOT take any irreversible action, just to appear productive.
 3. If that context is enough to complete the task, do so using it.
 4. If the task genuinely cannot proceed without a specific input the user has not provided (for example, a target URL for a QA check), do NOT fabricate one and do NOT loop: give ONE short menu of concrete next options and then hold — wait for the user instead of restating the same question.
 5. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
@@ -3747,7 +3367,18 @@ export class AgentModeService {
       // ENG-510: accumulate dedupe keys of media-gen calls that produced an asset, across
       // iterations of this turn, so the dispatcher can suppress an identical re-request in a
       // later iteration (e.g. resuming after a timeout) instead of regenerating the image.
-      const mediaCallKeysThisRun = new Map<string, string>();
+      // ENG-1239: seeded from RECENT persisted history (not just started empty) — this run
+      // may itself be a media auto-continuation of a batch that was deferred moments ago in
+      // a DIFFERENT (already-ended) turn, which this same-turn-only map would otherwise
+      // have no record of at all. Bounded to the last hour so an old, unrelated,
+      // coincidentally-identical request is never mistaken for a duplicate.
+      const mediaCallKeysThisRun = seedMediaCallKeysFromHistory(sessionHistory as any, Date.now() - 60 * 60 * 1000);
+
+      // ENG-426: session-wide search-call budget. Seeded from the WHOLE persisted session
+      // history (not time-bounded — a new session already starts this at 0, which is
+      // AgentMode's equivalent of Claude Code's `/clear`) and accumulated across this run's
+      // iterations below, mirroring the media-asset run-total pattern just above.
+      let searchCallCountThisRun = seedSearchCallCountFromHistory(sessionHistory as any);
 
       // ENG-907: whole-turn WALL-CLOCK budget — the analogue of the step budget below.
       // A broad research turn can stay far under `maxIterations` and still burn the whole
@@ -3796,14 +3427,13 @@ export class AgentModeService {
       // Set when the forced synthesis call failed with no room left to retry it — the loop
       // then stops instead of starting a second full call it cannot afford (see below).
       let synthesisRetryUnaffordable = false;
-      // Hard wall-clock bound for a permitted forced-synthesis retry, so a slower-than-
-      // predicted backup model still cannot run the turn past the caller's cap.
-      let synthesisRetryDeadlineMs: number | undefined;
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
       let iteration = 0;
       let responseMessage: any = null;
+      let workPlanDispositionRetries = 0;
+      let workPlanTurnDisposition: WorkPlanTurnDisposition | undefined;
       let skillsUpdated = false;
       let filteredToolsCache: any[] | null = null; // Cache for filtered tools
 
@@ -3842,6 +3472,14 @@ export class AgentModeService {
       // revert — matching how AGENT_FINALIZE_GUARD gates the other output-rewriting
       // seam. Off restores the exact pre-ENG-1054 behaviour.
       const synthesisResidueGuardEnabled = process.env.AGENT_SYNTHESIS_RESIDUE_GUARD !== 'false';
+
+      // ENG-1331 kill switch — ON by default; set AGENT_FALSE_CLAIM_GUARD=false to
+      // disable just the false-completion-claim correction below. Deliberately its
+      // OWN flag, not AGENT_SYNTHESIS_RESIDUE_GUARD: that guard discards junk-shaped
+      // output (isUnusableSynthesis), an orthogonal check from this one, which
+      // corrects a fluent but numerically false claim. Sharing a flag would mean
+      // standing down one guard silently disables the other.
+      const falseClaimGuardEnabled = process.env.AGENT_FALSE_CLAIM_GUARD !== 'false';
 
       let wasCancelled = false;
       // ENG-244: set true when the loop exits because the step budget (maxIterations)
@@ -4064,13 +3702,16 @@ export class AgentModeService {
         // Make LLM call (with backup model fallback on transient errors)
         const llmStart = Date.now();
         let response: any;
+        const chatTaskClass: GatewayTaskClass = isScheduledSession
+          ? 'scheduled_background'
+          : 'interactive_chat';
         // OTel `chat` span (ENG-141): brackets the primary call AND the backup
         // retry; the `finally` closes it with the FINAL model + usage attrs
         // (response undefined there = both attempts threw → status ERROR).
         const chatSpan = startRunChildSpan(agentRuntimeRunId, `${SPAN_CHAT_PREFIX} ${llmModel}`, {
           [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_CHAT,
           [ATTR_GEN_AI_REQUEST_MODEL]: llmModel,
-          [ATTR_GEN_AI_PROVIDER_NAME]: providerForModel(llmModel),
+          [ATTR_GEN_AI_PROVIDER_NAME]: 'openrouter',
           [ATTR_SESSION_ID]: sessionId,
         });
         try {
@@ -4090,106 +3731,35 @@ export class AgentModeService {
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
-            usageContext: { userId, sessionId, feature: 'agent_task' },
+            // ENG-1210 AC6: stamp scheduled-vs-interactive provenance at metering
+            // time. The ledger row is keyed `date#model#feature` and aggregates
+            // sessionId away, so `feature` is the only dimension that survives to
+            // answer "what is my scheduled work costing me".
+            usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
             // ENG-893: only the interactive conversation loop waits on a human.
-            humanPaced: humanPacedTurn
+            humanPaced: humanPacedTurn,
+            // Scheduled and interactive conversations canary independently;
+            // OpenRouter owns provider fallback once either class is enabled.
+            taskClass: chatTaskClass,
           });
         } catch (callError) {
-          // ENG-907: the backup-model retry below issues a SECOND full call of the same
-          // size. During the forced synthesis the only time left is the reserve held for
-          // that one call, so starting a retry it cannot afford runs the turn past the
-          // controller's cap — and the cap discards the answer, which is the failure this
-          // whole change exists to prevent. The attempt that just failed is the best
-          // available estimate of what the retry would cost, so require at least that much
-          // still on the clock. When there is not enough, end the turn here and deliver
-          // what was already gathered (TURN_TIME_BUDGET_FALLBACK_CONTENT covers an empty
-          // one) rather than throwing the turn away.
-          //
-          // Scoped tightly to the retry that would otherwise have run: the SAME
-          // `isTransientLLMError(...) && !backupModelUsed` condition guards it. A
-          // non-transient failure (context limit, content policy, malformed request) has no
-          // retry to skip, and reporting one as "I hit the time limit — reply continue"
-          // would be a lie that walks the user straight back into the same error. Those
-          // keep propagating through their existing classification path untouched, as does
-          // any transient failure outside the forced synthesis.
-          if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError) && !backupModelUsed) {
-            const retryBudget = evaluateTurnTimeBudget({
-              startedAtMs: turnStartedAtMs,
-              hardCapMs: turnHardCapMs,
-              longestLlmCallMs: longestLlmCallMsThisRun,
-            });
-            // What the retry will cost is a FULL call, so size it against the slowest full
-            // call this run actually made — not against the attempt that just failed. A
-            // primary that fails fast (an immediate 429, a dropped socket) burns almost no
-            // clock, so comparing to it alone waves through a backup that is slower than the
-            // time left and crosses the cap anyway, discarding the very partial answer this
-            // guard protects. Take whichever estimate is larger.
-            const failedCallMs = Date.now() - llmStart;
-            const estimatedRetryMs = Math.max(failedCallMs, longestLlmCallMsThisRun);
-            if (retryBudget.remainingMs <= estimatedRetryMs) {
-              console.warn(
-                `AgentMode: forced synthesis call failed in session ${sessionId} with only ` +
-                `${Math.round(retryBudget.remainingMs / 1000)}s left (the attempt itself took ` +
-                `${Math.round(failedCallMs / 1000)}s; a full call has taken up to ` +
-                `${Math.round(longestLlmCallMsThisRun / 1000)}s this run) — not starting a retry that ` +
-                'would run past the turn cap; delivering the work gathered so far'
-              );
-              recordSpanError(chatSpan, callError);
-              synthesisRetryUnaffordable = true;
-            } else {
-              // The estimate says a retry fits — but an estimate is not a guarantee. The
-              // backup can be a different, slower model than anything measured this run, so
-              // arm a hard bound too: whatever the retry does, this turn stops waiting on it
-              // with time still on the clock and delivers the partial answer. Without it the
-              // original ENG-907 loss stays reachable through the retry.
-              synthesisRetryDeadlineMs = Math.max(1, retryBudget.remainingMs - SYNTHESIS_RETRY_MARGIN_MS);
-            }
-          }
-          if (synthesisRetryUnaffordable) {
-            // handled above — fall through to the break after the span is closed
-          } else if (isTransientLLMError(callError) && !backupModelUsed) {
-            const backup = await this.getBackupModel(llmModel, transientFallbackModel);
-            if (backup) {
-              console.warn(`AgentMode: Primary model "${llmModel}" failed with transient error in session ${sessionId}, switching to backup model "${backup}"`);
-              if (onProgress) {
-                runEmitter.emitLegacy({
-                  iteration,
-                  status: 'switching_model',
-                  toolCalls: toolCalls.slice(),
-                  pendingTools: [`Primary model timed out. Switching to ${backup}...`]
-                });
-              }
-              llmModel = backup;
-              backupModelUsed = true;
-              response = await this.withSynthesisRetryDeadline(this.callLLM(llmModel, trimmedMessages, {
-                tools: filteredToolsCache,
-                tool_choice: 'auto',
-                max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
-                temperature: 0.1,
-                usageContext: { userId, sessionId, feature: 'agent_task' },
-                // ENG-893: same pacing as the primary call it is retrying.
-                humanPaced: humanPacedTurn
-              }), synthesisRetryDeadlineMs);
-              if (response === SYNTHESIS_RETRY_TIMED_OUT) {
-                console.warn(
-                  `AgentMode: backup model "${llmModel}" did not answer within the ${synthesisRetryDeadlineMs}ms ` +
-                  `left for the forced synthesis in session ${sessionId} — delivering the work gathered so far ` +
-                  'rather than letting the turn cap discard it'
-                );
-                recordSpanError(chatSpan, callError);
-                response = undefined;
-                synthesisRetryUnaffordable = true;
-              }
-            } else {
-              recordSpanError(chatSpan, callError);
-              throw callError;
-            }
+          // OpenRouter performs provider/model failover inside the one request. A
+          // transient failure here is therefore final for AgentWeb; do not issue a
+          // second full completion with altered model semantics.
+          if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError)) {
+            recordSpanError(chatSpan, callError);
+            synthesisRetryUnaffordable = true;
           } else {
             recordSpanError(chatSpan, callError);
             throw callError;
           }
         } finally {
-          endChatSpan(chatSpan, { model: llmModel, response, inputMessages: trimmedMessages });
+          endChatSpan(chatSpan, {
+            model: llmModel,
+            provider: 'openrouter',
+            response,
+            inputMessages: trimmedMessages,
+          });
         }
         // ENG-907: the forced synthesis failed and there was no time to retry it. Leave the
         // loop instead of raising — the caller is milliseconds from its cap, and an
@@ -4420,6 +3990,22 @@ export class AgentModeService {
           // never claim a false success. Gated on the per-turn flag, not on `content`:
           // `content` still holds any earlier turn's text and would suppress this.
           if (synthesisResidueGuardEnabled && synthesisResidueDropped) {
+            // ENG-1576 correction: an earlier revision of this PR added
+            // `!truncatedByTimeBudget` here too (matching the sibling plain-empty
+            // branch below, prompted by a CodeRabbit question about whether the two
+            // flags can coincide — they can). That was wrong for THIS branch and got
+            // reverted before merge finished rolling out: `synthesisResidueDropped`
+            // covers ENG-1188's echoed-nudge detection too (isUnusableSynthesis →
+            // isNudgeEcho, including the wall-clock nudge specifically), and
+            // ENG-1188's whole point is that an echoed nudge must NEVER reach the
+            // user — the ledger recap must win even when the turn is also
+            // time-budget-truncated. `nudgeEchoRecovery.test.ts`'s "recovers with
+            // the executed-action ledger when the forced synthesis turn echoes the
+            // time-budget nudge" case pins exactly this combination. Excluding
+            // truncatedByTimeBudget here silently broke that guarantee for one of
+            // the four nudges ENG-1188 exists to cover. The sibling branch below
+            // (plain emptiness, no residue detected at all) has no such guarantee
+            // attached to it and keeps its own truncatedByTimeBudget exclusion.
             if (!turnHadUsableText) {
               console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
               content = buildExecutedActionsFallback(toolCalls);
@@ -4437,6 +4023,99 @@ export class AgentModeService {
               }
             }
             if (responseMessage) responseMessage.content = content;
+          } else if (synthesisResidueGuardEnabled && !turnHadUsableText && toolCalls.length > 0 && !truncatedByTimeBudget) {
+            // Same failure family as the residue case above (a synthesis the run could
+            // not produce), just without residue text to detect: the bounded
+            // empty-synthesis nudge (MAX_EMPTY_SYNTHESIS_RETRIES) above already asked
+            // the model once more and it STILL came back with no text in every
+            // iteration of this turn — not junk, just nothing. Left alone this ships a
+            // blank, fully-timestamped assistant message with no explanation (observed
+            // live: an auto-continuation turn that rendered 7 real assets and then said
+            // nothing at all). Reuses the same truthful, tool-call-only recap and the
+            // same kill switch as the residue fallback, since both exist to guarantee a
+            // turn that did real work never reaches the user empty-handed.
+            //
+            // Gated on turnHadUsableText (this iteration's own text), not `content`
+            // (CodeRabbit, this PR): `content` is the sticky cross-turn accumulator —
+            // an earlier iteration's narration alongside its tool calls would leave it
+            // non-empty for the rest of the turn even though the iteration actually
+            // terminating here came back with nothing, silently disarming this fallback
+            // and shipping the stale narration as if it answered the empty turn.
+            //
+            // ENG-1576: also excludes a wall-clock-forced final synthesis
+            // (`truncatedByTimeBudget`) — that path has its own, more specific fallback
+            // below (`TURN_TIME_BUDGET_FALLBACK_CONTENT`, gated on `!content`). Setting
+            // `content` here unconditionally made this generic ledger recap win every
+            // time regardless of truncation reason, silently pre-empting the time-limit
+            // message the user actually needs to see (found via ENG-426 verification:
+            // turnTimeBudgetTruncation.test.ts pinned the time-limit message and this
+            // branch was clobbering it before the post-loop check ever ran).
+            console.warn(`AgentMode: Terminating turn stayed empty after ${emptySynthesisRetries} nudge retr${emptySynthesisRetries === 1 ? 'y' : 'ies'} in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
+            content = buildExecutedActionsFallback(toolCalls);
+            if (responseMessage) responseMessage.content = content;
+          }
+
+          // ENG-1331: independent of the residue guard above — this catches a
+          // FLUENT final answer that falsely claims more assets were completed
+          // than the ledger shows (production case: "all 12 sizes have been
+          // rendered, QA'd, and saved" when only 4 screenshots succeeded). It reads
+          // as a normal answer, so `isUnusableSynthesis` never flags it; this checks
+          // the claim's numbers against `toolCalls` instead of the text's shape.
+          if (falseClaimGuardEnabled && content) {
+            const falseClaim = detectFalseCompletionClaim(content, toolCalls);
+            if (falseClaim) {
+              console.warn(
+                `AgentMode: Final synthesis claims ${falseClaim.claimed} completed but the ledger shows only ` +
+                `${falseClaim.actual} succeeded asset-producing call(s) in session ${sessionId} — appending a correction`
+              );
+              content = `${content}\n\n${buildFalseClaimCorrectionFooter(falseClaim, toolCalls)}`;
+              if (responseMessage) responseMessage.content = content;
+            }
+          }
+
+          if (requireWorkPlanDisposition) {
+            const latestSession = await chatbotDb.getChatSession(sessionId, true);
+            workPlanTurnDisposition = decideWorkPlanTurnDisposition({
+              before: workPlanTurnBefore,
+              after: snapshotWorkPlanTurn(latestSession),
+              failed: finishReason === 'content_filter'
+                || stopReason === 'guardrail_intervened'
+                || stopReason === 'content_filtered',
+            });
+
+            if (workPlanTurnDisposition.kind === 'invalid') {
+              if (workPlanDispositionRetries < 1 && !timeBudgetBlocksContinuation) {
+                workPlanDispositionRetries += 1;
+                // The invalid assistant turn has not been checkpointed yet. Remove it
+                // before the next iteration so neither the model nor the customer sees
+                // the wall of prose that failed the structured contract.
+                if ((messages as any[])[messages.length - 1] === responseMessage) {
+                  (messages as any[]).pop();
+                }
+                content = '';
+                responseMessage = null;
+                (messages as any[]).push({
+                  role: 'system',
+                  content: '[SYSTEM — workplan control recovery, internal instruction, not from the user] This workplan progression turn cannot end with a prose-only question or a “Next Step” paragraph. Continue the work and call set_work_plan_status when the current step is complete, or call ask_user_question for the one blocking choice. Do not repeat the prior recap.',
+                });
+                console.warn(`AgentMode: workplan turn missing structured disposition in session ${sessionId}; retrying once`);
+                continue;
+              }
+
+              const retryMessage = 'I couldn’t create the decision card needed to continue this step. Please retry.';
+              content = retryMessage;
+              if (responseMessage) {
+                responseMessage.content = retryMessage;
+                responseMessage.metadata = {
+                  ...responseMessage.metadata,
+                  workPlanDispositionFailure: {
+                    code: workPlanTurnDisposition.code,
+                    retryable: true,
+                  },
+                };
+              }
+              console.error(`AgentMode: workplan turn missing structured disposition after recovery in session ${sessionId}`);
+            }
           }
 
           // Log the stop reason for debugging
@@ -4537,6 +4216,7 @@ export class AgentModeService {
           longestMediaCallMsThisRun,
           priorMediaCallKeys: mediaCallKeysThisRun,
           approvedRevisionImageSources,
+          priorSearchCallCount: searchCallCountThisRun,
           ports: {
             evaluateAgentToolPolicy,
             validateAndRepairToolArgs,
@@ -4576,6 +4256,9 @@ export class AgentModeService {
         // Carry the running per-run media-asset total forward so the next iteration's
         // budget decision knows whether this run has already produced ≥1 asset.
         mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
+        // ENG-426: carry the run-wide search-call count forward so the next iteration's
+        // budget check sees calls made earlier THIS turn, on top of prior-turn history.
+        searchCallCountThisRun += dispatchResult.searchCallsThisIteration;
         // ENG-510: carry the run-wide longest media-call latency forward so the next
         // iteration's adaptive hard-cap reserve uses real observed durations.
         longestMediaCallMsThisRun = Math.max(longestMediaCallMsThisRun, dispatchResult.longestMediaCallMs ?? 0);
@@ -4661,7 +4344,7 @@ export class AgentModeService {
             console.warn(`AgentMode: Detected ${consecutiveRepeats} consecutive identical tool calls in session ${sessionId}, injecting anti-loop warning`);
             (messages as any[]).push({
               role: 'user',
-              content: '[SYSTEM] You have been calling the same tools with the same arguments repeatedly without making progress. STOP calling tools and provide your final response to the user. Summarize what you accomplished and what could not be completed.'
+              content: ANTI_LOOP_STOP_MESSAGE,
             });
           }
         } else {
@@ -4845,6 +4528,89 @@ export class AgentModeService {
         }
       }
 
+      // ENG-1207 AC3: a run must not finish silently on an unread page.
+      //
+      // Same shape as the two reconcilers above and placed alongside them
+      // deliberately: deterministic, always-on, append-only, patched into the last
+      // assistant message so the persisted transcript matches what the user sees.
+      // It never rewrites the model's text and never claims success — it only adds
+      // the fact that some of the data was not looked at.
+      //
+      // NOT folded into the finalize guard, which is the established
+      // claimed-vs-executed seam: that guard is seen only when AGENT_FINALIZE_GUARD
+      // and AGENT_RUNTIME_SPINE_ENABLED are both on, and both are off in production.
+      // An acceptance criterion that cannot run is the defect it is meant to fix.
+      // The detection lives in a PURE module so the guard can absorb it unchanged
+      // the day those flags flip.
+      //
+      // Why this exists at all when AC1/AC2 already fixed the wording: during
+      // ENG-1200 the response ALREADY carried `has_more: true` and a cursor, and the
+      // model re-ran the identical unpaged query six times, then wrote 17 of 107
+      // records and reported the job complete. A clearer message makes noticing
+      // possible; it does not make it certain.
+      //
+      // Kill switch, not a gate: set AGENT_UNCONSUMED_CURSOR_NOTICE=false to disable.
+      // Absent means ON, so this cannot quietly become inert the way the guard did.
+      if (content && !wasCancelled && !mockMode
+          && process.env.AGENT_UNCONSUMED_CURSOR_NOTICE !== 'false') {
+        try {
+          // Same predicate the finalize ledger uses, so the two cannot disagree
+          // about which calls actually executed.
+          const reconciled = reconcileUnconsumedCursors(content, toolCalls, toolCallNeverExecuted);
+          if (reconciled !== content) {
+            content = reconciled;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                break;
+              }
+            }
+          }
+        } catch (cursorError) {
+          // Advisory. A bug here must never block delivery of a reply the user is
+          // waiting on — the failure mode this prevents is a silent overclaim, which
+          // is strictly less bad than losing the message.
+          console.warn('AgentMode: unconsumed-cursor notice failed', cursorError);
+        }
+      }
+
+      // ENG-1565: model resolution reads ONLY the request's llmModel field (the
+      // picker) — no code path parses chat text for an intent to switch/reassess
+      // models. So a message like "reassess using a new model" is inert by
+      // construction, and previously ran on the same model with no acknowledgement
+      // that nothing changed (production evidence: session
+      // e6c9e693-ff33-4883-a18a-9d674b4074c4, audited on ENG-426).
+      //
+      // Same shape as the reconcilers above: deterministic, append-only, patched
+      // into the last assistant message. `llmModel` here is already the model
+      // resolved for THIS turn; `findLastAssistantModel(sessionHistory)` is the
+      // model that generated the turn before it — comparing the two (rather than
+      // assuming chat text can never change the model) correctly stays silent if
+      // the picker was ALSO flipped in this same request, which really would
+      // change the model despite the chat text.
+      //
+      // Kill switch: set AGENT_MODEL_REASSESS_ACK=false to disable. Absent means ON.
+      if (content && !wasCancelled && !mockMode
+          && process.env.AGENT_MODEL_REASSESS_ACK !== 'false') {
+        try {
+          const modelBefore = findLastAssistantModel(sessionHistory as any);
+          const reconciled = reconcileModelReassessAck(content, messageContent, modelBefore, llmModel);
+          if (reconciled !== content) {
+            content = reconciled;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                break;
+              }
+            }
+          }
+        } catch (modelReassessError) {
+          // Advisory, same reasoning as the cursor notice above: never block
+          // delivery of a reply the user is waiting on over this note.
+          console.warn('AgentMode: model-reassess acknowledgement failed', modelReassessError);
+        }
+      }
+
       // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
@@ -4889,6 +4655,10 @@ export class AgentModeService {
         toolCalls: toolCalls.length,
         failedToolCalls: countFailedToolCalls(toolCalls),
         maxSameToolFailures: maxSameToolFailureCount(toolCalls),
+        // ENG-1210 AC14: grade the run against the model that produced it. These
+        // differ exactly when a transient error moved the run onto the backup.
+        llmModel,
+        modelAtStart: originalLlmModel,
         // ENG-143: an unresolved claim mismatch grades the run degraded
         // (claim_mismatch verdict reason) so the 17:30 UTC cluster cron sees it.
         ...(finalizeClaimMismatch ? { claimMismatch: true } : {}),
@@ -4911,7 +4681,7 @@ export class AgentModeService {
         // ENG-907: the wall-clock counterpart — the turn delivered a partial answer
         // because it ran out of time, so a scheduled run must continue it.
         ...(truncatedByTimeBudget ? { truncatedByTimeBudget: true } : {}),
-        ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
+        ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {})
       };
     } catch (error: any) {
       // Log with full detail so Bedrock validation errors (e.g. "Input is too long") are visible
@@ -4976,6 +4746,8 @@ export class AgentModeService {
         toolCalls: _toolCallsForTelemetry.length,
         failedToolCalls: countFailedToolCalls(_toolCallsForTelemetry),
         maxSameToolFailures: maxSameToolFailureCount(_toolCallsForTelemetry),
+        llmModel,
+        modelAtStart: originalLlmModel,
       });
       // ENG-102: drain telemetry before the error propagates / worker tears down.
       await flushAgentRunRecorderSafe();
@@ -5056,6 +4828,38 @@ export class AgentModeService {
 
     // Fallback to default welcome message
     return "I'm Emma, your team's new CMO 😎. I'll help you research, build, deploy, and measure Meta campaign insights in a blink of an eye.<br><br><strong>To get started, can you share your website URL?</strong>";
+  }
+
+  async getNewChatHeroGreeting(): Promise<NewChatHeroGreeting> {
+    try {
+      const setting = await settingsService.getSetting(NEW_CHAT_HERO_GREETING_SETTING);
+      return parseNewChatHeroGreetingSetting(setting?.settingValue);
+    } catch (error) {
+      console.error('Error getting New Chat hero greeting:', error);
+      return { ...DEFAULT_NEW_CHAT_HERO_GREETING };
+    }
+  }
+
+  async saveNewChatHeroGreeting(
+    value: unknown,
+    updatedBy: string = 'system',
+  ): Promise<NewChatHeroGreeting> {
+    const validationError = validateNewChatHeroGreeting(value);
+    if (validationError) throw new Error(validationError);
+
+    const normalized = parseNewChatHeroGreetingSetting(value);
+    await settingsService.setSetting(
+      NEW_CHAT_HERO_GREETING_SETTING,
+      JSON.stringify(normalized),
+      'Customer Portal New Chat hero greeting presentation copy',
+      updatedBy,
+    );
+    return normalized;
+  }
+
+  async resetNewChatHeroGreeting(): Promise<NewChatHeroGreeting> {
+    await settingsService.deleteSetting(NEW_CHAT_HERO_GREETING_SETTING);
+    return { ...DEFAULT_NEW_CHAT_HERO_GREETING };
   }
 
   async getConversationStarters(): Promise<string[]> {
@@ -5301,7 +5105,15 @@ export class AgentModeService {
    * scratch — an expensive, non-converging loop. Surfacing the existing filenames
    * lets the model generate only what's missing and then advance the step.
    */
-  public static extractGeneratedImageFilenames(sessionHistory?: any[]): string[] {
+  /**
+   * `sinceIso` (ENG-1188): when set, only images generated at or after this
+   * timestamp count — used to scope a work-plan step's produced-asset count to
+   * that step alone rather than the whole session (see setWorkPlanStatus). A
+   * marker with no timestamp (only possible on messages from before the
+   * `metadata.timestamp` field existed) is counted regardless, so this can never
+   * make an old in-flight session's count go DOWN relative to the unscoped call.
+   */
+  public static extractGeneratedImageFilenames(sessionHistory?: any[], sinceIso?: string): string[] {
     if (!Array.isArray(sessionHistory)) return [];
     const seen = new Set<string>();
     const filenames: string[] = [];
@@ -5317,6 +5129,8 @@ export class AgentModeService {
         if (match) filename = match[1].trim();
       }
       if (!filename || seen.has(filename)) continue;
+      const timestamp = typeof msg.metadata?.timestamp === 'string' ? msg.metadata.timestamp : undefined;
+      if (sinceIso && timestamp && timestamp < sinceIso) continue;
       seen.add(filename);
       filenames.push(filename);
     }
@@ -5574,6 +5388,13 @@ export class AgentModeService {
     'search_knowledge_base',
     'list_knowledge_base_files',
     'read_knowledge_base_files',
+    // Sibling of read_knowledge_base_files for images/video — same gate class as
+    // ENG-152/ENG-260 below: without this, materializing a KB image/video is
+    // invisible on any subscription tier whose allowedSkills doesn't unlock
+    // __other_skills__ (confirmed live: Gemini correctly named the tool, then
+    // reported it "not available on your subscription" because installing
+    // __other_skills__ itself was rejected).
+    'materialize_knowledge_base_asset',
     'you_search_web',         // Explicit You.com web search
     'you_search_news',        // Explicit You.com news search
 
@@ -5598,6 +5419,7 @@ export class AgentModeService {
     'save_work_plan',
     'list_predefined_work_plans',
     'launch_predefined_work_plan',
+    'recommend_predefined_work_plan',
 
     // Skill Creation (users can define custom skill bundles)
     'create_skill',
@@ -5625,6 +5447,7 @@ export class AgentModeService {
     'test_scheduled_chat',
     'get_scheduled_chat_test_history',
     'submit_scheduled_chat_variables',
+    'get_scheduled_chat_storage_diagnostics', // ENG-1071: byte-usage breakdown when a save fails/is at risk
 
     // Meeting Intelligence (Fathom)
     'fathom_get_meetings',
@@ -5777,9 +5600,14 @@ export class AgentModeService {
    * Excludes foundation tools and admin-only tools.
    */
   private getUnassociatedTools(publishedSkills: any[]): { name: string; description: string }[] {
-    // Collect all tool names used by any published skill
+    // Collect all tool names used by any published skill. Callers (e.g.
+    // loadAuthorizedSkillCatalog) pass a catalog that also mixes in unpublished
+    // private/org-shared skills for install purposes — those must NOT count here,
+    // or a single draft skill nobody published can silently steal a tool out of
+    // the shared __other_skills__ bundle for an entire org (ENG-1237).
     const associatedToolNames = new Set<string>();
     publishedSkills.forEach(skill => {
+      if (skill.isPublished !== true) return;
       skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
     });
 
@@ -5948,12 +5776,18 @@ export class AgentModeService {
     if (isWildcard || allowedSet.has(OTHER_SKILLS_VIRTUAL_ID)) {
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
       if (unassociatedTools.length > 0) {
+        // ENG-1237 follow-up: an unpublished/org-shared skill's own card already
+        // lists its toolNames above, and (correctly, post-ENG-1237) no longer
+        // removes those tools from this pool. Only trim the DISPLAY copy here —
+        // installability (the length check above) and execution (buildSkillContext,
+        // which never sees this per-user catalog) stay keyed on the real pool.
+        const displayedToolNames = new Set(skills.flatMap(s => s.toolNames));
         skills.push({
           skillId: OTHER_SKILLS_VIRTUAL_ID,
           name: 'Other Skills',
           description: 'Tools not associated with any specific skill',
           installed: installedIds.has(OTHER_SKILLS_VIRTUAL_ID),
-          toolNames: unassociatedTools.map(t => t.name)
+          toolNames: unassociatedTools.map(t => t.name).filter(name => !displayedToolNames.has(name))
         });
       }
     }
@@ -6036,7 +5870,17 @@ export class AgentModeService {
     }
   }
 
-  private buildSkillContext(
+  /**
+   * ENG-1222: the single source of truth for "which tools + skill-context text
+   * does a session with these installed skills get". Was private to Agent Mode
+   * until chatbotService.generateChatResponse (the Emma-widget path) started
+   * independently hand-rolling the same policy and drifting from it — a skill
+   * session reached through that path could get tools without the skill's own
+   * systemPrompt, or bypass subscription-tier skill gating entirely. Public so
+   * both pipelines resolve tool access through the same, tested logic; each
+   * still looks up tool *definitions* from its own appropriate registry.
+   */
+  public buildSkillContext(
     associatedSkills: any[],
     userAllowedSkillIds: string[],
     publishedSkills: any[],
@@ -6218,6 +6062,33 @@ export class AgentModeService {
         confirmationPrompt: result.confirmationPrompt,
         confirmationDetail: result.confirmationDetail,
         summary: result.summary,
+        /*
+         * ENG-1526 / ENG-1322. Approval tokens have to survive the minimizer.
+         *
+         * A halt that withholds its own token is a dead end, not a loop. Both gates tell
+         * the model to replay the call "with the token exactly as returned here" — and
+         * this minimizer dropped it, because everything it does not name is discarded.
+         * So the model was handed an instruction it could not follow: the override could
+         * never be applied and the removal could never be completed, no matter how many
+         * times a user approved.
+         *
+         * It failed CLOSED, which is why nothing unsafe happened and why it went unnoticed
+         * — the tracking gate simply kept blocking. But ENG-1526's own claim that "the
+         * path is a loop, not a dead end" was not true in production, and a recovery path
+         * people cannot complete is one they route around.
+         *
+         * Found by driving the real agent, not the handler: handler-level tests call the
+         * dispatcher directly and never reach this function, so they proved the tokens
+         * were ISSUED while saying nothing about whether they were DELIVERED.
+         *
+         * Named explicitly rather than pattern-matched on `_token`: these two exist to be
+         * replayed by the caller, and a blanket rule would eventually relay a field that
+         * does not.
+         */
+        ...(result.tracking_override_token
+          ? { tracking_override_token: result.tracking_override_token } : {}),
+        ...(result.conversion_action_removal_token
+          ? { conversion_action_removal_token: result.conversion_action_removal_token } : {}),
       };
       // ENG-396: also preserve the structured AskUserQuestion payload so the chat
       // card can render its options and the frontend can post back a structured
@@ -6235,6 +6106,87 @@ export class AgentModeService {
         };
       }
       return base;
+    }
+
+    // ENG-1523. Preserve a REFUSED launch for ANY tool, for the same reason the
+    // confirmation gate above is preserved: the per-tool minimizers below drop unknown
+    // fields and everything unrecognised falls through to `return {}`. There is no
+    // `call_google_ads_api` branch, so a RULE 7.5 block arrived at the browser as an
+    // empty object — and a block is a RETURNED value, not a throw, so `toolCall.error`
+    // stays unset and the frontend's status ternary resolves it to 'completed'. The
+    // user was shown a green success tick on a launch the backend had just refused.
+    //
+    // Tool-agnostic on purpose: metaLaunchGate returns this exact shape in five places,
+    // so the same erasure was happening to Meta launch blocks. Keyed on the payload,
+    // not the tool name, so a future gate is covered without another branch here.
+    //
+    // A refusal the operator never sees is indistinguishable from one that never
+    // happened, which is the failure the gate exists to prevent.
+    if (result && result.blocked === true) {
+      return {
+        success: false,
+        blocked: true,
+        reason: result.reason,
+        error: result.error,
+        ...(result.trackingCheck ? { trackingCheck: result.trackingCheck } : {}),
+      };
+    }
+
+    // ENG-1523 / ENG-1358. The launch was PERMITTED, but the page proves only that some
+    // Google tag is present — not that an Ads conversion can be recorded. The gate
+    // already computes this warning and its callers deliberately relay it rather than
+    // swallow it; without this branch the minimizer discards it one layer later, which
+    // is the same outcome by a longer route.
+    //
+    // The identifier has to come with it. Two of the four producers return one —
+    // AD CREATE (`adResourceName`) and ASSET_GROUP CREATE (`assetGroupResourceName`) —
+    // and dropping it would leave the persisted toolCalls ledger describing a resource
+    // that was created without saying which, so neither the UI nor any later
+    // reconciliation could find it. Warning the operator while losing the thing the
+    // warning is ABOUT is its own bug.
+    //
+    // Carried by suffix rather than a fixed list so a future producer is covered, and
+    // restricted to top-level strings so this stays a minimizer: no array or nested
+    // object can ride along on the back of a warning.
+    if (result && typeof result.trackingWarning === 'string' && result.trackingWarning) {
+      const identifiers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(result)) {
+        if (k.endsWith('ResourceName') && typeof v === 'string') identifiers[k] = v;
+      }
+      return {
+        success: result.success !== false,
+        trackingWarning: result.trackingWarning,
+        ...(typeof result.message === 'string' ? { message: result.message } : {}),
+        ...identifiers,
+      };
+    }
+
+
+    // ENG-1131: preserve the ENG-975 people-search-outage marker. Both tools that
+    // can raise it (`linkedin_outreach` search-people/search-parameters and the
+    // `find_leads` top-up loop) fall through to the `{}` default at the bottom of
+    // this method, which erased the only machine-readable evidence that a run
+    // sourced zero prospects because LinkedIn search was DOWN for the account
+    // rather than because nobody matched. The scheduled-run recorder reads it back
+    // off the tool ledger (detectRunBlockedReason) to record the run as blocked
+    // instead of as a clean success the owner reads as "no one matched".
+    //
+    // Deliberately keyed on the flag, not the tool name, so it survives wherever
+    // the guard is raised. The marker is stamped ONLY after the broad control
+    // query has confirmed the outage, so it can never fire on an honest empty.
+    if (result && result.searchUnavailable === true) {
+      return { searchUnavailable: true, message: 'LinkedIn people search is unavailable for this account' };
+    }
+
+    // ENG-1299 follow-up: same problem as the searchUnavailable marker above —
+    // linkedin_outreach has no branch below, so its stored tool-ledger result is
+    // the `{}` default, which erases the degraded/droppedFacets signal
+    // (searchPeople sets it when a resolver miss falls a facet back to
+    // keyword-only matching). Preserve it so post-hoc reconciliation can tell a
+    // search was filter-degraded, not just look at the live turn where the
+    // agent already sees the full spread result.
+    if (toolName === 'linkedin_outreach' && result?.data?.degraded === true) {
+      return { success: result?.success, degraded: true, droppedFacets: result.data.droppedFacets };
     }
 
     // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
@@ -6571,6 +6523,28 @@ export class AgentModeService {
       return result;
     }
 
+    // ENG-1472: preserve the full structured workplan_recommendation payload so
+    // the customer portal can detect result.type === 'workplan_recommendation'
+    // && result.version === 1 and render the recommendation card — including on
+    // reload, when this stored ledger entry (not the live tool return) is all
+    // the frontend has. The default `{}` fallback below would otherwise erase
+    // the card the instant the page reloads. A failed/rejected proposal (no
+    // `type`) is minimized to just success/message for diagnostics.
+    if (toolName === 'recommend_predefined_work_plan') {
+      if (result && result.type === 'workplan_recommendation' && result.version === 1) {
+        return {
+          success: true,
+          type: result.type,
+          version: result.version,
+          recommendationId: result.recommendationId,
+          plan: result.plan,
+          reason: result.reason,
+          ...(result.source !== undefined ? { source: result.source } : {}),
+        };
+      }
+      return { success: result?.success ?? false, message: result?.message };
+    }
+
     // ENG-736: landing-page deployment tools — preserve the small deployment-outcome
     // fields (status/buildStatus + the live URL + name/ids) so the tool ledger the
     // truthful-reporting reconciler reads can tell a genuinely-deployed page (and its
@@ -6604,6 +6578,48 @@ export class AgentModeService {
         ...(a.leadListId !== undefined ? { leadListId: a.leadListId } : {}),
       };
     }
+
+    // ENG-1207: pagination markers survive minimization, for EVERY tool.
+    //
+    // The default branch returned {}, which is right for storage and wrong for the
+    // one consumer that reads this ledger to decide whether a run finished on an
+    // unread page (`reconcileUnconsumedCursors`, at the finalize seam). With the
+    // cursor stripped it saw {} for every call and never fired — the feature was
+    // inert in production while its unit tests passed, because those tests built
+    // ledger entries by hand with un-minimized results and so never crossed this
+    // function. Found by live verification, not by the suite.
+    //
+    // Deliberately GENERIC rather than a list of tool names: a tool that paginates
+    // is describable by its response, and a future one must not have to be
+    // remembered here to be covered.
+    //
+    // Proportionate to the purpose of this function — a cursor string and a boolean,
+    // never the rows. The heavy payload is still dropped.
+    const paginationMarkers: Record<string, unknown> = {};
+    if (result && typeof result === 'object') {
+      for (const key of ['next_cursor', 'nextCursor', 'has_more', 'hasMore']) {
+        const value = (result as Record<string, unknown>)[key];
+        if (typeof value === 'string' ? value.trim() : typeof value === 'boolean') {
+          paginationMarkers[key] = value;
+        }
+      }
+      // The COUNT survives too, as a number — the rows themselves do not.
+      //
+      // Without it the notice said "search_leads returned 0 row(s) and more remain
+      // unread" on a call that returned 20, because the row array it counted had
+      // already been stripped here. Found in production; the unit test asserted
+      // only "no undefined/NaN", so zero passed.
+      //
+      // Zero is worse than silence in that sentence: it reads as "this found
+      // nothing", the opposite of what happened.
+      if (Object.keys(paginationMarkers).length > 0) {
+        for (const key of ['leads', 'engagements', 'results', 'items', 'rows']) {
+          const value = (result as Record<string, unknown>)[key];
+          if (Array.isArray(value)) { paginationMarkers.rowCount = value.length; break; }
+        }
+      }
+    }
+    if (Object.keys(paginationMarkers).length > 0) return paginationMarkers;
 
     // For other tools, return empty object to minimize storage
     return {};
@@ -7664,17 +7680,39 @@ export class AgentModeService {
    * liveVoiceService) are unaffected — there is no owner schedule setting to apply
    * to them, and a human is present.
    */
-  private static publishApprovalBlock(toolName: string, reason: 'required' | 'unverifiable') {
+  // ENG-1245: `reason` used to be the boolean-shaped 'required' | 'unverifiable'.
+  // 'required' unconditionally blamed "Require approval before publishing" — true
+  // only when that literal toggle is why the schedule is unauthorized. A legacy
+  // schedule that was simply never granted standing publish authorization (that
+  // toggle is OFF; see describePublishAuthorizationWithholdReason) got the exact
+  // same false claim and the exact same no-op remedy ("turn it OFF" — it already
+  // is). Split into the same two withheld reasons getScheduledSessionOverride
+  // uses, so the dispatch-guard error and the prompt-level report never disagree
+  // about why a run did not publish.
+  private static publishApprovalBlock(
+    toolName: string,
+    reason: PublishAuthorizationWithholdReason | 'unverifiable'
+  ) {
     const detail =
-      reason === 'required'
+      reason === 'require_publish_approval'
         ? `this schedule has "Require approval before publishing" turned ON, so ${toolName} cannot publish on the owner's behalf in an unattended run.`
+        : reason === 'revoked'
+        ? `the owner previously authorized this schedule to publish unattended and has since revoked that authorization, so ${toolName} cannot publish on the owner's behalf in this run.`
+        : reason === 'not_granted'
+        ? `${toolName} cannot publish because this schedule has not been granted standing authorization to publish unattended.`
         : `${toolName} cannot publish in this unattended run because its schedule's publish-approval setting could not be verified, and publishing is irreversible.`;
+    const unblockInstruction =
+      reason === 'require_publish_approval'
+        ? `Save the drafts, report plainly that nothing was published and why, and tell the owner they can turn "Require approval before publishing" OFF for this schedule to let the next run post.`
+        : reason === 'revoked'
+        ? `Save the drafts, and report plainly that nothing was published and why — publish authorization for this schedule was revoked. Do NOT tell the owner to turn "Require approval before publishing" OFF — that is a different, unrelated setting. They (or an admin) would need to re-authorize this schedule for a future run to publish.`
+        : `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF — that setting is not why this was blocked and toggling it will not change anything.`;
     return {
       success: false as const,
       error:
         `Blocked: ${detail} ` +
         `This is an account-level setting on the schedule — it is NOT a platform, X/Twitter, LinkedIn, API, or credential limit. ` +
-        `Save the drafts, report plainly that nothing was published and why, and tell the owner they can turn "Require approval before publishing" OFF for this schedule to let the next run post.`,
+        unblockInstruction,
       publishApprovalRequired: true as const,
     };
   }
@@ -7725,7 +7763,13 @@ export class AgentModeService {
 
     try {
       // resolvePublishAuthorized also returns false for a missing/deleted schedule.
-      if (resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId))) return null;
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (resolvePublishAuthorized(schedule)) return null;
+      console.warn(
+        `AgentMode ENG-803: blocked ${toolName} on scheduled session ${sessionId} — schedule ${scheduleId} is not authorized to publish.`
+      );
+      // ENG-1245: name the TRUE reason, not just "required" — see publishApprovalBlock.
+      return AgentModeService.publishApprovalBlock(toolName, describePublishAuthorizationWithholdReason(schedule) ?? 'unverifiable');
     } catch (scheduleError) {
       console.error(
         `AgentMode ENG-803: could not read schedule ${scheduleId} to verify publish approval for ${toolName}; blocking rather than publishing unverified:`,
@@ -7733,11 +7777,6 @@ export class AgentModeService {
       );
       return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
     }
-
-    console.warn(
-      `AgentMode ENG-803: blocked ${toolName} on scheduled session ${sessionId} — schedule ${scheduleId} requires approval before publishing.`
-    );
-    return AgentModeService.publishApprovalBlock(toolName, 'required');
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
@@ -8227,42 +8266,12 @@ export class AgentModeService {
         }
       ];
 
-      let visionModelUsed = llmModel;
-      let fallbackUsed = false;
-      let primaryError: string | undefined;
-      let response: any;
-      try {
-        response = await this.callVisionLLMWithTimeout(visionModelUsed, messages, {
-          max_completion_tokens: 2000
-        });
-      } catch (primaryFailure: any) {
-        primaryError = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure);
-        const fallbackModel = this.getVisionFallbackModel(visionModelUsed);
-        if (!fallbackModel || !this.isVisionFallbackWorthy(primaryFailure)) {
-          throw primaryFailure;
-        }
-
-        console.warn(
-          `AgentMode: describeImage with "${visionModelUsed}" failed with a retryable error; trying fallback "${fallbackModel}":`,
-          primaryError
-        );
-        try {
-          response = await this.callVisionLLMWithTimeout(fallbackModel, messages, {
-            max_completion_tokens: 2000
-          });
-        } catch (fallbackFailure: any) {
-          const fallbackMessage = fallbackFailure instanceof Error ? fallbackFailure.message : String(fallbackFailure);
-          return {
-            success: false,
-            message: `Failed to analyze image after primary and fallback vision models: ${fallbackMessage}`,
-            error: fallbackMessage,
-            primaryError,
-            fallbackModel
-          };
-        }
-        visionModelUsed = fallbackModel;
-        fallbackUsed = true;
-      }
+      const visionModelUsed = llmModel;
+      // This is one OpenRouter request. Provider failover occurs inside its
+      // gateway, so AgentWeb never makes a second vision completion itself.
+      const response = await this.callVisionLLMWithTimeout(visionModelUsed, messages, {
+        max_completion_tokens: 2000,
+      });
 
       const description = response.choices[0]?.message?.content || 'Unable to analyze image';
 
@@ -8271,7 +8280,6 @@ export class AgentModeService {
         description: description,
         imageUrl: imageUrl,
         model: visionModelUsed,
-        ...(fallbackUsed ? { fallbackUsed: true, primaryError } : {})
       };
 
     } catch (error) {
@@ -8708,6 +8716,21 @@ export class AgentModeService {
     return { cleanedText, links };
   }
 
+  /** ENG-1295: bound the self-consistency cache so the long-lived singleton doesn't grow unboundedly. */
+  private pruneDataAnalysisConsistencyCache(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.dataAnalysisConsistencyCache) {
+      if (now - entry.timestamp > this.DATA_ANALYSIS_CONSISTENCY_TTL_MS) {
+        this.dataAnalysisConsistencyCache.delete(key);
+      }
+    }
+    while (this.dataAnalysisConsistencyCache.size > this.DATA_ANALYSIS_CONSISTENCY_CACHE_MAX) {
+      const oldestKey = this.dataAnalysisConsistencyCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.dataAnalysisConsistencyCache.delete(oldestKey);
+    }
+  }
+
   public async performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
     try {
       const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
@@ -8826,6 +8849,9 @@ export class AgentModeService {
       // Human-readable source description per file, parallel to fileParts, used to
       // build the filename manifest in the prompt.
       const fileSources: string[] = [];
+      // Decoded raw content per file, parallel to fileSources — kept only for the
+      // ENG-1295 provenance stub's rows_in estimate, not sent anywhere else.
+      const fileRawContents: string[] = [];
       let totalSize = 0;
 
       for (const fileUrl of urlsToProcess) {
@@ -8869,6 +8895,7 @@ export class AgentModeService {
               }
             });
             fileSources.push(fileUrl);
+            fileRawContents.push(s3Content);
             continue;
           }
 
@@ -8907,6 +8934,7 @@ export class AgentModeService {
               }
             });
             fileSources.push(fileUrl);
+            fileRawContents.push(s3Content);
             continue;
           }
 
@@ -8929,7 +8957,8 @@ export class AgentModeService {
           // Send to Gemini as text/csv so the file materializes on the sandbox
           // filesystem (see SANDBOX_FILE_MIME note above). The actual content may
           // be CSV, JSON, or plain text — the model is told this in the prompt.
-          const base64Content = Buffer.from(fileData).toString('base64');
+          const fileBuffer = Buffer.from(fileData);
+          const base64Content = fileBuffer.toString('base64');
 
           fileParts.push({
             inlineData: {
@@ -8938,6 +8967,7 @@ export class AgentModeService {
             }
           });
           fileSources.push(fileUrl);
+          fileRawContents.push(fileBuffer.toString('utf-8'));
 
         } catch (error) {
           console.error(`Error processing file ${fileUrl}:`, error);
@@ -9021,6 +9051,15 @@ export class AgentModeService {
       // the post-loop block) — folding every intermediate code stdout into the
       // analysis would bury the real summary under print()-debugging noise.
       const codeExecOutputs: string[] = [];
+      // ENG-1295: the generated CSV text (if any), kept separately from resultParts
+      // so the provenance stub and self-consistency check below can parse it.
+      let generatedCsvText: string | null = null;
+      // ENG-1600: Gemini can return more than one text/csv inline part. Every one is shown to
+      // the caller as Computed Data, but only one can back the provenance stub and the
+      // cross-call cache. Comparing an arbitrary part against a previous run's arbitrary part
+      // fabricates an inconsistency and hard-rejects a correct analysis, so the count is
+      // tracked and the comparison is skipped when it exceeds one.
+      let generatedCsvPartCount = 0;
 
       // Extract parts from response
       const responseParts = candidates[0].content.parts || [];
@@ -9057,10 +9096,37 @@ export class AgentModeService {
         // Handle inline data (images/charts from code execution) (handle both camelCase and snake_case)
         if ((part as any).inlineData && (part as any).inlineData.data) {
           const mimeType = (part as any).inlineData.mimeType || 'image/png';
-          if (!mimeType.startsWith('image/')) {
+          if (mimeType === 'text/csv') {
+            // Gemini's code-execution sandbox returns generated tabular data (e.g. a
+            // df.to_csv() write) as an inlineData part with mimeType text/csv rather
+            // than through stdout/codeExecutionResult. Discarding this — as the old
+            // code did for every non-image inlineData — left the caller with only the
+            // model's separate narrative `text` summary, ungrounded by the real
+            // computed output. That is how perform_data_analysis reported hallucinated
+            // ad-group names and contradictory row counts (ENG-1295).
+            codeExecuted = true;
+            try {
+              const csvText = Buffer.from((part as any).inlineData.data, 'base64').toString('utf-8').trim();
+              if (csvText) {
+                resultParts.push(`**Computed Data:**\n${csvText}`);
+                generatedCsvText = csvText;
+                generatedCsvPartCount++;
+                // ENG-1295 follow-up: this Gemini response shape is rare and non-deterministic, so it
+                // could not be re-triggered on demand to confirm the fix still fires in real traffic.
+                // A positive signal here means the next organic occurrence shows up in CloudWatch.
+                console.log('AgentMode: performDataAnalysis surfaced generated CSV via inlineData (mimeType=text/csv)');
+              }
+            } catch (error) {
+              console.error('AgentMode: performDataAnalysis error decoding generated CSV inlineData:', error);
+            }
+          } else if (!mimeType.startsWith('image/')) {
             // Gemini returned non-image data (e.g. Vega-Lite JSON from altair) — skip it
             console.warn(`AgentMode: performDataAnalysis skipping non-image inlineData with mimeType=${mimeType}`);
           } else {
+            // A rendered chart image is itself proof that code actually ran in the
+            // sandbox (ENG-1295 hard guard below) — set this regardless of whether
+            // the subsequent S3 upload succeeds.
+            codeExecuted = true;
             try {
               const imageData = (part as any).inlineData.data;
 
@@ -9088,10 +9154,30 @@ export class AgentModeService {
         } else if ((part as any).inline_data && (part as any).inline_data.data) {
           // Handle snake_case format
           const mimeType = (part as any).inline_data.mimeType || (part as any).inline_data.mime_type || 'image/png';
-          if (!mimeType.startsWith('image/')) {
+          if (mimeType === 'text/csv') {
+            // See the camelCase inlineData branch above (ENG-1295): a generated CSV
+            // must be surfaced, not discarded, or the caller only sees the model's
+            // ungrounded narrative summary.
+            codeExecuted = true;
+            try {
+              const csvText = Buffer.from((part as any).inline_data.data, 'base64').toString('utf-8').trim();
+              if (csvText) {
+                resultParts.push(`**Computed Data:**\n${csvText}`);
+                generatedCsvText = csvText;
+                generatedCsvPartCount++;
+                // ENG-1295 follow-up: snake_case variant of the same rare shape — logged separately
+                // so the two branches are distinguishable in CloudWatch.
+                console.log('AgentMode: performDataAnalysis surfaced generated CSV via inline_data (mimeType=text/csv)');
+              }
+            } catch (error) {
+              console.error('AgentMode: performDataAnalysis error decoding generated CSV inline_data (snake_case):', error);
+            }
+          } else if (!mimeType.startsWith('image/')) {
             // Gemini returned non-image data (e.g. Vega-Lite JSON from altair) — skip it
             console.warn(`AgentMode: performDataAnalysis skipping non-image inline_data with mimeType=${mimeType}`);
           } else {
+            // See the camelCase branch above — a rendered chart proves code executed.
+            codeExecuted = true;
             try {
               const imageData = (part as any).inline_data.data;
 
@@ -9117,6 +9203,30 @@ export class AgentModeService {
             }
           }
         }
+      }
+
+      // ENG-1295 hard guard: real external data was supplied (file_urls resolved to
+      // at least one sandbox file) but nothing in the response shows code actually
+      // executing over it — no generated CSV, no rendered image, no codeExecutionResult
+      // stdout. A bare narrative `text` part in this case is unverifiable prose about
+      // data the model never touched — exactly how perform_data_analysis reported
+      // hallucinated ad-group names and contradictory counts in prod session d789c175.
+      // Reject rather than pass it off as computed output. Calls with no file_urls are
+      // unaffected: there is no external tabular data to hallucinate about, so
+      // inline-only summarization remains a legitimate use of this tool.
+      if (fileParts.length > 0 && !codeExecuted) {
+        console.warn(
+          `AgentMode: performDataAnalysis got narrative text with no verified code execution over ${fileParts.length} supplied file(s) (model=${modelName})`
+        );
+        return {
+          success: false,
+          message:
+            'The analysis model returned a narrative summary without any verified code execution over the supplied file_urls — ' +
+            'this cannot be trusted as computed output and was not returned. Retry with a more explicit instruction that forces ' +
+            'Python code execution over the file(s) (e.g. "You MUST read and parse the file(s) with Python and print exact ' +
+            'computed values — do not summarize without computing").',
+          error: 'execution_failed'
+        };
       }
 
       // Fallback narrative: the model produced executed-code output but no
@@ -9159,6 +9269,105 @@ export class AgentModeService {
         };
       }
 
+      // ENG-1295 hardening: cross-call self-consistency and a provenance stub
+      // (including intra-CSV id/name collision and source-grounding checks) for
+      // generated CSV data.
+      if (generatedCsvText) {
+        const provenance = parseCsvProvenance(generatedCsvText);
+        if (provenance) {
+          // 1. Cross-call self-consistency: an exact repeat call whose grouping-key
+          // set changed since its last run.
+          const cacheKey = buildDataAnalysisCacheKey(userId, urlsToProcess, analysisInstruction);
+          // ENG-1600: with several CSV parts, `provenance` describes only one of them and which
+          // one depends on part order. Comparing that against a previous run — which may have
+          // captured a different part — is a fabricated inconsistency, and this check hard-rejects.
+          const comparable = generatedCsvPartCount <= 1;
+          const prior = comparable ? this.dataAnalysisConsistencyCache.get(cacheKey) : undefined;
+          if (prior) {
+            const priorSet = new Set(prior.groupingKeyValues);
+            const currentSet = new Set(provenance.groupingKeyValues);
+            const isConsistent = priorSet.size === currentSet.size &&
+              [...priorSet].every(v => currentSet.has(v));
+            if (!isConsistent) {
+              console.warn(
+                `AgentMode: performDataAnalysis inconsistent result on an identical repeat call (userId=${userId}): ` +
+                `prior grouping keys=[${prior.groupingKeyValues.join(', ')}] vs current=[${provenance.groupingKeyValues.join(', ')}]`
+              );
+              return {
+                success: false,
+                message:
+                  'This exact analysis call (identical file_urls and analysis_instruction) previously returned a DIFFERENT set of ' +
+                  'result names than this run — the data-analysis model is not consistently computing over the real data, so ' +
+                  'neither result can be trusted. Do NOT retry with the identical arguments. Instead, re-run grouping strictly by ' +
+                  'a stable ID field (not a name) so the result is verifiable against the source data.',
+                error: 'inconsistent_result'
+              };
+            }
+          }
+          // Only cache a single-part result: storing one arbitrary part of a multi-part answer
+          // would poison the NEXT call's comparison exactly the same way.
+          if (comparable) {
+            this.dataAnalysisConsistencyCache.set(cacheKey, { groupingKeyValues: provenance.groupingKeyValues, timestamp: Date.now() });
+            this.pruneDataAnalysisConsistencyCache();
+          }
+
+          // 2. Provenance stub: cheap-to-verify rows_in / rows_out / distinct
+          // grouping-key values, so the caller doesn't have to trust the narrative
+          // summary about what the tool actually computed. Includes two
+          // informational (not hard-reject) caveats:
+          // - id grounding: a distinct id in the CSV that can't be found anywhere
+          //   in the raw source file(s) — a substring miss can also mean the
+          //   model reformatted the id, so this doesn't block a possibly-correct
+          //   result.
+          // - id/name collisions: the same id mapped to more than one name within
+          //   this CSV (the exact shape of the prod hallucination). Deliberately
+          //   NOT a hard reject — a real entity (an ad group, a CRM lead's
+          //   company) can legitimately be renamed within a query's date window,
+          //   which produces this same shape from genuinely correct data. We
+          //   can't tell "renamed" apart from "fabricated" from the CSV alone, so
+          //   this is surfaced for the caller to judge rather than risking a hard
+          //   failure on a correct result.
+          const rowsInPerFile = fileRawContents.map(c => estimateRowsIn(c)).filter((n): n is number => n !== null);
+          const rowsIn = rowsInPerFile.length > 0 ? rowsInPerFile.reduce((a, b) => a + b, 0) : null;
+          const MAX_DISTINCT_VALUES_SHOWN = 25;
+          const distinctPreview = provenance.groupingKeyValues.slice(0, MAX_DISTINCT_VALUES_SHOWN);
+          const moreCount = provenance.groupingKeyValues.length - distinctPreview.length;
+          const grounding = checkCsvIdGrounding(provenance.header, provenance.rows, fileRawContents);
+          const collisions = findCsvIdNameCollisions(provenance.header, provenance.rows);
+          if (collisions.length > 0) {
+            console.warn(
+              `AgentMode: performDataAnalysis intra-CSV id/name collision (userId=${userId}, informational): ` +
+              collisions.map(c => `id=${c.id} names=[${c.names.join(', ')}]`).join('; ')
+            );
+          }
+          resultParts.push(
+            `**Provenance:**\n` +
+            `rows_in: ${rowsIn !== null ? rowsIn : 'unknown (no parsable input file)'}\n` +
+            `rows_out: ${provenance.rowsOut}\n` +
+            `distinct grouping-key values (${provenance.groupingKeyValues.length}): ${distinctPreview.join(', ')}` +
+            (moreCount > 0 ? ` … (+${moreCount} more)` : '') +
+            (grounding && grounding.unverified > 0
+              ? `\n⚠️ ${grounding.unverified} of ${grounding.checked} id(s) in this result could not be found in the raw source file(s) — treat those rows as unverified.`
+              : '') +
+            (collisions.length > 0
+              ? `\n⚠️ ${collisions.length} id(s) map to more than one name within this result — e.g. id "${collisions[0].id}" as [${collisions[0].names.join(', ')}]. ` +
+                'This can mean the source entity was renamed during the query window, or that a row was fabricated/corrupted — verify before trusting these names.'
+              : '')
+          );
+
+          // 3. Explicit untrusted-narrative caveat: make it part of the tool's own
+          // contract that the free-form prose has not been cross-checked, rather
+          // than relying on the calling agent to know to verify it independently
+          // (the ad-hoc behavior that happened to save prod session d789c175).
+          if (hasNarrativeText) {
+            resultParts.push(
+              '**Note:** The prose above has not been independently verified. Treat **Computed Data** and **Provenance** as ' +
+              'the trusted, verified source — cross-check any names, ids, or counts mentioned in the prose against them before repeating them.'
+            );
+          }
+        }
+      }
+
       // Combine all results
       const analysisResult = resultParts.join('\n\n');
 
@@ -9179,6 +9388,13 @@ export class AgentModeService {
         /payload size exceeds|request too large|too large|exceeds.*limit/i.test(errorMessage);
       const isTimeout = (error as any)?.code === 'ECONNABORTED' ||
         /timeout|timed out|ETIMEDOUT/i.test(errorMessage);
+      // ENG-1295 (recommendation #4): a raw Gemini 400/422 that ISN'T already
+      // classified as payload-too-large is an invalid-argument rejection (e.g. a
+      // malformed file_urls entry, an unfetchable reference, or a request the
+      // sandbox otherwise refused). Previously this fell through to the generic
+      // "check that the file URLs are accessible" message with no distinct error
+      // code — the exact ambiguous failure hit in prod session 97a28948.
+      const isInvalidArgument = !isPayloadTooLarge && (statusCode === 400 || statusCode === 422);
       if (isPayloadTooLarge) {
         return {
           success: false,
@@ -9191,6 +9407,13 @@ export class AgentModeService {
           success: false,
           message: `The data analysis timed out — the dataset or analysis task is too large for a single call. Break it into smaller pieces: (1) split the data into smaller subsets, (2) call perform_data_analysis separately for each subset with a focused analysis_instruction, then (3) synthesize the individual results into a final summary.`,
           error: errorMessage
+        };
+      }
+      if (isInvalidArgument) {
+        return {
+          success: false,
+          message: `The data analysis request was rejected as invalid by the model API (HTTP ${statusCode}). This usually means a file_urls entry could not be read or parsed, or the request violated a sandbox limit. Verify each file_urls entry is a real, fetchable S3 URL or tool-response key, and that analysis_instruction does not reference unsupported content. Do NOT blindly retry the identical call — fix the arguments first.`,
+          error: 'invalid_argument'
         };
       }
       return {
@@ -11185,7 +11408,11 @@ export class AgentModeService {
 
       return {
         success: true,
-        message: `Found ${matchingLeads.length} lead(s)`,
+        // ENG-1207: same contract as searchLeads — a truncated page must not be
+        // phrased as a total.
+        message: cursor
+          ? `Showing the first ${matchingLeads.length} lead(s); more remain — pass next_cursor to continue.`
+          : `Found ${matchingLeads.length} lead(s)`,
         leads: matchingLeads.map((lead: any) => ({
           leadId: lead.leadId,
           email: lead.email || '',
@@ -11483,7 +11710,16 @@ export class AgentModeService {
 
       return {
         success: true,
-        message: `Found ${matchingLeads.length} matching lead(s)`,
+        // ENG-1207: only an exhausted scan may be phrased as a total. When the
+        // scan stopped at the caller's limit, say so — a bare "Found 20" reads
+        // as "there are 20", which is how a weak model concluded a 98-match
+        // filter had 20 hits, wrote 17 of them and reported the job complete
+        // (prod session d5898ffd). The true total is deliberately NOT stated:
+        // the scan breaks at the limit, so it was never counted and any "of N"
+        // here would be invented.
+        message: cursorOut
+          ? `Showing the first ${matchingLeads.length} matching lead(s); more remain — pass next_cursor to continue.`
+          : `Found ${matchingLeads.length} matching lead(s)`,
         leads: matchingLeads.map((entry) => {
           // Per-field provenance sidecar — lets the agent cite source, provider,
           // URL and confidence per field for list-wide queries (e.g. "funding
@@ -11572,7 +11808,7 @@ export class AgentModeService {
       const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
 
       // Verify list ownership (org members can access lists owned by other org members)
-      const list = await crmDb.getLeadListById(listId);
+      let list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
@@ -11581,9 +11817,29 @@ export class AgentModeService {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
-      const lead = await crmDb.getLeadById(listId, leadId);
+      const requestedListId = listId;
+      let lead = await crmDb.getLeadById(listId, leadId);
+      let correctedListId: string | null = null;
+      if (!lead) {
+        // ENG-969 follow-up: the requested list_id may just be stale/wrong
+        // rather than the lead not existing at all. See leadRecovery.ts for
+        // the full rationale (tiering, retry, and why it always fails safe).
+        const found = await recoverLeadFromWrongList(crmDb, userId, requestedListId, leadId);
+        if (found) {
+          lead = found;
+          listId = found.listId;
+          correctedListId = found.listId;
+        }
+      }
       if (!lead) {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
+      }
+      if (correctedListId) {
+        // Point `list` at the list the lead actually belongs to (never mutate the
+        // fetched record in place) — downstream code reads list.linkedInAccountId,
+        // which is per-list.
+        const correctedList = await crmDb.getLeadListById(correctedListId);
+        if (correctedList) list = correctedList;
       }
 
       // Per-field provenance sidecar — lets the agent answer "where does this
@@ -11655,8 +11911,14 @@ export class AgentModeService {
       return {
         success: true,
         message: `Lead details for ${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+        // Tell the caller the list_id it passed was wrong so it corrects its own
+        // working state for later calls, instead of repeating the same mismatch.
+        ...(correctedListId
+          ? { note: `list_id "${requestedListId}" does not contain this lead. Corrected to its actual list_id "${correctedListId}" — use that for future calls with lead_id "${leadId}".` }
+          : {}),
         lead: {
           leadId: lead.leadId,
+          listId: lead.listId,
           email: lead.email || '',
           firstName: lead.firstName || '',
           lastName: lead.lastName || '',
@@ -12543,22 +12805,70 @@ export class AgentModeService {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
       }
 
-      const [engagementCount, engagementsResult] = await Promise.all([
-        crmDb.getLeadEngagementCount(listId, leadId, userId),
+      // ENG-1207: the count is fetched alongside the engagements, so a rejection
+      // there rejected BOTH -- taking down a tool whose actual payload was sitting
+      // in the other promise. It is a summary field, not the answer, and since the
+      // message no longer derives its total from it (see below), nothing the caller
+      // asked for depends on it. Degrade the summary, not the tool.
+      const [engagementCountResult, engagementsResult] = await Promise.all([
+        crmDb.getLeadEngagementCount(listId, leadId, userId).catch((countError) => {
+          // Loud, not silent (CodeRabbit). The bare swallow kept the tool alive but
+          // left no trace, so a count query failing repeatedly would be invisible.
+          console.error('AgentMode getLeadEngagements: engagement count unavailable', countError);
+          return null;
+        }),
         crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
+      const engagementCountAvailable = engagementCountResult !== null;
+      const engagementCount: any = engagementCountResult || {};
       const engagements = engagementsResult.engagements || [];
 
       const limitedEngagements = engagements.slice(0, effectiveLimit);
 
+      // ENG-1207: never report a truncated page as a total. `searchLeads` and
+      // `getLeads` were corrected in #2407; this tool kept saying "Found 20
+      // engagement(s)" for a lead with 143, and a model reads that as "there are
+      // 20" and stops -- the same misread that wrote 17 of 107 records and called
+      // the job done.
+      //
+      // The total is `engagements.length`, NOT `engagementCount.total`, and the
+      // distinction matters. `engagements` is the exact population being sliced,
+      // and it is complete: both of its sources paginate fully (the email-events
+      // query loops on LastEvaluatedKey and returns everything; the rest is a lead
+      // attribute). `engagementCount` is a SEPARATE query that may count a
+      // different population, which would make "20 of 143" inconsistent with the
+      // 20 rows actually returned beside it -- and it can fail independently,
+      // leaving a total that has to be omitted or invented.
+      //
+      // Counting the array we truncated keeps the two numbers describing the same
+      // thing by construction, and removes the failure mode entirely.
+      const leadLabel = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+      // A lead with neither name collapses the label to '', leaving
+      // "... engagement(s) for  — raise limit": a double space and a dangling
+      // preposition in a sentence a model parses. Trimming the whole message does
+      // not help, because the gap is in the middle. Drop the clause instead.
+      const forLead = leadLabel ? ` for ${leadLabel}` : '';
+      const truncated = engagements.length > limitedEngagements.length;
+      const engagementMessage = truncated
+        ? `Showing the first ${limitedEngagements.length} of ${engagements.length} engagement(s)${forLead} — raise limit to see more.`
+        : `Found ${limitedEngagements.length} engagement(s)${forLead}`;
+
       return {
         success: true,
-        message: `Found ${limitedEngagements.length} engagement(s) for ${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+        message: engagementMessage,
+        // ENG-1207 (CodeRabbit): explicit null, never undefined, plus a flag when
+        // the count is unavailable. An undefined field vanishes from the serialised
+        // payload, so the model cannot tell "this lead has no engagements" from "we
+        // could not count them" -- a milder form of the very ambiguity this change
+        // exists to remove. `?? null` also normalises a partial count object.
         engagementSummary: {
-          total: engagementCount.total,
-          last7Days: engagementCount.last7Days,
-          totalAllMessages: engagementCount.totalAllMessages
+          total: engagementCount.total ?? null,
+          last7Days: engagementCount.last7Days ?? null,
+          totalAllMessages: engagementCount.totalAllMessages ?? null
         },
+        // Only when it actually failed. Stamping it unconditionally would train the
+        // model to ignore it, which is how `has_more` came to be ignored.
+        ...(engagementCountAvailable ? {} : { engagementCountUnavailable: true }),
         engagements: limitedEngagements.map((eng: any) => ({
           eventId: eng.eventId,
           eventType: eng.eventType,
@@ -12702,45 +13012,50 @@ export class AgentModeService {
 
       // Accept both shapes — see note in sendEmailFromConfiguredSender.
       const leadSenderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
+      const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+      if (leadSenderProvider !== 'resend' && !connectedAccountId) {
+        return {
+          success: false,
+          message: `${providerLabel(leadSenderProvider)} sender misconfigured`,
+          error: `The ${providerLabel(leadSenderProvider)} sender is missing its connected account id`,
+        };
+      }
 
-      if (leadSenderProvider !== 'resend') {
-        // Send through the customer's own connected mailbox (Gmail / Outlook)
-        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
-        if (!connectedAccountId) {
-          return {
-            success: false,
-            message: `${providerLabel(leadSenderProvider)} sender misconfigured`,
-            error: `The ${providerLabel(leadSenderProvider)} sender is missing its connected account id`,
-          };
-        }
-        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
-        await bootstrapEmailProviders();
-        const provider = getEmailProvider(leadSenderProvider);
-        const body = draft.htmlContent || draft.textContent || '';
+      // ENG-265: route through sendAsSender (not the provider APIs directly) so this
+      // chat-driven send is subject to the same daily-cap/warmup enforcement as every
+      // other send path. resolveSenderForSend gives the authoritative CrmSender
+      // (dailyLimit/warmupStartedAt included) — the same lookup crm.ts's send routes use.
+      const { resolveSenderForSend } = await import('./crmSenderService');
+      const { sendAsSender, SenderDailyLimitExceededError } = await import('./sendAsSender');
+      // Fail closed rather than falling back to a synthesized sender: resolveSenderForSend
+      // re-reads the persisted config, so a null here means the sender that existed a moment
+      // ago (from getCrmSenders) is now gone — a real (if narrow) race, not a legitimate
+      // ad-hoc-sender case. A synthesized fallback would carry no dailyLimit/warmupStartedAt
+      // and sendAsSender would treat it as uncapped, silently skipping enforcement.
+      const crmSender = await resolveSenderForSend(senderOwnerUserId, sender.id, sender.email);
+      if (!crmSender) {
+        return {
+          success: false,
+          message: 'Sender no longer available',
+          error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
+        };
+      }
+
+      try {
         // senderOwnerUserId, not userId: the connected account belongs to whoever owns the
         // sender config, and a refreshed/rotated token must be written back to them (ENG-299).
-        const sendResult = await provider.sendEmail(senderOwnerUserId, connectedAccountId, {
-          to: lead.email,
-          subject: draft.subject,
-          body,
-          isHtml: !!draft.htmlContent,
-        });
-        emailId = sendResult.messageId;
-      } else {
-        // Send via Resend (custom domain sender)
-        const { resendService } = await import('./resendService');
-        const from = `${sender.fromName} <${sender.email}>`;
-        const result = await resendService.sendEmail({
-          from,
+        const sendResult = await sendAsSender(senderOwnerUserId, crmSender, {
           to: lead.email,
           subject: draft.subject,
           html: draft.htmlContent,
-          text: draft.textContent
+          text: draft.textContent,
         });
-        if (!result) {
-          return { success: false, message: 'Email send failed', error: 'Failed to send email via Resend' };
+        emailId = sendResult.messageId;
+      } catch (error) {
+        if (error instanceof SenderDailyLimitExceededError) {
+          return { success: false, message: 'Daily sending limit reached', error: error.message };
         }
-        emailId = result.id;
+        throw error;
       }
 
       // Clear the draft after successful send
@@ -12878,62 +13193,61 @@ export class AgentModeService {
       // persisted key. A sender resolved outside loadSenderConfig may only carry the latter.
       const senderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
 
-      if (senderProvider !== 'resend') {
-        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
-        if (!connectedAccountId) {
-          return {
-            success: false,
-            message: `${providerLabel(senderProvider)} sender misconfigured`,
-            error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
-          };
-        }
-        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
-        const label = providerLabel(senderProvider);
-        await bootstrapEmailProviders();
-        const provider = getEmailProvider(senderProvider);
-        const body = htmlBody || textBody || '';
-        try {
-          const sendResult = await provider.sendEmail(userId, connectedAccountId, {
-            to,
-            subject: params.subject,
-            body,
-            isHtml: !!htmlBody,
-          });
-          emailId = sendResult.messageId;
-        } catch (providerErr: any) {
-          // Translate OAuth failures into an actionable message that names the
-          // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
-          // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
-          // configured"). Nearly all are resolved by reconnecting in Settings.
-          const raw = providerErr instanceof Error ? providerErr.message : String(providerErr);
-          const needsReconnect = /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
-          if (needsReconnect) {
-            return {
-              success: false,
-              message: `${label} sender needs reconnecting`,
-              error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
-            };
-          }
-          return {
-            success: false,
-            message: `${label} send failed`,
-            error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
-          };
-        }
-      } else {
-        const { resendService } = await import('./resendService');
-        const from = `${sender.fromName} <${sender.email}>`;
-        const result = await resendService.sendEmail({
-          from,
+      const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+      if (senderProvider !== 'resend' && !connectedAccountId) {
+        return {
+          success: false,
+          message: `${providerLabel(senderProvider)} sender misconfigured`,
+          error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
+        };
+      }
+      const label = providerLabel(senderProvider);
+
+      // ENG-265: route through sendAsSender so this chat-driven ad-hoc send is subject
+      // to the same daily-cap/warmup enforcement as every other send path.
+      const { resolveSenderForSend } = await import('./crmSenderService');
+      const { sendAsSender, SenderDailyLimitExceededError } = await import('./sendAsSender');
+      // Fail closed rather than falling back to a synthesized sender — see the matching
+      // comment in sendEmailToLead for why a null here must not become an uncapped send.
+      const crmSender = await resolveSenderForSend(userId, sender.id, sender.email);
+      if (!crmSender) {
+        return {
+          success: false,
+          message: 'Sender no longer available',
+          error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
+        };
+      }
+
+      try {
+        const sendResult = await sendAsSender(userId, crmSender, {
           to,
           subject: params.subject,
           html: htmlBody,
           text: textBody,
         });
-        if (!result) {
-          return { success: false, message: 'Email send failed', error: `Failed to send email to "${to}" via the configured sender ${sender.email}. This is often caused by an invalid or rejected recipient address, or the sender domain not being verified. Please double-check the recipient address.` };
+        emailId = sendResult.messageId;
+      } catch (error: any) {
+        if (error instanceof SenderDailyLimitExceededError) {
+          return { success: false, message: 'Daily sending limit reached', error: error.message };
         }
-        emailId = result.id;
+        // Translate OAuth failures into an actionable message that names the
+        // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
+        // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
+        // configured"). Nearly all are resolved by reconnecting in Settings.
+        const raw = error instanceof Error ? error.message : String(error);
+        const needsReconnect = senderProvider !== 'resend' && /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
+        if (needsReconnect) {
+          return {
+            success: false,
+            message: `${label} sender needs reconnecting`,
+            error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
+          };
+        }
+        return {
+          success: false,
+          message: `${label} send failed`,
+          error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
+        };
       }
 
       return {
@@ -13295,10 +13609,10 @@ ${emailDraftFormat === 'text'
   "htmlContent": "Complete HTML email body (well-formatted, professional, email-friendly HTML)"
 }`}`;
 
-      // Call LLM to generate email using direct chat completion (same as generateBlogContent)
-      const completion = await openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
-        messages: [
+      const reportGenerationModel = await this.getReportGenerationDefaultModel();
+      const completion = await this.callLLM(
+        reportGenerationModel,
+        [
           {
             role: "system",
             content: emailDraftFormat === 'text'
@@ -13307,24 +13621,14 @@ ${emailDraftFormat === 'text'
           },
           { role: "user", content: emailPrompt },
         ],
+        {
         temperature: 0.8,
-        max_tokens: 3000,
-        response_format: { type: 'json_object' }
-      });
-
-      // Shadow-meter this direct Azure completion (bypasses callLLM). Burn-only, fail-open.
-      if ((completion as any)?.usage) {
-        meterUsageFromResponse(
-          {
-            userId,
-            sessionId,
-            model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
-            provider: 'azure-openai',
-            feature: 'email_draft',
-          },
-          completion
-        );
-      }
+          max_completion_tokens: 3000,
+          response_format: { type: 'json_object' },
+          usageContext: { userId, sessionId, feature: 'email_draft' },
+          taskClass: 'content_generation',
+        },
+      );
 
       const responseContent = completion.choices[0].message.content;
       if (!responseContent) {
@@ -13417,22 +13721,14 @@ Good: "Sarah, Island's browser-isolation is one of the smarter takes on shadow I
 
 Reply with ONLY valid JSON: {"content": "the note text"}`;
 
-      // Use Gemini for message drafting (fast, cost-effective)
-      const geminiClient = await this.getGeminiClient();
-      const messageCompletion = await geminiClient.chat.completions.create({
-        model: 'gemini-3.5-flash',
-        messages: [{ role: "user", content: messagePrompt }],
+      const messageCompletion = await this.callLLM('gemini-3.5-flash', [
+        { role: 'user', content: messagePrompt },
+      ], {
         temperature: 0.8,
-        max_tokens: 2048,
-      } as any);
-
-      // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
-      if ((messageCompletion as any)?.usage) {
-        meterUsageFromResponse(
-          { userId, sessionId, model: 'gemini-3.5-flash', provider: 'gemini', feature: 'invite_message' },
-          messageCompletion
-        );
-      }
+        max_completion_tokens: 2048,
+        usageContext: { userId, sessionId, feature: 'invite_message' },
+        taskClass: 'content_generation',
+      });
 
       const messageResponseContent = messageCompletion.choices[0].message.content;
       if (!messageResponseContent) {
@@ -13468,7 +13764,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         // guarantee — same trimInviteMessage() the inline send path uses, kept consistent.
         if (noteText.length > inviteCharLimit) {
           const { shortenInviteNoteToLimit } = await import('./inviteNoteShortener');
-          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2, userId, sessionId);
+          noteText = await shortenInviteNoteToLimit(this, noteText, inviteCharLimit, 2, userId, sessionId);
         }
         messageDraft = {
           content: LinkedInOutreachService.trimInviteMessage(noteText, inviteCharLimit),
@@ -13664,41 +13960,165 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         return asset;
       };
 
+      // ENG-933 follow-up: this method is the ONE place every brand write
+      // funnels through — Emma's `update_brand_guidelines` chat tool included,
+      // not just the onboarding backstop (ensureBrandLogoPersisted) that only
+      // guards the one-time onboarding flow. Emma has a documented history
+      // (ENG-792, ENG-933) of calling this tool with only brandData.logoUrl
+      // and no brandAssets entry, which leaves `attachments` empty — the
+      // Brand Guidelines "Logo & Assets" card renders `attachments`, so the
+      // account shows "No logos uploaded" even though Emma "found" a logo.
+      // Auto-pin it here so that gap can't reopen through this call
+      // regardless of when or how it's invoked. Best-effort: any failure
+      // here must never break the underlying write (matches the onboarding
+      // backstop's own never-throws contract).
+      let autoLogoAsset: { type: string; url: string; filename: string; key: string } | null = null;
+      // Replaces the CALLER's own logo asset entry with a pinned/rasterised
+      // one when its URL isn't safe to trust as-is (see the third branch
+      // below). Distinct from autoLogoAsset, which is appended fresh when no
+      // asset was supplied at all.
+      let callerLogoAssetOverride: { type: string; url: string; filename: string; key: string } | null = null;
+      // Surfaced (not swallowed) when the fetch/rasterise attempt didn't land
+      // an asset — see the failure branch below for why this must not read
+      // as silent success.
+      let logoAutoPinIssue: string | null = null;
+      const incomingLogoUrl =
+        typeof (brandData as any)?.logoUrl === 'string' ? (brandData as any).logoUrl.trim() : '';
+      const normalizedBrandAssets: any[] = Array.isArray(brandAssets)
+        ? brandAssets
+        : brandAssets !== undefined && typeof brandAssets === 'object' && brandAssets !== null
+          ? [brandAssets]
+          : [];
+      const callerLogoAsset = normalizedBrandAssets.find((a: any) => a?.type === 'logo');
+      const callerSuppliedLogoAsset = !!callerLogoAsset;
+      const existingLogoAssetUrl = getPersistedBrandLogoAssetUrl({
+        attachments: existingBrand.attachments,
+      });
+      const alreadyHasLogoAsset = !!existingLogoAssetUrl;
+      if (incomingLogoUrl && !callerSuppliedLogoAsset && !alreadyHasLogoAsset) {
+        try {
+          const outcome = await downloadBrandLogoToS3(incomingLogoUrl, userId);
+          if (outcome.status === 'svg') {
+            // brandData.logoUrl keeps the raw incoming URL, exactly like this
+            // call behaved before this change — never worse than today. But
+            // the write must not silently report full success while no asset
+            // actually landed; the caller (Emma) needs to know so she can
+            // tell the user or retry, instead of believing the Logo & Assets
+            // card is populated when it isn't.
+            logoAutoPinIssue =
+              'The logo URL is an SVG that could not be rasterised — it was not stored as a Logo & Assets attachment. Ask the user to upload a PNG/JPEG/GIF/WEBP version instead.';
+          } else if (outcome.status !== 'uploaded') {
+            const detailSuffix = outcome.detail ? `: ${outcome.detail}` : '';
+            logoAutoPinIssue =
+              `Could not fetch/store the logo from that URL (${outcome.status}${detailSuffix}) — brandData.logoUrl was saved, but no Logo & Assets attachment was created. Retrying later (or asking the user to upload the logo directly) may be needed.`;
+          } else if (outcome.url) {
+            const filename = outcome.url.split('/').filter(Boolean).pop() || 'logo.png';
+            autoLogoAsset = {
+              type: 'logo',
+              url: outcome.url,
+              filename,
+              key: `auto-logo-${Date.now()}`,
+            };
+            // Point brandData.logoUrl at the pinned S3 copy too — never
+            // something an external host can take down or an image model
+            // invents later (ENG-326/ENG-933).
+            updatedBrandData.logoUrl = outcome.url;
+          }
+        } catch (e: any) {
+          console.warn('[brandLogo] auto-pin on update_brand_guidelines failed', {
+            userId,
+            error: e?.message ?? String(e),
+          });
+          logoAutoPinIssue =
+            'Could not fetch/store the logo from that URL (unexpected error) — brandData.logoUrl was saved, but no Logo & Assets attachment was created.';
+        }
+      } else if (incomingLogoUrl && !callerSuppliedLogoAsset && alreadyHasLogoAsset) {
+        // A real asset already exists and this call isn't replacing it (no
+        // fresh brandAssets entry) — keep brandData.logoUrl in sync with what
+        // is ACTUALLY displayed rather than letting it drift to whatever raw
+        // URL this call happens to carry (e.g. Emma re-sending the original
+        // scraped URL after the asset was already pinned on an earlier call).
+        // Without this, the Logo & Assets card would keep showing the correct
+        // pinned logo while brandData.logoUrl silently pointed somewhere else.
+        updatedBrandData.logoUrl = existingLogoAssetUrl;
+      } else if (
+        callerSuppliedLogoAsset &&
+        typeof callerLogoAsset?.url === 'string' &&
+        callerLogoAsset.url.trim()
+      ) {
+        // ENG-933 live-verification finding: Emma's `update_brand_guidelines`
+        // tool lets her supply brandAssets directly, and when explicitly
+        // asked to save a logo she constructs her OWN asset object from
+        // whatever URL she has — bypassing the auto-pin above entirely
+        // (which only fires when brandAssets is absent) and storing the raw
+        // site URL (e.g. a .ico) unrasterised and unpinned. Never trust a
+        // caller-supplied logo URL blindly: run it through the same
+        // rasterise/pin pipeline unless it's already one of our own S3
+        // assets (the onboarding backstop's own call already looks like
+        // this, and re-fetching it would be pure waste).
+        const rawCallerLogoUrl = callerLogoAsset.url.trim();
+        try {
+          const { isS3Url } = await import('../utils/s3Utils');
+          if (!isS3Url(rawCallerLogoUrl)) {
+            const outcome = await downloadBrandLogoToS3(rawCallerLogoUrl, userId);
+            if (outcome.status === 'svg') {
+              logoAutoPinIssue =
+                'The provided logo asset URL is an SVG that could not be rasterised — it was stored as provided, which brand guidelines normally rejects. Ask the user to upload a PNG/JPEG/GIF/WEBP version instead.';
+            } else if (outcome.status !== 'uploaded') {
+              const detailSuffix = outcome.detail ? `: ${outcome.detail}` : '';
+              logoAutoPinIssue =
+                `Could not pin the provided logo asset URL (${outcome.status}${detailSuffix}) — it was stored as provided, which may not render reliably in every browser and isn't hosted on our own storage.`;
+            } else if (outcome.url) {
+              const filename = outcome.url.split('/').filter(Boolean).pop() || 'logo.png';
+              callerLogoAssetOverride = {
+                type: 'logo',
+                url: outcome.url,
+                filename,
+                // Preserve the caller's own key if it supplied one (keeps a
+                // stable React list key / delete-asset target), else mint a
+                // fresh one matching the auto-pin's own convention.
+                key:
+                  typeof callerLogoAsset.key === 'string' && callerLogoAsset.key
+                    ? callerLogoAsset.key
+                    : `auto-logo-${Date.now()}`,
+              };
+              updatedBrandData.logoUrl = outcome.url;
+            }
+          }
+        } catch (e: any) {
+          console.warn('[brandLogo] pinning a caller-supplied logo asset failed', {
+            userId,
+            error: e?.message ?? String(e),
+          });
+          logoAutoPinIssue =
+            'Could not pin the provided logo asset URL (unexpected error) — it was stored as provided.';
+        }
+      }
+
       // Handle brandAssets update - merge by type to preserve existing assets
       let updatedAttachments = [...(existingBrand.attachments || [])];
       const updatedAssets: any[] = []; // Track which assets were actually updated
 
-      if (brandAssets !== undefined) {
-        if (Array.isArray(brandAssets)) {
-          // Merge by type: replace assets of the same type, keep others
-          brandAssets.forEach(rawAsset => {
-            const newAsset = normalizeBrandGuideAsset(rawAsset);
-            const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
-            if (existingIndex >= 0) {
-              // Replace existing asset of the same type
-              updatedAttachments[existingIndex] = newAsset;
-              updatedAssets.push(newAsset); // Track as updated
-            } else {
-              // Add new asset type
-              updatedAttachments.push(newAsset);
-              updatedAssets.push(newAsset); // Track as added
-            }
-          });
-        } else if (typeof brandAssets === 'object' && brandAssets !== null) {
-          // Single asset - merge by type
-          const newAsset = normalizeBrandGuideAsset(brandAssets);
-          const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
-          if (existingIndex >= 0) {
-            // Replace existing asset of the same type
-            updatedAttachments[existingIndex] = newAsset;
-            updatedAssets.push(newAsset); // Track as updated
-          } else {
-            // Add new asset type
-            updatedAttachments.push(newAsset);
-            updatedAssets.push(newAsset); // Track as added
-          }
-        }
+      const assetsToMerge: any[] = normalizedBrandAssets.map((a: any) =>
+        callerLogoAssetOverride && a?.type === 'logo' ? callerLogoAssetOverride : a
+      );
+      if (autoLogoAsset) {
+        assetsToMerge.push(autoLogoAsset);
       }
+
+      assetsToMerge.forEach(rawAsset => {
+        const newAsset = normalizeBrandGuideAsset(rawAsset);
+        const existingIndex = updatedAttachments.findIndex(existing => existing.type === newAsset.type);
+        if (existingIndex >= 0) {
+          // Replace existing asset of the same type
+          updatedAttachments[existingIndex] = newAsset;
+          updatedAssets.push(newAsset); // Track as updated
+        } else {
+          // Add new asset type
+          updatedAttachments.push(newAsset);
+          updatedAssets.push(newAsset); // Track as added
+        }
+      });
 
       // Update org-level or personal brand guidelines
       const updatedGuidelines = {
@@ -13733,7 +14153,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
 
       const updatedFields = [];
       if (brandData) updatedFields.push(...Object.keys(brandData));
-      if (brandAssets !== undefined) updatedFields.push('brandAssets');
+      if (assetsToMerge.length > 0) updatedFields.push('brandAssets');
       updatedFields.push(...Object.keys(otherFields));
 
       // Format the update result for LLM consumption
@@ -13743,7 +14163,8 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         updatedFields,
         brandData: updatedBrandData,
         attachments: updatedAttachments,
-        updatedAssets: updatedAssets
+        updatedAssets: updatedAssets,
+        ...(logoAutoPinIssue ? { logoAutoPinIssue } : {}),
       });
 
       return {
@@ -13765,6 +14186,11 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
             }
           }
           : {}),
+        // ENG-933 follow-up: the write always succeeds even when the logo
+        // fetch/rasterise attempt didn't land an asset — this field is how
+        // that partial outcome reaches Emma instead of reading as full
+        // success while the Logo & Assets card stays empty.
+        ...(logoAutoPinIssue ? { logoAutoPinIssue } : {}),
         formattedContent
       };
     } catch (error) {
@@ -15077,7 +15503,7 @@ Write it like a task name: "Competitive Analysis Report", "SaaS Product Launch A
 Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference content quality.`
         },
         { role: 'user', content: userMessage.slice(0, 500) }
-      ], { response_format: { type: 'json_object' } });
+      ], { response_format: { type: 'json_object' }, taskClass: 'interactive_chat' });
       // response_format: json_object forces Gemini/GPT to output valid JSON.
       // For Bedrock (Claude), response_format is ignored but the prompt instruction is sufficient.
       // No max_completion_tokens — Gemini treats it as total (input+output) tokens, causing empty
@@ -15172,6 +15598,7 @@ TRUTHFULNESS RULES (these override tone):
       ], {
         max_completion_tokens: 200,
         temperature: 0.3,
+        taskClass: 'nonstandard_consumer',
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -15220,6 +15647,7 @@ TRUTHFULNESS RULES (these override tone):
       ], {
         max_completion_tokens: 20,
         temperature: 0.3,
+        taskClass: 'scheduled_background',
       });
 
       const summary = (response_ as any).choices?.[0]?.message?.content?.trim();
@@ -15283,6 +15711,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         max_completion_tokens: 150,
         temperature: 0,
         response_format: { type: 'json_object' },
+        taskClass: 'scheduled_background',
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -15342,6 +15771,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         max_completion_tokens: 120,
         temperature: 0.7,
         response_format: { type: 'text' },
+        taskClass: 'interactive_chat',
       });
 
       const timeoutPromise = new Promise<null>(resolve =>
@@ -15399,7 +15829,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
           + finalText,
       },
-    ], { max_completion_tokens: 500, temperature: 0 });
+    ], { max_completion_tokens: 500, temperature: 0, taskClass: 'nonstandard_consumer' });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -15435,7 +15865,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Rewrite the reply now. Keep everything that is accurate, but only claim actions the run log confirms succeeded, '
           + 'clearly state what was NOT completed, and tell the user what to do next. Reply ONLY with the corrected message text.',
       },
-    ], { temperature: 0 });
+    ], { temperature: 0, taskClass: 'nonstandard_consumer' });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -15462,6 +15892,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       ], {
         max_completion_tokens: 10,
         temperature: 0,
+        taskClass: 'mcp_api',
       });
 
       const content = (response as any)?.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
@@ -16174,10 +16605,40 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}, ad_set_id?: string, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
-      case 'LIST':
-        return this.listMetaAdsAdCreatives(userId, account_id);
+      case 'LIST': {
+        // ENG-1476: ad_set_id never reached this edge either. Meta has no campaign->adcreatives
+        // edge, so campaign scoping is deliberately absent — use AD LIST with campaign_id, which
+        // returns creative{...} inline on each ad.
+        const result = await this.listMetaAdsAdCreatives(userId, account_id, ad_set_id ?? params?.ad_set_id);
+
+        /*
+         * If a caller supplied campaign_id anyway, say so. Returning an account-wide list
+         * labelled "(complete list)" while quietly discarding the requested scope is the exact
+         * defect this PR exists to remove — it would just be wearing a different hat. The scope
+         * is unsupportable here, so the honest move is to name it, not to drop it silently.
+         */
+        // Both spellings. The tool executor passes campaign_id POSITIONALLY into
+        // callMetaMarketingApi, never nested in params — reading only params here made this
+        // warning unreachable on the one path that actually matters.
+        const ignoredCampaignId = campaign_id ?? params?.campaign_id;
+        if (ignoredCampaignId && result?.success) {
+          // Rebuilt via buildListResult rather than spread: `{...result, scopeIgnored}` appends
+          // the new key AFTER `creatives`, putting it behind the S3 preview cut on exactly the
+          // large lists where it matters.
+          const r = result as any;
+          return buildListResult({
+            payloadKey: 'creatives',
+            payload: r.creatives ?? [],
+            message: `${r.message}${describeIgnoredCampaignScope(String(ignoredCampaignId))}`,
+            truncated: r.hasMore,
+            scope: r.scope,
+            scopeIgnored: { campaign_id: String(ignoredCampaignId) },
+          }) as MetaApiResult;
+        }
+        return result;
+      }
       case 'GET': {
         // Read ONE creative back by id (ENG-471). The service method has existed
         // and is already used by COPY_AD/RETAG_UTM — only the model-facing
@@ -16246,10 +16707,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsAds(userId, ad_set_id, account_id);
+        // ENG-1476: campaign_id used to stop here — it was never a parameter of this method,
+        // so an explicitly campaign-scoped LIST silently became an account-wide one. Accept it
+        // from the top-level argument or from params, since callers have used both spellings.
+        return this.listMetaAdsAds(userId, ad_set_id ?? params?.ad_set_id, account_id, campaign_id ?? params?.campaign_id);
       case 'CREATE':
         return this.createMetaAdsAd(userId, { ...params, account_id, adset_id: ad_set_id });
       case 'UPDATE':
@@ -16486,7 +16950,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           // discovery impossible in-product (ENG-399). The pixel id is the dataset id that
           // GET_MATCH_QUALITY consumes, so derive it directly and issue no per-pixel call at all.
           // Same conclusion the lander pixel resolver already reached (metaService.ts).
-          const pixels = await metaService.listPixels(accountId, accessToken);
+          const { pixels, truncated } = await metaService.listPixels(accountId, accessToken);
           const results = pixels.map((pixel: any) => ({
             pixel_id: pixel.id,
             pixel_name: pixel.name,
@@ -16494,21 +16958,111 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             dataset_id: pixel.id,
             datasets: [{ id: pixel.id, name: pixel.name }]
           }));
-          return {
-            success: true,
-            message: `Found ${pixels.length} pixel(s); each pixel id doubles as its dataset id for GET_MATCH_QUALITY`,
-            pixels: results
-          };
+          // ENG-1625 follow-up: this used to be `Found ${pixels.length} pixel(s)` with no
+          // bound — the exact ENG-1476/ENG-1584 sentence shape.
+          return buildListResult({
+            payloadKey: 'pixels',
+            payload: results,
+            message: `${buildListMessage({
+              noun: 'pixel(s)',
+              totalCount: results.length,
+              truncated,
+              campaignScopable: false,
+            })} Each pixel id doubles as its dataset id for GET_MATCH_QUALITY.`,
+            truncated,
+          }) as MetaApiResult;
         }
         case 'GET_MATCH_QUALITY': {
           const datasetId = params.dataset_id;
-          const stats = await metaService.getDatasetEventStats(datasetId, accessToken);
+
+          // Meta declines to answer this in TWO different ways, and the first version of this
+          // fix only handled one of them. It returns an empty `event_stats` on some pixels, and
+          // on others the call THROWS — observed on a real production pixel, where the throw
+          // escaped before the fallback could run and the tool answered nothing at all, which
+          // is the exact defect it was written to remove.
+          //
+          // ⚠ An AUTH error is deliberately NOT caught here. A dead token is a fact the caller
+          // must see so it can prompt a re-authorisation; converting it into send-side coverage
+          // would turn "your credentials are gone" into a quiet, plausible-looking answer —
+          // the could-not-ask/received-nothing conflation this module exists to prevent.
+          let stats: any = {};
+          let statsError: string | undefined;
+          try {
+            stats = await metaService.getDatasetEventStats(datasetId, accessToken);
+          } catch (statsErr: any) {
+            if (statsErr?.isMetaAuthError) throw statsErr;
+            statsError = statsErr?.message || 'Meta returned an error for event_stats';
+            console.warn(
+              `[AgentMode] GET_MATCH_QUALITY: Meta errored on event_stats for dataset ${datasetId}: ${statsError}`,
+            );
+          }
+
+          // Meta's `event_stats` is the only EMQ surface that exists, and on live busy
+          // pixels it comes back EMPTY — probed on two pixels, two tokens, two Business
+          // Managers. Returning that verbatim answered `{}` to every customer who asked
+          // Emma for match quality, while the docs advertise "EMQ scores per event type".
+          //
+          // The Meta call is deliberately KEPT: if Meta ever starts serving this, the real
+          // number wins and nothing below runs. Only when it is empty do we answer with the
+          // half we can actually measure — what WE sent (ENG-926 §F).
+          const { isEmptyEventStats, computeCapiKeyCoverage } = await import('./metaCapiKeyCoverage');
+
+          // Only a SUCCESSFUL, non-empty read is Meta's own answer. If it errored we never
+          // saw one, so `statsError` short-circuits ahead of the emptiness test.
+          if (!statsError && !isEmptyEventStats(stats.event_stats)) {
+            return {
+              success: true,
+              message: `Event match quality for dataset ${stats.name || datasetId}`,
+              dataset_id: stats.id,
+              dataset_name: stats.name,
+              event_stats: stats.event_stats
+            };
+          }
+
+          const { queryCapiKeyCoverageRows } = await import('./metaCapiKeyCoverageDb');
+          const sendSide = await computeCapiKeyCoverage([String(datasetId)], 30, {
+            queryRows: (pixelId, oldestDate) => queryCapiKeyCoverageRows(pixelId, oldestDate),
+          });
+
+          // ⚠ A Meta ERROR stays an ERROR. An existing test caught the first version of this
+          // turning "Dataset not found" into `success: true` — which would have answered a
+          // question about a dataset that does not exist, with coverage for it. The caller
+          // still gets the send-side numbers, but the verdict reports what actually happened.
+          if (statsError) {
+            return {
+              success: false,
+              message:
+                `${statsError} — Meta could not serve Event Match Quality for dataset ` +
+                `${datasetId}. Send-side identity coverage is included below: it is what WE ` +
+                `attached to the conversions we sent, NOT Meta's match-quality score, and Meta ` +
+                `does not expose that number through any API.`,
+              dataset_id: datasetId,
+              meta_event_match_quality_available: false,
+              meta_event_stats_status: 'error',
+              meta_event_stats_error: statsError,
+              send_side_identity_coverage: sendSide
+            };
+          }
+
           return {
             success: true,
-            message: `Event match quality for dataset ${stats.name || datasetId}`,
-            dataset_id: stats.id,
+            // Worded so it can never be relayed as Meta's own score. The distinction is the
+            // whole point: this says what identity we ATTACHED, not what Meta MATCHED.
+            message:
+              `Meta reports no Event Match Quality for dataset ${stats.name || datasetId} — ` +
+              `its event_stats field is empty, which is what it returns for live pixels. ` +
+              `Reporting our own send-side identity coverage instead: of the conversions we ` +
+              `sent to this dataset in the last 30 days, the share that carried each identity ` +
+              `parameter. This is NOT Meta's match-quality score and should not be described ` +
+              `as one — Meta does not expose that number through any API.`,
+            dataset_id: stats.id || datasetId,
             dataset_name: stats.name,
-            event_stats: stats.event_stats
+            event_stats: stats.event_stats,
+            meta_event_match_quality_available: false,
+            // 'error' and 'empty' are DIFFERENT facts and are reported as such — collapsing
+            // them would let a Meta outage read as "Meta has no data for you".
+            meta_event_stats_status: 'empty',
+            send_side_identity_coverage: sendSide
           };
         }
         default:
@@ -16543,17 +17097,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // budget_remaining, bid_strategy), the intended ENG-398 change, for every plain LIST
       // caller regardless of this branch.
       const hasSelector = Boolean(options.campaignId || options.fields);
-      const campaigns = (hasSelector
+      const result = hasSelector
         ? await metaService.listCampaigns(accountId, accessToken, options)
-        : await metaService.listCampaigns(accountId, accessToken)) || [];
-      const totalCount = Array.isArray(campaigns) ? campaigns.length : 0;
+        : await metaService.listCampaigns(accountId, accessToken);
+      const campaigns = result?.campaigns ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} campaign(s)`,
-        campaigns: campaigns,
-        totalCount: totalCount
-      };
+      // ENG-1625 follow-up: this used to be `Found ${totalCount} campaign(s)` with no scope
+      // or bound — the exact ENG-1476/ENG-1584 sentence shape. Assembled via buildListResult
+      // so completeness metadata precedes the payload (S3 offload cut — see metaListScope.ts).
+      return buildListResult({
+        payloadKey: 'campaigns',
+        payload: campaigns,
+        message: buildListMessage({
+          noun: 'campaign(s)',
+          totalCount: campaigns.length,
+          truncated: result?.truncated,
+          // Campaign LIST has no parent scope to name (it either lists the whole account or
+          // fetches one campaign by id, never "campaigns scoped to X").
+          campaignScopable: false,
+        }),
+        truncated: result?.truncated,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       // A permission refusal from Meta is not a "no campaigns" result — throw the
@@ -16737,17 +17301,28 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // billing_event, destination_type, promoted_object, bid_strategy), the intended
       // ENG-398 change, for every plain LIST caller regardless of this branch.
       const hasSelector = Boolean(options.adSetId || options.fields);
-      const adSets = (hasSelector
+      const result = hasSelector
         ? await metaService.listAdSets(accountId, accessToken, campaignId, options)
-        : await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
-      const totalCount = Array.isArray(adSets) ? adSets.length : 0;
+        : await metaService.listAdSets(accountId, accessToken, campaignId);
+      const adSets = result?.adSets ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} ad set(s)`,
-        adSets: adSets,
-        totalCount: totalCount
-      };
+      // ENG-1625 follow-up: this used to be `Found ${totalCount} ad set(s)` with no scope or
+      // bound — the exact ENG-1476/ENG-1584 sentence shape, and campaign_id scoping went
+      // through a bare param Meta's docs do not list as supported on this edge (fixed in
+      // metaService.listAdSets to go through the campaign node instead).
+      return buildListResult({
+        payloadKey: 'adSets',
+        payload: adSets,
+        message: buildListMessage({
+          noun: 'ad set(s)',
+          totalCount: adSets.length,
+          scope: result?.scope,
+          truncated: result?.truncated,
+          campaignScopable: true,
+        }),
+        truncated: result?.truncated,
+        scope: result?.scope,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ad sets:', error);
@@ -17053,18 +17628,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsAdCreatives(userId: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAdCreatives(userId: string, account_id?: string, adSetId?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const creatives = (await metaService.listAdCreatives(accountId, accessToken)) || [];
-      const totalCount = Array.isArray(creatives) ? creatives.length : 0;
+      const result = await metaService.listAdCreatives(accountId, accessToken, { adSetId });
+      const creatives = result?.creatives ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} ad creative(s)`,
-        creatives: creatives,
-        totalCount: totalCount
-      };
+      return buildListResult({
+        payloadKey: 'creatives',
+        payload: creatives,
+        message: buildListMessage({
+          noun: 'ad creative(s)',
+          totalCount: creatives.length,
+          scope: result?.scope,
+          truncated: result?.truncated,
+          // Meta has no campaign->adcreatives edge, so a campaign scope is never applied here.
+          campaignScopable: false,
+        }),
+        truncated: result?.truncated,
+        scope: result?.scope,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ad creatives:', error);
@@ -17156,18 +17739,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsAds(userId: string, adSetId?: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAds(userId: string, adSetId?: string, account_id?: string, campaignId?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const ads = (await metaService.listAds(accountId, accessToken, adSetId)) || [];
-      const totalCount = Array.isArray(ads) ? ads.length : 0;
+      const result = await metaService.listAds(accountId, accessToken, adSetId, { campaignId });
+      const ads = result?.ads ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} ad(s)`,
-        ads: ads,
-        totalCount: totalCount
-      };
+      // Message shape and field order both live in agentMode/metaListScope.ts — see that module
+      // for why completeness must precede the payload (the S3 preview cut).
+      return buildListResult({
+        payloadKey: 'ads',
+        payload: ads,
+        message: buildListMessage({
+          noun: 'ad(s)',
+          totalCount: ads.length,
+          scope: result?.scope,
+          truncated: result?.truncated,
+          campaignScopable: true,
+        }),
+        truncated: result?.truncated,
+        scope: result?.scope,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ads:', error);
@@ -18927,9 +19519,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
     if (isMetaSpendStartingWrite(entity_type, action, params)) {
       const gateCreds = await this.getMetaCredentials(userId, account_id);
+      // ENG-1636: an AD status flip usually arrives with only ad_id, but the gate needs
+      // the parent campaign to scope its tracking checks — and blocked such calls with
+      // "no campaign was identified" even though Meta carries campaign_id on the ad
+      // object. Resolve the parent instead of refusing a call whose campaign is one
+      // read away. A failed lookup falls through with the campaign still unset, so the
+      // gate blocks loudly exactly as before: failure to verify is never permission to
+      // proceed.
+      const gateCampaignId = await resolveMetaActivationCampaignId({
+        entityType: entity_type,
+        campaignId: campaign_id,
+        adId: ad_id,
+        accessToken: gateCreds.accessToken,
+        accountId: gateCreds.accountId,
+        resolver: metaService,
+      });
       const gate = await runMetaTrackingGate(
         gateCreds,
-        campaign_id,
+        gateCampaignId,
         `${entity_type}_${action}`,
         overrideTrackingCheck,
         sessionId,
@@ -18962,10 +19569,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return this.manageMetaAdsAdSets(userId, action as any, account_id, campaign_id, ad_set_id, params);
 
       case 'AD_CREATIVE':
-        return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params);
+        // campaign_id is forwarded so AD_CREATIVE LIST can SAY it cannot honour it, rather than
+        // dropping it silently — the same threading the AD case below does (ENG-1476).
+        return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params, ad_set_id, campaign_id);
 
       case 'AD':
-        return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params);
+        // campaign_id is forwarded here (ENG-1476). It was already in scope for the tracking
+        // gate above and was simply never handed to the AD handler, which is why an
+        // AD LIST scoped to a campaign returned the entire account instead.
+        return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params, campaign_id);
 
       case 'CUSTOM_AUDIENCE':
         return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
@@ -18998,13 +19610,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       switch (action) {
         case 'LIST': {
-          const result = await metaService.listCustomAudiences(accountId, accessToken);
-          const audiences = Array.isArray(result) ? result : [];
-          return {
-            success: true,
-            message: `Found ${audiences.length} custom audience(s)`,
-            audiences: audiences
-          };
+          const { audiences, truncated } = await metaService.listCustomAudiences(accountId, accessToken);
+          // ENG-1625 follow-up: this used to be `Found ${audiences.length} custom audience(s)`
+          // with no bound — the exact ENG-1476/ENG-1584 sentence shape (the old code also
+          // hard-capped at 50 with no truncation signal past that cap).
+          return buildListResult({
+            payloadKey: 'audiences',
+            payload: audiences,
+            message: buildListMessage({
+              noun: 'custom audience(s)',
+              totalCount: audiences.length,
+              truncated,
+              campaignScopable: false,
+            }),
+            truncated,
+          }) as MetaApiResult;
         }
         case 'CREATE': {
           // Validate required fields
@@ -20286,19 +20906,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  // Action type mappings (shared across all processing functions)
-  private readonly FORM_ACTIONS = new Set([
-    'leadgen',
-    'on_facebook_lead',
-    'onsite_conversion.lead_form',
-    'offsite_conversion.fb_pixel_custom',
-    'offsite_conversion.fb_pixel_lead'
-  ]);
-  private readonly WEBSITE_ACTIONS = new Set([
-    'website_lead',
-    'lead'
-  ]);
-
   // Helper function to process campaign data from Meta API
   private processCampaignData(campaigns: any[], insights: any[], adSets: any[]): any[] {
     const campaignMap = new Map();
@@ -20347,27 +20954,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         campaign.reach = parseInt(insight.reach) || 0;
 
         // Process lead generation metrics from actions and cost_per_action_type
-        if (insight.actions && Array.isArray(insight.actions)) {
-          for (const action of insight.actions) {
-            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-              campaign.websiteLeads += parseInt(action.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(action.action_type)) {
-              campaign.formLeads += parseInt(action.value) || 0;
-            }
-          }
-        }
-
-        if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
-          for (const costAction of insight.cost_per_action_type) {
-            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-              campaign.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(costAction.action_type)) {
-              campaign.costPerFormLead = parseFloat(costAction.value) || 0;
-            }
-          }
-        }
+        applyLeadMetrics(campaign, insight);
       }
     }
 
@@ -20383,19 +20970,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         campaign.frequency = campaign.impressions / campaign.reach;
       }
 
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (campaign.websiteLeads > 0) {
-        campaign.formLeads = 0; // Set form submissions to 0 when website leads exist
-        campaign.costPerWebsiteLead = campaign.costPerWebsiteLead || (campaign.spend / campaign.websiteLeads);
-        campaign.costPerFormLead = 0;
-      } else if (campaign.formLeads > 0) {
-        campaign.costPerFormLead = campaign.costPerFormLead || (campaign.spend / campaign.formLeads);
-      }
-
-      campaign.totalLeads = (campaign.websiteLeads || 0) + (campaign.formLeads || 0);
-      if (campaign.totalLeads > 0) {
-        campaign.costPerLead = campaign.spend / campaign.totalLeads;
-      }
+      // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
+      // longer need to suppress form leads. That suppression is what reported every Instant
+      // Form lead as a website lead on any account that also had website conversions.
+      finalizeLeadCosts(campaign);
     }
 
     // Return all campaigns regardless of activity
@@ -20449,27 +21027,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         adSet.reach = parseInt(insight.reach) || 0;
 
         // Process lead generation metrics from actions and cost_per_action_type
-        if (insight.actions && Array.isArray(insight.actions)) {
-          for (const action of insight.actions) {
-            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-              adSet.websiteLeads += parseInt(action.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(action.action_type)) {
-              adSet.formLeads += parseInt(action.value) || 0;
-            }
-          }
-        }
-
-        if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
-          for (const costAction of insight.cost_per_action_type) {
-            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-              adSet.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(costAction.action_type)) {
-              adSet.costPerFormLead = parseFloat(costAction.value) || 0;
-            }
-          }
-        }
+        applyLeadMetrics(adSet, insight);
       }
     }
 
@@ -20485,19 +21043,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         adSet.frequency = adSet.impressions / adSet.reach;
       }
 
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (adSet.websiteLeads > 0) {
-        adSet.formLeads = 0; // Set form submissions to 0 when website leads exist
-        adSet.costPerWebsiteLead = adSet.costPerWebsiteLead || (adSet.spend / adSet.websiteLeads);
-        adSet.costPerFormLead = 0;
-      } else if (adSet.formLeads > 0) {
-        adSet.costPerFormLead = adSet.costPerFormLead || (adSet.spend / adSet.formLeads);
-      }
-
-      adSet.totalLeads = (adSet.websiteLeads || 0) + (adSet.formLeads || 0);
-      if (adSet.totalLeads > 0) {
-        adSet.costPerLead = adSet.spend / adSet.totalLeads;
-      }
+      // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
+      // longer need to suppress form leads. That suppression is what reported every Instant
+      // Form lead as a website lead on any account that also had website conversions.
+      finalizeLeadCosts(adSet);
     }
 
     // Return all ad sets regardless of activity
@@ -20560,27 +21109,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ad.reach += parseInt(insight.reach) || 0;
 
         // Process lead generation metrics from actions and cost_per_action_type
-        if (insight.actions && Array.isArray(insight.actions)) {
-          for (const action of insight.actions) {
-            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-              ad.websiteLeads += parseInt(action.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(action.action_type)) {
-              ad.formLeads += parseInt(action.value) || 0;
-            }
-          }
-        }
-
-        if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
-          for (const costAction of insight.cost_per_action_type) {
-            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-              ad.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(costAction.action_type)) {
-              ad.costPerFormLead = parseFloat(costAction.value) || 0;
-            }
-          }
-        }
+        applyLeadMetrics(ad, insight);
       }
     }
 
@@ -20596,19 +21125,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ad.frequency = ad.impressions / ad.reach;
       }
 
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (ad.websiteLeads > 0) {
-        ad.formLeads = 0; // Set form submissions to 0 when website leads exist
-        ad.costPerWebsiteLead = ad.costPerWebsiteLead || (ad.spend / ad.websiteLeads);
-        ad.costPerFormLead = 0;
-      } else if (ad.formLeads > 0) {
-        ad.costPerFormLead = ad.costPerFormLead || (ad.spend / ad.formLeads);
-      }
-
-      ad.totalLeads = (ad.websiteLeads || 0) + (ad.formLeads || 0);
-      if (ad.totalLeads > 0) {
-        ad.costPerLead = ad.spend / ad.totalLeads;
-      }
+      // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
+      // longer need to suppress form leads. That suppression is what reported every Instant
+      // Form lead as a website lead on any account that also had website conversions.
+      finalizeLeadCosts(ad);
     }
 
     // Return all ads regardless of activity
@@ -20664,33 +21184,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
 
       // Process lead generation metrics from actions and cost_per_action_type
-      if (item.actions && Array.isArray(item.actions)) {
-        for (const action of item.actions) {
-          if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-            processedItem.websiteLeads += parseInt(action.value) || 0;
-          }
-          if (this.FORM_ACTIONS.has(action.action_type)) {
-            processedItem.formLeads += parseInt(action.value) || 0;
-          }
-        }
-      }
+      applyLeadMetrics(processedItem, item);
 
-      if (item.cost_per_action_type && Array.isArray(item.cost_per_action_type)) {
-        for (const costAction of item.cost_per_action_type) {
-          if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-            processedItem.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-          }
-          if (this.FORM_ACTIONS.has(costAction.action_type)) {
-            processedItem.costPerFormLead = parseFloat(costAction.value) || 0;
-          }
-        }
-      }
-
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (processedItem.websiteLeads > 0) {
-        processedItem.formLeads = 0; // Set form submissions to 0 when website leads exist
-        processedItem.costPerFormLead = 0;
-      }
+      // ENG-1575: buckets are disjoint (see applyLeadMetrics) — no suppression needed.
 
       // Calculate totals
       processedItem.totalLeads = (processedItem.websiteLeads || 0) + (processedItem.formLeads || 0);
@@ -21177,11 +21673,237 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production' ? 'prod/AgentWeb/Google/Share' : 'dev/AgentWeb/Google/Share';
     const credentials = JSON.parse(await getSecret(secretName));
+    this.driveServiceAccountEmail = credentials.client_email || null;
     const auth = new google.auth.GoogleAuth({
       credentials,
       scopes: ['https://www.googleapis.com/auth/drive.readonly'],
     });
     return google.drive({ version: 'v3', auth });
+  }
+
+  private getGoogleDriveServiceAccountEmail(): string {
+    return this.driveServiceAccountEmail || 'the AgentWeb Google Drive service account';
+  }
+
+  /**
+   * ENG-1624: classify a Drive failure into a short, safe reason for a
+   * model-visible payload. Never put the raw error object (or its message)
+   * there — mirrors metaService.ts's drainCursor, which deliberately doesn't
+   * log/surface FacebookRequestError objects because a paged Graph URL carries
+   * the access token in its query string; a Drive error can carry similarly
+   * sensitive request context. The full error is still logged server-side by
+   * the caller, same as before — only this classified string reaches the model.
+   */
+  private classifyDriveError(err: any): string {
+    const code = err?.code || err?.status;
+    if (code === 403 || code === 401) return 'permission denied';
+    if (code === 429) return 'rate limited';
+    if (code === 400) return 'invalid request';
+    if (typeof err?.message === 'string' && /did not respond within/i.test(err.message)) {
+      return 'temporary Drive error (timed out)';
+    }
+    return 'temporary Drive error';
+  }
+
+  /**
+   * ENG-1624: getGoogleDriveFolderTreeIds bounds folder COUNT (maxFolders) and
+   * queryDriveFilesAcrossFolders bounds per-batch file COUNT (perBatchTarget),
+   * but neither bounded elapsed TIME — both await Drive list calls sequentially,
+   * so a large or slow-to-respond tree/query was many serial round-trips with no
+   * deadline. Same shape as metaService.ts's META_LIST_MAX_MS / drainCursor: a
+   * count bound limits WORK, not TIME, when calls are awaited one at a time.
+   *
+   * A Drive list call here fetches only id+name (folder discovery) or a handful
+   * of scalar fields (file listing) with no nested expansions, so it's a much
+   * lighter call than a Meta ad-list page with `creative{...}` expansion —
+   * intentionally far short of Meta's 45s: long enough that an ordinary
+   * customer's tree (tens of folders) finishes in a fraction of it, short
+   * enough that a pathological or throttled tree can't visibly stall a turn.
+   * Crossing it sets `truncated`/`capped` — the same "incomplete, do not
+   * conclude absence" signal the count bounds already use, not a new failure
+   * mode.
+   */
+  private static readonly DRIVE_LIST_WALK_MAX_MS = 15_000;
+
+  // ENG-1624: a registered gdrive: KB folder is authorized by its root ID only, but
+  // every Drive query in this file was scoped to `'<folderId>' in parents` — direct
+  // children only. A file living in a sub-folder (any depth) of a registered root
+  // resolved as not-found, and the sub-folder itself as "Not authorized" (our own
+  // flat allowlist check, not a real Google permission failure). This walks the
+  // folder tree from a registered root so callers can search/list across the whole
+  // tree instead of just its direct children. `restricted` surfaces sub-folders that
+  // couldn't be listed (e.g. an unshared shortcut target) so callers can give an
+  // actionable error instead of a bare "not found". `rootRestricted` is the same
+  // signal for the registered root itself — kept separate from `restricted` so it
+  // isn't reported to the caller as if it were a sub-folder found underneath itself.
+  // `truncated` is set when the `maxFolders` bound stops the walk before the whole
+  // tree was covered, so a caller can say "incomplete" instead of asserting absence.
+  private async getGoogleDriveFolderTreeIds(
+    drive: any,
+    rootFolderId: string,
+    maxFolders: number = 500
+  ): Promise<{
+    folderIds: string[];
+    restricted: Array<{ id: string; name: string }>;
+    rootRestricted: boolean;
+    truncated: boolean;
+    folderNames: Map<string, string>;
+  }> {
+    const folderIdSet = new Set<string>([rootFolderId]);
+    const folderIds: string[] = [rootFolderId];
+    const folderNames = new Map<string, string>();
+    const queue: string[] = [rootFolderId];
+    const restricted: Array<{ id: string; name: string }> = [];
+    let rootRestricted = false;
+    let truncated = false;
+    const deadline = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
+
+    while (queue.length > 0 && !truncated) {
+      if (Date.now() >= deadline) {
+        truncated = true;
+        break;
+      }
+      const current = queue.shift()!;
+      let pageToken: string | undefined;
+      do {
+        if (Date.now() >= deadline) {
+          truncated = true;
+          break;
+        }
+        let resp: any;
+        try {
+          // A per-request timeout was considered here (the loop-level deadline
+          // check above only runs BEFORE a request starts, not while awaiting
+          // one, so it can't interrupt a single hung call — same reasoning as
+          // metaService.ts's withReadDeadline). googleapis' MethodOptions does
+          // support one (it extends gaxios' GaxiosOptions, which declares
+          // `timeout?: number`), but only as a SECOND argument to `.list()` —
+          // every existing test asserting this call's argument shape asserts a
+          // single-argument call, so adding one would require rewriting
+          // passing regression pins rather than fixing a bug. Left as a
+          // follow-up; the elapsed-time bound below is the hard requirement
+          // and doesn't need it.
+          resp = await drive.files.list({
+            q: `'${current}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+            fields: 'nextPageToken, files(id, name)',
+            pageSize: 1000,
+            ...(pageToken && { pageToken }),
+            supportsAllDrives: true,
+            includeItemsFromAllDrives: true,
+          });
+        } catch (err: any) {
+          const code = err?.code || err?.status;
+          if (code === 403 || code === 401) {
+            if (current === rootFolderId) {
+              rootRestricted = true;
+            } else {
+              restricted.push({ id: current, name: folderNames.get(current) || current });
+            }
+          }
+          console.log(`AgentMode: Could not list subfolders of Drive folder ${current}:`, err);
+          break;
+        }
+
+        for (const f of resp.data.files || []) {
+          if (!f.id || folderIdSet.has(f.id)) continue;
+          if (folderIds.length >= maxFolders) {
+            truncated = true;
+            break;
+          }
+          folderIdSet.add(f.id);
+          folderIds.push(f.id);
+          if (f.name) folderNames.set(f.id, f.name);
+          queue.push(f.id);
+        }
+
+        pageToken = truncated ? undefined : (resp.data.nextPageToken || undefined);
+      } while (pageToken);
+    }
+
+    return { folderIds, restricted, rootRestricted, truncated, folderNames };
+  }
+
+  // ENG-1624: `'<id>' in parents` clauses joined with OR grow ~52 chars per Drive
+  // id (33-char id + boilerplate). `q` travels as a URL query parameter, so a
+  // 500-folder tree building one query risks a 400/414 from Drive rather than
+  // degrading gracefully. Chunk into batches and merge results de-duplicated by
+  // file id — a file with multiple parents can legitimately appear in more than
+  // one batch.
+  private static readonly DRIVE_FOLDER_QUERY_BATCH_SIZE = 50;
+
+  // ENG-1624 rework: this used to fetch a single page per batch (pageSize
+  // pageSizePerBatch, no nextPageToken follow-through), so a batch holding more
+  // matches than that one page silently dropped the rest. `perBatchTarget` is now
+  // pursued via in-batch pagination — following nextPageToken — until either the
+  // batch is genuinely exhausted or `perBatchTarget` items have been accumulated
+  // FOR THAT BATCH. The target is deliberately per-batch, not a budget shared
+  // across batches: each batch is fetched with the same `orderBy`, so the
+  // per-batch top-K is a superset of what the true global top-K could need from
+  // that batch — a shared budget would let one batch starve another and return
+  // the wrong page contents, not just a wrong total. `capped` reports whether any
+  // batch stopped at its target with more available, i.e. whether the merged
+  // result can be trusted as exhaustive.
+  private async queryDriveFilesAcrossFolders(
+    drive: any,
+    folderIds: string[],
+    extraClause: string,
+    fields: string,
+    perBatchTarget: number,
+    orderBy?: string
+  ): Promise<{ files: Map<string, any>; capped: boolean }> {
+    const merged = new Map<string, any>();
+    let capped = false;
+    // ENG-1624: same time bound as getGoogleDriveFolderTreeIds, and for the same
+    // reason — batches and pages here are walked sequentially with no overall
+    // bound otherwise. Crossing it sets `capped`, reusing the existing
+    // "incomplete, do not conclude absence" signal.
+    const deadline = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
+    for (let i = 0; i < folderIds.length; i += AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE) {
+      if (Date.now() >= deadline) {
+        capped = true;
+        break;
+      }
+      const batch = folderIds.slice(i, i + AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE);
+      const parentClause = `(${batch.map(id => `'${id}' in parents`).join(' or ')})`;
+      let batchCount = 0;
+      let pageToken: string | undefined;
+      do {
+        if (Date.now() >= deadline) {
+          capped = true;
+          pageToken = undefined;
+          break;
+        }
+        // See getGoogleDriveFolderTreeIds for why a per-request timeout isn't
+        // added here: it needs a second call argument, which would break every
+        // existing test asserting this call's (single-argument) shape.
+        const resp = await drive.files.list({
+          q: `${parentClause} and ${extraClause}`,
+          // nextPageToken must be requested explicitly — it isn't returned by
+          // default, which is exactly why the old single-page fetch had no way
+          // to know it was truncating.
+          fields: `nextPageToken, ${fields}`,
+          pageSize: Math.min(perBatchTarget - batchCount, 1000),
+          ...(pageToken && { pageToken }),
+          ...(orderBy && { orderBy }),
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+        });
+        const files = resp.data.files || [];
+        for (const f of files) {
+          if (f.id) merged.set(f.id, f);
+        }
+        batchCount += files.length;
+        pageToken = resp.data.nextPageToken || undefined;
+        if (batchCount >= perBatchTarget && pageToken) {
+          // Hit this batch's target with more still available — stop here
+          // rather than draining a huge folder, but the caller needs to know
+          // this batch's contribution isn't necessarily complete.
+          capped = true;
+          pageToken = undefined;
+        }
+      } while (pageToken);
+    }
+    return { files: merged, capped };
   }
 
   private extractGoogleFileId(urlOrId: string): string {
@@ -21247,12 +21969,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           message: 'No search query provided.',
           query: query || '',
           results: [],
-          totalResults: 0,
+          returnedResults: 0,
+          hasMore: false,
         };
       }
 
       // Limit max results to 10
       const limitedMaxResults = Math.min(maxResults, 10);
+
+      // ENG-1624: set when a registered root's folder tree couldn't be fully
+      // walked/read (truncated by maxFolders, or a root/sub-folder 403'd) — the
+      // Drive portion of these results is then not exhaustive, and the final
+      // message must say so rather than reading as a complete search.
+      let driveScanIncomplete = false;
 
       // Search platform knowledge base (both public and private)
       const searchResults = await searchPlatformKnowledgeBase(query, limitedMaxResults, userId);
@@ -21274,15 +22003,33 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const folders = await this.getUserGoogleDriveFolders(userId);
           if (folders.length > 0) {
             const drive = await this.getGoogleDriveClient();
-            // Build query: search across all shared folders
-            const parentClauses = folders.map(f => `'${f.folderId}' in parents`).join(' or ');
-            const driveResponse = await drive.files.list({
-              q: `(${parentClauses}) and fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
-              fields: 'files(id, name, mimeType, parents)',
-              pageSize: limitedMaxResults,
-            });
+            // Walk each registered root's whole folder tree (ENG-1624) so search
+            // covers files nested in sub-folders too, not just direct children.
+            const folderTrees = await Promise.all(
+              folders.map(f => this.getGoogleDriveFolderTreeIds(drive, f.folderId))
+            );
+            if (folderTrees.some(t => t.truncated || t.rootRestricted || t.restricted.length > 0)) {
+              driveScanIncomplete = true;
+            }
+            // De-dupe across roots: a file with multiple parents (or two registered
+            // roots sharing a sub-tree) can otherwise appear twice.
+            const allFolderIds = [...new Set(folderTrees.flatMap(t => t.folderIds))];
+            const { files: driveFilesMap, capped: driveQueryCapped } = await this.queryDriveFilesAcrossFolders(
+              drive,
+              allFolderIds,
+              `fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
+              'files(id, name, mimeType, parents)',
+              limitedMaxResults
+            );
+            // A per-batch cap on the file query itself is a different reason the
+            // Drive portion isn't exhaustive than an unreadable folder — fold it
+            // into the same signal so a capped search result set isn't presented
+            // as exhaustive either.
+            if (driveQueryCapped) {
+              driveScanIncomplete = true;
+            }
 
-            const driveFiles = driveResponse.data.files || [];
+            const driveFiles = Array.from(driveFilesMap.values()).slice(0, limitedMaxResults);
             for (const file of driveFiles) {
               // Read file content for text-based files
               if (file.id && file.mimeType && !file.mimeType.startsWith('application/vnd.google-apps.folder')) {
@@ -21385,10 +22132,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (results.length === 0) {
         return {
           success: true,
-          message: `No knowledge base results found for "${query}"`,
+          message: driveScanIncomplete
+            ? `No knowledge base results found for "${query}" — note: some Google Drive folders could not be fully scanned, so this is not confirmed exhaustive.`
+            : `No knowledge base results found for "${query}"`,
           query,
           results: [],
-          totalResults: 0
+          returnedResults: 0,
+          hasMore: false,
+          ...(driveScanIncomplete && { scanIncomplete: true })
         };
       }
 
@@ -21397,12 +22148,34 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // list can be several times larger than requested — cap it to avoid context bloat.
       const boundedResults = results.slice(0, limitedMaxResults);
 
+      // ENG-1207: never present a page as a total. `totalResults` was the worst
+      // instance of this in the file — a structured field NAMED "total" carrying a
+      // page count reads as authoritative in a way prose does not, so a model has
+      // no reason to doubt it. Renamed to `returnedResults`, which is what it
+      // always actually held, plus an explicit `hasMore`.
+      //
+      // Unlike `get_lead_engagements`, no honest total is available here and none
+      // is invented. Each source (Vertex, Drive, ClickUp docs/tasks) is collected
+      // up to `limitedMaxResults` INDEPENDENTLY before merging, so `results.length`
+      // is a floor rather than a count of what matched — a source that returned
+      // exactly its own cap may well have had more. `hasMore` therefore reports
+      // only what is certain: that the merge itself was cut. It can be false while
+      // more exists upstream, which is why the message says "raise max_results"
+      // rather than promising a specific remainder.
+      const hasMore = results.length > boundedResults.length;
+      const scanIncompleteNote = driveScanIncomplete
+        ? ' Some Google Drive folders could not be fully scanned, so this is not confirmed exhaustive.'
+        : '';
       return {
         success: true,
-        message: `Found ${boundedResults.length} knowledge base results for "${query}"`,
+        message: (hasMore
+          ? `Showing the first ${boundedResults.length} knowledge base results for "${query}" — raise max_results to see more.`
+          : `Found ${boundedResults.length} knowledge base results for "${query}"`) + scanIncompleteNote,
         query,
         results: boundedResults,
-        totalResults: boundedResults.length
+        returnedResults: boundedResults.length,
+        hasMore,
+        ...(driveScanIncomplete && { scanIncomplete: true })
       };
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
@@ -21693,41 +22466,110 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       // Include Google Drive shared folders
+      // ENG-1624: set when Drive enumeration failed entirely (outer catch below)
+      // — a listing that's missing every Drive source must say so, not read as
+      // "this account has no Drive folders."
+      let driveEnumerationFailed = false;
       if (!options?.kb_type || options.kb_type === 'google-drive') try {
         const folders = await this.getUserGoogleDriveFolders(userId);
         if (folders.length > 0) {
           const drive = await this.getGoogleDriveClient();
           const driveLimit = options?.limit ?? 100;
           const driveOffset = options?.offset ?? 0;
-          for (const folder of folders) {
+
+          // ENG-1624: walk every registered root's tree up front. Two
+          // registered roots can be in an ancestor/descendant relationship —
+          // a customer registers both a parent folder and one of its own
+          // sub-folders (e.g. Harsha's mitigation for Phoenix, which added
+          // the ratio sub-folders directly alongside the already-registered
+          // parent). Now that this PR walks the whole tree instead of direct
+          // children only, the parent's listing legitimately includes the
+          // child's files too, so the same file can appear under two
+          // entries. Walking every tree first lets nesting be detected
+          // STRUCTURALLY (one root's resolved folderIds actually containing
+          // another registered root's own id) before any file query runs.
+          // getGoogleDriveFolderTreeIds never rejects — its own Drive errors
+          // are caught internally as restricted/rootRestricted — so this
+          // can't silently drop a root the way a failing Promise.all
+          // normally would.
+          const treeResults = await Promise.all(
+            folders.map(folder =>
+              this.getGoogleDriveFolderTreeIds(drive, folder.folderId).then(tree => ({ folder, ...tree }))
+            )
+          );
+
+          for (const { folder, folderIds, restricted, rootRestricted, truncated } of treeResults) {
             try {
-              // Build Drive query with optional date filter
-              let driveQuery = `'${folder.folderId}' in parents and trashed = false`;
+              // Structural, not name-based: a root only counts as nested
+              // when its OWN id was actually discovered inside another
+              // root's resolved tree. This can't false-positive from a
+              // truncated ancestor scan — truncation just means some
+              // folders were never visited, so an undiscovered descendant
+              // simply isn't found here either, and no relationship is
+              // claimed (falls back to the plain file-id dedup in the
+              // top-level totalFiles below).
+              const ancestor = treeResults.find(other =>
+                other.folder.folderId !== folder.folderId &&
+                other.folderIds.includes(folder.folderId)
+              );
+
+              // Exclude folder entries themselves — previously these showed up as
+              // 0-byte files instead of being descended into.
+              let extraClause = `mimeType != 'application/vnd.google-apps.folder' and trashed = false`;
               if (options?.modified_after) {
-                driveQuery += ` and modifiedTime >= '${options.modified_after}T00:00:00'`;
+                extraClause += ` and modifiedTime >= '${options.modified_after}T00:00:00'`;
               }
               if (options?.modified_before) {
-                driveQuery += ` and modifiedTime <= '${options.modified_before}T23:59:59'`;
+                extraClause += ` and modifiedTime <= '${options.modified_before}T23:59:59'`;
               }
 
-              // Fetch enough to support pagination: offset + limit
-              const response = await drive.files.list({
-                q: driveQuery,
-                fields: 'files(id, name, mimeType, size, modifiedTime)',
-                orderBy: 'modifiedTime desc',
-                pageSize: Math.min(driveOffset + driveLimit, 1000),
-              });
+              // ENG-1624: the tree can span more folders than fit in one `q` string
+              // (see queryDriveFilesAcrossFolders), so this is queried in batches and
+              // merged/de-duplicated by file id — NOT per batch, or offset/limit
+              // pagination below would silently skip and repeat files across batch
+              // boundaries.
+              //
+              // Per-batch target is offset+limit+1, not offset+limit: each batch is
+              // fetched at the same `orderBy`, so the global top-K of the union is
+              // always a subset of the union of each batch's own top-K — the `files`
+              // returned are correct regardless of the target. The `+1` is what makes
+              // `hasMore` exact: the merged set then holds at least
+              // min(trueTotal, K+1) files, so `allFiles.length > offset+limit` is
+              // true exactly when more files really exist beyond this page.
+              const perBatchTarget = driveOffset + driveLimit + 1;
+              const { files: filesMap, capped } = await this.queryDriveFilesAcrossFolders(
+                drive,
+                folderIds,
+                extraClause,
+                'files(id, name, mimeType, size, modifiedTime)',
+                perBatchTarget,
+                'modifiedTime desc'
+              );
 
-              const allFiles = (response.data.files || []).map((f) => ({
-                fileName: f.name || 'unknown',
-                fileSize: f.size ? parseInt(f.size, 10) : 0,
-                mimeType: f.mimeType || 'unknown',
-                driveFileId: f.id,
-                modifiedTime: f.modifiedTime,
-              }));
+              // Per-batch `orderBy` only sorts within its own batch; re-sort the
+              // merged set so global ordering (and therefore offset/limit slicing)
+              // is correct.
+              const allFiles = Array.from(filesMap.values())
+                .map((f) => ({
+                  fileName: f.name || 'unknown',
+                  fileSize: f.size ? parseInt(f.size, 10) : 0,
+                  mimeType: f.mimeType || 'unknown',
+                  driveFileId: f.id,
+                  modifiedTime: f.modifiedTime,
+                }))
+                .sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || ''));
 
               const totalMatchingFiles = allFiles.length;
               const driveFiles = allFiles.slice(driveOffset, driveOffset + driveLimit);
+              // ENG-1624: a scan that stopped early (folder-count bound or the root
+              // itself being unreadable) must not present its partial file list as
+              // complete.
+              const folderScanIncomplete = truncated || rootRestricted;
+              // A batch that hit its per-batch target means `totalMatchingFiles`
+              // wasn't fully counted — it's a floor, not an exact total. Getting an
+              // exact total would mean fully paginating every batch, which isn't
+              // worth the API cost just to render one page.
+              const totalFilesIsLowerBound = capped;
 
               knowledgeBases.push({
                 identifier: `gdrive:${folder.folderId}`,
@@ -21736,17 +22578,48 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 updatedAt: allFiles.length > 0 ? allFiles[0].modifiedTime : undefined,
                 files: driveFiles,
                 totalFiles: totalMatchingFiles,
-                hasMore: driveOffset + driveLimit < totalMatchingFiles,
+                hasMore: allFiles.length > driveOffset + driveLimit,
                 offset: driveOffset,
                 limit: driveLimit,
+                ...(totalFilesIsLowerBound && { totalFilesIsLowerBound: true }),
+                // ENG-1624: a sub-folder that couldn't be listed (e.g. an unshared
+                // shortcut target) previously shrank the listing with no signal to
+                // the caller. Name it so the caller can request access instead of
+                // silently seeing an incomplete file list.
+                ...(restricted.length > 0 && { inaccessibleFolders: restricted.map(r => r.name) }),
+                ...(rootRestricted && { inaccessibleRoot: true }),
+                ...(folderScanIncomplete && { folderScanIncomplete: true }),
+                // ENG-1624: this root's own id was found inside another
+                // registered root's resolved tree — its files are already
+                // counted there too. Kept as its own entry (never silently
+                // dropped), just labeled, so a saved gdrive:<this-id>
+                // reference still resolves exactly as it does today.
+                ...(ancestor && { nestedUnder: `gdrive:${ancestor.folder.folderId}` }),
               });
-            } catch (folderErr) {
+            } catch (folderErr: any) {
+              // ENG-1624: this used to just log and move on, which silently
+              // dropped the whole KB from the response — indistinguishable from
+              // "this folder has no files." Round 2 (the BFS walk + batched,
+              // paginated file query) turned a single files.list call into many,
+              // multiplying how often a Drive error lands here. A failure for
+              // one folder must not abort the others (kept below, same as
+              // before) — but the caller now still sees this source, marked as
+              // failed rather than absent.
               console.log(`AgentMode: Error listing files in Drive folder ${folder.name}:`, folderErr);
+              knowledgeBases.push({
+                identifier: `gdrive:${folder.folderId}`,
+                name: folder.name,
+                type: 'google-drive',
+                files: [],
+                listingFailed: true,
+                listingFailedReason: this.classifyDriveError(folderErr),
+              });
             }
           }
         }
       } catch (driveError) {
         console.error('AgentMode: Error listing Google Drive shared folders:', driveError);
+        driveEnumerationFailed = true;
       }
 
       // Include ClickUp docs
@@ -21917,10 +22790,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.error('AgentMode: Error listing Foreplay ads:', foreplayError);
       }
 
-      const totalFiles = knowledgeBases.reduce(
-        (sum: number, kb: any) => sum + (kb.files?.length || 0),
-        0
-      );
+      // ENG-1624: a plain per-KB sum double-counts once nesting/multi-parent
+      // overlap between registered Drive roots is possible (see the
+      // treeResults/nestedUnder logic above) — the same underlying Drive file
+      // can legitimately appear in more than one root's `files` array. De-dupe
+      // by driveFileId for google-drive entries specifically; other KB types
+      // (private/public/ClickUp/Foreplay) have no equivalent shared identity
+      // and are summed as before.
+      const seenDriveFileIds = new Set<string>();
+      const totalFiles = knowledgeBases.reduce((sum: number, kb: any) => {
+        if (kb.type !== 'google-drive') return sum + (kb.files?.length || 0);
+        let kbCount = 0;
+        for (const f of kb.files || []) {
+          if (!f.driveFileId || !seenDriveFileIds.has(f.driveFileId)) {
+            if (f.driveFileId) seenDriveFileIds.add(f.driveFileId);
+            kbCount++;
+          }
+        }
+        return sum + kbCount;
+      }, 0);
 
       const appliedFiltersEarly = [
         options?.modified_after ? `modified_after=${options.modified_after}` : null,
@@ -21937,30 +22825,63 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Point the model to the catalog so empty doesn't read as "Docs unavailable".
         // Scoped to the explicit drive query: an unfiltered/other empty gets the plain
         // message (this path lists all sources, and nudging Docs there is off-topic).
-        const message = options?.kb_type === 'google-drive'
-          ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
-          : 'No knowledge bases found';
+        //
+        // ENG-1624: an empty result caused by driveEnumerationFailed is a DIFFERENT
+        // claim than a genuinely empty account — the former means "we don't know",
+        // the latter means "there is nothing." Collapsing them into the same plain
+        // message would tell a caller no Drive folders are registered when the
+        // truth is the enumeration call itself failed.
+        let message: string;
+        if (driveEnumerationFailed) {
+          message = options?.kb_type === 'google-drive'
+            ? 'Google Drive sources could not be enumerated — this does not mean no folders are registered, only that the enumeration attempt itself failed. Try again.'
+            : 'No knowledge bases found in other sources, and Google Drive sources could not be enumerated — this does not mean no Drive folders exist, only that the enumeration attempt itself failed. Try again.';
+        } else {
+          message = options?.kb_type === 'google-drive'
+            ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
+            : 'No knowledge bases found';
+        }
         return {
           success: true,
           message,
           knowledge_bases: [],
           totalKnowledgeBases: 0,
           totalFiles: 0,
+          ...(driveEnumerationFailed && { driveEnumerationFailed: true }),
           ...(appliedFiltersEarly.length > 0 && { appliedFilters: appliedFiltersEarly }),
         };
       }
 
       const hasMorePages = knowledgeBases.some((kb: any) => kb.hasMore);
+      // ENG-1624: a folder-scan cutoff (folder-count bound, or the root/a
+      // sub-folder being unreadable) is a different signal than "more files exist
+      // to paginate" — it means the listing itself may be incomplete, not just
+      // capped.
+      const hasIncompleteFolderScan = knowledgeBases.some((kb: any) => kb.folderScanIncomplete);
+      // A Drive KB's file query hit its per-batch target — its `totalFiles` is a
+      // floor, not an exact count, even though `files`/`hasMore` are still correct.
+      const hasLowerBoundTotals = knowledgeBases.some((kb: any) => kb.totalFilesIsLowerBound);
+      // A Drive KB whose listing errored outright — shown with empty `files`, not
+      // dropped, but that empty array must not be mistaken for "no files exist."
+      const failedDriveCount = knowledgeBases.filter((kb: any) => kb.listingFailed).length;
+      // A Drive KB nested inside another registered Drive KB's tree — its files
+      // are already reflected in the parent's own listing (and in the
+      // de-duplicated totalFiles above), not additional ones.
+      const hasNestedRoots = knowledgeBases.some((kb: any) => kb.nestedUnder);
       const appliedFilters = appliedFiltersEarly;
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasIncompleteFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be listed and are shown as empty — their contents are unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles,
         ...(appliedFilters.length > 0 && { appliedFilters }),
         ...(hasMorePages && { hasMore: true }),
+        ...(hasIncompleteFolderScan && { folderScanIncomplete: true }),
+        ...(hasLowerBoundTotals && { totalFilesIsLowerBound: true }),
+        ...(failedDriveCount > 0 && { driveListingFailures: failedDriveCount }),
+        ...(driveEnumerationFailed && { driveEnumerationFailed: true }),
       };
     } catch (error) {
       console.error('AgentMode: Error listing knowledge base files:', error);
@@ -22068,7 +22989,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       content = Buffer.from(res.data);
     } else {
       // Binary files — download directly
-      const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
+      const res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'arraybuffer' });
       content = Buffer.from(res.data);
     }
 
@@ -22282,20 +23203,66 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     const folderMeta = folders.find(f => f.folderId === folderId);
+    const rootName = folderMeta?.name || folderId;
 
     try {
       const drive = await this.getGoogleDriveClient();
 
-      // Find the file by name in the folder
-      const listResponse = await drive.files.list({
-        q: `'${folderId}' in parents and name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
-        fields: 'files(id, name, mimeType, size, modifiedTime)',
-        pageSize: 1,
-      });
+      // Find the file by name anywhere in the registered folder's tree (ENG-1624:
+      // not just its direct children).
+      const { folderIds, restricted, rootRestricted, truncated: folderScanTruncated, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
+      // lets an ambiguous name (same filename in two sub-folders) be detected and
+      // reported instead of one candidate being picked arbitrarily.
+      const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
+        drive,
+        folderIds,
+        `name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
+        'files(id, name, mimeType, size, modifiedTime, parents)',
+        2
+      );
+      const files = Array.from(filesMap.values());
 
-      const files = listResponse.data.files || [];
       if (files.length === 0) {
-        return { success: false, message: `File "${fileName}" not found in Google Drive folder "${folderMeta?.name || folderId}"` };
+        if (rootRestricted) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (restricted.length > 0) {
+          const names = restricted.map(r => `"${r.name}"`).join(', ');
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}". Sub-folder(s) ${names} could not be accessed — share them with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (folderScanTruncated) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder tree is large enough that the scan stopped before covering it entirely, so this is not a confirmed absence.`
+          };
+        }
+        return { success: false, message: `File "${fileName}" not found in Google Drive folder "${rootName}"` };
+      }
+
+      if (files.length > 1) {
+        // A Drive file can have more than one parent — index [0] may be a
+        // folder outside the tree that was actually searched, which would
+        // point someone at the wrong place. Prefer whichever parent is
+        // actually in `folderIds`; only fall back to [0] when none of the
+        // file's parents resolve within the searched tree (shouldn't happen
+        // in practice, since the file matched a query scoped to folderIds).
+        const folderIdSet = new Set(folderIds);
+        const candidates = files.map(f => {
+          const parentId = (f.parents || []).find((p: string) => folderIdSet.has(p)) ?? (f.parents || [])[0];
+          const location = parentId === folderId ? rootName : (folderNames.get(parentId) || parentId || 'an unresolved sub-folder');
+          return `"${f.name}" in "${location}"`;
+        }).join(', ');
+        return {
+          success: false,
+          message: `Multiple files named "${fileName}" found in Google Drive folder "${rootName}": ${candidates}. Use a more specific file name, or move the duplicates so names are unique.`
+        };
       }
 
       const file = files[0];
@@ -22327,6 +23294,174 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: `Failed to read Google Drive file "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+      };
+    }
+  }
+
+  // Maximum bytes materialize_knowledge_base_asset will download/upload for one file.
+  private static readonly MATERIALIZE_ASSET_MAX_BYTES = 200 * 1024 * 1024;
+
+  /**
+   * Turn an image/video file from a connected Google Drive knowledge base
+   * folder into a real, hosted S3 asset with a usable URL.
+   *
+   * readGoogleDriveSharedFile / readGoogleDriveFileContent are text-oriented:
+   * a binary file falls through to `content.toString('base64')` inside a
+   * knowledge-base tool response capped at 1,000,000 characters, which
+   * silently truncates (and corrupts) anything but a tiny file, and nothing
+   * downstream consumes that base64 blob anyway (ad-creative tools need a
+   * real image_url/image_hash/video_id). This bypasses that path entirely:
+   * download raw bytes -> upload to S3 -> return a URL other tools can use
+   * directly, mirroring the existing removeC2PAFromImage upload pattern.
+   */
+  public async materializeKnowledgeBaseAsset(
+    kbIdentifier: string,
+    fileName: string,
+    userId: string
+  ): Promise<any> {
+    if (!kbIdentifier || !fileName) {
+      return { success: false, message: 'kb_identifier and file_name are required' };
+    }
+
+    if (!kbIdentifier.startsWith('gdrive:')) {
+      return {
+        success: false,
+        message: 'materialize_knowledge_base_asset currently only supports Google Drive knowledge base sources (kb_identifier starting with "gdrive:")'
+      };
+    }
+
+    const folderId = kbIdentifier.replace('gdrive:', '');
+    const folders = await this.getUserGoogleDriveFolders(userId);
+    if (!folders.some(f => f.folderId === folderId)) {
+      return { success: false, message: 'Not authorized to access this Google Drive folder' };
+    }
+    const rootName = folders.find(f => f.folderId === folderId)?.name || folderId;
+
+    try {
+      const drive = await this.getGoogleDriveClient();
+
+      // Search the whole folder tree rooted at the registered folder (ENG-1624),
+      // not just its direct children.
+      const { folderIds, restricted, rootRestricted, truncated, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
+      // lets an ambiguous name (same filename in two sub-folders) be detected and
+      // reported instead of one candidate being materialized arbitrarily.
+      const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
+        drive,
+        folderIds,
+        `name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
+        'files(id, name, mimeType, size, parents)',
+        2
+      );
+      const files = Array.from(filesMap.values());
+
+      if (files.length === 0) {
+        if (rootRestricted) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (restricted.length > 0) {
+          const names = restricted.map(r => `"${r.name}"`).join(', ');
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder. Sub-folder(s) ${names} could not be accessed — share them with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (truncated) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder tree is large enough that the scan stopped before covering it entirely, so this is not a confirmed absence.`
+          };
+        }
+        return { success: false, message: `File "${fileName}" not found in Google Drive folder` };
+      }
+
+      if (files.length > 1) {
+        // A Drive file can have more than one parent — index [0] may be a
+        // folder outside the tree that was actually searched, which would
+        // point someone at the wrong place. Prefer whichever parent is
+        // actually in `folderIds`; only fall back to [0] when none of the
+        // file's parents resolve within the searched tree (shouldn't happen
+        // in practice, since the file matched a query scoped to folderIds).
+        const folderIdSet = new Set(folderIds);
+        const candidates = files.map(f => {
+          const parentId = (f.parents || []).find((p: string) => folderIdSet.has(p)) ?? (f.parents || [])[0];
+          const location = parentId === folderId ? rootName : (folderNames.get(parentId) || parentId || 'an unresolved sub-folder');
+          return `"${f.name}" in "${location}"`;
+        }).join(', ');
+        return {
+          success: false,
+          message: `Multiple files named "${fileName}" found in Google Drive folder "${rootName}": ${candidates}. Use a more specific file name, or move the duplicates so names are unique.`
+        };
+      }
+
+      const file = files[0];
+      const mimeType = file.mimeType || '';
+      if (!mimeType.startsWith('image/') && !mimeType.startsWith('video/')) {
+        return {
+          success: false,
+          message: `"${fileName}" is a ${mimeType || 'unknown type'} file. materialize_knowledge_base_asset only handles images/videos — use read_knowledge_base_files for text/document content.`
+        };
+      }
+
+      const size = file.size ? parseInt(file.size, 10) : 0;
+      if (size > AgentModeService.MATERIALIZE_ASSET_MAX_BYTES) {
+        return {
+          success: false,
+          message: `"${fileName}" is ${Math.round(size / (1024 * 1024))}MB, over the ${AgentModeService.MATERIALIZE_ASSET_MAX_BYTES / (1024 * 1024)}MB limit for asset materialization`
+        };
+      }
+
+      const mediaResponse = await drive.files.get(
+        { fileId: file.id!, alt: 'media', supportsAllDrives: true },
+        { responseType: 'arraybuffer' }
+      );
+      const buffer = Buffer.from(mediaResponse.data as any);
+
+      // Drive's reported `size` can be missing/stale (e.g. 0 during virus-scan) —
+      // re-check the actual downloaded bytes so an oversized file can't slip
+      // through on bad metadata and get uploaded/reported with a wrong size.
+      if (buffer.length > AgentModeService.MATERIALIZE_ASSET_MAX_BYTES) {
+        return {
+          success: false,
+          message: `"${fileName}" is ${Math.round(buffer.length / (1024 * 1024))}MB, over the ${AgentModeService.MATERIALIZE_ASSET_MAX_BYTES / (1024 * 1024)}MB limit for asset materialization`
+        };
+      }
+
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const uploadResult = await uploadFileToS3(buffer, file.name || fileName, userId, mimeType);
+
+      if (!uploadResult.success || !uploadResult.url) {
+        return {
+          success: false,
+          message: uploadResult.error || 'Failed to upload asset to S3',
+          error: uploadResult.error || 's3_upload_failed'
+        };
+      }
+
+      return {
+        success: true,
+        message: `Materialized "${fileName}" from Google Drive as a hosted asset.`,
+        url: uploadResult.url,
+        file_name: file.name || fileName,
+        mime_type: mimeType,
+        size,
+        kb_identifier: kbIdentifier
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error materializing knowledge base asset:', error);
+      const code = error?.code || error?.status;
+      if (code === 404) {
+        return { success: false, message: `File "${fileName}" not found or not accessible` };
+      }
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Access denied reading this Google Drive file' };
+      }
+      return {
+        success: false,
+        message: `Failed to materialize "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
       };
     }
   }
@@ -22466,18 +23601,46 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
-      // Create as a standalone doc at workspace root
-      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content);
+      // Create as a standalone doc at workspace root, then attach the content as its
+      // first page. ClickUp's doc-create endpoint has no `content` param — content
+      // must be added via a separate page-create call, mirroring the parentDocId branch above.
+      const doc = await createClickUpDoc(clickUpToken, workspaceId, name);
+      try {
+        await createClickUpPageInDoc(clickUpToken, workspaceId, doc.id, name, content);
+      } catch (pageError) {
+        // The doc itself already exists in ClickUp at this point. Reporting a hard
+        // failure would risk the caller retrying and creating a second, duplicate
+        // empty doc — report partial success with the doc id instead.
+        console.error('AgentMode: Created ClickUp doc but failed to add its content page:', pageError);
+        return {
+          success: true,
+          message: `Created ClickUp document "${name}" in workspace "${workspace.name}", but failed to save its content: ${pageError instanceof Error ? pageError.message : 'Unknown error'}. Retry by calling write_clickup_doc with parent_doc_id="${doc.id}" to add the content as a page.`,
+          docId: doc.id,
+        };
+      }
       return {
         success: true,
         message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"`,
         docId: doc.id,
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('AgentMode: Error creating ClickUp doc:', error);
+
+      // ENG-1354: ClickUp's own API error body ({ err, ECODE }) is the only thing
+      // that can distinguish an OAuth-scope problem from a workspace-side
+      // permission restriction from a malformed request — Axios's generic
+      // "Request failed with status code N" collapses all three into the same
+      // unreadable message. Mirrors the error.response?.data extraction already
+      // used in publishBlogArticle.
+      let errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const clickUpError = error?.response?.data;
+      if (clickUpError?.err) {
+        errorMessage = `${clickUpError.err}${clickUpError.ECODE ? ` (ClickUp code: ${clickUpError.ECODE})` : ''}`;
+      }
+
       return {
         success: false,
-        message: `Failed to create ClickUp document "${name}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to create ClickUp document "${name}": ${errorMessage}`
       };
     }
   }
@@ -22499,7 +23662,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     const readWithDrive = async (driveClient: any) => {
-      const meta = await driveClient.files.get({ fileId, fields: 'id,name,mimeType,modifiedTime' });
+      const meta = await driveClient.files.get({ fileId, fields: 'id,name,mimeType,modifiedTime', supportsAllDrives: true });
       const { name, mimeType, modifiedTime } = meta.data;
       const isGoogleNative =
         mimeType === 'application/vnd.google-apps.document' ||
@@ -22597,6 +23760,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         fields: 'files(id,name,mimeType,modifiedTime,webViewLink),nextPageToken',
         orderBy: 'name',
         pageSize: 100,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
       });
 
       const files = resp.data.files || [];
@@ -22679,6 +23844,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         fields: 'files(id,name,mimeType,webViewLink,parents)',
         orderBy: 'modifiedTime desc',
         pageSize: 20,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
       });
 
       const files = resp.data.files || [];
@@ -23956,7 +25123,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const body = s3Ref ? msg.content.slice(s3Ref.length) : msg.content;
           // Summarize to a short preview instead of keeping 8KB
           const preview = body.slice(0, 200).replace(/\n/g, ' ').trim();
-          const compressed = `[Tool: ${msg.name} — ${preview}...]`;
+          // ENG-1310: the recovery path (re-read via read_tool_response/search_tool_response,
+          // or re-run the source tool) already existed via the S3 key above, but nothing told
+          // the model to actually USE it instead of re-serving a number from its own earlier
+          // reply — a compressed result a few calls back just silently disappeared, and the
+          // model kept going with whatever it had already said, which the prompt elsewhere
+          // forbids ("never quote an analytics number until you have read it in THIS
+          // session") but this placeholder never enforced. Say so explicitly, every time.
+          const recoveryHint = s3Ref
+            ? 're-read the full result via read_tool_response/search_tool_response using the S3 key above'
+            : `re-run ${msg.name} if you need the full result`;
+          const compressed = `[Tool: ${msg.name} — compressed for context; this preview is NOT a verified source — do not restate any number or figure from it, or from your own earlier reply, as confirmed; ${recoveryHint}. preview: ${preview}...]`;
           return { ...msg, content: s3Ref ? `${s3Ref.trim()}\n${compressed}` : compressed };
         }
       }
@@ -24247,6 +25424,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           }
         }
       });
+    }
+
+    if (updateResult.logoAutoPinIssue) {
+      formattedSummary += `<br><strong>⚠️ Logo not stored as an asset:</strong> ${updateResult.logoAutoPinIssue}<br>`;
     }
 
     formattedSummary += `<br><em>💡 You can view the latest brand guidelines at the <a href="/brand-guidelines">Brand Guidelines page</a>.</em>`;
@@ -28197,7 +29378,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         ], {
           temperature: 0.1,
           response_format: { type: 'json_object' },
-          max_completion_tokens: maxTokens
+          max_completion_tokens: maxTokens,
+          taskClass: 'content_generation',
         });
 
         const finishReason = substitutionResponse.choices[0].finish_reason;
@@ -29241,7 +30423,7 @@ ${strippedHtml}`;
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number }>, sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -29266,7 +30448,8 @@ ${strippedHtml}`;
           notes: undefined,
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds,
-          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount })
+          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
+          ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools })
         })),
         autocomplete: autocomplete || false,
         createdAt: new Date().toISOString(),
@@ -29310,7 +30493,7 @@ ${strippedHtml}`;
    */
   public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean }): Promise<any> {
     try {
-      const { workPlanService } = await import('./workPlanService');
+      const { getAccessiblePredefinedWorkPlanCandidates } = await import('./predefinedWorkPlanResolver');
 
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -29327,32 +30510,13 @@ ${strippedHtml}`;
         };
       }
 
-      // Resolve candidate plans with private (user/org) taking priority over system/public.
-      const candidates: any[] = [];
-      if (userId && !userId.startsWith('anon_')) {
-        try {
-          const { userDb } = await import('./db');
-          const user = await userDb.getUserById(userId);
-          const [ownPlans, orgPlans] = await Promise.all([
-            workPlanService.getWorkPlansByOwner(userId),
-            user?.orgId ? workPlanService.getWorkPlansByOrg(user.orgId) : Promise.resolve([]),
-          ]);
-          const seen = new Set<string>();
-          for (const p of [...ownPlans, ...orgPlans]) {
-            if (p.visibility === 'private' && !seen.has(p.planId)) {
-              seen.add(p.planId);
-              candidates.push(p);
-            }
-          }
-        } catch (err) {
-          console.warn('[applyPredefinedWorkPlan] Error loading private plans:', (err as Error).message);
-        }
-      }
-      const [systemPlans, publicPlans] = await Promise.all([
-        workPlanService.getWorkPlansByVisibility('system'),
-        workPlanService.getWorkPlansByVisibility('public'),
-      ]);
-      candidates.push(...systemPlans, ...publicPlans);
+      // ENG-1472: the private/org/system/public candidate-building logic that used
+      // to be inlined here now lives in predefinedWorkPlanResolver.ts (shared with
+      // the recommend_predefined_work_plan tool and the accept endpoint). This
+      // method still matches by title OR planId (unlike the resolver's strict
+      // planId-only lookup) to keep launch_predefined_work_plan's existing
+      // behavior — title-based launches from Emma — unchanged.
+      const candidates = await getAccessiblePredefinedWorkPlanCandidates(userId);
 
       const needle = planTitleOrId.toLowerCase();
       const predefinedPlan = candidates.find(
@@ -29380,11 +30544,17 @@ ${strippedHtml}`;
           requiredFunctionCalls: step.requiredFunctionCalls,
           skillIds: step.skillIds,
           ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
+          ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
         autocomplete: predefinedPlan.autocomplete || false,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        // ENG-1472: which predefined template this session's plan was launched
+        // from, so a completed run can traceably chain into its author-approved
+        // "next plan" suggestions and so the accept endpoint can idempotently
+        // detect "this recommendation was already applied".
+        templatePlanId: predefinedPlan.planId,
       };
       await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
 
@@ -29435,7 +30605,139 @@ ${strippedHtml}`;
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
+  /**
+   * Scan a session's persisted assistant messages for an existing
+   * `workplan_recommendation` (v1) result naming `planId`, so a repeated
+   * recommend call returns the SAME proposal instead of adding another
+   * (ENG-1472 closed decision #8: a plan is proposed at most once per session).
+   * Thin wrapper over the shared scan in predefinedWorkPlanResolver.ts, which
+   * the accept endpoint also uses (lookup by recommendationId instead).
+   */
+  private async findPersistedWorkPlanRecommendation(messages: any[] | undefined, planId: string): Promise<any | null> {
+    const { findWorkPlanRecommendationToolResult } = await import('./predefinedWorkPlanResolver');
+    return findWorkPlanRecommendationToolResult(messages, (r) => r.plan?.id === planId);
+  }
+
+  /**
+   * Propose (but never instantiate) an existing, accessible predefined work plan
+   * inline during chat (ENG-1472). The proposal is a persisted structured tool
+   * result — `session.workPlan` is never mutated here; the plan only starts when
+   * the owner explicitly accepts it via the work-plan-recommendation accept
+   * endpoint, which itself calls `applyPredefinedWorkPlan`.
+   *
+   * The backend trusts only `planId` and the model's short `reason` — title,
+   * summary, and steps always come from the canonical server record resolved
+   * through `resolveAccessiblePredefinedWorkPlan`, never from anything the model
+   * supplied. `options.source` is an optional marker ("completion_next") for the
+   * completion-recommendation extension so the UI can distinguish an ordinary
+   * in-chat proposal from one following a just-completed plan's author-approved
+   * "what's next" suggestions; every other rule (dedupe, ownership, access,
+   * boundary validation) is identical for both.
+   */
+  public async recommendPredefinedWorkPlan(
+    planId: string,
+    reason: string,
+    sessionId: string,
+    userId?: string,
+    options?: { source?: string },
+  ): Promise<any> {
+    try {
+      // Boundary validation first — structured, non-customer-sensitive errors
+      // that never touch the database. Empty strings are already rejected by
+      // the tool-gateway's required-argument check upstream; these guards make
+      // the contract hold even when this method is called directly (as the
+      // accept-endpoint's sibling paths and tests do).
+      if (typeof planId !== 'string' || planId.trim() === '') {
+        return { success: false, message: 'recommend_predefined_work_plan requires a non-empty planId.' };
+      }
+      if (planId.length > 128) {
+        return { success: false, message: 'recommend_predefined_work_plan requires planId to be at most 128 characters.' };
+      }
+      if (typeof reason !== 'string' || reason.trim() === '') {
+        return { success: false, message: 'recommend_predefined_work_plan requires a non-empty reason.' };
+      }
+      if (reason.length > 240) {
+        return { success: false, message: 'recommend_predefined_work_plan requires reason to be at most 240 characters.' };
+      }
+      if (!sessionId) {
+        return { success: false, message: 'recommend_predefined_work_plan requires an active session.' };
+      }
+
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return { success: false, message: 'Session not found' };
+      }
+
+      // Dedupe: an already-persisted recommendation for this exact plan wins
+      // outright — including its ORIGINAL reason. A second call (the model
+      // re-proposing, or asking again with different wording) never overwrites
+      // the first proposal the user is looking at.
+      const existing = await this.findPersistedWorkPlanRecommendation(session.messages, planId);
+      if (existing) {
+        return { success: true, ...existing };
+      }
+
+      const { resolveAccessiblePredefinedWorkPlan } = await import('./predefinedWorkPlanResolver');
+      const plan = await resolveAccessiblePredefinedWorkPlan({ planId, userId });
+      if (!plan) {
+        // Deliberately the SAME message for deleted / pending-review / private-
+        // inaccessible / malformed — never leaks WHY a plan can't be recommended.
+        return { success: false, message: `Work plan template "${planId}" is not available.` };
+      }
+
+      const trimmedReason = reason.trim();
+      const rawSteps = Array.isArray(plan.steps) ? plan.steps : [];
+      const steps = rawSteps.slice(0, 4).map((step: any, idx: number) => ({
+        position: typeof step?.stepCount === 'number' ? step.stepCount : idx + 1,
+        // Until ENG-1469's customer-readable display metadata exists, fall back
+        // to the step's raw title (documented fallback per the ENG-1472 spec).
+        label: typeof step?.title === 'string' && step.title.trim() !== '' ? step.title : `Step ${idx + 1}`,
+      }));
+
+      // Deterministic opaque id: the SAME session recommending the SAME plan
+      // twice (with no persisted history to dedupe against yet, e.g. two
+      // concurrent turns) converges on one id instead of two unrelated ones.
+      const recommendationId = createHash('sha256').update(`${sessionId}:${plan.planId}`).digest('hex').slice(0, 32);
+
+      const source = options?.source === 'completion_next' ? 'completion_next' as const : undefined;
+
+      // Same source fields ENG-1469's customer projection uses — no new
+      // persisted data, just surfacing what the plan record already has.
+      const thumbnailUrl = typeof (plan as any).thumbnail_url === 'string' ? (plan as any).thumbnail_url.trim() : '';
+      const thumbnail = thumbnailUrl
+        ? {
+            url: thumbnailUrl,
+            alt: typeof (plan as any).thumbnail_alt_text === 'string' ? (plan as any).thumbnail_alt_text.trim() : '',
+          }
+        : undefined;
+
+      return {
+        success: true,
+        type: 'workplan_recommendation' as const,
+        version: 1 as const,
+        recommendationId,
+        plan: {
+          id: plan.planId,
+          title: plan.title,
+          summary: typeof plan.description === 'string' ? plan.description : '',
+          steps,
+          ...(thumbnail ? { thumbnail } : {}),
+        },
+        reason: trimmedReason,
+        ...(source ? { source } : {}),
+        formattedContent: `Recommended work plan "${plan.title}" — ${trimmedReason}`,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error recommending predefined work plan:', error);
+      return {
+        success: false,
+        message: 'Failed to recommend work plan',
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -29471,8 +30773,10 @@ ${strippedHtml}`;
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
             // Allow scope changes: an explicit expectedAssetCount overrides (including 0
             // to clear the asset gate when the user approves a smaller set); omitting it
-            // preserves the existing value.
-            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount
+            // preserves the existing value. Same override-or-preserve semantics for
+            // expectedAssetCountTools (ENG-1331).
+            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount,
+            expectedAssetCountTools: newStep.expectedAssetCountTools !== undefined ? newStep.expectedAssetCountTools : workPlan.steps[existingIndex].expectedAssetCountTools
           };
         } else {
           // Add new step (stepCount will be fixed by updateSessionWorkPlan)
@@ -29486,7 +30790,8 @@ ${strippedHtml}`;
             notes: undefined,
             requiredFunctionCalls: newStep.requiredFunctionCalls,
             skillIds: newStep.skillIds,
-            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount })
+            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount }),
+            ...(newStep.expectedAssetCountTools !== undefined && { expectedAssetCountTools: newStep.expectedAssetCountTools })
           });
         }
       }
@@ -29518,90 +30823,290 @@ ${strippedHtml}`;
     updates: Array<{ stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string }>,
     sessionId: string
   ): Promise<any> {
-    try {
-      const session = await chatbotDb.getChatSession(sessionId);
-      if (!session || !session.workPlan) {
-        return {
-          success: false,
-          message: 'No work plan found in this session. Create one first using create_work_plan.'
-        };
-      }
-
-      const workPlan = { ...session.workPlan };
-      const updatedSteps: Array<{ stepCount: number; title: string; status: string }> = [];
-      const notFoundSteps: number[] = [];
-      const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
-
-      // Get function call counts from session (make a copy to modify)
-      const calledFunctionCounts = { ...(session.calledFunctions || {}) };
-      let countsModified = false;
-
-      // Count media assets actually produced this session (distinct "Image generated:"
-      // markers), used by the expectedAssetCount completion gate below. This is ground
-      // truth from the message history — independent of the calledFunctions counter,
-      // which can be inflated by non-producing generate_image returns (confirmation
-      // gate). Computed once; cheap relative to the DynamoDB round-trips already done.
-      const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages).length;
-      const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
-
-      // Process each update
-      for (const update of updates) {
-        const stepIndex = workPlan.steps.findIndex(s => s.stepCount === update.stepCount);
-
-        if (stepIndex < 0) {
-          notFoundSteps.push(update.stepCount);
+    // ENG-1626: set_work_plan_status persists workplan step progression — a
+    // production session (822c1ed4) hit set_work_plan_status twice while the
+    // customer watched "Step 9 of 10" live, with no system-level retry, so a
+    // transient DynamoDB/network blip anywhere in the read-modify-write below
+    // surfaced immediately as a customer-visible failure. One transparent retry
+    // for a classified-transient error (timeout/network/rate_limit/upstream_5xx)
+    // before giving up — the same classifier the model-visible retry guidance
+    // already uses, so this and that guidance never disagree about what's
+    // retryable. Deliberate gate refusals (missing steps, out-of-order
+    // completion, etc.) never throw, so they pass straight through on the
+    // first attempt untouched.
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        return await this.setWorkPlanStatusAttempt(updates, sessionId);
+      } catch (error) {
+        lastError = error;
+        const errorClass = classifyToolErrorClass(error);
+        if (attempt < 2 && isRetryableErrorClass(errorClass)) {
+          console.warn(`AgentMode: set_work_plan_status failed with a transient error (${errorClass}) for session ${sessionId}; retrying once`);
           continue;
         }
+        break;
+      }
+    }
+    console.error('AgentMode: Error setting work plan status:', lastError);
+    return {
+      success: false,
+      message: 'Failed to update work plan status',
+      error: lastError instanceof Error ? lastError.message : 'Unknown error'
+    };
+  }
 
-        const step = workPlan.steps[stepIndex];
+  private async setWorkPlanStatusAttempt(
+    updates: Array<{ stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string }>,
+    sessionId: string
+  ): Promise<any> {
+    // ENG-1188 (Greptile): consistentRead, not the default eventually-consistent
+    // read -- a turn that writes an "Image generated" marker and then
+    // immediately calls set_work_plan_status in the same turn can otherwise race
+    // a stale replica and see too few images, rejecting genuinely-complete work
+    // as insufficientAssets. ENG-510 built this parameter for exactly this "just
+    // wrote it, must see it now" shape (agentModeController.ts already uses it
+    // for the analogous timed-out-run read).
+    const session = await chatbotDb.getChatSession(sessionId, true);
+    if (!session || !session.workPlan) {
+      return {
+        success: false,
+        message: 'No work plan found in this session. Create one first using create_work_plan.'
+      };
+    }
 
-        // Validate required function calls if marking as completed
-        if (update.status === 'completed' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
-          // Count how many times each function is required
-          const requiredCounts: Record<string, number> = {};
-          for (const fn of step.requiredFunctionCalls) {
-            requiredCounts[fn] = (requiredCounts[fn] || 0) + 1;
-          }
+    // ENG-1626 (code review): the retry wrapper in setWorkPlanStatus can re-invoke
+    // this attempt after a classified-transient error whose underlying DynamoDB
+    // writes actually committed server-side (ack-lost) -- the client sees a
+    // timeout/network failure, but updateSessionWorkPlan/updateCalledFunctions
+    // below are unconditional SETs with no idempotency key. Blindly re-running a
+    // step's mutation would re-decrement an already-decremented
+    // calledFunctionCounts and re-stamp resolvedAt, corrupting the asset-count
+    // cutoff window for later steps.
+    //
+    // ENG-1626 (CodeRabbit follow-up): an early return here for the whole batch
+    // was too broad -- it also skipped the post-write side effects below
+    // (updateSessionWorkPlanInputRequest, i.e. the NEXT step's decision card,
+    // and addAssociatedSkills). If attempt 1's updateSessionWorkPlan committed
+    // but a later call in that same attempt threw, the retry would see every
+    // step already at its target status and return success WITHOUT ever
+    // creating the decision card or installing the next step's skills -- the
+    // exact "customer never sees a card" failure this issue is about. Those
+    // calls are independently safe to repeat (updateSessionWorkPlanInputRequest
+    // is guarded by failIfAwaitingExists and returns null rather than
+    // throwing if one already exists; addAssociatedSkills filters against
+    // already-associated ids), so only the unsafe per-step mutation
+    // (calledFunctionCounts decrement, resolvedAt/completedAt stamp) is
+    // skipped below -- scoped per step, not per batch, so a batch mixing an
+    // already-applied step with a genuinely new one handles each correctly.
+    const alreadyAppliedStepCounts = new Set(
+      updates
+        .filter(update => {
+          const step = session.workPlan!.steps.find((s: any) => s.stepCount === update.stepCount);
+          return !!step && step.status === update.status;
+        })
+        .map(update => update.stepCount)
+    );
 
-          // Check if we have enough calls for each required function
-          const missing: string[] = [];
-          for (const [fn, requiredCount] of Object.entries(requiredCounts)) {
-            const availableCount = calledFunctionCounts[fn] || 0;
-            if (availableCount < requiredCount) {
-              missing.push(`${fn} (need ${requiredCount}, have ${availableCount})`);
-            }
-          }
+    // ENG-1188 (Greptile follow-up): each step's PRE-BATCH resolvedAt/completedAt
+    // AND status, captured before any update in THIS call runs. workPlan.steps
+    // below starts as the SAME array session.workPlan.steps points at (the
+    // spread on the next line only copies the top-level object), so an
+    // in-place `workPlan.steps[i] = {...}` replacement further down is visible
+    // through both references — reading a "live" cutoff would see this batch's
+    // OWN just-assigned timestamps, collapsing every step resolved together in
+    // one call to the same instant and wrongly excluding assets a later step in
+    // that same batch actually produced in an earlier turn.
+    //
+    // Status is captured alongside the timestamp (CodeRabbit, PR #2430): a step
+    // that was completed/skipped and later reset to 'pending' (e.g. its assets
+    // need regenerating) keeps its old resolvedAt/completedAt untouched — only
+    // a 'completed'/'skipped' transition refreshes those fields. Blindly trusting
+    // that stale timestamp as a cutoff for a later step would wrongly widen the
+    // asset-count window with assets from the step's earlier, now-superseded
+    // attempt — see the cutoff walk below for how a reset step's PRE-BATCH
+    // status routes it to its fresh LIVE timestamp instead.
+    const originalStepStateByCount = new Map<number, { resolvedAt: string | undefined; status: string }>(
+      session.workPlan.steps.map((s: any) => [s.stepCount, { resolvedAt: s.resolvedAt || s.completedAt, status: s.status }])
+    );
 
-          if (missing.length > 0) {
-            missingFunctionCalls.push({
-              stepCount: update.stepCount,
-              title: step.title,
-              missing
-            });
-            continue; // Skip updating this step
-          }
+    const workPlan = { ...session.workPlan };
+    const updatedSteps: Array<{ stepCount: number; title: string; status: string }> = [];
+    const notFoundSteps: number[] = [];
+    const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
+    const outOfOrderSteps: Array<{ stepCount: number; title: string; pendingSteps: string[] }> = [];
 
-          // If validation passed and marking as completed, decrement the function counts
-          for (const fn of step.requiredFunctionCalls) {
-            calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
-            countsModified = true;
+    // Get function call counts from session (make a copy to modify)
+    const calledFunctionCounts = { ...(session.calledFunctions || {}) };
+    let countsModified = false;
+
+    const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
+
+    // Process each update
+    for (const update of updates) {
+      const stepIndex = workPlan.steps.findIndex(s => s.stepCount === update.stepCount);
+
+      if (stepIndex < 0) {
+        notFoundSteps.push(update.stepCount);
+        continue;
+      }
+
+      const step = workPlan.steps[stepIndex];
+
+      // ENG-1626 (CodeRabbit follow-up): this step already carries the
+      // requested status from a prior (ack-lost) attempt -- report it as
+      // updated so the persistence/input-request/skills block below still
+      // runs, and still apply `notes` (a plain overwrite with no side
+      // effects, same as the normal path below), but skip every gate and the
+      // resolvedAt/completedAt/calledFunctionCounts mutation for it (those
+      // already ran once; re-running them would corrupt state).
+      if (alreadyAppliedStepCounts.has(update.stepCount)) {
+        workPlan.steps[stepIndex] = { ...workPlan.steps[stepIndex], notes: update.notes };
+        updatedSteps.push({ stepCount: update.stepCount, title: step.title, status: update.status });
+        continue;
+      }
+
+      // Cross-step ordering gate (ENG-1188 root cause fault #3): the xCures
+      // incident marked "QA, Contact Sheet & Delivery" completed while "Render
+      // the Full Size Matrix" — an earlier step — was still pending, so delivery
+      // never actually gated on the rendering it claimed to deliver. Neither gate
+      // below catches this: both only look at the step being completed, never at
+      // whether the steps before it are actually done. Checked against the
+      // in-progress workPlan.steps (not a snapshot from before the loop), so
+      // several steps completed in the same batch, in order, chain correctly —
+      // and a batch that completes them out of order is caught per-step.
+      if (update.status === 'completed') {
+        const pendingEarlierSteps = workPlan.steps.filter(
+          (s: any) => s.stepCount < step.stepCount && s.status !== 'completed' && s.status !== 'skipped'
+        );
+        if (pendingEarlierSteps.length > 0) {
+          outOfOrderSteps.push({
+            stepCount: update.stepCount,
+            title: step.title,
+            pendingSteps: pendingEarlierSteps.map((s: any) => `${s.stepCount} "${s.title}"`),
+          });
+          continue; // Skip updating this step
+        }
+      }
+
+      // Validate required function calls if marking as completed
+      if (update.status === 'completed' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+        // Count how many times each function is required
+        const requiredCounts: Record<string, number> = {};
+        for (const fn of step.requiredFunctionCalls) {
+          requiredCounts[fn] = (requiredCounts[fn] || 0) + 1;
+        }
+
+        // Check if we have enough calls for each required function
+        const missing: string[] = [];
+        for (const [fn, requiredCount] of Object.entries(requiredCounts)) {
+          const availableCount = calledFunctionCounts[fn] || 0;
+          if (availableCount < requiredCount) {
+            missing.push(`${fn} (need ${requiredCount}, have ${availableCount})`);
           }
         }
 
-        // Asset-count completion gate. When a step declares expectedAssetCount, it may
-        // not be marked completed until the session has actually produced that many
-        // media assets. This prevents the xCures failure mode: a "Generate 3 Images Per
-        // Hook — 18 total" step being marked done with only 3 images produced (the model
-        // self-reported "Hooks 2-6 generate-pending" yet completed the step). The
-        // required-function-calls gate above could not catch this — it only checked that
-        // generate_image was called ≥1×, and the call counter was inflated to 76 by
-        // non-producing confirmation-gate returns. Counting real assets is the fix.
-        // The user can still legitimately reduce scope via modify_work_plan (lowering or
-        // clearing expectedAssetCount), so this never becomes an unrecoverable block.
-        if (update.status === 'completed'
-          && typeof step.expectedAssetCount === 'number'
-          && step.expectedAssetCount > 0
-          && producedAssetCount < step.expectedAssetCount) {
+        if (missing.length > 0) {
+          missingFunctionCalls.push({
+            stepCount: update.stepCount,
+            title: step.title,
+            missing
+          });
+          continue; // Skip updating this step
+        }
+
+        // If validation passed and marking as completed, decrement the function counts
+        for (const fn of step.requiredFunctionCalls) {
+          calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
+          countsModified = true;
+        }
+      }
+
+      // Asset-count completion gate. When a step declares expectedAssetCount, it may
+      // not be marked completed until IT has actually produced that many media
+      // assets. This prevents the xCures failure mode: a "Generate 3 Images Per
+      // Hook — 18 total" step being marked done with only 3 images produced (the model
+      // self-reported "Hooks 2-6 generate-pending" yet completed the step). The
+      // required-function-calls gate above could not catch this — it only checked that
+      // generate_image was called ≥1×, and the call counter was inflated to 76 by
+      // non-producing confirmation-gate returns. Counting real assets is the fix.
+      // The user can still legitimately reduce scope via modify_work_plan (lowering or
+      // clearing expectedAssetCount), so this never becomes an unrecoverable block.
+      //
+      // ENG-1188: scoped to images generated SINCE the previous step resolved, not
+      // the whole session — otherwise an earlier step's images satisfy a later
+      // step's requirement without it producing anything of its own (e.g. step 1's
+      // 18 hero images would silently cover step 2's own "3 required" declaration).
+      // No earlier step (or none with a resolvedAt yet) means no cutoff, matching
+      // the session-wide count this replaces for step 1.
+      //
+      // ENG-1188 (Greptile follow-up): the cutoff comes from each earlier step's
+      // PRE-BATCH resolvedAt (originalStepStateByCount, captured before this call
+      // started), walking back to the nearest earlier step that already had one —
+      // NOT the live in-progress workPlan.steps. A step resolved earlier in this
+      // SAME batch shares this instant as its live timestamp, which would exclude
+      // assets this step actually produced in an earlier turn; a step resolved
+      // in this same batch simply contributes no cutoff of its own, same as a
+      // step that has never resolved.
+      //
+      // ENG-1188 (CodeRabbit follow-up): a step can be reset to 'pending' after
+      // having been completed/skipped before (e.g. its assets need
+      // regenerating) — only 'completed'/'skipped' transitions stamp
+      // resolvedAt/completedAt, so a reset step KEEPS its stale timestamp from
+      // the earlier, now-superseded attempt. The ordering gate above means the
+      // only way we can reach a 'completed' update here with an earlier step's
+      // PRE-BATCH status of 'pending' is if that earlier step is ALSO being
+      // resolved within this very batch (otherwise it would still be pending
+      // live, too, and the ordering gate would have rejected this update
+      // already). In that case, trust the fresh, just-stamped LIVE timestamp
+      // for that step instead of its stale pre-batch one — that boundary is
+      // exactly "when did this step's redo actually finish," which correctly
+      // excludes both the stale pre-reset attempt's assets AND any redo-work
+      // assets produced leading up to this exact re-completion. A step with NO
+      // prior resolution at all (genuinely first-time-completed within this
+      // batch) still contributes no cutoff, same as the existing behavior.
+      if (update.status === 'completed'
+        && typeof step.expectedAssetCount === 'number'
+        && step.expectedAssetCount > 0) {
+        const earlierStepCounts = workPlan.steps
+          .filter((s: any) => s.stepCount < step.stepCount)
+          .map((s: any) => s.stepCount as number)
+          .sort((a: number, b: number) => b - a); // nearest first
+        let sinceIso: string | undefined;
+        for (const count of earlierStepCounts) {
+          const preBatch = originalStepStateByCount.get(count);
+          if (!preBatch) continue;
+          if (preBatch.status === 'completed' || preBatch.status === 'skipped') {
+            if (preBatch.resolvedAt) { sinceIso = preBatch.resolvedAt; break; }
+            continue;
+          }
+          if (preBatch.resolvedAt) {
+            const live = workPlan.steps.find((s: any) => s.stepCount === count);
+            if (live?.resolvedAt) { sinceIso = live.resolvedAt; break; }
+          }
+        }
+        // ENG-1331: extractGeneratedImageFilenames only recognizes generate_image's
+        // own marker, so a step whose deliverable is Playwright-rendered
+        // screenshots (no generate_image call at all) would always read 0 there.
+        // extractProducedAssetCount reads the same persisted toolCalls ledger for
+        // every known asset-producing tool.
+        //
+        // When the step names its own expectedAssetCountTools, trust that
+        // explicitly and skip the max-with-legacy-signal blend below: the whole
+        // point of naming the tool(s) is precision, and blending in
+        // extractGeneratedImageFilenames' generate_image count would reopen the
+        // exact ambiguity the author resolved by naming their tool(s) at all (e.g.
+        // an unrelated generate_image call elsewhere in the step inflating a
+        // screenshot-only count). Without a declared list, take the max of both
+        // signals so neither detection path can pull the count DOWN relative to
+        // the other — the safe default for a step that hasn't disambiguated.
+        const producedAssetCount = step.expectedAssetCountTools?.length
+          ? extractProducedAssetCount(session.messages, sinceIso, step.expectedAssetCountTools)
+          : Math.max(
+              AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
+              extractProducedAssetCount(session.messages, sinceIso),
+            );
+        if (producedAssetCount < step.expectedAssetCount) {
           insufficientAssets.push({
             stepCount: update.stepCount,
             title: step.title,
@@ -29610,115 +31115,170 @@ ${strippedHtml}`;
           });
           continue; // Skip updating this step
         }
-
-        // Update the step status
-        workPlan.steps[stepIndex] = {
-          ...workPlan.steps[stepIndex],
-          status: update.status,
-          notes: update.notes,
-          completedAt: update.status === 'completed' ? new Date().toISOString() : workPlan.steps[stepIndex].completedAt
-        };
-
-        updatedSteps.push({
-          stepCount: update.stepCount,
-          title: workPlan.steps[stepIndex].title,
-          status: update.status
-        });
       }
 
-      // Check if there are missing function calls - this is a critical error
-      if (missingFunctionCalls.length > 0) {
-        const errorDetails = missingFunctionCalls.map(mfc =>
-          `Step ${mfc.stepCount} "${mfc.title}": missing required function calls: ${mfc.missing.join(', ')}`
-        ).join('\n');
+      // Update the step status
+      const resolvedNow = update.status === 'completed' || update.status === 'skipped'
+        ? new Date().toISOString()
+        : undefined;
+      workPlan.steps[stepIndex] = {
+        ...workPlan.steps[stepIndex],
+        status: update.status,
+        notes: update.notes,
+        completedAt: update.status === 'completed' ? resolvedNow : workPlan.steps[stepIndex].completedAt,
+        // ENG-1188 (Greptile follow-up): set for 'skipped' too, unlike completedAt
+        // — see the field's doc comment in chatbotService.ts for why this can't
+        // just reuse completedAt.
+        resolvedAt: resolvedNow || workPlan.steps[stepIndex].resolvedAt,
+      };
 
-        return {
-          success: false,
-          message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
-          missingFunctionCalls,
-          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nPlease make the required function calls first, then mark the steps as completed.`
-        };
-      }
+      updatedSteps.push({
+        stepCount: update.stepCount,
+        title: workPlan.steps[stepIndex].title,
+        status: update.status
+      });
+    }
 
-      // Asset-count gate failure — the step's declared media assets are not all produced.
-      if (insufficientAssets.length > 0) {
-        const errorDetails = insufficientAssets.map(ia =>
-          `Step ${ia.stepCount} "${ia.title}": ${ia.produced} of ${ia.expected} required images/assets have been generated (${ia.expected - ia.produced} still missing)`
-        ).join('\n');
-
-        return {
-          success: false,
-          message: 'Cannot mark steps as completed. The required number of assets has not been generated yet.',
-          insufficientAssets,
-          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nGenerate the remaining assets with generate_image, then mark the step completed. If the user has explicitly approved a smaller set, call modify_work_plan to lower the step's expected asset count first.`
-        };
-      }
-
-      // Check if any steps were not found
-      if (notFoundSteps.length > 0 && updatedSteps.length === 0) {
-        return {
-          success: false,
-          message: `Steps not found: ${notFoundSteps.join(', ')}`
-        };
-      }
-
-      // Only update if there are changes
-      if (updatedSteps.length > 0) {
-        workPlan.updatedAt = new Date().toISOString();
-        // Update the session (will throw error if stepCount is not sequential)
-        await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
-
-        // Update function counts if they were modified
-        if (countsModified) {
-          await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
-        }
-
-        // Auto-install skills for the next pending step
-        const completedStepCounts = updatedSteps.filter(s => s.status === 'completed').map(s => s.stepCount);
-        if (completedStepCounts.length > 0) {
-          const nextPendingStep = workPlan.steps
-            .sort((a: any, b: any) => a.stepCount - b.stepCount)
-            .find((s: any) => s.status === 'pending');
-          if (nextPendingStep?.skillIds?.length) {
-            try {
-              const currentAssociated = session.associatedSkills || [];
-              const newSkillIds = nextPendingStep.skillIds.filter((id: string) => !currentAssociated.includes(id));
-              if (newSkillIds.length > 0) {
-                await chatbotDb.addAssociatedSkills(sessionId, newSkillIds);
-                console.log(`AgentMode: Auto-installed skills for step ${nextPendingStep.stepCount}: ${newSkillIds.join(', ')}`);
-              }
-            } catch (skillErr) {
-              console.error('AgentMode: Error auto-installing skills for next step:', skillErr);
-            }
-          }
-        }
-      }
-
-      const message = updatedSteps.length === 1
-        ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
-        : `Updated ${updatedSteps.length} step${updatedSteps.length > 1 ? 's' : ''}`;
-
-      const formattedContent = updatedSteps.map(s =>
-        `Updated step ${s.stepCount} "${s.title}" to ${s.status}`
+    // Ordering gate failure — a step was completed while an earlier step in the
+    // plan is still pending. Same all-or-nothing shape as the two gates below:
+    // the caller can just resend the batch in the correct order.
+    if (outOfOrderSteps.length > 0) {
+      const errorDetails = outOfOrderSteps.map(oos =>
+        `Step ${oos.stepCount} "${oos.title}": earlier step(s) not yet done: ${oos.pendingSteps.join(', ')}`
       ).join('\n');
 
       return {
-        success: updatedSteps.length > 0,
-        message: notFoundSteps.length > 0
-          ? `${message}. Steps not found: ${notFoundSteps.join(', ')}`
-          : message,
-        updatedSteps,
-        notFoundSteps: notFoundSteps.length > 0 ? notFoundSteps : undefined,
-        formattedContent
-      };
-    } catch (error) {
-      console.error('AgentMode: Error setting work plan status:', error);
-      return {
         success: false,
-        message: 'Failed to update work plan status',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        // ENG-1626: this is a deliberate business-rule gate, not a malfunction --
+        // blocked/reason lets recordToolFailure (agentToolGatewayService) recognize
+        // it as a ToolResultPolicyBlockedError and skip it, the same telemetry
+        // carve-out ENG-1636 established. Without this, a self-corrected refusal
+        // like this one incremented failedFunctions.set_work_plan_status and read
+        // as an infra flake on the failure-cluster dashboard.
+        blocked: true,
+        reason: 'workplan_out_of_order',
+        message: 'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
+        outOfOrderSteps,
+        formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nComplete (or explicitly skip) the earlier step(s) first, then mark this step as completed.`
       };
     }
+
+    // Check if there are missing function calls - this is a critical error
+    if (missingFunctionCalls.length > 0) {
+      const errorDetails = missingFunctionCalls.map(mfc =>
+        `Step ${mfc.stepCount} "${mfc.title}": missing required function calls: ${mfc.missing.join(', ')}`
+      ).join('\n');
+
+      return {
+        success: false,
+        // ENG-1626: deliberate gate, see the out-of-order gate above for why
+        // blocked/reason is set here.
+        blocked: true,
+        reason: 'workplan_missing_function_calls',
+        message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
+        missingFunctionCalls,
+        formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nPlease make the required function calls first, then mark the steps as completed.`
+      };
+    }
+
+    // Asset-count gate failure — the step's declared media assets are not all produced.
+    if (insufficientAssets.length > 0) {
+      const errorDetails = insufficientAssets.map(ia =>
+        `Step ${ia.stepCount} "${ia.title}": ${ia.produced} of ${ia.expected} required images/assets have been generated (${ia.expected - ia.produced} still missing)`
+      ).join('\n');
+
+      return {
+        success: false,
+        // ENG-1626: deliberate gate, see the out-of-order gate above for why
+        // blocked/reason is set here.
+        blocked: true,
+        reason: 'workplan_insufficient_assets',
+        message: 'Cannot mark steps as completed. The required number of assets has not been generated yet.',
+        insufficientAssets,
+        formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nGenerate the remaining assets with generate_image, then mark the step completed. If the user has explicitly approved a smaller set, call modify_work_plan to lower the step's expected asset count first.`
+      };
+    }
+
+    // Check if any steps were not found
+    if (notFoundSteps.length > 0 && updatedSteps.length === 0) {
+      return {
+        success: false,
+        // ENG-1626: deliberate gate (bad stepCount), see the out-of-order gate
+        // above for why blocked/reason is set here.
+        blocked: true,
+        reason: 'workplan_step_not_found',
+        message: `Steps not found: ${notFoundSteps.join(', ')}`
+      };
+    }
+
+    // Only update if there are changes
+    if (updatedSteps.length > 0) {
+      workPlan.updatedAt = new Date().toISOString();
+      // Update the session (will throw error if stepCount is not sequential)
+      await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      // A configured input belongs to the step that just became active, not
+      // to a particular portal. Persist the same request the customer portal
+      // renders and an MCP client elicits natively. Answered historical
+      // requests may be replaced; a concurrent live request never is.
+      const nextInputStep = workPlan.steps
+        .sort((a: any, b: any) => a.stepCount - b.stepCount)
+        .find((s: any) => s.status === 'pending' && s.inputRequest);
+      if (nextInputStep?.inputRequest) {
+        await chatbotDb.updateSessionWorkPlanInputRequest(
+          sessionId,
+          buildWorkPlanInputRequest({
+            ...nextInputStep.inputRequest,
+            requestId: uuidv4(),
+            stepCount: nextInputStep.stepCount,
+          }),
+          { failIfAwaitingExists: true },
+        );
+      }
+
+      // Update function counts if they were modified
+      if (countsModified) {
+        await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
+      }
+
+      // Auto-install skills for the next pending step
+      const completedStepCounts = updatedSteps.filter(s => s.status === 'completed').map(s => s.stepCount);
+      if (completedStepCounts.length > 0) {
+        const nextPendingStep = workPlan.steps
+          .sort((a: any, b: any) => a.stepCount - b.stepCount)
+          .find((s: any) => s.status === 'pending');
+        if (nextPendingStep?.skillIds?.length) {
+          try {
+            const currentAssociated = session.associatedSkills || [];
+            const newSkillIds = nextPendingStep.skillIds.filter((id: string) => !currentAssociated.includes(id));
+            if (newSkillIds.length > 0) {
+              await chatbotDb.addAssociatedSkills(sessionId, newSkillIds);
+              console.log(`AgentMode: Auto-installed skills for step ${nextPendingStep.stepCount}: ${newSkillIds.join(', ')}`);
+            }
+          } catch (skillErr) {
+            console.error('AgentMode: Error auto-installing skills for next step:', skillErr);
+          }
+        }
+      }
+    }
+
+    const message = updatedSteps.length === 1
+      ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
+      : `Updated ${updatedSteps.length} step${updatedSteps.length > 1 ? 's' : ''}`;
+
+    const formattedContent = updatedSteps.map(s =>
+      `Updated step ${s.stepCount} "${s.title}" to ${s.status}`
+    ).join('\n');
+
+    return {
+      success: updatedSteps.length > 0,
+      message: notFoundSteps.length > 0
+        ? `${message}. Steps not found: ${notFoundSteps.join(', ')}`
+        : message,
+      updatedSteps,
+      notFoundSteps: notFoundSteps.length > 0 ? notFoundSteps : undefined,
+      formattedContent
+    };
   }
 
   public async listBooks(userId: string, type?: string, status?: string): Promise<any> {
@@ -30666,6 +32226,42 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     return describeMetaAdsCapability(acc);
   }
 
+  /**
+   * ENG-1362. What an agent needs to know before choosing a Google Ads account to act on.
+   *
+   * `is_active` and `account_name` were the whole of it, which meant the only signal for
+   * "is this safe to experiment in" was the NAME — and a name guarantees nothing. There is
+   * a real, billable, ENABLED account on this platform whose descriptive name is literally
+   * "Test". An agent asked to "use the test account" would pick it on the strength of that
+   * string and spend real money.
+   *
+   * Google's own mechanism is `customer.test_account`: when true, the account CANNOT serve
+   * ads and CANNOT spend. That is the fact worth surfacing, so it is surfaced.
+   *
+   * `can_spend` is derived here rather than left to each caller, and derived so that only
+   * an affirmative `test_account: true` clears it. `false` and unknown both mean real
+   * money. Making every consumer re-derive that is how "we never recorded it" quietly
+   * becomes "it's fine".
+   */
+  private async describeGoogleAdsAccount(
+    userId: string,
+    config: GoogleAdsConfigShape,
+  ): Promise<Record<string, unknown>> {
+    const customerId = config.customer_id;
+    // Recorded at connect time for anything connected since ENG-1362; resolved live (and
+    // process-cached) for older records, so the answer is never simply missing.
+    const testAccount = typeof config.test_account === 'boolean'
+      ? config.test_account
+      : await googleAdsService.isTestAccount(userId, customerId);
+    return {
+      customer_id: customerId,
+      currency: config.currency || 'USD',
+      // Same single rule the connected-accounts route uses. Two copies of "does true mean
+      // safe" is how one of them eventually stops meaning it.
+      ...describeGoogleAdsSpendRisk({ test_account: testAccount }),
+    };
+  }
+
   async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
     try {
       const { getAccountsByUserIdIncludingOrgShared, isTokenValid } = await import('./connectedAccountsDb');
@@ -30727,10 +32323,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             ? unipileStatusMap.get(acc.account_id) === 'OK'
             : await isTokenValid(acc),
           ...(acc.platform === 'google_ads' && (acc.config as { customer_id?: string })?.customer_id
-            ? {
-                customer_id: (acc.config as { customer_id: string }).customer_id,
-                currency: (acc.config as { currency?: string }).currency || 'USD',
-              }
+            ? await this.describeGoogleAdsAccount(userId, acc.config as GoogleAdsConfigShape)
             : {}),
           // A Meta ad account can be connected and unexpired yet unable to read ads
           // data because the owner never granted ads_read/ads_management. Without
@@ -31295,19 +32888,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      // Check if the account exists first
-      const { getAccountsByUserId } = await import('./connectedAccountsDb');
-      const allAccounts = await getAccountsByUserId(userId);
-      const matchingAccount = allAccounts.find(a => a.account_id === accountId);
-      if (!matchingAccount) {
+      // ENG-1385: existence must be org-shared-aware (resolveAccessibleAccount),
+      // not a plain per-caller lookup — a company page list_connected_accounts
+      // reports as active can be owned by a teammate and shared with the org.
+      const resolved = await this.resolveAccessibleAccount(userId, accountId);
+      if (!resolved) {
         return {
           success: false,
           message: 'Account not found or access denied'
         };
       }
+      const { account, ownerUserId } = resolved;
 
+      // getPostsForUser does its own internal account lookup — it must be handed
+      // the account's real owner, not the caller, or it re-derives nothing for a
+      // teammate-owned account. Also matches every adapter call below needing the
+      // owner's id for token lookup/refresh, same as loadConnectedAccountMetrics.
       const { getPostsForUser } = await import('./socialPostsService');
-      const result = await getPostsForUser(userId, {
+      const result = await getPostsForUser(ownerUserId, {
         accountId,
         limit: options.limit || 10,
         includeMetrics: options.include_metrics !== false,
@@ -31344,8 +32942,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // connected and healthy), so this must NOT render as a tool "failure" in
       // the UI. The message leads with what AgentWeb DOES (positive, ownership
       // framing) so the model doesn't present this as a weakness/"limitation".
-      const accountType = (matchingAccount.config as any)?.account_type;
-      if (result.posts.length === 0 && matchingAccount.platform === 'linkedin' && accountType === 'personal') {
+      const accountType = (account.config as any)?.account_type;
+      if (result.posts.length === 0 && account.platform === 'linkedin' && accountType === 'personal') {
         return {
           success: true,
           organicReadUnsupported: true,
@@ -31523,6 +33121,94 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     };
   }
 
+  /**
+   * ENG-1558 follow-up: classic search-people results almost never carry
+   * `work_experience` (confirmed live — every item across two production
+   * test searches omitted it; see outreachProspectPreviewService's own
+   * "search results often omit it" comment), so calling
+   * filterByCompanySize directly on raw search items resolves an employer
+   * for ~0% of candidates and excludes everyone as unverifiable regardless
+   * of the requested bounds. importLeadsFromSearch already avoids this with
+   * a 4-tier resolution chain (work_experience → title-regex → batched LLM
+   * → Unipile getProfile) before its own company-size filter; this mirrors
+   * that same chain for the single search-people call so the two paths
+   * agree, and reshapes the result as `work_experience` since that's what
+   * filterByCompanySize's employerOf() reads.
+   */
+  private async resolveEmployersForSizeFilter(
+    items: any[],
+    accountId: string,
+    userId: string,
+  ): Promise<Array<{ work_experience: Array<{ company: string; current: true }> }>> {
+    const names: Array<string | null> = items.map((item: any) => {
+      if (item?.work_experience?.length) {
+        const current = item.work_experience.find((w: any) => w?.current) || item.work_experience[0];
+        if (current?.company) return current.company;
+      }
+      return null;
+    });
+
+    items.forEach((item: any, i: number) => {
+      if (!names[i] && typeof item?.headline === 'string') {
+        const parsed = parseCompanyFromTitle(item.headline);
+        if (parsed) names[i] = parsed;
+      }
+    });
+
+    const llmIndices: number[] = [];
+    const llmTitles: string[] = [];
+    items.forEach((item: any, i: number) => {
+      if (!names[i] && typeof item?.headline === 'string' && item.headline) {
+        llmIndices.push(i);
+        llmTitles.push(item.headline);
+      }
+    });
+    if (llmTitles.length > 0) {
+      try {
+        const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, this, userId);
+        for (let k = 0; k < llmIndices.length; k++) {
+          const v = results[k];
+          if (v && v !== 'NONE') names[llmIndices[k]] = v;
+        }
+      } catch (e: any) {
+        console.warn('[resolveEmployersForSizeFilter] LLM batch company-parse failed:', e?.message ?? String(e));
+      }
+    }
+
+    // CodeRabbit: an unbounded Promise.all here would let one hung Unipile
+    // request stall the whole interactive search-people turn — the same
+    // failure mode filterByCompanySize already guards against with a timeout
+    // + chunked concurrency. Mirror that here rather than reintroducing it.
+    const lookupTargets = items
+      .map((item: any, i: number) => ({ item, i }))
+      .filter(({ item, i }) => !names[i] && item?.public_identifier && accountId);
+    for (let start = 0; start < lookupTargets.length; start += EMPLOYER_PROFILE_LOOKUP_CONCURRENCY) {
+      const batch = lookupTargets.slice(start, start + EMPLOYER_PROFILE_LOOKUP_CONCURRENCY);
+      await Promise.all(batch.map(async ({ item, i }) => {
+        try {
+          const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
+          const profile = await withTimeoutOrReject(
+            getUnipileProfileService().getProfile(item.public_identifier, accountId),
+            EMPLOYER_PROFILE_LOOKUP_TIMEOUT_MS,
+            `LinkedIn profile lookup for ${item.public_identifier}`,
+          );
+          const raw = (profile as any)?.rawData ?? profile;
+          const exp = raw?.work_experience;
+          if (Array.isArray(exp) && exp.length) {
+            const cur = exp.find((w: any) => w?.current) || exp[0];
+            if (cur?.company) names[i] = cur.company;
+          }
+        } catch (e: any) {
+          console.warn('[resolveEmployersForSizeFilter] getProfile fallback failed:', e?.message ?? String(e));
+        }
+      }));
+    }
+
+    return names.map((name) => ({
+      work_experience: name ? [{ company: name, current: true as const }] : [],
+    }));
+  }
+
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
@@ -31532,12 +33218,28 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // Write actions must use an account that is either owned by the calling user or
     // explicitly shared with the org (sharedWithOrg: true). This prevents an LLM from
     // reusing a shared enrichment account_id from a prior get-profile call.
-    const WRITE_ACTIONS = ['send-invite', 'send-message', 'send-inmail', 'cancel-invitation', 'accept-invitation'];
-    if (WRITE_ACTIONS.includes(action)) {
-      const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
-      const userAccounts = await getAccountsByUserIdIncludingOrgShared(userId);
-      const authorized = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
-      if (!authorized) {
+    // Same set the pacer uses, deliberately not a second hand-maintained copy: a
+    // sixth write action added to one list and not the other would be either
+    // silently unpaced or silently unauthorized.
+    //
+    // Also resolves the account's owner + daily-cap config here (via
+    // resolveLinkedInAccountForWrite — services/agentMode/linkedInDailyVolumeGate.ts),
+    // from the same lookup this authorization check already needs, avoiding a
+    // second DB read. The daily cap is self-reported (set directly by the user
+    // in Settings, or by Emma via the set-daily-invite-cap action after asking
+    // about Premium status), never auto-detected — see linkedInWritePacer.ts's
+    // module doc comment for why. Unset defaults to the conservative free-tier
+    // number, never to the Premium max. The resolved owner may differ from the
+    // calling user for an org-shared account — writes below go through the
+    // owner's record, not the caller's.
+    // set-daily-invite-cap shares this same ownership check (a config write on
+    // the account still needs to be the caller's own/shared account) but is
+    // deliberately NOT in PACED_WRITE_ACTIONS — it doesn't touch LinkedIn at
+    // all, so none of the burst/hourly/daily send-pacing below applies to it.
+    let resolvedLinkedInAccount: ResolvedLinkedInAccount | null = null;
+    if (PACED_WRITE_ACTIONS.has(action) || action === 'set-daily-invite-cap') {
+      resolvedLinkedInAccount = await resolveLinkedInAccountForWrite(userId, account_id);
+      if (!resolvedLinkedInAccount) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
       }
     }
@@ -31546,13 +33248,36 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // site-wide Unipile accounts when the user has no personally-connected account.
     // Write actions (send-invite, send-message, etc.) are excluded from this fallback —
     // they already block non-owned accounts above.
+    //
+    // ENG-1198: a shared/site-wide account's network is NOT the user's — its
+    // network_distance and "already connected/pending" signals are computed
+    // relative to a stranger's account. `usedSharedAccount` (+ `sharedAccountId`)
+    // is threaded into every read-action response below so callers can caveat
+    // or refuse degree-based logic instead of silently trusting it.
     const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people', 'get-company', 'search-parameters'];
-    if (!account_id && READ_ACTIONS_WITH_FALLBACK.includes(action)) {
-      account_id = await linkedInOutreachService.resolveAccountId(userId);
+    let usedSharedAccount = false;
+    if (READ_ACTIONS_WITH_FALLBACK.includes(action)) {
+      if (!account_id) {
+        const resolved = await linkedInOutreachService.resolveAccountIdWithSource(userId);
+        account_id = resolved.accountId;
+        usedSharedAccount = resolved.usedSharedAccount;
+      } else {
+        // ENG-1198: an explicit account_id isn't necessarily the user's own —
+        // it may be a `sharedAccountId` this same endpoint disclosed on a prior
+        // call and the caller echoed back. Check ownership instead of assuming
+        // false whenever the caller supplied an id, so the flag stays accurate.
+        const ownAccountIds = await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+        usedSharedAccount = !ownAccountIds.includes(account_id);
+      }
       if (account_id) {
-        console.log(`[AgentMode] linkedinOutreach: using site-wide account for ${action}`);
+        console.log(`[AgentMode] linkedinOutreach: using ${usedSharedAccount ? 'site-wide' : 'own'} account for ${action}`);
       }
     }
+    const withAccountMeta = (data: any) => (
+      data && typeof data === 'object'
+        ? { ...data, usedSharedAccount, ...(usedSharedAccount ? { sharedAccountId: account_id } : {}) }
+        : data
+    );
 
     // Guard: if no account_id is available at this point, return a clear error
     // instead of forwarding a null account_id to Unipile (which returns a
@@ -31586,11 +33311,45 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const sessionState = await linkedInOutreachService.probeAccountSession(account_id);
     if (sessionState === 'disconnected') {
       console.log(`[AgentMode] linkedinOutreach: account ${account_id} failed preflight — disconnected Unipile session`);
+      // Persist alongside the reactive handler below, so the owner alert doesn't
+      // depend on which of the two paths happened to observe the dead session first
+      // (ENG-1197).
+      const { recordUnipileAccountHealth } = await import('./linkedInConnectionHealth');
+      await recordUnipileAccountHealth({
+        accountId: account_id,
+        ownerUserId: userId,
+        state: 'disconnected',
+      });
       return this.linkedInDisconnectedResponse();
     }
     if (sessionState === 'unknown') {
       console.log(`[AgentMode] linkedinOutreach: account ${account_id} preflight indeterminate — proceeding, reactive handler remains the backstop`);
     }
+
+    // ENG-1197: pace write actions so a drain cannot burst the session to death.
+    //
+    // Twice this schedule fired ten cancel-invitation calls in one parallel batch
+    // and LinkedIn revoked the account's session ~17 seconds later, locking the
+    // customer out for days. The model emits parallel tool calls because that is the
+    // efficient shape of the work, and an unattended run has nobody to notice it
+    // ignoring an instruction not to — so the spacing has to be structural, not
+    // prompted. Reads are untouched; only actions that mutate LinkedIn state queue.
+    // Deliberately NOT taken here, up front, for the whole action. Several paced
+    // actions return before they ever reach Unipile — send-invite skips a profile
+    // whose invite is already pending or whose identity fails the ENG-1026 check,
+    // send-message skips a stale-sync or duplicate-text send. Reserving at the top
+    // would spend a slot (and sleep the caller a full gap) on those no-ops, so a
+    // batch of already-invited leads would both crawl and eat the hourly ceiling
+    // that the genuinely-new invites later in the same run need. Each case below
+    // therefore calls this immediately before its own Unipile write.
+    // Daily-volume + hourly/burst pacing lives in
+    // services/agentMode/linkedInDailyVolumeGate.ts — see that module's doc
+    // comment for the ownership and check-ordering fixes it encodes.
+    const paceWrite = async (): Promise<{ refusal: any } | null> => {
+      if (!PACED_WRITE_ACTIONS.has(action)) return null;
+      const result = await paceLinkedInWrite(action, resolvedLinkedInAccount!, account_id);
+      return result.refusal ? { refusal: result.refusal } : null;
+    };
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
     // We know which one it is based on which arg was provided.
@@ -31604,6 +33363,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             keywords, search_url, title, company, cursor,
             company_id, location, location_id,
             industry, industry_id, school, school_id,
+            company_size_min, company_size_max,
           } = args;
           // Unipile classic search needs at least one of keywords/search_url/cursor.
           // The downstream linkedInOutreachService.searchPeople synthesizes keywords
@@ -31634,7 +33394,60 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // Trim to essential fields only — full profiles (skills, education, photos, etc.)
           // inflate context by 10x and degrade LLM output quality in long sessions.
           if (Array.isArray(searchResult?.items)) {
-            const trimmedItems = searchResult.items.map((item: any) => {
+            // ENG-1198: LinkedIn anonymizes out-of-network/restricted results with
+            // public_identifier literally the string 'undefined' — passing those
+            // through yields unusable fake profile URLs like /in/undefined.
+            const usableItems = searchResult.items.filter((item: any) => !isAnonymizedIdentifier(item.public_identifier));
+            // How many the filter removed. ENG-1198 dropped them silently, which
+            // turned "every match was out-of-network" into an empty list
+            // indistinguishable from "nobody matches" — and from the ENG-975
+            // account-cannot-search outage. The ENG-975 canary deliberately does not
+            // cover this case: it only fires when the RAW page was empty, and here
+            // the account searched fine and returned rows we then discarded. So the
+            // count has to be reported, or the agent is left guessing which of three
+            // very different situations it is in.
+            const anonymizedFiltered = searchResult.items.length - usableItems.length;
+            // ENG-1558: Unipile has no native headcount filter for people search
+            // (only for its Companies category), so a company-size ask is applied
+            // as a post-filter here — resolve each candidate's current employer
+            // and drop those outside the requested range (or unverifiable). No-op
+            // (zero extra Unipile/LLM calls) when the caller didn't ask for it.
+            //
+            // Classic search-people items almost never carry `work_experience`
+            // (confirmed live, ENG-1558 follow-up), so the employer has to be
+            // resolved first via the same tiered chain importLeadsFromSearch
+            // uses — otherwise every candidate reads as unverifiable and the
+            // filter excludes 100% of results regardless of the bounds asked for.
+            const wantsSizeFilter = company_size_min != null || company_size_max != null;
+            let sizeFilterInput = usableItems;
+            if (wantsSizeFilter) {
+              const resolved = await this.resolveEmployersForSizeFilter(usableItems, account_id, userId);
+              // CodeRabbit: only fill in the synthetic work_experience when the
+              // item didn't already carry a usable one — otherwise this
+              // overwrites a real Tier-1 work_experience (with `position`, etc.)
+              // with the resolver's bare { company, current } shape, silently
+              // dropping fields for the rare item that already had them. The
+              // "usable" check has to match the current/first-entry semantics
+              // resolveEmployersForSizeFilter's Tier 1 and filterByCompanySize's
+              // employerOf() both use — a bare .some() across every entry can
+              // keep an item whose CURRENT entry has no company, discarding a
+              // real resolved value and later reading as unverifiable anyway.
+              const hasCurrentCompany = (item: any): boolean => {
+                const exp = Array.isArray(item?.work_experience) ? item.work_experience : [];
+                const current = exp.find((w: any) => w?.current) || exp[0];
+                return !!current?.company;
+              };
+              sizeFilterInput = usableItems.map((item: any, i: number) => (
+                hasCurrentCompany(item) ? item : { ...item, ...resolved[i] }
+              ));
+            }
+            const { items: sizedItems, excludedUnverifiable: companySizeFiltered } =
+              await linkedInOutreachService.filterByCompanySize(
+                sizeFilterInput,
+                { min: company_size_min, max: company_size_max },
+                account_id,
+              );
+            const trimmedItems = sizedItems.map((item: any) => {
               const trimmed: any = {
                 provider_id: item.provider_id,
                 public_identifier: item.public_identifier,
@@ -31642,7 +33455,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 last_name: item.last_name,
                 headline: item.headline,
                 location: item.location,
-                network_distance: item.network_distance,
+                // network_distance is relative to whichever account ran the search —
+                // omit it when that account is a shared one, not the user's own
+                // (ENG-1198), so degree-based targeting logic isn't silently corrupted.
+                ...(usedSharedAccount ? {} : { network_distance: item.network_distance }),
                 public_profile_url: item.public_profile_url,
                 is_open_profile: item.is_open_profile,
               };
@@ -31653,9 +33469,40 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               if (item.summary) trimmed.summary = item.summary.slice(0, 200);
               return trimmed;
             });
-            return { success: true, data: { ...searchResult, items: trimmedItems } };
+            const searchData = withAccountMeta({
+              ...searchResult,
+              items: trimmedItems,
+              ...(anonymizedFiltered > 0 ? { anonymizedFiltered } : {}),
+              ...(companySizeFiltered > 0 ? { companySizeFiltered } : {}),
+            });
+            if (trimmedItems.length === 0 && anonymizedFiltered > 0) {
+              // Say plainly what happened, so this does not get reported to the
+              // user as "no prospects match" or escalated as a broken search.
+              return {
+                success: true,
+                message:
+                  `All ${anonymizedFiltered} result(s) were anonymized by LinkedIn (out-of-network), so none are usable. ` +
+                  `The search itself worked — this is a reach limit, not an outage and not an empty niche. ` +
+                  `Broaden the query, or search from an account whose network covers these people.`,
+                data: searchData,
+              };
+            }
+            if (trimmedItems.length === 0 && companySizeFiltered > 0) {
+              // Same transparency principle as the anonymized case above: a
+              // company-size ask that excluded every real candidate is a
+              // narrow-niche result, not an empty search and not an outage.
+              return {
+                success: true,
+                message:
+                  `Found candidates, but excluded all ${companySizeFiltered} of them because their employer's size ` +
+                  `either fell outside the requested range or couldn't be verified. The search itself worked — ` +
+                  `try widening the company_size range, or drop it to see the unfiltered results.`,
+                data: searchData,
+              };
+            }
+            return { success: true, data: searchData };
           }
-          return { success: true, data: searchResult };
+          return { success: true, data: withAccountMeta(searchResult) };
         }
 
         case 'get-profile': {
@@ -31688,13 +33535,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // viewer's connection state back into the shared cache and re-introduce the
           // very cross-viewer leak this fix closes.
           if (raw && typeof raw === 'object') {
+            // Both halves must reject the sentinel, because this URL is used as a
+            // DynamoDB GSI lookup key below. Unfiltered, EVERY anonymized profile
+            // queries the same `/in/undefined` key — and the connection-sync cron
+            // writes rows under exactly that key — so the lookup returns an
+            // unrelated person's connection row and their is_relationship /
+            // connected_at get presented as this user's, driving the agent's
+            // invite-vs-message decision off a stranger's state.
             const profileUrl =
-              raw.public_profile_url ||
-              (raw.public_identifier
-                ? `https://www.linkedin.com/in/${raw.public_identifier}`
-                : (isUrl ? target : null));
+              usableProfileUrl(raw.public_profile_url) ||
+              (usablePublicIdentifier(raw.public_identifier)
+                ? `https://www.linkedin.com/in/${usablePublicIdentifier(raw.public_identifier)}`
+                : (isUrl ? usableProfileUrl(target) : null));
+            // ENG-1198: LinkedIn anonymizes out-of-network/restricted profiles
+            // with public_identifier literally the string 'undefined' — mirrors
+            // the search-people filtering above. get-profile can't drop the row
+            // (the caller asked for this specific person), so flag it and drop
+            // the fabricated /in/undefined URL instead.
+            const isAnonymized = isAnonymizedIdentifier(raw.public_identifier);
             let conn: { connectedAt?: number } | null = null;
-            if (profileUrl) {
+            // A shared/site-wide account's connection state belongs to a
+            // STRANGER, not the user — reconciling is_relationship/connected_at
+            // from it would present that stranger's "already connected/pending"
+            // status as the user's own (ENG-1198). Skip the lookup entirely so
+            // both fields are omitted below, same as network_distance.
+            if (profileUrl && !usedSharedAccount) {
               const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
               conn = await getConnectionByProfileUrlAndAccount(profileUrl, account_id).catch(() => null);
             }
@@ -31703,9 +33568,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // BEFORE this change (30-day TTL) can still carry another viewer's stale
             // values — a spread of `raw` would leak them until the row expires. Only a
             // LIVE response (`!fromCache`) legitimately carries this viewer's own state.
+            // ENG-1198: on a cold (non-cached) response network_distance survives
+            // onto `raw` (see unipileProfileService.ts) — but it's relative to
+            // whichever account was used. Drop it when that account is a shared
+            // one, not the user's own, so a stranger's connection degree isn't
+            // presented as the user's.
             const {
               is_relationship: rawRelationship,
               connected_at: rawConnectedAt,
+              network_distance: rawNetworkDistance,
+              public_profile_url: rawPublicProfileUrl,
               ...viewerIndependentRaw
             } = raw;
             // Reconcile as a union: connected if our per-account cache has a row OR a
@@ -31716,20 +33588,38 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             const isConnected =
               !!conn || (!profileResult.fromCache && rawRelationship === true);
             const data = {
-              ...viewerIndependentRaw,
-              is_relationship: isConnected,
-              // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
-              // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
-              // otherwise keep the raw timestamp ONLY from a live response.
-              ...(conn && typeof conn.connectedAt === 'number'
-                ? { connected_at: conn.connectedAt }
-                : !profileResult.fromCache && typeof rawConnectedAt === 'number'
-                  ? { connected_at: rawConnectedAt }
-                  : {}),
+              // Dropping the fabricated URL alone was not enough: `public_identifier`
+              // stayed on the object as the literal string 'undefined', so the agent
+              // was handed the exact slug needed to rebuild the dead link itself.
+              ...withoutFabricatedProfileFields(viewerIndependentRaw),
+              // Never surface the fabricated /in/undefined URL for an anonymized profile.
+              ...(isAnonymized || !usableProfileUrl(rawPublicProfileUrl)
+                ? {}
+                : { public_profile_url: rawPublicProfileUrl }),
+              // See ENG-1198 note above: is_relationship/connected_at are the
+              // user's "already connected/pending" signal — only meaningful
+              // relative to the user's own account, not a borrowed shared one.
+              ...(usedSharedAccount ? {} : {
+                is_relationship: isConnected,
+                // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
+                // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
+                // otherwise keep the raw timestamp ONLY from a live response.
+                ...(conn && typeof conn.connectedAt === 'number'
+                  ? { connected_at: conn.connectedAt }
+                  : !profileResult.fromCache && typeof rawConnectedAt === 'number'
+                    ? { connected_at: rawConnectedAt }
+                    : {}),
+              }),
+              // See ENG-1198 note above: only keep network_distance when it's
+              // relative to the user's own account, not a borrowed shared one.
+              ...(!usedSharedAccount && rawNetworkDistance !== undefined
+                ? { network_distance: rawNetworkDistance }
+                : {}),
+              ...(isAnonymized ? { anonymized: true } : {}),
             };
-            return { success: true, data };
+            return { success: true, data: withAccountMeta(data) };
           }
-          return { success: true, data: raw };
+          return { success: true, data: withAccountMeta(raw) };
         }
 
         case 'list-connections': {
@@ -31775,7 +33665,84 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const sharedSecret = args.shared_secret;
           if (!invitationId) throw new Error('invitation_id is required for accept-invitation');
           if (!sharedSecret) throw new Error('shared_secret is required for accept-invitation (use the value from list-received-invitations)');
+
+          // ENG-1595 identity binding: resolve the invitee's identity from Unipile's
+          // OWN received-invitations record for THIS invitationId, before accepting —
+          // never from caller-supplied profile_url/provider_id/name args. Those are
+          // LLM-supplied and unverified against invitation_id; unlike send-invite
+          // (where the supplied identity IS the send target by construction), a
+          // mismatched pair here would accept invitation A but mirror the CRM write
+          // onto an unrelated person B. Bounded scan: received invitations are a
+          // live feed, not something to page through unboundedly on a request path.
+          let acceptedSenderProfile: { public_id?: string; provider_id?: string; full_name?: string } | null = null;
+          try {
+            const MAX_PAGES = 5;
+            let cursor: string | undefined;
+            for (let page = 0; page < MAX_PAGES && !acceptedSenderProfile; page++) {
+              const received = await linkedInOutreachService.listReceivedInvitations(account_id, cursor);
+              const items = Array.isArray(received?.items) ? received.items : [];
+              const match = items.find((it: any) => String(it?.id) === String(invitationId));
+              if (match) {
+                acceptedSenderProfile = match.sender_profile || null;
+                break;
+              }
+              cursor = received?.cursor;
+              if (!cursor) break;
+            }
+          } catch (lookupErr) {
+            console.warn(`[AgentMode] accept-invitation: could not verify sender identity for invitation ${invitationId} (CRM mirror will be skipped):`, lookupErr);
+          }
+
+          const acceptPaced = await paceWrite();
+          if (acceptPaced) return acceptPaced.refusal;
           const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, account_id, sharedSecret);
+
+          // ENG-1595: mirror the now-accepted INBOUND connection into the CRM, same
+          // best-effort pattern send-invite uses below — an accepted connection must
+          // be as findable/engageable as one this account invited, or name-based CRM
+          // search silently misses a real, legitimate contact (the reported symptom).
+          // No-ops cleanly when identity couldn't be verified or list can't be
+          // resolved — mirrors nothing rather than guessing or trusting the caller.
+          //
+          // Deliberately NOT falling back to resolveListIdForAccount here (unlike
+          // send-invite). Sending an invite is always a deliberate targeting action —
+          // the account-bound list is a safe default. Accepting an inbound request is
+          // not: it could be a genuine prospect or an unrelated personal connection,
+          // and the account owner never decided "every accept is a lead." Only mirror
+          // when the caller explicitly names a list_id — i.e. when the task driving
+          // this run has actually judged this specific person relevant.
+          try {
+            const publicId = acceptedSenderProfile?.public_id;
+            const mirrorProfileUrl = publicId ? `https://www.linkedin.com/in/${publicId}/` : null;
+            if (mirrorProfileUrl) {
+              const { mirrorLinkedInInviteToCrm, splitInvitedUserName, INVITE_ACCEPTED_EVENT } = await import('./linkedInInviteCrmMirror');
+              const mirrorListId = args.list_id;
+              if (mirrorListId) {
+                const { crmDb } = await import('./db');
+                const mirrorList = await crmDb.getLeadListById(mirrorListId);
+                const { canDestructiveCrmList } = await import('./crmAccessControl');
+                if (mirrorList && (await canDestructiveCrmList(userId, mirrorList))) {
+                  const { firstName, lastName } = splitInvitedUserName(acceptedSenderProfile?.full_name);
+                  await mirrorLinkedInInviteToCrm({
+                    userId,
+                    listId: mirrorListId,
+                    linkedinUrl: mirrorProfileUrl,
+                    leadId: args.lead_id,
+                    firstName,
+                    lastName,
+                    accountId: account_id,
+                    invitationId,
+                    eventType: INVITE_ACCEPTED_EVENT,
+                  });
+                } else {
+                  console.warn(`[AgentMode] accept-invitation: skipping CRM mirror — list ${mirrorListId} not accessible to user ${userId}`);
+                }
+              }
+            }
+          } catch (mirrorErr) {
+            console.warn('[AgentMode] accept-invitation: failed to mirror accepted connection to CRM (non-fatal):', mirrorErr);
+          }
+
           return { success: true, data: acceptResult };
         }
 
@@ -31931,6 +33898,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // explicitly authorized it via on_note_quota='send_without_note'.
           const onNoteQuota: 'send_without_note' | 'skip' =
             on_note_quota === 'send_without_note' ? 'send_without_note' : 'skip';
+          // ENG-126's account-level cooldown short-circuits the network call inside
+          // sendInvitation, so a paced caller would sleep a full gap and burn one of
+          // the account's hourly writes for a request that never leaves the process —
+          // for the whole hour the breaker is armed, on every queued invite. Check it
+          // here, before the slot is taken.
+          if (linkedInOutreachService.isUnderInvitationCooldown(account_id)) {
+            return {
+              success: false,
+              error:
+                'Cannot resend yet — this LinkedIn Outreach account is under an active account-level '
+                + 'invitation cooldown (its invitation cap was hit on an earlier send this run). '
+                + 'Skip the remaining invites and report what was completed.',
+            };
+          }
+          // Past every skip path (already-pending, identity mismatch, cooldown): this
+          // call is going to reach LinkedIn, so now is when it should cost a slot.
+          const invitePaced = await paceWrite();
+          if (invitePaced) return invitePaced.refusal;
           try {
             const inviteResult = await linkedInOutreachService.sendInvitation(
               account_id, target, isUrl, message, inviteCharLimit, { onNoteQuota },
@@ -32081,6 +34066,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             }
           }
 
+          const messagePaced = await paceWrite();
+          if (messagePaced) return messagePaced.refusal;
           const messageResponse = await linkedInOutreachService.sendMessage(account_id, target, isUrl, message);
 
           // Persist the sent message to the CRM so it shows up in engagement history.
@@ -32119,6 +34106,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const { subject } = args;
           if (!subject) throw new Error('subject is required for send-inmail action');
 
+          const inmailPaced = await paceWrite();
+          if (inmailPaced) return inmailPaced.refusal;
           const inmailResponse = await linkedInOutreachService.sendInMail(account_id, target, isUrl, subject, message);
 
           // Persist the sent InMail to the CRM so it shows up in engagement history.
@@ -32216,13 +34205,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // persisting — see unipileCompanyService.ts.
           const { getUnipileCompanyService } = await import('./unipileCompanyServiceFactory');
           const companyResult = await getUnipileCompanyService().getCompany(companyId, account_id);
-          return { success: true, data: companyResult.rawData };
+          return { success: true, data: withAccountMeta(companyResult.rawData) };
         }
 
         case 'cancel-invitation': {
           const invitationId = args.invitation_id;
           if (!invitationId) throw new Error('invitation_id is required for cancel-invitation');
+          const cancelPaced = await paceWrite();
+          if (cancelPaced) return cancelPaced.refusal;
           const cancelResult = await linkedInOutreachService.cancelInvitation(invitationId, account_id);
+          // We just ended this invitation, so we know it is no longer pending —
+          // don't make the cache wait for the next full-feed prune to find out
+          // (ENG-1197). Best-effort: a failed cleanup must not turn a successful
+          // withdrawal into a reported failure.
+          const { deleteSentInvitationByInvitationId } = await import('./unipileSentInvitationsDb');
+          await deleteSentInvitationByInvitationId(account_id, invitationId).catch((err) =>
+            console.error(`[AgentMode] Failed to drop withdrawn invitation ${invitationId}:`, err),
+          );
           return { success: true, data: cancelResult };
         }
 
@@ -32258,16 +34257,40 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           }));
           return {
             success: true,
-            data: {
+            data: withAccountMeta({
               candidates: trimmedCandidates,
               fromCache: resolveResult.fromCache,
               source: resolveResult.source,
+            }),
+          };
+        }
+
+        case 'set-daily-invite-cap': {
+          // Self-reported, not detected — see linkedInWritePacer.ts's module doc
+          // comment for why this is a direct question to the user rather than an
+          // API probe. Use this ONLY after the user has told you, in THIS
+          // conversation, whether their connected LinkedIn account has Premium —
+          // never guess, never infer it from anything else, and never call this
+          // for an unattended/scheduled run (there's no one to ask).
+          // Writes through the account OWNER's record, not necessarily the
+          // caller's — see linkedInDailyVolumeGate.ts's module doc comment.
+          const clampedCap = await setDailyInviteCap(
+            resolvedLinkedInAccount!,
+            account_id,
+            args.daily_invite_cap,
+          );
+          return {
+            success: true,
+            data: {
+              account_id,
+              daily_invite_cap: clampedCap,
+              ...(clampedCap !== Number(args.daily_invite_cap) ? { note: `Requested ${args.daily_invite_cap} was clamped to the system-wide maximum of ${clampedCap}.` } : {}),
             },
           };
         }
 
         default: {
-          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters'];
+          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters','set-daily-invite-cap'];
           throw new Error(`Unsupported LinkedIn outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }
       }
@@ -32287,6 +34310,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         // probe's 10-minute cache window), so the reactive path stays as the backstop.
         // Both return the identical response via one helper.
         linkedInOutreachService.clearStatusCache(account_id);
+        // Persist it as well (ENG-1197). This used to end here — the one place that
+        // learned a session was dead told the model and nobody else, so an unattended
+        // scheduled run discovered the outage, no-opped, and left no trace anything
+        // was wrong. Recording it is what gives the owner an alert and lets the next
+        // run skip instead of repeating the discovery. A no-op for shared accounts,
+        // which this user doesn't own.
+        const { recordUnipileAccountHealth } = await import('./linkedInConnectionHealth');
+        await recordUnipileAccountHealth({
+          accountId: account_id,
+          ownerUserId: userId,
+          state: 'disconnected',
+        });
         return this.linkedInDisconnectedResponse();
       }
 
@@ -33221,11 +35256,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
      *  lead back to the persona that sourced it. Distinct from the
      *  `lead.icpMatch` scoring field (post-import scoring). */
     icpSource?: string;
+    /** ENG-1558: post-filter on each lead's resolved employer headcount —
+     *  same semantics as search-people's company_size_min/max. Applied AFTER
+     *  the 4-tier company-resolution chain below (not on raw work_experience
+     *  alone), so a lead whose company only resolved via title-parse/LLM/
+     *  profile fallback is still correctly sized instead of excluded early. */
+    company_size_min?: number;
+    company_size_max?: number;
   }): Promise<any> {
     const {
       listId, keywords, search_url, title, company, company_id,
       location, location_id, industry, industry_id, school, school_id,
       cursor, limit = 20, auto_enrich = false, icpSource,
+      company_size_min, company_size_max,
     } = args;
 
     if (!listId) return { success: false, error: 'listId is required' };
@@ -33320,6 +35363,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const allCreated: Array<{ leadId: string; email?: string; lead?: any }> = [];
     // Out-of-network "LinkedIn Member" hits dropped before the write.
     let anonymizedSkipped = 0;
+    // ENG-1558: leads dropped by the company_size_min/max post-filter
+    // (outside the requested range, or an unverifiable employer).
+    let companySizeFiltered = 0;
+    // ENG-1558 follow-up: consecutive pages the size filter emptied
+    // completely. A narrow company_size range against a market where it's
+    // genuinely rare could otherwise burn all MAX_ITERATIONS pages — each
+    // costing a full searchPeople call plus per-employer lookups — before
+    // giving up. Bail out well before that once the filter has clearly
+    // proven unproductive, rather than paying the full cap's cost every time.
+    let consecutiveEmptiedBySizeFilter = 0;
+    const SIZE_FILTER_EARLY_EXIT_AFTER = 3;
+    let earlyExitOnSizeFilter = false;
 
     while (iterationCount < MAX_ITERATIONS) {
       iterationCount++;
@@ -33441,7 +35496,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         candidates.push({ lead: leads[i], item: items[i] });
       }
-      const importable: any[] = candidates.map((c) => c.lead);
+      let importable: any[] = candidates.map((c) => c.lead);
       if (importable.length === 0) {
         if (!nextCursor) break;
         continue;
@@ -33459,8 +35514,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
       if (llmTitles.length > 0) {
         try {
-          const llmClient = await this.getClientForModel('gemini-2.5-flash');
-          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient, userId);
+          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, this, userId);
           for (let k = 0; k < llmIndices.length; k++) {
             const v = results[k];
             if (v && v !== 'NONE') importable[llmIndices[k]].company = v;
@@ -33486,6 +35540,49 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           console.warn('[importLeadsFromSearch] getProfile fallback failed:', e?.message ?? String(e));
         }
       }));
+
+      // Phase 3.5 (ENG-1558): company-size post-filter, run AFTER every
+      // resolution tier above so lead.company reflects the best available
+      // employer name — filtering on Tier-1 (work_experience) alone, like
+      // search-people does, would wrongly exclude leads whose company only
+      // resolved via title-parse/LLM/profile fallback. Adapts each lead's
+      // flat `.company` string into the work_experience shape
+      // filterByCompanySize expects, tagging each with its array index so
+      // the kept subset can be mapped back without disturbing `importable`'s
+      // order (batchCreateLeads' returned sourceIndex must match).
+      if (company_size_min != null || company_size_max != null) {
+        const preFilterCount = importable.length;
+        const sizableItems = importable.map((lead: any, idx: number) => ({
+          __idx: idx,
+          work_experience: lead.company ? [{ company: lead.company, current: true }] : [],
+        }));
+        const { items: kept } = await linkedInOutreachService.filterByCompanySize(
+          sizableItems,
+          { min: company_size_min, max: company_size_max },
+          accountId,
+        );
+        const keepIdx = new Set(kept.map((it: any) => it.__idx));
+        companySizeFiltered += importable.length - keepIdx.size;
+        importable = importable.filter((_: any, i: number) => keepIdx.has(i));
+
+        if (preFilterCount > 0 && importable.length === 0) {
+          consecutiveEmptiedBySizeFilter++;
+          if (consecutiveEmptiedBySizeFilter >= SIZE_FILTER_EARLY_EXIT_AFTER) {
+            // The filter has proven unproductive several pages running —
+            // stop paying for more searchPeople + per-employer lookup calls
+            // rather than grinding to MAX_ITERATIONS on a range that's
+            // clearly not matching this market.
+            earlyExitOnSizeFilter = true;
+            break;
+          }
+        } else {
+          consecutiveEmptiedBySizeFilter = 0;
+        }
+      }
+      if (importable.length === 0) {
+        if (!nextCursor) break;
+        continue;
+      }
 
       const result = await crmDb.batchCreateLeads(listId, importable);
       cumulativeNew += result.newCount ?? 0;
@@ -33566,14 +35663,29 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       iterations: iterationCount,
       trimmed: trimmedCount,
       anonymizedSkipped,
+      companySizeFiltered,
       safetyCapHit,
     };
     if (searchError) response.searchError = searchError;
     if (searchUnavailable) response.searchUnavailable = true;
+    if (earlyExitOnSizeFilter) response.earlyExitOnSizeFilter = true;
     if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
       response.message = 'No results found for the given search criteria.';
+    } else if (earlyExitOnSizeFilter) {
+      // ENG-1558 follow-up: distinct from (and takes priority over) the
+      // generic "excluded all, search exhausted normally" message below —
+      // this stopped BEFORE exhausting, so there may be more matches the
+      // cursor can still reach.
+      response.message = cumulativeNew > 0
+        ? `Imported ${cumulativeNew} lead(s), then stopped early after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where the company_size filter excluded every result. There may be more matches — resume from the returned cursor, or widen the range.`
+        : `Stopped after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where every result was excluded by the company_size filter (out of range, or an unverifiable employer) — this looks like a narrow niche for this market, not an empty search. Widen the company_size range, or drop it to import the unfiltered results.`;
     } else if (cumulativeNew === 0 && anonymizedSkipped > 0 && !searchError) {
       response.message = `${anonymizedSkipped} search result(s) were out-of-network LinkedIn profiles with no name or profile URL and were not imported. Widen the search or connect a LinkedIn account with closer network reach.`;
+    } else if (cumulativeNew === 0 && companySizeFiltered > 0 && !searchError) {
+      // ENG-1558: same transparency principle as the anonymized-skip case
+      // above — a company-size ask that excluded every candidate is a
+      // narrow-niche result, not an empty search and not an outage.
+      response.message = `${companySizeFiltered} search result(s) were excluded because their employer's size either fell outside the requested range or couldn't be verified. Widen the company_size range, or drop it to import the unfiltered results.`;
     }
     // Preview strictly the records that were written and survived trimming.
     response.importedLeads = allCreated.slice(0, 5).map((c) => c.lead).filter(Boolean);
@@ -33612,7 +35724,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     action: string,
     override: boolean,
     sessionId?: string,
-  ): Promise<{ proceed: boolean; blockResult?: any }> {
+  ): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
     const finalUrls = await googleAdsService.getCampaignFinalUrls(userId, customerId, campaignResourceName);
     // No serving URLs (e.g. a campaign with no ads yet) ⇒ nothing to gate.
     if (finalUrls.length === 0) return { proceed: true };
@@ -33626,6 +35738,134 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * to a PAUSED/DRAFT campaign are not gated here; they are re-checked when that
    * campaign is later enabled/resumed.
    */
+  /**
+   * ENG-1527. Resolve the parent campaign's status and run the creative-addition gate,
+   * failing CLOSED when the answer cannot be established.
+   *
+   * Both call sites used to swallow every failure and proceed, on this rationale:
+   *
+   *   "defence-in-depth (the RESUME / UPDATE→ENABLED gate is the hard guarantee), so a
+   *    transient parent-status lookup failure must NOT break an otherwise-valid create"
+   *
+   * That is exactly backwards for the case this gate exists to cover. The gate only ever
+   * matters when the parent is ALREADY ENABLED — and an already-enabled campaign has no
+   * future RESUME or UPDATE→ENABLED for the "hard guarantee" to fire on. The creative IS
+   * the launch, it serves paid traffic the moment it is created, and this gate is the only
+   * thing standing in front of it. Calling it defence-in-depth described a second layer
+   * that, in this specific situation, does not exist.
+   *
+   * Three ways the old code proceeded without ever checking anything, all silent:
+   *   - the parent lookup threw;
+   *   - the parent lookup returned nothing, so the gate call was skipped entirely;
+   *   - the gate itself threw while fetching the landing page.
+   *
+   * Now: a status we could not determine is treated as possibly-ENABLED and refused. A
+   * status we DID determine to be anything other than ENABLED still proceeds untouched —
+   * there is no launch to guard, so a flaky lookup must not block ordinary staging work.
+   * An approved override still wins, because it is a user's disclosed decision to accept
+   * exactly this risk, and it keeps the refusal from being a dead end.
+   */
+  private async guardCreativeAddition(opts: {
+    customerId: string;
+    action: string;
+    override: boolean;
+    sessionId?: string;
+    finalUrls: Array<string | undefined>;
+    resolveParent: () => Promise<{ campaignResourceName: string; campaignStatus: string | null } | null>;
+  }): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
+    /**
+     * `overridable` is FALSE for every parent-status failure, and that is deliberate.
+     *
+     * The approval the user actually saw says: "this launch will SKIP the tracking
+     * pre-flight check. Paid delivery may start at a destination that cannot report
+     * conversions." It discloses one risk — an unverified destination. It says nothing
+     * about "we could not establish whether this campaign is even live", which is a
+     * different and undisclosed risk. ENG-941 already settled this principle for Meta:
+     * an override the user was not told about is not user-granted, whatever else it was
+     * attached to. So the override only spends against the risk it named.
+     *
+     * That leaves no override path for an unresolved status, which is correct: a lookup
+     * failure is either transient (retry) or a wrong resource name (fix it). Neither is
+     * something to wave through.
+     */
+    const refuse = async (
+      why: string,
+      campaignResourceName: string,
+      opts2: { overridable: boolean; advice: string },
+      err?: unknown,
+    ) => {
+      const urls = opts.finalUrls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
+      // Same per-URL detail in the response as in the run record. Recording richer data
+      // than we return means the caller is told less than we know, and the run record was
+      // the only place this detail survived.
+      const urlResults = urls.map(url => ({ url, status: 'unknown', mechanisms: [] as string[], error: why }));
+
+      if (opts2.overridable && opts.override) {
+        // Recorded, not just logged. The non-override path writes a run record, so leaving
+        // this one to a console line would put a hole in the audit trail at exactly the
+        // point where a human made a deliberate decision.
+        await chatbotDb.recordGoogleAdsMeasurementCheck(opts.sessionId || '', {
+          customerId: opts.customerId, campaignResourceName, action: opts.action,
+          outcome: 'overridden', urlResults, checkedAt: new Date().toISOString(),
+        });
+        console.error(`[ENG-1527] ${opts.action} creative-addition gate unresolved (${why}); proceeding on an approved override:`, err);
+        return { proceed: true };
+      }
+
+      console.error(`[ENG-1527] ${opts.action} creative-addition gate unresolved (${why}); refusing:`, err);
+      await chatbotDb.recordGoogleAdsMeasurementCheck(opts.sessionId || '', {
+        customerId: opts.customerId, campaignResourceName, action: opts.action,
+        outcome: 'blocked', urlResults, checkedAt: new Date().toISOString(),
+      });
+      return {
+        proceed: false,
+        blockResult: {
+          success: false,
+          blocked: true,
+          reason: 'tracking_preflight_unresolved',
+          error: `Cannot confirm this creative is safe to add: ${why}. If the parent campaign is already ENABLED the creative starts serving paid traffic immediately, so refusing is the safe answer rather than adding it unchecked. ${opts2.advice} Nothing was created.`,
+          trackingCheck: { measured: false, urlResults },
+        },
+      };
+    };
+
+    let parent: { campaignResourceName: string; campaignStatus: string | null } | null;
+    try {
+      parent = await opts.resolveParent();
+    } catch (err) {
+      return refuse(
+        'the parent campaign\'s status could not be read from Google Ads', '',
+        { overridable: false, advice: 'Retry — a read failure here is usually transient.' }, err,
+      );
+    }
+    if (!parent || !parent.campaignStatus) {
+      // Deliberately NOT described as transient: the usual cause is a stale or wrong
+      // ad_group_resource_name, and telling the agent to retry a permanent failure just
+      // buys a retry loop.
+      return refuse(
+        'the parent campaign was not found, or returned no status',
+        parent?.campaignResourceName || '',
+        { overridable: false, advice: 'Check the resource name is current — a campaign that does not resolve will not resolve on a retry either.' },
+      );
+    }
+    // Not a launch: nothing to guard, so a gate failure here cannot cost anything.
+    if (parent.campaignStatus !== 'ENABLED') return { proceed: true };
+
+    try {
+      return await this.enforceGoogleAdsCreativeAdditionGate(
+        opts.customerId, parent.campaignResourceName, parent.campaignStatus,
+        opts.action, opts.override, opts.sessionId, opts.finalUrls,
+      );
+    } catch (err) {
+      // The ONE overridable case: this is the tracking pre-flight failing to run, which is
+      // exactly the risk the override's confirmation text discloses.
+      return refuse(
+        'the landing page tracking check could not be completed', parent.campaignResourceName,
+        { overridable: true, advice: 'Retry — a landing-page fetch failure is usually transient.' }, err,
+      );
+    }
+  }
+
   private async enforceGoogleAdsCreativeAdditionGate(
     customerId: string,
     campaignResourceName: string,
@@ -33634,7 +35874,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     override: boolean,
     sessionId: string | undefined,
     newFinalUrls: Array<string | undefined>,
-  ): Promise<{ proceed: boolean; blockResult?: any }> {
+  ): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
     if (campaignStatus !== 'ENABLED') return { proceed: true };
     const urls = newFinalUrls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
     if (urls.length === 0) return { proceed: true };
@@ -33653,15 +35893,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     override: boolean,
     sessionId: string | undefined,
     finalUrls: string[],
-  ): Promise<{ proceed: boolean; blockResult?: any }> {
+  ): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
     const gate = await preflightTrackingGate(finalUrls);
     const urlResults = gate.results.map(r => ({ url: r.url, status: r.status, mechanisms: r.mechanisms, error: r.error }));
 
     if (gate.ok) {
+      /*
+       * ENG-1358: measurable, but nothing on the page proves an Ads conversion can be
+       * recorded — only a GTM container or a GA4 property. Recorded under its own outcome
+       * so the run history distinguishes "verified" from "we could not tell", and
+       * returned so the caller surfaces it instead of the gate quietly swallowing it.
+       *
+       * A warning that is computed and discarded is the same as no warning at all, which
+       * is exactly how the AC1 wiring gap survived 111 green tests.
+       */
+      const warned = (gate.warnings?.length ?? 0) > 0;
       await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
-        customerId, campaignResourceName, action, outcome: 'passed', urlResults, checkedAt: new Date().toISOString(),
+        customerId, campaignResourceName, action,
+        outcome: warned ? 'passed_with_warning' : 'passed',
+        urlResults, checkedAt: new Date().toISOString(),
       });
-      return { proceed: true };
+      return warned ? { proceed: true, warning: gate.message } : { proceed: true };
     }
 
     if (override) {
@@ -33688,13 +35940,72 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION';
     action: string;
     [key: string]: any;
   }, opts?: { sessionId?: string }): Promise<any> {
     try {
       const { customer_id, entity_type, action } = args;
-      const overrideTrackingCheck = args.override_tracking_check === true;
+      /*
+       * ENG-1526. The override is bound to a disclosed approval, exactly as Meta's is.
+       *
+       * This used to be `args.override_tracking_check === true` and nothing else: the model
+       * could set it on its own, and the only thing standing against that was a sentence in
+       * the tool description ("Never set it on your own"). ENG-941 wrote the threat model
+       * down for the Meta path and dismissed precisely that defence — "an override the model
+       * can introduce after approval is not user-granted, whatever the tool description
+       * says" — then hardened Meta and left Google on the sentence.
+       *
+       * Reusing ENG-941's helpers rather than writing a second mechanism: HMAC over the
+       * exact call, keyed with a server-only secret so the caller cannot mint one, and
+       * key-order-independent so a re-emitted argument object still matches.
+       * `stableStringify` excludes the gate-only flags, so the replay carrying the token
+       * digests identically to the preview that issued it.
+       *
+       * A claimed-but-unapproved override does not fail — it HALTS and discloses, then
+       * issues the matching token. The path is a loop, not a dead end. A call that waives
+       * nothing is untouched: no token is ever required.
+       *
+       * Deliberately narrower than Meta's gate: this halts only when an override is
+       * claimed. Google Ads writes still have no general confirmation step — that is a
+       * bigger change and its own ticket (ENG-1527), and conflating the two would put an
+       * unrelated behaviour change inside a security fix.
+       */
+      const overrideClaimed = args.override_tracking_check === true;
+      const overrideDigest = overrideClaimed
+        ? computeTrackingOverrideDigest(getJwtSecret(), { customer_id, entity_type, action, args })
+        : '';
+      const overrideApproved =
+        overrideClaimed && trackingOverrideTokenMatches(args.tracking_override_token, overrideDigest);
+
+      if (overrideClaimed && !overrideApproved) {
+        const target = [entity_type, action, customer_id].filter(Boolean).join(' ');
+        return {
+          success: true,
+          requiresConfirmation: true,
+          awaitingUserConfirmation: true,
+          summary: `Waive the tracking pre-flight check for ${target}`,
+          confirmationPrompt:
+            `This Google Ads call would WAIVE the pre-flight tracking check.\n\n` +
+            `That check is what stops a campaign spending on pages that cannot report a ` +
+            `conversion. Waiving it means accepting that this launch may be unmeasurable — ` +
+            `you would be paying for traffic you cannot evaluate.\n\n` +
+            `Target: ${target}\n\n` +
+            `Reply "yes" / "confirm" to waive the check and proceed, or tell me to fix the ` +
+            `tracking first.`,
+          confirmationDetail: `Waive the tracking pre-flight check for ${target}`,
+          message:
+            `This call sets override_tracking_check, which waives the deterministic ` +
+            `pre-flight measurement check for ${target}. Show the user the warning above and ` +
+            `get explicit approval. Once approved, call call_google_ads_api again with the ` +
+            `same arguments PLUS tracking_override_token exactly as returned here — without ` +
+            `it the override will not apply and the gate will run normally.`,
+          // Only issued when an override was actually described in this halt, so it can
+          // only ever approve a waiver the user was shown.
+          tracking_override_token: overrideDigest,
+        } as any;
+      }
+      const overrideTrackingCheck = overrideApproved;
 
       if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
         const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
@@ -33734,8 +36045,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for RESUME action' };
           const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'RESUME', overrideTrackingCheck, opts?.sessionId);
           if (!gate.proceed) return gate.blockResult;
+          const resumeTrackingWarning = gate.warning;
           await googleAdsService.resumeCampaign(userId, customer_id, args.campaign_resource_name);
-          return { success: true, message: 'Campaign resumed' };
+          // Relayed, not swallowed: the launch is permitted, but the operator has to be
+          // told the page proves only that SOME Google tag is present (ENG-1358).
+          return { success: true, message: 'Campaign resumed', ...(resumeTrackingWarning ? { trackingWarning: resumeTrackingWarning } : {}) };
         }
         if (action === 'REMOVE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for REMOVE action' };
@@ -33772,10 +36086,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
+          let trackingWarning: string | undefined;
           // Enabling a campaign via UPDATE(status=ENABLED) is a launch — gate it like RESUME.
           if (args.status === 'ENABLED') {
             const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'UPDATE', overrideTrackingCheck, opts?.sessionId);
             if (!gate.proceed) return gate.blockResult;
+            trackingWarning = gate.warning;
           }
           const didUpdate = await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
             name: args.name,
@@ -33788,7 +36104,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             finalUrlSuffix: args.final_url_suffix,
           });
           if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
-          return { success: true, message: 'Campaign updated' };
+          // Same relay as RESUME: permitted, but the operator is told what could not be
+          // verified rather than reading a bare success (ENG-1358).
+          return { success: true, message: 'Campaign updated', ...(trackingWarning ? { trackingWarning } : {}) };
         }
         if (action === 'ADD_PROXIMITY') {
           if (!args.campaign_resource_name || args.radius === undefined || !args.address) {
@@ -33812,6 +36130,219 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for REMOVE_PROXIMITY' };
           await googleAdsService.removeCampaignCriterion(userId, customer_id, args.criterion_resource_name, ['PROXIMITY']);
           return { success: true, message: 'Campaign criterion removed' };
+        }
+      }
+
+      // CONVERSION_ACTION (ENG-1322). CREATE / LIST / UPDATE only — REMOVE is
+      // deliberately absent (Harsha, ENG-1329): it severs historical attribution in
+      // the customer's account and is the one operation we cannot undo from our
+      // side. Pausing via UPDATE covers what an operator actually needs.
+      if (entity_type === 'OFFLINE_CONVERSION') {
+        if (action !== 'UPLOAD') {
+          return { success: false, error: `OFFLINE_CONVERSION supports UPLOAD only, not ${action}.` };
+        }
+        if (!args.gclid || !args.conversion_action_resource_name || !args.conversion_at) {
+          return {
+            success: false,
+            error: 'gclid, conversion_action_resource_name and conversion_at are all required. '
+              + 'conversion_at is when the conversion HAPPENED (ISO 8601), not when you noticed it — '
+              + 'Google attributes it to that moment.',
+          };
+        }
+        const { buildClickConversion } = await import('../utils/googleAdsOfflineConversions');
+        /*
+         * Validate BEFORE resolving the time zone. getAccountTimeZone is a live Google
+         * call, so doing it first meant a future-dated timestamp or a value with no
+         * currency — both refusable locally — still cost a network round trip before
+         * being rejected. On a background sweep that is a request per bad row.
+         *
+         * The zone is only needed to FORMAT a conversion we have already accepted, so a
+         * throwaway placeholder validates everything else first. UTC is safe here purely
+         * because the result is discarded; the real formatting below uses the account's
+         * own zone, and getting that wrong would shift every conversion by the real
+         * offset with no symptom beyond conversions landing on the wrong day.
+         */
+        const validateOnlyArgs = {
+          gclid: args.gclid,
+          conversionActionResourceName: args.conversion_action_resource_name,
+          conversionAt: new Date(args.conversion_at),
+          value: args.conversion_value,
+          currencyCode: args.currency_code,
+          orderId: args.order_id,
+        };
+        try {
+          buildClickConversion({ ...validateOnlyArgs, timeZone: 'UTC' });
+        } catch (err: any) {
+          return { success: false, error: err?.message || 'Invalid offline conversion.' };
+        }
+
+        const tz = args.time_zone || await googleAdsService.getAccountTimeZone(userId, customer_id);
+        let conversion: Record<string, unknown>;
+        try {
+          conversion = buildClickConversion({
+            gclid: args.gclid,
+            conversionActionResourceName: args.conversion_action_resource_name,
+            conversionAt: new Date(args.conversion_at),
+            timeZone: tz,
+            value: args.conversion_value,
+            currencyCode: args.currency_code,
+            orderId: args.order_id,
+          });
+        } catch (err: any) {
+          // Refused locally, before the network. An upload runs from a background sweep
+          // with nobody watching, so a rejected batch surfaces days later as "conversions
+          // never appeared".
+          return { success: false, error: err?.message || 'Invalid offline conversion.' };
+        }
+        const out = await googleAdsService.uploadClickConversions(
+          userId, customer_id, [conversion], { validateOnly: args.validate_only === true },
+        );
+        return {
+          success: out.failures.length === 0,
+          validateOnly: args.validate_only === true,
+          uploaded: out.uploaded,
+          failures: out.failures,
+          conversion,
+          ...(out.failures.length > 0
+            ? { error: out.failures.map((f) => `row ${f.index}: ${f.errorCode ?? ''} ${f.message}`.trim()).join('; ') }
+            : {}),
+        };
+      }
+
+      if (entity_type === 'CONVERSION_ACTION') {
+        if (action === 'LIST') {
+          const conversionActions = await googleAdsService.listConversionActions(userId, customer_id);
+          return { success: true, conversionActions };
+        }
+        if (action === 'CREATE') {
+          // counting_type is NOT defaulted here — the service refuses an absent one
+          // with a message naming both options and what choosing wrong costs.
+          const created = await googleAdsService.createConversionAction(userId, customer_id, {
+            name: args.name,
+            category: args.category,
+            countingType: args.counting_type,
+            status: args.status,
+            primaryForGoal: args.primary_for_goal,
+            clickThroughLookbackWindowDays: args.click_through_lookback_window_days,
+          });
+          return {
+            success: true,
+            conversionActionResourceName: created.resourceName,
+            // The pair the page actually needs — a resource name cannot be installed.
+            tag: created.tag,
+            tagUnavailable: created.tag
+              ? undefined
+              : 'Google has not generated tag snippets for this action yet. Re-run CONVERSION_ACTION LIST shortly to read the AW-<id>/<label> pair.',
+            stored: created.stored,
+            drift: created.drift,
+            driftWarning: created.drift.length > 0
+              ? `Google stored ${created.drift.length} field(s) differently from what was requested — see drift.`
+              : undefined,
+          };
+        }
+        if (action === 'UPDATE') {
+          const updated = await googleAdsService.updateConversionAction(
+            userId, customer_id, args.conversion_action_resource_name, {
+              name: args.name,
+              status: args.status,
+              category: args.category,
+              countingType: args.counting_type,
+              primaryForGoal: args.primary_for_goal,
+              clickThroughLookbackWindowDays: args.click_through_lookback_window_days,
+            });
+          return {
+            success: true,
+            conversionActionResourceName: updated.resourceName,
+            stored: updated.stored,
+            drift: updated.drift,
+            driftWarning: updated.drift.length > 0
+              ? `Google stored ${updated.drift.length} field(s) differently from what was requested — see drift.`
+              : undefined,
+          };
+        }
+        if (action === 'REMOVE') {
+          if (!args.conversion_action_resource_name) {
+            return { success: false, error: 'conversion_action_resource_name is required for CONVERSION_ACTION REMOVE.' };
+          }
+          /*
+           * Permanent and not re-enableable, so it goes through an explicit confirmation —
+           * the follow-up shape ENG-1329 anticipated ("if REMOVE is needed later, it's a
+           * small additive follow-up with its own explicit confirmation step").
+           *
+           * The message states what removal ACTUALLY does. The previous wording said it
+           * "severs historical attribution", which is not true and would talk someone out
+           * of a safe operation: Google models this as a soft state — the action stops
+           * recording, and conversions already recorded stay in reporting, exactly as a
+           * REMOVED campaign still returns its historical metrics.
+           */
+          /*
+           * ENG-1322 follow-up. The removal flag is BOUND to a disclosed approval, exactly
+           * as ENG-1526 bound override_tracking_check.
+           *
+           * `confirm_conversion_action_removal: true` used to be sufficient on its own, and
+           * the model sets its own arguments — so the only thing standing between a model
+           * that decided to "clean up" a conversion action and a permanent, unrecoverable
+           * removal was a sentence in the tool description asking it not to. ENG-941 already
+           * wrote down why that is not a control: "an override the model can introduce after
+           * approval is not user-granted, whatever the tool description says." This is the
+           * same shape guarding a strictly worse outcome — a removed conversion action cannot
+           * be re-enabled, and every campaign bidding toward it stops counting it.
+           *
+           * So: a claimed removal with no matching token HALTS and discloses, and issues an
+           * HMAC over this exact call. Only a replay presenting that token removes anything.
+           * A forged token, or a token minted for a DIFFERENT conversion action, falls back
+           * into a fresh disclosure rather than proceeding — which is the case that matters,
+           * because the destructive argument here is the resource name.
+           */
+          const removalClaimed = args.confirm_conversion_action_removal === true;
+          // Computed unconditionally, NOT only when the flag is claimed. The digest covers
+          // the call being disclosed, not the caller's intent to confirm — and the halt
+          // below has to hand back a usable token whether or not the flag was set. Gating
+          // it on the flag made the FIRST (unflagged) call disclose an empty string, which
+          // the model then replayed faithfully and was refused for, turning a two-step loop
+          // into three and making the token look broken. Issuing it here is not a weakening:
+          // the token is only ever returned alongside the disclosure of this exact resource
+          // name, which is what binds it.
+          const removalDigest = computeTrackingOverrideDigest(getJwtSecret(), {
+            customer_id, entity_type, action,
+            conversion_action_resource_name: args.conversion_action_resource_name,
+          });
+          const removalApproved =
+            removalClaimed && trackingOverrideTokenMatches(args.conversion_action_removal_token, removalDigest);
+
+          if (!removalApproved) {
+            const target = args.conversion_action_resource_name;
+            return {
+              success: true,
+              requiresConfirmation: true,
+              awaitingUserConfirmation: true,
+              summary: `Permanently stop conversion action ${target} from recording`,
+              confirmationPrompt:
+                `This PERMANENTLY stops a Google Ads conversion action from recording.\n\n`
+                + `It cannot be re-enabled afterwards, and any campaign bidding toward it as a `
+                + `goal will stop counting it — which changes how those campaigns bid. `
+                + `Conversions it already recorded stay in your reports, so this is not data `
+                + `loss, but it is not reversible either.\n\n`
+                + `Conversion action: ${target}\n\n`
+                + `Reply "yes" / "confirm" to remove it, or tell me to leave it alone.`,
+              confirmationDetail: `Permanently stop conversion action ${target} from recording`,
+              message:
+                `CONVERSION_ACTION REMOVE permanently stops ${target} recording and cannot be `
+                + `undone. Show the user the warning above and get explicit approval — do not `
+                + `decide this yourself. Once approved, call call_google_ads_api again with the `
+                + `same arguments PLUS conversion_action_removal_token exactly as returned here; `
+                + `without it nothing is removed.`,
+              // Only issued alongside a disclosure of this exact resource name, so the token
+              // can only ever approve the removal the user was actually shown.
+              conversion_action_removal_token: removalDigest,
+            };
+          }
+          await googleAdsService.removeConversionAction(userId, customer_id, args.conversion_action_resource_name);
+          return {
+            success: true,
+            message: `Conversion action removed. It has stopped recording and cannot be re-enabled; `
+              + `conversions it already recorded remain in reporting.`,
+          };
         }
       }
 
@@ -33848,6 +36379,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             campaignResourceName: args.campaign_resource_name,
             type: args.type,
             cpcBidMicros: args.cpc_bid_micros,
+            // ENG-1514. ENG-1293 taught createAdGroup to accept a status; this call
+            // site never sent one, so `params.status ?? 'ENABLED'` fired and an
+            // explicit PAUSED was dropped behind a success response. Defaulting to
+            // PAUSED (not ENABLED) matches CAMPAIGN CREATE above and RULE 11.
+            status: args.status || 'PAUSED',
           });
           return { success: true, adGroupResourceName: adGroup.resourceName };
         }
@@ -33879,7 +36415,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'ADD') {
           if (!args.ad_group_resource_name || !args.keywords) return { success: false, error: 'ad_group_resource_name and keywords array are required' };
-          await googleAdsService.addKeywords(userId, customer_id, args.ad_group_resource_name, args.keywords);
+          // ENG-1527: forward the caller's status. Same shape as the CAMPAIGN/AD_GROUP/AD
+          // creates — the argument the schema advertises has to reach the service.
+          await googleAdsService.addKeywords(userId, customer_id, args.ad_group_resource_name, args.keywords, args.status || 'PAUSED');
           return { success: true, message: `Added ${args.keywords.length} keyword(s)` };
         }
         if (action === 'ADD_NEGATIVE') {
@@ -33926,18 +36464,21 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           }
           // ENG-335: an ad added to an already-live campaign serves paid traffic
           // instantly — gate its final_url like a launch when the parent is ENABLED.
-          // Fail-open on a lookup/gate error: this is defence-in-depth (the RESUME /
-          // UPDATE→ENABLED gate is the hard guarantee), so a transient parent-status
-          // lookup failure must NOT break an otherwise-valid ad creation.
-          try {
-            const parent = await googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name);
-            if (parent) {
-              const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, parent.campaignResourceName, parent.campaignStatus, 'AD_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
-              if (!gate.proceed) return gate.blockResult;
-            }
-          } catch (gateErr) {
-            console.error('[ENG-335] AD_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
-          }
+          // ENG-1358: adding a creative to an already-ENABLED campaign is a launch too. The
+          // gate already computes the warning; relaying it here is what stops it being
+          // computed and discarded — the exact failure this ticket's own comment names.
+          // ENG-1527: fails CLOSED when the parent's status cannot be established — see
+          // guardCreativeAddition for why "the RESUME gate still guards it" was inverted.
+          const adGate = await this.guardCreativeAddition({
+            customerId: customer_id,
+            action: 'AD_CREATE',
+            override: overrideTrackingCheck,
+            sessionId: opts?.sessionId,
+            finalUrls: [args.final_url],
+            resolveParent: () => googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name),
+          });
+          if (!adGate.proceed) return adGate.blockResult;
+          const creativeTrackingWarning = adGate.warning;
           let adType = args.type as string;
           if (adType === 'SEARCH') adType = 'RESPONSIVE_SEARCH_AD';
           else if (adType === 'DISPLAY') adType = 'RESPONSIVE_DISPLAY_AD';
@@ -33948,8 +36489,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             descriptions: args.descriptions,
             finalUrl: args.final_url,
             imageAssetResourceNames: args.image_asset_resource_names,
+            // ENG-1514, same as the AD_GROUP CREATE above: the status the caller
+            // asked for has to reach the service, or a staged ad goes live the
+            // moment its campaign is enabled.
+            status: args.status || 'PAUSED',
           });
-          return { success: true, adResourceName: ad.resourceName };
+          return { success: true, adResourceName: ad.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
         }
         if (action === 'UPDATE') {
           if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
@@ -34006,15 +36551,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         // ENG-335: a PMax asset group added to an already-live campaign serves paid
         // traffic instantly — gate its final_url like a launch when the parent is ENABLED.
-        // Fail-open on a lookup/gate error (see AD_CREATE above): defence-in-depth, so a
-        // transient campaign-status lookup failure must NOT break a valid asset-group create.
-        try {
-          const campaignStatus = await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name);
-          const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, args.campaign_resource_name, campaignStatus, 'ASSET_GROUP_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
-          if (!gate.proceed) return gate.blockResult;
-        } catch (gateErr) {
-          console.error('[ENG-335] ASSET_GROUP_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
-        }
+        // Same relay as AD CREATE — a PMax asset group on an ENABLED campaign is a launch —
+        // and the same ENG-1527 fail-closed treatment, through the same helper so the two
+        // call sites cannot drift apart.
+        const assetGroupGate = await this.guardCreativeAddition({
+          customerId: customer_id,
+          action: 'ASSET_GROUP_CREATE',
+          override: overrideTrackingCheck,
+          sessionId: opts?.sessionId,
+          finalUrls: [args.final_url],
+          resolveParent: async () => ({
+            campaignResourceName: args.campaign_resource_name,
+            campaignStatus: await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name),
+          }),
+        });
+        if (!assetGroupGate.proceed) return assetGroupGate.blockResult;
+        const creativeTrackingWarning = assetGroupGate.warning;
         const assetGroup = await googleAdsService.createAssetGroup(userId, customer_id, {
           name: args.name,
           campaignResourceName: args.campaign_resource_name,
@@ -34027,7 +36579,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           videoAssets: args.video_assets,
           finalUrl: args.final_url,
         });
-        return { success: true, assetGroupResourceName: assetGroup.resourceName };
+        return { success: true, assetGroupResourceName: assetGroup.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
       }
 
       if (entity_type === 'ASSET_GROUP' && action === 'RETAG_UTM') {
@@ -34610,6 +37162,34 @@ function computeFindLeadsCriteriaHash(filters: {
   return require('crypto').createHash('sha1').update(JSON.stringify(obj)).digest('hex').slice(0, 16);
 }
 
+// Mirrors LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS /
+// COMPANY_SIZE_LOOKUP_CONCURRENCY (kept as separate local constants rather
+// than importing that class here — this file already reaches the singleton
+// via the top-level `linkedInOutreachService` import, and the class itself
+// is only ever pulled in via dynamic import for a handful of static helpers).
+const EMPLOYER_PROFILE_LOOKUP_TIMEOUT_MS = 30_000;
+const EMPLOYER_PROFILE_LOOKUP_CONCURRENCY = 5;
+
+/**
+ * Races a promise against a timeout, mirroring
+ * LinkedInOutreachService's private withTimeout (not accessible from here) —
+ * used so a single hung Unipile call can't stall an interactive chat turn.
+ * The timer is unref'd so it never keeps the process alive.
+ */
+function withTimeoutOrReject<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err: any = new Error(`${label} timed out after ${ms}ms`);
+      err.isTimeout = true;
+      err.classification = 'TIMEOUT_ERROR';
+      reject(err);
+    }, ms);
+    if (typeof (timer as any).unref === 'function') (timer as any).unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /**
  * Tier 2 of company resolution for LinkedIn-search leads: cheap regex on
  * the lead's headline / title. Looks for "Role at Company" or "Role @ Company"
@@ -34625,19 +37205,19 @@ function parseCompanyFromTitle(title: any): string | null {
 }
 
 /**
- * Tier 3 of company resolution: ONE Gemini Flash call per page that takes the
+ * Tier 3 of company resolution: ONE shared-gateway call per page that takes the
  * full batch of titles and returns a parallel array of company names (or
- * "NONE"). Caller passes the resolved llmClient so the helper stays pure and
+ * "NONE"). Caller passes the gateway seam so the helper stays pure and
  * easily mockable. On any error or response-shape mismatch, returns an
  * all-"NONE" array so callers fall through to Tier 4 (Unipile getProfile).
  */
 async function batchParseCompaniesFromTitlesWithLLM(
   titles: string[],
-  llmClient: any,
+  gateway: Pick<AgentModeService, 'callLLM'> | null,
   userId?: string,
 ): Promise<string[]> {
   if (!Array.isArray(titles) || titles.length === 0) return [];
-  if (!llmClient?.chat?.completions?.create) return titles.map(() => 'NONE');
+  if (!gateway?.callLLM) return titles.map(() => 'NONE');
   try {
     const systemPrompt = [
       'You extract company names from professional / LinkedIn titles in batch.',
@@ -34654,24 +37234,19 @@ async function batchParseCompaniesFromTitlesWithLLM(
       '- Use "NONE" (uppercase) when uncertain.',
     ].join('\n');
     const userPrompt = `Titles: ${JSON.stringify(titles)}`;
-    const completion = await llmClient.chat.completions.create({
-      model: 'gemini-2.5-flash',
-      messages: [
+    const completion = await gateway.callLLM(
+      'gemini-3.1-flash-lite',
+      [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
-      max_completion_tokens: Math.max(500, titles.length * 30),
-      temperature: 0.1,
-    });
-    // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
-    // Tokens are recorded even though gemini-2.5-flash may be unpriced (cost 0
-    // until a price row exists) — token visibility is still worth having.
-    if ((completion as any)?.usage) {
-      meterUsageFromResponse(
-        { userId, model: 'gemini-2.5-flash', provider: 'gemini', feature: 'title_company_parse' },
-        completion
-      );
-    }
+      {
+        max_completion_tokens: Math.max(500, titles.length * 30),
+        temperature: 0.1,
+        usageContext: { userId, feature: 'title_company_parse' },
+        taskClass: 'nonstandard_consumer',
+      },
+    );
     const raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();
     // Gemini Flash often adds preamble / postamble / markdown fences despite
     // explicit instructions. Locate the widest `[ ... ]` substring instead of

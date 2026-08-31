@@ -49,6 +49,21 @@ export interface ItemizedUsageResult {
 // the OTHER member's aggregate row, since both hash to the same key. Every
 // charge event carries actingUserId and every aggregate row carries userId,
 // so both sides can always be scoped correctly.
+// Deliberately NOT keyed on the payer, and that is load-bearing (ENG-1210,
+// Greptile PR #2407).
+//
+// Keying it on `billingUserId` looked safer and was strictly worse. Legacy rows
+// stored the ACTING user as their payer -- `recordUsage` defaulted
+// `ctx.billingUserId || userId`, and measured on production 0 of 4,629 rows carry
+// a payer that differs from the actor -- while charge events carry the real
+// billing ROOT. Keyed on the payer those two stop hashing together, coverage
+// silently stops matching, and the full aggregate is reported alongside the
+// charge events that already itemise it: an OVERCOUNT on a customer's bill.
+//
+// The cross-payer leakage that motivated adding it is already handled by grouping
+// rows into slots below: two rows for one slot are combined and their coverage is
+// netted once, which gives the same total whether or not the payer is in the key.
+// Grouping was the fix; the payer was redundant, and its redundancy cost money.
 const aggregateKey = (actingUserId: string, date: string, model: string, feature: string) =>
   `${actingUserId}#${date}#${model}#${feature}`;
 
@@ -88,13 +103,46 @@ export function reconcileItemizedUsage(
     coverageByKey.set(key, entry);
   }
 
-  const aggregateItems: ItemizedUsageItem[] = rows.flatMap((row) => {
+  // Rows sharing a slot are COMBINED before coverage is netted, because coverage
+  // is per slot and subtracting it from each row would remove it more than once.
+  //
+  // One row per slot was guaranteed until the payer joined the sort key
+  // (ENG-1210). Now a day that was accumulating under `date#model#feature` stops
+  // there and a new row starts at `date#model#feature#payer`, so for as long as a
+  // cycle spans the cutover a slot holds two rows with the SAME payer. Netting
+  // each independently understated the bill by a full day's coverage -- an
+  // undercount, which is the direction a customer cannot see.
+  //
+  // With one row per slot this is arithmetically identical to the previous
+  // behaviour, so the ordinary case is unchanged.
+  const slots = new Map<
+    string,
+    { row: UsageRecordRow; microUsd: number; tokens: number; calls: number }
+  >();
+  for (const row of rows) {
     const key = aggregateKey(row.userId, row.date, row.model, row.feature);
+    const slot = slots.get(key);
+    if (slot) {
+      slot.microUsd += row.costMicroUsd || 0;
+      slot.tokens += row.totalTokens || 0;
+      slot.calls += row.callCount || 0;
+      continue;
+    }
+    slots.set(key, {
+      row,
+      microUsd: row.costMicroUsd || 0,
+      tokens: row.totalTokens || 0,
+      calls: row.callCount || 0,
+    });
+  }
+
+  const aggregateItems: ItemizedUsageItem[] = [...slots.entries()].flatMap(([key, slot]) => {
+    const row = slot.row;
     const coverage = coverageByKey.get(key);
-    // row.costMicroUsd is already micro-USD, same unit as the charge events summed above.
-    const rowMicroUsd = row.costMicroUsd || 0;
-    const rowTokens = row.totalTokens || 0;
-    const rowCalls = row.callCount || 0;
+    // Already micro-USD, same unit as the charge events summed above.
+    const rowMicroUsd = slot.microUsd;
+    const rowTokens = slot.tokens;
+    const rowCalls = slot.calls;
 
     if (!coverage) {
       // No charge-event coverage exists for this (date, model, feature) at

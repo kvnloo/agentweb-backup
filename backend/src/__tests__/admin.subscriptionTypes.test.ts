@@ -318,6 +318,87 @@ describe('Admin subscription types routes', () => {
     expect(saved[0].llmUsagePolicy).toEqual(llmUsagePolicy);
   });
 
+  // ENG-1214 AC5: the alert thresholds are only "admin-configurable" if the
+  // admin save path can actually carry them. It builds the stored policy from an
+  // explicit field whitelist, so a field missing from that list is not merely
+  // un-settable -- it is silently DROPPED from any policy that already had it,
+  // reverting the tier to the defaults without telling anyone.
+  it('persists the alert thresholds when an admin sets them', async () => {
+    const llmUsagePolicy = {
+      version: 'starter-alert-v1', enforcementState: 'enforce',
+      optimizationCostThresholdMicroUsd: 30_000_000,
+      hardCostThresholdMicroUsd: 60_000_000,
+      optimizedModelIds: ['gemini-3.1-flash-lite'],
+      optimizedDefaultModel: 'gemini-3.1-flash-lite',
+      alertUsagePercentThreshold: 75,
+      alertOnForecastShortfall: false,
+    };
+
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsagePolicy }],
+    }).expect(200);
+
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].llmUsagePolicy.alertUsagePercentThreshold).toBe(75);
+    expect(saved[0].llmUsagePolicy.alertOnForecastShortfall).toBe(false);
+  });
+
+  it('leaves the alert fields absent when the admin omits them', async () => {
+    // Absent must stay absent rather than being materialised as the default:
+    // a stored 90 cannot later be told apart from "never configured", which is
+    // what lets the default move without rewriting every tier.
+    const llmUsagePolicy = {
+      version: 'starter-noalert-v1', enforcementState: 'enforce',
+      optimizationCostThresholdMicroUsd: 30_000_000,
+      hardCostThresholdMicroUsd: 60_000_000,
+      optimizedModelIds: ['gemini-3.1-flash-lite'],
+      optimizedDefaultModel: 'gemini-3.1-flash-lite',
+    };
+
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsagePolicy }],
+    }).expect(200);
+
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].llmUsagePolicy).not.toHaveProperty('alertUsagePercentThreshold');
+    expect(saved[0].llmUsagePolicy).not.toHaveProperty('alertOnForecastShortfall');
+  });
+
+  it('rejects an out-of-range alert threshold instead of coercing it', async () => {
+    // Passing the value through RAW is what lets validation see it. Coercing at
+    // the boundary (Number(...), === true) would make the validator a no-op and
+    // silently store a threshold that never fires.
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{
+        name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'],
+        llmUsagePolicy: {
+          version: 'starter-bad-v1', enforcementState: 'enforce',
+          optimizationCostThresholdMicroUsd: 30_000_000,
+          hardCostThresholdMicroUsd: 60_000_000,
+          optimizedModelIds: ['gemini-3.1-flash-lite'],
+          optimizedDefaultModel: 'gemini-3.1-flash-lite',
+          alertUsagePercentThreshold: 100,
+        },
+      }],
+    }).expect(400);
+  });
+
+  it('rejects a non-boolean forecast-alert flag instead of coercing it', async () => {
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{
+        name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'],
+        llmUsagePolicy: {
+          version: 'starter-bad-v2', enforcementState: 'enforce',
+          optimizationCostThresholdMicroUsd: 30_000_000,
+          hardCostThresholdMicroUsd: 60_000_000,
+          optimizedModelIds: ['gemini-3.1-flash-lite'],
+          optimizedDefaultModel: 'gemini-3.1-flash-lite',
+          alertOnForecastShortfall: 'yes',
+        },
+      }],
+    }).expect(400);
+  });
+
   it('persists the hard-cap-only rollout state independently of model optimization', async () => {
     const llmUsagePolicy = {
       version: 'starter-hard-v1', enforcementState: 'hard_only',

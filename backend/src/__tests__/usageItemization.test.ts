@@ -35,6 +35,102 @@ const row = (overrides: Partial<UsageRecordRow> = {}): UsageRecordRow => ({
 });
 
 describe("reconcileItemizedUsage", () => {
+  it("matches coverage for a LEGACY row stamped with the actor, not the root", () => {
+    // Greptile, PR #2407: "payer-aware itemization separates legacy actor-stamped
+    // rows from correctly root-stamped coverage."
+    //
+    // `recordUsage` defaulted the payer to `ctx.billingUserId || userId`, so every
+    // row written before ENG-1217 tagged the agent path carries the ACTING user --
+    // measured on production, 0 of 4,629 rows carry a payer that differs from the
+    // actor. Charge events carry the real billing ROOT, because that is their
+    // partition key.
+    //
+    // Key the coverage map on the payer and those two stop hashing together: the
+    // coverage is silently lost and the whole aggregate is reported alongside the
+    // charge events that already itemise it. That is an OVERCOUNT on a customer's
+    // bill, which is why the coverage key must stay payer-free.
+    const events = [
+      event({ billingUserId: "root-1", actingUserId: "member-a", costMicroUsd: 5000 }),
+    ];
+    const rows = [
+      row({ userId: "member-a", billingUserId: "member-a", costMicroUsd: 5000,
+            sk: "2026-08-15#gpt-4o#chat" }),
+    ];
+
+    const result = reconcileItemizedUsage(events, rows);
+    const total = result.items.reduce((sum, i) => sum + i.costMicroUsd, 0);
+
+    // The row is fully covered by its charge event. Only the event's 5000 counts.
+    expect(total).toBe(5000);
+  });
+
+  it("nets a slot's coverage ONCE when the day holds an old- and new-format row", () => {
+    // The deploy-day case for the payer sort-key change. A day that was already
+    // accumulating under `date#model#feature` stops there and a new row starts at
+    // `date#model#feature#payer`. Same actor, same day, same slot, SAME payer --
+    // two rows where there used to be one.
+    //
+    // Coverage is per SLOT, not per row. Subtracting it from each row
+    // independently removes it twice and understates the bill -- and an
+    // undercount is invisible to the customer, which is what makes it the
+    // dangerous direction. This is the one real hazard the key change introduces,
+    // and it lasts exactly as long as a cycle contains rows of both formats.
+    const events = [event({ billingUserId: "bill-1", actingUserId: "actor-1", costMicroUsd: 3000 })];
+    const rows = [
+      row({ userId: "actor-1", billingUserId: "bill-1", costMicroUsd: 5000,
+            sk: "2026-08-15#gpt-4o#chat" }),
+      row({ userId: "actor-1", billingUserId: "bill-1", costMicroUsd: 4000,
+            sk: "2026-08-15#gpt-4o#chat#bill-1" }),
+    ];
+
+    const result = reconcileItemizedUsage(events, rows);
+    const total = result.items.reduce((sum, i) => sum + i.costMicroUsd, 0);
+
+    // Aggregates total 9000, of which 3000 is already itemised as a charge event.
+    // Correct total = 3000 (event) + (9000 - 3000) = 9000.
+    expect(total).toBe(9000);
+  });
+
+  it("does not apply one payer's coverage to another payer's row for the same slot", () => {
+    // ENG-1210 (Greptile, PR #2407). Since the payer became part of the aggregate
+    // row's sort key, a billing transition mid-day yields TWO rows for one
+    // (actor, date, model, feature) slot. Read from the subject's own partition,
+    // both come back.
+    //
+    // Keyed without the payer they would hash together, and the coverage from
+    // owner-1's charge event would be subtracted from owner-2's row as well --
+    // understating the bill by a full day's coverage. An undercount is invisible
+    // to the customer, which is what makes it the dangerous direction.
+    const events = [event({ billingUserId: "bill-1", actingUserId: "actor-1", costMicroUsd: 5000 })];
+    const rows = [
+      row({ userId: "actor-1", billingUserId: "bill-1", costMicroUsd: 5000,
+            sk: "2026-08-15#gpt-4o#chat#bill-1" }),
+      row({ userId: "actor-1", billingUserId: "bill-2", costMicroUsd: 7000,
+            sk: "2026-08-15#gpt-4o#chat#bill-2" }),
+    ];
+
+    const result = reconcileItemizedUsage(events, rows);
+    const total = result.items.reduce((sum, i) => sum + i.costMicroUsd, 0);
+
+    // bill-1's row is fully covered by its charge event (5000 - 5000 = 0), and
+    // bill-2's row is untouched by it. The event itself contributes 5000.
+    expect(total).toBe(5000 + 7000);
+  });
+
+  it("still nets a row against coverage from its OWN payer", () => {
+    // The scoping must not go so far that legitimate coverage stops matching --
+    // that would double-count, which is the opposite failure.
+    const events = [event({ billingUserId: "bill-1", actingUserId: "actor-1", costMicroUsd: 5000 })];
+    const rows = [
+      row({ userId: "actor-1", billingUserId: "bill-1", costMicroUsd: 5000,
+            sk: "2026-08-15#gpt-4o#chat#bill-1" }),
+    ];
+
+    const result = reconcileItemizedUsage(events, rows);
+    const total = result.items.reduce((sum, i) => sum + i.costMicroUsd, 0);
+    expect(total).toBe(5000);
+  });
+
   it("shows the aggregate row in full when no charge events touch its key", () => {
     const result = reconcileItemizedUsage([], [row()]);
     expect(result.items).toEqual([

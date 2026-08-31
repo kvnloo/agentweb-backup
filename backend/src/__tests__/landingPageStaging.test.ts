@@ -408,6 +408,45 @@ describe("GET /commits with branch query param", () => {
 // POST /publish
 // =============================================================================
 describe("POST /publish", () => {
+  /**
+   * ENG-1488 (6470eb409) made publish read the draft's check-runs and require a completed,
+   * non-cancelled "Tests" check before merging. It shipped with no test of its own AND
+   * without updating this suite's ordered axios chains, so every publish test 500'd on
+   * `checksRes.data` of an exhausted mock queue. CI could not catch it: no workflow runs
+   * jest any more.
+   *
+   * Queue this immediately AFTER the pre-merge-SHA read and BEFORE the merge POST.
+   */
+  const DRAFT_SHA = "draft-head-sha";
+  /**
+   * ENG-1488 (6470eb409) inserted four GETs into publish and re-reads the draft ref twice
+   * more, so the ordered chain each test queues is now, after the pre-merge main read:
+   *   draft ref -> open PRs -> check-runs -> draft ref again -> draft ref before delete.
+   * The PR lookup MUST be non-empty or the route POSTs to create one and eats the merge POST.
+   * Both re-reads MUST match the first, or the route treats the draft as having moved.
+   *
+   * It shipped with no test of its own and without touching this suite; nothing caught it
+   * because no CI workflow runs jest any more.
+   */
+  const queueTestsCheck = (
+    check: Record<string, unknown> | null = {},
+    sha: string = DRAFT_SHA,
+    throughDelete = true,
+  ) => {
+    const ref = () => mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha } }));
+    ref();                                                                   // draft ref
+    mockedAxios.get.mockResolvedValueOnce(axiosRes([{ number: 1 }]));        // an open PR exists
+    mockedAxios.get.mockResolvedValueOnce(
+      axiosRes({
+        check_runs: check === null ? [] : [{ name: "Tests", status: "completed", conclusion: "success", ...check }],
+      })
+    );
+    if (check === null || check.status === "in_progress" || check.conclusion === "cancelled") return;
+    ref();                                                                   // re-read: did the draft move?
+    if (!throughDelete) return; // the merge fails in this test, so the pre-delete read never happens
+    ref();                                                                   // re-read before delete
+  };
+
   it("FAIL: missing branch → 400", async () => {
     const res = await request(app)
       .post("/api/landing-pages/v0/generated/page-123/publish")
@@ -438,6 +477,7 @@ describe("POST /publish", () => {
   it("SUCCESS: merges branch and deletes it", async () => {
     // Read pre-merge main SHA
     mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "pre-merge-sha" } }));
+    queueTestsCheck();
     // Merge succeeds
     mockedAxios.post.mockResolvedValueOnce(axiosRes({ sha: "merge-sha-123" }));
     // Delete branch succeeds
@@ -457,7 +497,9 @@ describe("POST /publish", () => {
       expect.stringContaining("/merges"),
       expect.objectContaining({
         base: "main",
-        head: "draft/agentweb-preview",
+        // ENG-1488: merges the exact SHA whose Tests check was verified, not the branch ref —
+        // otherwise the branch could move between the check and the merge.
+        head: DRAFT_SHA,
       }),
       expect.any(Object)
     );
@@ -482,6 +524,7 @@ describe("POST /publish", () => {
   it("SUCCESS: does not record publish history when pre-merge SHA is unreadable", async () => {
     // Reading pre-merge main fails — revert won't be offered for this publish
     mockedAxios.get.mockRejectedValueOnce(new Error("network"));
+    queueTestsCheck();
     mockedAxios.post.mockResolvedValueOnce(axiosRes({ sha: "merge-sha-456" }));
     mockedAxios.delete.mockResolvedValueOnce(axiosRes({}));
 
@@ -496,6 +539,7 @@ describe("POST /publish", () => {
 
   it("SUCCESS: publish still succeeds when recording publish history fails", async () => {
     mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "pre-merge-sha" } }));
+    queueTestsCheck();
     mockedAxios.post.mockResolvedValueOnce(axiosRes({ sha: "merge-sha-789" }));
     mockedAxios.delete.mockResolvedValueOnce(axiosRes({}));
     mockRecordPublish.mockRejectedValueOnce(new Error("dynamo down"));
@@ -511,14 +555,11 @@ describe("POST /publish", () => {
   it("SUCCESS: merge conflict (409) falls back to force-advancing main", async () => {
     // Read pre-merge main SHA
     mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "pre-merge-sha" } }));
+    queueTestsCheck({}, "draft-tip-sha-abc");
     // Standard merge returns 409
     mockedAxios.post.mockRejectedValueOnce({
       response: { status: 409, data: { message: "Merge conflict" } },
     });
-    // GET branch tip SHA
-    mockedAxios.get.mockResolvedValueOnce(
-      axiosRes({ object: { sha: "draft-tip-sha-abc" } })
-    );
     // PATCH main ref (force-update)
     mockedAxios.patch.mockResolvedValueOnce(axiosRes({ ref: "refs/heads/main" }));
     // Delete draft branch
@@ -540,7 +581,56 @@ describe("POST /publish", () => {
     );
   });
 
+
+  // ENG-1488's gate itself — three refusal branches, none of which had a test.
+  it("ENG-1488 GATE: refuses to merge when the Tests check has not started", async () => {
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "pre-merge-sha" } }));
+    queueTestsCheck(null); // no check_runs at all
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-123/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    // Assert the REFUSAL, not merely "not 200" — a 500 from an exhausted axios queue or an
+    // exception would satisfy that too, and would hide the very regression this pins.
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockedAxios.post).not.toHaveBeenCalledWith(expect.stringContaining("/merges"), expect.anything(), expect.anything());
+  });
+
+  it("ENG-1488 GATE: refuses while the Tests check is still running", async () => {
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "pre-merge-sha" } }));
+    queueTestsCheck({ status: "in_progress", conclusion: null });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-123/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    // Assert the REFUSAL, not merely "not 200" — a 500 from an exhausted axios queue or an
+    // exception would satisfy that too, and would hide the very regression this pins.
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockedAxios.post).not.toHaveBeenCalledWith(expect.stringContaining("/merges"), expect.anything(), expect.anything());
+  });
+
+  it("ENG-1488 GATE: refuses when the Tests check was cancelled", async () => {
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "pre-merge-sha" } }));
+    queueTestsCheck({ conclusion: "cancelled" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-123/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    // Assert the REFUSAL, not merely "not 200" — a 500 from an exhausted axios queue or an
+    // exception would satisfy that too, and would hide the very regression this pins.
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockedAxios.post).not.toHaveBeenCalledWith(expect.stringContaining("/merges"), expect.anything(), expect.anything());
+  });
+
   it("FAIL: branch not found → 404", async () => {
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "pre-merge-sha" } }));
+    queueTestsCheck({}, DRAFT_SHA, false);
     mockedAxios.post.mockRejectedValueOnce({
       response: { status: 404, data: { message: "Not found" } },
     });

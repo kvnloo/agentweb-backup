@@ -1,5 +1,5 @@
 import app from './app';
-import { isCronEnabled, disableCron } from './utils/instanceState';
+import { isCronEnabled, disableCron, shouldBootstrapBackgroundJobs } from './utils/instanceState';
 import { cronJobRegistry } from './utils/cronJobRegistry';
 import { DRAIN_CEILING_MS } from './utils/shutdownConstants';
 import { agentModeService } from './services/agentModeService';
@@ -10,10 +10,10 @@ import bcrypt from 'bcryptjs';
 import http from 'http';
 import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
-import { generateChatResponse, chatbotDb } from './services/chatbotService';
-import { checkTokenUsage } from './services/tokenUsageService';
+import { chatbotDb } from './services/chatbotService';
 import { userDb } from './services/db';
 import { registerIo } from './services/sessionSockets';
+import { handleSocketChatMessage } from './services/chatSocketHandler';
 import {
   sendAudioChunk,
   sendAudioStreamEnd,
@@ -260,56 +260,13 @@ io.on('connection', (socket: Socket) => {
   });
 
   // Handle chat messages
-  socket.on('message', async (data: {
+  socket.on('message', (data: {
     sessionId: string;
     message: string;
     currentUrl?: string;
     pageContent?: string;
     portal?: 'customer' | 'partner';
-  }) => {
-    try {
-      // Get user ID from socket auth
-      const token = socket.handshake.auth.token;
-      if (!token) {
-        throw new Error('No authentication token provided');
-      }
-
-      const decoded = jwt.verify(token, getJwtSecret()) as { userId: string; isAdmin?: boolean; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
-      const userId = decoded.delegateAccess?.targetUserId || decoded.userId;
-      const isDelegatedAdmin = !!decoded.delegateAccess || decoded.isAdmin === true;
-
-      // Check token usage limits
-      const usageStatus = await checkTokenUsage(userId);
-      if (!usageStatus.allowed) {
-        socket.emit('error', {
-          message: 'Monthly token limit reached. Please contact support or upgrade your plan.',
-          code: 'TOKEN_LIMIT_EXCEEDED',
-          tokenUsage: usageStatus,
-        });
-        return;
-      }
-
-      const portalType = data.portal || 'partner';
-      const orgRole = portalType === 'customer' ? (await userDb.getUserById(userId))?.orgRole : undefined;
-      const response = await generateChatResponse(
-        data.sessionId,
-        data.message,
-        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id, isDelegatedAdmin, orgRole }
-      );
-
-      // Send response back to the client
-      const responseContent = typeof response === 'string' ? response : (response as any)?.content ?? '';
-      socket.emit('message', {
-        sessionId: data.sessionId,
-        content: responseContent
-      });
-    } catch (error) {
-      console.error('Error processing message:', error);
-      socket.emit('error', {
-        message: 'Failed to process message'
-      });
-    }
-  });
+  }) => handleSocketChatMessage(socket, data));
 
   // Implement automatic reconnection
   socket.on('reconnect_attempt', () => {
@@ -535,6 +492,20 @@ createTestAccount().then(async () => {
     console.log(`WebSocket server is ready`);
     console.log(`Test account email: ${process.env.TEST_EMAIL}`);
 
+    // ENG-1286: everything below this line either schedules a timer or awaits a
+    // dynamic import, and under Jest both outlive the test that triggered them.
+    // Nothing asks for this — `app.ts` registers `routes/crm.ts`, which imports
+    // `../server`, so merely touching `app` boots the real server. The 30-second
+    // cron bootstrap then fires long after that file's environment is torn down,
+    // resolves every `await import(...)` against a dead module registry, and
+    // throws `TypeError: <fn> is not a function` inside an unrelated suite.
+    // Returning here — rather than guarding each cron — is deliberate: a guard
+    // per job is a list that the next background job will be added without.
+    if (!shouldBootstrapBackgroundJobs()) {
+      console.log('[server] Test runtime — background jobs not started (ENG-1286)');
+      return;
+    }
+
     // ENG-764: an EB deploy terminates this instance without waiting for the
     // drain, killing any in-flight scheduled run. Watch for the ASG's termination
     // signal, drain first, then release the instance. Self-disables off-ASG (local
@@ -640,6 +611,38 @@ createTestAccount().then(async () => {
       }
 
 
+      // ENG-916: Meta Ads Metrics Snapshot — runs daily at 09:00 UTC (after
+      // ActivationCron at 08:00), re-pulling the last SETTLING_WINDOW_DAYS days each run
+      // (28, sized against Meta's documented insights-mutability window) so a stored row
+      // doesn't freeze while Meta is still revising it.
+      try {
+        const METRICS_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        const { runMetaMetricsSnapshot } = await import('./cron/metaMetricsSnapshotCron');
+
+        const nowForMetricsCron = new Date();
+        const nextMetricsRunUTC = new Date(nowForMetricsCron);
+        nextMetricsRunUTC.setUTCHours(9, 0, 0, 0);
+        if (nextMetricsRunUTC <= nowForMetricsCron) {
+          nextMetricsRunUTC.setUTCDate(nextMetricsRunUTC.getUTCDate() + 1);
+        }
+        const msUntilNextMetricsRun = nextMetricsRunUTC.getTime() - nowForMetricsCron.getTime();
+
+        console.log(`[MetaMetricsSnapshotCron] Initialized — first run at 09:00 UTC (in ${Math.round(msUntilNextMetricsRun / 60000)} min)`);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('MetaMetricsSnapshotCron', runMetaMetricsSnapshot())
+            .catch(e => console.error('[MetaMetricsSnapshotCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('MetaMetricsSnapshotCron', runMetaMetricsSnapshot())
+              .catch(e => console.error('[MetaMetricsSnapshotCron] Error:', e));
+          }, METRICS_SNAPSHOT_INTERVAL_MS);
+        }, msUntilNextMetricsRun);
+      } catch (error) {
+        console.error('[MetaMetricsSnapshotCron] Failed to initialize:', error);
+      }
+
+
       // Drip Sequence Worker — runs every 5 minutes
       try {
         const { processDueEnrollments } = await import('./services/dripSequenceWorker');
@@ -662,6 +665,16 @@ createTestAccount().then(async () => {
       // or simply empty) is completely normal, not an error.
       try {
         const { pollAndProcessOnce } = await import('./services/asyncJobQueue');
+        // Verify the binding BEFORE scheduling the timer. The import is captured
+        // once, and calling an undefined binding throws SYNCHRONOUSLY inside the
+        // interval callback — past this try/catch and past the `.catch()` below,
+        // which only sees rejected promises. That error then surfaces 30s later
+        // against whichever unrelated suite happens to be running, which is how
+        // `settings.replaySessions` and `securityHeaders` failed on a PR that
+        // touches neither. Failing here instead keeps it to one init-time log.
+        if (typeof pollAndProcessOnce !== 'function') {
+          throw new Error('asyncJobQueue.pollAndProcessOnce is unavailable — poller not started');
+        }
         const QUEUE_POLL_INTERVAL_MS = 30 * 1000;
         setInterval(() => {
           if (!isCronEnabled()) return;
@@ -814,6 +827,59 @@ createTestAccount().then(async () => {
         console.log('[renewalIntegrationHealthCron] Initialized — running daily');
       } catch (error) {
         console.error('[renewalIntegrationHealthCron] Failed to initialize:', error);
+      }
+
+      // CRM Auto-Enrichment (ENG-88) — runs every 15 minutes.
+      // Ray's manual campaign-monitoring routine included clicking "renew"
+      // (the enrich-v3 engine) on managed-campaign lead lists by hand a
+      // couple of times. With Ray leaving, this keeps it happening without
+      // a human clicking anything — but ONLY for a list whose saved
+      // enrichmentConfig has explicitly opted in (`autoEnrich: true`, set
+      // via the existing PUT /lists/:listId/enrichment-config). Every
+      // other list's behavior is unchanged; nothing runs until a human
+      // flips that flag for a specific list.
+      try {
+        const { runCrmAutoEnrichmentCheck } = await import('./cron/crmAutoEnrichmentCron');
+        const CRM_AUTO_ENRICHMENT_INTERVAL_MS = 15 * 60 * 1000;
+        // Guard the initial run too, matching the interval callback below —
+        // a disabled-cron environment must not enrich real leads once on
+        // startup just because the guard was only on the recurring path.
+        if (isCronEnabled()) {
+          cronJobRegistry.track('crmAutoEnrichmentCron', runCrmAutoEnrichmentCheck())
+            .catch(e => console.error('[crmAutoEnrichmentCron] Error on first run:', e));
+        }
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('crmAutoEnrichmentCron', runCrmAutoEnrichmentCheck())
+            .catch(e => console.error('[crmAutoEnrichmentCron] Error:', e));
+        }, CRM_AUTO_ENRICHMENT_INTERVAL_MS);
+        console.log('[crmAutoEnrichmentCron] Initialized — running every 15 minutes (opt-in per list, default off)');
+      } catch (error) {
+        console.error('[crmAutoEnrichmentCron] Failed to initialize:', error);
+      }
+
+      // Skill Review Queue Digest (ENG-932) — runs daily.
+      // "Submit for Review" fires no notification at all (ENG-149 correctly
+      // killed the old per-submission oncall page as noise, but that left the
+      // queue with no reader). This alerts once a skill has sat in
+      // pending_review past the stale window, deduped to at most one message
+      // per day regardless of queue size — submitting a single skill still
+      // pages nobody.
+      try {
+        const { runSkillReviewQueueDigest } = await import('./cron/skillReviewQueueDigestCron');
+        const SKILL_REVIEW_DIGEST_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        if (isCronEnabled()) {
+          cronJobRegistry.track('skillReviewQueueDigestCron', runSkillReviewQueueDigest())
+            .catch(e => console.error('[skillReviewQueueDigestCron] Error on first run:', e));
+        }
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('skillReviewQueueDigestCron', runSkillReviewQueueDigest())
+            .catch(e => console.error('[skillReviewQueueDigestCron] Error:', e));
+        }, SKILL_REVIEW_DIGEST_INTERVAL_MS);
+        console.log('[skillReviewQueueDigestCron] Initialized — running daily');
+      } catch (error) {
+        console.error('[skillReviewQueueDigestCron] Failed to initialize:', error);
       }
 
       // Outlook Bounce/Complaint Monitor (ENG-266 Part 3, option B+) — runs every 15

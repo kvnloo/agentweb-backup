@@ -4,8 +4,37 @@ import { assertPublicHostname } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, utmKeysInQueryString, utmQueryString } from '../utils/adUtm';
 import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
+import {
+  assertCountingType,
+  assertConversionActionStatus,
+  assertCreatableConversionActionStatus,
+  describeGoogleAdsError,
+  parseTagSnippets,
+  diffConversionAction,
+  type ConversionActionDrift,
+  type ConversionTagPair,
+} from '../utils/googleAdsConversionActions';
+import {
+  summarizePartialFailure,
+  type ConversionUploadFailure,
+} from '../utils/googleAdsOfflineConversions';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
+
+/**
+ * Every Google Ads call goes through callApi, and it had no timeout at all — an axios
+ * request with none waits forever on a stalled connection.
+ *
+ * That is not an abstract risk here. A hung call blocks the agent-mode tool call that
+ * made it, and on the offline-conversion path (ENG-1325) it would stall a background
+ * sweep with nobody watching, so the symptom is "conversions stopped uploading" with no
+ * error anywhere.
+ *
+ * 60s rather than something tighter: a GAQL search over a large account is legitimately
+ * slow, and a timeout that fires on normal traffic is worse than none — it turns a slow
+ * read into a spurious failure. This is a ceiling on hanging, not a latency target.
+ */
+const GOOGLE_ADS_HTTP_TIMEOUT_MS = 60_000;
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
 
 export interface GoogleAdAccount {
@@ -34,12 +63,129 @@ export interface GoogleAdLeaf {
   loginCustomerId: string;
   /** True if this customerId is already a connected google_ads account for the user. */
   alreadyConnected?: boolean;
+  /**
+   * ENG-1362. Google's `test_account` flag — the ONLY thing that guarantees an account
+   * cannot serve ads and cannot spend. Captured at discovery so nothing downstream has to
+   * infer it from the account NAME, which guarantees nothing: a real, billable, ENABLED
+   * account named "Test" is exactly the case this exists to disambiguate.
+   */
+  testAccount?: boolean;
 }
 
 /** A node in the account-selection tree returned during OAuth finalize. */
 export type GoogleAdsAccountNode =
-  | { type: 'leaf'; customerId: string; name: string; currency: string; loginCustomerId: string; alreadyConnected?: boolean }
+  | { type: 'leaf'; customerId: string; name: string; currency: string; loginCustomerId: string; alreadyConnected?: boolean; testAccount?: boolean }
   | { type: 'manager'; customerId: string; name: string; children: GoogleAdLeaf[] };
+
+/**
+ * ENG-1527. Refuse a bid target that cannot be written, instead of dropping it.
+ *
+ * Google stores a bid target as a LEAF of the bidding strategy — `target_cpa.target_cpa_micros`,
+ * `target_roas.target_roas`, `maximize_conversions.target_cpa_micros` and so on. There is no
+ * strategy-agnostic field, so a target supplied without a strategy has nowhere to go: both
+ * createCampaign and updateCampaign read it into `params` and then never touch it.
+ *
+ * On UPDATE that was silent whenever any OTHER field was masked — `name` alone made the
+ * update mask non-empty, the mutate went through, and the caller was told "Campaign updated"
+ * while the target it asked for was never sent. Smart bidding then keeps optimising to the
+ * old target, spending real money at the wrong efficiency point, and there is no read-back on
+ * campaigns to catch it.
+ *
+ * Refused rather than inferred: guessing the leaf would mean reading the campaign's current
+ * strategy and writing a MONEY field based on a value that can change between the read and
+ * the write. A refusal costs the caller one retry; a wrong guess costs budget.
+ *
+ * Shared by both call sites deliberately. The same invariant written twice is how these
+ * diverge, which is the shape of most of the defects this ticket collects.
+ */
+/**
+ * Which bid targets each strategy can actually carry, and where Google stores them.
+ *
+ * `target` is bidding_strategy_target, `ceiling` is cpc_bid_ceiling_micros. A `false` here
+ * does not mean "we chose not to support it" — it means the field does not exist on that
+ * strategy at campaign level, so sending it writes nothing.
+ *
+ * cpc_bid_ceiling_micros is documented as "mutable for portfolio bidding strategies only",
+ * which is why it is false on every STANDARD strategy that is not TARGET_IMPRESSION_SHARE
+ * (where it is required) or TARGET_SPEND (where it is the strategy's only knob). We
+ * deliberately do NOT start writing it onto TargetCpa/TargetRoas to "support" it: that is a
+ * new, spend-affecting write we cannot validate against the live API from here, and the
+ * caller is better served by a loud rejection than by a bid cap that may be ignored.
+ */
+const BID_TARGET_SUPPORT: Record<string, { target: boolean; ceiling: boolean; targetMeans: string }> = {
+  MAXIMIZE_CONVERSIONS:      { target: true,  ceiling: false, targetMeans: 'a target CPA' },
+  MAXIMIZE_CONVERSION_VALUE: { target: true,  ceiling: false, targetMeans: 'a target ROAS' },
+  TARGET_CPA:                { target: true,  ceiling: false, targetMeans: 'a target CPA' },
+  TARGET_ROAS:               { target: true,  ceiling: false, targetMeans: 'a target ROAS' },
+  TARGET_IMPRESSION_SHARE:   { target: true,  ceiling: true,  targetMeans: 'an impression share fraction' },
+  TARGET_SPEND:              { target: false, ceiling: true,  targetMeans: '' },
+  MANUAL_CPC:                { target: false, ceiling: false, targetMeans: '' },
+};
+
+/**
+ * Refuse any bid target the selected strategy cannot store, BEFORE anything is sent.
+ *
+ * Google keeps a bid target as a leaf of the bidding strategy (target_cpa.target_cpa_micros
+ * and friends), so a target is only reachable through the strategy branch that owns it.
+ * Every combination this rejects used to be accepted, dropped on the floor, and reported as
+ * `success: true` — the caller was told the campaign was updated while the number they sent
+ * was never written, leaving smart bidding optimising to the OLD target with real money.
+ *
+ * Three distinct shapes of that bug, all confirmed against the mutate payload:
+ *   - no strategy at all: the target had no branch to live in;
+ *   - a strategy that has no such field (MANUAL_CPC + target, TARGET_SPEND + target,
+ *     MAXIMIZE_* + ceiling);
+ *   - a portfolio resource name, where the campaign only carries a REFERENCE and every
+ *     target belongs to the shared strategy object instead.
+ */
+function assertBidTargetIsAddressable(params: {
+  biddingStrategy?: string;
+  biddingStrategyResourceName?: string;
+  biddingStrategyTarget?: number;
+  cpcBidCeilingMicros?: number;
+}): void {
+  const sentTarget = params.biddingStrategyTarget !== undefined;
+  const sentCeiling = params.cpcBidCeilingMicros !== undefined;
+  if (!sentTarget && !sentCeiling) return;
+
+  const supplied = [
+    sentTarget ? 'bidding_strategy_target' : '',
+    sentCeiling ? 'cpc_bid_ceiling_micros' : '',
+  ].filter(Boolean).join(' / ');
+
+  if (!params.biddingStrategy && !params.biddingStrategyResourceName) {
+    throw new Error(
+      `${supplied} cannot be applied on their own: Google stores a bid target as a leaf of the bidding strategy, so the strategy has to be named to know which field to write. Re-send with bidding_strategy set to the campaign's current strategy (read it with call_google_ads_reporting_api: SELECT campaign.bidding_strategy_type FROM campaign). Nothing was sent to Google Ads.`,
+    );
+  }
+
+  // A portfolio/shared strategy is attached to the campaign by REFERENCE. The campaign row
+  // has nowhere to put a target, so one supplied here would be silently discarded — it has
+  // to be written on the shared strategy object itself, where it applies to every campaign
+  // using it.
+  if (params.biddingStrategyResourceName) {
+    throw new Error(
+      `${supplied} cannot be set on a campaign that uses the portfolio bidding strategy ${params.biddingStrategyResourceName}: the campaign only holds a reference to it, and the target lives on the shared strategy, where it applies to every campaign using that strategy. Update the bidding strategy itself instead. Nothing was sent to Google Ads.`,
+    );
+  }
+
+  const support = BID_TARGET_SUPPORT[params.biddingStrategy as string];
+  // An unknown strategy is rejected further down with the list of supported values; let
+  // that error win rather than shadowing it with a less specific one.
+  if (!support) return;
+
+  if (sentTarget && !support.target) {
+    throw new Error(
+      `bidding_strategy_target is not a field of ${params.biddingStrategy}: that strategy has no bid target to set${params.biddingStrategy === 'MANUAL_CPC' ? ' (bids are per ad group / keyword with MANUAL_CPC)' : ''}. Drop bidding_strategy_target, or choose a strategy that takes one (${Object.entries(BID_TARGET_SUPPORT).filter(([, v]) => v.target).map(([k]) => k).join(', ')}). Nothing was sent to Google Ads.`,
+    );
+  }
+
+  if (sentCeiling && !support.ceiling) {
+    throw new Error(
+      `cpc_bid_ceiling_micros is not a campaign-level field of ${params.biddingStrategy}: Google makes the ceiling on this strategy mutable only through a PORTFOLIO bidding strategy, so a ceiling sent here is not stored and the campaign keeps bidding uncapped. Either move the campaign onto a portfolio strategy that carries the ceiling, or drop cpc_bid_ceiling_micros${support.target ? ` and control cost with bidding_strategy_target (${support.targetMeans})` : ''}. Nothing was sent to Google Ads.`,
+    );
+  }
+}
 
 export class GoogleAdsService {
   // Single-flight refresh guard: userId:accountId → in-flight promise
@@ -72,15 +218,29 @@ export class GoogleAdsService {
     }
     try {
       const response = method === 'GET'
-        ? await axios.get(url, { headers })
-        : await axios.post(url, body, { headers });
+        ? await axios.get(url, { headers, timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS })
+        : await axios.post(url, body, { headers, timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS });
       if (process.env.NODE_ENV !== 'production') {
         console.log('[GoogleAds] callApi response:', JSON.stringify(response.data, null, 2));
       }
       return response.data;
     } catch (err: any) {
+      // Log ONLY the response body — never the error object at large, which carries the
+      // full request config including its headers. The body is the part with diagnostic
+      // value; the rest is noise at best.
       const detail = err?.response?.data;
       console.error('[GoogleAds] callApi error:', JSON.stringify(detail, null, 2));
+      // Google's body names the exact field or error code; axios's own message is only
+      // "Request failed with status code 400", so that detail reached the log and nowhere
+      // else. Enrich the message in place and rethrow the SAME error.
+      //
+      // Deliberately NOT a new Error wrapping this one. Callers read Google Ads error
+      // codes straight off `err.response.data.error.details[0].errors[]` — agentModeService
+      // builds its errorType/errorCode for CAMPAIGN_CRITERION from exactly that — so
+      // replacing the object silently degrades every Google Ads failure to a generic
+      // message. Caught by googleAdsService.test.ts asserting the original is rethrown.
+      const described = describeGoogleAdsError(err);
+      if (described) err.message = described;
       throw err;
     }
   }
@@ -99,6 +259,11 @@ export class GoogleAdsService {
       pages++;
     } while (pageToken && pages < MAX_PAGES);
     return all;
+  }
+
+  /** Internal passthrough for endpoints that are not `:mutate` (e.g. conversionUploads). */
+  private async callApiPublic(method: 'GET' | 'POST', path: string, accessToken: string, body?: any, loginCustomerId?: string): Promise<any> {
+    return this.callApi(method, path, accessToken, body, loginCustomerId);
   }
 
   async mutate(customerId: string, accessToken: string, resource: string, operations: any[], loginCustomerId?: string): Promise<any> {
@@ -129,7 +294,10 @@ export class GoogleAdsService {
         client_secret: secrets.clientSecret,
         refresh_token: refreshToken,
         grant_type: 'refresh_token',
-      }).toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+      }).toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS,
+      });
       const { access_token, expires_in } = response.data as { access_token: string; expires_in: number };
       await updateAccountTokens(userId, 'google_ads', {
         access_token,
@@ -188,6 +356,7 @@ export class GoogleAdsService {
   async listAccountHierarchy(accessToken: string): Promise<GoogleAdsAccountNode[]> {
     const secrets = await getGoogleAdsCredentials();
     const response = await axios.get(`${GOOGLE_ADS_API_BASE}/customers:listAccessibleCustomers`, {
+      timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS,
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'developer-token': secrets.developerToken,
@@ -205,7 +374,7 @@ export class GoogleAdsService {
       const customerId = resourceName.replace('customers/', '');
       try {
         const results = await this.search(customerId, accessToken,
-          'SELECT customer.id, customer.descriptive_name, customer.currency_code, customer.manager FROM customer LIMIT 1'
+          'SELECT customer.id, customer.descriptive_name, customer.currency_code, customer.manager, customer.test_account FROM customer LIMIT 1'
         );
         if (results.length === 0) continue;
         const c = results[0].customer;
@@ -229,6 +398,9 @@ export class GoogleAdsService {
             name: c.descriptiveName || customerId,
             currency: c.currencyCode || 'USD',
             loginCustomerId: id,
+            // Strict === true: anything Google did not affirmatively mark as a test
+            // account is billable, and an absent field must never read as safe.
+            testAccount: c.testAccount === true,
           });
         }
       } catch (err: any) {
@@ -241,7 +413,7 @@ export class GoogleAdsService {
     // Top-level leaves first (those not also managed by a discovered manager), then managers.
     for (const [id, leaf] of directLeaves) {
       if (!managedLeafIds.has(id)) {
-        nodes.push({ type: 'leaf', customerId: leaf.customerId, name: leaf.name, currency: leaf.currency, loginCustomerId: leaf.loginCustomerId });
+        nodes.push({ type: 'leaf', customerId: leaf.customerId, name: leaf.name, currency: leaf.currency, loginCustomerId: leaf.loginCustomerId, testAccount: leaf.testAccount });
       }
     }
     for (const m of managers) {
@@ -250,12 +422,47 @@ export class GoogleAdsService {
     return nodes;
   }
 
+  /**
+   * ENG-1362. Google's `test_account` flag for one connected account.
+   *
+   * Only needed for accounts connected BEFORE discovery started capturing it — new
+   * connections carry it in their stored config and never reach this. Cached for the
+   * life of the process because the flag is immutable: Google fixes it when the account
+   * is created and provides no way to change it afterwards.
+   *
+   * Returns `null` when the lookup fails, and callers must treat null as BILLABLE. An
+   * account we could not verify is not an account we may describe as safe — that is the
+   * whole point of reading the flag instead of the name.
+   */
+  private testAccountCache = new Map<string, boolean>();
+
+  async isTestAccount(userId: string, customerId: string): Promise<boolean | null> {
+    const cached = this.testAccountCache.get(customerId);
+    if (cached !== undefined) return cached;
+    try {
+      const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+      const rows = await this.search(
+        customerId, accessToken,
+        'SELECT customer.id, customer.test_account FROM customer LIMIT 1',
+        loginCustomerId,
+      );
+      const value = rows[0]?.customer?.testAccount === true;
+      this.testAccountCache.set(customerId, value);
+      return value;
+    } catch (err: any) {
+      // Deliberately not cached: a transient failure must not pin this account as
+      // "unknown" for the life of the process.
+      console.warn(`[GoogleAds] isTestAccount(${customerId}) failed; reporting unknown:`, err?.message || err);
+      return null;
+    }
+  }
+
   // Enumerate every enabled non-manager leaf under a manager (descendants at any depth,
   // flattened). login-customer-id must be the manager id for these queries and for all
   // later API calls against these leaves.
   private async listManagerLeaves(managerId: string, accessToken: string): Promise<GoogleAdLeaf[]> {
     const results = await this.search(managerId, accessToken,
-      "SELECT customer_client.id, customer_client.descriptive_name, customer_client.currency_code, customer_client.manager, customer_client.status FROM customer_client WHERE customer_client.manager = false AND customer_client.status = 'ENABLED'",
+      "SELECT customer_client.id, customer_client.descriptive_name, customer_client.currency_code, customer_client.manager, customer_client.status, customer_client.test_account FROM customer_client WHERE customer_client.manager = false AND customer_client.status = 'ENABLED'",
       managerId,
     );
     const leaves: GoogleAdLeaf[] = [];
@@ -271,6 +478,7 @@ export class GoogleAdsService {
         name: cc.descriptiveName || id,
         currency: cc.currencyCode || 'USD',
         loginCustomerId: managerId,
+        testAccount: cc.testAccount === true,
       });
     }
     return leaves;
@@ -281,7 +489,7 @@ export class GoogleAdsService {
     const out: GoogleAdLeaf[] = [];
     for (const n of nodes) {
       if (n.type === 'leaf') {
-        out.push({ customerId: n.customerId, name: n.name, currency: n.currency, loginCustomerId: n.loginCustomerId });
+        out.push({ customerId: n.customerId, name: n.name, currency: n.currency, loginCustomerId: n.loginCustomerId, testAccount: n.testAccount });
       } else {
         out.push(...n.children);
       }
@@ -336,6 +544,271 @@ export class GoogleAdsService {
     }));
   }
 
+  // ── Conversion actions (ENG-1322) ─────────────────────────────────────────
+  //
+  // CREATE / LIST / UPDATE only. REMOVE is deliberately not implemented (Harsha,
+  // ENG-1329): removing a conversion action severs historical attribution in the
+  // customer's account, and it is the one operation whose damage we cannot undo
+  // from our side. Pausing via UPDATE covers what an operator actually needs.
+
+  /** The fields a conversion action's tag and reporting behaviour actually hinge on. */
+  private conversionActionSelect(): string {
+    return 'SELECT conversion_action.resource_name, conversion_action.id, conversion_action.name, '
+      + 'conversion_action.status, conversion_action.type, conversion_action.category, '
+      + 'conversion_action.counting_type, conversion_action.primary_for_goal, '
+      + 'conversion_action.include_in_conversions_metric, '
+      + 'conversion_action.click_through_lookback_window_days, conversion_action.tag_snippets '
+      + 'FROM conversion_action';
+  }
+
+  private mapConversionAction(row: any): any {
+    const ca = row.conversionAction || {};
+    return {
+      resourceName: ca.resourceName,
+      id: ca.id,
+      name: ca.name,
+      status: ca.status,
+      type: ca.type,
+      category: ca.category,
+      countingType: ca.countingType,
+      primaryForGoal: ca.primaryForGoal,
+      includeInConversionsMetric: ca.includeInConversionsMetric,
+      clickThroughLookbackWindowDays: ca.clickThroughLookbackWindowDays,
+      tagSnippets: ca.tagSnippets,
+      // The pair the page actually needs. A resource name cannot be installed.
+      tag: parseTagSnippets(ca.tagSnippets),
+    };
+  }
+
+  async listConversionActions(userId: string, customerId: string): Promise<any[]> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const results = await this.search(customerId, accessToken, this.conversionActionSelect(), loginCustomerId);
+    return results.map((r: any) => this.mapConversionAction(r));
+  }
+
+  private async getConversionActionByResourceName(
+    customerId: string, accessToken: string, resourceName: string, loginCustomerId?: string,
+  ): Promise<any | null> {
+    const escaped = resourceName.replace(/'/g, "\\'");
+    const rows = await this.search(
+      customerId, accessToken,
+      `${this.conversionActionSelect()} WHERE conversion_action.resource_name = '${escaped}'`,
+      loginCustomerId,
+    );
+    return rows.length > 0 ? this.mapConversionAction(rows[0]) : null;
+  }
+
+  /**
+   * Create a conversion action and hand back the tag pair, not just a resource name.
+   *
+   * Two things this deliberately does NOT do. It does not default `countingType` —
+   * that field fails silently and picking for the customer is how reported
+   * conversions quietly inflate. And it does not trust the create: the action is
+   * read back and diffed field by field, because `createAdGroup`/`createAd` already
+   * prove a create can return success while storing something else (ENG-1293).
+   */
+  async createConversionAction(userId: string, customerId: string, params: {
+    name: string;
+    category: string;
+    countingType: string;
+    status?: string;
+    primaryForGoal?: boolean;
+    clickThroughLookbackWindowDays?: number;
+  }): Promise<{ resourceName: string; tag: ConversionTagPair | null; stored: any; drift: ConversionActionDrift[] }> {
+    if (!params?.name || !params.name.trim()) {
+      throw new Error('name is required to create a conversion action.');
+    }
+    if (!params?.category || !params.category.trim()) {
+      throw new Error(
+        'category is required and is never inferred — it decides how Google reports and optimises '
+        + 'this action (for example SUBMIT_LEAD_FORM, PURCHASE, SIGNUP, DOWNLOAD).',
+      );
+    }
+    const countingType = assertCountingType(params.countingType);
+
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const create: any = {
+      name: params.name,
+      type: 'WEBPAGE',
+      category: params.category,
+      countingType,
+      // Validated, not passed through: ConversionActionStatus has no PAUSED, and an
+      // unvalidated value returns an opaque 400 (ENG-1329 e2e).
+      //
+      // Keyed on `undefined`, not falsiness. `status: ''` is a supplied-but-invalid value,
+      // and treating it as "omitted" would silently create an ENABLED action off a request
+      // the caller got wrong — the same silent-substitution the PAUSED fix exists to stop,
+      // and inconsistent with updateConversionAction, which validates every defined status.
+      status: params.status === undefined ? 'ENABLED' : assertCreatableConversionActionStatus(params.status),
+    };
+    if (params.primaryForGoal !== undefined) create.primaryForGoal = params.primaryForGoal;
+    if (params.clickThroughLookbackWindowDays !== undefined) {
+      create.clickThroughLookbackWindowDays = params.clickThroughLookbackWindowDays;
+    }
+
+    const data = await this.mutate(customerId, accessToken, 'conversionActions', [{ create }], loginCustomerId);
+    const resourceName = data.results[0].resourceName;
+
+    const stored = await this.getConversionActionByResourceName(customerId, accessToken, resourceName, loginCustomerId);
+    const requested: Record<string, unknown> = {
+      name: params.name, category: params.category, countingType, status: create.status,
+    };
+    if (params.primaryForGoal !== undefined) requested.primaryForGoal = params.primaryForGoal;
+    // Every field we SEND has to be a field we CHECK, or drift on it is invisible.
+    // A silently-widened attribution window misattributes conversions for weeks.
+    if (params.clickThroughLookbackWindowDays !== undefined) {
+      requested.clickThroughLookbackWindowDays = params.clickThroughLookbackWindowDays;
+    }
+
+    return {
+      resourceName,
+      tag: stored?.tag ?? null,
+      stored,
+      drift: diffConversionAction(requested, stored || {}),
+    };
+  }
+
+  /**
+   * Amend an existing conversion action. Only the fields supplied are sent, so an
+   * omitted field is left alone rather than reset — and `countingType`, when given,
+   * still goes through the same no-inference check as on create.
+   */
+  async updateConversionAction(userId: string, customerId: string, resourceName: string, params: {
+    name?: string;
+    status?: string;
+    category?: string;
+    countingType?: string;
+    primaryForGoal?: boolean;
+    clickThroughLookbackWindowDays?: number;
+  }): Promise<{ resourceName: string; stored: any; drift: ConversionActionDrift[] }> {
+    if (!resourceName) throw new Error('conversion_action_resource_name is required for CONVERSION_ACTION UPDATE.');
+
+    const update: any = { resourceName };
+    const updateMask: string[] = [];
+    const requested: Record<string, unknown> = {};
+
+    if (params.name !== undefined) { update.name = params.name; updateMask.push('name'); requested.name = params.name; }
+    if (params.status !== undefined) {
+      const status = assertConversionActionStatus(params.status);
+      // status=REMOVED reaches the same end as the REMOVE operation, and REMOVE carries the
+      // confirmation gate. Route it there rather than letting UPDATE be an unconfirmed
+      // back door to the same irreversible change.
+      if (status === 'REMOVED') {
+        throw new Error(
+          'To stop a conversion action recording, use CONVERSION_ACTION REMOVE with '
+          + 'confirm_conversion_action_removal=true rather than UPDATE status=REMOVED — the '
+          + 'change is permanent and cannot be re-enabled, so it goes through the confirmation '
+          + 'step. Conversions already recorded stay in your reports either way.',
+        );
+      }
+      update.status = status; updateMask.push('status'); requested.status = status;
+    }
+    if (params.category !== undefined) { update.category = params.category; updateMask.push('category'); requested.category = params.category; }
+    if (params.countingType !== undefined) {
+      const countingType = assertCountingType(params.countingType);
+      update.countingType = countingType; updateMask.push('counting_type'); requested.countingType = countingType;
+    }
+    if (params.primaryForGoal !== undefined) {
+      update.primaryForGoal = params.primaryForGoal; updateMask.push('primary_for_goal'); requested.primaryForGoal = params.primaryForGoal;
+    }
+    if (params.clickThroughLookbackWindowDays !== undefined) {
+      update.clickThroughLookbackWindowDays = params.clickThroughLookbackWindowDays;
+      updateMask.push('click_through_lookback_window_days');
+      requested.clickThroughLookbackWindowDays = params.clickThroughLookbackWindowDays;
+    }
+
+    if (updateMask.length === 0) {
+      throw new Error('CONVERSION_ACTION UPDATE requires at least one field to change.');
+    }
+
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'conversionActions',
+      [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
+
+    const stored = await this.getConversionActionByResourceName(customerId, accessToken, resourceName, loginCustomerId);
+    return { resourceName, stored, drift: diffConversionAction(requested, stored || {}) };
+  }
+
+  /**
+   * Retire a conversion action. Google models this as a soft state, not a delete: the
+   * action stops recording, and conversions it already recorded stay in reporting — the
+   * same way a REMOVED campaign still returns its historical metrics.
+   *
+   * Scope note: ENG-1329 deferred this, on the stated basis that removal "severs historical
+   * attribution". The end-to-end run showed that premise is only half right — it cannot be
+   * undone, but nothing already attributed is lost — and that HIDDEN, the alternative every
+   * earlier message recommended, cannot be set through the API at all. That left no working
+   * retire path, which is the "if REMOVE is needed later" case that decision anticipated.
+   *
+   * The caller-facing confirmation lives in the handler, not here, so this stays a plain
+   * service method like removeBudget/removeCampaign.
+   */
+  async removeConversionAction(userId: string, customerId: string, resourceName: string): Promise<void> {
+    if (!resourceName) throw new Error('conversion_action_resource_name is required for CONVERSION_ACTION REMOVE.');
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'conversionActions', [{ remove: resourceName }], loginCustomerId);
+  }
+
+  /**
+   * The account's own IANA time zone, read from Google rather than assumed.
+   *
+   * Offline conversion timestamps are interpreted in the ACCOUNT's zone. Defaulting to
+   * UTC would shift every conversion by the account's real offset — for the INR account
+   * this work was verified against, 5.5 hours — and the only symptom is conversions
+   * attributed to the wrong day, which reads as a reporting oddity rather than a bug.
+   */
+  async getAccountTimeZone(userId: string, customerId: string): Promise<string> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(
+      customerId, accessToken,
+      'SELECT customer.time_zone FROM customer LIMIT 1',
+      loginCustomerId,
+    );
+    const tz = rows?.[0]?.customer?.timeZone;
+    if (!tz) throw new Error('Could not read the account time zone, so a conversion timestamp cannot be placed correctly.');
+    return tz;
+  }
+
+  /**
+   * Upload offline conversions keyed on gclid (ENG-1325).
+   *
+   * `partialFailure` is on deliberately. A sweep of fifty leads where one click has aged
+   * past its lookback window should upload forty-nine, not zero — an all-or-nothing batch
+   * turns one stale row into a silent gap across the whole run. The caller gets the
+   * per-row failures back so "uploaded" never quietly means "some of them".
+   *
+   * `validateOnly` exists for the same reason the drift read-back does: this runs from a
+   * background sweep with nobody watching, so being able to rehearse a batch before
+   * committing it is the difference between a caught mistake and a discovered one.
+   */
+  async uploadClickConversions(
+    userId: string,
+    customerId: string,
+    conversions: Record<string, unknown>[],
+    opts?: { validateOnly?: boolean },
+  ): Promise<{ uploaded: number; failures: ConversionUploadFailure[]; raw: any }> {
+    if (!Array.isArray(conversions) || conversions.length === 0) {
+      throw new Error('At least one conversion is required for an offline conversion upload.');
+    }
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const raw = await this.callApiPublic(
+      'POST',
+      // `resource:method`, not a sub-collection. Verified against the real API: the
+      // sub-collection form returned Google's own 404 naming the URL
+      // `/v24/customers/…/conversionUploads:uploadClickConversions`. Same shape as the
+      // two other custom methods in this service, `customers:listAccessibleCustomers`
+      // and `geoTargetConstants:suggest`.
+      `/customers/${customerId}:uploadClickConversions`,
+      accessToken,
+      { conversions, partialFailure: true, validateOnly: opts?.validateOnly === true },
+      loginCustomerId,
+    );
+    const failures = summarizePartialFailure(raw);
+    // Counted from what Google accepted, not from what we sent — those differ exactly
+    // when partial failure fires, which is the case this reporting exists for.
+    return { uploaded: Math.max(0, conversions.length - failures.length), failures, raw };
+  }
+
   // ── Portfolio (shared) bidding strategies ─────────────────────────────────
 
   async listBiddingStrategies(userId: string, customerId: string): Promise<{ resourceName: string; id: string; name: string; type: string; status: string }[]> {
@@ -383,7 +856,6 @@ export class GoogleAdsService {
     brandBusinessName?: string;
     brandLogoAssetResourceName?: string;
   }): Promise<{ resourceName: string }> {
-    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
     // DISPLAY campaigns cannot use MAXIMIZE_CONVERSIONS with a shared budget
     if (params.type === 'DISPLAY' && params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') {
@@ -393,6 +865,7 @@ export class GoogleAdsService {
     if (params.biddingStrategy && params.biddingStrategyResourceName) {
       throw new Error('Provide either bidding_strategy (a standard strategy) or bidding_strategy_resource_name (a portfolio/shared strategy), not both.');
     }
+    assertBidTargetIsAddressable(params);
     if (!params.biddingStrategy && !params.biddingStrategyResourceName) {
       throw new Error('A campaign requires a bidding strategy: pass bidding_strategy (standard) or bidding_strategy_resource_name (portfolio/shared).');
     }
@@ -400,8 +873,15 @@ export class GoogleAdsService {
     const biddingField: Record<string, any> = {};
     // Portfolio/shared strategy: attach by resource-name reference on campaign.bidding_strategy.
     if (params.biddingStrategyResourceName) biddingField.biddingStrategy = params.biddingStrategyResourceName;
-    else if (params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') biddingField.maximizeConversions = {};
-    else if (params.biddingStrategy === 'MAXIMIZE_CONVERSION_VALUE') biddingField.maximizeConversionValue = {};
+    // A supplied target is carried, matching updateCampaign. This branch used to emit `{}`
+    // unconditionally, so a target sent at CREATE was dropped while the same call at UPDATE
+    // applied it — the campaign launched optimising to no target at all.
+    else if (params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') biddingField.maximizeConversions =
+      params.biddingStrategyTarget !== undefined
+        ? { targetCpaMicros: String(Math.round(params.biddingStrategyTarget * 1_000_000)) }
+        : {};
+    else if (params.biddingStrategy === 'MAXIMIZE_CONVERSION_VALUE') biddingField.maximizeConversionValue =
+      params.biddingStrategyTarget !== undefined ? { targetRoas: params.biddingStrategyTarget } : {};
     else if (params.biddingStrategy === 'TARGET_CPA') biddingField.targetCpa = { targetCpaMicros: String(Math.round((params.biddingStrategyTarget || 0) * 1_000_000)) };
     else if (params.biddingStrategy === 'TARGET_ROAS') biddingField.targetRoas = { targetRoas: params.biddingStrategyTarget || 1 };
     else if (params.biddingStrategy === 'TARGET_IMPRESSION_SHARE') biddingField.targetImpressionShare = {
@@ -421,6 +901,13 @@ export class GoogleAdsService {
         : {};
     }
     else throw new Error(`Unsupported bidding_strategy '${params.biddingStrategy}' for CAMPAIGN CREATE. Supported values: MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, TARGET_CPA, TARGET_ROAS, TARGET_IMPRESSION_SHARE, TARGET_SPEND, MANUAL_CPC.`);
+
+    // Credentials are loaded only AFTER every local validation above, matching
+    // updateCampaign. Loading them first meant an invalid request could trigger a token
+    // refresh and rewrite the stored tokens on its way to being rejected, and a caller
+    // with an expired connection got an authentication error instead of the validation
+    // error that actually described their mistake.
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
     const campaignCreate = {
       name: params.name,
@@ -563,6 +1050,7 @@ export class GoogleAdsService {
     if (params.biddingStrategy && params.biddingStrategyResourceName) {
       throw new Error('Provide either bidding_strategy (a standard strategy) or bidding_strategy_resource_name (a portfolio/shared strategy), not both.');
     }
+    assertBidTargetIsAddressable(params);
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
     const update: any = { resourceName: campaignResourceName };
@@ -577,10 +1065,25 @@ export class GoogleAdsService {
       updateMask.push('bidding_strategy');
     } else if (params.biddingStrategy) {
       if (params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') {
-        update.maximizeConversions = { targetCpaMicros: '0' };
+        // ENG-1527. The target is OPTIONAL on Maximize Conversions, and 0 means "no CPA
+        // constraint" — so 0 is the right value when none was supplied, and was the only
+        // value ever written. A caller who DID supply one got it discarded on a success
+        // response, which is the same silent drop as the guard above by another route.
+        //
+        // This is also what makes that guard's advice safe: it tells the caller to restate
+        // the strategy, and before this, restating MAXIMIZE_CONVERSIONS would have wiped
+        // the very target they were trying to set.
+        update.maximizeConversions = {
+          targetCpaMicros: params.biddingStrategyTarget !== undefined
+            ? String(Math.round(params.biddingStrategyTarget * 1_000_000))
+            : '0',
+        };
         updateMask.push('maximize_conversions.target_cpa_micros');
       } else if (params.biddingStrategy === 'MAXIMIZE_CONVERSION_VALUE') {
-        update.maximizeConversionValue = { targetRoas: 0 };
+        // Same as above: 0 = no ROAS constraint, which is correct only when none was given.
+        update.maximizeConversionValue = {
+          targetRoas: params.biddingStrategyTarget !== undefined ? params.biddingStrategyTarget : 0,
+        };
         updateMask.push('maximize_conversion_value.target_roas');
       } else if (params.biddingStrategy === 'TARGET_CPA') {
         update.targetCpa = { targetCpaMicros: String(Math.round((params.biddingStrategyTarget || 0) * 1_000_000)) };
@@ -715,6 +1218,7 @@ export class GoogleAdsService {
     let response;
     try {
       response = await axios.post(`${GOOGLE_ADS_API_BASE}/geoTargetConstants:suggest`, { locale, locationNames: { names: [query] } }, {
+        timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS,
         headers: {
           Authorization: `Bearer ${accessToken}`,
           'developer-token': secrets.developerToken,
@@ -755,6 +1259,7 @@ export class GoogleAdsService {
     name: string;
     campaignResourceName: string;
     type: 'SEARCH_STANDARD' | 'DISPLAY_STANDARD';
+    status?: 'ENABLED' | 'PAUSED';
     cpcBidMicros?: number;
   }): Promise<{ resourceName: string }> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
@@ -762,7 +1267,7 @@ export class GoogleAdsService {
       create: {
         name: params.name,
         campaign: params.campaignResourceName,
-        status: 'ENABLED',
+        status: params.status ?? 'ENABLED',
         type: params.type,
         ...(params.cpcBidMicros !== undefined && { cpcBidMicros: String(params.cpcBidMicros) }),
       },
@@ -799,15 +1304,29 @@ export class GoogleAdsService {
 
   // ── Keywords ─────────────────────────────────────────────────────────────
 
+  /**
+   * ENG-1527. `status` was hardcoded ENABLED with no parameter at all — the last create on
+   * this surface that could not be staged, after ENG-1514 gave AD_GROUP and AD one.
+   *
+   * The greenfield case was contained (a keyword under a paused ad group cannot serve), but
+   * that containment does not exist on the path that matters: adding keywords to an
+   * ALREADY-LIVE ad group starts buying new queries on the next refresh, at the ad group's
+   * default bid, with no review of match type or bid — and unlike AD CREATE and
+   * ASSET_GROUP CREATE, KEYWORD ADD passes through no gate at all.
+   *
+   * Defaults to PAUSED, matching CAMPAIGN/AD_GROUP/AD and Management RULE 11. That is a
+   * deliberate trade: an operator who expected delivery sees keywords sitting paused, which
+   * is visible and one call to fix, where unreviewed spend is neither.
+   */
   async addKeywords(userId: string, customerId: string, adGroupResourceName: string, keywords: {
     text: string;
     matchType: 'BROAD' | 'PHRASE' | 'EXACT';
-  }[]): Promise<void> {
+  }[], status: 'ENABLED' | 'PAUSED' = 'PAUSED'): Promise<void> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'adGroupCriteria', keywords.map(kw => ({
       create: {
         adGroup: adGroupResourceName,
-        status: 'ENABLED',
+        status,
         keyword: { text: kw.text, matchType: kw.matchType },
       },
     })), loginCustomerId);
@@ -1120,6 +1639,7 @@ export class GoogleAdsService {
     headlines: string[];
     descriptions: string[];
     finalUrl: string;
+    status?: 'ENABLED' | 'PAUSED';
     imageAssetResourceNames?: string[];
     /** ENG-239: explicit UTM/tracking suffix; wins over the auto-generated one. */
     finalUrlSuffix?: string;
@@ -1166,7 +1686,7 @@ export class GoogleAdsService {
     const data = await this.mutate(customerId, accessToken, 'adGroupAds', [{
       create: {
         adGroup: params.adGroupResourceName,
-        status: 'ENABLED',
+        status: params.status ?? 'ENABLED',
         ad: {
           ...adContent,
           finalUrls: [params.finalUrl],

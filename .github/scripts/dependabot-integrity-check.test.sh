@@ -30,6 +30,13 @@ if [ "$1" = "api" ]; then
     echo "mock gh: simulated partial-pagination failure (later page errored)" >&2
     exit 1
   fi
+  # ENG-1382: the workflow-YAML branch now also consults dependabot-only-pr.sh,
+  # which calls .../commits. Route by endpoint so one mock serves both scripts.
+  for arg in "$@"; do
+    case "${arg}" in
+      */commits*) cat "${MOCK_COMMITS:-/dev/null}"; exit 0 ;;
+    esac
+  done
   cat "${MOCK_FILES}"
   exit 0
 fi
@@ -171,6 +178,8 @@ run_script() {
     MOCK_FILES="${WORKDIR}/files.json" \
     MOCK_EXIT="${WORKDIR}/exit_code" \
     MOCK_PARTIAL="${WORKDIR}/files_partial.json" \
+    MOCK_COMMITS="${WORKDIR}/commits.json" \
+    GH_TOKEN="mock-token" \
     REPO="${TEST_REPO:-}" \
     PR_NUMBER="${TEST_PR_NUMBER:-}" \
     bash "${SCRIPT}" 2>&1
@@ -283,15 +292,23 @@ else
   printf 'FAIL: %s\n  output: %s\n' 'the specific disallowed path is named in the failure output' "${LAST_OUTPUT}"
 fi
 
-# The REAL shape of a genuine GitHub-Actions-ecosystem Dependabot update
-# (verified live, agentweb#2276) must STILL fail this check, deliberately —
-# declining the bypass for that PR class (it still gets a full, real
-# Greptile review) rather than attempt to verify the diff is a pure
-# action-SHA bump.
+# ENG-1382: this case used to assert that a genuine GitHub-Actions-ecosystem
+# Dependabot update (verified live, agentweb#2276) fails closed on its PATHS —
+# encoding as intended behaviour the very thing that made every Dependabot PR in
+# this repo permanently unmergeable (0 of 4 ever merged, pins rotting since
+# 2026-08-04). Its own name flagged the tension: "even though this is what a real
+# GH-Actions Dependabot bump looks like".
+#
+# The security intent survives: workflow YAML is still never trusted on paths
+# alone. What changed is what the trust rests on — provable authorship of the
+# whole commit history rather than the file list. This case now pins the
+# fail-closed half: an unreadable commit list means authorship is unproven, so
+# the check must still fail.
 files_touches_workflow >"${WORKDIR}/files.json"
+rm -f "${WORKDIR}/commits.json"
 run_script
-check 'a diff touching .github/workflows/ fails closed, even though this is what a real GH-Actions Dependabot bump looks like' 1 \
-  'not a recognized dependency manifest'
+check 'workflow YAML with an unreadable commit list fails closed (authorship unproven)' 1 \
+  'NOT provably dependabot'
 
 files_touches_greptile_json >"${WORKDIR}/files.json"
 run_script
@@ -325,6 +342,75 @@ run_script
 check 'a partial-pagination failure (non-empty output, non-zero exit) fails closed, not treated as a complete untampered list' 1 \
   'DEPENDABOT_INTEGRITY_CHECK_FAILED'
 echo 0 >"${WORKDIR}/exit_code"
+
+# ---------------------------------------------------------------------------
+# ENG-1382: the github-actions ecosystem is the ONLY one this repo configures
+# (.github/dependabot.yml), and such a bump can never satisfy the manifest
+# allowlist — so every Dependabot PR reached the failure path above. Because
+# this job is a REQUIRED check, "not bypass-eligible" silently became
+# "permanently unmergeable".
+# ---------------------------------------------------------------------------
+
+files_workflow_plus_script() {
+  cat <<'EOF'
+[
+  {"filename": ".github/workflows/tests.yml"},
+  {"filename": ".github/scripts/eb-deploy.sh"}
+]
+EOF
+}
+commits_all_dependabot_verified() {
+  cat <<'EOF'
+[
+  {"author": {"login": "dependabot[bot]"}, "commit": {"verification": {"verified": true}}},
+  {"author": {"login": "dependabot[bot]"}, "commit": {"verification": {"verified": true}}}
+]
+EOF
+}
+commits_with_human() {
+  cat <<'EOF'
+[
+  {"author": {"login": "dependabot[bot]"}, "commit": {"verification": {"verified": true}}},
+  {"author": {"login": "harshmoney123"}, "commit": {"verification": {"verified": false}}}
+]
+EOF
+}
+commits_forged_author_unverified() {
+  cat <<'EOF'
+[
+  {"author": {"login": "dependabot[bot]"}, "commit": {"verification": {"verified": false}}}
+]
+EOF
+}
+
+# THE case that was permanently blocked: agentweb#2432, portal#997/#998/#999.
+files_touches_workflow >"${WORKDIR}/files.json"
+commits_all_dependabot_verified >"${WORKDIR}/commits.json"
+run_script
+check 'a pure Actions-workflow bump with an all-dependabot verified history PASSES' 0 'Untampered'
+
+# It must say what it did and did not prove, never pass silently.
+run_script
+check 'the workflow-YAML pass emits a ::warning:: naming what it proved' 0 '::warning::'
+
+# The hole that trusting PATHS alone would open: a human pushes onto a
+# Dependabot-opened branch. Authorship is what closes it, not the file list.
+commits_with_human >"${WORKDIR}/commits.json"
+run_script
+check 'a human commit anywhere in the history fails closed even for workflow YAML' 1 'NOT provably dependabot'
+
+# Author metadata is self-declared; the signature is not. Requiring both is the
+# whole point — a forged author email with no valid signature must not pass.
+commits_forged_author_unverified >"${WORKDIR}/commits.json"
+run_script
+check 'a forged dependabot author with an unverified signature fails closed' 1 'NOT provably dependabot'
+
+# The narrowing that keeps this from becoming ".github/** is fine now".
+files_workflow_plus_script >"${WORKDIR}/files.json"
+commits_all_dependabot_verified >"${WORKDIR}/commits.json"
+run_script
+check 'a .github/scripts/ path still fails closed even with a clean dependabot history' 1 \
+  'outside the recognized dependency-manifest allowlist'
 
 printf '\n%s checks run, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ] || exit 1

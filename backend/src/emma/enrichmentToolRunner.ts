@@ -6,7 +6,7 @@ import { processEnrichmentConfig } from '../services/enrichmentConfigService';
 import { buildConfigProcessingDeps } from '../services/enrichmentConfigDeps';
 import { runEnrichment, type RunEnrichmentResult } from '../services/crmEnrichmentServiceV3';
 import { buildOrchestratorDeps } from '../services/enrichmentV3RealDeps';
-import type { SocketEmitFn } from '../services/crmEnrichmentService';
+import { CrmEnrichmentService, type SocketEmitFn } from '../services/crmEnrichmentService';
 import { buildRawEnrichmentConfig, type EmmaEnrichmentOutputField } from './enrichmentToolConfig';
 import { normalizeOutputFields, type FieldRemap } from './enrichmentFieldNormalizer';
 import { fieldVerificationStatus, fieldProvenanceBadge } from '../utils/enrichedFieldValue';
@@ -184,7 +184,11 @@ export async function runEmmaEnrichment(
 
 /** Select 2 representative sample leads for a preview run. Prefers leads
  *  with identity data (email or linkedin) so the preview shows useful
- *  results. Throws when the list has no leads to sample. */
+ *  results. A placeholder/test address (queue-verify@example.com) is not
+ *  identity data — such a row can never be enriched (ENG-968), and sampling
+ *  two of them makes an otherwise-enrichable list look unenrichable. Falls
+ *  back to the raw pool when no better leads exist. Throws when the list has
+ *  no leads to sample. */
 export async function pickPreviewLeadIds(
   listId: string,
   explicitLeadIds: string[] | undefined,
@@ -198,8 +202,13 @@ export async function pickPreviewLeadIds(
   if (pool.length === 0) {
     throw new Error('This list has no leads to preview enrichment on.');
   }
+  const hasRealEmail = (l: any) => {
+    const email = typeof l.email === 'string' ? l.email.trim() : '';
+    if (!email) return false;
+    return !CrmEnrichmentService.isPlaceholderDomain(email.split('@')[1] || '');
+  };
   const hasIdentity = (l: any) =>
-    (typeof l.email === 'string' && l.email.trim()) ||
+    hasRealEmail(l) ||
     (typeof l.linkedin === 'string' && l.linkedin.trim());
   const withIdentity = pool.filter(hasIdentity);
   const chosen = (withIdentity.length >= 2 ? withIdentity : pool).slice(0, 2);

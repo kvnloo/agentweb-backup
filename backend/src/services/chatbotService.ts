@@ -1,6 +1,5 @@
 import OpenAI from "openai";
 import { getAzureClient } from "../utils/llmClients";
-import { meterUserUsage } from "./usageRecorderService";
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import dotenv from "dotenv";
@@ -25,7 +24,6 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../utils/citations';
-import { isTransientLLMError } from '../utils/agentModeErrors';
 import { shrinkMessageForPersistence } from '../utils/messageSizeGuard';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
@@ -34,6 +32,7 @@ import { computeCostMicroUsd } from './usageRecorderService';
 import type { CacheWriteByTtl } from '../utils/llmPricing';
 import { approvalDb } from './approvalDb';
 import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
+import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -58,15 +57,6 @@ export const dynamodb = new AWS.DynamoDB.DocumentClient({
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
   },
 });
-
-// Metered Azure OpenAI client for Emma chat. Same standard deployment the
-// module singleton used; usage is recorded per user/session via the factory.
-function chatClient(userId?: string, sessionId?: string) {
-  return getAzureClient(
-    { userId, feature: "chat", sessionId },
-    process.env.AZURE_OPENAI_DEPLOYMENT
-  );
-}
 
 // Metered client for embeddings (knowledge-base semantic search). Uses the
 // separate EMBEDDINGS endpoint/key/api-version the module singleton used. No
@@ -107,6 +97,8 @@ export interface ChatMessage {
     completion_tokens: number;
     total_tokens: number;
     estimated_cost: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
   };
   metadata?: {
     currentUrl?: string;
@@ -151,6 +143,7 @@ export interface ChatMessage {
     imageFilename?: string;             // Filename when kind === 'image-generated'
     imageUrl?: string;                  // ENG-510: image URL on the immediate marker so a completed image survives a whole-turn-cap kill
     citations?: Citation[];             // ENG-351: de-duplicated web sources this message consulted (ChatGPT-style Sources UI)
+    mediaBudgetDeferred?: boolean;      // ENG-1239: set on the tool-role deferral marker AND on the whole-turn-timeout partial-delivery message that reports it, so an unresolved media-batch pause is detectable from the tail of session history alone
   };
 }
 
@@ -191,6 +184,14 @@ export interface ChatSession {
       description?: string;
       status: 'pending' | 'completed' | 'skipped';
       completedAt?: string;
+      // ENG-1188 (Greptile): set alongside completedAt for 'completed' AND ALSO for
+      // 'skipped' -- unlike completedAt, this exists purely so setWorkPlanStatus's
+      // asset-count gate has a real "this step left pending" marker for a skipped
+      // step to scope a later step's asset count against, instead of silently
+      // falling through to counting the whole session. Internal bookkeeping only;
+      // never rendered (PlanProgress/HorizontalPlanProgress key off completedAt +
+      // status === 'completed', which reusing completedAt here would have broken).
+      resolvedAt?: string;
       notes?: string;
       requiredFunctionCalls?: string[]; // Required function names that must be called before marking complete
       skillIds?: string[]; // Skill IDs to auto-install when this step becomes active
@@ -200,11 +201,25 @@ export interface ChatSession {
       // step (e.g. "Generate 3 Images Per Hook — 18 total") from being marked done with
       // only a fraction generated (the xCures incident). Unset = no asset-count gate.
       expectedAssetCount?: number;
+      // ENG-1331: which tool name(s) count toward expectedAssetCount, when a step's
+      // deliverable spans multiple asset-producing tools that aren't interchangeable
+      // (see synthesisResidue.ts's countProducedAssets for the full rationale). Unset
+      // = the gate falls back to the max succeeded count across every known
+      // asset-producing tool.
+      expectedAssetCountTools?: string[];
+      inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
     }>;
     createdAt: string;
     updatedAt: string;
     welcomeMessage?: string; // Custom welcome message for this work plan
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
+    // ENG-1472: the predefined WorkPlan template (AW-WorkPlans planId) this
+    // session's work plan was instantiated from, when it was launched from a
+    // template (launch_predefined_work_plan, the public plan-session route, or
+    // the recommend-then-accept flow). Absent for plans created ad hoc via
+    // create_work_plan. Used for accept-endpoint idempotency and to chain into
+    // a completed template's author-approved "next plan" suggestions.
+    templatePlanId?: string;
   };
   contextLimitReported?: boolean; // True once a context-limit issue report has been auto-filed
   // ENG-396: the single structured question Emma is currently blocked on (if any).
@@ -217,6 +232,11 @@ export interface ChatSession {
   // write gate (checkQuestionGate) still find an earlier human answer even
   // after Emma has moved on to asking something else in the same session.
   answeredQuestions?: Record<string, PendingUserQuestion>;
+  // One channel-neutral information request emitted by the current work-plan
+  // step. It is intentionally separate from pendingUserQuestion because it
+  // carries typed values rather than an option selection; the write guard
+  // still makes the two mutually exclusive while either is awaiting.
+  pendingWorkPlanInput?: WorkPlanInputRequest;
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
@@ -299,6 +319,11 @@ export interface ChatSession {
       goalCompletion: number;   // 1-5: did the assistant accomplish what was asked?
       dataAccuracy: number;     // 1-5: plausible/consistent data, no hallucinations?
       outputQuality: number;    // 1-5: well-structured, specific, actionable output?
+      // ENG-1312: optional — a session scored before this shipped, or by a
+      // stale custom judge prompt, simply omits these.
+      concision?: number;               // 0-5: did reply length match the question/instruction?
+      instructionCompliance?: number;   // 0-5: explicit instruction followed on first attempt?
+      unnecessaryPermissionRequest?: boolean; // asked to confirm a safe (read-only/draft/test) action?
     };
   };
   judgeScores?: Record<string, {  // keyed by judge ID
@@ -311,6 +336,10 @@ export interface ChatSession {
       goalCompletion: number;
       dataAccuracy: number;
       outputQuality: number;
+      // ENG-1312: see satisfactionScore.dimensions above.
+      concision?: number;
+      instructionCompliance?: number;
+      unnecessaryPermissionRequest?: boolean;
     };
   }>;
   // Scores retracted because the session turned out to be outside the
@@ -565,8 +594,15 @@ export interface GoogleAdsMeasurementCheckRecord {
   customerId: string;
   campaignResourceName: string;
   action: string;
-  /** Overall outcome of the gate for this launch attempt. */
-  outcome: 'passed' | 'blocked' | 'overridden';
+  /**
+   * Overall outcome of the gate for this launch attempt.
+   *
+   * `passed_with_warning` (ENG-1358) is deliberately distinct from `passed`: the launch
+   * was permitted, but the page carried only a GTM container or a GA4 property and no
+   * Google Ads conversion tag. Collapsing the two would make the audit trail claim the
+   * conversion path was verified when all we verified was that some Google tag exists.
+   */
+  outcome: 'passed' | 'passed_with_warning' | 'blocked' | 'overridden';
   /** Per-URL check results (url + status + detected mechanisms). */
   urlResults: Array<{ url: string; status: string; mechanisms: string[]; error?: string }>;
   checkedAt: string;
@@ -2535,11 +2571,21 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * ENG-1332: guarded by default against clobbering an admin override. The
+   * caller (scoreSessionIfNeeded) already skips adminOverride rows using the
+   * session it read, but that read happens once before scoring — a concurrent
+   * admin override written in between is a TOCTOU race the in-process check
+   * can't catch. Pass `allowOverride: true` only for an explicit human
+   * override write (the admin PUT route), which must be allowed to replace
+   * anything, including a prior override.
+   */
   async updateSessionSatisfactionScore(
     sessionId: string,
-    satisfactionScore: ChatSession["satisfactionScore"]
-  ): Promise<ChatSession> {
-    const params = {
+    satisfactionScore: ChatSession["satisfactionScore"],
+    options?: { allowOverride?: boolean }
+  ): Promise<ChatSession | null> {
+    const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
       TableName: this.tableName,
       Key: {
         sessionId,
@@ -2551,10 +2597,18 @@ export class ChatbotDB {
       ReturnValues: "ALL_NEW",
     };
 
+    if (!options?.allowOverride) {
+      params.ConditionExpression = "attribute_not_exists(satisfactionScore.adminOverride)";
+    }
+
     try {
       const result = await dynamodb.update(params).promise();
       return result.Attributes as ChatSession;
     } catch (error) {
+      // Lost the race: an admin override landed on this row after it was read
+      // for scoring, so there is nothing to persist. Not an error — the row
+      // still holds the human's score.
+      if (!options?.allowOverride && this.isConditionalCheckFailure(error)) return null;
       console.error("Error updating session satisfaction score:", error);
       throw error;
     }
@@ -3070,6 +3124,68 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Persist the typed information a work-plan step is waiting for. The same
+   * request is rendered as a chat card in the portal or as MCP elicitation;
+   * persisting the channel-neutral form lets a reconnect resume safely.
+   *
+   * There is one human-input interruption at a time across both structured
+   * interaction types. A second request must wait instead of racing to steal
+   * the user's answer slot.
+   */
+  async updateSessionWorkPlanInputRequest(
+    sessionId: string,
+    pendingWorkPlanInput: WorkPlanInputRequest | null,
+    opts?: { failIfAwaitingExists?: boolean; requireStillAwaiting?: string },
+  ): Promise<ChatSession | null> {
+    const guard = opts?.failIfAwaitingExists === true && pendingWorkPlanInput !== null;
+    const requireStillAwaiting =
+      typeof opts?.requireStillAwaiting === 'string' ? opts.requireStillAwaiting : undefined;
+
+    const params: any = pendingWorkPlanInput
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET pendingWorkPlanInput = :pendingWorkPlanInput, adminListPartition = :adminListPartition',
+          ExpressionAttributeValues: {
+            ':pendingWorkPlanInput': pendingWorkPlanInput,
+            ':adminListPartition': 'all',
+          },
+          ReturnValues: 'ALL_NEW',
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'REMOVE pendingWorkPlanInput',
+          ReturnValues: 'ALL_NEW',
+        };
+
+    if (guard) {
+      params.ConditionExpression = '(attribute_not_exists(pendingWorkPlanInput) OR pendingWorkPlanInput.#inputStatus <> :awaitingStatus) AND (attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#questionStatus <> :awaitingStatus)';
+      params.ExpressionAttributeNames = { '#inputStatus': 'status', '#questionStatus': 'status' };
+      params.ExpressionAttributeValues[':awaitingStatus'] = 'awaiting';
+    } else if (requireStillAwaiting) {
+      params.ConditionExpression = 'pendingWorkPlanInput.requestId = :requestId AND pendingWorkPlanInput.#inputStatus = :awaitingStatus';
+      params.ExpressionAttributeNames = { '#inputStatus': 'status' };
+      params.ExpressionAttributeValues = {
+        ...(params.ExpressionAttributeValues || {}),
+        ':requestId': requireStillAwaiting,
+        ':awaitingStatus': 'awaiting',
+      };
+    }
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      if ((guard || requireStillAwaiting) && (error as any)?.code === 'ConditionalCheckFailedException') {
+        return null;
+      }
+      console.error('Error updating session work-plan input request:', error);
+      throw error;
+    }
+  }
+
   async updateSessionWorkPlan(
     sessionId: string,
     workPlan: {
@@ -3084,15 +3200,22 @@ export class ChatbotDB {
         userInstructions?: string;
         status: 'pending' | 'completed' | 'skipped';
         completedAt?: string;
+        /** ENG-1188: see the matching field on the read-side workPlan type above. */
+        resolvedAt?: string;
         notes?: string;
         requiredFunctionCalls?: string[];
         skillIds?: string[];
         expectedAssetCount?: number;
+        /** ENG-1331: see the matching field on the read-side workPlan type above. */
+        expectedAssetCountTools?: string[];
+        inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
       }>;
       createdAt: string;
       updatedAt: string;
       welcomeMessage?: string;
       autocomplete?: boolean;
+      /** ENG-1472: see the matching field on the read-side workPlan type above. */
+      templatePlanId?: string;
     }
   ): Promise<ChatSession> {
     const timestamp = new Date().toISOString();
@@ -3613,7 +3736,15 @@ export class ChatbotDB {
     limit: number,
     lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key,
     timeRange?: { startTime: string; endTime: string }
-  ): Promise<{ sessions: ChatSession[]; lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key }> {
+  ): Promise<{
+    sessions: ChatSession[];
+    lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key;
+    // ENG-1332 (Greptile): the gap query's page cap can stop before reaching a
+    // qualifying late-touched session, silently understating the requested
+    // range. This says so, rather than leaving the caller to trust an
+    // unqualified count.
+    gapQueryTruncated?: boolean;
+  }> {
     const expressionValues: Record<string, any> = {
       ":adminListPartition": "all",
     };
@@ -3651,9 +3782,114 @@ export class ChatbotDB {
           currentKey = result.LastEvaluatedKey;
         } while (currentKey);
 
+        // ENG-1332 follow-up: the query above is keyed on updatedAt, so a session
+        // created inside the window but last touched AFTER timeRange.endTime (e.g.
+        // its final message landed a few seconds past the window boundary, or this
+        // window is being re-queried well after it closed) is invisible to it even
+        // though it belongs in the requested range. Close that gap with a second
+        // query over [endTime, now] — only sessions genuinely created in range are
+        // kept from it, so it can't pull in unrelated later activity. DynamoDB
+        // KeyConditionExpression allows only one condition per key, so BETWEEN
+        // (inclusive both ends) is the only compound-range operator available;
+        // BETWEEN is inclusive on both ends, so a session with updatedAt exactly
+        // at endTime legitimately matches both this query and the primary one —
+        // dedupe by sessionId against what the primary query already returned
+        // (comparing the updatedAt strings directly is not reliable: DynamoDB
+        // always stores full-millisecond ISO timestamps, but a caller-supplied
+        // endTime without milliseconds, e.g. "...T14:00:00Z", would never
+        // string-equal the stored value even though they name the same instant).
+        // Skipped entirely when endTime is already at/after "now" (the common
+        // daily-report case, where nothing can have updatedAt in the future), so
+        // this adds no cost to the case the fix already handles.
+        //
+        // [endTime, now] is unbounded in principle (a stale/old window re-queried
+        // much later can span months of unrelated activity), so this loop stops
+        // once enough in-range sessions have been found to fill `limit` — the
+        // final slice below never returns more than `limit` in-range sessions
+        // anyway, so scanning further pages can't change the response, only add
+        // cost.
+        //
+        // The `inRangeCount < limit` stop condition alone isn't enough: a
+        // sparse stale range (few or no sessions actually created in it) can
+        // never reach `limit` no matter how many pages are scanned, so it would
+        // still walk every page through "now" one at a time. A hard page cap
+        // bounds that case too — past this many pages, further scanning trades
+        // an unbounded amount of latency for a small chance of catching one
+        // more late-touched session, so this stops and logs instead.
+        const nowIso = new Date().toISOString();
+        let gapQueryTruncated = false;
+        if (timeRange.endTime < nowIso) {
+          const primarySessionIds = new Set(accumulated.map((s) => s.sessionId));
+          let inRangeCount = accumulated.filter(
+            (s) => s.createdAt && s.createdAt >= timeRange.startTime && s.createdAt <= timeRange.endTime
+          ).length;
+          const lateExpressionValues: Record<string, any> = {
+            ":adminListPartition": "all",
+            ":end": timeRange.endTime,
+            ":now": nowIso,
+          };
+          const lateKeyCondition =
+            "adminListPartition = :adminListPartition AND updatedAt BETWEEN :end AND :now";
+          const MAX_GAP_QUERY_PAGES = 20;
+          let lateKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+          let pageCount = 0;
+          do {
+            const lateParams: AWS.DynamoDB.DocumentClient.QueryInput = {
+              TableName: this.tableName,
+              IndexName: "AdminUpdatedAtIndex",
+              KeyConditionExpression: lateKeyCondition,
+              ExpressionAttributeValues: lateExpressionValues,
+              ScanIndexForward: false,
+            };
+            if (lateKey) {
+              lateParams.ExclusiveStartKey = lateKey;
+            }
+
+            const lateResult = await dynamodb.query(lateParams).promise();
+            pageCount++;
+            for (const session of (lateResult.Items as ChatSession[]) || []) {
+              if (primarySessionIds.has(session.sessionId)) continue; // already covered by the primary query
+              const createdAt = session.createdAt;
+              if (createdAt && createdAt >= timeRange.startTime && createdAt <= timeRange.endTime) {
+                accumulated.push(session);
+                inRangeCount++;
+              }
+            }
+            lateKey = lateResult.LastEvaluatedKey;
+          } while (lateKey && inRangeCount < limit && pageCount < MAX_GAP_QUERY_PAGES);
+
+          if (lateKey && pageCount >= MAX_GAP_QUERY_PAGES) {
+            gapQueryTruncated = true;
+            console.warn(
+              `[chatbotService] getRecentSessionsPage: gap query hit its ${MAX_GAP_QUERY_PAGES}-page cap scanning [${timeRange.endTime}, ${nowIso}] for a sparse range — some late-touched in-range sessions past this point may be missing from this page`
+            );
+          }
+        }
+
+        // ENG-1332: the query above orders by updatedAt, not createdAt — a
+        // historical session touched (but not created) during this window sorts
+        // by that touch, and can outrank a session genuinely created in the
+        // window if the touch is more recent. Re-prioritize before truncating:
+        // sessions actually created within the requested range come first
+        // (newest first), so the `limit` slice and any budget-bound consumer
+        // (e.g. the sync scoring backfill) exhaust in-range coverage before
+        // spending anything on out-of-range history.
+        const inRange: ChatSession[] = [];
+        const outOfRange: ChatSession[] = [];
+        for (const session of accumulated) {
+          const createdAt = session.createdAt;
+          if (createdAt && createdAt >= timeRange.startTime && createdAt <= timeRange.endTime) {
+            inRange.push(session);
+          } else {
+            outOfRange.push(session);
+          }
+        }
+        inRange.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+
         return {
-          sessions: accumulated.slice(0, limit),
+          sessions: [...inRange, ...outOfRange].slice(0, limit),
           lastEvaluatedKey: undefined,
+          gapQueryTruncated,
         };
       } catch (error) {
         console.error("Error getting chat sessions by time range:", error);
@@ -4107,7 +4343,8 @@ export function calculateCost(
 // Helper function to log token usage
 function logTokenUsage(
   response: OpenAI.Chat.ChatCompletion,
-  context: string = ""
+  context: string = "",
+  pricingModel: string = response.model
 ) {
   const usage = response.usage;
   if (!usage) return;
@@ -4116,14 +4353,14 @@ function logTokenUsage(
   const cost = calculateCost(
     usage.prompt_tokens,
     usage.completion_tokens,
-    response.model,
+    pricingModel,
     u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
     u.cache_creation_input_tokens || 0,
     u.cache_creation_by_ttl
   );
 
   console.log(
-    `[Token Usage] Model: ${response.model} | Prompt: ${
+    `[Token Usage] Model: ${pricingModel} | Prompt: ${
       usage.prompt_tokens
     } | Completion: ${usage.completion_tokens} | Total: ${
       usage.total_tokens
@@ -4137,6 +4374,12 @@ function logTokenUsage(
     completion_tokens: usage.completion_tokens,
     total_tokens: usage.total_tokens,
     estimated_cost: cost,
+    // ENG-1222: without these, a session's spend has no per-model attribution
+    // basis (apiTools.ts reads msg.usage.cache_*_input_tokens) and reports as
+    // 'selection-only' with cacheTokens/costByModel null even though real spend
+    // happened — the exact telemetry fingerprint that hid the P0 fabrication bug.
+    cache_read_input_tokens: u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
+    cache_creation_input_tokens: u.cache_creation_input_tokens || 0,
   };
 }
 
@@ -4151,6 +4394,31 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5)
     throw error;
   }
 }
+
+// ENG-1222 follow-up: the Vertex AI Discovery Engine calls below have no
+// timeout of their own and can hang indefinitely — observed directly in a
+// live environment, where a single call blocked an entire chat turn for
+// several minutes. Every chatbotService.ts turn goes through this function
+// (not just skill sessions), so an unbounded hang here stalls the whole
+// generateChatResponse call. Mirrors the same pattern already used
+// independently in v0Service.ts / linkedInOutreachService.ts / etc. — a
+// shared utility would be a separate, larger cleanup, not bundled in here.
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const e: any = new Error(`${label} timed out after ${Math.round(ms / 1000)}s`);
+      e.code = 'KNOWLEDGE_BASE_SEARCH_TIMEOUT';
+      reject(e);
+    }, ms);
+    // Don't keep the event loop alive solely for this guard timer.
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+const KNOWLEDGE_BASE_SEARCH_TIMEOUT_MS = 10_000;
 
 // Function to search platform-wide knowledge base using Vertex AI Search
 export async function searchPlatformKnowledgeBase(query: string, maxResults: number = 10, userId?: string): Promise<ContextChunk[]> {
@@ -4208,11 +4476,18 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
       }
     };
 
-    // Search both knowledge bases in parallel
-    const [publicResults, privateResults] = await Promise.all([
-      publicClient.search({ ...searchRequest, servingConfig: publicServingConfig }),
-      privateClient.search({ ...searchRequest, servingConfig: privateServingConfig })
-    ]);
+    // Search both knowledge bases in parallel. The outer withTimeout guard only
+    // abandons the *promise* on the caller's side — without also passing
+    // CallOptions.timeout, the underlying RPCs stay in flight past the 10s
+    // deadline, holding the socket and retry budget open.
+    const [publicResults, privateResults] = await withTimeout(
+      Promise.all([
+        publicClient.search({ ...searchRequest, servingConfig: publicServingConfig }, { timeout: KNOWLEDGE_BASE_SEARCH_TIMEOUT_MS }),
+        privateClient.search({ ...searchRequest, servingConfig: privateServingConfig }, { timeout: KNOWLEDGE_BASE_SEARCH_TIMEOUT_MS })
+      ]),
+      KNOWLEDGE_BASE_SEARCH_TIMEOUT_MS,
+      'searchPlatformKnowledgeBase',
+    );
 
     const results: ContextChunk[] = [];
 
@@ -4408,17 +4683,75 @@ export async function generateChatResponse(
       throw new Error("Chat session not found");
     }
 
+    // ENG-1222: resolve skill/admin tool access ONCE, through agent-mode's own
+    // buildSkillContext, shared below by both the system prompt (skill
+    // systemPrompt injection) and tool binding — this is the single source of
+    // truth for "which tools + skill-context text does this session get",
+    // replacing two independently hand-rolled, silently-drifting copies of the
+    // same policy. Also picks up subscription-tier skill gating and
+    // __other_skills__ support that this path never had.
+    const sessionHasInstalledSkills = Array.isArray(session.associatedSkills) && session.associatedSkills.length > 0;
+    const sessionSkillIds = Array.isArray(session.associatedSkills) ? session.associatedSkills : [];
+    const skillToolGateOpen = portalType === 'customer' || (portalType as string) === 'emma-sidebar' || !!isDelegatedAdmin || sessionHasInstalledSkills;
+    const agentModeService = new AgentModeService();
+    let skillContext: { allowedToolNames: Set<string>; installedSkillContextMsg: string } = { allowedToolNames: new Set<string>(), installedSkillContextMsg: '' };
+    // Exposed for the ENG-1222 hard gate below, so it can tell "subscription
+    // correctly doesn't include this skill" apart from "tool resolution failed".
+    let userAllowedSkillIdsForGate: string[] = [];
+    // getSkillsByIds/getPublishedSkills/getAllowedSkills can all reject (e.g. a
+    // transient DynamoDB error) — without tracking that separately from "resolved
+    // to an empty allowlist", the hard gate below would misreport a backend
+    // failure as "this skill isn't in your plan" to a paying customer whose
+    // subscription was never actually checked.
+    let skillAllowlistResolved = false;
+    if (skillToolGateOpen) {
+      try {
+        await agentModeService.initialize();
+        const { skillService } = await import('./skillService');
+        // buildSkillContext only ever consults publishedSkills/userAllowedSkillIds
+        // when the session itself has skill IDs to resolve or gate (regular skills,
+        // or the __other_skills__ virtual ID) — a plain skill-less customer/admin
+        // turn never uses either. Skipping them here avoids a subscription-tier
+        // lookup plus a full Dev-AW-Skills table scan on every single Emma message,
+        // not just the ones that actually have a skill installed.
+        if (sessionSkillIds.length > 0) {
+          const { getAllowedSkills, getPublicAllowedSkills } = await import('./subscriptionService');
+          const [associatedSkills, publishedSkills, userAllowedSkillIds] = await Promise.all([
+            skillService.getSkillsByIds(sessionSkillIds),
+            skillService.getPublishedSkills(),
+            // ENG-1222: userId is optional on this function (anonymous/public
+            // callers exist) — route those through the same public-allowlist path
+            // subscriptionService already defines, instead of letting getAllowedSkills
+            // throw on an undefined id and silently falling back to zero tools below.
+            userId ? getAllowedSkills(userId) : getPublicAllowedSkills(),
+          ]);
+          userAllowedSkillIdsForGate = userAllowedSkillIds;
+          // Set only after buildSkillContext itself succeeds — if it throws, the
+          // catch block below must still see skillAllowlistResolved === false, or
+          // the hard gate would misreport a context-construction bug as "your
+          // subscription doesn't include this skill".
+          skillContext = agentModeService.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionSkillIds, !!isDelegatedAdmin);
+          skillAllowlistResolved = true;
+        } else {
+          skillContext = agentModeService.buildSkillContext([], [], [], [], !!isDelegatedAdmin);
+        }
+      } catch (skillContextErr) {
+        console.error('[generateChatResponse] Error resolving skill/tool context:', skillContextErr);
+      }
+    }
+
     // Get messages for OpenAI
     // Always inject the current system prompt fresh (ignoring the stale stored version)
     // so that DynamoDB overrides and prompt updates take effect immediately for all sessions.
     const freshSystemPrompt = portalType === "customer" ? getEmmaSystemContext(session.sessionType, orgRole) : null;
+    const combinedSystemPrompt = [freshSystemPrompt, skillContext.installedSkillContextMsg || null].filter(Boolean).join('\n\n') || null;
     const messages = [...session.messages];
-    if (freshSystemPrompt) {
+    if (combinedSystemPrompt) {
       const firstSystemIdx = messages.findIndex((m) => m.role === "system");
       if (firstSystemIdx >= 0) {
-        messages[firstSystemIdx] = { ...messages[firstSystemIdx], content: freshSystemPrompt };
+        messages[firstSystemIdx] = { ...messages[firstSystemIdx], content: combinedSystemPrompt };
       } else {
-        messages.unshift({ role: "system", content: freshSystemPrompt, metadata: { timestamp: new Date().toISOString() } });
+        messages.unshift({ role: "system", content: combinedSystemPrompt, metadata: { timestamp: new Date().toISOString() } });
       }
     }
 
@@ -4553,28 +4886,26 @@ export async function generateChatResponse(
     }
 
     // Initialize tool support for Emma (customer portal, or admin users on any portal)
-    let agentModeService: AgentModeService | null = null;
     let toolDefinitions: any[] = [];
 
-    if (portalType === 'customer' || (portalType as string) === 'emma-sidebar' || isDelegatedAdmin) {
+    if (skillToolGateOpen) {
       try {
-        // Initialize AgentModeService to access tool registry and executeTool
-        agentModeService = new AgentModeService();
-        await agentModeService.initialize();
-
-        // Base tools: foundation tools (always available in agent mode) + Emma-specific extras
+        // Base tools: agent-mode's resolved skill/admin/foundation tool names
+        // (computed once above, shared with the system prompt) + Emma-specific extras.
         // Only include customer-specific tools when on the customer portal or emma-sidebar
         const isCustomerContext = (portalType as string) === 'customer' || (portalType as string) === 'emma-sidebar';
-        const toolsToInclude = new Set<string>(isCustomerContext ? [
-          ...AgentModeService.FOUNDATION_TOOLS,
-          'read_page_source',
-          'enrich_leads_preview', 'enrich_leads_execute',
-          'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
-          'search_user_guide',
-          'report_product_issues',
-          'get_temp_email', 'check_temp_inbox',
-          'get_test_account', 'save_test_account', 'list_test_accounts',
-        ] : []);
+        const toolsToInclude = new Set<string>(skillContext.allowedToolNames);
+        if (isCustomerContext) {
+          [
+            'read_page_source',
+            'enrich_leads_preview', 'enrich_leads_execute',
+            'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
+            'search_user_guide',
+            'report_product_issues',
+            'get_temp_email', 'check_temp_inbox',
+            'get_test_account', 'save_test_account', 'list_test_accounts',
+          ].forEach((t) => toolsToInclude.add(t));
+        }
 
         if (isCustomerContext) {
           // Page-aware tool injection based on the current page URL
@@ -4607,12 +4938,6 @@ export async function generateChatResponse(
           }
         }
 
-        // Add admin tools when user is admin (direct or delegated)
-        if (isDelegatedAdmin) {
-          const adminToolNames = agentModeService.getAdminToolNames();
-          adminToolNames.forEach(t => toolsToInclude.add(t));
-        }
-
         if (!emmaToolsLoaded) {
           await import('../emma/tools');
           await import('../emma/tempEmailTools');
@@ -4622,29 +4947,6 @@ export async function generateChatResponse(
         }
         const { mcpToolRegistry } = await import('../mcp/server/registry');
         const { emmaToolRegistry } = await import('../emma/registry');
-
-        // Expand the tool set with any skills installed on this session
-        // (session.associatedSkills). Without this, skills installed via Emma's
-        // install_skills tool — or auto-installed when a work plan template is
-        // launched (launch_predefined_work_plan) — would have no effect on Emma's tool list,
-        // so the plan's required tools would never become available. This mirrors
-        // Agent Mode, which resolves a session's installed skills into tool names.
-        const sessionSkillIds = Array.isArray(session.associatedSkills) ? session.associatedSkills : [];
-        if (sessionSkillIds.length > 0) {
-          try {
-            const { resolveSkillsToToolNames } = await import('./subscriptionService');
-            const skillToolNames = await resolveSkillsToToolNames(sessionSkillIds);
-            if (skillToolNames.includes('*')) {
-              // Wildcard: every registered Emma/MCP tool becomes available.
-              emmaToolRegistry.getToolNames().forEach(t => toolsToInclude.add(t));
-              mcpToolRegistry.getToolNames().forEach(t => toolsToInclude.add(t));
-            } else {
-              skillToolNames.forEach(t => toolsToInclude.add(t));
-            }
-          } catch (skillErr) {
-            console.error('[generateChatResponse] Error resolving session skills to tools:', skillErr);
-          }
-        }
 
         // Expand the tool set with the active work plan's required function calls.
         // Predefined templates declare the tools each step needs via
@@ -4686,6 +4988,77 @@ export async function generateChatResponse(
       }
     }
 
+    // ENG-1222 hard gate: a skill session (session.associatedSkills non-empty)
+    // expects its skill's tools to be available, so resolving to zero tools here
+    // is a binding/configuration failure (e.g. an unregistered tool name, or a
+    // skill with no toolNames declared), not a legitimate "no tools needed" turn.
+    // Fail explicitly instead of letting the model free-text an answer it has no
+    // real capability to back up — this is the failure mode that produced the P0
+    // ("I don't have the capability to..." for a session that actually did).
+    // toolDefinitions also carries customer/page/work-plan tools unrelated to the
+    // installed skill (e.g. a CRM-page turn on a customer session), so a nonzero
+    // toolDefinitions.length doesn't prove the skill's own tools bound. Gate on
+    // the subset that actually came from the skill (+ virtual-skill) resolution
+    // instead — excluding FOUNDATION_TOOLS and the delegated-admin tool set,
+    // since buildSkillContext unions both into allowedToolNames unconditionally
+    // (foundation tools for every session, admin tools for any delegated admin),
+    // so a single registered tool from either would otherwise mask the exact
+    // "this skill's own tools failed to bind" failure the gate exists to catch.
+    const adminToolNames = new Set(agentModeService.getAdminToolNames());
+    const skillOnlyToolNames = new Set(
+      [...skillContext.allowedToolNames].filter((name) => !AgentModeService.FOUNDATION_TOOLS.has(name) && !adminToolNames.has(name)),
+    );
+    const skillToolDefinitions = toolDefinitions.filter((t: any) => skillOnlyToolNames.has(t.function.name));
+    if (sessionHasInstalledSkills && skillToolDefinitions.length === 0) {
+      // ENG-1222: subscription-tier gating (now enforced here via buildSkillContext,
+      // where before this path ignored it) correctly excludes a skill's tools when
+      // the caller's plan doesn't include it — that isn't a bug to apologize for or
+      // ask the user to retry. Tell them the real reason instead of the generic
+      // "configuration issue" message, which would be actively misleading here.
+      const isWildcardAllowed = userAllowedSkillIdsForGate.includes('*');
+      // skillAllowlistResolved guards this: an unresolved allowlist (the
+      // Promise.all above rejected) must never be classified as "subscription
+      // doesn't include this skill" — that's only a real conclusion once the
+      // allowlist was actually fetched.
+      const isSubscriptionGated = skillAllowlistResolved && !isWildcardAllowed && sessionSkillIds.length > 0
+        && sessionSkillIds.every((id) => !userAllowedSkillIdsForGate.includes(id));
+      console.error('[generateChatResponse] ENG-1222 hard gate: skill session resolved to zero tools', {
+        sessionId,
+        associatedSkills: session.associatedSkills,
+        isSubscriptionGated,
+      });
+      const hardGateMessage = isSubscriptionGated
+        ? "This skill isn't included in your current plan, so I don't have access to its tools right now. You may need to upgrade your subscription, or contact support if you believe this is a mistake."
+        : "I wasn't able to load the tools this task needs right now — that looks like a configuration issue on our side rather than something you did wrong. Please try again in a moment, and let us know if it keeps happening.";
+      await chatbotDb.addMessageToSession(sessionId, {
+        role: "assistant",
+        content: hardGateMessage,
+        metadata: { timestamp, portalType },
+      });
+      return hardGateMessage;
+    }
+
+    // ENG-1222 runtime assertion: if the user's message names one of the tools
+    // that IS available this turn (e.g. "call list_connected_accounts") and the
+    // model's first response makes zero tool calls, don't accept that as final —
+    // nudge once and give it a real chance to actually call the tool before
+    // falling back to whatever it says (still subject to the fabrication guard
+    // below either way).
+    const availableToolNames = toolDefinitions.map((t: any) => t.function.name);
+    const userNamedAvailableTool = availableToolNames.some((name: string) => {
+      if (!userMessage.includes(name)) return false;
+      // Exclude meta-questions ABOUT the tool ("what does X do?", "how does X
+      // work?", "explain X") from counting as a request to invoke it — a naive
+      // substring match would otherwise retry a question the model already
+      // answered correctly without calling anything.
+      const isMetaQuestionAboutTool = new RegExp(
+        `\\b(?:what (?:does|is)|how does|explain|describe|tell me about)\\b[^.!?]*${name}`,
+        'i',
+      ).test(userMessage);
+      return !isMetaQuestionAboutTool;
+    });
+    let retriedForMissingToolCall = false;
+
     // Iterative tool execution loop (follows Agent Mode pattern)
     const startMemory = process.memoryUsage();
     const startTime = Date.now();
@@ -4699,55 +5072,11 @@ export async function generateChatResponse(
     let finalAssistantMessage = '';
     let finalUsageData: any = null;
 
-    const isGeminiModel = model ? model.toLowerCase().includes('gemini') : false;
-    // Match 'claude' or 'anthropic.' prefixed Bedrock IDs (e.g. anthropic.claude-3-5-sonnet-20241022)
-    // Deliberately excludes generic 'sonnet' to avoid false positives on unrelated model names.
-    const isClaudeModel = model ? (model.toLowerCase().includes('claude') || model.startsWith('anthropic.')) : false;
-
-    // Select the active client:
-    // - Claude/Bedrock: use agentModeService.getBedrockClient() which returns an
-    //   OpenAI-compatible wrapper that fully supports tool calling via ChatBedrockConverse.
-    // - Gemini: use agentModeService.getGeminiClient() which returns an
-    //   OpenAI-compatible wrapper that supports tool calling.
-    // - Azure OpenAI (default): use the standard OpenAI SDK client.
-    const activeDeployment = isClaudeModel ? model! : (model || process.env.AZURE_OPENAI_DEPLOYMENT || '');
-    let activeClient: any;
-
-    if (isClaudeModel || isGeminiModel) {
-      if (!agentModeService) {
-        throw new Error('AgentModeService not initialized');
-      }
-    }
-
-    // ENG-1134: NONE of these clients charges the quota. The llmClients factories
-    // fire `recordUsage` only (see fireRecord) — a ledger row, no deduction — and
-    // the Bedrock/Gemini wrappers from agentModeService do not meter at all.
-    // Message persistence used to be the single charge point for every Emma path,
-    // so removing it (it double-charged agent mode) would have left Emma spending
-    // for free on all three providers.
-    //
-    // So Emma meters explicitly below, for every provider. The Azure client is
-    // therefore requested UN-metered: leaving its factory recording while we also
-    // meter here would write two ledger rows for one call, trading a missing
-    // charge for a doubled record.
-
-    if (isClaudeModel) {
-      activeClient = await agentModeService!.getBedrockClient(model!);
-    } else if (isGeminiModel) {
-      activeClient = await agentModeService!.getGeminiClient();
-    } else {
-      // model specified → that Azure deployment; otherwise the default
-      // deployment (what the module singleton used). Metered via the factory.
-      activeClient = getAzureClient(
-        { userId, feature: "chat", sessionId },
-        model || process.env.AZURE_OPENAI_DEPLOYMENT,
-        // Un-metered: the meter below is the single record-and-charge point.
-        { metered: false }
-      );
-    }
-
-    // Helper: Sleep function for exponential backoff
-    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+    // One logical model and one shared execution boundary for every Emma portal.
+    // callLLM owns provider transport, retries/fallback, and exactly-once metering;
+    // the sidebar owns only conversation/tool behavior.
+    const activeModel = model || session.llmModel || await agentModeService.getDefaultModel();
+    const isEmmaInteractive = portalType === 'customer';
 
     while (iteration < MAX_ITERATIONS) {
       console.log(`[generateChatResponse] Iteration ${iteration + 1}`);
@@ -4755,16 +5084,11 @@ export async function generateChatResponse(
       // Trim large old tool results to prevent context window overflow
       const trimmedMessages = trimToolMessagesForContext(messages);
 
-      // Generate response using OpenAI (with tools if available)
+      // Generate through the shared runtime gateway (with tools if available).
       const llmStartMs = Date.now();
-      let response: any;
-      const maxAttempts = 3;
-      const baseDelayMs = 2000;
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-          response = await activeClient.chat.completions.create({
-            model: activeDeployment,
-            messages: trimmedMessages.map(({ role, content, name, tool_call_id, tool_calls }: any) => {
+      const response = await agentModeService.callLLM(
+        activeModel,
+        trimmedMessages.map(({ role, content, name, tool_call_id, tool_calls }: any) => {
           const message: any = { role, content };
           if (role === 'tool' && tool_call_id) {
             message.tool_call_id = tool_call_id;
@@ -4777,21 +5101,13 @@ export async function generateChatResponse(
           }
           return message;
         }),
-        // Add tools only for customer portal with tools loaded
-        ...(toolDefinitions.length > 0 ? { tools: toolDefinitions, tool_choice: 'auto' } : {})
-          });
-          break; // Success, break the retry loop
-        } catch (error) {
-          const isLastAttempt = attempt >= maxAttempts;
-          if (!isTransientLLMError(error) || isLastAttempt) {
-            throw error;
-          }
-          const jitterMs = Math.floor(Math.random() * 500);
-          const delayMs = baseDelayMs * Math.pow(2, attempt - 1) + jitterMs;
-          console.warn(`[generateChatResponse] Rate limit/transient error for model "${activeDeployment}", attempt ${attempt}/${maxAttempts}. Waiting ${delayMs}ms before retry...`);
-          await sleep(delayMs);
-        }
-      }
+        {
+          ...(toolDefinitions.length > 0 ? { tools: toolDefinitions, tool_choice: 'auto' as const } : {}),
+          ...(isEmmaInteractive ? { taskClass: 'interactive_chat' as const } : {}),
+          humanPaced: true,
+          usageContext: { userId, sessionId, feature: 'chat' },
+        },
+      );
 
       const llmDurationMs = Date.now() - llmStartMs;
       const responseMessage = response.choices[0]?.message;
@@ -4802,42 +5118,9 @@ export async function generateChatResponse(
       // Log token usage for this iteration
       logTokenUsage(
         response,
-        `Iteration ${iteration + 1}${contextInfo ? `, used ${contextInfo.length} chars of context` : ''}`
+        `Iteration ${iteration + 1}${contextInfo ? `, used ${contextInfo.length} chars of context` : ''}`,
+        activeModel,
       );
-
-      // ENG-1134: meter this turn for the clients that do not meter themselves.
-      // Runs per iteration, because each loop pass is a separate billable call —
-      // metering only the final one would undercount every tool-using turn.
-      // Fire-and-forget and fail-open by contract, like every other meter.
-      {
-        // Tokens are read exactly the way callLLM reads them, NOT via
-        // meterUsageFromResponse. That helper dispatches on response shape, and
-        // the Bedrock Converse wrapper answers in OpenAI shape — so it would take
-        // normalizeOpenAIUsage, which only knows `prompt_tokens_details.cached_tokens`
-        // and would silently record Bedrock's cache tokens as zero. Cache is ~73%
-        // of traffic, so that would under-count this spend by roughly 4x, in the
-        // very ledger the cost cap is about to be enforced against.
-        const u: any = response?.usage;
-        if (u) {
-          meterUserUsage({
-            userId,
-            sessionId,
-            model: activeDeployment,
-            provider: isClaudeModel ? 'bedrock' : isGeminiModel ? 'gemini' : 'azure-openai',
-            feature: 'chat',
-            // ENG-1251: response.id is stable across a retried/re-processed
-            // response and distinct across real calls — closes the "retries
-            // defeat charge dedup" Greptile P1 for this iteration's charge.
-            eventId: typeof response?.id === 'string' ? response.id : undefined,
-            inputTokens: u.prompt_tokens || 0,
-            outputTokens: u.completion_tokens || 0,
-            cacheReadTokens: u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
-            cacheWriteTokens: u.cache_creation_input_tokens || 0,
-            // ENG-893: bill writes at the TTL Bedrock actually applied.
-            cacheWriteByTtl: u.cache_creation_by_ttl,
-          });
-        }
-      }
 
       // Add assistant message to messages array (for next iteration)
       const assistantMsg: any = {
@@ -4851,10 +5134,28 @@ export async function generateChatResponse(
 
       // Check if LLM wants to call tools
       if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
+        // toolCalls.length === 0 restricts the retry to "nothing real has executed
+        // yet this turn" — once a tool has actually run, a later toolless response
+        // is the model synthesizing its final answer from real results, not denying
+        // or fabricating, and must not be treated as another missed tool call.
+        if (userNamedAvailableTool && !retriedForMissingToolCall && toolCalls.length === 0) {
+          retriedForMissingToolCall = true;
+          console.warn('[generateChatResponse] ENG-1222 retry: user named an available tool but the model made zero tool calls this turn', {
+            sessionId,
+            availableToolNames,
+          });
+          iterationTimings.push({ iteration: iteration + 1, llmDurationMs, toolNames: [] });
+          messages.push({
+            role: 'user',
+            content: `Reminder: you have real tools available (${availableToolNames.join(', ')}) for this request — call the tool now instead of describing or simulating what it would return.`,
+          });
+          iteration++;
+          continue;
+        }
         // No tool calls - we're done
         iterationTimings.push({ iteration: iteration + 1, llmDurationMs, toolNames: [] });
         finalAssistantMessage = responseMessage.content || "I apologize, but I was unable to generate a response.";
-        finalUsageData = logTokenUsage(response, "Final response");
+        finalUsageData = logTokenUsage(response, "Final response", activeModel);
         break;
       }
 
@@ -4866,12 +5167,11 @@ export async function generateChatResponse(
           functionArgs = JSON.parse(toolCall.function.arguments);
           console.log(`[generateChatResponse] Executing tool: ${toolCall.function.name}`, functionArgs);
           onToolStart?.(toolCall.function.name);
-          if (!agentModeService) throw new Error("AgentModeService not initialized");
           const extraContext: Record<string, any> = {};
           if (socketId) extraContext.socketId = socketId;
           if (isDelegatedAdmin) extraContext.isDelegatedAdmin = true;
           if (isDelegatedAdmin && adminEmail) extraContext.adminEmail = adminEmail;
-          const result = await agentModeService.executeTool(response.model, toolCall.function.name, functionArgs, userId!, sessionId, false, Object.keys(extraContext).length ? extraContext : undefined);
+          const result = await agentModeService.executeTool(activeModel, toolCall.function.name, functionArgs, userId!, sessionId, false, Object.keys(extraContext).length ? extraContext : undefined);
           console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
           // ENG-351: harvest web-search sources into the citation registry.
           let citationBatch: Citation[] = [];
@@ -4902,6 +5202,50 @@ export async function generateChatResponse(
     if (iteration >= MAX_ITERATIONS && !finalAssistantMessage) {
       finalAssistantMessage = "I apologize, but I reached the maximum number of iterations. Please try again with a simpler request.";
       console.warn(`[generateChatResponse] Hit MAX_ITERATIONS (${MAX_ITERATIONS})`);
+    }
+
+    // ENG-1222: a turn that made zero real tool calls must never present its own
+    // prose as if it were actual/real tool-derived data — this is exactly the P0
+    // fabrication pattern (an invented Google Ads account presented as "the
+    // ACTUAL returned rows"). toolCalls.length === 0 is ground truth for whether
+    // anything really executed. The phrase match alone over-fires on innocent
+    // text like "based on your actual account settings" (no tool-result claim at
+    // all) — genuine fabrication also presents something ID/list-shaped to look
+    // authentic, so require both signals together to cut that false-positive rate
+    // without weakening the check against the actual incident pattern.
+    const CLAIMS_REAL_TOOL_OUTPUT = /\bactual(?:ly)?\s+(?:returned|return|results?|rows?|data|account\s+(?:names?|ids?))\b|\breal\s+(?:api|account|customer)\s+data\b/i;
+    const LOOKS_LIKE_TOOL_SHAPED_DATA = /\d{3,}|(?:^|\n)\s*[-*•]\s|(?:^|\n)\s*\d+[.)]\s/;
+    // An honest refusal ("I can't reach your actual data, but here's how to
+    // check it yourself:" followed by a bulleted list) satisfies both patterns
+    // above on a zero-tool turn. Scoped to a denial word immediately followed by
+    // an access verb, not any negation within reach of "actual" — "I don't know
+    // why, but here are the actual returned rows" is genuine fabrication and
+    // must still be caught, so a bare "don't"/"can't" elsewhere in the sentence
+    // doesn't exempt it.
+    const DENIES_REAL_TOOL_ACCESS = /\b(?:can(?:'|’)?t|cannot|don(?:'|’)?t|unable to|without)\s+(?:access(?:ing)?|reach(?:ing)?|retriev(?:e|ing)|get(?:ting)?|provid(?:e|ing)|check(?:ing)?|pull(?:ing)?|fetch(?:ing)?|see(?:ing)?)\b[^.!?]{0,30}\bactual\b/i;
+    // A turn where every tool call threw still pushes those failures into
+    // toolCalls (see the catch block above), so toolCalls.length alone isn't
+    // "something really executed" — it must have at least one call that didn't
+    // error and didn't report an explicit { success: false } result.
+    const isFailedToolResult = (result: any): boolean => {
+      // Tool results aren't always objects — some handlers return a JSON string
+      // (see toolContent above). A string result with success:false must count
+      // as a failure too, or a serialized error slips past the `.success`
+      // property check (undefined on a string, so `!== false` is trivially true).
+      const parsed = typeof result === 'string'
+        ? (() => { try { return JSON.parse(result); } catch { return undefined; } })()
+        : result;
+      return parsed?.success === false;
+    };
+    const hasSuccessfulToolCall = toolCalls.some((tc) => !tc.error && !isFailedToolResult(tc.result));
+    if (
+      !hasSuccessfulToolCall
+      && CLAIMS_REAL_TOOL_OUTPUT.test(finalAssistantMessage)
+      && LOOKS_LIKE_TOOL_SHAPED_DATA.test(finalAssistantMessage)
+      && !DENIES_REAL_TOOL_ACCESS.test(finalAssistantMessage)
+    ) {
+      console.error('[generateChatResponse] Blocked a zero-tool-call response claiming real tool-derived data', { sessionId, portalType });
+      finalAssistantMessage = "I wasn't able to actually run the tools needed to get real data for this, so I don't have genuine results to share. Please try again, and let us know if this keeps happening.";
     }
 
     // Calculate memory usage delta and current state
@@ -4936,6 +5280,12 @@ export async function generateChatResponse(
     await chatbotDb.addMessageToSession(sessionId, {
       role: "assistant",
       content: finalAssistantMessage,
+      // ENG-1222: stamp the model that actually generated this turn so
+      // apiTools.ts's per-session attribution (attributionBasis/generationModels/
+      // costByModel) reads 'transcript' instead of falling back to
+      // 'selection-only' — without this, spend/model telemetry for every Emma
+      // turn is invisible to the tool-binding-failure fingerprint the P0 relied on.
+      llm: activeModel,
       usage: finalUsageData,
       metadata: assistantMessageMetadata,
     });

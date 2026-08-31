@@ -82,8 +82,14 @@ export interface UsageRecordIncrement {
   calls?: number;
 }
 
-/** Provenance of a cost figure — see `UsageRecordIncrement.costSource`. */
-export type CostSource = "measured" | "allocated";
+/**
+ * Provenance of a cost figure — see `UsageRecordIncrement.costSource`.
+ * ENG-700: "unpriced" marks a row whose `costMicroUsd` is 0 because the model
+ * has no price entry (never because the model is genuinely free) — distinct
+ * from "allocated", which means 0 or more real dollars were computed from a
+ * known rate.
+ */
+export type CostSource = "measured" | "allocated" | "unpriced";
 
 export interface UsageRecordRow {
   userId: string;
@@ -130,8 +136,31 @@ export function isVendorEntry(row: UsageRecordRow): boolean {
   return row.provider != null && row.unit != null;
 }
 
-function buildSortKey(date: string, model: string, feature: string): string {
-  return `${date}#${model}#${feature}`;
+/**
+ * The daily aggregate's identity, INCLUDING the payer (ENG-1210, raised by
+ * Greptile on PR #2407).
+ *
+ * `billingUserId` used to be a plain attribute written with an unconditional SET,
+ * so a member whose billing owner changed mid-day left ONE row holding both
+ * payers' counters, stamped with whichever call wrote last. The whole day was
+ * then attributed to one of them -- the other's spend vanished from their bill and
+ * appeared on someone else's.
+ *
+ * Putting the payer in the key means counters can never mix: each payer gets its
+ * own aggregate, and a transition simply starts a second row.
+ *
+ * Safe to change without a migration, and deliberately done that way:
+ *  - nothing parses `sk`; every reader uses the `date`/`model`/`feature`
+ *    attributes, which are still written on the row;
+ *  - the date stays the LEADING segment, so the `sk BETWEEN :start AND :end~`
+ *    range queries match exactly as before -- '#' sorts below '~';
+ *  - rows written before this keep their old key and remain readable and
+ *    summable. They keep their last-writer attribution, which is the pre-existing
+ *    state, not a regression. Only new spend is attributed correctly, the same
+ *    forward-only choice ENG-1210 made for the scheduled-vs-interactive tag.
+ */
+function buildSortKey(date: string, model: string, feature: string, billingUserId: string): string {
+  return `${date}#${model}#${feature}#${billingUserId}`;
 }
 
 /**
@@ -203,6 +232,9 @@ function buildIncrementUsageUpdate(inc: UsageRecordIncrement): {
     "#date = :date",
     "#model = :model",
     "#feature = :feature",
+    // Still written as an attribute even though it is now part of the key: every
+    // reader (the attribute scan, isBilledTo, itemization) reads it off the row,
+    // and rows written before the key change only have the attribute.
     "billingUserId = :billing",
     "updatedAt = :now",
     "#ttl = if_not_exists(#ttl, :ttl)",
@@ -222,13 +254,28 @@ function buildIncrementUsageUpdate(inc: UsageRecordIncrement): {
   const descriptive: Array<[string, unknown]> = [
     ["provider", inc.provider],
     ["unit", inc.unit],
-    ["costSource", inc.costSource],
   ];
   for (const [attr, value] of descriptive) {
     if (value == null) continue;
     names[`#${attr}`] = attr;
     values[`:${attr}`] = value;
     setClauses.push(`#${attr} = if_not_exists(#${attr}, :${attr})`);
+  }
+
+  // ENG-700 Greptile P1: costSource is NOT constant across writers to a row
+  // the way provider/unit are — a model can go from unpriced to priced mid-day,
+  // and once "allocated" (real cost known) it must win over a stale "unpriced"
+  // from an earlier write. if_not_exists would freeze the row on the first
+  // writer's verdict, so an allocated write always overwrites; an unpriced
+  // write still only fills a genuinely empty slot.
+  if (inc.costSource != null) {
+    names["#costSource"] = "costSource";
+    values[":costSource"] = inc.costSource;
+    setClauses.push(
+      inc.costSource === "allocated"
+        ? "#costSource = :costSource"
+        : "#costSource = if_not_exists(#costSource, :costSource)"
+    );
   }
 
   // Session is the one call-level fact that is NOT constant across a row. The sort
@@ -246,7 +293,7 @@ function buildIncrementUsageUpdate(inc: UsageRecordIncrement): {
   }
 
   return {
-    Key: { userId: inc.userId, sk: buildSortKey(inc.date, inc.model, inc.feature) },
+    Key: { userId: inc.userId, sk: buildSortKey(inc.date, inc.model, inc.feature, inc.billingUserId) },
     UpdateExpression: `ADD ${addClauses.join(", ")} SET ${setClauses.join(", ")}`,
     ExpressionAttributeNames: names,
     ExpressionAttributeValues: values,

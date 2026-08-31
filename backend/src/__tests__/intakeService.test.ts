@@ -130,6 +130,58 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
   });
 });
 
+describe('fileUserIssue — bug, noResolvableReporter (ENG-939 AC4: unresolved telemetry-affected user, never default to the surfacing reviewer)', () => {
+  const realFlag = process.env.FEATUREBASE_INTAKE;
+  beforeEach(() => {
+    process.env.FEATUREBASE_INTAKE = 'true';
+    linear.listOpenBugCanonicals.mockResolvedValue([]);
+    dedup.findDuplicate.mockResolvedValue(null);
+  });
+  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+
+  it('never mints a personal Featurebase card for the surfacing reviewer', async () => {
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
+    await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'rui@agentweb.pro', noResolvableReporter: true });
+    expect(fb.createTicket).not.toHaveBeenCalled();
+  });
+
+  it('still creates/dedupes the Linear canonical (still files)', async () => {
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
+    const r = await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'rui@agentweb.pro', noResolvableReporter: true, reportedByAdmin: 'rui@agentweb.pro' });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Bug', 'Customer Reported'] }));
+    expect(r.canonicalUrl).toBe('lin');
+  });
+
+  it('ENG-289 leak guard: trackerUrl is NEVER the internal canonical URL when there is no Featurebase ticket', async () => {
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'https://linear.app/emmabyaw/issue/ENG-9', id: 'uuid-9' });
+    const r = await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'rui@agentweb.pro', noResolvableReporter: true });
+    // trackerUrl is surfaced to the filing caller unconditionally (unlike canonicalUrl, which is
+    // admin-gated) — it must fall back to the public Featurebase board, never the Linear link.
+    expect(r.trackerUrl).toBe('https://agentweb.featurebase.app/');
+    expect(r.trackerUrl).not.toContain('linear.app');
+    expect(r.userUrl).toBeUndefined();
+    expect(r.canonicalUrl).toBe('https://linear.app/emmabyaw/issue/ENG-9');
+  });
+
+  it('never writes a [reporter-ticket #N] marker -> the resolve bridge notifies nobody for it', async () => {
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
+    await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'rui@agentweb.pro', noResolvableReporter: true, reportedByAdmin: 'rui@agentweb.pro' });
+    expect(linear.addIssueComment).toHaveBeenCalled();
+    const comments = linear.addIssueComment.mock.calls.map((c: any[]) => c[1] as string);
+    expect(comments.some((c: string) => /\[reporter-ticket #\d+/.test(c))).toBe(false);
+    expect(comments.some((c: string) => c.includes('rui@agentweb.pro'))).toBe(true); // surfacing reviewer still visible to eng
+  });
+
+  it('grouping onto an existing canonical still works normally', async () => {
+    linear.listOpenBugCanonicals.mockResolvedValue([{ identifier: 'ENG-5', issueId: 'uuid-5', title: 'crash', description: 'x' }]);
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-5', title: 'crash', description: 'x' });
+    const r = await fileUserIssue({ type: 'bug', title: 'crash', description: 'd', userEmail: 'rui@agentweb.pro', noResolvableReporter: true });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(fb.createTicket).not.toHaveBeenCalled();
+    expect(r.deduped).toBe(true);
+  });
+});
+
 describe('fileUserIssue — bug priority mapping (ENG-231: stated priority becomes the Linear field, blended with the funnel tier)', () => {
   const realFlag = process.env.FEATUREBASE_INTAKE;
   beforeEach(() => {
@@ -274,6 +326,40 @@ describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
     resend.sendSystemEmail.mockRejectedValueOnce(new Error('resend down'));
     await notifyCanonicalResolved('issue-uuid', 'T');
     expect(shipNotify.notifyReporterShipped).toHaveBeenCalledWith(expect.objectContaining({ email: 'a@e.com' }));
+  });
+
+  // ENG-939 AC3: an internal (@agentweb.pro) affected user must never get the customer-channel
+  // Slack ping or resolution email — e.g. a telemetry-attached affected user who turns out to be
+  // internal staff, or (defense in depth) today's actual bug where an internal reviewer was
+  // wrongly attached as the reporter in the first place.
+  it('skips the Slack ping and email for an @agentweb.pro reporter', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([c('[reporter-ticket #10 rui@agentweb.pro] internal')]);
+    const r = await notifyCanonicalResolved('issue-uuid', 'T');
+    expect(shipNotify.notifyReporterShipped).not.toHaveBeenCalled();
+    expect(resend.sendSystemEmail).not.toHaveBeenCalled();
+    // Ticket status still flips — internal tracking stays tidy even without a customer notification.
+    expect(fb.patchTicketStatus).toHaveBeenCalledWith(10, 'status-completed');
+    expect(r.ticketNumbers).toEqual([10]);
+  });
+
+  it('is case-insensitive on the internal domain', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([c('[reporter-ticket #10 Rui@AgentWeb.Pro] internal')]);
+    await notifyCanonicalResolved('issue-uuid', 'T');
+    expect(shipNotify.notifyReporterShipped).not.toHaveBeenCalled();
+    expect(resend.sendSystemEmail).not.toHaveBeenCalled();
+  });
+
+  it('a mixed batch only suppresses the internal reporter — the external one is still notified', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      c('[reporter-ticket #10 a@external.com] ext'),
+      c('[reporter-ticket #11 staffer@agentweb.pro] int'),
+    ]);
+    const r = await notifyCanonicalResolved('issue-uuid', 'T');
+    expect(shipNotify.notifyReporterShipped).toHaveBeenCalledTimes(1);
+    expect(shipNotify.notifyReporterShipped).toHaveBeenCalledWith(expect.objectContaining({ email: 'a@external.com' }));
+    expect(resend.sendSystemEmail).toHaveBeenCalledTimes(1);
+    expect(resend.sendSystemEmail).toHaveBeenCalledWith(expect.objectContaining({ to: 'a@external.com' }));
+    expect(r.ticketNumbers.sort()).toEqual([10, 11]);
   });
 });
 
@@ -554,7 +640,13 @@ describe('intakeService.fileAutoIssue', () => {
     );
   });
 
-  it('replaces a conflicting route and owner when enriching a deduped canonical', async () => {
+  // ENG-1285: a recurrence of an already-filed oncall alert must not touch labels, assignee,
+  // state, or priority on the matched canonical — those are PM/human routing decisions, and the
+  // rail re-firing hourly must not silently revert them. Only the recurrence comment (and,
+  // separately, raise-only priority escalation via escalateIssue on a strictly more severe
+  // occurrence) are allowed side effects. See the AC on ENG-1285 — this replaces the old
+  // "replaces a conflicting route and owner" test, which asserted exactly the bug being fixed.
+  it('recurrence makes no label mutation on the matched canonical (ENG-1285 AC #1)', async () => {
     linear.listOpenIssuesByLabel.mockResolvedValue([
       { identifier: 'ENG-11', issueId: 'uuid-11', title: 'same alert', description: 'd' },
     ]);
@@ -566,28 +658,44 @@ describe('intakeService.fileAutoIssue', () => {
       executionRoute: 'autofix',
     });
 
-    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-11', {
-      addLabelNames: ['Bug', 'autofix'],
-      removeLabelNames: ['Needs PM'],
-      assigneeId: 'cabadf7c-b95d-4455-b9ec-df11d5d83f5f',
-      settleStateName: 'Todo',
-    });
+    expect(linear.raiseIssueTriage).not.toHaveBeenCalled();
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-11', expect.stringContaining('Recurred on'));
   });
 
-  it('fails deduped intake visibly when required route enrichment fails', async () => {
+  it('a first-file (no match) still gets the full Auto + Needs PM + Oncall + Bug label set (ENG-1285 AC #2)', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-12', url: 'u' });
+
+    await fileAutoIssue({
+      title: 'brand new alert',
+      description: 'd',
+      source: 'Oncall alert',
+      executionRoute: 'human-triage',
+      extraLabels: ['Oncall'],
+    });
+
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
+      expect.objectContaining({ labelNames: ['Auto', 'Bug', 'Needs PM', 'Oncall'] }),
+    );
+  });
+
+  it('a re-fire does not overwrite priority, assignee, state, or due date set by a human (ENG-1285 AC #3/#4 — regression)', async () => {
+    // Simulate PM triage having already routed the canonical: Needs PM removed, reassigned,
+    // priority set, moved off Todo. The recurrence path must never call raiseIssueTriage (the
+    // only function capable of touching any of those fields on this path), so none of it can
+    // be reverted no matter what the mock canonical currently looks like.
     linear.listOpenIssuesByLabel.mockResolvedValue([
       { identifier: 'ENG-11', issueId: 'uuid-11', title: 'same alert', description: 'd' },
     ]);
-    linear.raiseIssueTriage.mockRejectedValueOnce(new Error('Linear route update rejected'));
 
-    await expect(
-      fileAutoIssue({
-        title: 'same alert',
-        description: 'd',
-        source: 'AI eval',
-        executionRoute: 'autofix',
-      }),
-    ).rejects.toThrow('Linear route update rejected');
+    await fileAutoIssue({
+      title: 'same alert',
+      description: 'd',
+      source: 'AI eval',
+      executionRoute: 'human-triage',
+    });
+
+    expect(linear.raiseIssueTriage).not.toHaveBeenCalled();
   });
 
   it('flag ON + open Auto issue with same title -> groups (comment), no new issue', async () => {

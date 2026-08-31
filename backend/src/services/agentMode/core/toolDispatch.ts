@@ -27,6 +27,7 @@
 
 import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
+import { ToolResultPolicyBlockedError } from '../../../utils/toolResultError';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
 import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
@@ -58,6 +59,30 @@ export const MEDIA_GEN_TOOLS = new Set<string>([
   'generate_image',
   'generate_video',
   'generate_voiceover',
+]);
+
+/**
+ * ENG-1331: MEDIA_GEN_TOOLS' three rate-limited generation APIs share a time-budget
+ * deferral + auto-continuation mechanism (ENG-510/ENG-1239) that
+ * `playwright_browser_take_screenshot` never joined — even though a
+ * Playwright-rendered asset loop (e.g. a display-ad size matrix: create_html_file +
+ * one screenshot per size) hits the exact same "one batch exceeds the run's wall
+ * clock" failure. Without deferral eligibility it just runs until the whole-turn
+ * hard cap, with no deferral marker and no auto-resume — production evidence: a
+ * 12-size render stopped at 4 with nothing surfaced, then the closing synthesis
+ * claimed all 12 (the false-completion-claim guard now catches THAT symptom, but
+ * this is the mechanism that let the run truncate unannounced in the first place).
+ *
+ * Superset of MEDIA_GEN_TOOLS used ONLY for the deferral / asset-count /
+ * duration-tracking checks below — deliberately NOT folded into MEDIA_GEN_TOOLS
+ * itself, which also drives forced-serial batching (`hasMultipleMediaGenTools`
+ * below) and the confirmation-gate-pause check in `mediaGenProducedAsset`, both
+ * legitimately specific to rate-limited external generation APIs and not
+ * applicable to a local, unrate-limited browser screenshot.
+ */
+export const DEFERRABLE_ASSET_TOOLS = new Set<string>([
+  ...MEDIA_GEN_TOOLS,
+  'playwright_browser_take_screenshot',
 ]);
 
 /**
@@ -117,6 +142,112 @@ export function mediaGenProducedAsset(toolName: string, result: any): boolean {
     return false;
   }
   return true;
+}
+
+/** Minimal shape of a persisted assistant message this reads — deliberately loose so it
+ * doesn't need to import the full ChatMessage type from chatbotService. */
+interface HistoryMessageLike {
+  role?: string;
+  timestamp?: string;
+  metadata?: {
+    timestamp?: string;
+    toolCalls?: Array<{ id?: string; name?: string; arguments?: unknown; result?: any; error?: string; duplicateOf?: string }>;
+  } | null;
+}
+
+/**
+ * ENG-1239: `priorMediaCallKeys` (see executePreparedTools above) only ever contains what
+ * the CALLER threads in — every fresh turn starts it as `new Map()`
+ * (agentModeService.ts), so a media auto-continuation (a brand-new turn, not a later
+ * iteration of the SAME turn) got no code-level dedupe protection at all against the
+ * model re-emitting an already-completed generate_image call — only the LLM-prompt
+ * "already generated" awareness block, which relies on the model actually obeying it.
+ *
+ * This reconstructs the identical key shape (`name:stableStringify(args)` →
+ * tool_call_id) from PERSISTED session history instead, so a continuation turn can seed
+ * the dispatcher's dedupe map with what already actually happened — the dispatcher then
+ * refuses a genuine duplicate outright, the same hard guarantee same-turn iterations
+ * already get. Only counts a call that actually produced an asset (matches
+ * `mediaGenProducedAsset` / `countsAsAsset` above: no error, not deferred, not a
+ * confirmation-gate pause) — a failed or deferred call must stay retryable, not be
+ * mistaken for a duplicate. Bounded to `sinceMs` so an old, unrelated, coincidentally-
+ * identical request from a much earlier session/turn is never treated as a duplicate.
+ */
+export function seedMediaCallKeysFromHistory(
+  messages: HistoryMessageLike[] | undefined | null,
+  sinceMs: number,
+): Map<string, string> {
+  const seeded = new Map<string, string>();
+  if (!Array.isArray(messages)) return seeded;
+  for (const message of messages) {
+    if (!message || message.role !== 'assistant') continue;
+    const toolCalls = message.metadata?.toolCalls;
+    if (!Array.isArray(toolCalls)) continue;
+    const rawTs = message.timestamp || message.metadata?.timestamp;
+    const ts = rawTs ? Date.parse(rawTs) : NaN;
+    if (!Number.isFinite(ts) || ts < sinceMs) continue;
+    for (const tc of toolCalls) {
+      // ENG-1331: deliberately MEDIA_GEN_TOOLS here, not the broader
+      // DEFERRABLE_ASSET_TOOLS — see the dedupe-key check below for why
+      // playwright_browser_take_screenshot must stay OUT of this reconstruction.
+      if (!tc?.name || !MEDIA_GEN_TOOLS.has(tc.name)) continue;
+      if (tc.error || !tc.result || tc.result.deferred === true || tc.result.success === false) continue;
+      if (!mediaGenProducedAsset(tc.name, tc.result)) continue;
+      const key = `${tc.name}:${stableStringify(tc.arguments)}`;
+      if (!seeded.has(key)) seeded.set(key, tc.id || '');
+    }
+  }
+  return seeded;
+}
+
+/**
+ * ENG-426: session-wide cap on `WEB_SEARCH_TOOL_NAMES` calls. Prod incident: a research
+ * turn made 193 web searches (73 file reads, 503 retained messages, 17.4M prompt tokens,
+ * $8.68) before an outer time limit ended it — the loop's exact-match anti-loop signature
+ * check (name + byte-identical arguments) never caught it, because each search varied its
+ * query text. This is a volume cap, not a dedupe: every prior call in the session counts
+ * regardless of arguments or outcome, so the model can't outrun it by rephrasing the query.
+ *
+ * Mirrors Claude Code's own fix for the identical failure mode ("Added a session-wide
+ * limit on WebSearch tool calls (default 200) to stop runaway search loops",
+ * `CLAUDE_CODE_MAX_WEB_SEARCHES_PER_SESSION`). Default set well above legitimate heavy
+ * single-topic research (rarely >20-30 distinct searches) while decisively catching a
+ * runaway. Override with AGENT_MODE_MAX_SEARCH_CALLS_PER_SESSION.
+ */
+export const SEARCH_CALL_SESSION_CAP = Math.max(
+  1,
+  parseInt(process.env.AGENT_MODE_MAX_SEARCH_CALLS_PER_SESSION || '60', 10) || 60,
+);
+
+/**
+ * ENG-426: count prior `WEB_SEARCH_TOOL_NAMES` calls across the WHOLE persisted session
+ * history. Deliberately NOT time-bounded (unlike `seedMediaCallKeysFromHistory` above) —
+ * a session naturally resets to zero the moment the user starts a new chat (a fresh
+ * `sessionId` has empty history), which is AgentMode's equivalent of Claude Code's
+ * `/clear`, so there is no old-unrelated-session risk to bound against here. Counts every
+ * call regardless of success/failure/arguments: this bounds the tool's volume, it does not
+ * detect duplicates.
+ */
+export function seedSearchCallCountFromHistory(
+  messages: HistoryMessageLike[] | undefined | null,
+): number {
+  if (!Array.isArray(messages)) return 0;
+  let count = 0;
+  for (const message of messages) {
+    if (!message || message.role !== 'assistant') continue;
+    const toolCalls = message.metadata?.toolCalls;
+    if (!Array.isArray(toolCalls)) continue;
+    for (const tc of toolCalls) {
+      // CodeRabbit (PR #2633): appendSuppressedDuplicate ALSO pushes a ledger entry with
+      // the collapsed call's name and a `duplicateOf` id (see executePreparedTools below)
+      // so the next LLM turn isn't left with an orphaned tool_call_id — but that entry
+      // never actually dispatched (no network call, no budget spent). Counting it here
+      // would inflate a later turn's seeded count for a search that only ran once.
+      if (tc?.duplicateOf) continue;
+      if (tc?.name && WEB_SEARCH_TOOL_NAMES.has(tc.name)) count++;
+    }
+  }
+  return count;
 }
 
 /** A tool-result outcome from the gateway, normalized into the loop's union shape. */
@@ -328,6 +459,16 @@ export interface ExecutePreparedToolsInput {
    * unless every requested input image is in this allow-list.
    */
   approvedRevisionImageSources?: string[];
+  /**
+   * ENG-426: count of `WEB_SEARCH_TOOL_NAMES` calls already made this SESSION before
+   * this iteration — seeded from persisted history via `seedSearchCallCountFromHistory`
+   * plus any earlier iterations of this same turn (the loop accumulates
+   * `searchCallsThisIteration` across iterations, same pattern as media asset tracking
+   * above). The cap check always runs; defaulting to 0 only means a caller that doesn't
+   * thread this through (or a unit test) starts counting from zero for that one call,
+   * so cross-iteration/cross-turn accumulation requires wiring it, as agentModeService.ts does.
+   */
+  priorSearchCallCount?: number;
   // ---- ports ----
   ports: ToolDispatchPorts;
 }
@@ -357,6 +498,13 @@ export interface ExecutePreparedToolsResult {
    * the same turn is suppressed instead of regenerating the image.
    */
   producedMediaCallKeys: Map<string, string>;
+  /**
+   * ENG-426: number of `WEB_SEARCH_TOOL_NAMES` calls ALLOWED to execute this iteration
+   * (i.e. not rejected by the session search-call cap). The loop adds this to its
+   * running `priorSearchCallCount` and threads the total into the next iteration, the
+   * same accumulate-and-thread pattern as `mediaAssetsProduced`/`mediaAssetsProducedThisRun`.
+   */
+  searchCallsThisIteration: number;
 }
 
 /**
@@ -445,6 +593,7 @@ export async function executePreparedTools(
     longestMediaCallMsThisRun = 0,
     priorMediaCallKeys,
     approvedRevisionImageSources,
+    priorSearchCallCount = 0,
     ports,
   } = input;
   // ENG-510: keys of media-gen assets successfully produced this iteration, returned to the
@@ -456,6 +605,8 @@ export async function executePreparedTools(
   let skillsUpdated = false;
   let mediaAssetsProduced = 0;
   let mediaBudgetDeferred = false;
+  // ENG-426: search calls ALLOWED to execute this iteration (see SEARCH_CALL_SESSION_CAP).
+  let searchCallsThisIteration = 0;
 
   // Phase 1: Validate and prepare tool calls (synchronous)
   const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision; dedupeKey: string }> = [];
@@ -550,6 +701,21 @@ export async function executePreparedTools(
 
       if (excludeTools?.includes(toolCall.function.name)) {
         const errorMsg = `Tool "${toolCall.function.name}" is not available in this context.`;
+        appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
+        continue;
+      }
+
+      // ENG-426: session-wide search-call budget. Checked against calls already
+      // ALLOWED (prior turns + earlier this iteration loop), so a call that itself
+      // trips the cap is rejected before counting toward its own limit.
+      if (WEB_SEARCH_TOOL_NAMES.has(toolCall.function.name)
+          && priorSearchCallCount + searchCallsThisIteration >= SEARCH_CALL_SESSION_CAP) {
+        const used = priorSearchCallCount + searchCallsThisIteration;
+        const errorMsg =
+          `Search budget reached: this session has already used ${used} web-search calls `
+          + `(limit ${SEARCH_CALL_SESSION_CAP}). Stop searching. Answer now using what you've `
+          + `already found, or tell the user you've hit the research limit and ask how they'd `
+          + `like to proceed.`;
         appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
         continue;
       }
@@ -650,12 +816,21 @@ export async function executePreparedTools(
         suppressedDuplicates.push({ toolCall, functionArgs: preparedFunctionArgs, duplicateOfId });
         continue;
       }
-      // ENG-510: cross-iteration dedupe for MEDIA-GEN tools only. The per-iteration check
+      // ENG-510: cross-iteration dedupe for MEDIA_GEN_TOOLS only. The per-iteration check
       // above misses an identical generate_image re-emitted in a LATER iteration of the
       // same turn (e.g. resuming after a timeout, the model re-requests an image it already
       // made). Suppress it if that exact call already produced an asset earlier this turn.
-      // Media-only so a legitimately-repeated mutating call (send_email) is never blocked;
-      // only successful generations are recorded, so a failed call can still be retried.
+      //
+      // ENG-1331: deliberately NOT extended to playwright_browser_take_screenshot, unlike
+      // the deferral/asset-count/duration checks above. generate_image's dedupe protects
+      // against re-paying for an expensive, rate-limited external API call; a screenshot is
+      // a cheap local action with the opposite risk profile — this exact template's own QA
+      // step ("Fix and re-render failures before delivery") calls for re-taking a screenshot
+      // with the SAME dimension-based filename after correcting a problem, and this dedupe
+      // would silently swallow that legitimate re-render as a false "already done" duplicate,
+      // leaving the broken original in place with no error surfaced. Media-only (not
+      // screenshot) so a legitimately-repeated mutating call (send_email) is also never
+      // blocked; only successful generations are recorded, so a failed call can still retry.
       if (
         MEDIA_GEN_TOOLS.has(toolCall.function.name)
         && priorMediaCallKeys?.has(dedupeKey)
@@ -665,6 +840,14 @@ export async function executePreparedTools(
         continue;
       }
       seenToolCallKeys.set(dedupeKey, toolCall.id);
+
+      // ENG-426: count this call toward the session search-call budget only once it has
+      // cleared same-turn/cross-iteration dedupe and is genuinely about to execute — an
+      // exact-duplicate call suppressed above never reaches the gateway, so it shouldn't
+      // consume budget either.
+      if (WEB_SEARCH_TOOL_NAMES.has(toolCall.function.name)) {
+        searchCallsThisIteration++;
+      }
 
       preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision, dedupeKey });
     } catch (error) {
@@ -680,13 +863,24 @@ export async function executePreparedTools(
     }
   }
 
-  // Phase 2: Execute tools — sequential if wait_seconds is present (so the wait
-  // happens in order) or when multiple media-gen calls are batched (rate limits),
-  // parallel otherwise.
+  // Phase 2: Execute tools — sequential if wait_seconds is present (so the wait happens
+  // in order) or multiple screenshot calls are batched (see hasMultipleScreenshotCalls),
+  // bounded-concurrent when multiple media-gen calls are batched (rate limits), parallel
+  // otherwise.
   const hasWaitTool = preparedCalls.some(({ toolCall }) => toolCall.function.name === 'wait_seconds');
   const hasMultipleMediaGenTools = preparedCalls.length > 1 && preparedCalls.some(({ toolCall }) =>
     toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video' || toolCall.function.name === 'generate_voiceover'
   );
+  // ENG-1331: unlike the 3 rate-limited generation APIs above, multiple
+  // playwright_browser_take_screenshot calls in one turn act on the SAME shared browser
+  // page (resize-then-screenshot per size) — running them with bounded concurrency would
+  // race on that shared state, not just on a provider rate limit. Force strict sequential
+  // instead, alongside wait_seconds, so each call's deferral decision also settles
+  // race-free against the prior one's result (the plain parallel path below assumes at
+  // most one deferrable-asset call ever reaches it — see its comment).
+  const hasMultipleScreenshotCalls = preparedCalls.length > 1 && preparedCalls.filter(({ toolCall }) =>
+    toolCall.function.name === 'playwright_browser_take_screenshot'
+  ).length > 1;
 
   let toolResults: DispatchToolResult[];
 
@@ -769,7 +963,10 @@ export async function executePreparedTools(
   // ENG-510: run-wide longest media-call duration, seeded from prior iterations and
   // updated as calls settle below, so the adaptive reserve reflects real latency.
   let longestMediaCallMs = longestMediaCallMsThisRun;
-  const isMediaGenTool = (toolCall: any) => MEDIA_GEN_TOOLS.has(toolCall.function.name);
+  // ENG-1331: DEFERRABLE_ASSET_TOOLS (MEDIA_GEN_TOOLS + playwright_browser_take_screenshot)
+  // — broader than the name once was, so a Playwright render loop gets the same
+  // deferral/asset-counting/duration-tracking treatment as generate_image et al.
+  const isDeferrableAssetTool = (toolCall: any) => DEFERRABLE_ASSET_TOOLS.has(toolCall.function.name);
   // Fixed soft-budget deadline passed (the original, fast-image assumption).
   const softBudgetExceeded = (): boolean =>
     mediaGenerationDeadlineMs != null && Date.now() > mediaGenerationDeadlineMs;
@@ -782,7 +979,7 @@ export async function executePreparedTools(
     && longestMediaCallMs > 0
     && (generationHardCapMs - Date.now()) < longestMediaCallMs;
   const shouldDeferMedia = (toolCall: any): boolean =>
-    isMediaGenTool(toolCall)
+    isDeferrableAssetTool(toolCall)
     && (mediaAssetsProducedThisRun + assetsThisBatch) >= 1
     && (softBudgetExceeded() || withinOneMediaCallOfHardCap());
   const makeDeferred = (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision): DispatchToolResult => {
@@ -795,21 +992,22 @@ export async function executePreparedTools(
   // this batch" consistent with the calledFunctions / mediaAssetsProduced counters.
   const countsAsAsset = (dr: DispatchToolResult): boolean =>
     dr.status === 'success'
-    && isMediaGenTool(dr.toolCall)
+    && isDeferrableAssetTool(dr.toolCall)
     && !ports.toolResultError(dr.result)
     && mediaGenProducedAsset(dr.toolCall.function.name, dr.result);
   // ENG-510: track how long a media call actually took so the adaptive reserve (and the
   // value returned to the loop) reflects real latency. Updated as each call settles so a
   // later call in the SAME batch already sees the earlier call's duration.
   const recordMediaDuration = (dr: DispatchToolResult): void => {
-    if (isMediaGenTool(dr.toolCall) && dr.status !== 'deferred') {
+    if (isDeferrableAssetTool(dr.toolCall) && dr.status !== 'deferred') {
       longestMediaCallMs = Math.max(longestMediaCallMs, dr.duration || 0);
     }
   };
 
-  if (hasWaitTool) {
+  if (hasWaitTool || hasMultipleScreenshotCalls) {
     // Strict sequential: wait_seconds must take effect in emission order, so nothing
-    // batched with it may overlap it.
+    // batched with it may overlap it; multiple screenshot calls share one browser page
+    // (see hasMultipleScreenshotCalls above) and must not race on it either.
     toolResults = [];
     for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
       if (shouldDeferMedia(toolCall)) {
@@ -848,9 +1046,10 @@ export async function executePreparedTools(
       });
     }
   } else {
-    // Parallel path carries at most one media-gen call (a solo call; any media call
-    // batched with other tools forces the sequential path above), so a single
-    // pre-launch deferral check is race-free.
+    // Parallel path carries at most one deferrable-asset call (a solo call; a media-gen
+    // call batched with other tools forces the bounded-concurrency path above, and 2+
+    // screenshot calls force the strict-sequential path above), so a single pre-launch
+    // deferral check is race-free.
     const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs, policyDecision }) => {
       if (shouldDeferMedia(toolCall)) {
         return makeDeferred(toolCall, functionArgs, policyDecision);
@@ -981,9 +1180,11 @@ export async function executePreparedTools(
         pendingCounterUpdates[toolCall.function.name] =
           (pendingCounterUpdates[toolCall.function.name] || 0) + counterIncrement;
 
-        // Track media assets produced this iteration so the loop can carry a running
-        // per-run total into the next call's time-budget decision.
-        if (MEDIA_GEN_TOOLS.has(toolCall.function.name)) {
+        // Track media/deferrable assets produced this iteration so the loop can carry a
+        // running per-run total into the next call's time-budget decision (ENG-1331:
+        // includes playwright_browser_take_screenshot, consistent with shouldDeferMedia's
+        // "≥1 asset produced this batch" gate above).
+        if (DEFERRABLE_ASSET_TOOLS.has(toolCall.function.name)) {
           mediaAssetsProduced += 1;
         }
       }
@@ -1107,7 +1308,15 @@ export async function executePreparedTools(
         role: 'tool',
         name: toolCall.function.name,
         content: deferContent,
-        metadata: { timestamp: new Date().toISOString(), mediaBudgetDeferred: true },
+        // CodeRabbit (PR #2479): mediaBudgetDeferred must mean exactly what it says — a
+        // genuine per-turn media time-budget pause — not any deferral. A handler-supplied
+        // deferral (ENG-822's anonymous-account-scoped refusal, or any future one) carries
+        // its own unrelated reason and is a deliberate, permanent policy decision, never
+        // meant to be auto-retried. Durability checks (hasPersistedMediaBudgetDeferral,
+        // hasUnresolvedMediaDeferral) key off exactly this flag to decide whether to
+        // auto-resume, so tagging it unconditionally would have made those checks retry a
+        // policy refusal as if it were a timing issue.
+        metadata: { timestamp: new Date().toISOString(), ...(handlerDeferral ? {} : { mediaBudgetDeferred: true }) },
       });
     } else {
       const { toolCall, functionArgs, error, duration } = toolResult;
@@ -1122,8 +1331,18 @@ export async function executePreparedTools(
         duration,
       });
 
-      failedCounterUpdates[toolCall.function.name] =
-        (failedCounterUpdates[toolCall.function.name] || 0) + 1;
+      // ENG-1626 / ENG-1636: a ToolResultPolicyBlockedError (result.blocked===true
+      // + a reason, e.g. set_work_plan_status's out-of-order/missing-calls/
+      // insufficient-assets gates) is the tool refusing BY DESIGN, not a
+      // malfunction. agentToolGatewayService already excludes these from the
+      // repeated-failure breaker for the same reason; this counter feeds
+      // session.failedFunctions, the exact field the failure-cluster telemetry
+      // and this issue's "failed 2x" reading were built from, so it needs the
+      // same carve-out or a self-correcting gate refusal reads as an infra flake.
+      if (!(error instanceof ToolResultPolicyBlockedError)) {
+        failedCounterUpdates[toolCall.function.name] =
+          (failedCounterUpdates[toolCall.function.name] || 0) + 1;
+      }
 
       // ENG-124: the model-visible error carries (a) what failed (formatToolError
       // names the tool + reason, with per-tool fix text), and (b+c) an explicit
@@ -1152,5 +1371,5 @@ export async function executePreparedTools(
     appendSuppressedDuplicate(suppressed);
   }
 
-  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred, longestMediaCallMs, producedMediaCallKeys };
+  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred, longestMediaCallMs, producedMediaCallKeys, searchCallsThisIteration };
 }

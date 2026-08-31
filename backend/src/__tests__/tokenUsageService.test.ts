@@ -6,6 +6,7 @@ import {
   grantTokenBonus,
   resolveBillingUserId,
   deriveBlockedByCost,
+  ANONYMOUS_SESSION_COST_CAP_USD,
 } from "../services/tokenUsageService";
 
 // Mock dependencies
@@ -28,6 +29,12 @@ jest.mock("../services/subscriptionService", () => ({
   getSubscriptionTypeConfig: jest.fn(),
 }));
 
+jest.mock("../services/chatbotService", () => ({
+  chatbotDb: {
+    getUserSessions: jest.fn(),
+  },
+}));
+
 // Explicit mock (rather than relying on the shared aws-sdk auto-mock's
 // always-succeeding `put`) so isNewCharge can be driven to false for the
 // "don't strand an unapplied event" regression test below.
@@ -42,8 +49,10 @@ import {
   getSubscriptionTypeConfig,
 } from "../services/subscriptionService";
 import { recordLlmChargeEvent } from "../services/llmChargeAuditDb";
+import { chatbotDb } from "../services/chatbotService";
 
 const mockGetUserById = userDb.getUserById as jest.Mock;
+const mockGetUserSessions = chatbotDb.getUserSessions as jest.Mock;
 const mockGetUserByIdConsistent = (userDb as any).getUserByIdConsistent as jest.Mock;
 const mockUpdateUser = userDb.updateUser as jest.Mock;
 const mockIncrementTokenUsageForMonth = userDb.incrementTokenUsageForMonth as jest.Mock;
@@ -101,6 +110,54 @@ describe("getUserTokenUsage - failure cases", () => {
     expect(result.totalCost).toBe(0);
     expect(result.bonus).toBe(0);
     expect(result.month).toBe(currentMonth());
+  });
+});
+
+// ENG-1163 rework: getEffectiveLlmUsagePolicy (called unconditionally by
+// generateSharedResponse's resolveEffectiveModelForUser, right after the
+// checkTokenUsage gate) calls getUserTokenUsage directly — bypassing
+// checkTokenUsage's anon_ short-circuit entirely. Without a matching guard
+// here, an anon-owned session still throws "User not found" on its first
+// reply even after the checkTokenUsage fix, just one call deeper. Verified
+// live on the ENG-1163 preview: turn 1 500'd from this exact stack before
+// this guard was added.
+describe("getUserTokenUsage - anonymous session owner (ENG-1163)", () => {
+  it("does not throw for an anon_ userId with no AW-Users row, and never queries user records", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({ sessions: [] });
+
+    const result = await getUserTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.totalTokens).toBe(0);
+    expect(result.totalCost).toBe(0);
+    expect(result.bonus).toBe(0);
+    expect(result.month).toBe(currentMonth());
+    expect(mockGetUserById).not.toHaveBeenCalled();
+  });
+
+  it("sums prior anon session cost into totalCost", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({ sessions: [{ totalCost: 0.45 }] });
+
+    const result = await getUserTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.totalCost).toBe(0.45);
+  });
+
+  it("fails closed to the anonymous cost cap when the session-cost lookup errors", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockRejectedValue(new Error("DynamoDB unavailable"));
+
+    const result = await getUserTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.totalCost).toBe(ANONYMOUS_SESSION_COST_CAP_USD);
+  });
+
+  it("still throws for a real (non-anonymous) userId with no AW-Users row", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+
+    await expect(getUserTokenUsage("1746747115266")).rejects.toThrow("User not found");
+    expect(mockGetUserSessions).not.toHaveBeenCalled();
   });
 });
 
@@ -272,6 +329,90 @@ describe("checkTokenUsage", () => {
   });
 });
 
+describe("checkTokenUsage - anonymous session owner (ENG-1163 / ENG-705)", () => {
+  it("does not throw for an anon_ userId with no AW-Users row and no prior sessions", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({ sessions: [] });
+
+    await expect(checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049")).resolves.not.toThrow();
+  });
+
+  it("allows an anon_ userId under the fixed anonymous cost cap, with cost enforcement on", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({
+      sessions: [{ totalCost: 0.45 }],
+    });
+
+    const result = await checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.allowed).toBe(true);
+    expect(result.effectiveAllowance).toBeNull();
+    expect(result.percentUsed).toBe(0);
+    expect(result.costEnforced).toBe(true);
+    expect(result.costUsed).toBe(0.45);
+    expect(result.costAllowance).toBeGreaterThan(0);
+  });
+
+  it("blocks an anon_ userId once their summed session cost reaches the fixed cap — no unlimited free generation on a public share link", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({
+      sessions: [{ totalCost: 1.2 }, { totalCost: 0.9 }],
+    });
+
+    const result = await checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.allowed).toBe(false);
+    expect(result.costEnforced).toBe(true);
+    expect(result.costUsed).toBe(2.1);
+  });
+
+  it("blocks exactly at the cap boundary — cost equal to (not just over) the fixed cap is not allowed", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({
+      sessions: [{ totalCost: ANONYMOUS_SESSION_COST_CAP_USD }],
+    });
+
+    const result = await checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.allowed).toBe(false);
+    expect(result.costUsed).toBe(ANONYMOUS_SESSION_COST_CAP_USD);
+  });
+
+  it("never queries user/subscription records for an anon_ userId (short-circuits before any lookup)", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({ sessions: [] });
+
+    await checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(mockGetUserById).not.toHaveBeenCalled();
+    expect(mockGetUserSubscriptionType).not.toHaveBeenCalled();
+  });
+
+  it("fails closed (blocked) when the anon session-cost lookup itself errors, rather than defaulting to unlimited", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockRejectedValue(new Error("DynamoDB unavailable"));
+
+    const result = await checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.allowed).toBe(false);
+    expect(result.costEnforced).toBe(true);
+  });
+
+  it("does NOT treat a missing/empty userId as anonymous — falls through and throws, so a data-integrity bug is never silently granted an allowance", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+
+    await expect(checkTokenUsage("")).rejects.toThrow("User not found");
+    expect(mockGetUserSessions).not.toHaveBeenCalled();
+  });
+
+  it("still throws for a real (non-anonymous) userId with no AW-Users row — data-integrity errors must not be swallowed", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+
+    await expect(checkTokenUsage("1746747115266")).rejects.toThrow("User not found");
+    expect(mockGetUserSessions).not.toHaveBeenCalled();
+  });
+});
+
 describe("checkTokenUsage - versioned cost-only policy", () => {
   const llmUsagePolicy = {
     version: "starter-v1",
@@ -307,11 +448,13 @@ describe("checkTokenUsage - versioned cost-only policy", () => {
     expect(result.usageMode).toBe("full_choice");
   });
 
-  it("enters optimized mode exactly at the configured cost threshold", async () => {
+  it("keeps full model choice at the former optimization threshold (ENG-1211)", async () => {
+    // Was: crossing the soft threshold entered `optimized` and coerced the model.
+    // Only the hard cap changes state now; the soft threshold is inert.
     mockCostState(30);
     const result = await checkTokenUsage("u1");
     expect(result.allowed).toBe(true);
-    expect(result.usageMode).toBe("optimized");
+    expect(result.usageMode).toBe("full_choice");
     expect(result.usagePolicyVersion).toBe("starter-v1");
   });
 
@@ -345,14 +488,17 @@ describe("checkTokenUsage - versioned cost-only policy", () => {
     expect(result.costUsed).toBe(0);
   });
 
-  it('purchased credit extends the hard cap while keeping optimized mode active', async () => {
+  it('purchased credit resumes admission without changing the model (ENG-1211 AC3)', async () => {
+    // A top-up used to resume work but keep the account pinned to the cheap
+    // catalog. It now returns full choice: credits buy allowance, not a
+    // downgrade.
     mockCostState(60, 300_000_000, {
       month: currentMonth(), totalPurchasedMicroUsd: 10_000_000, totalMigrationOffsetMicroUsd: 0,
       grantIds: ['stripe:1'], grants: [],
     });
     const result = await checkTokenUsage('u1');
     expect(result.allowed).toBe(true);
-    expect(result.usageMode).toBe('optimized');
+    expect(result.usageMode).toBe('full_choice');
     expect(result.costAllowance).toBe(70);
   });
 });

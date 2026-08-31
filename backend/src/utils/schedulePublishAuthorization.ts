@@ -1,5 +1,6 @@
 import { isPublishName } from './hardeningGaps';
 import { resolvePublishAuthorized, SchedulePublishApprovalInput } from './schedulePublishApproval';
+import { EQUIVALENT_PUBLISH_ROUTES, normalizeAction, normalizePlatform } from './requiredCallSatisfaction';
 
 /**
  * ENG-827 — resolving the unattended publish gate.
@@ -233,6 +234,54 @@ export function resolveSchedulePublishAuthorization(
 }
 
 /**
+ * ENG-1245 — WHY a schedule resolves to unauthorized, for accurate owner-facing
+ * reporting only. Deliberately NOT part of `SchedulePublishAuthorization`'s own
+ * shape (asserted with exact-object equality across every case above) — this is
+ * read solely by the prompt-construction call site that decides which withheld
+ * explanation to show the owner.
+ *
+ * Session 0e5af215 (2026-08-15) and every daily run since — through today —
+ * told the owner "you turned ON Require approval before publishing, turn it
+ * OFF to unblock." The live schedule record has `requirePublishApproval:
+ * false`. The real reason: this schedule was never granted standing
+ * autopublish authorization, and its `requiredFunctionCalls` names no publish
+ * tool, so the legacy opt-out above finds no scope and falls to UNAUTHORIZED.
+ * Telling the owner to flip a switch that is already off fixes nothing and
+ * hides a real regression (ENG-1245) — it also happens to point at "Publish
+ * without my review" wording that does not exist anywhere in the schedule UI,
+ * which only ever offers "Require approval before publishing".
+ *
+ * Only the literal `requirePublishApproval === true` case is that specific,
+ * named toggle. Two other unauthorized cases are worth telling apart too — not
+ * everything collapses to "never asked":
+ *
+ *  - `'revoked'` — `autopublishAuthorized === false`, an explicit owner decision,
+ *    just not the "Require approval before publishing" toggle. Reporting this as
+ *    "not been granted" (implying nobody ever considered it) would understate a
+ *    real choice the owner made.
+ *  - `'not_granted'` — everything else: truly never asked, or a grant with no
+ *    approved tool scope (consent given but nothing usable — there is no active
+ *    grant right now, and unlike an explicit `false` this was never a deliberate
+ *    "no").
+ */
+export type PublishAuthorizationWithholdReason = 'require_publish_approval' | 'revoked' | 'not_granted';
+
+export function describePublishAuthorizationWithholdReason(
+  schedule: SchedulePublishAuthorizationInput | null | undefined
+): PublishAuthorizationWithholdReason | undefined {
+  if (!schedule) return undefined;
+  // CodeRabbit: this function only explains WHY a schedule is withheld — it must
+  // never assert a withholding reason for a schedule that resolveSchedulePublishAuthorization
+  // says is actually authorized (e.g. a usable explicit grant). Every current
+  // caller already guards on `.authorized` before reaching here, but the
+  // function's own contract has to hold for any caller that doesn't.
+  if (resolveSchedulePublishAuthorization(schedule).authorized) return undefined;
+  if (schedule.requirePublishApproval === true) return 'require_publish_approval';
+  if (schedule.autopublishAuthorized === false) return 'revoked';
+  return 'not_granted';
+}
+
+/**
  * Narrow a schedule's required-function list to what this run is actually allowed
  * to be nudged for.
  *
@@ -300,4 +349,56 @@ export function narrowPublishAuthorization(
     authorized: admitted.authorized && latest.authorized && tools.length > 0,
     tools: admitted.authorized && latest.authorized ? tools : []
   };
+}
+
+/**
+ * Whether `toolName` (optionally scoped to `args.action`) is covered by a grant for
+ * `tools` — either because it IS one of the granted tools, or because ENG-1045
+ * already treats it as ACHIEVING one of them (the identical equivalence table the
+ * completion checker uses to decide `functionCallMatches`).
+ *
+ * WITHOUT THIS, THE ENG-1045 FIX WAS UNREACHABLE IN PRACTICE. `tools` here is
+ * derived from the schedule's literal `requiredFunctionCalls` (see
+ * `getRequiredPublishTools`), so a schedule requiring only `post_on_connected_account`
+ * granted consent for exactly that name — never for `twitter_manage_post`, even
+ * though a thread/reply/quote-tweet through it satisfies the SAME requirement.
+ * `refuseUnauthorizedScheduledPublish` refused the call outright before the
+ * completion checker's equivalence route ever had a chance to credit it (live-verified
+ * on preview 2026-08-17): the model was told "this schedule is only pre-authorized to
+ * publish using post_on_connected_account" and silently collapsed a requested
+ * 2-tweet thread into one tweet rather than posting the thread it was asked for.
+ *
+ * DELIBERATELY ACTION-SCOPED, not a blanket tool grant. `twitter_manage_post` also
+ * has a `retweet` action that is NOT in `post_on_connected_account`'s equivalence
+ * list — resharing someone else's content is a different act the owner never
+ * approved, so granting the whole tool name would authorize more than the owner's
+ * literal consent covers. Matching `EQUIVALENT_PUBLISH_ROUTES` exactly, action for
+ * action, is what keeps this an outcome-equivalent substitution instead of a scope
+ * widening.
+ */
+export function isPublishCallWithinAuthorizedScope(
+  toolName: string,
+  args: any,
+  tools: string[]
+): boolean {
+  if (tools.includes(toolName)) return true;
+  const action = normalizeAction(args?.action);
+  const platform = normalizePlatform(args?.platform);
+  // postOnConnectedAccount resolves the target account by `account_id` FIRST and
+  // ignores `platform` entirely whenever `account_id` is present (agentModeService.ts) —
+  // so `args.platform` only actually describes the account being posted to when no
+  // `account_id` is given. Trusting a caller-supplied `platform` alongside a
+  // caller-supplied `account_id` would let a mismatched account_id (e.g. a LinkedIn
+  // account) pass a platform-scoped grant by simply claiming platform:'twitter'. Like
+  // every other ambiguous case in this module, that fails closed rather than guessing.
+  const hasAccountId = args?.account_id !== undefined && args?.account_id !== null && args?.account_id !== '';
+  return tools.some((required) => {
+    const routes = EQUIVALENT_PUBLISH_ROUTES[required];
+    if (!routes) return false;
+    return routes.some((route) =>
+      route.tool === toolName &&
+      (!route.actions || route.actions.includes(action)) &&
+      (!route.platforms || (!hasAccountId && route.platforms.includes(platform)))
+    );
+  });
 }

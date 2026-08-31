@@ -167,6 +167,34 @@ require_env() {
 }
 
 now_seconds() {
+  # ENG-1522: a test-only clock seam. Production never sets EB_CLOCK_FILE, so on
+  # the deploy path this is `date +%s` verbatim and the branch below is
+  # unreachable. eb-deploy.test.sh asserts structurally that no workflow can set
+  # it, so it cannot reach production by edit either.
+  #
+  # Why the seam exists: this function is read TWICE inside a single poll
+  # iteration -- once to stamp `ready_since` when the environment first reports
+  # Ready, and again to test that stamp against EB_HEALTH_SETTLE_SECONDS.
+  # `date +%s` has one-second granularity, so when the wall clock happens to
+  # tick between those two reads the delta jumps 0 -> 1 and a 1s settle budget
+  # expires a poll early. Against the suite's mocked AWS queue that surfaces as
+  # "health stayed Red for 1s ... describe-instances-health returned no
+  # instances" -- two red checks out of 79, on PRs touching no deploy code
+  # (portal #1092, #1093). Scheduler jitter, not deploy logic. Reproduced
+  # deterministically by forcing that tick, which is how it was confirmed.
+  #
+  # The generalisation matters more than the one case: a fixed mocked event
+  # queue was being consumed against a wall-clock budget, so poll counts
+  # depended on how fast the runner happened to be. With the seam the harness
+  # advances time once per describe-environments call, making time a function of
+  # the mocked event sequence -- identical on an idle laptop and a saturated CI
+  # box. Raising the budget instead would have hidden the race AND made the
+  # settle-window-reset case vacuous, since an un-reset window would then also
+  # fit inside the larger budget.
+  if [ -n "${EB_CLOCK_FILE:-}" ] && [ -r "${EB_CLOCK_FILE}" ]; then
+    cat "${EB_CLOCK_FILE}"
+    return
+  fi
   date +%s
 }
 
@@ -500,7 +528,7 @@ scan_for_terminal_events() {
   EB_LAST_ERROR_EVENTS="${out}"
 
   for pattern in "${EB_TERMINAL_EVENT_PATTERNS[@]}"; do
-    if printf '%s' "${out}" | grep -qF "${pattern}"; then
+    if grep -qF "${pattern}" <<<"${out}"; then
       fail "Elastic Beanstalk REJECTED this update and it cannot succeed. EB reported: '${pattern}'. Version '${EB_VERSION_LABEL}' was NOT applied and '${EB_ENVIRONMENT_NAME}' is still running '${EB_CURRENT_VERSION}'. Full event text: ${out}"
     fi
   done
@@ -519,7 +547,7 @@ events_show_recoverable_abort() {
     return 1
   fi
   for pattern in "${EB_ABORT_EVENT_PATTERNS[@]}"; do
-    if printf '%s' "${EB_LAST_ERROR_EVENTS}" | grep -qF "${pattern}"; then
+    if grep -qF "${pattern}" <<<"${EB_LAST_ERROR_EVENTS}"; then
       return 0
     fi
   done
@@ -541,7 +569,7 @@ create_application_version() {
     return 0
   fi
 
-  if printf '%s' "${out}" | grep -qiF 'already exists'; then
+  if grep -qiF 'already exists' <<<"${out}"; then
     log "Application version '${EB_VERSION_LABEL}' already exists; reusing the existing version. AWS reported: ${out}"
     return 0
   fi
@@ -640,7 +668,7 @@ update_environment() {
     # EB rejects an update while another is running with "Environment named X is
     # in an invalid state for this operation. Must be Ready." That is the one
     # error worth retrying, because the environment settling makes it go away.
-    if printf '%s' "${out}" | grep -qiE 'invalid state|concurrentupdate|concurrent update'; then
+    if grep -qiE 'invalid state|concurrentupdate|concurrent update' <<<"${out}"; then
       log "Environment '${EB_ENVIRONMENT_NAME}' was mid-update on attempt ${attempt}/${EB_UPDATE_MAX_ATTEMPTS}; waiting for it to settle and retrying. AWS reported: ${out}"
       attempt=$(( attempt + 1 ))
       continue

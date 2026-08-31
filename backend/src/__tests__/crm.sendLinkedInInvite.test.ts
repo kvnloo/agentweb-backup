@@ -80,6 +80,8 @@ jest.mock('../services/linkedInOutreachService', () => ({
     resolveUserOwnedAccountId: (...args: any[]) => mockResolveUserOwnedAccountId(...args),
     getLinkedInProfile: (...args: any[]) => mockGetLinkedInProfile(...args),
     sendInvitation: (...args: any[]) => mockSendInvitation(...args),
+    // ENG-126 breaker check — must be present or send-invite throws before pacing.
+    isUnderInvitationCooldown: jest.fn(() => false),
     getInviteCharLimitForAccount: (...args: any[]) => mockGetInviteCharLimitForAccount(...args),
   },
 }));

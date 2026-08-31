@@ -1076,4 +1076,96 @@ describe('handleCallGoogleAdsReportingApi — error handling', () => {
     expect(result.success).toBe(false);
     expect(result.error).toBe('mode must be "raw" or "dashboard"');
   });
+
+});
+
+// ENG-1514. A PAUSED create must round-trip as PAUSED.
+//
+// ENG-1293 fixed googleAdsService.createAdGroup/createAd to ACCEPT a status and
+// apply `status: params.status ?? 'ENABLED'`. That fix is real, and it is also
+// unreachable: these two dispatcher call sites never passed `status` through, so
+// params.status was always undefined, the ENABLED default fired, and an explicit
+// PAUSED request was discarded silently behind `success: true`.
+//
+// Caught live on 2026-08-24 (account 2883029950, ENG-1157 closing E2E): ad group
+// 201029416233 and ad 821954276361 were both submitted PAUSED and both stored
+// ENABLED. Nothing served only because the parent campaign was PAUSED — the
+// hierarchy contained it, not the API.
+//
+// These assert on the ARGS HANDED TO THE SERVICE, not on the mock's return value:
+// the whole failure mode is a success response that describes a request the
+// backend did not make.
+describe('handleCallGoogleAdsApi — a PAUSED create must not come back ENABLED (ENG-1514)', () => {
+  it('forwards status PAUSED to createAdGroup instead of dropping it', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD_GROUP',
+      action: 'CREATE',
+      name: 'Staged Ad Group',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      type: 'SEARCH_STANDARD',
+      status: 'PAUSED',
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.createAdGroup).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      expect.objectContaining({ status: 'PAUSED' }),
+    );
+  });
+
+  it('forwards status PAUSED to createAd instead of dropping it', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD',
+      action: 'CREATE',
+      ad_group_resource_name: 'customers/123/adGroups/1',
+      type: 'SEARCH',
+      headlines: ['H1', 'H2', 'H3'],
+      descriptions: ['D1', 'D2'],
+      final_url: 'https://example.com',
+      status: 'PAUSED',
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.createAd).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      expect.objectContaining({ status: 'PAUSED' }),
+    );
+  });
+
+  // Management RULE 11 (safe defaults) and the CAMPAIGN CREATE path already in
+  // this dispatcher both say a create with no stated status is PAUSED, not live.
+  it('defaults an unstated status to PAUSED, matching CAMPAIGN CREATE', async () => {
+    await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD_GROUP',
+      action: 'CREATE',
+      name: 'Unstated Ad Group',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      type: 'SEARCH_STANDARD',
+    });
+    expect(googleAdsService.createAdGroup).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      expect.objectContaining({ status: 'PAUSED' }),
+    );
+  });
+
+  it('still honours an explicit ENABLED create', async () => {
+    await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD_GROUP',
+      action: 'CREATE',
+      name: 'Live Ad Group',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      type: 'SEARCH_STANDARD',
+      status: 'ENABLED',
+    });
+    expect(googleAdsService.createAdGroup).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      expect.objectContaining({ status: 'ENABLED' }),
+    );
+  });
 });

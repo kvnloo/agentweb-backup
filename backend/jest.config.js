@@ -56,17 +56,39 @@ module.exports = {
     // node-fetch after the same local-or-allowlisted check. See __mocks__/node-fetch.ts.
     '^node-fetch$': '<rootDir>/__mocks__/node-fetch.ts',
   },
+  // ENG-1376: this used to read `src/utils/**/*.ts` only — 112 of the 811
+  // source files under src/. The 98.35% the CI comment advertised was 98.35%
+  // *of src/utils*, and nothing said so, so it read as a backend-wide number.
+  // Measured over the widened scope, with both test jobs' coverage merged, the
+  // same suites score 74.02% statements / 64.75% branches / 74.89% functions /
+  // 74.79% lines over 729 files (PR #2547 CI). Nothing regressed; the
+  // denominator was wrong.
+  //
+  // Exclusions, and why each one is not a dodge:
+  //   *.d.ts          - ambient declarations, no executable statements.
+  //   **/__tests__/** - the tests themselves. Must be `**/`, not `src/__tests__/`:
+  //                     there are 12 more __tests__ dirs nested under services/,
+  //                     routes/, mcp/, etc., and an anchored pattern leaks them
+  //                     into the denominator as ~100%-covered "source".
+  //   **/__mocks__/** - hand-written module stubs (see moduleNameMapper above).
+  //   src/types/**    - type-only declarations.
+  //   src/scripts/**  - 69 one-off operational scripts run by hand against real
+  //                     AWS/DB, not importable units. Listed in the coverage
+  //                     comment as an explicit exclusion so the number stays
+  //                     honest about what it skipped.
   collectCoverageFrom: [
-    'src/utils/**/*.ts',
+    'src/**/*.ts',
     '!src/**/*.d.ts',
-    '!src/__tests__/**',
+    '!src/**/__tests__/**',
+    '!src/**/__mocks__/**',
+    '!src/types/**',
+    '!src/scripts/**',
   ],
-  coverageThreshold: {
-    global: {
-      branches: 95,
-      functions: 95,
-      lines: 95,
-      statements: 95,
-    },
-  },
+  // No `coverageThreshold` here on purpose, and nothing enforces one elsewhere
+  // either. ENG-1376 made the merged-shard result the single enforcement point;
+  // ENG-1463 then removed coverage from CI altogether ("does not run routine
+  // product suites, enforce coverage, or deploy staging" — CLAUDE.md), taking
+  // that mechanism with it. `collectCoverageFrom` above is kept because it is
+  // what makes a local `npm run test:coverage` measure the whole backend rather
+  // than one directory; it is a local diagnostic now, not a gate.
 };

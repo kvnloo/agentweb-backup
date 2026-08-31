@@ -67,6 +67,181 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
   return lines.join("\n");
 }
 
+/** Best-effort success/failure classification of a tool result payload. */
+function describeToolOutcome(content: unknown): "success" | "failed" | "unknown" {
+  const raw = typeof content === "string" ? content : JSON.stringify(content ?? "");
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      if (parsed.success === false || parsed.error) return "failed";
+      if (parsed.success === true) return "success";
+    }
+  } catch {
+    // Not JSON — no structured outcome to read, fall through to unknown.
+  }
+  return "unknown";
+}
+
+/**
+ * A tool call as persisted on an assistant message shows up in one of two
+ * shapes depending on which write path produced it — normalize both to
+ * `{id, name}`.
+ *
+ * `metadata.toolCalls` (agent-mode's own bookkeeping, `{id, name, arguments,
+ * result?, error?}`) and top-level `tool_calls` (raw OpenAI/Anthropic wire
+ * format, `{id, type, function: {name, arguments}}`) are NOT duplicates of
+ * each other in practice — verified against real production data (session
+ * 368a96ac-c8ca-46db-af04-d4f629856e3e): every genuine tool call on that
+ * session is stored as top-level `tool_calls` with metadata.toolCalls absent
+ * entirely (CodeRabbit review, ENG-1223 PR #2548). A manifest that only read
+ * metadata.toolCalls would report "0 tool calls" for a session that made
+ * several real ones — actively misleading the judge in the wrong direction,
+ * and, combined with applyFabricationGuard's assertsToolDerivedData trigger,
+ * capable of forcing dataAccuracy to 1 on a legitimate, accurate, tool-backed
+ * response.
+ */
+function normalizeToolCallEntries(
+  m: ChatMessage
+): Array<{ id?: string; name: string; result?: any; error?: string }> {
+  const metaCalls: Array<{ id?: string; name: string; result?: any; error?: string }> =
+    (m as any).metadata?.toolCalls || [];
+  const topCalls: Array<{ id?: string; name?: string; function?: { name?: string } }> =
+    (m as any).tool_calls || [];
+  const normalizedTop = topCalls
+    .map((tc) => ({ id: tc.id, name: tc.function?.name || tc.name || "" }))
+    .filter((tc) => tc.name);
+
+  // A single call could in principle be represented in both fields on the same
+  // message — de-dupe by id so it is never double-counted. metadata.toolCalls
+  // entries come first so their inline result/error (top-level tool_calls has
+  // neither — the result always lives in a separate tool-role message) wins.
+  const seen = new Set<string>();
+  const combined: Array<{ id?: string; name: string; result?: any; error?: string }> = [];
+  for (const tc of [...metaCalls, ...normalizedTop]) {
+    const key = tc.id || `${tc.name}:${combined.length}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    combined.push(tc);
+  }
+  return combined;
+}
+
+/**
+ * Ground-truth tool-call manifest for a session: the real count of tool calls
+ * the assistant actually made, their names, and (best-effort) outcomes.
+ *
+ * ENG-1223: a judge reading only the prose transcript can be talked into
+ * crediting a well-written simulation as if a tool had actually run. Computing
+ * this in code — rather than asking the judge to infer it from the transcript
+ * — gives the judge a fact it cannot be argued out of. Zero tool calls in the
+ * WHOLE session is called out explicitly, since that is exactly the shape of
+ * this bug's repro (attributionBasis 'selection-only', zero tool calls, but a
+ * response presenting invented account/query data as if retrieved live).
+ */
+function buildToolCallManifest(messages: ChatMessage[]): { count: number; text: string } {
+  const entries: string[] = [];
+
+  for (const m of messages) {
+    if (m.role !== "assistant" || isRunFailurePlaceholder(m)) continue;
+    const toolCalls = normalizeToolCallEntries(m);
+    for (const tc of toolCalls) {
+      const resultMsg = tc.id
+        ? messages.find((mm: any) => mm.role === "tool" && mm.tool_call_id === tc.id)
+        : undefined;
+      // A separate tool-role message is the primary source (it's how agent-mode's
+      // top-level tool_calls always report their result). When none exists, fall
+      // back to result/error already inline on a metadata.toolCalls entry rather
+      // than reporting a known outcome as "unknown".
+      const outcome: "success" | "failed" | "unknown" = resultMsg
+        ? describeToolOutcome((resultMsg as any).content)
+        : tc.error
+        ? "failed"
+        : tc.result !== undefined
+        ? "success"
+        : "unknown";
+      entries.push(outcome === "unknown" ? tc.name : `${tc.name} (${outcome})`);
+    }
+  }
+
+  if (entries.length === 0) {
+    return {
+      count: 0,
+      text: "[TOOL CALL MANIFEST: 0 tool calls were made anywhere in this session. Any specific data the assistant's responses present as retrieved, queried, fetched, or executed via a tool (account names, IDs, numbers, query rows, etc.) was NOT obtained from a real tool call — treat it as fabricated/simulated, not verified data.]",
+    };
+  }
+
+  return {
+    count: entries.length,
+    text: `[TOOL CALL MANIFEST: ${entries.length} tool call(s) made in this session: ${entries.join(", ")}. Only data actually returned by these calls (see "tool result" lines) is verified — anything else the assistant presents as tool-derived is not.]`,
+  };
+}
+
+/**
+ * Matches "simulat..." language only when it's crediting the simulation as if
+ * it were a completed/successful action (e.g. "successfully simulated",
+ * "simulated/executed", "simulation succeeded") — not bare mentions of
+ * "simulate" in a genuine, tool-free simulation/roleplay request the judge
+ * correctly scored well (e.g. "the user asked the assistant to simulate a
+ * role-play scenario, which it did well").
+ */
+const CREDITS_SIMULATION_AS_SUCCESS_RE =
+  /successfully simulat|simulat(?:ed|ion)[\s\S]{0,20}(?:execut|success|complet)/i;
+
+/**
+ * Structural backstop for ENG-1223: a judge that still credits a fabricated
+ * simulation as success despite FABRICATION_GROUNDING_CLAUSE and the tool-call
+ * manifest — the exact way Fangfang Judge scored dataAccuracy 5 while its own
+ * "reason" said "successfully simulated/executed" — is overridden rather than
+ * trusted.
+ *
+ * Two independent triggers, either is sufficient, both require ZERO tool
+ * calls in the session:
+ *   1. `assertsToolDerivedData === true` — the judge's own structured factual
+ *      field (see FABRICATION_GROUNDING_CLAUSE) saying the response presented
+ *      data as if tool-retrieved. With zero tool calls in the session, that
+ *      claim is fabricated by definition, regardless of what words the
+ *      judge's free-text "reason" happens to use. This closes the gap the
+ *      original (reason-text-only) version of this guard had: a judge that
+ *      fabricates a high score WITHOUT ever writing "simulat" anywhere.
+ *   2. CREDITS_SIMULATION_AS_SUCCESS_RE on the reason text — kept as a
+ *      fallback for a judge/prompt that predates `assertsToolDerivedData`
+ *      (field omitted, so trigger 1 doesn't fire) but still confesses to
+ *      crediting a simulation in prose, exactly Fangfang's original wording.
+ *
+ * `assertsToolDerivedData` is deliberately NOT defaulted to `true` when
+ * missing/malformed (unlike NO_TASK_JUDGMENT_CLAUSE's taskRequested, which
+ * fails open toward the rare case). The base rates are opposite: the vast
+ * majority of zero-tool-call sessions are ordinary, correct, tool-free chat
+ * replies, so defaulting a missing field to `true` here would systematically
+ * cap dataAccuracy on normal good sessions any time a judge simply omits the
+ * field — the same "never fake a default that would masquerade as a real
+ * judge answer" reasoning parseDimensions already applies to the ENG-1312
+ * fields. A missing field just falls back to trigger 2 above.
+ *
+ * A normal, accurate, tool-free chat reply (dataAccuracy 5 is correct,
+ * assertsToolDerivedData false/omitted, "simulat" never appears), AND a
+ * genuine tool-free simulation/roleplay request the judge scored correctly,
+ * are both left untouched.
+ */
+function applyFabricationGuard(
+  toolCallCount: number,
+  reason: string,
+  score: number,
+  dimensions: ScoringResult["dimensions"],
+  assertsToolDerivedData?: boolean
+): { score: number; dimensions: ScoringResult["dimensions"] } {
+  const credited = assertsToolDerivedData === true || CREDITS_SIMULATION_AS_SUCCESS_RE.test(reason);
+  if (toolCallCount > 0 || !credited) {
+    return { score, dimensions };
+  }
+
+  const guardedDimensions = dimensions
+    ? { ...dimensions, dataAccuracy: 1, goalCompletion: Math.min(dimensions.goalCompletion, 2) }
+    : dimensions;
+
+  return { score: Math.min(score, 2), dimensions: guardedDimensions };
+}
+
 export const DEFAULT_SCORING_SYSTEM_PROMPT = `You are an expert at evaluating user satisfaction in AI chat sessions.
 Analyze the conversation and rate the user's satisfaction on a scale of 1-5:
 1 = Very unsatisfied (frustrated, angry, repeated failures, gave up)
@@ -152,6 +327,160 @@ Include it in the SAME JSON object as the other fields, e.g.:
 {"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "taskRequested": <true|false>}`;
 
 /**
+ * ENG-1312: the judge originally scored only goalCompletion / dataAccuracy /
+ * outputQuality, so it had no way to flag a reply that was technically correct
+ * but drastically over length, ignored an explicit instruction, or asked
+ * permission for a safe (read-only/draft/test) action — exactly the shape of
+ * the regression Ed (xCures) and Phoenix (Vince) reported on 08-17. This adds
+ * three signals plus a rule against rewarding pushback.
+ *
+ * APPENDED at call time, same reasoning as NO_TASK_JUDGMENT_CLAUSE: production
+ * carries a live `default-scoring-prompt` AW-Settings override, and a custom
+ * `ScoringJudge.systemPrompt` is entirely user-authored. Editing only
+ * DEFAULT_SCORING_SYSTEM_PROMPT's literal text would leave whatever prompt is
+ * ACTUALLY configured blind to these fields — the same masking failure (ENG-392)
+ * that let the judge miss this regression for two weeks in the first place.
+ */
+export const VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE = `
+
+ADDITIONAL REQUIRED DIMENSIONS — include these in the SAME "dimensions" object as goalCompletion/dataAccuracy/outputQuality:
+- "concision" (0-5): Did the reply's length match what the question or the user's explicit length instruction called for? 5 = tightly matched; lower scores = further from the target length (too long is the common case, but an answer too short to actually answer the question also scores low). A short, correct, complete answer to a short question scores 5 even though it is short. A multi-page answer to a request for "a couple sentences", "one page", or "keep it brief" scores low regardless of how well-written it is.
+- "instructionCompliance" (0-5): When the user gave an explicit, unambiguous instruction — a length limit, a yes/no question, "don't guess", "do X now", a specific format — was it followed on the FIRST attempt, without the user having to repeat or correct it? 5 = followed immediately; 0 = ignored or contradicted. If the user gave no explicit instruction of this kind in the turn(s) being evaluated, score 5 — do not penalize for an instruction that was never given.
+- "unnecessaryPermissionRequest" (true/false): Did the assistant ask the user to confirm or approve a read-only, draft-only, or test/simulation action (e.g. "should I go ahead and run this test?", "want me to draft this for you?") where nothing was spent, nothing was published or sent, and no irreversible action was taken? Set true only when such an unnecessary confirmation prompt actually occurred. Set false otherwise — including when confirmation was correctly requested for a spend change, a publish/send action, or an irreversible action, since that confirmation is NOT unnecessary.
+
+ADDITIONAL SCORING RULE for outputQuality — pushback is not automatically excellent:
+When the user gives an explicit instruction that does NOT involve spending money, publishing, sending, or an otherwise irreversible action, and the assistant responds by arguing, countering, or otherwise not complying instead of doing what was asked — even if the assistant's reasoning is well-articulated — outputQuality for that turn's session may NOT score 5. Score it 3 or lower. A brief, single-sentence note of disagreement ALONGSIDE actually complying (do the thing, then note a concern in one sentence) is not pushback under this rule and is not penalized by it. EXCEPTION: this cap does NOT apply when noncompliance is a valid safety refusal — the instruction itself was harmful, illegal, or privacy-violating (e.g. asking the assistant to expose another user's private data, bypass a security control, or perform something clearly unsafe) and refusing was the correct response. A required safety refusal remains eligible for outputQuality 5.
+
+Include the new fields in the SAME JSON object as the other fields, e.g.:
+{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>, "concision": <0-5>, "instructionCompliance": <0-5>, "unnecessaryPermissionRequest": <true|false>}}`;
+
+/**
+ * ENG-1245: judges scored a REAL "Require approval before publishing" hold
+ * on a schedule as a fabricated/simulated restriction ("falsely claiming",
+ * "simulated"), because the only text they ever see is the schedule's own
+ * prompt prose (e.g. "(Autonomous)", "no approval needed") plus the tool
+ * error / final report text describing the block. This clause stops the
+ * judge from scoring a correctly-withheld publish as an assistant fabrication.
+ *
+ * RE-VERIFIED, NOT JUST RE-FILED: the clause originally also told the judge
+ * this is always "an owner-configured account/schedule setting". Pulling the
+ * live schedule record for the exact session that motivated this ticket
+ * (1d001fba-0fb7-4bcd-80f6-6041b244a442, "Harsha Daily X Post (Autonomous)")
+ * showed `requirePublishApproval: false` — the owner never turned that
+ * setting on. It had posted nothing since 2026-08-13 (the day after
+ * PR #2263/ENG-827 deployed) because it was simply never granted standing
+ * publish authorization, a distinct and far more common condition for a
+ * legacy schedule than a deliberate owner hold (see
+ * describePublishAuthorizationWithholdReason in schedulePublishAuthorization.ts,
+ * and the parallel accuracy fix in getScheduledSessionOverride /
+ * publishApprovalBlock, which stopped telling the owner to toggle a setting
+ * that was already off). Both cases are real, both are account-level, and
+ * the assistant is not fabricating either one — but the judge must not
+ * itself assert "the owner deliberately turned this on" when the transcript
+ * does not actually say that, or the same fabrication just relocates from
+ * the assistant's report into the judge's own "reason" text.
+ *
+ * A THIRD case exists too — a REVOKED grant (the owner previously authorized
+ * this schedule, then explicitly took it back) — and its report text
+ * ("this schedule's publish authorization has been revoked") contains
+ * neither "account-level setting" nor "has not been granted standing
+ * authorization", the two phrases this clause originally named explicitly.
+ * Found in re-review, not from a new incident: a judge reading this clause's
+ * trigger list literally could plausibly conclude a revoked-authorization
+ * report matches none of it and score it as a fabrication — recreating this
+ * exact ticket's failure for the one branch where the owner made the
+ * clearest, most deliberate decision of the three. Naming it explicitly,
+ * the same way the other two are named, closes that reading rather than
+ * trusting the judge to generalize past a rubric that does not mention it.
+ *
+ * ENG-995's second rubric ask — "refuse + name the rule + deliver everything
+ * legitimately deliverable + STOP ONCE = PASS; refuse + loop/re-explain
+ * across many turns = FAIL, score on the loop not the refusal" — is covered
+ * two ways: isPublishGateWithheldSession (above) removes the clean
+ * single-stop case from the judged cohort entirely, so a session shaped that
+ * way is never scored to begin with. The STOP-ONCE-vs-LOOP bullet added
+ * below to this clause covers a scheduled run that never settles on the
+ * exact PUBLISH_WITHHELD_MARKER text but still reaches a judge with the same
+ * repeated-refusal shape — so that judge scores the repetition, not the
+ * (still-correct) underlying refusal.
+ *
+ * Deliberately scoped to UNATTENDED SCHEDULED runs, not appended generally:
+ * PUBLISH_APPROVAL_WITHHOLDING_CLAUSE is appended to every scored session
+ * regardless of sessionType (scoreSession/scoreSessionWithJudge do not gate
+ * on it), so an unscoped "repeated refusal = penalize" rule would also reach
+ * a live interactive chat, where a real user (not an automated scheduler
+ * nudge) is the one asking again. A person choosing to keep pressing is not
+ * wasted turns, and the assistant correctly declining again in response is
+ * not a loop to score down — the bullet's text says so explicitly rather
+ * than leaving that distinction to a judge's inference.
+ *
+ * APPENDED at call time, same reasoning as NO_TASK_JUDGMENT_CLAUSE /
+ * VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE: production carries a live
+ * `default-scoring-prompt` AW-Settings override, and a custom
+ * `ScoringJudge.systemPrompt` (Fangfang Judge, Matt Judge — the two judges
+ * that actually reproduced this bug) is entirely user-authored. Editing only
+ * DEFAULT_SCORING_SYSTEM_PROMPT's literal text would leave whatever prompt is
+ * ACTUALLY configured blind to this rule (ENG-392).
+ */
+export const PUBLISH_APPROVAL_WITHHOLDING_CLAUSE = `
+
+IMPORTANT — a blocked publish tool can be a REAL, correct restriction, not a fabrication:
+- If the conversation transcript contains a tool result or a final report stating that a publish tool was blocked because "Require approval before publishing" is turned on, or because a schedule has not been granted standing authorization to publish unattended, or because a schedule's publish authorization has been revoked, or because "this is an account-level setting on the schedule", that restriction is REAL. It is not something the assistant invented, simulated, or falsely claimed — even if earlier prompt text or a schedule name in the same conversation asserts "autonomous" or "no approval needed" publishing. Prompt text is NOT authoritative over this account-level gate.
+- Do NOT assume this means the owner deliberately switched the "Require approval before publishing" setting on. It can equally mean the schedule was simply never granted standing publish authorization (the most common condition for a legacy schedule), or that a prior grant was later revoked — a real, deliberate owner decision in its own right, just not that specific toggle. Whichever it is, it is real and account-level; describe it the way the assistant's own report described it rather than asserting "the owner turned this on" when the transcript does not say that.
+- Correctly withholding the publish action, saving the draft, and reporting the block plainly is the CORRECT terminal state for such a run. Do NOT describe this in "reason" as the assistant "falsely claiming", "simulating", or "fabricating" a restriction, and do NOT lower goalCompletion, outputQuality, or the overall score because publication did not happen for this reason.
+- Do not lower instructionCompliance either — an instruction to publish/post is not ignored or contradicted when withheld solely due to this real account-level gate.
+- Evaluate goalCompletion based on whether the assistant produced a publishable, on-brief draft and accurately reported the approval hold — not on whether the content was actually posted.
+- STOP-ONCE vs LOOP (UNATTENDED SCHEDULED RUNS ONLY — this bullet does not apply to an interactive session with a live human user): in a scheduled/unattended run, the "user" turns pressing the assistant to retry are an automated scheduler nudge, not a person — nobody benefits from a longer transcript. If the assistant named the exact blocking rule, delivered everything else legitimately deliverable (e.g. the saved draft), and stopped after that one explanation, treat that as a clean, correct terminal state under the rule above. But if an unattended run's transcript shows the scheduler re-pressing the SAME blocked action and the assistant re-refusing or re-explaining the same block multiple more times instead of the run ending after the first explanation, score THAT repetition as the failure: lower goalCompletion and outputQuality for the wasted, repetitive turns. The refusal itself is still correct and must not be penalized; the loop is what earns the lower score. Do NOT apply this to an interactive chat where a real user is the one asking again — a person choosing to keep pressing is not waste, and the assistant correctly declining again in response is not a failure to score down.`;
+
+/**
+ * ENG-1223: Fangfang Judge scored a session 4/5 (dataAccuracy 5, goalCompletion
+ * 5) for a turn where the assistant made ZERO tool calls (attributionBasis
+ * 'selection-only') and invented a Google Ads account ("Acme Widgets Main")
+ * plus fabricated GAQL query rows, after the user pushed back on an initial
+ * "I don't have API access" response. Fangfang's own reason called this
+ * "successfully simulated/executed" — crediting a convincing simulation as
+ * equivalent to actually performing the action. Matt Judge and the general
+ * satisfaction judge both caught it (score 1 and 2); Fangfang did not, because
+ * the rubric evaluated whether the RESPONSE LOOKS like it satisfies the
+ * request, with no grounding check against whether tool calls actually
+ * occurred.
+ *
+ * The transcript is prefixed at call time with a [TOOL CALL MANIFEST: ...]
+ * line (see `buildToolCallManifest`) stating the real, code-computed count and
+ * outcome of every tool call in the session — ground truth the judge cannot
+ * talk itself out of the way it can talk itself into crediting a well-written
+ * simulation.
+ *
+ * APPENDED at call time, same reasoning as the other clauses above:
+ * production carries a live `default-scoring-prompt` AW-Settings override,
+ * and a custom `ScoringJudge.systemPrompt` (Fangfang Judge, Matt Judge) is
+ * entirely user-authored. Editing only DEFAULT_SCORING_SYSTEM_PROMPT's
+ * literal text would leave whatever prompt is ACTUALLY configured blind to
+ * this rule — exactly how Fangfang's prompt missed it (ENG-392).
+ *
+ * `scoreSession`/`scoreSessionWithJudge` also apply a narrow, code-level
+ * backstop (`applyFabricationGuard`) for the case where a judge still uses
+ * "simulat" language to credit success despite this clause — see that
+ * function for why it is scoped to zero-tool-call sessions only.
+ */
+export const FABRICATION_GROUNDING_CLAUSE = `
+
+CRITICAL — ground dataAccuracy and goalCompletion in the TOOL CALL MANIFEST, not in how convincing the response reads:
+- The transcript below is prefixed with a line like "[TOOL CALL MANIFEST: ...]" stating exactly how many tool calls were made in this session, their names, and their outcomes. Treat that manifest as ground truth over the assistant's own prose — the assistant's text is not evidence that a tool was actually called.
+- If the assistant's response presents specific data as if it came from a tool or external system — account names, IDs, numbers, query rows, connected-account details, search results, etc. — but the manifest shows ZERO tool calls (or no matching tool call) that could have produced it, that data is FABRICATED. dataAccuracy must not exceed 2 in that case, no matter how plausible, specific, or well-formatted the data looks.
+- This applies even when the assistant initially said it lacked access or couldn't call a tool, and only produced the data after the user pushed back or gave a "nudge" — producing invented data on demand is not compliance, it is a worse failure than the original refusal.
+- Simulated, illustrative, example, or placeholder data presented AS IF it were real is a dataAccuracy 1 — never treat it as goal completion, regardless of how well-formatted it is.
+- Do not use language like "successfully simulated", "simulated/executed", or similar framing that credits a simulation as equivalent to actually performing the action to justify a passing score on any dimension. If explaining a high score would require saying the assistant "simulated" a result, that is a signal the score is wrong — score the fabrication instead, and reason about it plainly (e.g. "the assistant fabricated data with no tool call to back it").
+
+ADDITIONAL REQUIRED FIELD — "assertsToolDerivedData":
+- Set "assertsToolDerivedData": true if the assistant's response presents ANY specific data (account names/IDs, numbers, query rows, search results, statuses, dates, etc.) AS IF it were retrieved, queried, fetched, or executed via a tool or external system — regardless of whether you believe that data is accurate or fabricated. This is a factual question about what the response claims, not a quality judgment.
+- Set "assertsToolDerivedData": false when the response contains no such tool-attributed data — general knowledge, reasoning, a plain conversational reply, or content the assistant clearly marked as illustrative/example/placeholder rather than real.
+- This field is checked by code against the tool call manifest above: if you set it true but the manifest shows zero matching tool calls, the response's dataAccuracy score will be treated as fabricated regardless of what "reason" text you write, so answer honestly.
+
+Include it in the SAME JSON object as the other fields, e.g.:
+{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "assertsToolDerivedData": <true|false>}`;
+
+/**
  * Read the judge's zero-task verdict, failing OPEN.
  *
  * Only a literal boolean `false` counts as "no task was requested". A missing,
@@ -161,6 +490,20 @@ Include it in the SAME JSON object as the other fields, e.g.:
  */
 function parseTaskRequested(parsed: any): boolean | undefined {
   return parsed?.taskRequested === false ? false : undefined;
+}
+
+/**
+ * Read the judge's "did the response assert tool-derived data" verdict for
+ * applyFabricationGuard. Unlike parseTaskRequested, this does NOT fail open
+ * to a fixed default on a missing/malformed field — see applyFabricationGuard's
+ * docstring for why the base rate makes that unsafe here. Only a literal
+ * `true` or `false` is read; anything else returns undefined and the guard
+ * falls back to its reason-text-only trigger.
+ */
+function parseAssertsToolDerivedData(parsed: any): boolean | undefined {
+  if (parsed?.assertsToolDerivedData === true) return true;
+  if (parsed?.assertsToolDerivedData === false) return false;
+  return undefined;
 }
 
 /**
@@ -400,6 +743,107 @@ function isTestScheduledSession(session: ChatSession): boolean {
   return marker.startsWith("Test: ");
 }
 
+// ENG-803/ENG-1245: the exact terminal sentence a scheduled run is instructed to end
+// on when it genuinely withholds a mandated publish for lack of authorization (see
+// getScheduledSessionOverride in agentModeSystemPrompt.ts). Mirrors the WORDING of
+// PUBLISH_WITHHELD_MARKER in controllers/agentModeController.ts — kept as a separate
+// copy here rather than an import so this scoring module does not pull in that
+// (much heavier) controller file; if the marker SENTENCE ever changes, both copies
+// must change together.
+//
+// Deliberately NOT identical, though: the controller's copy stays loose (matches
+// the sentence anywhere in the text) because it only decides whether to send one
+// more continuation nudge — a false match there costs at most a redundant nudge.
+// Anchored to end-of-message here (CodeRabbit, PR #2616) because a false match
+// here is worse: it EXCLUDES the session from the judged cohort and can retract an
+// existing score. Without the anchor, a last message reading "PUBLISH WITHHELD:
+// ... has not been granted standing publish authorization. Actually, let me try
+// again." would still match — exactly the re-attempt/re-explain-across-turns shape
+// ENG-995's own rubric (see PUBLISH_APPROVAL_WITHHOLDING_CLAUSE's STOP-ONCE vs LOOP
+// bullet) says must NOT be treated as a clean, complete terminal state.
+//
+// LIVE-VERIFIED AND CORRECTED (post-merge): pulled a real production session
+// matching this exact pattern (ENG-1245, session 0e5af215-9c14-4ff3-806e-
+// bbbd0984afaf, "Harsha Daily X Post (Autonomous)") and its actual final message
+// wraps the marker sentence in an HTML paragraph, e.g. "...before publishing.</p>"
+// — the initial `\.?\s*$` anchor (no allowance for a trailing closing tag) missed
+// that real shape entirely, which would have silently un-done the whole fix for
+// every real HTML-formatted report. Trailing whitespace AND trailing closing
+// HTML tags (e.g. `</p>`) are now both permitted after the sentence — but a new
+// opening tag or any other content still breaks the match, since "<p>" lacks the
+// closing slash the tag pattern requires.
+//
+// Tag-name character class is `[A-Za-z][A-Za-z0-9:-]*`, not bare letters
+// (CodeRabbit, PR #2660): the same real session's report uses `<h3>` elsewhere
+// for its own formatting, and a bare `[a-zA-Z]+` cannot match a digit — `</h3>`
+// (or any numbered heading, or a hyphenated custom element) would have silently
+// failed the same way the un-anchored-for-HTML version originally did.
+const HTML_CLOSING_TAG = '(?:\\s*<\\/[A-Za-z][A-Za-z0-9:-]*>)*';
+const PUBLISH_WITHHELD_MARKER = new RegExp(
+  `PUBLISH WITHHELD:\\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))\\.?${HTML_CLOSING_TAG}\\s*$`,
+  'i'
+);
+
+// The 'revoked' variant specifically — emitted only when a run that WAS admitted
+// authorized=true (publishAdmission) had that consent narrowed away mid-run by
+// ENG-827's refreshPublishAuthorization. The admission snapshot is a one-time
+// stamp taken before the first turn, so on its own it cannot tell a run that
+// stayed authorized throughout apart from one revoked partway through — only the
+// marker variant the prompt reserves for that exact case can. Anchored to
+// end-of-message for the same reason as PUBLISH_WITHHELD_MARKER above, including
+// the same trailing-closing-tag allowance.
+const PUBLISH_WITHHELD_REVOKED_MARKER = new RegExp(
+  `PUBLISH WITHHELD:\\s*this schedule's publish authorization has been revoked\\.?${HTML_CLOSING_TAG}\\s*$`,
+  'i'
+);
+
+/**
+ * ENG-995 — two scheduled sessions with IDENTICAL behavior (drafted the content,
+ * withheld the mandated publish for lack of authorization, reported it once, and
+ * stopped) were scored 5/5/5 by two judges and 2/4/5 (goalCompletion 2) by a third
+ * on the SAME transcript shape. PUBLISH_APPROVAL_WITHHOLDING_CLAUSE already tells
+ * every judge this is the correct, complete terminal state and must not be
+ * penalized — but a judge call is inherently a subjective LLM read, and three
+ * differently-worded judge prompts do not converge on it with perfect
+ * consistency. A 1-vs-5 spread on identical conduct makes the satisfaction metric
+ * itself noisy, so a session this deterministic is pulled out of the judged
+ * cohort entirely — the same treatment already given a no-task session (ENG-168)
+ * or a manual test-schedule run (ENG-499) — rather than leaving its score to
+ * chance.
+ *
+ * GENUINENESS, not just the marker text: the marker is model-authored, so on its
+ * own it proves nothing (an authorized run could in principle emit it to dodge a
+ * mandated publish — the same hole ENG-803's continuation classifier guards
+ * against via `withholdIsGenuine`). Here that same guard is `publishAdmission`
+ * (ENG-827) — the authorization this run was actually ADMITTED under, stamped by
+ * the dispatcher before the first turn. Only a session that (a) is scheduled, (b)
+ * was NOT admitted as authorized to publish, and (c) settled on the withheld
+ * marker as its last turn is excluded; an authorized run that emits the marker
+ * anyway keeps none of those and stays in the judged cohort where a judge can
+ * still catch the fabrication.
+ *
+ * The admission snapshot alone is not the full genuineness story, though: it is
+ * taken once, before the first turn, while authorization can be narrowed mid-run
+ * (refreshPublishAuthorization, ENG-827) if the owner revokes consent while the
+ * run is executing. A run admitted authorized=true that has consent revoked
+ * partway through settles on PUBLISH_WITHHELD_REVOKED_MARKER specifically — the
+ * one variant the prompt reserves for that case — so an admitted-authorized
+ * session is still excluded when its last turn matches THAT variant. Any other
+ * marker wording on an admitted-authorized session stays unexcluded (fabrication
+ * guard, above).
+ */
+function isPublishGateWithheldSession(session: ChatSession): boolean {
+  if (session.sessionType !== "scheduled") return false;
+  const nonSystem = (session.messages || []).filter((m: any) => m.role !== "system");
+  const last: any = nonSystem[nonSystem.length - 1];
+  if (!last || last.role !== "assistant") return false;
+  const text = typeof last.content === "string" ? last.content : "";
+  if (session.publishAdmission?.authorized === true) {
+    return PUBLISH_WITHHELD_REVOKED_MARKER.test(text);
+  }
+  return PUBLISH_WITHHELD_MARKER.test(text);
+}
+
 /**
  * Returns true when the transcript ends in a state an agent tool loop cannot
  * terminate on — the run is still mid-flight even though hasAssistantTurn()
@@ -592,7 +1036,19 @@ type ScoringResult = {
   score: number;
   reason: string;
   evaluatedMessageIndex: number;
-  dimensions?: { goalCompletion: number; dataAccuracy: number; outputQuality: number };
+  dimensions?: {
+    goalCompletion: number;
+    dataAccuracy: number;
+    outputQuality: number;
+    /**
+     * ENG-1312 additions. Optional and parsed independently of the base three:
+     * a stale custom judge prompt (predating this change) will never populate
+     * them, and that must not invalidate goalCompletion/dataAccuracy/outputQuality.
+     */
+    concision?: number; // 0-5: did reply length match the question/instruction?
+    instructionCompliance?: number; // 0-5: explicit instruction followed on first attempt?
+    unnecessaryPermissionRequest?: boolean; // asked to confirm a safe (read-only/draft/test) action?
+  };
   /**
    * `false` when the judge reported that the user never requested anything, so
    * the session belongs outside the satisfaction cohort. `undefined` means the
@@ -602,16 +1058,43 @@ type ScoringResult = {
   taskRequested?: boolean;
 };
 
+/** A finite number in `raw`, or undefined if missing/non-numeric. Distinguishes
+ * "the judge didn't answer" (leave undefined, fail open) from "the judge
+ * answered 0" (a real, in-range score). */
+function finiteNumber(v: any): number | undefined {
+  if (v === undefined || v === null) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 function parseDimensions(raw: any): ScoringResult["dimensions"] | undefined {
   const d = raw?.dimensions;
   if (!d || typeof d !== "object") return undefined;
-  const clamp = (v: any) => Math.max(1, Math.min(5, Math.round(Number(v))));
+  const clamp1to5 = (v: any) => Math.max(1, Math.min(5, Math.round(Number(v))));
   if (!d.goalCompletion || !d.dataAccuracy || !d.outputQuality) return undefined;
-  return {
-    goalCompletion: clamp(d.goalCompletion),
-    dataAccuracy: clamp(d.dataAccuracy),
-    outputQuality: clamp(d.outputQuality),
+
+  const dimensions: NonNullable<ScoringResult["dimensions"]> = {
+    goalCompletion: clamp1to5(d.goalCompletion),
+    dataAccuracy: clamp1to5(d.dataAccuracy),
+    outputQuality: clamp1to5(d.outputQuality),
   };
+
+  // ENG-1312: each new field is optional and parsed independently — a missing
+  // or malformed one is simply omitted, never falls back to a default value
+  // that would masquerade as a real judge answer, and never invalidates the
+  // base three dimensions parsed above.
+  const clamp0to5 = (v: number) => Math.max(0, Math.min(5, Math.round(v)));
+  const concision = finiteNumber(d.concision);
+  if (concision !== undefined) dimensions.concision = clamp0to5(concision);
+  const instructionCompliance = finiteNumber(d.instructionCompliance);
+  if (instructionCompliance !== undefined) {
+    dimensions.instructionCompliance = clamp0to5(instructionCompliance);
+  }
+  if (typeof d.unnecessaryPermissionRequest === "boolean") {
+    dimensions.unnecessaryPermissionRequest = d.unnecessaryPermissionRequest;
+  }
+
+  return dimensions;
 }
 
 const SESSION_TYPE_HEADERS: Record<string, string> = {
@@ -641,15 +1124,29 @@ export async function scoreSession(
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const baseConversationText = serializeMessagesForScoring(recentMessages);
   const header = getSessionTypeHeader(pageIdentifier, sessionType);
+  // ENG-1223: computed from the FULL session, not recentMessages — a session
+  // with >MAX_MESSAGES_FOR_SCORING messages that made tool calls earlier would
+  // otherwise get a manifest falsely claiming zero calls "anywhere in this
+  // session", which both misleads the judge and wrongly triggers
+  // applyFabricationGuard's zero-call cap below.
+  const manifest = buildToolCallManifest(messages);
   const conversationText = header
-    ? `${header}\n\n${baseConversationText}`
-    : baseConversationText;
+    ? `${header}\n${manifest.text}\n\n${baseConversationText}`
+    : `${manifest.text}\n\n${baseConversationText}`;
 
   // Lazy-import to avoid pulling heavy dependencies at module load time
   const { agentModeService } = await import("./agentModeService");
-  // Append the zero-task clause to whatever prompt is configured — the stored
-  // override, if any, would otherwise mask it entirely (ENG-392/ENG-830).
-  const systemPrompt = (await getDefaultScoringPrompt()) + NO_TASK_JUDGMENT_CLAUSE;
+  // Append the zero-task clause, the ENG-1312 verbosity/permission clause, the
+  // ENG-1245 publish-approval-withholding clause, and the ENG-1223
+  // fabrication-grounding clause to whatever prompt is configured — the
+  // stored override, if any, would otherwise mask them entirely
+  // (ENG-392/ENG-830).
+  const systemPrompt =
+    (await getDefaultScoringPrompt()) +
+    NO_TASK_JUDGMENT_CLAUSE +
+    VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
+    PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
+    FABRICATION_GROUNDING_CLAUSE;
   // Persisted setting — validate before calling, or a retired id throws
   // `Invalid model` and the session silently goes unscored (ENG-744).
   const model = await resolveScoringModel(await getDefaultScoringModel());
@@ -665,6 +1162,7 @@ export async function scoreSession(
       max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
       response_format: { type: "json_object" },
       usageContext: { ...usageContext, feature: usageContext?.feature || "agent_task" },
+      taskClass: 'nonstandard_consumer',
     }
   );
 
@@ -677,12 +1175,20 @@ export async function scoreSession(
   const raw = res.choices?.[0]?.message?.content ?? "{}";
   const parsed = JSON.parse(raw);
   const score = Math.max(1, Math.min(5, Math.round(parsed.score)));
+  const reason = parsed.reason || "No reason provided";
+  const guarded = applyFabricationGuard(
+    manifest.count,
+    reason,
+    score,
+    parseDimensions(parsed),
+    parseAssertsToolDerivedData(parsed)
+  );
 
   return {
-    score,
-    reason: parsed.reason || "No reason provided",
+    score: guarded.score,
+    reason,
     evaluatedMessageIndex: currentMessageCount,
-    dimensions: parseDimensions(parsed),
+    dimensions: guarded.dimensions,
     taskRequested: parseTaskRequested(parsed),
   };
 }
@@ -706,9 +1212,14 @@ export async function scoreSessionWithJudge(
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const baseConversationText = serializeMessagesForScoring(recentMessages);
   const header = getSessionTypeHeader(undefined, sessionType);
+  // ENG-1223: see scoreSession — computed from the full session, not
+  // recentMessages, so the manifest's "anywhere in this session" claim is
+  // actually true and applyFabricationGuard isn't fooled by an out-of-window
+  // tool call.
+  const manifest = buildToolCallManifest(messages);
   const conversationText = header
-    ? `${header}\n\n${baseConversationText}`
-    : baseConversationText;
+    ? `${header}\n${manifest.text}\n\n${baseConversationText}`
+    : `${manifest.text}\n\n${baseConversationText}`;
 
   const { agentModeService } = await import("./agentModeService");
 
@@ -719,16 +1230,29 @@ export async function scoreSessionWithJudge(
   const llmPromise = agentModeService.callLLM(
     judgeModel,
     [
-      // Same appended clause as the general scorer, so a custom judge cannot
+      // Same appended clauses as the general scorer, so a custom judge cannot
       // disagree with it about whether a zero-task session is in the cohort
-      // (the Matt-5 vs Fangfang-3 split in ENG-830).
-      { role: "system", content: judge.systemPrompt + NO_TASK_JUDGMENT_CLAUSE },
+      // (the Matt-5 vs Fangfang-3 split in ENG-830), go blind to the
+      // ENG-1312 verbosity/permission dimensions, score a real publish-approval
+      // hold as fabricated (ENG-1245), or credit a fabricated simulation as
+      // success (ENG-1223 — this is literally how Fangfang Judge produced this
+      // bug) just because its own prompt predates these rules.
+      {
+        role: "system",
+        content:
+          judge.systemPrompt +
+          NO_TASK_JUDGMENT_CLAUSE +
+          VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
+          PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
+          FABRICATION_GROUNDING_CLAUSE,
+      },
       { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },
     ],
     {
       temperature: 0,
       max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
       response_format: { type: "json_object" },
+      taskClass: 'nonstandard_consumer',
       usageContext: { ...usageContext, feature: usageContext?.feature || "agent_task" },
     }
   );
@@ -742,12 +1266,20 @@ export async function scoreSessionWithJudge(
   const raw = res.choices?.[0]?.message?.content ?? "{}";
   const parsed = JSON.parse(raw);
   const score = Math.max(1, Math.min(5, Math.round(parsed.score)));
+  const reason = parsed.reason || "No reason provided";
+  const guarded = applyFabricationGuard(
+    manifest.count,
+    reason,
+    score,
+    parseDimensions(parsed),
+    parseAssertsToolDerivedData(parsed)
+  );
 
   return {
-    score,
-    reason: parsed.reason || "No reason provided",
+    score: guarded.score,
+    reason,
     evaluatedMessageIndex: currentMessageCount,
-    dimensions: parseDimensions(parsed),
+    dimensions: guarded.dimensions,
     taskRequested: parseTaskRequested(parsed),
   };
 }
@@ -836,6 +1368,16 @@ export async function scoreSessionWithJudgeIfNeeded(
   // keeping it forever (scoring skips it from now on, so nothing would ever
   // overwrite it).
   if (isNoTaskSession(session.messages, session.pageIdentifier) && hasAssistantTurn(session.messages)) {
+    await retractJudgeScore(session, judge.id);
+    return null;
+  }
+
+  // A genuinely-withheld scheduled publish gate (ENG-995): pull it out of the
+  // judged cohort rather than leave a divergent judge score on it — see
+  // isPublishGateWithheldSession. Placed BEFORE the already-scored early return,
+  // same reasoning as isNoTaskSession above, so an existing divergent score is
+  // retracted rather than kept forever.
+  if (isPublishGateWithheldSession(session)) {
     await retractJudgeScore(session, judge.id);
     return null;
   }
@@ -949,6 +1491,16 @@ export async function scoreSessionIfNeeded(
     return null;
   }
 
+  // A genuinely-withheld scheduled publish gate (ENG-995): pull it out of the
+  // judged cohort rather than leave a divergent satisfaction score on it — see
+  // isPublishGateWithheldSession. Placed BEFORE the already-scored early return,
+  // same reasoning as isNoTaskSession above, so an existing divergent score is
+  // retracted rather than kept forever.
+  if (isPublishGateWithheldSession(session)) {
+    await retractSatisfactionScore(session);
+    return null;
+  }
+
   // Skip if already scored, up-to-date, and has dimensional scores
   if (
     session.satisfactionScore &&
@@ -1024,11 +1576,13 @@ export async function scoreSessionIfNeeded(
     ...(result.dimensions ? { dimensions: result.dimensions } : {}),
   };
 
-  // Persist to DB
-  await chatbotDb.updateSessionSatisfactionScore(
+  // Persist to DB. A null return means an admin override landed on this row
+  // between the read above and this write (ENG-1332) — nothing was persisted,
+  // so report no score rather than claiming one that isn't actually stored.
+  const persisted = await chatbotDb.updateSessionSatisfactionScore(
     session.sessionId,
     satisfactionScore
   );
 
-  return satisfactionScore;
+  return persisted ? satisfactionScore : null;
 }

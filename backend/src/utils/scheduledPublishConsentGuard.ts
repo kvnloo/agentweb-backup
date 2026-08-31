@@ -2,6 +2,7 @@ import {
   resolveSchedulePublishAuthorization,
   narrowPublishAuthorization,
   isPublishCall,
+  isPublishCallWithinAuthorizedScope,
   SchedulePublishAuthorization,
 } from './schedulePublishAuthorization';
 import { extractScheduleId } from './schedulePublishApproval';
@@ -32,6 +33,8 @@ import { extractScheduleId } from './schedulePublishApproval';
 
 export interface ScheduledPublishRefusal {
   success: false;
+  blocked: true;
+  reason: 'publish_consent';
   error: string;
 }
 
@@ -162,6 +165,8 @@ export function readAdmittedAuthorization(session: any): SchedulePublishAuthoriz
 function refuse(toolName: string, detail: string): ScheduledPublishRefusal {
   return {
     success: false,
+    blocked: true,
+    reason: 'publish_consent',
     error:
       `${toolName} was not executed: this unattended scheduled run is not authorized to publish. ${detail} ` +
       `Do NOT retry this tool in this run. Save the content as a draft, state plainly that it is ` +
@@ -214,6 +219,8 @@ export async function refuseUnauthorizedScheduledPublish(
     );
     return {
       success: false,
+      blocked: true,
+      reason: 'publish_consent',
       error:
         `${toolName} was not executed: this run's publishing authorization could not be confirmed, ` +
         `and an unconfirmed permission is treated as withheld — a live post cannot be un-made. ` +
@@ -286,8 +293,12 @@ export async function refuseUnauthorizedScheduledPublish(
 
   // Gate on the boolean AND the approved scope. Consent is recorded against the publish
   // tools the owner could see when they gave it, so a run can be authorized for one tool
-  // while reaching for another they never approved — that call is refused.
-  if (!authorization.authorized || !authorization.tools.includes(toolName)) {
+  // while reaching for another they never approved — that call is refused. ENG-1045: the
+  // scope check also credits a call that ACHIEVES an approved tool's mandated outcome
+  // via an equivalent route (e.g. a thread through twitter_manage_post satisfying a
+  // post_on_connected_account grant) — without it this gate refused the exact call the
+  // completion checker's equivalence route exists to credit, before that logic ever ran.
+  if (!authorization.authorized || !isPublishCallWithinAuthorizedScope(toolName, args, authorization.tools)) {
     return refuse(
       toolName,
       authorization.tools.length > 0

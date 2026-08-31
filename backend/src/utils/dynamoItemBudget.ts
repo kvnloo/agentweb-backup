@@ -113,3 +113,90 @@ export const trimListToItemBudget = <T>(
   const kept = keptReversed.reverse();
   return { kept, dropped: entries.length - kept.length };
 };
+
+/**
+ * ENG-1071: read-only diagnosis of WHY a schedule is under storage pressure,
+ * for surfaces (Emma, the portal) that only have the failure symptom — a bare
+ * `500`/`400` — and no way to see which field is actually consuming the
+ * item's budget. This is deliberately read-only: it reports byte counts, it
+ * never trims, prunes, or writes anything (that stays ENG-1048's job, on the
+ * write path above).
+ */
+export type ScheduleStorageField = 'currentPrompt' | 'promptRevisions' | 'runResults' | 'other';
+
+export interface ScheduleStorageDiagnostics {
+  /** Total marshaled item size, same estimator the write path budgets against. */
+  totalBytes: number;
+  /** DynamoDB's hard per-item ceiling (`DYNAMO_MAX_ITEM_BYTES`). */
+  limitBytes: number;
+  /** The working budget writes are held to (`SCHEDULE_ITEM_BUDGET_BYTES` by default). */
+  budgetBytes: number;
+  /** Byte contribution of each bounded field — sizes only, never the field's content. */
+  fields: {
+    currentPrompt: number;
+    promptRevisions: number;
+    runResults: number;
+    other: number;
+  };
+  /** Which field is consuming the most of the item's budget. */
+  dominantField: ScheduleStorageField;
+  /** True once `totalBytes` has crossed `budgetBytes`. */
+  approachingLimit: boolean;
+  /** Recommended next step, or `null` when nothing is needed. Never null when approachingLimit is true. */
+  correctiveAction: string | null;
+}
+
+const SCHEDULE_STORAGE_FIELD_LABELS: Record<ScheduleStorageField, string> = {
+  currentPrompt: 'the current starting message',
+  promptRevisions: 'saved prompt-edit history (promptRevisions)',
+  runResults: 'saved run history (runResults)',
+  other: 'other schedule fields',
+};
+
+/** Marshaled size of a single named attribute as it contributes to the item, name + value. */
+const fieldBytes = (item: Record<string, any>, key: string): number =>
+  estimateDynamoItemBytes({ [key]: item?.[key] });
+
+/**
+ * Byte breakdown for the three fields that actually grow without bound
+ * (`startingMessage`, `promptRevisions`, `runResults`), the dominant
+ * contributor, and — once the schedule has crossed its working budget — the
+ * one corrective action a customer can take themselves. Never returns any
+ * field's actual content, only sizes: safe to hand to Emma or the portal.
+ */
+export const getScheduleStorageDiagnostics = (
+  schedule: Record<string, any> | null | undefined,
+  budgetBytes: number = SCHEDULE_ITEM_BUDGET_BYTES,
+): ScheduleStorageDiagnostics => {
+  const item = schedule || {};
+  const currentPrompt = fieldBytes(item, 'startingMessage');
+  const promptRevisions = fieldBytes(item, 'promptRevisions');
+  const runResults = fieldBytes(item, 'runResults');
+  const totalBytes = estimateDynamoItemBytes(item);
+  const other = Math.max(0, totalBytes - currentPrompt - promptRevisions - runResults);
+
+  const fields = { currentPrompt, promptRevisions, runResults, other };
+  const dominantField = (Object.keys(fields) as ScheduleStorageField[]).reduce((leader, candidate) =>
+    fields[candidate] > fields[leader] ? candidate : leader
+  );
+
+  const approachingLimit = totalBytes >= budgetBytes;
+  const correctiveAction = approachingLimit
+    ? `This schedule is using about ${Math.round(totalBytes / 1024)}KB of DynamoDB's `
+      + `${Math.round(DYNAMO_MAX_ITEM_BYTES / 1024)}KB per-item limit, mostly from `
+      + `${SCHEDULE_STORAGE_FIELD_LABELS[dominantField]}. AgentWeb automatically trims the oldest `
+      + 'saved prompt-revision and run-history entries on every edit to stay under the limit — if '
+      + 'edits keep failing anyway, shorten the starting message, since that is the only field you '
+      + 'can reduce directly.'
+    : null;
+
+  return {
+    totalBytes,
+    limitBytes: DYNAMO_MAX_ITEM_BYTES,
+    budgetBytes,
+    fields,
+    dominantField,
+    approachingLimit,
+    correctiveAction,
+  };
+};

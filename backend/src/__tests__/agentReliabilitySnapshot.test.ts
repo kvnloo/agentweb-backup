@@ -169,6 +169,31 @@ describe('computeReliabilitySnapshot (pure)', () => {
     expect(snap.topClusters.some((c) => c.toolName === 'crm')).toBe(false);
   });
 
+  it('does not collide two distinct toolName/errorClass pairs that share the same joined string (CodeRabbit, PR #2443)', () => {
+    // "alpha beta" + "gamma" and "alpha" + "beta gamma" both naively join to
+    // "alpha beta gamma" under a plain `${toolName} ${errorClass}` key.
+    const start = new Date('2026-06-13T18:00:00Z');
+    const events: NormalizedEvent[] = [
+      ev(EVT_TOOL_FAILED, '2026-06-14T01:00:00Z', { toolName: 'alpha beta', errorClass: 'gamma' }),
+      ev(EVT_TOOL_FAILED, '2026-06-14T01:01:00Z', { toolName: 'alpha', errorClass: 'beta gamma' }),
+    ];
+    const snap = computeReliabilitySnapshot({
+      events,
+      date: '2026-06-14',
+      windowStart: start,
+      windowEnd: NOW,
+      windowLabel: '24h',
+      now: NOW,
+    });
+    expect(snap.topClusters).toHaveLength(2);
+    expect(snap.topClusters).toEqual(
+      expect.arrayContaining([
+        { toolName: 'alpha beta', errorClass: 'gamma', count: 1 },
+        { toolName: 'alpha', errorClass: 'beta gamma', count: 1 },
+      ]),
+    );
+  });
+
   it('ignores events outside the window', () => {
     const start = new Date('2026-06-14T00:00:00Z');
     const events: NormalizedEvent[] = [

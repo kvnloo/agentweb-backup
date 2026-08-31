@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { userDb, User } from './db';
 import { invalidateCachedPixels } from './metaPixelsCache';
+import type { DailyVolumeState } from './linkedInWritePacer';
 
 // ============================================
 // Type Definitions
@@ -64,6 +65,42 @@ export interface LinkedInOutreachConfig {
   // Premium LinkedIn accounts allow 300-char invitation notes (free accounts: 200).
   // User-set in Settings → Connected accounts. Absent/false = free tier.
   is_premium?: boolean;
+  /**
+   * Self-reported daily LinkedIn connection-request ceiling (linkedInWritePacer.ts).
+   * Set directly by the user in Settings, or by Emma via the linkedin_outreach
+   * `set-daily-invite-cap` action after asking whether the account has LinkedIn
+   * Premium. Deliberately NOT auto-detected — see the pacer's module doc comment.
+   * Unset defaults to the conservative free-tier number; the pacer clamps any
+   * value to its own absolute system-wide ceiling regardless of what's stored here.
+   */
+  daily_invite_cap?: number;
+  /**
+   * Durable daily-volume counters (linkedInWritePacer.ts). Persisted here —
+   * not in process memory — specifically so a backend restart (which happens
+   * on every merge to `main`) can't reset an account's daily send count to
+   * zero mid-day. Written by the pacer's caller, never read/written directly
+   * anywhere else.
+   */
+  daily_volume?: DailyVolumeState;
+  /**
+   * Persisted session health (ENG-1197).
+   *
+   * Unipile owns this session's lifecycle, so `token_expires_at` is a sentinel and
+   * says nothing about liveness — only a live probe does. That probe's result used
+   * to live exclusively in an in-process 10-minute Map, which meant the moment a
+   * session died was observed and then thrown away: no stored state, therefore no
+   * connected→disconnected TRANSITION, therefore nothing an alert could key on. A
+   * daily scheduled run rediscovered it hours later and silently no-opped.
+   *
+   * Storing it turns a level ("is dead right now", true on every one of the 288
+   * daily poll cycles) into an edge ("just died"), which is the only thing safe to
+   * notify a customer about. `disconnect_notified_at` then paces the reminder for a
+   * session that stays dead for weeks.
+   */
+  needs_reconnect?: boolean;     // set when a probe proves the session dead; cleared on reconnect
+  disconnected_at?: string;      // ISO — when the disconnect was first observed
+  last_verified_at?: string;     // ISO — last time a probe proved the session live
+  disconnect_notified_at?: string; // ISO — last owner notification, for reminder pacing
 }
 
 /**
@@ -259,6 +296,18 @@ export interface GoogleAdsConfig extends BaseOAuthConfig {
   account_type: 'google_ads';
   customer_id: string;
   currency: string;
+  /**
+   * ENG-1362. Google's `test_account` flag, captured at connect time.
+   *
+   * `true` is Google's guarantee that the account cannot serve ads and cannot spend.
+   * `false` means real money. **Absent** means the account was connected before this was
+   * recorded — which must be read as billable, never as safe, and is resolved live by
+   * `googleAdsService.isTestAccount`.
+   *
+   * Stored because the account NAME carries no such guarantee: a real, billable, ENABLED
+   * account descriptively named "Test" is exactly the case this field disambiguates.
+   */
+  test_account?: boolean;
   /**
    * The manager (MCC) account id to send as `login-customer-id` on every Google Ads
    * API call for this account. Set when the account is a leaf reached through a manager
@@ -680,6 +729,8 @@ export type AccountConfigMutation =
   | ((freshConfig: Record<string, any>) => {
       updates: Record<string, any>;
       unset?: string[];
+      /** Return without writing when the fresh state declines the mutation. */
+      skip?: boolean;
     });
 
 export const updateAccountConfig = async (
@@ -719,9 +770,11 @@ export const updateAccountConfig = async (
     const existingAccount = accounts[accountIndex];
 
     const isDerived = typeof configUpdates === 'function';
-    const { updates, unset } = isDerived
+    const mutation = isDerived
       ? configUpdates(existingAccount.config || {})
       : { updates: configUpdates, unset: options?.unset };
+    if (mutation.skip) return;
+    const { updates, unset } = mutation;
 
     const mergedConfig: Record<string, any> = {
       ...existingAccount.config,

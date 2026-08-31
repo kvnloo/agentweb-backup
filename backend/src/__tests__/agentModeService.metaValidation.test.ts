@@ -687,6 +687,20 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(out).toContain('Confirm B');
     });
 
+    it('batches AD, AD_SET, and CAMPAIGN writes into one confirmation prompt', () => {
+      const out = (service as any).collectConfirmationPrompt([
+        awaiting('Update AD: pause Prospecting Ad'),
+        awaiting('Update AD_SET: pause Prospecting Ad Set'),
+        awaiting('Update CAMPAIGN: pause Prospecting Campaign'),
+      ]);
+
+      expect(out).toContain('3 changes I\'m about to make');
+      expect(out).toContain('AD: pause Prospecting Ad');
+      expect(out).toContain('AD_SET: pause Prospecting Ad Set');
+      expect(out).toContain('CAMPAIGN: pause Prospecting Campaign');
+      expect(out.match(/Reply "yes" \/ "confirm"/g)?.length).toBe(1);
+    });
+
     it('batches multiple confirmations under ONE intro/footer using confirmationDetail', () => {
       const detailItem = (detail: string, prompt: string) => ({
         status: 'success' as const,

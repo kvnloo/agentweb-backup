@@ -124,7 +124,8 @@ All agent-engine secrets live in **GCP Secret Manager** (project
 |---|---|---|
 | `agentengine-prod-aws-credentials` | JSON | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` for a dedicated `aw_agentengine_user` IAM user (DynamoDB/S3/Bedrock only, least-privilege) |
 | `agentengine-prod-azure-openai`, `-2`, `-3` | JSON | `apiKey`, `endpoint`, `apiVersion` per Azure OpenAI config slot |
-| `agentengine-prod-openai`, `-gemini`, `-google-image`, `-deepseek`, `-pld-deepseek`, `-resend`, `-google-search`, `-runway`, `-reelmind`, `-openai-image`, `-github`, `-jwt-secret`, `-scheduled-chats-service-secret` | plain string | corresponding API key/secret |
+| `agentengine-prod-openrouter` | plain string | OpenRouter gateway key for all text/tool model calls |
+| `agentengine-prod-openai`, `-gemini`, `-google-image`, `-deepseek`, `-pld-deepseek`, `-resend`, `-google-search`, `-runway`, `-reelmind`, `-openai-image`, `-github`, `-jwt-secret`, `-scheduled-chats-service-secret` | plain string | corresponding API key/secret; retain `-openai` for `consult_agi` and `-gemini` for file/video analysis. Only `-deepseek` and `-pld-deepseek` become removable after the OpenRouter cutover; non-text provider entries remain explicit |
 | `agentengine-prod-smtp` | JSON | `user`, `pass` — used by task-level (in-process) email notifications only, readable by the main VM service account |
 | `agentengine-prod-alert-smtp` | JSON | `user`, `pass` — separate copy, used ONLY by `alert_oncall.py`'s process-failure alert. Scoped to the `agentengine-alerter@...` SA alone; the main VM service account has no access. Deliberately a different secret from `agentengine-prod-smtp` even though the credentials may be the same mailbox — the isolation is about which identity can *read* it, not the content |
 | `agentengine-prod-github-deploy-token` | JSON | `username`, `token` — GitHub PAT for `git clone`/`pull` of the private `AgentWebPro/agentweb` repo |

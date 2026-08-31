@@ -3,6 +3,7 @@ import { userDb, orgDb } from '../services/db';
 import { CUSTOMER_PORTAL_PAGES } from '../services/customerPortalPages';
 import {
   getUserSubscriptionType,
+  getUserSubscriptionResolution,
   getSubscriptionTypeConfig,
   getAllAvailableFunctionCalls,
   getAllAvailablePages,
@@ -92,6 +93,15 @@ describe('subscriptionService', () => {
     mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u2' } as any);
     const t2 = await getUserSubscriptionType('u2');
     expect(t2).toBe('Free');
+  });
+
+  it('marks a missing user as unresolved instead of a confirmed Free subscription', async () => {
+    mockedUserDb.getUserById.mockResolvedValueOnce(null as any);
+
+    await expect(getUserSubscriptionResolution('missing-user')).resolves.toEqual({
+      subscriptionType: 'Free',
+      resolved: false,
+    });
   });
 
   it('uses an explicit feature entitlement without relying on the tier name', async () => {

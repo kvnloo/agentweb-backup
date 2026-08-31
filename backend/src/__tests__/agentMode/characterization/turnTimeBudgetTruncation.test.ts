@@ -248,6 +248,36 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(elapsedMs).toBeLessThanOrEqual(CAP_MS);
   });
 
+  it('still prefers the ledger recap over the time-limit message when the forced synthesis returns residue (ENG-1576 correction)', async () => {
+    // A forced-final-synthesis turn (truncatedByTimeBudget) can ALSO produce
+    // residue-shaped output ("}]") — isUnusableSynthesis runs unconditionally, so
+    // the two flags are not mutually exclusive (CodeRabbit question, PR #2639). An
+    // earlier revision of this fix made that combination defer to the generic
+    // time-limit message instead of the ledger recap — but that's wrong:
+    // synthesisResidueDropped also covers ENG-1188's echoed-nudge detection
+    // (including the wall-clock nudge specifically — see nudgeEchoRecovery.test.ts's
+    // "recovers with the executed-action ledger when the forced synthesis turn
+    // echoes the time-budget nudge"), and ENG-1188's entire point is that an echoed
+    // nudge must never reach the user, EVEN under time-budget truncation. Since
+    // isUnusableSynthesis gives the caller no way to distinguish plain residue from
+    // a nudge echo, the ledger recap has to win for both — reverted to match.
+    const { result, elapsedMs, finalSynthesisPerCall } = await runRealLoop((call, isFinalSynthesis) =>
+      isFinalSynthesis
+        ? { content: '}]' }
+        : {
+            content: '',
+            tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
+          },
+    );
+
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/built directly from the actions I actually ran/);
+    expect(result.content).toContain('twitter_outreach');
+    expect(result.content).not.toMatch(/time limit/i);
+    expect(finalSynthesisPerCall.filter(Boolean)).toHaveLength(1);
+    expect(elapsedMs).toBeLessThanOrEqual(CAP_MS);
+  });
+
   it('delivers a token-truncated synthesis as-is instead of spending the reserve on a continuation', async () => {
     // Same hazard from the other continuation ladder: a synthesis that stops on
     // max_tokens normally gets a "keep going" round trip. Inside the reserve there is no
@@ -375,12 +405,7 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(result.content).toMatch(/time limit/i);
   });
 
-  it('stops waiting on a permitted backup that turns out to be slower than the time left', async () => {
-    // The affordability estimate is drawn from calls this run already made, and the backup
-    // is by definition a DIFFERENT model — it can be slower than anything measured. An
-    // estimate is therefore not a guarantee, so the admitted retry is also hard-bounded: if
-    // it overruns, the turn stops waiting and delivers the partial answer instead of letting
-    // the controller's cap fire and discard everything.
+  it('does not issue a second model call after a transient forced-synthesis failure', async () => {
     let call = 0;
     const modelsCalled: string[] = [];
     jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
@@ -393,10 +418,6 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       );
       modelsCalled.push(args[0]);
       if (isFinalSynthesis) {
-        if (modelsCalled.filter((_, i) => i >= 0).length && args[0] !== service.default_model) {
-          // The backup: never answers within the bound.
-          return new Promise(() => {});
-        }
         nowMs += 1_000;
         throw new Error('Too many requests, please try again later');
       }
@@ -406,37 +427,21 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
         tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
       });
     });
-    jest.spyOn(service as any, 'getBackupModel').mockResolvedValue('gpt-5-chat-2');
     jest.spyOn(service as any, 'executeTool').mockResolvedValue(
       JSON.stringify({ success: true, data: 'mock' }),
     );
     jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
-    // The bound is real wall-clock (minutes), so fire it immediately to keep the test fast.
-    // Restored in `finally` — jest.clearAllMocks() does NOT put the real timer back, and a
-    // leaked instant setTimeout would quietly corrupt every later test in this file.
-    const timerSpy = jest.spyOn(global, 'setTimeout').mockImplementation(((fn: any) => {
-      Promise.resolve().then(() => fn());
-      return { unref() {} } as any;
-    }) as any);
+    const result = (await service.generateMarketingResponse(
+      'Find me the 10 best X posts about agentic wallets, 10 more to reply to, 5 accounts to monitor, and the order to reply in.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+      false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+      nowMs,
+    )) as any;
 
-    let result: any;
-    try {
-      result = (await service.generateMarketingResponse(
-        'Find me the 10 best X posts about agentic wallets, 10 more to reply to, 5 accounts to monitor, and the order to reply in.',
-        [] as any,
-        'test-user',
-        service.default_model,
-        'test-session',
-        false, undefined, undefined, false, undefined, undefined, undefined, false, false,
-        nowMs,
-      )) as any;
-    } finally {
-      timerSpy.mockRestore();
-    }
-
-    // The backup WAS attempted (the estimate allowed it) but never answered, and the turn
-    // still came back with the partial-delivery message instead of hanging into the cap.
-    expect(modelsCalled).toContain('gpt-5-chat-2');
+    expect(new Set(modelsCalled)).toEqual(new Set([service.default_model]));
     expect(result.truncatedByTimeBudget).toBe(true);
     expect(result.content).toMatch(/time limit/i);
   });

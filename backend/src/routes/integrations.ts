@@ -73,6 +73,10 @@ router.post('/linear/webhook', async (req, res) => {
       payload?.data?.id;
 
     if (transitionedIntoDone) {
+      // ENG-1268's pre-flight verification gate (require a structured customer-symptom-check
+      // comment before the resolve bridge could fire) is deliberately removed (Harsha, 2026-08-25:
+      // "i don't give a shit about closure risk anymore its annoying, torch it"). Any transition
+      // into Done fires the resolve bridge, exactly like a non-customer-reported issue always did.
       const { notifyCanonicalResolved } = await import('../services/intakeService');
       const r = await notifyCanonicalResolved(payload.data.id, payload.data.title || undefined);
       return res.json({ ok: true, notified: r.ticketNumbers.length, ticketNumbers: r.ticketNumbers });

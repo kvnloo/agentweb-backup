@@ -115,3 +115,43 @@ describe('isAnonymizedSearchItem', () => {
     );
   });
 });
+
+describe('the anonymized sentinel must not build a URL that defeats the rule', () => {
+  // `isAnonymizedSearchLead` returns early on any truthy `linkedin`, so a URL built
+  // from LinkedIn's `"undefined"` sentinel short-circuits the brand-token and
+  // empty-name rules underneath it. That kept exactly the rows this function exists
+  // to reject — and since every one of them normalizes to the SAME lookup key, the
+  // CRM write boundary could merge distinct real people into a single lead.
+
+  it('rejects an anonymized item whose placeholder name is not the en-US spelling', () => {
+    expect(isAnonymizedSearchItem({
+      name: 'Miembro de LinkedIn',
+      public_identifier: 'undefined',
+    })).toBe(true);
+  });
+
+  it('rejects an anonymized item with no name at all', () => {
+    expect(isAnonymizedSearchItem({ public_identifier: 'undefined' })).toBe(true);
+  });
+
+  it('rejects one whose profile_url is the fabricated link', () => {
+    expect(isAnonymizedSearchItem({
+      name: 'Miembro de LinkedIn',
+      profile_url: 'https://www.linkedin.com/in/undefined?trk=x',
+    })).toBe(true);
+  });
+
+  it('still keeps a real person who has a real slug', () => {
+    expect(isAnonymizedSearchItem({
+      name: 'Jennifer Sun',
+      public_identifier: 'jennifer-sun-1a2b3c',
+    })).toBe(false);
+  });
+
+  it('still keeps a real person known only by profile_url', () => {
+    expect(isAnonymizedSearchItem({
+      name: 'Jennifer Sun',
+      profile_url: 'https://www.linkedin.com/in/jennifer-sun-1a2b3c?trk=search',
+    })).toBe(false);
+  });
+});

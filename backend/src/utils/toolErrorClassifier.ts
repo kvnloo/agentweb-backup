@@ -10,8 +10,8 @@
  * Classes are intentionally coarse and stable — they feed the agent-mode
  * loop's failure clustering and the inspector UI, so renaming one is a
  * breaking change for historical queries:
- *   timeout | auth | rate_limit | invalid_args | not_found | network |
- *   upstream_5xx | policy_blocked | repeated_failure |
+ *   timeout | auth | rate_limit | quota_exceeded | invalid_args | not_found |
+ *   network | upstream_5xx | policy_blocked | repeated_failure |
  *   tool_unavailable | upstream_rejected | empty_result | invalid_output
  *
  * The three trailing classes were added 2026-06-14 after a 7-day production
@@ -44,6 +44,7 @@
 const GATEWAY_NAME_CLASSES: Record<string, string> = {
   AgentToolBudgetExceededError: 'repeated_failure',
   AgentToolPolicyBlockedError: 'policy_blocked',
+  ToolResultPolicyBlockedError: 'policy_blocked',
   AgentToolRepeatedFailureError: 'repeated_failure',
   AgentToolContractValidationError: 'invalid_args',
   // A tool returned without throwing but produced no usable output (ENG-105).
@@ -74,6 +75,14 @@ function classFromStatus(status: number): string | null {
 function classFromMessage(message: string): string | null {
   const m = message.toLowerCase();
 
+  // Hard quota exhaustion (OpenAI/Azure `insufficient_quota`, "exceeded your
+  // current quota, please check your plan and billing details") is a
+  // permanent billing stop even though the provider surfaces it as HTTP 429 —
+  // checked before the status/rate-limit matches below so it isn't folded
+  // into the transient 'rate_limit' class, which is exempt from the
+  // session-wide media budget (ENG-1220).
+  if (/insufficient_quota|exceeded your current quota|quota exceeded|check your plan and billing/.test(m)) return 'quota_exceeded';
+
   // HTTP status embedded in the message ("status code 429", "503 Service…").
   const statusMatch = m.match(/(?:status(?:\s+code)?\s+|^|\s)([45]\d{2})(?:\s|$|[^\d])/);
   if (statusMatch) {
@@ -87,7 +96,7 @@ function classFromMessage(message: string): string | null {
   if (/is not available\. you must install the required skill|install_skills/.test(m)) return 'tool_unavailable';
 
   if (/etimedout|timed?\s*out|deadline exceeded|operation was aborted/.test(m)) return 'timeout';
-  if (/too many requests|rate limit|quota exceeded/.test(m)) return 'rate_limit';
+  if (/too many requests|rate limit/.test(m)) return 'rate_limit';
 
   // Bad arguments the model emitted — schema-validation rejections (the
   // contract layer rejects before execution) plus classic validation phrasing.
@@ -132,6 +141,18 @@ export function classifyToolErrorClass(error: unknown): string {
     const byName = GATEWAY_NAME_CLASSES[error.name]
       ?? GATEWAY_NAME_CLASSES[error.constructor?.name ?? ''];
     if (byName) return byName;
+
+    // AWS SDK v2 (DynamoDB et al.) puts the exception name in the STRING
+    // `.code` property (ENG-1626, CodeRabbit) — checked BEFORE the numeric
+    // status below, not after: these errors also carry a numeric
+    // `.statusCode` of 400, and classFromStatus(400) returns 'invalid_args'
+    // before this string check would otherwise ever run, silently discarding
+    // the real classification and disabling retry during throttling.
+    const stringCodeProp = (error as { code?: unknown }).code;
+    if (typeof stringCodeProp === 'string'
+      && (stringCodeProp === 'ThrottlingException' || stringCodeProp === 'ProvisionedThroughputExceededException')) {
+      return 'rate_limit';
+    }
 
     let statusProp = (error as { status?: unknown }).status
       ?? (error as { statusCode?: unknown }).statusCode;

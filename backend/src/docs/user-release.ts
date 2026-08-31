@@ -9,6 +9,30 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-08-18',
+    changes: [
+      'Fixed: A Scheduled Run No Longer Reports Success After Doing Nothing',
+      '- When LinkedIn ends the session on a connected LinkedIn Outreach account, nothing can be sent from it until you reconnect — but a scheduled run would still start, work through your list, send nothing, and record itself as a success',
+      '- Those runs cost you model usage for a guaranteed no-op, and because they looked successful, nothing flagged them: one account went weeks before anyone noticed',
+      '- A run whose LinkedIn Outreach account has no live session is now skipped in about a second, before any of that work begins, and is recorded as skipped rather than successful so it is visible in your run history',
+      'New: You Are Told When Your LinkedIn Outreach Account Disconnects',
+      '- You now get an email naming the account, what has stopped, and a direct link to reconnect it',
+      '- It is deliberately not sent the instant we see a problem: a brief hiccup would otherwise tell you your account is broken when it is not, so we confirm the session is still down on a later check first',
+      '- If it stays disconnected, you get a reminder rather than silence',
+      'New: A Schedule Stopped by a Disconnected Account Restarts Itself When You Reconnect',
+      '- Repeated skips now pause the schedule instead of leaving it claiming to be active, and you are told which schedule stopped',
+      '- Reconnecting the account switches it back on for you — there is nothing to remember to re-enable',
+      'Fixed: Lead Enrichment No Longer Records a LinkedIn Link That Belongs to Nobody',
+      '- LinkedIn hides the identity of profiles outside your network, and those results were being turned into a profile link that leads nowhere',
+      '- That link could be saved onto a lead and shown as if it were real, and several such leads could collapse into one another because they all pointed at the same non-existent profile',
+      '- Those results are now recognised for what they are and left out',
+      'Improved: Outreach Actions Are Paced So LinkedIn Is Less Likely to End Your Session',
+      '- Withdrawing or sending in a fast burst appears automated, and twice preceded LinkedIn ending an account\'s session within seconds — which then blocked that customer for days',
+      '- Invitations, messages and withdrawals are now spaced out per account instead of being sent all at once',
+      '- We also stopped re-reading your full pending-invitation list every few minutes, which was a large and constant load on your account for no benefit',
+    ],
+  },
+  {
     date: '2026-08-12',
     changes: [
       'Fixed: Saving a Long Scheduled-Chat Prompt No Longer Fails With an Unexplained Error',

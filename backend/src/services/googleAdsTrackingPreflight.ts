@@ -39,8 +39,22 @@ export interface PreflightGateResult {
   results: UrlTrackingResult[];
   /** URLs that are 'unmeasured' or 'unverifiable' — i.e. the reason a launch is blocked. */
   blockedUrls: UrlTrackingResult[];
+  /**
+   * URLs that ARE measurable but carry no Google Ads conversion tag — only a GTM
+   * container or a GA4 property. Not blocked: plenty of legitimate setups fire the Ads
+   * conversion from inside GTM, and blocking those would be the mirror image of today's
+   * false pass. But not a clean pass either, because a container is a PLACE tags may
+   * live, not evidence any particular tag is in it (ENG-1358).
+   */
+  warnings?: UrlTrackingWarning[];
   /** Human-readable explanation naming each blocked URL, what was checked, and how to fix it. */
   message: string;
+}
+
+export interface UrlTrackingWarning {
+  url: string;
+  /** The container / property ids we DID see, e.g. ['GTM:GTM-NFWK798Z']. */
+  mechanisms: string[];
 }
 
 export interface PreflightDeps {
@@ -59,21 +73,87 @@ export const TRACKING_MECHANISMS: string[] = [
  * Inspect served HTML for Google measurement mechanisms. Pure and side-effect-free.
  * Returns a de-duplicated list of labelled matches (empty ⇒ no tracking detected).
  */
+/**
+ * Everything in a document that could carry a tag, with rendered prose removed (ENG-1527).
+ *
+ * Keeps two things and drops the rest:
+ *   - `<script>` and `<noscript>` bodies, so inline `gtag('config','AW-…')` and the GTM
+ *     noscript iframe both survive
+ *   - every tag's markup, so `src=`, `href=` and `data-` attributes survive — which matters
+ *     more than it looks: on a real Next.js page the GA4 id appears in a
+ *     `<link rel="preload" href="…gtag/js?id=G-…">` and inside the hydration payload, NOT
+ *     only in a classic `<script src>`. Narrowing to script tags alone would have started
+ *     false-blocking correctly tagged pages.
+ *
+ * What it drops is text nodes — the one place an id is definitely not doing anything.
+ *
+ * Verified against the live `www.agentweb.pro` document before shipping: identical id set
+ * before and after narrowing, while a prose-only page goes from "measured" to "unmeasured".
+ * Deliberately a lexical pass, not a parser: this runs on untrusted third-party HTML, and a
+ * scan that cannot throw is worth more here than one that understands nesting.
+ */
+function markupOnly(html: string): string {
+  const kept: string[] = [];
+  for (const m of html.match(/<(script|noscript)\b[\s\S]*?<\/(?:script|noscript)\s*>/gi) || []) {
+    kept.push(m);
+  }
+  for (const m of html.match(/<[^>]+>/g) || []) {
+    kept.push(m);
+  }
+  // A response with no markup at all is not an HTML document — a bare script body, a JSON
+  // payload, a redirect stub. Narrowing it to nothing would report "no tag" for a response
+  // that might carry one, which is the wrong direction for a gate whose job is to refuse
+  // launches it cannot vouch for. Fall back to the raw text; a prose page always has markup,
+  // so this cannot resurrect the false positive above.
+  if (kept.length === 0) return html;
+  return kept.join('\n');
+}
+
 export function detectTrackingSnippets(html: string): string[] {
   if (!html || typeof html !== 'string') return [];
   const found = new Set<string>();
 
+  /*
+   * CASE-SENSITIVE ON PURPOSE. Google issues every one of these ids in upper case and
+   * pages embed them verbatim, so the `i` flag these patterns used to carry bought no
+   * real detection — and it cost a false PASS, which is the one error this gate exists
+   * to prevent.
+   *
+   * Found live on our own marketing site: www.agentweb.pro has a nav link to
+   * `/ai-gtm-agent` (the AI GTM Agent product page). Matched case-insensitively, the
+   * slug `gtm-agent` reads as container `GTM-AGENT`, so the page was reported as
+   * carrying a GTM container it does not have. The same hole swallows GA4: a hashed
+   * build class like `g-a1b2c3` scores as measurement id `G-A1B2C3`.
+   *
+   * The consequence is the ENG-334 / ThinkingAI incident verbatim — a landing page with
+   * no tracking whatsoever is classified `measured`, skips the BLOCK, and spends paid
+   * traffic on a funnel that cannot report a single conversion. A word in a URL slug
+   * must never be able to authorise ad spend.
+   *
+   * Matching upper case only removes that entire class (slugs, kebab-case hrefs, hashed
+   * CSS class names and minified identifiers are lower case). The residual risk is an
+   * upper-case literal in copy — far rarer, and it fails toward BLOCK-with-override
+   * rather than toward silent spend.
+   */
+
+  // ENG-1527. Scanned over MARKUP ONLY, not the whole document. An id sitting in rendered
+  // body text is prose, not a tag: "Ask your rep for conversion id AW-11112222333" used to
+  // read as a working Google Ads tag and pass a page that fires nothing — the same class of
+  // false positive as the `ai-gtm-agent` slug ENG-1358 closed, arriving through the AW door
+  // instead, and the one error this gate exists to prevent.
+  const scannable = markupOnly(html);
+
   // GA4 measurement ID: G-XXXXXXXXXX (also matches googletagmanager.com/gtag/js?id=G-…)
-  for (const m of html.match(/\bG-[A-Z0-9]{6,}\b/gi) || []) {
-    found.add(`GA4:${m.toUpperCase()}`);
+  for (const m of scannable.match(/\bG-[A-Z0-9]{6,}\b/g) || []) {
+    found.add(`GA4:${m}`);
   }
   // GTM container: GTM-XXXXXXX (also matches gtm.js?id=GTM-… and the ns.html noscript iframe)
-  for (const m of html.match(/\bGTM-[A-Z0-9]{4,}\b/gi) || []) {
-    found.add(`GTM:${m.toUpperCase()}`);
+  for (const m of scannable.match(/\bGTM-[A-Z0-9]{4,}\b/g) || []) {
+    found.add(`GTM:${m}`);
   }
   // Google Ads conversion / remarketing tag: AW-123456789
-  for (const m of html.match(/\bAW-[0-9]{6,}\b/gi) || []) {
-    found.add(`AW:${m.toUpperCase()}`);
+  for (const m of scannable.match(/\bAW-[0-9]{6,}\b/g) || []) {
+    found.add(`AW:${m}`);
   }
 
   return [...found];
@@ -164,6 +244,21 @@ async function defaultFetchHtml(url: string): Promise<string> {
 }
 
 /**
+ * Does this URL carry a Google Ads conversion tag specifically, as opposed to *some*
+ * Google measurement?
+ *
+ * The distinction the gate was missing. `detectTrackingSnippets` answers "is anything
+ * Google-ish here", which is the right question for GA4 or GTM and the wrong one for a
+ * Google Ads launch: bidding optimises toward a conversion the page must be able to
+ * report, and only an `AW-` tag reports one.
+ *
+ * Kept pure and separate so the rule is provable without a fetch boundary.
+ */
+export function hasAdsConversionTag(mechanisms: string[]): boolean {
+  return (mechanisms || []).some((m) => m.startsWith('AW:'));
+}
+
+/**
  * Fetch one final URL and classify its measurement status. A fetch failure
  * (timeout, 4xx/5xx, DNS, SSRF-blocked) is NEVER treated as measured — it
  * surfaces as 'unverifiable' and follows the blocked-by-default path.
@@ -210,6 +305,55 @@ function buildBlockMessage(blocked: UrlTrackingResult[]): string {
   ].join('\n');
 }
 
+/**
+ * The WARN wording, and it is the part that decides whether this is useful or noise.
+ *
+ * It must name the specific unverifiable thing rather than say "tracking may be
+ * incomplete" — an operator cannot act on that. And it must give the two ways to settle
+ * it, because a warning with no route to resolution is one people learn to scroll past.
+ */
+function buildWarnMessage(results: UrlTrackingResult[], warnings: UrlTrackingWarning[]): string {
+  // Guidance is built PER WARNING, not once for the whole set. A mixed set — one URL with
+  // a GTM container, another with only GA4 — previously took a single branch, so the GA4
+  // URL was told to open GTM Preview on a container it does not have. Advice that does
+  // not match what the operator can see is how a warning gets written off as noise.
+  const lines = warnings.map((w) => {
+    const gtm = w.mechanisms.some((m) => m.startsWith('GTM:'));
+    const how = gtm
+      ? 'check GTM Preview on that container for an Ads conversion tag'
+      : 'check that the GA4 conversion is imported into Google Ads as a conversion action';
+    return `  • ${w.url} — found ${w.mechanisms.join(', ')}, but no Google Ads conversion tag (AW-…). To settle it: ${how}, `
+      + 'or submit the form and confirm a request to googleadservices.com/pagead/conversion/… carrying your conversion label.';
+  });
+
+  const anyGtm = warnings.some((w) => w.mechanisms.some((m) => m.startsWith('GTM:')));
+  const anyGa4Only = warnings.some((w) => !w.mechanisms.some((m) => m.startsWith('GTM:')));
+  const why: string[] = [];
+  if (anyGtm) {
+    why.push(
+      'A GTM container is a place where tags may live, not evidence that an Ads conversion tag '
+      + 'is inside it — and a container\'s contents cannot be read over HTTP.',
+    );
+  }
+  if (anyGa4Only) {
+    why.push(
+      'A GA4 property measures analytics, not Google Ads conversions — they are separate systems, '
+      + 'and a page can report to GA4 while recording nothing against your Ads conversion action.',
+    );
+  }
+
+  return [
+    'Pre-flight tracking check passed with a warning. These URLs are measurable, but nothing '
+      + 'on them proves a Google Ads conversion can be recorded:',
+    ...lines,
+    '',
+    ...why,
+    '',
+    'If the conversion does fire by one of those routes this is fine; if it does not, the '
+      + 'campaign will bid toward a conversion the page can never report.',
+  ].join('\n');
+}
+
 function buildPassMessage(results: UrlTrackingResult[]): string {
   if (results.length === 0) {
     return 'Pre-flight tracking check: no final URLs to verify.';
@@ -234,10 +378,28 @@ export async function preflightTrackingGate(urls: string[], deps: PreflightDeps 
   const blockedUrls = results.filter((r) => r.status !== 'measured');
   const ok = blockedUrls.length === 0;
 
+  /*
+   * ENG-1358. Measurable, but with no AW- tag — only a container or a GA4 property.
+   *
+   * Found on a live campaign: the account's one ENABLED campaign pointed at a page
+   * carrying GTM-NFWK798Z and no AW- id anywhere, with a biddable SUBMIT_LEAD_FORM goal.
+   * The gate passed it. It was one bid change from spending into a funnel that could not
+   * report a single conversion.
+   *
+   * Only computed for URLs that are otherwise fine: an unverifiable or unmeasured URL is
+   * already blocked, and adding a warning on top would bury the harder finding.
+   */
+  const warnings: UrlTrackingWarning[] = results
+    .filter((r) => r.status === 'measured' && !hasAdsConversionTag(r.mechanisms))
+    .map((r) => ({ url: r.url, mechanisms: r.mechanisms }));
+
   return {
     ok,
     results,
     blockedUrls,
-    message: ok ? buildPassMessage(results) : buildBlockMessage(blockedUrls),
+    ...(warnings.length > 0 ? { warnings } : {}),
+    message: ok
+      ? (warnings.length > 0 ? buildWarnMessage(results, warnings) : buildPassMessage(results))
+      : buildBlockMessage(blockedUrls),
   };
 }

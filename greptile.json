@@ -1,6 +1,0 @@
-{
-  "triggerOnUpdates": false,
-  "statusCheck": true,
-  "fixWithAI": true,
-  "excludeAuthors": ["dependabot[bot]"]
-}

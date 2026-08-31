@@ -45,6 +45,19 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('Rate limit exceeded, retry in 2s'))).toBe('rate_limit');
   });
 
+  // ENG-1220: hard-quota exhaustion (OpenAI/Azure `insufficient_quota`, "exceeded
+  // your current quota") is 429-shaped like transient per-minute throttling, but
+  // permanent — it must classify separately from 'rate_limit' so callers that
+  // exempt rate_limit from a session-wide retry budget (agentToolGatewayService's
+  // shouldTrackInSessionScope) don't also exempt a hard billing stop.
+  it('classifies hard-quota exhaustion as quota_exceeded, distinct from rate_limit', () => {
+    expect(classifyToolErrorClass(err('insufficient_quota'))).toBe('quota_exceeded');
+    expect(classifyToolErrorClass(err('You exceeded your current quota, please check your plan and billing details.'))).toBe('quota_exceeded');
+    expect(classifyToolErrorClass(err('gpt-image-2 API failed: quota exceeded for this billing period'))).toBe('quota_exceeded');
+    // Genuine per-minute throttling stays rate_limit even though both are 429s.
+    expect(classifyToolErrorClass(err('Too Many Requests'))).toBe('rate_limit');
+  });
+
   it('classifies argument validation — the LinkedIn outreach cluster', () => {
     expect(classifyToolErrorClass(err('Invitation message is too long (224 characters). Max is 200.'))).toBe('invalid_args');
     expect(classifyToolErrorClass(err('Invalid parameters'))).toBe('invalid_args');
@@ -177,5 +190,27 @@ describe('payment_required — X credit exhaustion (402)', () => {
   it('does not misclassify a 403 as payment_required', () => {
     const err = Object.assign(new Error('Request failed with code 403'), { code: 403 });
     expect(classifyToolErrorClass(err)).toBe('auth');
+  });
+});
+
+// ENG-1626 (CodeRabbit): DynamoDB throttling from the AWS SDK v2 carries the
+// exception name as a STRING .code (not .status/.statusCode), and typically
+// ALSO carries a numeric statusCode of 400 -- classFromStatus(400) returns
+// 'invalid_args', so the string-code check must run before the numeric
+// status check or it never gets a chance to fire.
+describe('rate_limit — AWS SDK v2 DynamoDB throttling (ENG-1626)', () => {
+  it('classifies ThrottlingException as rate_limit even with statusCode 400', () => {
+    const err = Object.assign(new Error('Throttling'), { code: 'ThrottlingException', statusCode: 400 });
+    expect(classifyToolErrorClass(err)).toBe('rate_limit');
+  });
+
+  it('classifies ProvisionedThroughputExceededException as rate_limit even with statusCode 400', () => {
+    const err = Object.assign(new Error('Rate exceeded'), { code: 'ProvisionedThroughputExceededException', statusCode: 400 });
+    expect(classifyToolErrorClass(err)).toBe('rate_limit');
+  });
+
+  it('classifies ThrottlingException as rate_limit with no statusCode at all', () => {
+    const err = Object.assign(new Error('Throttling'), { code: 'ThrottlingException' });
+    expect(classifyToolErrorClass(err)).toBe('rate_limit');
   });
 });

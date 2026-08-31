@@ -94,7 +94,16 @@ export function countsTowardRequirement(toolCall: any): boolean {
  * against `requiredFunctionCalls`. One shared mapper because runVerifiedChat
  * builds this ledger in three places (the resumed-run seed, the completion-gate
  * continuation turn, and the main turn) and they must not drift — three private
- * copies of a rule is precisely how the bug above survived.
+ * copies of a rule is precisely how the ENG-947 bug above survived.
+ *
+ * ENG-1045/ENG-1276: equivalent-route crediting (a thread through
+ * twitter_manage_post satisfying post_on_connected_account, or email/
+ * send_email_from_sender crediting each other) is NOT done here — it lives in
+ * `requiredCallSatisfaction.ts`'s `callSatisfiesRequirement`/
+ * `countCallsSatisfyingRequirement`, which need each entry's arguments and
+ * success/error markers to apply it (a bare name list discards them), and which
+ * `schedulePublishAuthorization.ts`'s execution-time consent gate also reads from
+ * — ONE shared equivalence table, not two.
  */
 export function requirementEvidenceNames(toolCalls: any[]): string[] {
   if (!Array.isArray(toolCalls)) return [];

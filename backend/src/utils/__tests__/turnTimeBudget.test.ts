@@ -133,4 +133,28 @@ describe('buildTurnTimeBudgetNudge', () => {
     expect(msg).toMatch(/partial/i);
     expect(msg).toMatch(/what you already have|gathered so far/i);
   });
+
+  // ENG-1310 AC4: the wall-clock nudge used to tell the model to "write your final
+  // answer NOW ... even if it is incomplete" with no distinction between a number the
+  // model actually verified this session and one it is recalling/guessing under time
+  // pressure — the exact shape that produced an unverified figure stated as current.
+  // Both nudges now require the reply to be split into labeled verified/unverified
+  // sections so a rushed answer is never presented as fully confirmed.
+  it('requires a labeled verified/unverified split in the wrap-up nudge (ENG-1310 AC4)', () => {
+    const msg = buildTurnTimeBudgetNudge(wrapUp, 'wrap_up');
+    expect(msg).toMatch(/verified:/i);
+    expect(msg).toMatch(/unverified\s*\/\s*not checked:/i);
+    expect(msg).toMatch(/never state an item from the unverified section as if it were confirmed/i);
+  });
+
+  it('requires a labeled verified/unverified split in the final-synthesis nudge (ENG-1310 AC4)', () => {
+    const msg = buildTurnTimeBudgetNudge(final, 'final_synthesis');
+    expect(msg).toMatch(/verified:/i);
+    expect(msg).toMatch(/unverified\s*\/\s*not checked:/i);
+    expect(msg).toMatch(/never assert an item from the unverified section as fact/i);
+    // Still forbids new tool calls and still surfaces the recovery instruction —
+    // the split is additive, not a replacement for the existing ENG-907 behavior.
+    expect(msg).toMatch(/do not call any (more|further) tools/i);
+    expect(msg).toMatch(/reply "continue"/i);
+  });
 });

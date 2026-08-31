@@ -63,6 +63,23 @@ export async function addPageViaCodingAgent(
   const slug = buildPageSlug(name);
   const now = new Date().toISOString();
 
+
+  /*
+   * Both halves or neither, decided ONCE and copied as a unit. An id without its label
+   * fires a conversion that matches no conversion action — reported as fired, attributing
+   * nothing — and the task instructions below are gated on the same pair, so a partial
+   * copy would leave a record claiming tracking that is never wired.
+   */
+  const inheritedGoogleAds = site.googleAdsConversionId && site.googleAdsConversionLabel
+    ? {
+        googleAdsConversionId: site.googleAdsConversionId,
+        googleAdsConversionLabel: site.googleAdsConversionLabel,
+        ...(site.googleAdsCustomerId ? { googleAdsCustomerId: site.googleAdsCustomerId } : {}),
+        ...(site.googleAdsTrackingInstalled !== undefined
+          ? { googleAdsTrackingInstalled: site.googleAdsTrackingInstalled } : {}),
+      }
+    : undefined;
+
   const record: GeneratedLandingPage = {
     id,
     userId,
@@ -77,6 +94,16 @@ export async function addPageViaCodingAgent(
     siteId: site.siteId ?? site.id,
     ...(opts.originatingSessionId ? { originatingSessionId: opts.originatingSessionId } : {}),
     ...(opts.leadListId ? { leadListId: opts.leadListId } : {}),
+    // A conversion is site-wide by construction (shared root layout), so this page
+    // inherits the site's pair rather than resolving its own — the same rule addSubPage
+    // follows. Carried onto the record so RULE 7.5 and the offline import (ENG-1325) can
+    // read it off ANY page of the site (ENG-1328).
+    //
+    // Copied as ONE unit, from a pair validated once above. Copying the id and label
+    // independently would persist half a pair when the site record holds only one — and
+    // the task instructions, which require both, would then be omitted for that same
+    // page: a record advertising a conversion id that nothing ever fires.
+    ...(inheritedGoogleAds ?? {}),
     createdAt: now,
     updatedAt: now,
   };
@@ -89,7 +116,15 @@ export async function addPageViaCodingAgent(
   // (check_deployment), and we promote to main ONLY on a green build — so the live
   // site is never broken by a bad generation.
   const draftBranch = LANDING_PAGE_PREVIEW_BRANCH;
-  const task = buildSubPageTask(slug, name, prompt, brandContext, opts.leadListId);
+  // Same pair the record inherited — derived once above, so the instructions and the
+  // persisted metadata can never disagree about whether this page is tracked.
+  const googleAds = inheritedGoogleAds
+    ? {
+        conversionId: inheritedGoogleAds.googleAdsConversionId,
+        conversionLabel: inheritedGoogleAds.googleAdsConversionLabel,
+      }
+    : undefined;
+  const task = buildSubPageTask(slug, name, prompt, brandContext, opts.leadListId, googleAds);
 
   try {
     const result = await runCodingAgent(task, {
@@ -191,7 +226,8 @@ export function buildSubPageTask(
   name: string,
   prompt: string,
   brand: BrandContext,
-  leadListId?: string
+  leadListId?: string,
+  googleAds?: { conversionId: string; conversionLabel: string }
 ): string {
   const brandLines = summarizeBrand(brand);
   const formLine = leadListId
@@ -211,6 +247,25 @@ export function buildSubPageTask(
     ``,
     brandLines,
     formLine,
+    // Both halves checked again here rather than trusted from the caller: this function
+    // is exported and directly tested, and a half-empty pair would emit an instruction
+    // naming a conversion that can never match a conversion action.
+    //
+    // Until now this path relied entirely on "mirror the home page's form" to carry the
+    // tracking call across. That works when it works, but it is inference: the agent can
+    // reasonably build a clean form and drop the call, and nothing would notice until a
+    // campaign reported zero conversions. Naming the requirement — and the exact pair —
+    // removes the guesswork (ENG-1328).
+    ...(googleAds?.conversionId && googleAds?.conversionLabel ? [
+      `- This site has Google Ads conversion tracking. On a SUCCESSFUL form submission the page MUST call `
+      + `fireLeadTracking({ email, eventId, googleAds: { conversionId: "${googleAds.conversionId}", `
+      + `conversionLabel: "${googleAds.conversionLabel}" } }) — imported from "@/lib/agentweb-track", exactly as the `
+      + `home page's form does. Generate eventId ONCE per submit with crypto.randomUUID() and send the same value `
+      + `as an "eventId" field in the /api/capture body.`,
+      `- Do NOT hand-author a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed `
+      + `in the shared root layout, and fireLeadTracking fires the conversion correctly, in the right order, `
+      + `before any redirect. Dropping this call means the page captures leads that report no conversion.`,
+    ] : []),
     `- Write real, specific copy from the brief — no lorem ipsum, no [PLACEHOLDER] text.`,
     `- Self-contained and consistent with the existing components; prefer reusing the site's components over writing new ones.`,
     ``,

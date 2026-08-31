@@ -435,6 +435,33 @@ describe('s3Utils', () => {
         Key: 'file.txt',
       }));
     });
+
+    // ENG-1188: generated ad-creative assets (HTML banners, screenshots) had no
+    // working download path -- the S3 object never carries an attachment
+    // disposition, so "open in new tab" just renders the file inline instead of
+    // saving it. ResponseContentDisposition on the presigned URL itself forces a
+    // real download regardless of same-origin/`download`-attribute quirks.
+    it('should pass ResponseContentDisposition through when a download disposition is requested', () => {
+      mockGetSignedUrl.mockReturnValue('https://presigned-url.example.com');
+
+      generatePresignedUrl('users/123/banner.html', 'test-bucket', 3600, 'attachment; filename="banner.html"');
+
+      expect(mockGetSignedUrl).toHaveBeenCalledWith('getObject', {
+        Bucket: 'test-bucket',
+        Key: 'users/123/banner.html',
+        Expires: 3600,
+        ResponseContentDisposition: 'attachment; filename="banner.html"',
+      });
+    });
+
+    it('should NOT include ResponseContentDisposition when none is requested', () => {
+      mockGetSignedUrl.mockReturnValue('https://presigned-url.example.com');
+
+      generatePresignedUrl('users/123/banner.html', 'test-bucket');
+
+      const params = mockGetSignedUrl.mock.calls[0][1];
+      expect(params).not.toHaveProperty('ResponseContentDisposition');
+    });
   });
 
   describe('presignS3Url', () => {
@@ -461,6 +488,21 @@ describe('s3Utils', () => {
       delete process.env.AWS_S3_BUCKET;
       const result = presignS3Url('https://example.com/file.txt');
       expect(result).toBeNull();
+    });
+
+    it('should forward a download disposition to the presigned URL', () => {
+      mockGetSignedUrl.mockReturnValue('https://presigned-url.example.com');
+
+      presignS3Url(
+        'https://test-bucket.s3.amazonaws.com/users/123/banner.html',
+        'test-bucket',
+        3600,
+        'attachment; filename="banner.html"'
+      );
+
+      expect(mockGetSignedUrl).toHaveBeenCalledWith('getObject', expect.objectContaining({
+        ResponseContentDisposition: 'attachment; filename="banner.html"',
+      }));
     });
   });
 

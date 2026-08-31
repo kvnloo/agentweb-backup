@@ -1,4 +1,5 @@
 import AWS from "aws-sdk";
+import { assertMemoryContentWithinLimit } from '../utils/memoryContentLimit';
 import dotenv from "dotenv";
 import path from "path";
 import { S3 } from "aws-sdk";
@@ -152,13 +153,14 @@ export interface User {
   displayName?: string;
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
-  emailDomain?: string; // Email sender domain
-  resendDomainId?: string; // Resend domain ID for domain verification
+  emailDomain?: string; // @deprecated legacy single sending domain — kept for the task/subscriber-notification fallback sender (emailService.ts, dripSequenceWorker.ts legacyDefaultSender); CRM sending domains live in emailDomains[] (ENG-265)
+  resendDomainId?: string; // @deprecated Resend domain ID paired with the legacy emailDomain above
+  emailDomains?: Array<{ id: string; domain: string; status: string; addedAt: string }>; // Multiple verified Resend sending domains (ENG-265). id = Resend domain id.
+  emailDomainList?: string[]; // Denormalized domain names from emailDomains[], kept in sync on every write — lets getUsersByEmailDomain's Scan filter with contains() instead of pulling every row into app memory.
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels. Kept for backward-compat reads.
   slackChannels?: string[]; // Slack channels configured for this user (agent tools are restricted to these)
-  slackSuggestedRepliesDisabled?: boolean; // When true, suppress Slack suggested-reply (slack-triggered) sessions/emails for this user. Absent/false = enabled (default).
   slackShipNotifyDisabled?: boolean; // When true, suppress the Slack ping when an item this user reported ships (shipNotifyService). Absent/false = enabled (default).
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   landerUtmDefault?: import("../utils/landerUtm").UtmConfig; // Customer-level UTM default for generated landers (ENG-724); read/write only via landerUtmStore
@@ -470,6 +472,15 @@ export interface User {
    * other devices — are rejected by the auth middleware. Absent = 0.
    */
   sessionVersion?: number;
+  /**
+   * Monotonic revocation counter for DELEGATE tokens minted against this user
+   * (admin/contractor "access as customer"). Embedded as `dte` in every delegate
+   * token. Bumping it rejects every outstanding delegate token for this user
+   * without touching their own sessions — which `sessionVersion` cannot do, since
+   * that would log the customer out of their own devices as a side effect of a
+   * support-access cleanup. Absent = 0. See ENG-1506.
+   */
+  delegateTokenEpoch?: number;
   /**
    * Set when the account is created with a system-generated initial password
    * (e.g. admin creating a user from the waitlist). The user MUST set their own
@@ -1236,7 +1247,9 @@ export class UserDB {
       do {
         const params: AWS.DynamoDB.DocumentClient.ScanInput = {
           TableName: this.tableName,
-          FilterExpression: 'emailDomain = :emailDomain AND NOT begins_with(userId, :tombstone)',
+          // ENG-265: also matches a domain registered as one of several entries in emailDomains[]
+          // via the denormalized emailDomainList — see the field comment on User.emailDomainList.
+          FilterExpression: '(emailDomain = :emailDomain OR contains(emailDomainList, :emailDomain)) AND NOT begins_with(userId, :tombstone)',
           ExpressionAttributeValues: {
             ':emailDomain': normalizedDomain,
             ':tombstone': 'deleted_',
@@ -1685,6 +1698,42 @@ export class UserDB {
       return (result.Attributes as { sessionVersion: number }).sessionVersion;
     } catch (error) {
       handleDynamoDbError(error, "incrementSessionVersion");
+      throw error;
+    }
+  }
+
+  /**
+   * Atomically increment a user's delegateTokenEpoch, rejecting every delegate
+   * token minted against them with a prior value. Returns the new epoch.
+   *
+   * Deliberately separate from `sessionVersion`: revoking support access must not
+   * log the customer out of their own devices, and a customer changing their
+   * password should not be the only way to cut off a delegate token. Both signals
+   * are checked independently in the auth middleware.
+   *
+   * Same `if_not_exists` shape as incrementSessionVersion, so records predating
+   * the field are treated as 0 and bumped to 1.
+   */
+  async incrementDelegateTokenEpoch(userId: string): Promise<number> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+
+    const params = {
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression: "SET #dte = if_not_exists(#dte, :zero) + :one",
+      ExpressionAttributeNames: { "#dte": "delegateTokenEpoch" },
+      ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
+      ReturnValues: "UPDATED_NEW",
+    };
+
+    try {
+      const result = await this.docClient.update(params).promise();
+      return (result.Attributes as { delegateTokenEpoch: number }).delegateTokenEpoch;
+    } catch (error) {
+      handleDynamoDbError(error, "incrementDelegateTokenEpoch");
       throw error;
     }
   }
@@ -3313,6 +3362,25 @@ const writeShedRunResults = async (
   }
 };
 
+/**
+ * ENG-1363: in `expect`, "the attribute is still UNSET" — matching BOTH spellings
+ * production uses for an unset schedule model.
+ *
+ * `undefined` already means "still absent" and keeps that strict meaning, because
+ * consent attributes (ENG-827 `autopublishAuthorized`) depend on absence being
+ * absence. But a schedule that inherits the platform default is stored two ways:
+ * the attribute is missing on 12 active schedules and holds `""` on 48. Asserting
+ * `attribute_not_exists` against the second group is false the moment it is
+ * written, so every model switch on the majority of active schedules failed its
+ * condition and surfaced as a permanent 409.
+ *
+ * This is deliberately NOT a relaxation of the guard. It still binds the write to
+ * the state the caller decided from — it just spells that state the way the data
+ * actually spells it. A row holding a real model still fails the condition, which
+ * is what stops a stale "unset" decision overwriting somebody else's pin.
+ */
+export const EXPECT_UNSET = Symbol.for("agentweb.schedule.expectUnset");
+
 export const scheduleDb = {
   async createSchedule(schedule: {
     scheduleId: string;
@@ -3334,6 +3402,10 @@ export const scheduleDb = {
     functionCallMinCalls?: { [functionName: string]: number };
     emailNotifications?: string[];
     dailyDigest?: boolean;
+    // ENG-1131 follow-up: owner opt-out for the proactive sourcing-block
+    // transition email specifically (does not affect the schedule-card badge,
+    // per-run emails, or run history).
+    disableSourcingBlockAlerts?: boolean;
     updatedAt?: string;
     sessionId?: string | null;
     type?: string;
@@ -3497,18 +3569,48 @@ export const scheduleDb = {
      * leaves the length unchanged, and length alone would wave the stale count
      * through. Capped at MAX_ATOMIC_RUN_RESULT_REMOVALS by the caller.
      */
-    shedRunResults?: { count: number; expectedLength: number; expectedLast?: any }
+    shedRunResults?: { count: number; expectedLength: number; expectedLast?: any },
+    /**
+     * Attributes to REMOVE outright, restoring "never set" rather than writing a
+     * blank. Explicit rather than inferred from an undefined value: an absent
+     * attribute is a meaningful state -- a schedule with no `llmModel` INHERITS
+     * the platform default and follows it as it moves, where any stored value
+     * would not -- and deleting configuration is too consequential to happen
+     * because an optional field came through undefined.
+     */
+    removeAttributes?: string[]
   ) {
     try {
       const updateExpressions: string[] = [];
       const expressionAttributeNames: { [key: string]: string } = {};
       const expressionAttributeValues: { [key: string]: any } = {};
 
+      // An `undefined` value is NEVER emitted as a SET. `Object.entries` still
+      // yields the key, so doing so produced `SET #k = :k` while the
+      // DocumentClient marshaller DROPPED `:k` -- an expression referencing a
+      // value that never reached DynamoDB, which fails the entire write with a
+      // ValidationException. Skipping makes a stray undefined a no-op rather than
+      // a crash. Deliberate removal goes through `removeAttributes` instead, so
+      // it can never be triggered by an accidentally-undefined field.
       Object.entries(updates).forEach(([key, value]) => {
+        if (value === undefined) return;
         updateExpressions.push(`#${key} = :${key}`);
         expressionAttributeNames[`#${key}`] = key;
         expressionAttributeValues[`:${key}`] = value;
       });
+
+      const attributeRemovals: string[] = [];
+      for (const key of removeAttributes || []) {
+        // One key cannot be both SET and REMOVEd in a single expression, and the
+        // explicit removal wins because the caller named it outright.
+        const setIndex = updateExpressions.indexOf(`#${key} = :${key}`);
+        if (setIndex >= 0) {
+          updateExpressions.splice(setIndex, 1);
+          delete expressionAttributeValues[`:${key}`];
+        }
+        expressionAttributeNames[`#${key}`] = key;
+        attributeRemovals.push(`#${key}`);
+      }
 
       // ENG-827: an optional "only if this is still true" clause. A caller that
       // DERIVES what it writes from what it read cannot write unconditionally — a
@@ -3524,6 +3626,15 @@ export const scheduleDb = {
           conditionExpressions.push(`attribute_not_exists(#${alias})`);
           return;
         }
+        // ENG-1363: "still unset" is absent OR empty. One clause, so the whole
+        // condition stays a single conjunction and the write stays atomic.
+        if (value === EXPECT_UNSET) {
+          conditionExpressions.push(
+            `(attribute_not_exists(#${alias}) OR #${alias} = :${alias})`,
+          );
+          expressionAttributeValues[`:${alias}`] = '';
+          return;
+        }
         conditionExpressions.push(`#${alias} = :${alias}`);
         expressionAttributeValues[`:${alias}`] = value;
       });
@@ -3532,13 +3643,18 @@ export const scheduleDb = {
       // is what makes this safe against a run finishing mid-edit: appends land at the
       // tail, so index 0 still names the oldest entry. `runResults` is never also SET
       // here — overlapping document paths in one expression are rejected.
-      let removeExpression = '';
+      // Both kinds of removal share ONE clause: DynamoDB allows a single REMOVE
+      // per expression, so these are collected rather than assigned, or whichever
+      // ran second would silently discard the other.
+      const removeTargets: string[] = [...attributeRemovals];
       if (shedRunResults && shedRunResults.count > 0) {
         expressionAttributeNames['#runResults'] = 'runResults';
-        removeExpression = ` REMOVE ${Array.from(
-          { length: Math.min(shedRunResults.count, MAX_ATOMIC_RUN_RESULT_REMOVALS) },
-          (_, index) => `#runResults[${index}]`
-        ).join(", ")}`;
+        removeTargets.push(
+          ...Array.from(
+            { length: Math.min(shedRunResults.count, MAX_ATOMIC_RUN_RESULT_REMOVALS) },
+            (_, index) => `#runResults[${index}]`
+          )
+        );
         conditionExpressions.push('size(#runResults) = :expectedRunResultsLength');
         expressionAttributeValues[':expectedRunResultsLength'] = shedRunResults.expectedLength;
         if (shedRunResults.expectedLast !== undefined && shedRunResults.expectedLength > 0) {
@@ -3549,16 +3665,31 @@ export const scheduleDb = {
         }
       }
 
+      // A removal-only update has nothing to SET, and a bare `SET ` is a syntax
+      // error -- so each clause is emitted only when it has targets.
+      const clauses: string[] = [];
+      if (updateExpressions.length > 0) clauses.push(`SET ${updateExpressions.join(", ")}`);
+      if (removeTargets.length > 0) clauses.push(`REMOVE ${removeTargets.join(", ")}`);
+      if (clauses.length === 0) {
+        // Nothing to do. Returning beats sending an empty expression, which
+        // DynamoDB rejects, and beats pretending a write happened.
+        return undefined;
+      }
+
       const params: any = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId,
         },
-        UpdateExpression: `SET ${updateExpressions.join(", ")}${removeExpression}`,
+        UpdateExpression: clauses.join(" "),
         ExpressionAttributeNames: expressionAttributeNames,
-        ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",
       };
+      // An empty value map is itself a validation error, so it is only attached
+      // when the expression actually references values.
+      if (Object.keys(expressionAttributeValues).length > 0) {
+        params.ExpressionAttributeValues = expressionAttributeValues;
+      }
       if (conditionExpressions.length > 0) {
         params.ConditionExpression = conditionExpressions.join(" AND ");
       }
@@ -5115,6 +5246,30 @@ export const crmDb = {
     return items;
   },
 
+  /**
+   * Lists opted into the CRM auto-enrichment cron (ENG-88):
+   * `enrichmentConfig.autoEnrich === true`. Scoped scan, not a rename/reuse
+   * of getAllLeadLists — that function's minimal projection is depended on
+   * elsewhere, and this needs the enrichmentConfig attribute plus a filter.
+   * Cheap by design: `autoEnrich` is opt-in and expected to stay rare.
+   */
+  async getAutoEnrichEnabledLists(): Promise<Array<{ listId: string; userId: string }>> {
+    const items: any[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.scan({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        ProjectionExpression: 'listId, userId',
+        FilterExpression: 'enrichmentConfig.autoEnrich = :true',
+        ExpressionAttributeValues: { ':true': true },
+        ExclusiveStartKey: lastEvaluatedKey,
+      }).promise();
+      items.push(...(result.Items || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return items;
+  },
+
   // Returns true if userId owns the list OR has CRM read access to the owner's org lists.
   // Respects shareSettings.crm.enabled: when false, only the list owner, the org owner,
   // and listed crm.editors retain cross-member read access.
@@ -6244,6 +6399,64 @@ export const crmDb = {
     }
   },
 
+  // ENG-969 follow-up: leadId is minted once, globally (Date.now() + a random
+  // suffix — see createLead), never re-derived per list, so it never legitimately
+  // collides across two lists. Production session 6082779b-f9f1-4e38-a8eb-34abbc3da419
+  // showed an agent pair a valid lead_id with a stale list_id from an earlier step
+  // in the same run — a not-found on the requested list is as likely to mean "wrong
+  // list_id" as "no such lead". `candidateListIds` should already be access-scoped
+  // (e.g. via getLeadListsForUser) since any match here is returned as-is, with no
+  // further access check. Capped at 200 lists (8 BatchGetItem round trips) so a
+  // pathological org with hundreds of lists can't turn a single not-found into an
+  // unbounded scan.
+  async getLeadByIdAcrossLists(candidateListIds: string[], leadId: string) {
+    if (candidateListIds.length === 0) return null;
+    const MAX_CANDIDATE_LISTS = 200;
+    const BATCH_SIZE = 25;
+    // BatchGetItem can partially succeed and return the requested key in
+    // UnprocessedKeys (capacity limits, internal retries) — AWS's own docs
+    // require retrying those, with backoff, or a genuinely-existing lead can
+    // read as "not found" here. Bounded so contention degrades gracefully
+    // instead of retrying forever.
+    const MAX_UNPROCESSED_RETRIES = 3;
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const listIds = candidateListIds.slice(0, MAX_CANDIDATE_LISTS);
+
+    for (let i = 0; i < listIds.length; i += BATCH_SIZE) {
+      let keys: Array<{ listId: string; leadId: string }> = listIds
+        .slice(i, i + BATCH_SIZE)
+        .map(listId => ({ listId, leadId }));
+      let unprocessedAttempt = 0;
+
+      while (keys.length > 0) {
+        const params = {
+          RequestItems: {
+            [tableName]: { Keys: keys },
+          },
+        };
+        try {
+          const result = await dynamodb.batchGet(params).promise();
+          const items = (result.Responses?.[tableName] as any[]) || [];
+          if (items.length > 0) return items[0];
+
+          const unprocessed = result.UnprocessedKeys?.[tableName]?.Keys as
+            | Array<{ listId: string; leadId: string }>
+            | undefined;
+          if (!unprocessed || unprocessed.length === 0) break; // batch genuinely done, no match
+
+          unprocessedAttempt += 1;
+          if (unprocessedAttempt > MAX_UNPROCESSED_RETRIES) break; // give up on this batch's remainder
+          await new Promise(resolve => setTimeout(resolve, 50 * 2 ** (unprocessedAttempt - 1)));
+          keys = unprocessed;
+        } catch (error) {
+          handleDynamoDbError(error, "getLeadByIdAcrossLists");
+          throw error;
+        }
+      }
+    }
+    return null;
+  },
+
   /**
    * ENG-926 §C: atomically record that one Meta conversion event has been relayed.
    *
@@ -6769,6 +6982,8 @@ export const crmDb = {
     enrichmentMetadata?: Record<string, any>;
     /** ISO timestamp set when a LinkedIn connection invite is manually sent from the CRM. */
     linkedInInviteSentAt?: string | null;
+    /** ISO timestamp set when this account accepted an INBOUND LinkedIn invite from this lead — distinct from linkedInInviteSentAt (an outbound send), since the two are opposite real-world events. */
+    linkedInInviteAcceptedAt?: string | null;
     /** ENG-1026: pre-send identity cross-check stamp (ISO date + verified canonical URL). */
     linkedinIdentityVerifiedAt?: string | null;
     linkedinIdentityVerifiedUrl?: string | null;
@@ -6965,6 +7180,15 @@ export const crmDb = {
         } else {
           setExpressions.push('linkedInInviteSentAt = :linkedInInviteSentAt');
           expressionAttributeValues[':linkedInInviteSentAt'] = updates.linkedInInviteSentAt;
+        }
+      }
+
+      if (updates.linkedInInviteAcceptedAt !== undefined) {
+        if (updates.linkedInInviteAcceptedAt === null) {
+          removeExpressions.push('linkedInInviteAcceptedAt');
+        } else {
+          setExpressions.push('linkedInInviteAcceptedAt = :linkedInInviteAcceptedAt');
+          expressionAttributeValues[':linkedInInviteAcceptedAt'] = updates.linkedInInviteAcceptedAt;
         }
       }
 
@@ -8590,7 +8814,7 @@ export const crmDb = {
     /** True when skippedLeadIds was omitted due to size. */
     skippedDeduplicationUnavailable?: boolean;
     /** Aggregate counts per failure step (search/linkedin/llm/update). Item #11. */
-    failureBreakdown?: { searchWebFailed: number; linkedinFailed: number; llmOrParseFailed: number; updateFailed: number };
+    failureBreakdown?: { identityResolutionFailed?: number; searchWebFailed: number; linkedinFailed: number; llmOrParseFailed: number; updateFailed: number };
     /** Per-lead failure records (capped to ~50 to keep row size bounded). Item #11. */
     failures?: Array<{ leadId: string; email?: string; step: string; message: string }>;
     /** Per-provider live vs cached counts across all leads in this run. */
@@ -9603,9 +9827,7 @@ export const accountMemoryDb = {
     // valid becomes invalid. Worst-case stored size roughly doubles (2,000
     // astral chars ≈ 8 KB UTF-8) — negligible against DynamoDB's 400 KB limit.
     // The other three memory guards below/above match this unit deliberately.
-    if (Array.from(content).length > 2000) {
-      throw new Error('Content must be 2000 characters or less');
-    }
+    assertMemoryContentWithinLimit(content);
 
     const { ulid } = await import('ulid');
     const now = new Date().toISOString();
@@ -9706,9 +9928,7 @@ export const accountMemoryDb = {
     }
     // Code points, not UTF-16 code units — same unit as the declared
     // `maxLength: 2000` and the addMemory guard (ENG-821).
-    if (updates.content !== undefined && Array.from(updates.content).length > 2000) {
-      throw new Error('Content must be 2000 characters or less');
-    }
+    if (updates.content !== undefined) assertMemoryContentWithinLimit(updates.content);
 
     const expressions: string[] = ['#updatedAt = :updatedAt'];
     const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
@@ -9772,9 +9992,7 @@ export const orgMemoryDb = {
     }
     // Code points, not UTF-16 code units — same unit as the declared
     // `maxLength: 2000` and the addMemory guard (ENG-821).
-    if (Array.from(content).length > 2000) {
-      throw new Error('Content must be 2000 characters or less');
-    }
+    assertMemoryContentWithinLimit(content);
 
     const { ulid } = await import('ulid');
     const now = new Date().toISOString();
@@ -9874,9 +10092,7 @@ export const orgMemoryDb = {
     }
     // Code points, not UTF-16 code units — same unit as the declared
     // `maxLength: 2000` and the addMemory guard (ENG-821).
-    if (updates.content !== undefined && Array.from(updates.content).length > 2000) {
-      throw new Error('Content must be 2000 characters or less');
-    }
+    if (updates.content !== undefined) assertMemoryContentWithinLimit(updates.content);
 
     const expressions: string[] = ['#updatedAt = :updatedAt'];
     const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
