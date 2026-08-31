@@ -28,47 +28,66 @@ account) it doesn't have to be reverse-engineered from code again.
 
 ## Prerequisites
 
-- Access to (or ownership of) the Attio workspace/account used to register
-  AgentWeb's developer app — check whether one already exists before creating
-  a second one (see "Existing app vs. new app" below).
-- Access to update AWS Secrets Manager for the target environment (`dev` or
-  `prod`), or someone who does.
-
-## Existing app vs. new app
-
-Check first whether an Attio developer app already exists for AgentWeb before
-registering a new one — there's no record in this repo of who created the
-original one or its current review status. Registering a second app when one
-already exists just creates a second set of credentials to track and a
-confusing choice about which one is live.
+- Access to [build.attio.com](https://build.attio.com/), Attio's dedicated
+  developer portal (separate from the main workspace app).
+- Access to update AWS Secrets Manager for `prod` (there is no dev/staging
+  Attio app as of this writing — see Step 9), or someone who does.
 
 ## Steps
 
-### 1. Register (or open) the OAuth app
+Confirmed from an actual walkthrough of creating the app (2026-08-31), not
+just inferred from the code.
 
-In the Attio workspace: **Settings → Developers → Apps** (or
-`developers.attio.com`, per Attio's own docs — the exact path may have moved;
-follow Attio's current developer-portal navigation). Create a new app, or open
-the existing AgentWeb app if one is already registered.
+### 1. Create the app
 
-### 2. Set the redirect/callback URI
+Go to **[build.attio.com](https://build.attio.com/)** → **New app** → give it
+a name (e.g. "AgentWeb"). This is Attio's dedicated developer portal, separate
+from the main workspace app — it is not under the workspace's own
+Settings menu.
+
+### 2. Set the app listing details
+
+In the **App listing** tab, set the name, logo, etc. — whatever's shown to a
+workspace admin when they connect it.
+
+### 3. Enable OAuth
+
+Go to the **OAuth** tab and enable the toggle. The app has no OAuth
+credentials until this is on.
+
+### 4. Get the client ID and secret
+
+Once OAuth is enabled, the app shows its **Client ID** and **Client Secret**.
+Copy both — needed for Step 9.
+
+### 5. Set the redirect URI
+
+Still in the **OAuth** tab, add the redirect URI. There is only one
+environment in practice — production, no staging:
 
 Must match exactly what the backend sends in the `/authorize` request
 (`config/integrations.ts` → `attio.redirectUri`, built as
 `` `${BACKEND_URL}/api/oauth/attio/callback` ``):
 
-| Environment | Redirect URI |
-| --- | --- |
-| Production | `https://api.agentweb.pro/api/oauth/attio/callback` |
-| Staging | `https://api-stage.agentweb.pro/api/oauth/attio/callback` |
+```
+https://api.agentweb.pro/api/oauth/attio/callback
+```
 
-### 3. Enable scopes on the app
+### 6. Set the OAuth flow URL
 
-Attio scopes are configured in the app's dashboard settings, **not** negotiated
-per-request — the `scopes` array in `config/integrations.ts` is sent along
-with the `/authorize` call but is inert unless the app itself has the
-corresponding scope enabled. Based on every Attio API endpoint the integration
-actually calls (`attioService.ts`), the app needs:
+There is a second URL field in the OAuth tab (labeled something like "OAuth
+flow URL"). Set it to the same value as Step 5. Its exact purpose wasn't
+fully clear when this was set up — if Attio's own field description says
+something different by the time this is read, follow that instead.
+
+### 7. Enable scopes on the app
+
+Go to the **Scopes** tab. Attio scopes are configured here, in the app's
+dashboard settings, **not** negotiated per-request — the `scopes` array in
+`config/integrations.ts` is sent along with the `/authorize` call but is
+inert unless the app itself has the corresponding scope enabled. Based on
+every Attio API endpoint the integration actually calls (`attioService.ts`),
+enable:
 
 - **Records** — read/write (create, update, delete person/company records)
 - **Lists & list entries** — read/write (list membership, deal-analog entries)
@@ -82,15 +101,16 @@ the time this is read, cross-check against `attioService.ts`'s actual API
 calls rather than guessing — a missing scope fails silently as a 403 at
 runtime, not at app-creation time.
 
-### 4. Get the client ID and secret, store them in Secrets Manager
+### 8. Save changes
 
-Once the app is created/confirmed, copy its Client ID and Client Secret into
-AWS Secrets Manager as a single JSON secret (read by
-`getAttioCredentials()` in `utils/secretsManager.ts`):
+### 9. Store the credentials in production Secrets Manager
+
+Put the Client ID and Client Secret from Step 4 into AWS Secrets Manager as a
+single JSON secret (read by `getAttioCredentials()` in
+`utils/secretsManager.ts`):
 
 | Environment | Secret name |
 | --- | --- |
-| Development | `dev/AgentWeb/Attio` |
 | Production | `prod/AgentWeb/Attio` |
 
 Secret value shape:
@@ -103,20 +123,13 @@ Secret value shape:
 aws secretsmanager create-secret \
   --name prod/AgentWeb/Attio \
   --secret-string '{"clientId": "...", "clientSecret": "..."}'
-# repeat with dev/AgentWeb/Attio for development, and different real values
 ```
 
-There are no `ATTIO_*` entries in `.env.example` — this integration is
-Secrets-Manager-only, unlike some others that have an env-var fallback path.
-
-### 5. Confirm the app is actually published/approved on Attio's side
-
-Registering the app is not the same as it being usable — per this feature's
-original scoping notes, Attio's own review/publication of the app was
-pending at the time the integration was built. An unpublished/unapproved app
-can still redirect through `/authorize` and fail at the token-exchange step,
-which looks like a backend bug but isn't one. Confirm the app's status
-directly in Attio's developer portal before treating this as done.
+There is no dev/staging Attio app as of this writing (Step 5) — if one is
+ever set up separately later, the same process applies with a secret named
+`dev/AgentWeb/Attio` instead. There are no `ATTIO_*` entries in
+`.env.example` either way — this integration is Secrets-Manager-only, unlike
+some others that have an env-var fallback path.
 
 ## Verifying it works end-to-end
 
@@ -125,11 +138,11 @@ directly in Attio's developer portal before treating this as done.
    success state (not an error param) — `attioAuth.ts`'s `/callback` route
    relays `code`/`state`/`error` straight through to
    `${CUSTOMER_FRONTEND_URL}/oauth/attio/callback`, so a misconfigured
-   redirect URI or unapproved app shows up here first.
+   redirect URI shows up here first.
 3. Confirm `/finalize` succeeded — this is where the actual token exchange
    against `https://app.attio.com/oauth/token` happens and workspace info is
-   fetched from `https://api.attio.com/v2/self`. A wrong client secret or an
-   unapproved app fails here specifically.
+   fetched from `https://api.attio.com/v2/self`. A wrong client secret fails
+   here specifically.
 4. Configure a lead list's CRM sync to Attio and push a test lead — confirms
    the record/list scopes are actually granted, not just the connection
    itself.
