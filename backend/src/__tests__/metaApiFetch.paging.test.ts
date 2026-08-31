@@ -66,21 +66,33 @@ describe('fetchWithRetryAndPaging', () => {
     expect(data.paging).toBeUndefined();
   });
 
+  // The bound is driven explicitly rather than through META_PAGING_MAX_PAGES so these pin the
+  // BEHAVIOUR at a bound, not the constant's current value — which is deliberately large.
   it('stops at the page bound instead of recursing without limit', async () => {
-    const served = mockPages(500);
-    const data = await fetchWithRetryAndPaging(graphUrl(0));
+    const served = mockPages(1000);
+    const data = await fetchWithRetryAndPaging(graphUrl(0), 3);
 
-    expect(served()).toBe(META_PAGING_MAX_PAGES + 1);
-    expect(data.data).toHaveLength(META_PAGING_MAX_PAGES + 1);
+    expect(served()).toBe(4);
+    expect(data.data).toHaveLength(4);
   });
 
   it('flags a bounded stop so a short list cannot read as a complete one', async () => {
-    mockPages(500);
-    const data = await fetchWithRetryAndPaging(graphUrl(0));
+    mockPages(1000);
+    const data = await fetchWithRetryAndPaging(graphUrl(0), 3);
 
     expect(data.pagingTruncated).toBe(true);
     const warned = warnSpy.mock.calls.flat().join(' ');
     expect(warned).toMatch(/paging stopped/i);
     expect(warned).not.toContain(TOKEN);
+  });
+
+  /*
+   * The default bound must stay far above what routes/meta.ts's dashboard reads need. Those six
+   * calls set no `limit`, so Meta serves 25 rows a page: a 25-page bound would have capped them
+   * at 625 rows where they were previously unbounded — silently shrinking dashboards, which is
+   * the defect this file exists to prevent, introduced by the guard against it.
+   */
+  it('keeps a default bound generous enough not to shrink an unlimited caller', () => {
+    expect(META_PAGING_MAX_PAGES).toBeGreaterThanOrEqual(500);
   });
 });

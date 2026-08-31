@@ -86,12 +86,20 @@ export const fetchWithRetry = async (url: string, retries: number = 3, delayMs: 
 /**
  * Hard bound on how many pages one `fetchWithRetryAndPaging` call will follow.
  *
- * Mirrors `metaService`'s `META_LIST_MAX_PAGES`: a paged read over an account of unknown size
- * is unbounded work, and this helper follows `paging.next` RECURSIVELY, so an account large
- * enough turns "slow" into a blown stack. A bound that is announced (see `pagingTruncated`
- * below) is safe; an unannounced one is the ENG-1584 defect, so the caller is told.
+ * This helper follows `paging.next` RECURSIVELY, so an account large enough turns "slow" into a
+ * blown stack. A bound that is announced (see `pagingTruncated` below) is safe; an unannounced
+ * one is the ENG-1584 defect, so the caller is told.
+ *
+ * ⚠ Deliberately far larger than `metaService`'s `META_LIST_MAX_PAGES` (25), and NOT a copy of
+ * it. That value pairs with an explicit `limit=100`, so 25 pages is 2,500 rows. The callers
+ * here — `routes/meta.ts`'s six dashboard reads — set no `limit` at all, so Meta serves its
+ * default 25 per page and 25 pages would be just 625 rows. Their previous behaviour was
+ * genuinely unbounded, so a tight bound would silently shrink dashboards for any account past
+ * that: the exact defect this file is being changed to prevent. 500 pages is a runaway guard,
+ * not a page-size policy — it sits far beyond any realistic dashboard query while still
+ * bounding the recursion.
  */
-export const META_PAGING_MAX_PAGES = 25;
+export const META_PAGING_MAX_PAGES = 500;
 
 /**
  * A Graph `paging.next` URL carries the `access_token` in its query string — often first,
