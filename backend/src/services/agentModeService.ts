@@ -30271,359 +30271,388 @@ ${strippedHtml}`;
     updates: Array<{ stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string }>,
     sessionId: string
   ): Promise<any> {
-      // ENG-1188 (Greptile): consistentRead, not the default eventually-consistent
-      // read -- a turn that writes an "Image generated" marker and then
-      // immediately calls set_work_plan_status in the same turn can otherwise race
-      // a stale replica and see too few images, rejecting genuinely-complete work
-      // as insufficientAssets. ENG-510 built this parameter for exactly this "just
-      // wrote it, must see it now" shape (agentModeController.ts already uses it
-      // for the analogous timed-out-run read).
-      const session = await chatbotDb.getChatSession(sessionId, true);
-      if (!session || !session.workPlan) {
-        return {
-          success: false,
-          message: 'No work plan found in this session. Create one first using create_work_plan.'
-        };
+    // ENG-1188 (Greptile): consistentRead, not the default eventually-consistent
+    // read -- a turn that writes an "Image generated" marker and then
+    // immediately calls set_work_plan_status in the same turn can otherwise race
+    // a stale replica and see too few images, rejecting genuinely-complete work
+    // as insufficientAssets. ENG-510 built this parameter for exactly this "just
+    // wrote it, must see it now" shape (agentModeController.ts already uses it
+    // for the analogous timed-out-run read).
+    const session = await chatbotDb.getChatSession(sessionId, true);
+    if (!session || !session.workPlan) {
+      return {
+        success: false,
+        message: 'No work plan found in this session. Create one first using create_work_plan.'
+      };
+    }
+
+    // ENG-1626 (code review): the retry wrapper in setWorkPlanStatus can re-invoke
+    // this attempt after a classified-transient error whose underlying DynamoDB
+    // writes actually committed server-side (ack-lost) -- the client sees a
+    // timeout/network failure, but updateSessionWorkPlan/updateCalledFunctions
+    // below are unconditional SETs with no idempotency key. Blindly re-running the
+    // mutation would re-decrement an already-decremented calledFunctionCounts and
+    // re-stamp resolvedAt, corrupting the asset-count cutoff window for later
+    // steps. If every requested step is already in its target status, the prior
+    // attempt's mutation already landed -- report success without touching state.
+    if (updates.every(update => {
+      const step = session.workPlan!.steps.find((s: any) => s.stepCount === update.stepCount);
+      return !!step && step.status === update.status;
+    })) {
+      const updatedSteps = updates.map(update => {
+        const step = session.workPlan!.steps.find((s: any) => s.stepCount === update.stepCount)!;
+        return { stepCount: update.stepCount, title: step.title, status: update.status };
+      });
+      return {
+        success: true,
+        message: updatedSteps.length === 1
+          ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
+          : `Updated ${updatedSteps.length} step${updatedSteps.length > 1 ? 's' : ''}`,
+        updatedSteps,
+        formattedContent: updatedSteps.map(s =>
+          `Updated step ${s.stepCount} "${s.title}" to ${s.status}`
+        ).join('\n')
+      };
+    }
+
+    // ENG-1188 (Greptile follow-up): each step's PRE-BATCH resolvedAt/completedAt
+    // AND status, captured before any update in THIS call runs. workPlan.steps
+    // below starts as the SAME array session.workPlan.steps points at (the
+    // spread on the next line only copies the top-level object), so an
+    // in-place `workPlan.steps[i] = {...}` replacement further down is visible
+    // through both references — reading a "live" cutoff would see this batch's
+    // OWN just-assigned timestamps, collapsing every step resolved together in
+    // one call to the same instant and wrongly excluding assets a later step in
+    // that same batch actually produced in an earlier turn.
+    //
+    // Status is captured alongside the timestamp (CodeRabbit, PR #2430): a step
+    // that was completed/skipped and later reset to 'pending' (e.g. its assets
+    // need regenerating) keeps its old resolvedAt/completedAt untouched — only
+    // a 'completed'/'skipped' transition refreshes those fields. Blindly trusting
+    // that stale timestamp as a cutoff for a later step would wrongly widen the
+    // asset-count window with assets from the step's earlier, now-superseded
+    // attempt — see the cutoff walk below for how a reset step's PRE-BATCH
+    // status routes it to its fresh LIVE timestamp instead.
+    const originalStepStateByCount = new Map<number, { resolvedAt: string | undefined; status: string }>(
+      session.workPlan.steps.map((s: any) => [s.stepCount, { resolvedAt: s.resolvedAt || s.completedAt, status: s.status }])
+    );
+
+    const workPlan = { ...session.workPlan };
+    const updatedSteps: Array<{ stepCount: number; title: string; status: string }> = [];
+    const notFoundSteps: number[] = [];
+    const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
+    const outOfOrderSteps: Array<{ stepCount: number; title: string; pendingSteps: string[] }> = [];
+
+    // Get function call counts from session (make a copy to modify)
+    const calledFunctionCounts = { ...(session.calledFunctions || {}) };
+    let countsModified = false;
+
+    const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
+
+    // Process each update
+    for (const update of updates) {
+      const stepIndex = workPlan.steps.findIndex(s => s.stepCount === update.stepCount);
+
+      if (stepIndex < 0) {
+        notFoundSteps.push(update.stepCount);
+        continue;
       }
 
-      // ENG-1188 (Greptile follow-up): each step's PRE-BATCH resolvedAt/completedAt
-      // AND status, captured before any update in THIS call runs. workPlan.steps
-      // below starts as the SAME array session.workPlan.steps points at (the
-      // spread on the next line only copies the top-level object), so an
-      // in-place `workPlan.steps[i] = {...}` replacement further down is visible
-      // through both references — reading a "live" cutoff would see this batch's
-      // OWN just-assigned timestamps, collapsing every step resolved together in
-      // one call to the same instant and wrongly excluding assets a later step in
-      // that same batch actually produced in an earlier turn.
+      const step = workPlan.steps[stepIndex];
+
+      // Cross-step ordering gate (ENG-1188 root cause fault #3): the xCures
+      // incident marked "QA, Contact Sheet & Delivery" completed while "Render
+      // the Full Size Matrix" — an earlier step — was still pending, so delivery
+      // never actually gated on the rendering it claimed to deliver. Neither gate
+      // below catches this: both only look at the step being completed, never at
+      // whether the steps before it are actually done. Checked against the
+      // in-progress workPlan.steps (not a snapshot from before the loop), so
+      // several steps completed in the same batch, in order, chain correctly —
+      // and a batch that completes them out of order is caught per-step.
+      if (update.status === 'completed') {
+        const pendingEarlierSteps = workPlan.steps.filter(
+          (s: any) => s.stepCount < step.stepCount && s.status !== 'completed' && s.status !== 'skipped'
+        );
+        if (pendingEarlierSteps.length > 0) {
+          outOfOrderSteps.push({
+            stepCount: update.stepCount,
+            title: step.title,
+            pendingSteps: pendingEarlierSteps.map((s: any) => `${s.stepCount} "${s.title}"`),
+          });
+          continue; // Skip updating this step
+        }
+      }
+
+      // Validate required function calls if marking as completed
+      if (update.status === 'completed' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+        // Count how many times each function is required
+        const requiredCounts: Record<string, number> = {};
+        for (const fn of step.requiredFunctionCalls) {
+          requiredCounts[fn] = (requiredCounts[fn] || 0) + 1;
+        }
+
+        // Check if we have enough calls for each required function
+        const missing: string[] = [];
+        for (const [fn, requiredCount] of Object.entries(requiredCounts)) {
+          const availableCount = calledFunctionCounts[fn] || 0;
+          if (availableCount < requiredCount) {
+            missing.push(`${fn} (need ${requiredCount}, have ${availableCount})`);
+          }
+        }
+
+        if (missing.length > 0) {
+          missingFunctionCalls.push({
+            stepCount: update.stepCount,
+            title: step.title,
+            missing
+          });
+          continue; // Skip updating this step
+        }
+
+        // If validation passed and marking as completed, decrement the function counts
+        for (const fn of step.requiredFunctionCalls) {
+          calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
+          countsModified = true;
+        }
+      }
+
+      // Asset-count completion gate. When a step declares expectedAssetCount, it may
+      // not be marked completed until IT has actually produced that many media
+      // assets. This prevents the xCures failure mode: a "Generate 3 Images Per
+      // Hook — 18 total" step being marked done with only 3 images produced (the model
+      // self-reported "Hooks 2-6 generate-pending" yet completed the step). The
+      // required-function-calls gate above could not catch this — it only checked that
+      // generate_image was called ≥1×, and the call counter was inflated to 76 by
+      // non-producing confirmation-gate returns. Counting real assets is the fix.
+      // The user can still legitimately reduce scope via modify_work_plan (lowering or
+      // clearing expectedAssetCount), so this never becomes an unrecoverable block.
       //
-      // Status is captured alongside the timestamp (CodeRabbit, PR #2430): a step
-      // that was completed/skipped and later reset to 'pending' (e.g. its assets
-      // need regenerating) keeps its old resolvedAt/completedAt untouched — only
-      // a 'completed'/'skipped' transition refreshes those fields. Blindly trusting
-      // that stale timestamp as a cutoff for a later step would wrongly widen the
-      // asset-count window with assets from the step's earlier, now-superseded
-      // attempt — see the cutoff walk below for how a reset step's PRE-BATCH
-      // status routes it to its fresh LIVE timestamp instead.
-      const originalStepStateByCount = new Map<number, { resolvedAt: string | undefined; status: string }>(
-        session.workPlan.steps.map((s: any) => [s.stepCount, { resolvedAt: s.resolvedAt || s.completedAt, status: s.status }])
-      );
-
-      const workPlan = { ...session.workPlan };
-      const updatedSteps: Array<{ stepCount: number; title: string; status: string }> = [];
-      const notFoundSteps: number[] = [];
-      const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
-      const outOfOrderSteps: Array<{ stepCount: number; title: string; pendingSteps: string[] }> = [];
-
-      // Get function call counts from session (make a copy to modify)
-      const calledFunctionCounts = { ...(session.calledFunctions || {}) };
-      let countsModified = false;
-
-      const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
-
-      // Process each update
-      for (const update of updates) {
-        const stepIndex = workPlan.steps.findIndex(s => s.stepCount === update.stepCount);
-
-        if (stepIndex < 0) {
-          notFoundSteps.push(update.stepCount);
-          continue;
-        }
-
-        const step = workPlan.steps[stepIndex];
-
-        // Cross-step ordering gate (ENG-1188 root cause fault #3): the xCures
-        // incident marked "QA, Contact Sheet & Delivery" completed while "Render
-        // the Full Size Matrix" — an earlier step — was still pending, so delivery
-        // never actually gated on the rendering it claimed to deliver. Neither gate
-        // below catches this: both only look at the step being completed, never at
-        // whether the steps before it are actually done. Checked against the
-        // in-progress workPlan.steps (not a snapshot from before the loop), so
-        // several steps completed in the same batch, in order, chain correctly —
-        // and a batch that completes them out of order is caught per-step.
-        if (update.status === 'completed') {
-          const pendingEarlierSteps = workPlan.steps.filter(
-            (s: any) => s.stepCount < step.stepCount && s.status !== 'completed' && s.status !== 'skipped'
-          );
-          if (pendingEarlierSteps.length > 0) {
-            outOfOrderSteps.push({
-              stepCount: update.stepCount,
-              title: step.title,
-              pendingSteps: pendingEarlierSteps.map((s: any) => `${s.stepCount} "${s.title}"`),
-            });
-            continue; // Skip updating this step
+      // ENG-1188: scoped to images generated SINCE the previous step resolved, not
+      // the whole session — otherwise an earlier step's images satisfy a later
+      // step's requirement without it producing anything of its own (e.g. step 1's
+      // 18 hero images would silently cover step 2's own "3 required" declaration).
+      // No earlier step (or none with a resolvedAt yet) means no cutoff, matching
+      // the session-wide count this replaces for step 1.
+      //
+      // ENG-1188 (Greptile follow-up): the cutoff comes from each earlier step's
+      // PRE-BATCH resolvedAt (originalStepStateByCount, captured before this call
+      // started), walking back to the nearest earlier step that already had one —
+      // NOT the live in-progress workPlan.steps. A step resolved earlier in this
+      // SAME batch shares this instant as its live timestamp, which would exclude
+      // assets this step actually produced in an earlier turn; a step resolved
+      // in this same batch simply contributes no cutoff of its own, same as a
+      // step that has never resolved.
+      //
+      // ENG-1188 (CodeRabbit follow-up): a step can be reset to 'pending' after
+      // having been completed/skipped before (e.g. its assets need
+      // regenerating) — only 'completed'/'skipped' transitions stamp
+      // resolvedAt/completedAt, so a reset step KEEPS its stale timestamp from
+      // the earlier, now-superseded attempt. The ordering gate above means the
+      // only way we can reach a 'completed' update here with an earlier step's
+      // PRE-BATCH status of 'pending' is if that earlier step is ALSO being
+      // resolved within this very batch (otherwise it would still be pending
+      // live, too, and the ordering gate would have rejected this update
+      // already). In that case, trust the fresh, just-stamped LIVE timestamp
+      // for that step instead of its stale pre-batch one — that boundary is
+      // exactly "when did this step's redo actually finish," which correctly
+      // excludes both the stale pre-reset attempt's assets AND any redo-work
+      // assets produced leading up to this exact re-completion. A step with NO
+      // prior resolution at all (genuinely first-time-completed within this
+      // batch) still contributes no cutoff, same as the existing behavior.
+      if (update.status === 'completed'
+        && typeof step.expectedAssetCount === 'number'
+        && step.expectedAssetCount > 0) {
+        const earlierStepCounts = workPlan.steps
+          .filter((s: any) => s.stepCount < step.stepCount)
+          .map((s: any) => s.stepCount as number)
+          .sort((a: number, b: number) => b - a); // nearest first
+        let sinceIso: string | undefined;
+        for (const count of earlierStepCounts) {
+          const preBatch = originalStepStateByCount.get(count);
+          if (!preBatch) continue;
+          if (preBatch.status === 'completed' || preBatch.status === 'skipped') {
+            if (preBatch.resolvedAt) { sinceIso = preBatch.resolvedAt; break; }
+            continue;
+          }
+          if (preBatch.resolvedAt) {
+            const live = workPlan.steps.find((s: any) => s.stepCount === count);
+            if (live?.resolvedAt) { sinceIso = live.resolvedAt; break; }
           }
         }
-
-        // Validate required function calls if marking as completed
-        if (update.status === 'completed' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
-          // Count how many times each function is required
-          const requiredCounts: Record<string, number> = {};
-          for (const fn of step.requiredFunctionCalls) {
-            requiredCounts[fn] = (requiredCounts[fn] || 0) + 1;
-          }
-
-          // Check if we have enough calls for each required function
-          const missing: string[] = [];
-          for (const [fn, requiredCount] of Object.entries(requiredCounts)) {
-            const availableCount = calledFunctionCounts[fn] || 0;
-            if (availableCount < requiredCount) {
-              missing.push(`${fn} (need ${requiredCount}, have ${availableCount})`);
-            }
-          }
-
-          if (missing.length > 0) {
-            missingFunctionCalls.push({
-              stepCount: update.stepCount,
-              title: step.title,
-              missing
-            });
-            continue; // Skip updating this step
-          }
-
-          // If validation passed and marking as completed, decrement the function counts
-          for (const fn of step.requiredFunctionCalls) {
-            calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
-            countsModified = true;
-          }
-        }
-
-        // Asset-count completion gate. When a step declares expectedAssetCount, it may
-        // not be marked completed until IT has actually produced that many media
-        // assets. This prevents the xCures failure mode: a "Generate 3 Images Per
-        // Hook — 18 total" step being marked done with only 3 images produced (the model
-        // self-reported "Hooks 2-6 generate-pending" yet completed the step). The
-        // required-function-calls gate above could not catch this — it only checked that
-        // generate_image was called ≥1×, and the call counter was inflated to 76 by
-        // non-producing confirmation-gate returns. Counting real assets is the fix.
-        // The user can still legitimately reduce scope via modify_work_plan (lowering or
-        // clearing expectedAssetCount), so this never becomes an unrecoverable block.
+        // ENG-1331: extractGeneratedImageFilenames only recognizes generate_image's
+        // own marker, so a step whose deliverable is Playwright-rendered
+        // screenshots (no generate_image call at all) would always read 0 there.
+        // extractProducedAssetCount reads the same persisted toolCalls ledger for
+        // every known asset-producing tool.
         //
-        // ENG-1188: scoped to images generated SINCE the previous step resolved, not
-        // the whole session — otherwise an earlier step's images satisfy a later
-        // step's requirement without it producing anything of its own (e.g. step 1's
-        // 18 hero images would silently cover step 2's own "3 required" declaration).
-        // No earlier step (or none with a resolvedAt yet) means no cutoff, matching
-        // the session-wide count this replaces for step 1.
-        //
-        // ENG-1188 (Greptile follow-up): the cutoff comes from each earlier step's
-        // PRE-BATCH resolvedAt (originalStepStateByCount, captured before this call
-        // started), walking back to the nearest earlier step that already had one —
-        // NOT the live in-progress workPlan.steps. A step resolved earlier in this
-        // SAME batch shares this instant as its live timestamp, which would exclude
-        // assets this step actually produced in an earlier turn; a step resolved
-        // in this same batch simply contributes no cutoff of its own, same as a
-        // step that has never resolved.
-        //
-        // ENG-1188 (CodeRabbit follow-up): a step can be reset to 'pending' after
-        // having been completed/skipped before (e.g. its assets need
-        // regenerating) — only 'completed'/'skipped' transitions stamp
-        // resolvedAt/completedAt, so a reset step KEEPS its stale timestamp from
-        // the earlier, now-superseded attempt. The ordering gate above means the
-        // only way we can reach a 'completed' update here with an earlier step's
-        // PRE-BATCH status of 'pending' is if that earlier step is ALSO being
-        // resolved within this very batch (otherwise it would still be pending
-        // live, too, and the ordering gate would have rejected this update
-        // already). In that case, trust the fresh, just-stamped LIVE timestamp
-        // for that step instead of its stale pre-batch one — that boundary is
-        // exactly "when did this step's redo actually finish," which correctly
-        // excludes both the stale pre-reset attempt's assets AND any redo-work
-        // assets produced leading up to this exact re-completion. A step with NO
-        // prior resolution at all (genuinely first-time-completed within this
-        // batch) still contributes no cutoff, same as the existing behavior.
-        if (update.status === 'completed'
-          && typeof step.expectedAssetCount === 'number'
-          && step.expectedAssetCount > 0) {
-          const earlierStepCounts = workPlan.steps
-            .filter((s: any) => s.stepCount < step.stepCount)
-            .map((s: any) => s.stepCount as number)
-            .sort((a: number, b: number) => b - a); // nearest first
-          let sinceIso: string | undefined;
-          for (const count of earlierStepCounts) {
-            const preBatch = originalStepStateByCount.get(count);
-            if (!preBatch) continue;
-            if (preBatch.status === 'completed' || preBatch.status === 'skipped') {
-              if (preBatch.resolvedAt) { sinceIso = preBatch.resolvedAt; break; }
-              continue;
-            }
-            if (preBatch.resolvedAt) {
-              const live = workPlan.steps.find((s: any) => s.stepCount === count);
-              if (live?.resolvedAt) { sinceIso = live.resolvedAt; break; }
-            }
-          }
-          // ENG-1331: extractGeneratedImageFilenames only recognizes generate_image's
-          // own marker, so a step whose deliverable is Playwright-rendered
-          // screenshots (no generate_image call at all) would always read 0 there.
-          // extractProducedAssetCount reads the same persisted toolCalls ledger for
-          // every known asset-producing tool.
-          //
-          // When the step names its own expectedAssetCountTools, trust that
-          // explicitly and skip the max-with-legacy-signal blend below: the whole
-          // point of naming the tool(s) is precision, and blending in
-          // extractGeneratedImageFilenames' generate_image count would reopen the
-          // exact ambiguity the author resolved by naming their tool(s) at all (e.g.
-          // an unrelated generate_image call elsewhere in the step inflating a
-          // screenshot-only count). Without a declared list, take the max of both
-          // signals so neither detection path can pull the count DOWN relative to
-          // the other — the safe default for a step that hasn't disambiguated.
-          const producedAssetCount = step.expectedAssetCountTools?.length
-            ? extractProducedAssetCount(session.messages, sinceIso, step.expectedAssetCountTools)
-            : Math.max(
-                AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
-                extractProducedAssetCount(session.messages, sinceIso),
-              );
-          if (producedAssetCount < step.expectedAssetCount) {
-            insufficientAssets.push({
-              stepCount: update.stepCount,
-              title: step.title,
-              expected: step.expectedAssetCount,
-              produced: producedAssetCount,
-            });
-            continue; // Skip updating this step
-          }
-        }
-
-        // Update the step status
-        const resolvedNow = update.status === 'completed' || update.status === 'skipped'
-          ? new Date().toISOString()
-          : undefined;
-        workPlan.steps[stepIndex] = {
-          ...workPlan.steps[stepIndex],
-          status: update.status,
-          notes: update.notes,
-          completedAt: update.status === 'completed' ? resolvedNow : workPlan.steps[stepIndex].completedAt,
-          // ENG-1188 (Greptile follow-up): set for 'skipped' too, unlike completedAt
-          // — see the field's doc comment in chatbotService.ts for why this can't
-          // just reuse completedAt.
-          resolvedAt: resolvedNow || workPlan.steps[stepIndex].resolvedAt,
-        };
-
-        updatedSteps.push({
-          stepCount: update.stepCount,
-          title: workPlan.steps[stepIndex].title,
-          status: update.status
-        });
-      }
-
-      // Ordering gate failure — a step was completed while an earlier step in the
-      // plan is still pending. Same all-or-nothing shape as the two gates below:
-      // the caller can just resend the batch in the correct order.
-      if (outOfOrderSteps.length > 0) {
-        const errorDetails = outOfOrderSteps.map(oos =>
-          `Step ${oos.stepCount} "${oos.title}": earlier step(s) not yet done: ${oos.pendingSteps.join(', ')}`
-        ).join('\n');
-
-        return {
-          success: false,
-          message: 'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
-          outOfOrderSteps,
-          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nComplete (or explicitly skip) the earlier step(s) first, then mark this step as completed.`
-        };
-      }
-
-      // Check if there are missing function calls - this is a critical error
-      if (missingFunctionCalls.length > 0) {
-        const errorDetails = missingFunctionCalls.map(mfc =>
-          `Step ${mfc.stepCount} "${mfc.title}": missing required function calls: ${mfc.missing.join(', ')}`
-        ).join('\n');
-
-        return {
-          success: false,
-          message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
-          missingFunctionCalls,
-          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nPlease make the required function calls first, then mark the steps as completed.`
-        };
-      }
-
-      // Asset-count gate failure — the step's declared media assets are not all produced.
-      if (insufficientAssets.length > 0) {
-        const errorDetails = insufficientAssets.map(ia =>
-          `Step ${ia.stepCount} "${ia.title}": ${ia.produced} of ${ia.expected} required images/assets have been generated (${ia.expected - ia.produced} still missing)`
-        ).join('\n');
-
-        return {
-          success: false,
-          message: 'Cannot mark steps as completed. The required number of assets has not been generated yet.',
-          insufficientAssets,
-          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nGenerate the remaining assets with generate_image, then mark the step completed. If the user has explicitly approved a smaller set, call modify_work_plan to lower the step's expected asset count first.`
-        };
-      }
-
-      // Check if any steps were not found
-      if (notFoundSteps.length > 0 && updatedSteps.length === 0) {
-        return {
-          success: false,
-          message: `Steps not found: ${notFoundSteps.join(', ')}`
-        };
-      }
-
-      // Only update if there are changes
-      if (updatedSteps.length > 0) {
-        workPlan.updatedAt = new Date().toISOString();
-        // Update the session (will throw error if stepCount is not sequential)
-        await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
-
-        // A configured input belongs to the step that just became active, not
-        // to a particular portal. Persist the same request the customer portal
-        // renders and an MCP client elicits natively. Answered historical
-        // requests may be replaced; a concurrent live request never is.
-        const nextInputStep = workPlan.steps
-          .sort((a: any, b: any) => a.stepCount - b.stepCount)
-          .find((s: any) => s.status === 'pending' && s.inputRequest);
-        if (nextInputStep?.inputRequest) {
-          await chatbotDb.updateSessionWorkPlanInputRequest(
-            sessionId,
-            buildWorkPlanInputRequest({
-              ...nextInputStep.inputRequest,
-              requestId: uuidv4(),
-              stepCount: nextInputStep.stepCount,
-            }),
-            { failIfAwaitingExists: true },
-          );
-        }
-
-        // Update function counts if they were modified
-        if (countsModified) {
-          await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
-        }
-
-        // Auto-install skills for the next pending step
-        const completedStepCounts = updatedSteps.filter(s => s.status === 'completed').map(s => s.stepCount);
-        if (completedStepCounts.length > 0) {
-          const nextPendingStep = workPlan.steps
-            .sort((a: any, b: any) => a.stepCount - b.stepCount)
-            .find((s: any) => s.status === 'pending');
-          if (nextPendingStep?.skillIds?.length) {
-            try {
-              const currentAssociated = session.associatedSkills || [];
-              const newSkillIds = nextPendingStep.skillIds.filter((id: string) => !currentAssociated.includes(id));
-              if (newSkillIds.length > 0) {
-                await chatbotDb.addAssociatedSkills(sessionId, newSkillIds);
-                console.log(`AgentMode: Auto-installed skills for step ${nextPendingStep.stepCount}: ${newSkillIds.join(', ')}`);
-              }
-            } catch (skillErr) {
-              console.error('AgentMode: Error auto-installing skills for next step:', skillErr);
-            }
-          }
+        // When the step names its own expectedAssetCountTools, trust that
+        // explicitly and skip the max-with-legacy-signal blend below: the whole
+        // point of naming the tool(s) is precision, and blending in
+        // extractGeneratedImageFilenames' generate_image count would reopen the
+        // exact ambiguity the author resolved by naming their tool(s) at all (e.g.
+        // an unrelated generate_image call elsewhere in the step inflating a
+        // screenshot-only count). Without a declared list, take the max of both
+        // signals so neither detection path can pull the count DOWN relative to
+        // the other — the safe default for a step that hasn't disambiguated.
+        const producedAssetCount = step.expectedAssetCountTools?.length
+          ? extractProducedAssetCount(session.messages, sinceIso, step.expectedAssetCountTools)
+          : Math.max(
+              AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
+              extractProducedAssetCount(session.messages, sinceIso),
+            );
+        if (producedAssetCount < step.expectedAssetCount) {
+          insufficientAssets.push({
+            stepCount: update.stepCount,
+            title: step.title,
+            expected: step.expectedAssetCount,
+            produced: producedAssetCount,
+          });
+          continue; // Skip updating this step
         }
       }
 
-      const message = updatedSteps.length === 1
-        ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
-        : `Updated ${updatedSteps.length} step${updatedSteps.length > 1 ? 's' : ''}`;
+      // Update the step status
+      const resolvedNow = update.status === 'completed' || update.status === 'skipped'
+        ? new Date().toISOString()
+        : undefined;
+      workPlan.steps[stepIndex] = {
+        ...workPlan.steps[stepIndex],
+        status: update.status,
+        notes: update.notes,
+        completedAt: update.status === 'completed' ? resolvedNow : workPlan.steps[stepIndex].completedAt,
+        // ENG-1188 (Greptile follow-up): set for 'skipped' too, unlike completedAt
+        // — see the field's doc comment in chatbotService.ts for why this can't
+        // just reuse completedAt.
+        resolvedAt: resolvedNow || workPlan.steps[stepIndex].resolvedAt,
+      };
 
-      const formattedContent = updatedSteps.map(s =>
-        `Updated step ${s.stepCount} "${s.title}" to ${s.status}`
+      updatedSteps.push({
+        stepCount: update.stepCount,
+        title: workPlan.steps[stepIndex].title,
+        status: update.status
+      });
+    }
+
+    // Ordering gate failure — a step was completed while an earlier step in the
+    // plan is still pending. Same all-or-nothing shape as the two gates below:
+    // the caller can just resend the batch in the correct order.
+    if (outOfOrderSteps.length > 0) {
+      const errorDetails = outOfOrderSteps.map(oos =>
+        `Step ${oos.stepCount} "${oos.title}": earlier step(s) not yet done: ${oos.pendingSteps.join(', ')}`
       ).join('\n');
 
       return {
-        success: updatedSteps.length > 0,
-        message: notFoundSteps.length > 0
-          ? `${message}. Steps not found: ${notFoundSteps.join(', ')}`
-          : message,
-        updatedSteps,
-        notFoundSteps: notFoundSteps.length > 0 ? notFoundSteps : undefined,
-        formattedContent
+        success: false,
+        message: 'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
+        outOfOrderSteps,
+        formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nComplete (or explicitly skip) the earlier step(s) first, then mark this step as completed.`
       };
+    }
+
+    // Check if there are missing function calls - this is a critical error
+    if (missingFunctionCalls.length > 0) {
+      const errorDetails = missingFunctionCalls.map(mfc =>
+        `Step ${mfc.stepCount} "${mfc.title}": missing required function calls: ${mfc.missing.join(', ')}`
+      ).join('\n');
+
+      return {
+        success: false,
+        message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
+        missingFunctionCalls,
+        formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nPlease make the required function calls first, then mark the steps as completed.`
+      };
+    }
+
+    // Asset-count gate failure — the step's declared media assets are not all produced.
+    if (insufficientAssets.length > 0) {
+      const errorDetails = insufficientAssets.map(ia =>
+        `Step ${ia.stepCount} "${ia.title}": ${ia.produced} of ${ia.expected} required images/assets have been generated (${ia.expected - ia.produced} still missing)`
+      ).join('\n');
+
+      return {
+        success: false,
+        message: 'Cannot mark steps as completed. The required number of assets has not been generated yet.',
+        insufficientAssets,
+        formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nGenerate the remaining assets with generate_image, then mark the step completed. If the user has explicitly approved a smaller set, call modify_work_plan to lower the step's expected asset count first.`
+      };
+    }
+
+    // Check if any steps were not found
+    if (notFoundSteps.length > 0 && updatedSteps.length === 0) {
+      return {
+        success: false,
+        message: `Steps not found: ${notFoundSteps.join(', ')}`
+      };
+    }
+
+    // Only update if there are changes
+    if (updatedSteps.length > 0) {
+      workPlan.updatedAt = new Date().toISOString();
+      // Update the session (will throw error if stepCount is not sequential)
+      await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      // A configured input belongs to the step that just became active, not
+      // to a particular portal. Persist the same request the customer portal
+      // renders and an MCP client elicits natively. Answered historical
+      // requests may be replaced; a concurrent live request never is.
+      const nextInputStep = workPlan.steps
+        .sort((a: any, b: any) => a.stepCount - b.stepCount)
+        .find((s: any) => s.status === 'pending' && s.inputRequest);
+      if (nextInputStep?.inputRequest) {
+        await chatbotDb.updateSessionWorkPlanInputRequest(
+          sessionId,
+          buildWorkPlanInputRequest({
+            ...nextInputStep.inputRequest,
+            requestId: uuidv4(),
+            stepCount: nextInputStep.stepCount,
+          }),
+          { failIfAwaitingExists: true },
+        );
+      }
+
+      // Update function counts if they were modified
+      if (countsModified) {
+        await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
+      }
+
+      // Auto-install skills for the next pending step
+      const completedStepCounts = updatedSteps.filter(s => s.status === 'completed').map(s => s.stepCount);
+      if (completedStepCounts.length > 0) {
+        const nextPendingStep = workPlan.steps
+          .sort((a: any, b: any) => a.stepCount - b.stepCount)
+          .find((s: any) => s.status === 'pending');
+        if (nextPendingStep?.skillIds?.length) {
+          try {
+            const currentAssociated = session.associatedSkills || [];
+            const newSkillIds = nextPendingStep.skillIds.filter((id: string) => !currentAssociated.includes(id));
+            if (newSkillIds.length > 0) {
+              await chatbotDb.addAssociatedSkills(sessionId, newSkillIds);
+              console.log(`AgentMode: Auto-installed skills for step ${nextPendingStep.stepCount}: ${newSkillIds.join(', ')}`);
+            }
+          } catch (skillErr) {
+            console.error('AgentMode: Error auto-installing skills for next step:', skillErr);
+          }
+        }
+      }
+    }
+
+    const message = updatedSteps.length === 1
+      ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
+      : `Updated ${updatedSteps.length} step${updatedSteps.length > 1 ? 's' : ''}`;
+
+    const formattedContent = updatedSteps.map(s =>
+      `Updated step ${s.stepCount} "${s.title}" to ${s.status}`
+    ).join('\n');
+
+    return {
+      success: updatedSteps.length > 0,
+      message: notFoundSteps.length > 0
+        ? `${message}. Steps not found: ${notFoundSteps.join(', ')}`
+        : message,
+      updatedSteps,
+      notFoundSteps: notFoundSteps.length > 0 ? notFoundSteps : undefined,
+      formattedContent
+    };
   }
 
   public async listBooks(userId: string, type?: string, status?: string): Promise<any> {
