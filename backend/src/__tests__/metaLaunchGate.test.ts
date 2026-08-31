@@ -434,6 +434,50 @@ describe('referenced creative destinations (ENG-941)', () => {
     expect(mockPreflight.mock.calls[0][0]).toEqual(['https://site.example/new']);
   });
 
+  /*
+   * `adId` is supplied only for an AD-entity write, so it is undefined for every CREATE. Gating
+   * the truncation block on `!adId` alone therefore blocked creates whose destination was fully
+   * checkable, telling them to "activate a single ad instead" — impossible for an entity that
+   * does not exist yet. The ad list's completeness only matters when the ad list is what the
+   * decision rests on.
+   */
+  describe('a truncated ad list and a CREATE that carries its own destination', () => {
+    it('does not block a CREATE whose destination came from the request', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+      mockPreflight.mockResolvedValue({ ok: true, results: [], blockedUrls: [], message: '' });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'AD_CREATE', false, 'sess-c',
+        {}, undefined, ['https://site.example/new-lp'], [],
+      );
+
+      expect(out.proceed).toBe(true);
+      // The supplied destination is what gets checked — the unread siblings are irrelevant to it.
+      expect(mockPreflight.mock.calls[0][0]).toContain('https://site.example/new-lp');
+    });
+
+    it('still blocks when the truncated ad list IS what the decision rests on', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'UPDATE', false, 'sess-c', {}, undefined, [], [],
+      );
+
+      expect(out.proceed).toBe(false);
+      expect(out.blockResult.error).toMatch(/too large to read completely/i);
+    });
+
+    it('offers a remedy a CREATE can actually follow', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'UPDATE', false, 'sess-c', {}, undefined, [], [],
+      );
+
+      expect(out.blockResult.error).toMatch(/supply the destination on the request/i);
+    });
+  });
+
   it('resolves a referenced creative to its destination and checks it', async () => {
     mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     const resolveCreativeDestinations = jest.fn().mockResolvedValue(['https://site.example/referenced']);
