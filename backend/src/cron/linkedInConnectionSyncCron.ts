@@ -77,6 +77,35 @@ const isInviteReconcileEnabled = (): boolean => process.env.LINKEDIN_INVITE_CRM_
  * to no single customer, so nothing that writes into a customer's CRM may act on
  * them.
  */
+/**
+ * Resolves every known Unipile account_id and (where owned) its ownerUserId.
+ *
+ * Uses userDb.scanWithFilter (raw items, no counts) rather than getAllUsers —
+ * the latter fires 3 extra per-user queries (task/workflow/chat session
+ * counts) that exist only for its own admin-dashboard `UserWithCounts` shape
+ * and are entirely unused here. That made this function far more expensive
+ * than the lookup it performs, and — combined with the per-user scan failing
+ * silently below — turned a slow lookup into a fragile one: a transient
+ * failure anywhere in that N×3-query fan-out used to return an EMPTY map with
+ * no error, which the account_status webhook (unipileWebhook.ts) would then
+ * treat as "this account has no owner" — paging oncall with a misleading
+ * "no owner record" message and, critically, never writing needs_reconnect,
+ * silently dropping the health signal.
+ *
+ * The per-user section below now throws on a genuine failure instead of
+ * swallowing it, so a caller can tell "no owner" apart from "lookup failed":
+ *  - the cron's own call site (runLinkedInConnectionSync) is wrapped by
+ *    server.ts's existing top-level `.catch(console.error)` on every
+ *    invocation, so a thrown error here surfaces as a logged failure for that
+ *    cycle rather than a silent, misleadingly-empty result.
+ *  - the webhook route's own try/catch turns a thrown error into a non-200
+ *    response, so Unipile's own retry (5x/30s) gets a chance to succeed
+ *    against a transient failure instead of the delivery being acked away.
+ *
+ * Site-wide accounts (a small, rarely-changed settings blob) keep their own
+ * tolerant catch — a parse failure there is lower-stakes and unrelated to the
+ * scan-cost problem this rewrite targets.
+ */
 export async function getAllUnipileAccountIds(): Promise<{
   ids: string[];
   ownerByAccountId: Map<string, string>;
@@ -96,26 +125,24 @@ export async function getAllUnipileAccountIds(): Promise<{
   } catch { /* ignore */ }
 
   // Per-user connected Unipile accounts
-  try {
-    const { userDb } = await import('../services/db');
-    const users = await userDb.getAllUsers();
-    for (const user of users) {
-      if (!user.connected_accounts) continue;
-      for (const acct of user.connected_accounts as any[]) {
-        if (acct.platform === 'unipile') {
-          const accountId = acct.config?.unipile_account_id || acct.account_id;
-          if (accountId) {
-            ids.add(accountId);
-            // First owner wins; an account shared across users has no single owner
-            // to attribute to, and overwriting would make the choice arbitrary.
-            if (user.userId && !ownerByAccountId.has(accountId)) {
-              ownerByAccountId.set(accountId, String(user.userId));
-            }
+  const { userDb } = await import('../services/db');
+  const users = await userDb.scanWithFilter('attribute_exists(connected_accounts)', {});
+  for (const user of users) {
+    if (!user.connected_accounts) continue;
+    for (const acct of user.connected_accounts as any[]) {
+      if (acct.platform === 'unipile') {
+        const accountId = acct.config?.unipile_account_id || acct.account_id;
+        if (accountId) {
+          ids.add(accountId);
+          // First owner wins; an account shared across users has no single owner
+          // to attribute to, and overwriting would make the choice arbitrary.
+          if (user.userId && !ownerByAccountId.has(accountId)) {
+            ownerByAccountId.set(accountId, String(user.userId));
           }
         }
       }
     }
-  } catch { /* ignore */ }
+  }
 
   return { ids: Array.from(ids), ownerByAccountId };
 }
