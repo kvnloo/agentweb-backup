@@ -395,7 +395,7 @@ export async function runMetaTrackingGate(
   let destinationUrls: string[] = [];
   let pixelIds: string[] = [];
   try {
-    const [ads, pixels] = await Promise.all([
+    const [{ items: ads }, { pixels }] = await Promise.all([
       metaService.listAdsForUtmAudit(accountId, accessToken, campaignId),
       metaService.listPixels(accountId, accessToken),
     ]);
@@ -458,7 +458,7 @@ export async function runMetaTrackingGate(
      * on the miss.
      */
     try {
-      const accountWide = await metaService.listAdsForUtmAudit(accountId, accessToken, undefined as any);
+      const { items: accountWide } = await metaService.listAdsForUtmAudit(accountId, accessToken, undefined as any);
       const named = (accountWide ?? []).filter((a: any) => String(a?.adId) === String(adId));
       const found = named.flatMap((a: any) => a?.destinationUrls ?? []).filter(Boolean);
       if (found.length > 0) {
