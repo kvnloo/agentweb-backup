@@ -7,6 +7,9 @@ import type { ScoringJudge } from "../services/sessionScoringService";
 const makeSession = (id: string): ChatSession =>
   ({ sessionId: id, userId: "u1", messages: [] } as unknown as ChatSession);
 
+const makeSessionWithSize = (id: string, messageCount: number): ChatSession =>
+  ({ sessionId: id, userId: "u1", messageCount, messages: [] } as unknown as ChatSession);
+
 const judge = (id: string): ScoringJudge =>
   ({ id, name: `Judge ${id}`, systemPrompt: "p", createdAt: "2024-01-01", updatedAt: "2024-01-01" } as ScoringJudge);
 
@@ -113,6 +116,50 @@ describe("backfillSessionScores", () => {
       status: "not-attempted",
       reason: "scoring budget exhausted",
     });
+  });
+
+  // ENG-929 follow-up: a scaled-up per-session timeout (up to 60s for a large
+  // transcript, vs. the old flat 20s fail-fast) means a few large sessions can
+  // now consume much more of the shared budget than before. Dispatching
+  // smallest-first keeps a mixed window from having its budget eaten by a
+  // handful of large sessions before the many small ones are ever attempted.
+  it("dispatches smaller sessions first so a constrained budget scores more of them (FAIL boundary)", async () => {
+    // Listed BIG session first — array order must not determine dispatch order.
+    const sessions = [
+      makeSessionWithSize("big", 1000),
+      makeSessionWithSize("small-a", 1),
+      makeSessionWithSize("small-b", 2),
+    ];
+    let t = 0;
+    const now = () => t;
+    const scoreSession = jest.fn(async () => {
+      t += 100;
+      return { score: { score: 4 } } as any;
+    });
+
+    // budget 150ms, concurrency 1 → sessions start at t=0 and t=100 (both
+    // <150); the one that would start at t=200 is refused. Exactly 2 fit.
+    const result = await backfillSessionScores(sessions, [], {
+      scoreSession,
+      concurrency: 1,
+      budgetMs: 150,
+      now,
+    });
+
+    // The two smallest were scored; the big one — despite being first in the
+    // input array — was left for a later run.
+    expect(scoreSession).toHaveBeenCalledTimes(2);
+
+    // outcomes stays in the ORIGINAL input order (big, small-a, small-b) —
+    // dispatch order changed, the returned order contract did not.
+    expect(result.outcomes.map((o) => o.sessionId)).toEqual(["big", "small-a", "small-b"]);
+    expect(result.outcomes[0]).toEqual({
+      sessionId: "big",
+      status: "not-attempted",
+      reason: "scoring budget exhausted",
+    });
+    expect(result.outcomes[1].status).toBe("scored");
+    expect(result.outcomes[2].status).toBe("scored");
   });
 
   it("continues with other sessions when one session's scorer throws (error path)", async () => {
