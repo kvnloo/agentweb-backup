@@ -74,14 +74,31 @@ async function main() {
 
   const sessions = [];
   for (const sessionId of SESSION_IDS) {
-    const session = await chatbotDb.getChatSession(sessionId);
+    let session;
+    try {
+      session = await chatbotDb.getChatSession(sessionId);
+    } catch (error) {
+      // Isolated per session (matches admin.ts's own hydration loop) — a transient
+      // read failure on one ID must not abort the other two.
+      console.log(`  ${sessionId}: FETCH FAILED — skipping (${(error as Error).message})`);
+      continue;
+    }
     if (!session) {
       console.log(`  ${sessionId}: NOT FOUND — skipping`);
       continue;
     }
-    if (session.satisfactionScore) {
+    const messageCount = session.messageCount ?? session.messages?.length ?? 0;
+    const alreadyScored =
+      session.satisfactionScore &&
+      session.satisfactionScore.evaluatedMessageIndex >= messageCount &&
+      (session.satisfactionScore as any).dimensions;
+    if (alreadyScored) {
       console.log(
-        `  ${sessionId}: already has a satisfactionScore (evaluatedAt=${session.satisfactionScore.evaluatedAt}) — leaving as-is, backfillSessionScores will skip it`
+        `  ${sessionId}: already scored with dimensions (evaluatedAt=${session.satisfactionScore!.evaluatedAt}) — backfillSessionScores will skip it`
+      );
+    } else if (session.satisfactionScore) {
+      console.log(
+        `  ${sessionId}: has a satisfactionScore but missing dimensions or stale evaluatedMessageIndex — backfillSessionScores WILL re-score it`
       );
     }
     sessions.push(session);
