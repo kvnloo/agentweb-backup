@@ -343,6 +343,33 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.anything(), 'pull', false);
   });
 
+  // CodeRabbit-flagged: the per-event try/catch above only covers
+  // applyAttioPersonEvent failures — a throw from auth/service resolution
+  // (e.g. a bad or expired manual token) happens BEFORE the loop even
+  // starts, and previously skipped updateSyncTimestamp entirely too.
+  it('stamps lastPullSyncAt with success:false when Attio auth/service resolution throws', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue(mockConfig('attio'));
+    (externalCrmSyncService.resolveAuthForList as jest.Mock).mockRejectedValueOnce(new Error('token decryption failed'));
+
+    const event = {
+      event_type: 'record.updated',
+      workspace_id: 'ws-abc',
+      data: {
+        object: { slug: 'people' },
+        record: { id: { record_id: 'rec-xyz' } },
+      },
+    };
+
+    const res = await request(app)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send(event);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.anything(), 'pull', false);
+  });
+
   it('skips Attio event for non-people objects (e.g. companies)', async () => {
     (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue(mockConfig('attio'));
 
