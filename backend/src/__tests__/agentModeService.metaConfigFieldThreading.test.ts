@@ -59,7 +59,9 @@ describe('call_meta_marketing_api config-field threading (ENG-398)', () => {
     jest.clearAllMocks();
     (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
     (metaService.listAdSets as jest.Mock).mockResolvedValue([]);
-    (metaService.listCampaigns as jest.Mock).mockResolvedValue([]);
+    // listCampaigns returns { campaigns, truncated, pagesFetched }, not a bare
+    // array (ENG-1625) — matches the real MetaCampaignListResult contract.
+    (metaService.listCampaigns as jest.Mock).mockResolvedValue({ campaigns: [], truncated: false, pagesFetched: 1 });
   });
 
   // -------- AD_SET --------
