@@ -18,6 +18,7 @@ import { generateMarketingResponseWorkerService } from '../services/generateMark
 import { resolveInboundAnswer, resolveTypedTextAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { buildWorkPlanInputRequest, resolveWorkPlanInputAnswer, WorkPlanInputRequestError } from '../services/agentMode/core/workPlanInputRequest';
 import type { WorkPlanTurnDisposition } from '../services/agentMode/core/workPlanTurnDisposition';
+import { priorTurnNeedsWorkPlanDispositionRetry } from '../services/agentMode/core/workPlanTurnDisposition';
 import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
@@ -6664,7 +6665,17 @@ export async function generateSessionResponse(
   // Check if this is the first user message (excluding system message)
   const userMessages = session.messages?.filter(msg => msg.role === 'user') || [];
   const isFirstMessage = userMessages.length === 0;
+  // ENG-1626: if the immediately-preceding assistant turn failed to reach a
+  // structured workplan disposition (e.g. a decision-card creation that
+  // silently failed even after the in-turn retry), re-enforce the check on
+  // THIS turn too — regardless of what the customer typed — so the retry
+  // happens automatically instead of depending on them asking for it by name
+  // (production case: the customer had to type "Please retry creating the
+  // card" verbatim before anything happened).
+  const lastMessage = session.messages?.[session.messages.length - 1];
+  const priorTurnFailedDisposition = priorTurnNeedsWorkPlanDispositionRetry(lastMessage);
   const enforceWorkPlanDisposition = requireWorkPlanDisposition
+    || priorTurnFailedDisposition
     || (Boolean(session.workPlan) && isFirstMessage);
 
   // If this is the first message, add system message with version info first
