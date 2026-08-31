@@ -606,18 +606,27 @@ const LINKEDIN_INVITE_CAP_BLOCK_RE =
 type LinkedInInviteSendBlock = {
   notice: string;
   successfulInviteSends: number;
+  // ENG-1657 (AC3): the Unipile account the blocked send-invite call targeted, when
+  // the tool arguments carried one. Used only to key the internal oncall alert's
+  // per-account/day dedupe — never surfaced to the customer.
+  accountId?: string;
 };
 
-function linkedInOutreachAction(call: any): string {
+function linkedInOutreachArgs(call: any): Record<string, any> | null {
   const args = call?.arguments;
-  if (args && typeof args === 'object') return String(args.action || '').toLowerCase();
-  if (typeof args !== 'string') return '';
+  if (args && typeof args === 'object') return args;
+  if (typeof args !== 'string') return null;
   try {
     const parsed = JSON.parse(args);
-    return parsed && typeof parsed === 'object' ? String(parsed.action || '').toLowerCase() : '';
+    return parsed && typeof parsed === 'object' ? parsed : null;
   } catch {
-    return '';
+    return null;
   }
+}
+
+function linkedInOutreachAction(call: any): string {
+  const args = linkedInOutreachArgs(call);
+  return args ? String(args.action || '').toLowerCase() : '';
 }
 
 /**
@@ -647,7 +656,10 @@ function detectLinkedInInviteSendBlock(toolCalls: any[] | undefined | null): Lin
     .join(' ');
   const internalPacing = /daily (?:invite|volume).*(?:cap|limit)|write actions are being paced|pacing|paced/i.test(detail);
   const reason = internalPacing ? 'our internal pacing cap' : "LinkedIn's account-level invitation cooldown";
+  const blockedArgs = linkedInOutreachArgs(blockedCall);
+  const accountId = blockedArgs && typeof blockedArgs.account_id === 'string' ? blockedArgs.account_id : undefined;
   return {
+    accountId,
     notice:
       `LinkedIn send-invite was blocked by ${reason}. ` +
       'No further send-invite actions will succeed until it clears; the remaining invitations were not sent.',
@@ -5338,6 +5350,34 @@ export async function runScheduledChat(
         console.error('Failed to persist LinkedIn invitation-block notice to session:', persistError);
       }
     }
+    // ENG-1657 (ENG-1132 AC3): "we find out before the customer complains" —
+    // a schedule-wide LinkedIn invite block is a fully-blocked outreach run, so it
+    // must page oncall through the SAME mechanism the LinkedIn-disconnect alerts use
+    // (sendAgentModeOncallAlert), not a bespoke channel. Deduped per account/day: a
+    // cooldown/pacing cap that persists across many scheduled fires in one day must
+    // not flood oncall with a near-identical page every fire.
+    if (linkedInInviteSendBlock && !isTest) {
+      const dedupeAccountKey = linkedInInviteSendBlock.accountId || `schedule:${schedule.scheduleId}`;
+      void sendAgentModeOncallAlert({
+        subject: `LinkedIn outreach run fully blocked: ${schedule.scheduleName}`,
+        message:
+          `Scheduled LinkedIn outreach run for schedule "${schedule.scheduleName}" attempted `
+          + `send-invite and was fully blocked. ${linkedInInviteSendBlock.notice}`,
+        sessionId,
+        // No date component: dedupeWindowMs alone enforces the rolling 24h
+        // suppression window, so an alert at 23:59 UTC and the next at 00:01
+        // UTC the following day correctly dedupe instead of bypassing on the
+        // UTC-midnight key rollover (CodeRabbit).
+        dedupeKey: `linkedin_invite_blocked:${dedupeAccountKey}`,
+        dedupeWindowMs: 24 * 60 * 60 * 1000,
+        context: {
+          'Schedule ID': schedule.scheduleId,
+          'Schedule Name': schedule.scheduleName,
+          'User ID': userId,
+          'Account ID': linkedInInviteSendBlock.accountId || 'unknown',
+        },
+      }).catch((err) => console.error('Failed to send oncall alert for blocked LinkedIn invite run:', err));
+    }
     const scheduledResponse = linkedInInviteSendBlock
       ? `${result.content}\n\n${linkedInInviteSendBlock.notice}`
       : result.content;
@@ -5614,7 +5654,11 @@ export async function runScheduledChat(
         }
       })
         .catch(err => console.error('Failed to file scheduled-chat-failure issue:', err))
-        .then(() => sendAgentModeOncallAlert({
+        // A blocked-invite run already paged oncall above via the dedicated
+        // linkedin_invite_blocked alert — sending this generic alert too would
+        // double-page a single blocked run (CodeRabbit). The issue is still
+        // filed unconditionally above so tracking stays intact either way.
+        .then(() => linkedInInviteSendRequirementMissed ? undefined : sendAgentModeOncallAlert({
           subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
           message: scheduledChatFailureDescription,
           sessionId,
