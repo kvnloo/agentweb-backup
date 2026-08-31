@@ -1557,7 +1557,8 @@ export type ScoringSkipReason =
   | "no-task-session"
   | "already-scored"
   | "test-run"
-  | "in-flight";
+  | "in-flight"
+  | "publish-gate-withheld";
 
 export interface SessionScoringAttempt {
   /** The newly-written score, or null when the session was skipped. */
@@ -1616,7 +1617,7 @@ export async function attemptSessionScore(
   // retracted rather than kept forever.
   if (isPublishGateWithheldSession(session)) {
     await retractSatisfactionScore(session);
-    return null;
+    return skip("publish-gate-withheld");
   }
 
   // Skip if already scored, up-to-date, and has dimensional scores
