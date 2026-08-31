@@ -83,22 +83,59 @@ export const fetchWithRetry = async (url: string, retries: number = 3, delayMs: 
  * @param url - The URL to fetch
  * @returns Parsed JSON data with all pages merged
  */
-export const fetchWithRetryAndPaging = async (url: string): Promise<any> => {
+/**
+ * Hard bound on how many pages one `fetchWithRetryAndPaging` call will follow.
+ *
+ * Mirrors `metaService`'s `META_LIST_MAX_PAGES`: a paged read over an account of unknown size
+ * is unbounded work, and this helper follows `paging.next` RECURSIVELY, so an account large
+ * enough turns "slow" into a blown stack. A bound that is announced (see `pagingTruncated`
+ * below) is safe; an unannounced one is the ENG-1584 defect, so the caller is told.
+ */
+export const META_PAGING_MAX_PAGES = 25;
+
+/**
+ * A Graph `paging.next` URL carries the `access_token` in its query string — often first,
+ * so even a truncated prefix can expose token material. This helper used to log the first 100
+ * characters of that URL on every page, putting credential material into application logs.
+ * `metaService`'s `drainCursor` refuses to log Meta error objects for exactly this reason; the
+ * same rule applies here. Log the path only, never the query string.
+ */
+const redactGraphUrl = (raw: string): string => {
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return '[unparseable Graph URL]';
+  }
+};
+
+export const fetchWithRetryAndPaging = async (url: string, pagesRemaining: number = META_PAGING_MAX_PAGES): Promise<any> => {
   const response = await fetchWithRetry(url);
   const data = await response.json();
   
   // Check if there's a paging.next URL for more data
   if (data.paging && data.paging.next) {
-    console.log(`Meta API: Fetching next page of data from ${data.paging.next.substring(0, 100)}...`);
+    if (pagesRemaining <= 0) {
+      // Announce the stop. A silently short list reads as a complete one — the exact
+      // failure that told a customer an ad they were protecting did not exist.
+      console.warn(`Meta API: paging stopped at the ${META_PAGING_MAX_PAGES}-page bound for ${redactGraphUrl(url)}`);
+      data.pagingTruncated = true;
+      delete data.paging;
+      return data;
+    }
+    console.log(`Meta API: Fetching next page of data from ${redactGraphUrl(data.paging.next)}`);
     
     // Recursively fetch next page
-    const nextPageData = await fetchWithRetryAndPaging(data.paging.next);
+    const nextPageData = await fetchWithRetryAndPaging(data.paging.next, pagesRemaining - 1);
     
     // Merge the data arrays
     if (data.data && Array.isArray(data.data) && nextPageData.data && Array.isArray(nextPageData.data)) {
       data.data = [...data.data, ...nextPageData.data];
     }
     
+    // A downstream page that stopped at the bound makes THIS result incomplete too.
+    if (nextPageData?.pagingTruncated) data.pagingTruncated = true;
+
     // Remove paging info since we've fetched all pages
     delete data.paging;
   }
