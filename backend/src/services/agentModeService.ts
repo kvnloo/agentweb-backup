@@ -21703,31 +21703,62 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // one batch.
   private static readonly DRIVE_FOLDER_QUERY_BATCH_SIZE = 50;
 
+  // ENG-1624 rework: this used to fetch a single page per batch (pageSize
+  // pageSizePerBatch, no nextPageToken follow-through), so a batch holding more
+  // matches than that one page silently dropped the rest. `perBatchTarget` is now
+  // pursued via in-batch pagination — following nextPageToken — until either the
+  // batch is genuinely exhausted or `perBatchTarget` items have been accumulated
+  // FOR THAT BATCH. The target is deliberately per-batch, not a budget shared
+  // across batches: each batch is fetched with the same `orderBy`, so the
+  // per-batch top-K is a superset of what the true global top-K could need from
+  // that batch — a shared budget would let one batch starve another and return
+  // the wrong page contents, not just a wrong total. `capped` reports whether any
+  // batch stopped at its target with more available, i.e. whether the merged
+  // result can be trusted as exhaustive.
   private async queryDriveFilesAcrossFolders(
     drive: any,
     folderIds: string[],
     extraClause: string,
     fields: string,
-    pageSizePerBatch: number,
+    perBatchTarget: number,
     orderBy?: string
-  ): Promise<Map<string, any>> {
+  ): Promise<{ files: Map<string, any>; capped: boolean }> {
     const merged = new Map<string, any>();
+    let capped = false;
     for (let i = 0; i < folderIds.length; i += AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE) {
       const batch = folderIds.slice(i, i + AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE);
       const parentClause = `(${batch.map(id => `'${id}' in parents`).join(' or ')})`;
-      const resp = await drive.files.list({
-        q: `${parentClause} and ${extraClause}`,
-        fields,
-        pageSize: pageSizePerBatch,
-        ...(orderBy && { orderBy }),
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-      });
-      for (const f of resp.data.files || []) {
-        if (f.id) merged.set(f.id, f);
-      }
+      let batchCount = 0;
+      let pageToken: string | undefined;
+      do {
+        const resp = await drive.files.list({
+          q: `${parentClause} and ${extraClause}`,
+          // nextPageToken must be requested explicitly — it isn't returned by
+          // default, which is exactly why the old single-page fetch had no way
+          // to know it was truncating.
+          fields: `nextPageToken, ${fields}`,
+          pageSize: Math.min(perBatchTarget - batchCount, 1000),
+          ...(pageToken && { pageToken }),
+          ...(orderBy && { orderBy }),
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+        });
+        const files = resp.data.files || [];
+        for (const f of files) {
+          if (f.id) merged.set(f.id, f);
+        }
+        batchCount += files.length;
+        pageToken = resp.data.nextPageToken || undefined;
+        if (batchCount >= perBatchTarget && pageToken) {
+          // Hit this batch's target with more still available — stop here
+          // rather than draining a huge folder, but the caller needs to know
+          // this batch's contribution isn't necessarily complete.
+          capped = true;
+          pageToken = undefined;
+        }
+      } while (pageToken);
     }
-    return merged;
+    return { files: merged, capped };
   }
 
   private extractGoogleFileId(urlOrId: string): string {
@@ -21838,13 +21869,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             // De-dupe across roots: a file with multiple parents (or two registered
             // roots sharing a sub-tree) can otherwise appear twice.
             const allFolderIds = [...new Set(folderTrees.flatMap(t => t.folderIds))];
-            const driveFilesMap = await this.queryDriveFilesAcrossFolders(
+            const { files: driveFilesMap, capped: driveQueryCapped } = await this.queryDriveFilesAcrossFolders(
               drive,
               allFolderIds,
               `fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
               'files(id, name, mimeType, parents)',
               limitedMaxResults
             );
+            // A per-batch cap on the file query itself is a different reason the
+            // Drive portion isn't exhaustive than an unreadable folder — fold it
+            // into the same signal so a capped search result set isn't presented
+            // as exhaustive either.
+            if (driveQueryCapped) {
+              driveScanIncomplete = true;
+            }
 
             const driveFiles = Array.from(driveFilesMap.values()).slice(0, limitedMaxResults);
             for (const file of driveFiles) {
@@ -22311,12 +22349,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // merged/de-duplicated by file id — NOT per batch, or offset/limit
               // pagination below would silently skip and repeat files across batch
               // boundaries.
-              const filesMap = await this.queryDriveFilesAcrossFolders(
+              //
+              // Per-batch target is offset+limit+1, not offset+limit: each batch is
+              // fetched at the same `orderBy`, so the global top-K of the union is
+              // always a subset of the union of each batch's own top-K — the `files`
+              // returned are correct regardless of the target. The `+1` is what makes
+              // `hasMore` exact: the merged set then holds at least
+              // min(trueTotal, K+1) files, so `allFiles.length > offset+limit` is
+              // true exactly when more files really exist beyond this page.
+              const perBatchTarget = driveOffset + driveLimit + 1;
+              const { files: filesMap, capped } = await this.queryDriveFilesAcrossFolders(
                 drive,
                 folderIds,
                 extraClause,
                 'files(id, name, mimeType, size, modifiedTime)',
-                Math.min(driveOffset + driveLimit, 1000),
+                perBatchTarget,
                 'modifiedTime desc'
               );
 
@@ -22339,6 +22386,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // itself being unreadable) must not present its partial file list as
               // complete.
               const folderScanIncomplete = truncated || rootRestricted;
+              // A batch that hit its per-batch target means `totalMatchingFiles`
+              // wasn't fully counted — it's a floor, not an exact total. Getting an
+              // exact total would mean fully paginating every batch, which isn't
+              // worth the API cost just to render one page.
+              const totalFilesIsLowerBound = capped;
 
               knowledgeBases.push({
                 identifier: `gdrive:${folder.folderId}`,
@@ -22347,9 +22399,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 updatedAt: allFiles.length > 0 ? allFiles[0].modifiedTime : undefined,
                 files: driveFiles,
                 totalFiles: totalMatchingFiles,
-                hasMore: driveOffset + driveLimit < totalMatchingFiles,
+                hasMore: allFiles.length > driveOffset + driveLimit,
                 offset: driveOffset,
                 limit: driveLimit,
+                ...(totalFilesIsLowerBound && { totalFilesIsLowerBound: true }),
                 // ENG-1624: a sub-folder that couldn't be listed (e.g. an unshared
                 // shortcut target) previously shrank the listing with no signal to
                 // the caller. Name it so the caller can request access instead of
@@ -22574,17 +22627,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // to paginate" — it means the listing itself may be incomplete, not just
       // capped.
       const hasIncompleteFolderScan = knowledgeBases.some((kb: any) => kb.folderScanIncomplete);
+      // A Drive KB's file query hit its per-batch target — its `totalFiles` is a
+      // floor, not an exact count, even though `files`/`hasMore` are still correct.
+      const hasLowerBoundTotals = knowledgeBases.some((kb: any) => kb.totalFilesIsLowerBound);
       const appliedFilters = appliedFiltersEarly;
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasIncompleteFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasIncompleteFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles,
         ...(appliedFilters.length > 0 && { appliedFilters }),
         ...(hasMorePages && { hasMore: true }),
         ...(hasIncompleteFolderScan && { folderScanIncomplete: true }),
+        ...(hasLowerBoundTotals && { totalFilesIsLowerBound: true }),
       };
     } catch (error) {
       console.error('AgentMode: Error listing knowledge base files:', error);
@@ -22917,7 +22974,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
       // lets an ambiguous name (same filename in two sub-folders) be detected and
       // reported instead of one candidate being picked arbitrarily.
-      const filesMap = await this.queryDriveFilesAcrossFolders(
+      const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
         drive,
         folderIds,
         `name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
@@ -23042,7 +23099,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
       // lets an ambiguous name (same filename in two sub-folders) be detected and
       // reported instead of one candidate being materialized arbitrarily.
-      const filesMap = await this.queryDriveFilesAcrossFolders(
+      const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
         drive,
         folderIds,
         `name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
