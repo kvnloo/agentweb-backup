@@ -384,6 +384,10 @@ describe('executePreparedTools', () => {
     const result = await executePreparedTools(input);
 
     expect(input.toolCallsLedger[0].error).toBeUndefined();
+    expect(input.toolCallsLedger[0].arguments).toEqual({
+      title: 'Phoenix FFL Merchants — "Creative Fatigue" Audit',
+      content_draft: '<div class="header">Hi</div>',
+    });
     expect(result.failedCounterUpdates).toEqual({});
     expect((ports as any).__execOrder).toEqual(['read_brand_guidelines']);
   });

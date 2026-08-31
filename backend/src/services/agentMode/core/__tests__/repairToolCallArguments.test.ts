@@ -39,6 +39,27 @@ describe('repairUnescapedQuotes (ENG-1477)', () => {
     const raw = '{"a":"x "y" z","b":"p "q" r"}';
     expect(JSON.parse(repairUnescapedQuotes(raw))).toEqual({ a: 'x "y" z', b: 'p "q" r' });
   });
+
+  // ENG-1477 review finding: a plain "quote then comma" lookahead misreads a
+  // comma-adjacent embedded quote as the string's real terminator — exactly
+  // the shape of a CSS font-family list or an unescaped JS/JSON array
+  // literal inside styled HTML report content. The comma must only close the
+  // string when what follows genuinely looks like the next property.
+  it('keeps a comma-adjacent embedded quote open inside a CSS font-family list', () => {
+    const raw = '{"title":"Report","content_draft":"<style>body{font-family:"Arial",sans-serif}</style>"}';
+    expect(JSON.parse(repairUnescapedQuotes(raw))).toEqual({
+      title: 'Report',
+      content_draft: '<style>body{font-family:"Arial",sans-serif}</style>',
+    });
+  });
+
+  it('keeps a comma-adjacent embedded quote open inside an unescaped JSON array literal', () => {
+    const raw = '{"title":"Chart","content_draft":"data: [1, "two", 3]"}';
+    expect(JSON.parse(repairUnescapedQuotes(raw))).toEqual({
+      title: 'Chart',
+      content_draft: 'data: [1, "two", 3]',
+    });
+  });
 });
 
 describe('parseToolCallArguments (ENG-1477)', () => {
@@ -61,6 +82,12 @@ describe('parseToolCallArguments (ENG-1477)', () => {
   });
 
   it('throws the original JSON.parse error when the payload is not recoverable', () => {
-    expect(() => parseToolCallArguments('{not json}')).toThrow(SyntaxError);
+    let expected: Error | undefined;
+    try {
+      JSON.parse('{not json}');
+    } catch (e) {
+      expected = e as Error;
+    }
+    expect(() => parseToolCallArguments('{not json}')).toThrow(expected!.message);
   });
 });
