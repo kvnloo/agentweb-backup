@@ -6282,8 +6282,10 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
 
     let leads = await fetchAllLeadsForGroupEmail(listId);
 
-    // Only consider eligible leads (have email, not do-not-contact/unsubscribed)
-    const eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
+    // Only consider eligible leads (have email, not do-not-contact/unsubscribed, valid syntax/domain)
+    const eligibleLeads = leads.filter(
+      (l: any) => l.email && !isDoNotContact(l) && isEligibleGroupEmailRecipient(l.email),
+    );
     const eligibleCount = eligibleLeads.length;
 
     // Auto-fix dark mode: inject color-scheme opt-out before format check so
