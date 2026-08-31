@@ -10,6 +10,7 @@ jest.mock('../services/db', () => ({
     updateLead: jest.fn(),
     batchCreateLeads: jest.fn(),
     setLeadListCrmSyncConfig: jest.fn().mockResolvedValue(undefined),
+    updateLeadListCrmSyncStatus: jest.fn().mockResolvedValue(undefined),
   },
   userDb: {
     // Default: users have no org, so only the config owner can access it.
@@ -62,8 +63,11 @@ const mockAttioServiceInstance = {
   createCompany: jest.fn().mockResolvedValue({ recordId: 'comp_123', name: 'Test Corp' }),
   getCompanyById: jest.fn().mockResolvedValue({ recordId: 'comp_123', name: 'Test Corp' }),
   getAllPeopleAttributes: jest.fn().mockResolvedValue([]),
+  getAllObjectAttributes: jest.fn().mockResolvedValue([]),
+  getAllLists: jest.fn().mockResolvedValue([]),
   listListAttributes: jest.fn().mockResolvedValue([]),
   deletePerson: jest.fn().mockResolvedValue(undefined),
+  deleteListEntry: jest.fn().mockResolvedValue(undefined),
 };
 
 jest.mock('../services/hubspotService', () => ({
@@ -244,9 +248,9 @@ describe('ExternalCrmSyncService', () => {
 
   // ─── changePipeline ───────────────────────────────────────────────────────
   describe('changePipeline', () => {
-    it('throws for a non-hubspot provider', async () => {
+    it('throws for an unsupported provider', async () => {
       mockListWithConfig(makeConfig({ provider: 'attio' as any }), 'attio');
-      await expect(service.changePipeline('user1', 'list1', 'attio', 'p1')).rejects.toThrow(/hubspot/i);
+      await expect(service.changePipeline('user1', 'list1', 'salesforce', 'p1')).rejects.toThrow(/hubspot and attio/i);
     });
 
     it('throws when no sync configuration exists', async () => {
@@ -258,6 +262,42 @@ describe('ExternalCrmSyncService', () => {
       mockListWithConfig(makeConfig({ lastPushSyncAt: '2024-02-01T00:00:00.000Z', externalPipelineId: 'old' }));
       mockHubSpotServiceInstance.listDealPipelines.mockResolvedValue([{ id: '123', label: 'Sales', displayOrder: 0, stages: [] }]);
       await expect(service.changePipeline('user1', 'list1', 'hubspot', '999')).rejects.toThrow(/not found/i);
+    });
+
+    // ─── Attio ────────────────────────────────────────────────────────────────
+
+    it('throws when the target list does not exist in Attio', async () => {
+      mockListWithConfig(
+        makeConfig({ provider: 'attio' as any, lastPushSyncAt: '2024-02-01T00:00:00.000Z', attioDealListId: 'old_list' }),
+        'attio'
+      );
+      (mockAttioServiceInstance as any).getAllLists = jest.fn().mockResolvedValue([{ id: '123', name: 'Deals' }]);
+      await expect(service.changePipeline('user1', 'list1', 'attio', 'nonexistent')).rejects.toThrow(/not found/i);
+    });
+
+    it('re-points the Attio deal list without a bulk lead-cleanup pass', async () => {
+      // Deliberately NOT clearing attio_list_entry_id in bulk here — an
+      // unbounded synchronous per-lead write loop inside this HTTP request
+      // can outlast the upstream proxy timeout on a large list. Instead,
+      // pushLeads self-heals: a stale entry id 404s against the new list,
+      // and the push falls back to findListEntry/addPersonToList exactly
+      // like an entry-less lead already does (covered in
+      // attioAdapter.pushLeads.deal.test.ts).
+      const config = makeConfig({
+        provider: 'attio' as any,
+        lastPushSyncAt: '2024-02-01T00:00:00.000Z',
+        attioDealListId: 'old_list',
+      });
+      mockListWithConfig(config, 'attio');
+      (mockAttioServiceInstance as any).getAllLists = jest.fn().mockResolvedValue([{ id: 'new_list', name: 'New Deals' }]);
+
+      const updated = await service.changePipeline('user1', 'list1', 'attio', 'new_list');
+
+      expect(updated.attioDealListId).toBe('new_list');
+      const savedCall = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      expect((savedCall[2] as any).attioDealListId).toBe('new_list');
+      expect(mockCrmDb.getLeadsByListId).not.toHaveBeenCalled();
+      expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
     });
 
     it('updates externalPipelineId and clears the stage map even after a sync (lock bypass)', async () => {
@@ -449,26 +489,93 @@ describe('ExternalCrmSyncService', () => {
       expect(saved.customFieldMapping).toEqual(customMapping);
     });
 
-    it('merges Attio deal mappings into custom mappings', async () => {
+    it('persists Attio deal mappings without merging into custom mappings', async () => {
       mockNoConfig();
       mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
 
+      const dealMapping: FieldMapping[] = [
+        { agentwebField: 'status', crmProperty: 'deal_status', direction: 'both', enabled: true },
+      ];
+      const customMapping: FieldMapping[] = [
+        { agentwebField: 'company', crmProperty: 'company_name', direction: 'push', enabled: true },
+      ];
+
       await service.saveConfig('user1', 'list1', 'attio', {
-        dealFieldMapping: [
-          { agentwebField: 'status', crmProperty: 'deal_status', direction: 'both', enabled: true },
-        ],
-        customFieldMapping: [
-          { agentwebField: 'company', crmProperty: 'company_name', direction: 'push', enabled: true },
-        ],
+        dealFieldMapping: dealMapping,
+        customFieldMapping: customMapping,
       });
 
       const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
       const saved = call[2] as Record<string, any>;
-      expect(saved.dealFieldMapping).toEqual([]);
-      expect(saved.customFieldMapping).toEqual(expect.arrayContaining([
-        expect.objectContaining({ agentwebField: 'status', crmProperty: 'deal_status' }),
-        expect.objectContaining({ agentwebField: 'company', crmProperty: 'company_name' }),
-      ]));
+      expect(saved.dealFieldMapping).toEqual(dealMapping);
+      expect(saved.customFieldMapping).toEqual(customMapping);
+    });
+
+    it('saves Attio company field mapping', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      const companyMapping: FieldMapping[] = [
+        { agentwebField: 'industry', crmProperty: 'industry', direction: 'both', enabled: true },
+      ];
+      await service.saveConfig('user1', 'list1', 'attio', { companyFieldMapping: companyMapping });
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.companyFieldMapping).toEqual(companyMapping);
+    });
+
+    it('defaults companyFieldMapping to empty for a fresh Attio config', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'attio', {});
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.companyFieldMapping).toEqual([]);
+    });
+
+    it('defaults companyFieldMapping to empty for HubSpot (no Company-object concept)', async () => {
+      mockNoConfig();
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'hubspot', {});
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.companyFieldMapping).toEqual([]);
+    });
+
+    it('preserves an existing companyFieldMapping across an unrelated partial save', async () => {
+      const companyMapping: FieldMapping[] = [
+        { agentwebField: 'industry', crmProperty: 'industry', direction: 'both', enabled: true },
+      ];
+      const existing = makeConfig({ provider: 'attio', companyFieldMapping: companyMapping } as any);
+      mockListWithConfig(existing, 'attio');
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'attio', { autoSyncEnabled: false });
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.companyFieldMapping).toEqual(companyMapping);
+    });
+
+    it('keeps the Attio deal list ID locked after first sync', async () => {
+      const existing = makeConfig({
+        provider: 'attio',
+        attioDealListId: 'list-locked-123',
+        lastPushSyncAt: '2024-02-01T00:00:00.000Z',
+      });
+      mockListWithConfig(existing, 'attio');
+      mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
+
+      await service.saveConfig('user1', 'list1', 'attio', {});
+
+      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls[0];
+      const saved = call[2] as Record<string, any>;
+      expect(saved.attioDealListId).toBe('list-locked-123');
     });
 
     it('keeps the pipeline ID locked after first sync', async () => {
@@ -733,6 +840,107 @@ describe('ExternalCrmSyncService', () => {
       const cfg = makeConfig({ accountId: 'acct1', apiKeyEncrypted: undefined });
       expect(await service.isAccountConnected(cfg)).toBe(false);
     });
+
+    // Regression: an Attio account can exist but be flagged needs_reconnect
+    // (webhook registration 403'd on a missing OAuth scope) — the account
+    // still resolves, so this must be an explicit check, not just presence.
+    // Without it, the account looked fully connected while real-time
+    // auto-pull was silently dead with no user-facing indication at all.
+    it('returns false when the resolved account is flagged needs_reconnect (e.g. missing Attio webhook scope)', async () => {
+      mockGetAccountById.mockResolvedValue({
+        account_id: 'acct1',
+        platform: 'attio',
+        userId: 'user1',
+        config: { needs_reconnect: true },
+      });
+      const cfg = makeConfig({ provider: 'attio', accountId: 'acct1', apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(false);
+    });
+
+    it('returns true for an Attio account with no needs_reconnect flag', async () => {
+      mockGetAccountById.mockResolvedValue({
+        account_id: 'acct1',
+        platform: 'attio',
+        userId: 'user1',
+        config: { webhook_id: 'wh_1' },
+      });
+      const cfg = makeConfig({ provider: 'attio', accountId: 'acct1', apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(true);
+    });
+  });
+
+  // ─── updateSyncTimestamp ────────────────────────────────────────────────────
+  // CodeRabbit-flagged (twice): setLeadListCrmSyncConfig overwrites a
+  // provider's entire config entry wholesale (read-modify-write at the
+  // provider-map level, not per-field). Writing back the in-memory `config`
+  // this function is passed — which can be stale by the time a long-running
+  // push/pull/webhook job finishes — would silently clobber a concurrent
+  // PUT /config save landing in between. A first fix (reload-then-write)
+  // only narrowed the race window without eliminating it; this now calls a
+  // genuinely atomic, targeted DynamoDB update (crmDb.updateLeadListCrmSyncStatus)
+  // that touches only the sync-status attribute paths, so there is no window
+  // at all for a concurrent field-mapping/webhookEnabled save to be lost.
+
+  describe('updateSyncTimestamp', () => {
+    it('calls the atomic status update with the push timestamp on success', async () => {
+      const cfg = makeConfig({ listId: 'list1', provider: 'hubspot' });
+
+      await service.updateSyncTimestamp(cfg, 'push', true);
+
+      expect(crmDb.updateLeadListCrmSyncStatus).toHaveBeenCalledWith('list1', 'hubspot', {
+        lastPushSyncAt: expect.any(String),
+        lastSyncStatus: 'success',
+        lastSyncError: null,
+        lastSyncErrorCategory: null,
+        lastSyncErrorCount: null,
+      });
+      // Never reads or rewrites the rest of the config — that's the whole point.
+      expect(crmDb.getLeadListById).not.toHaveBeenCalled();
+      expect(crmDb.setLeadListCrmSyncConfig).not.toHaveBeenCalled();
+    });
+
+    it('calls the atomic status update with the pull timestamp on success', async () => {
+      const cfg = makeConfig({ listId: 'list1', provider: 'attio' });
+
+      await service.updateSyncTimestamp(cfg, 'pull', true);
+
+      expect(crmDb.updateLeadListCrmSyncStatus).toHaveBeenCalledWith('list1', 'attio', {
+        lastPullSyncAt: expect.any(String),
+        lastSyncStatus: 'success',
+        lastSyncError: null,
+        lastSyncErrorCategory: null,
+        lastSyncErrorCount: null,
+      });
+    });
+
+    it('persists caller-set error detail on failure', async () => {
+      const cfg = makeConfig();
+      cfg.lastSyncError = 'Some leads could not be synced';
+      cfg.lastSyncErrorCategory = 'data';
+      cfg.lastSyncErrorCount = 3;
+
+      await service.updateSyncTimestamp(cfg, 'push', false);
+
+      expect(crmDb.updateLeadListCrmSyncStatus).toHaveBeenCalledWith(cfg.listId, cfg.provider, {
+        lastPushSyncAt: expect.any(String),
+        lastSyncStatus: 'error',
+        lastSyncError: 'Some leads could not be synced',
+        lastSyncErrorCategory: 'data',
+        lastSyncErrorCount: 3,
+      });
+    });
+
+    it('removes error fields (passes null) on failure when the caller set no detail', async () => {
+      const cfg = makeConfig(); // no lastSyncError/*Category/*Count set
+
+      await service.updateSyncTimestamp(cfg, 'pull', false);
+
+      const call = (crmDb.updateLeadListCrmSyncStatus as jest.Mock).mock.calls[0][2];
+      expect(call.lastSyncStatus).toBe('error');
+      expect(call.lastSyncError).toBeNull();
+      expect(call.lastSyncErrorCategory).toBeNull();
+      expect(call.lastSyncErrorCount).toBeNull();
+    });
   });
 
   // ─── getDefaultMappings ─────────────────────────────────────────────────────
@@ -751,6 +959,33 @@ describe('ExternalCrmSyncService', () => {
       const fields = defaults.customFieldMapping.map(m => m.agentwebField);
       expect(fields).not.toContain('listName');
       expect(fields).not.toContain('listId');
+    });
+
+    it('includes UTM/attribution fields in the HubSpot custom mapping defaults', async () => {
+      const defaults = await service.getDefaultMappings('hubspot');
+      expect(defaults.customFieldMapping).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentwebField: 'utmSource', crmProperty: 'utm_source', direction: 'push', enabled: true }),
+        expect.objectContaining({ agentwebField: 'utmMedium', crmProperty: 'utm_medium', direction: 'push', enabled: true }),
+        expect.objectContaining({ agentwebField: 'firstTouch.utm.campaign', crmProperty: 'utm_campaign', direction: 'push', enabled: true }),
+      ]));
+    });
+
+    it('includes UTM/attribution fields in the Attio custom mapping defaults', async () => {
+      const defaults = await service.getDefaultMappings('attio');
+      expect(defaults.customFieldMapping).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentwebField: 'utmSource', crmProperty: 'utm_source', direction: 'push', enabled: true }),
+        expect.objectContaining({ agentwebField: 'utmMedium', crmProperty: 'utm_medium', direction: 'push', enabled: true }),
+        expect.objectContaining({ agentwebField: 'firstTouch.utm.campaign', crmProperty: 'utm_campaign', direction: 'push', enabled: true }),
+      ]));
+    });
+
+    it('never maps the parent firstTouch/utm object directly (leaf fields only)', async () => {
+      const hubspotFields = (await service.getDefaultMappings('hubspot')).customFieldMapping.map(m => m.agentwebField);
+      const attioFields = (await service.getDefaultMappings('attio')).customFieldMapping.map(m => m.agentwebField);
+      for (const fields of [hubspotFields, attioFields]) {
+        expect(fields).not.toContain('firstTouch');
+        expect(fields).not.toContain('firstTouch.utm');
+      }
     });
   });
 
@@ -1008,7 +1243,7 @@ describe('ExternalCrmSyncService', () => {
       const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
 
       expect(result.errorCount).toBeGreaterThan(0);
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('error');
       expect(saved.lastSyncErrorCategory).toBe('data');
     });
@@ -1031,7 +1266,7 @@ describe('ExternalCrmSyncService', () => {
       const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
 
       expect(result.errorCount).toBe(3);
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncErrorCategory).toBe('data');
       expect(saved.lastSyncErrorCount).toBe(3);
     });
@@ -1059,13 +1294,16 @@ describe('ExternalCrmSyncService', () => {
       const result = await service.pushAllLeads('user1', 'list1', 'hubspot');
 
       expect(result.errorCount).toBe(2);
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('error');
       // Connection wins; the surfaced message is the connection-shaped one.
       expect(saved.lastSyncErrorCategory).toBe('connection');
       expect(saved.lastSyncError).toMatch(/Authentication credentials not found/);
       // A connection failure isn't lead-scoped, so no per-lead count is recorded.
-      expect(saved.lastSyncErrorCount).toBeUndefined();
+      // updateLeadListCrmSyncStatus's failure path passes null (remove) for an
+      // unset count, not undefined — the old assertion targeted
+      // setLeadListCrmSyncConfig's full-object-omission shape.
+      expect(saved.lastSyncErrorCount).toBeNull();
     });
 
     it('resolves the HubSpot service once for a multi-chunk push, not per chunk', async () => {
@@ -1470,7 +1708,7 @@ describe('ExternalCrmSyncService', () => {
 
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', notes: 'x' }, 'hubspot', 'created');
 
-      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1);
+      const call = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1);
       expect(call).toBeDefined();
       const saved = call![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('error');
@@ -1486,7 +1724,7 @@ describe('ExternalCrmSyncService', () => {
 
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', notes: 'x' }, 'hubspot', 'created');
 
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncErrorCategory).toBe('connection');
     });
 
@@ -1496,7 +1734,7 @@ describe('ExternalCrmSyncService', () => {
       // An invalid email is caught per-lead into result.errors (no throw), errorCount=1.
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'not-an-email' }, 'hubspot', 'created');
 
-      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1);
+      const call = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1);
       expect(call).toBeDefined();
       const saved = call![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('error');
@@ -1510,7 +1748,7 @@ describe('ExternalCrmSyncService', () => {
       // connection is healthy, so reconnecting would not help — category 'data'.
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'not-an-email' }, 'hubspot', 'created');
 
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('error');
       expect(saved.lastSyncErrorCategory).toBe('data');
     });
@@ -1527,7 +1765,7 @@ describe('ExternalCrmSyncService', () => {
 
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'valid@example.com' }, 'hubspot', 'created');
 
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('error');
       expect(saved.lastSyncErrorCategory).toBe('connection');
     });
@@ -1539,11 +1777,14 @@ describe('ExternalCrmSyncService', () => {
 
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', firstName: 'Ada' }, 'hubspot', 'created');
 
-      const call = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1);
+      const call = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1);
       expect(call).toBeDefined();
       const saved = call![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('success');
-      expect(saved.lastSyncError).toBeUndefined();
+      // updateLeadListCrmSyncStatus's success path passes null (remove), not
+      // undefined — the old assertion targeted setLeadListCrmSyncConfig's
+      // full-object-omission shape, which no longer applies here.
+      expect(saved.lastSyncError).toBeNull();
       expect(saved.lastPushSyncAt).toBeTruthy();
     });
 
@@ -1559,10 +1800,10 @@ describe('ExternalCrmSyncService', () => {
 
       await service.autoSyncLead('user1', 'list1', { leadId: 'l1', email: 'a@b.com', firstName: 'Ada' }, 'hubspot', 'created');
 
-      const saved = mockCrmDb.setLeadListCrmSyncConfig.mock.calls.at(-1)![2] as Record<string, any>;
+      const saved = mockCrmDb.updateLeadListCrmSyncStatus.mock.calls.at(-1)![2] as Record<string, any>;
       expect(saved.lastSyncStatus).toBe('success');
-      expect(saved.lastSyncErrorCategory).toBeUndefined();
-      expect(saved.lastSyncErrorCount).toBeUndefined();
+      expect(saved.lastSyncErrorCategory).toBeNull();
+      expect(saved.lastSyncErrorCount).toBeNull();
     });
 
     // ─── per-lead status propagation (Task 2 supplies the behaviour) ──────────
@@ -1680,6 +1921,24 @@ describe('ExternalCrmSyncService', () => {
       expect(result.properties[0]).toMatchObject({ name: 'amount', label: 'Amount' });
     });
 
+    it('returns Attio Company object attributes when objectType=company', async () => {
+      const config = makeConfig({ provider: 'attio' });
+      mockListWithConfig(config, 'attio');
+      (mockAttioServiceInstance as any).getAllObjectAttributes = jest.fn().mockResolvedValue([
+        { api_slug: 'industry', title: 'Industry', type: 'select', is_system_attribute: false, attribute_id: 'a1' },
+        { api_slug: 'employee_range', title: 'Employee Range', type: 'select', is_system_attribute: true, attribute_id: 'a2' },
+      ]);
+
+      const result = await service.getExternalProperties('user1', 'list1', 'attio', { objectType: 'company' });
+
+      expect((mockAttioServiceInstance as any).getAllObjectAttributes).toHaveBeenCalledWith('companies');
+      expect((mockAttioServiceInstance as any).getAllPeopleAttributes).not.toHaveBeenCalled();
+      expect(result.properties).toEqual([
+        { name: 'industry', label: 'Industry', type: 'select' },
+        { name: 'employee_range', label: 'Employee Range', type: 'select' },
+      ]);
+    });
+
     it('returns Attio people attributes for any objectType', async () => {
       const config = makeConfig({ provider: 'attio' });
       mockListWithConfig(config, 'attio');
@@ -1755,6 +2014,73 @@ describe('ExternalCrmSyncService', () => {
       });
 
       expect((mockHubSpotServiceInstance as any).deleteContact).toHaveBeenCalledWith('c123');
+    });
+
+    it('calls Attio deletePerson when deleteOnPush=true and attio_record_id exists', async () => {
+      const config = makeConfig({ provider: 'attio', deleteOnPush: true });
+      mockListWithConfig(config, 'attio');
+
+      await service.deleteLeadFromCrm('user1', 'list1', 'attio', {
+        leadId: 'l1', email: 'a@b.com',
+        syncMetadata: { attio_record_id: 'p123' },
+      });
+
+      expect(mockAttioServiceInstance.deletePerson).toHaveBeenCalledWith('p123');
+      expect(mockAttioServiceInstance.deleteListEntry).not.toHaveBeenCalled();
+    });
+
+    it('also deletes the Deal List Entry when attio_list_entry_id exists (Gap: HubSpot deletes contact+deal, Attio must delete person+entry)', async () => {
+      const config = makeConfig({ provider: 'attio', deleteOnPush: true, attioDealListId: 'deallist_1' });
+      mockListWithConfig(config, 'attio');
+
+      await service.deleteLeadFromCrm('user1', 'list1', 'attio', {
+        leadId: 'l1', email: 'a@b.com',
+        syncMetadata: { attio_record_id: 'p123', attio_list_entry_id: 'entry_1' },
+      });
+
+      expect(mockAttioServiceInstance.deletePerson).toHaveBeenCalledWith('p123');
+      expect(mockAttioServiceInstance.deleteListEntry).toHaveBeenCalledWith('deallist_1', 'entry_1');
+    });
+
+    it('deletes the list entry from the list stamped on the lead, not the config\'s current (re-pointed) list', async () => {
+      // The lead was pushed to the OLD deal list, then changePipeline
+      // re-pointed the config to a NEW list without migrating this lead's
+      // pointer (self-heals lazily on next push, not yet re-pushed). Deletion
+      // must still target the list the entry actually lives in.
+      const config = makeConfig({ provider: 'attio', deleteOnPush: true, attioDealListId: 'new_list' });
+      mockListWithConfig(config, 'attio');
+
+      await service.deleteLeadFromCrm('user1', 'list1', 'attio', {
+        leadId: 'l1', email: 'a@b.com',
+        syncMetadata: { attio_record_id: 'p123', attio_list_entry_id: 'entry_1', attio_deal_list_id: 'old_list' },
+      });
+
+      expect(mockAttioServiceInstance.deleteListEntry).toHaveBeenCalledWith('old_list', 'entry_1');
+    });
+
+    it('falls back to the config\'s attioDealListId for a lead synced before attio_deal_list_id was stamped', async () => {
+      const config = makeConfig({ provider: 'attio', deleteOnPush: true, attioDealListId: 'deallist_1' });
+      mockListWithConfig(config, 'attio');
+
+      await service.deleteLeadFromCrm('user1', 'list1', 'attio', {
+        leadId: 'l1', email: 'a@b.com',
+        syncMetadata: { attio_record_id: 'p123', attio_list_entry_id: 'entry_1' }, // no attio_deal_list_id
+      });
+
+      expect(mockAttioServiceInstance.deleteListEntry).toHaveBeenCalledWith('deallist_1', 'entry_1');
+    });
+
+    it('does not fail person deletion when list-entry deletion fails (non-critical)', async () => {
+      const config = makeConfig({ provider: 'attio', deleteOnPush: true, attioDealListId: 'deallist_1' });
+      mockListWithConfig(config, 'attio');
+      mockAttioServiceInstance.deleteListEntry.mockRejectedValueOnce(new Error('already gone'));
+
+      await expect(service.deleteLeadFromCrm('user1', 'list1', 'attio', {
+        leadId: 'l1', email: 'a@b.com',
+        syncMetadata: { attio_record_id: 'p123', attio_list_entry_id: 'entry_1' },
+      })).resolves.not.toThrow();
+
+      expect(mockAttioServiceInstance.deletePerson).toHaveBeenCalledWith('p123');
     });
   });
 });
