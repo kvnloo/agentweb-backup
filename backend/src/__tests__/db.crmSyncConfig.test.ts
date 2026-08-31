@@ -27,20 +27,17 @@ function nameForField(names: Record<string, string>, field: string): string | un
 }
 
 /**
- * ENG-1380 — CodeRabbit findings on crmDb.setLeadListCrmSyncConfig, both
- * fixed here:
+ * ENG-1380 — CodeRabbit findings on crmDb.setLeadListCrmSyncConfig, all now
+ * fixed:
  *
  * 1. It used to replace externalCrmSyncConfigs.<provider> — or, on a
  *    provider's first-ever save, the WHOLE externalCrmSyncConfigs map
  *    including every other already-connected provider — wholesale (read,
  *    merge in JS, write the whole thing back). A concurrent
  *    updateLeadListCrmSyncStatus nested-path write for ANY provider landing
- *    between the read and the write here would be silently clobbered. Now
- *    it always writes via targeted nested paths once externalCrmSyncConfigs
- *    exists as an attribute at all; the only remaining special case is that
- *    attribute not existing on the item yet at all (the very first CRM
- *    connection ever made for this list), which bootstraps it via a
- *    conditional write.
+ *    between the read and the write here would be silently clobbered. Fixed
+ *    by writing via targeted paths, scoped as narrowly as each of the three
+ *    cases below allows.
  *
  * 2. The targeted per-field write used to alias each field by its own name
  *    (#${field}). Every real ExternalCrmSyncConfig carries a `provider`
@@ -48,6 +45,20 @@ function nameForField(names: Record<string, string>, field: string): string | un
  *    bound to the provider VALUE ('attio'/'hubspot'), corrupting every
  *    #ecs.#provider.* path in the same expression. Now uses collision-proof
  *    indexed aliases (#f0/:v0, #f1/:v1, ...).
+ *
+ * 3. The per-field write used to be reached whenever externalCrmSyncConfigs
+ *    existed as an attribute at all — even when THIS provider's own key
+ *    didn't exist within it yet. DynamoDB can only create the LAST segment
+ *    of a path in one SET: #ecs.#provider.#f0 requires #ecs.#provider to
+ *    already exist as a map, or DynamoDB rejects the write with
+ *    ValidationException (confirmed against DynamoDB's documented
+ *    UpdateExpression semantics — it will not create a provider map AND a
+ *    field inside it in one operation). Fixed by splitting into three
+ *    cases, matching the three describe blocks below: (a) the whole
+ *    externalCrmSyncConfigs attribute doesn't exist — conditional
+ *    bootstrap; (b) it exists but this provider's key doesn't — a single
+ *    one-level-deep SET of the whole provider value; (c) this provider's
+ *    key already exists — the targeted per-field write.
  */
 describe('crmDb.setLeadListCrmSyncConfig', () => {
   let mockDynamoDB: any;
@@ -72,10 +83,14 @@ describe('crmDb.setLeadListCrmSyncConfig', () => {
       });
     });
 
-    it('falls through to a targeted per-field write when the conditional bootstrap loses a race', async () => {
-      mockDynamoDB.get.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Item: {} }) });
-      // First update() call (the conditional bootstrap) loses the race —
-      // someone else's concurrent first-connection save landed first.
+    it('re-reads and falls through to the correct case when the conditional bootstrap loses a race', async () => {
+      // First get(): attribute absent. First update() (conditional bootstrap):
+      // loses the race — someone else's concurrent first-connection save for
+      // a DIFFERENT provider landed first. Second get(): re-read shows that
+      // provider now exists, but ours ('attio') still doesn't.
+      mockDynamoDB.get
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Item: {} }) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Item: { externalCrmSyncConfigs: { hubspot: { autoSyncEnabled: false } } } }) });
       const condFailure: any = new Error('conditional check failed');
       condFailure.code = 'ConditionalCheckFailedException';
       mockDynamoDB.update
@@ -84,15 +99,16 @@ describe('crmDb.setLeadListCrmSyncConfig', () => {
 
       await crmDb.setLeadListCrmSyncConfig('list-1', 'attio', { provider: 'attio', autoSyncEnabled: true });
 
+      expect(mockDynamoDB.get).toHaveBeenCalledTimes(2);
       expect(mockDynamoDB.update).toHaveBeenCalledTimes(2);
       const secondCallParams = mockDynamoDB.update.mock.calls[1][0];
-      // The fallback write must be the targeted per-field form, not another
-      // wholesale replace — no :singleProviderMap value on the second call.
-      expect(secondCallParams.ExpressionAttributeValues[':singleProviderMap']).toBeUndefined();
-      expect(secondCallParams.ConditionExpression).toBeUndefined();
-      const providerAlias = nameForField(secondCallParams.ExpressionAttributeNames, 'provider');
-      expect(providerAlias).toBeDefined();
-      expect(secondCallParams.UpdateExpression).toContain(`#ecs.#provider.${providerAlias} = ${providerAlias!.replace('#f', ':v')}`);
+      // The fallback must be the single one-level-deep write (case b), not
+      // another wholesale replace and not the per-field write (case c) —
+      // 'attio' still doesn't exist within externalCrmSyncConfigs at this
+      // point, only the OTHER provider that won the race does.
+      expect(secondCallParams.UpdateExpression).toBe('SET #ecs.#provider = :configObj, #updatedAt = :now');
+      expect(secondCallParams.ExpressionAttributeNames['#provider']).toBe('attio');
+      expect(secondCallParams.ExpressionAttributeValues[':configObj']).toEqual({ provider: 'attio', autoSyncEnabled: true });
     });
 
     it('propagates a genuine DynamoDB error from the conditional bootstrap (not a lost race)', async () => {
@@ -108,29 +124,49 @@ describe('crmDb.setLeadListCrmSyncConfig', () => {
     });
   });
 
-  describe('externalCrmSyncConfigs already exists on the item (any provider ever connected before)', () => {
-    it('writes field-by-field via targeted nested paths for a provider connecting for the first time', async () => {
+  describe('externalCrmSyncConfigs exists, but this provider has no entry within it yet', () => {
+    // CodeRabbit finding (ENG-1380): DynamoDB can only create the LAST
+    // segment of a path in one SET. #ecs already existing does NOT make
+    // #ecs.#provider.#f0 valid when #ecs.#provider itself doesn't exist yet
+    // — that would require creating both the provider map and a field
+    // inside it in one operation, which DynamoDB rejects with
+    // ValidationException. The correct write here is a single
+    // one-level-deep SET of the whole provider value.
+    it('writes the whole provider value as a single one-level-deep SET, not a per-field breakdown', async () => {
       mockDynamoDB.get.mockReturnValue({
         promise: jest.fn().mockResolvedValue({ Item: { externalCrmSyncConfigs: { hubspot: { autoSyncEnabled: false } } } }),
+      });
+
+      await crmDb.setLeadListCrmSyncConfig('list-1', 'attio', { autoSyncEnabled: true, webhookEnabled: true });
+
+      const params = mockDynamoDB.update.mock.calls[0][0];
+      expect(params.UpdateExpression).toBe('SET #ecs.#provider = :configObj, #updatedAt = :now');
+      expect(params.ConditionExpression).toBeUndefined();
+      expect(params.ExpressionAttributeNames['#provider']).toBe('attio');
+      expect(params.ExpressionAttributeValues[':configObj']).toEqual({ autoSyncEnabled: true, webhookEnabled: true });
+      // Must not be any of the OTHER two write shapes.
+      expect(params.ExpressionAttributeValues[':mergedMap']).toBeUndefined();
+      expect(params.ExpressionAttributeValues[':singleProviderMap']).toBeUndefined();
+      expect(params.UpdateExpression).not.toMatch(/#ecs\.#provider\.#f\d/);
+      // hubspot's own entry must never appear anywhere in this write.
+      expect(JSON.stringify(params)).not.toContain('hubspot');
+    });
+
+    it('treats an existing-but-empty externalCrmSyncConfigs ({}) the same way (e.g. after removing the last provider)', async () => {
+      mockDynamoDB.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { externalCrmSyncConfigs: {} } }),
       });
 
       await crmDb.setLeadListCrmSyncConfig('list-1', 'attio', { autoSyncEnabled: true });
 
       const params = mockDynamoDB.update.mock.calls[0][0];
-      // No conditional write, no wholesale replace — a direct nested SET
-      // against the already-existing #ecs map, whether or not "attio" was
-      // already one of its keys.
+      expect(params.UpdateExpression).toBe('SET #ecs.#provider = :configObj, #updatedAt = :now');
       expect(params.ConditionExpression).toBeUndefined();
-      expect(params.ExpressionAttributeValues[':mergedMap']).toBeUndefined();
-      expect(params.ExpressionAttributeValues[':singleProviderMap']).toBeUndefined();
-      expect(params.ExpressionAttributeNames['#provider']).toBe('attio');
-      const alias = nameForField(params.ExpressionAttributeNames, 'autoSyncEnabled');
-      expect(params.UpdateExpression).toContain(`#ecs.#provider.${alias} = ${alias!.replace('#f', ':v')}`);
-      // hubspot's own entry must never appear anywhere in this write.
-      expect(JSON.stringify(params)).not.toContain('hubspot');
     });
+  });
 
-    it('writes field-by-field via targeted nested paths once the provider config already exists', async () => {
+  describe('this provider already has an entry within externalCrmSyncConfigs', () => {
+    it('writes field-by-field via targeted nested paths', async () => {
       mockDynamoDB.get.mockReturnValue({
         promise: jest.fn().mockResolvedValue({
           Item: { externalCrmSyncConfigs: { attio: { autoSyncEnabled: false, lastSyncStatus: 'success' } } },
@@ -145,6 +181,7 @@ describe('crmDb.setLeadListCrmSyncConfig', () => {
       const params = mockDynamoDB.update.mock.calls[0][0];
       expect(params.ExpressionAttributeValues[':mergedMap']).toBeUndefined();
       expect(params.ExpressionAttributeValues[':singleProviderMap']).toBeUndefined();
+      expect(params.ExpressionAttributeValues[':configObj']).toBeUndefined();
       const autoSyncAlias = nameForField(params.ExpressionAttributeNames, 'autoSyncEnabled')!;
       const webhookAlias = nameForField(params.ExpressionAttributeNames, 'webhookEnabled')!;
       expect(params.UpdateExpression).toContain(`SET #ecs.#provider.${autoSyncAlias} = ${autoSyncAlias.replace('#f', ':v')}`);

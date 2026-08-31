@@ -5571,7 +5571,7 @@ export const crmDb = {
    *
    * Pass config=null to REMOVE the provider key without touching the other provider.
    *
-   * CodeRabbit findings (ENG-1380), both now fixed:
+   * CodeRabbit findings (ENG-1380), all now fixed:
    *
    * 1. This used to replace externalCrmSyncConfigs.<provider> — or, for a
    *    provider's first-ever save, the WHOLE externalCrmSyncConfigs map,
@@ -5579,19 +5579,10 @@ export const crmDb = {
    *    merge in JS, write the whole thing back). A concurrent
    *    updateLeadListCrmSyncStatus nested-path write for ANY provider
    *    landing between the read and the write here would be silently
-   *    clobbered by this call's stale snapshot. Fixed by always writing via
-   *    targeted nested paths once externalCrmSyncConfigs exists as an
-   *    attribute at all — DynamoDB accepts a nested SET/REMOVE against an
-   *    EXISTING parent map whether or not the specific child key (this
-   *    provider) was already present in it, so no read-modify-write of
-   *    siblings is needed either way. The only case that still needs special
-   *    handling is externalCrmSyncConfigs not existing as an attribute on
-   *    the item AT ALL (the very first CRM connection ever made for this
-   *    list) — DynamoDB's nested SET requires the parent path to already
-   *    resolve, so that one case bootstraps the attribute with a
-   *    conditional write (attribute_not_exists) and falls through to the
-   *    same targeted-write path on a lost race, rather than ever doing an
-   *    unconditional wholesale replace.
+   *    clobbered by this call's stale snapshot. Fixed by writing via
+   *    targeted paths whenever possible, scoped as narrowly as each case
+   *    allows (see the three cases below), instead of ever doing an
+   *    unconditional wholesale replace of externalCrmSyncConfigs.
    *
    * 2. The targeted per-field write used the field's own name as its
    *    ExpressionAttributeNames alias (`#${field}`). Every real
@@ -5601,6 +5592,23 @@ export const crmDb = {
    *    #ecs.#provider.* path in the same expression. Fixed by using
    *    collision-proof indexed aliases (#f0/:v0, #f1/:v1, ...) for the
    *    per-field loop instead of the field's own name.
+   *
+   * 3. The per-field write was reached whenever externalCrmSyncConfigs
+   *    existed as an attribute at all — even when THIS provider's own key
+   *    didn't exist within it yet (e.g. Attio connecting for the first time
+   *    on a list that already has HubSpot). DynamoDB can only create the
+   *    LAST segment of a path in one SET: `#ecs.#provider.#f0` requires
+   *    `#ecs.#provider` to already exist as a map, or DynamoDB rejects the
+   *    whole write with ValidationException — it won't create both the
+   *    provider map AND a field inside it in one operation. Fixed by
+   *    splitting into three cases: (a) externalCrmSyncConfigs doesn't exist
+   *    at all — bootstrap it with a conditional write; (b) it exists but
+   *    this provider's key doesn't — a single one-level-deep
+   *    `SET #ecs.#provider = :configObj` (safe unconditionally: nothing can
+   *    legitimately be racing a provider key that doesn't exist yet, since
+   *    updateLeadListCrmSyncStatus itself requires the key to already
+   *    exist); (c) this provider's key already exists — the targeted
+   *    per-field write, unchanged.
    */
   async setLeadListCrmSyncConfig(
     listId: string,
@@ -5625,15 +5633,19 @@ export const crmDb = {
         return;
       }
 
-      const current = await dynamodb.get({
-        TableName: `${TABLE_PREFIX}AW-LeadLists`,
-        Key: { listId },
-        ProjectionExpression: '#ecs',
-        ExpressionAttributeNames: { '#ecs': 'externalCrmSyncConfigs' },
-      }).promise();
-      let hasEcs = current.Item?.externalCrmSyncConfigs !== undefined;
+      const readEcs = async (): Promise<Record<string, any> | undefined> => {
+        const current = await dynamodb.get({
+          TableName: `${TABLE_PREFIX}AW-LeadLists`,
+          Key: { listId },
+          ProjectionExpression: '#ecs',
+          ExpressionAttributeNames: { '#ecs': 'externalCrmSyncConfigs' },
+        }).promise();
+        return current.Item?.externalCrmSyncConfigs;
+      };
 
-      if (!hasEcs) {
+      let existingMap = await readEcs();
+
+      if (existingMap === undefined) {
         try {
           await dynamodb.update({
             TableName: `${TABLE_PREFIX}AW-LeadLists`,
@@ -5650,11 +5662,28 @@ export const crmDb = {
         } catch (condError: any) {
           if (condError?.code !== 'ConditionalCheckFailedException') throw condError;
           // Someone else's concurrent first-ever-connection save for this
-          // list won the race — externalCrmSyncConfigs now exists, so fall
-          // through to the targeted per-field write below exactly as if
-          // we'd read it that way to begin with.
-          hasEcs = true;
+          // list won the race — re-read rather than assume, since we don't
+          // know whether they created THIS provider or a different one.
+          existingMap = (await readEcs()) ?? {};
         }
+      }
+
+      if (existingMap[provider] === undefined) {
+        // externalCrmSyncConfigs exists (has at least one other provider, or
+        // is an empty {} left behind by removing the last one), but this
+        // provider's own key doesn't. A single one-level-deep SET creates
+        // the whole provider map in one operation — valid because #ecs
+        // already exists — rather than the per-field write below, which
+        // would need DynamoDB to create #ecs.#provider AND a field inside it
+        // simultaneously (not supported; see finding 3 above).
+        await dynamodb.update({
+          TableName: `${TABLE_PREFIX}AW-LeadLists`,
+          Key: { listId },
+          UpdateExpression: 'SET #ecs.#provider = :configObj, #updatedAt = :now',
+          ExpressionAttributeNames: { '#ecs': 'externalCrmSyncConfigs', '#provider': provider, '#updatedAt': 'updatedAt' },
+          ExpressionAttributeValues: { ':configObj': config, ':now': new Date().toISOString() },
+        }).promise();
+        return;
       }
 
       const setExpressions: string[] = [];
