@@ -1212,13 +1212,17 @@ describe('AgentModeService - Work Plan', () => {
         expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(2);
       });
 
-      it('short-circuits the retry without a second persist when attempt 1 actually committed (ack-lost)', async () => {
-        // The scenario the ENG-1626 idempotency short-circuit exists for: attempt
-        // 1's updateSessionWorkPlan call commits server-side, but the client sees
-        // a transient error anyway (the ack itself was lost, not the write). The
-        // retry's fresh read must see the ALREADY-completed step and report
-        // success without re-running the mutation -- otherwise it would re-decrement
-        // an already-decremented calledFunctionCounts and re-stamp resolvedAt.
+      it('does not re-stamp resolvedAt or re-decrement counts on retry when attempt 1 actually committed (ack-lost)', async () => {
+        // The scenario the ENG-1626 idempotency guard exists for: attempt 1's
+        // updateSessionWorkPlan call commits server-side, but the client sees a
+        // transient error anyway (the ack itself was lost, not the write). The
+        // retry's fresh read sees the ALREADY-completed step. updateSessionWorkPlan
+        // itself is safe to call again (an unconditional SET, re-writing the same
+        // state) -- CodeRabbit's review on this PR flagged that the ORIGINAL guard
+        // over-corrected by skipping that entire write (and its post-write side
+        // effects: the decision-card input request, skill install), stranding the
+        // decision card. What must NOT repeat is the resolvedAt re-stamp and the
+        // calledFunctionCounts decrement -- this test pins THAT invariant.
         const pendingSession = {
           sessionId: mockSessionId,
           userId: mockUserId,
@@ -1238,8 +1242,11 @@ describe('AgentModeService - Work Plan', () => {
           .mockResolvedValueOnce(JSON.parse(JSON.stringify(committedSession)));
         // Attempt 1's persist call itself throws -- the caller never sees a
         // successful response, even though (per the committedSession read above)
-        // the write actually landed.
-        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockRejectedValue(new Error('ETIMEDOUT'));
+        // the write actually landed. Attempt 2's persist call (the same
+        // already-applied state written back) succeeds.
+        (chatbotDb.updateSessionWorkPlan as jest.Mock)
+          .mockRejectedValueOnce(new Error('ETIMEDOUT'))
+          .mockResolvedValueOnce(committedSession);
 
         const result = await (agentModeService as any).setWorkPlanStatus(
           [{ stepCount: 1, status: 'completed' }],
@@ -1248,9 +1255,12 @@ describe('AgentModeService - Work Plan', () => {
 
         expect(result.success).toBe(true);
         expect(chatbotDb.getChatSession).toHaveBeenCalledTimes(2);
-        // Called ONCE (attempt 1's own persist call, which the mock rejects) --
-        // the short-circuit must prevent a SECOND call on the retry.
-        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(1);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(2);
+        // The retry's own write must carry the ORIGINAL committed resolvedAt, not
+        // a freshly-generated one -- a re-stamp here would shift the asset-count
+        // cutoff window for any later step.
+        const secondCallWorkPlan = (chatbotDb.updateSessionWorkPlan as jest.Mock).mock.calls[1][1];
+        expect(secondCallWorkPlan.steps[0].resolvedAt).toBe('2026-08-27T17:00:05.000Z');
       });
     });
   });

@@ -159,6 +159,17 @@ export function classifyToolErrorClass(error: unknown): string {
       if (byStatus) return byStatus;
     }
 
+    // AWS SDK v2 (DynamoDB et al.) puts the exception name in the STRING
+    // `.code` property rather than `.status`/`.statusCode` (ENG-1626,
+    // CodeRabbit) — a real DynamoDB throttling error would otherwise fall
+    // through to the unclassified legacy fallback and never be recognized as
+    // retryable by isRetryableErrorClass's 'rate_limit' set.
+    const codeProp = (error as { code?: unknown }).code;
+    if (typeof codeProp === 'string'
+      && (codeProp === 'ThrottlingException' || codeProp === 'ProvisionedThroughputExceededException')) {
+      return 'rate_limit';
+    }
+
     const byMessage = classFromMessage(error.message ?? '');
     if (byMessage) return byMessage;
   } else if (typeof error === 'string') {

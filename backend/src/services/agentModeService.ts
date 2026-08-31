@@ -30347,30 +30347,34 @@ ${strippedHtml}`;
     // this attempt after a classified-transient error whose underlying DynamoDB
     // writes actually committed server-side (ack-lost) -- the client sees a
     // timeout/network failure, but updateSessionWorkPlan/updateCalledFunctions
-    // below are unconditional SETs with no idempotency key. Blindly re-running the
-    // mutation would re-decrement an already-decremented calledFunctionCounts and
-    // re-stamp resolvedAt, corrupting the asset-count cutoff window for later
-    // steps. If every requested step is already in its target status, the prior
-    // attempt's mutation already landed -- report success without touching state.
-    if (updates.every(update => {
-      const step = session.workPlan!.steps.find((s: any) => s.stepCount === update.stepCount);
-      return !!step && step.status === update.status;
-    })) {
-      const updatedSteps = updates.map(update => {
-        const step = session.workPlan!.steps.find((s: any) => s.stepCount === update.stepCount)!;
-        return { stepCount: update.stepCount, title: step.title, status: update.status };
-      });
-      return {
-        success: true,
-        message: updatedSteps.length === 1
-          ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
-          : `Updated ${updatedSteps.length} step${updatedSteps.length > 1 ? 's' : ''}`,
-        updatedSteps,
-        formattedContent: updatedSteps.map(s =>
-          `Updated step ${s.stepCount} "${s.title}" to ${s.status}`
-        ).join('\n')
-      };
-    }
+    // below are unconditional SETs with no idempotency key. Blindly re-running a
+    // step's mutation would re-decrement an already-decremented
+    // calledFunctionCounts and re-stamp resolvedAt, corrupting the asset-count
+    // cutoff window for later steps.
+    //
+    // ENG-1626 (CodeRabbit follow-up): an early return here for the whole batch
+    // was too broad -- it also skipped the post-write side effects below
+    // (updateSessionWorkPlanInputRequest, i.e. the NEXT step's decision card,
+    // and addAssociatedSkills). If attempt 1's updateSessionWorkPlan committed
+    // but a later call in that same attempt threw, the retry would see every
+    // step already at its target status and return success WITHOUT ever
+    // creating the decision card or installing the next step's skills -- the
+    // exact "customer never sees a card" failure this issue is about. Those
+    // calls are independently safe to repeat (updateSessionWorkPlanInputRequest
+    // is guarded by failIfAwaitingExists and returns null rather than
+    // throwing if one already exists; addAssociatedSkills filters against
+    // already-associated ids), so only the unsafe per-step mutation
+    // (calledFunctionCounts decrement, resolvedAt/completedAt stamp) is
+    // skipped below -- scoped per step, not per batch, so a batch mixing an
+    // already-applied step with a genuinely new one handles each correctly.
+    const alreadyAppliedStepCounts = new Set(
+      updates
+        .filter(update => {
+          const step = session.workPlan!.steps.find((s: any) => s.stepCount === update.stepCount);
+          return !!step && step.status === update.status;
+        })
+        .map(update => update.stepCount)
+    );
 
     // ENG-1188 (Greptile follow-up): each step's PRE-BATCH resolvedAt/completedAt
     // AND status, captured before any update in THIS call runs. workPlan.steps
@@ -30416,6 +30420,19 @@ ${strippedHtml}`;
       }
 
       const step = workPlan.steps[stepIndex];
+
+      // ENG-1626 (CodeRabbit follow-up): this step already carries the
+      // requested status from a prior (ack-lost) attempt -- report it as
+      // updated so the persistence/input-request/skills block below still
+      // runs, and still apply `notes` (a plain overwrite with no side
+      // effects, same as the normal path below), but skip every gate and the
+      // resolvedAt/completedAt/calledFunctionCounts mutation for it (those
+      // already ran once; re-running them would corrupt state).
+      if (alreadyAppliedStepCounts.has(update.stepCount)) {
+        workPlan.steps[stepIndex] = { ...workPlan.steps[stepIndex], notes: update.notes };
+        updatedSteps.push({ stepCount: update.stepCount, title: step.title, status: update.status });
+        continue;
+      }
 
       // Cross-step ordering gate (ENG-1188 root cause fault #3): the xCures
       // incident marked "QA, Contact Sheet & Delivery" completed while "Render
