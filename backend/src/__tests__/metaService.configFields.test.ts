@@ -233,3 +233,65 @@ describe('MetaService CAMPAIGN spend_cap read (ENG-785)', () => {
     });
   });
 });
+
+// ENG-1625 — a live post-deploy read-back requested effective_status and
+// special_ad_categories (both real Campaign GET fields — effective_status was already
+// allow-listed for ads) and was rejected LOUDLY because CAMPAIGN_READ_FIELDS hadn't been
+// widened to include them, the same defect shape as ENG-398/ENG-785. Same fix: widen the
+// allow-list so the verification read succeeds instead of throwing.
+describe('MetaService CAMPAIGN effective_status / special_ad_categories read (ENG-1625)', () => {
+  let service: MetaService;
+  const token = 'mock_token';
+  const accountId = '1234567890';
+
+  beforeEach(() => {
+    service = MetaService.getInstance();
+    jest.clearAllMocks();
+  });
+
+  it('CAMPAIGN LIST honors an explicit fields selection including effective_status and special_ad_categories', async () => {
+    const getCampaigns = jest.fn().mockResolvedValue([]);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getCampaigns }));
+
+    await service.listCampaigns(accountId, token, { fields: 'effective_status,special_ad_categories' });
+
+    expect(getCampaigns).toHaveBeenCalledWith(['effective_status', 'special_ad_categories']);
+  });
+
+  it('CAMPAIGN LIST default now includes effective_status and special_ad_categories', async () => {
+    const getCampaigns = jest.fn().mockResolvedValue([{ _data: { id: 'c1' } }]);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getCampaigns }));
+
+    await service.listCampaigns(accountId, token);
+
+    const requestedFields = getCampaigns.mock.calls[0][0] as string[];
+    expect(requestedFields).toEqual(
+      expect.arrayContaining(['effective_status', 'special_ad_categories'])
+    );
+  });
+
+  it('CAMPAIGN LIST single-campaign read (campaign_id) honors effective_status and special_ad_categories', async () => {
+    const get = jest.fn().mockResolvedValue({
+      _data: { id: 'camp_9', effective_status: 'CAMPAIGN_PAUSED', special_ad_categories: ['NONE'] },
+    });
+    (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get }));
+
+    const result = await service.listCampaigns(accountId, token, {
+      campaignId: 'camp_9',
+      fields: 'effective_status,special_ad_categories',
+    });
+
+    expect(get).toHaveBeenCalledWith(['effective_status', 'special_ad_categories']);
+    expect(result).toEqual([{ id: 'camp_9', effective_status: 'CAMPAIGN_PAUSED', special_ad_categories: ['NONE'] }]);
+  });
+
+  it('CAMPAIGN LIST still rejects unknown fields LOUDLY after the widening (ENG-398 regression pin)', async () => {
+    const getCampaigns = jest.fn().mockResolvedValue([]);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getCampaigns }));
+
+    await expect(
+      service.listCampaigns(accountId, token, { fields: 'effective_status,not_a_real_field' })
+    ).rejects.toThrow(/Unsupported campaign field\(s\): not_a_real_field/);
+    expect(getCampaigns).not.toHaveBeenCalled();
+  });
+});
