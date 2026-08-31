@@ -105,6 +105,45 @@ describe('ENG-1215 — non-prod guard at the Resend chokepoint', () => {
     expect(mockResendSend.mock.calls[0][0].to).toEqual(['a.real.customer@acme.io']);
   });
 
+  it('never lets sendEmailStrict report a suppressed send as delivered', async () => {
+    // CodeRabbit caught this: the guard returns a string `id` so the
+    // "no messageId" check does not misread it as a provider failure — but a
+    // string id is exactly what every delivery-status consumer treats as proof
+    // of delivery. Recording a blocked message as delivered is a worse failure
+    // than the one the guard prevents.
+    const { emailService } = await import('../services/emailService');
+
+    await expect(
+      emailService.sendEmailStrict('a.real.customer@acme.io', 'Audited', 'text', '<p>html</p>'),
+    ).rejects.toThrow(/suppressed by the non-prod email guard/);
+
+    expect(mockResendSend).not.toHaveBeenCalled();
+  });
+
+  it('still returns a real provider messageId for an allowlisted strict send', async () => {
+    const { emailService } = await import('../services/emailService');
+
+    const result = await emailService.sendEmailStrict(
+      'test@example.com', 'Audited', 'text', '<p>html</p>',
+    );
+
+    expect(result.messageId).toBe('real-provider-id');
+  });
+
+  it('does not log a suppressed best-effort send as sent', async () => {
+    const { emailService } = await import('../services/emailService');
+    const logged: string[] = [];
+    const spy = jest.spyOn(console, 'log').mockImplementation((...args: any[]) => {
+      logged.push(args.join(' '));
+    });
+
+    await emailService.sendEmail('a.real.customer@acme.io', 'Best effort', 'text', '<p>html</p>');
+    spy.mockRestore();
+
+    expect(logged.some((line) => /Email sent successfully/.test(line))).toBe(false);
+    expect(logged.some((line) => /suppressed by the non-prod guard/.test(line))).toBe(true);
+  });
+
   it('honours an explicit allow-all for a deliberate staging delivery test', async () => {
     process.env.NONPROD_EMAIL_ALLOW_ALL = 'true';
     const { resendService } = await import('../services/resendService');
