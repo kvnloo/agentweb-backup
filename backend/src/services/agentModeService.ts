@@ -16021,9 +16021,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         objective: campaign.objective
       }));
 
+      /*
+       * `fetchWithRetryAndPaging` is bounded (META_PAGING_MAX_PAGES), and this URL sets no
+       * `limit`, so Meta serves its default page size. A bounded read that reports a bare count
+       * is the ENG-1584 sentence — "Found N campaign(s)" reads as "these are all of them". The
+       * helper reports `pagingTruncated`; say so rather than discarding it.
+       */
+      const campaignsTruncated = campaignsData.pagingTruncated === true;
       return {
         success: true,
-        message: `Found ${campaigns.length} campaign(s)`,
+        complete: !campaignsTruncated,
+        ...(campaignsTruncated ? { hasMore: true } : {}),
+        message: campaignsTruncated
+          ? `Found ${campaigns.length} campaign(s), but THIS LIST IS INCOMPLETE — the read stopped at its page bound. Do NOT conclude a campaign is absent from it.`
+          : `Found ${campaigns.length} campaign(s) (complete list).`,
         campaigns: campaigns,
         totalCount: campaigns.length
       };
@@ -18988,7 +18999,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     };
     const resolveAdSet = async (id?: string) => {
       if (!id || !accessToken) return undefined;
-      try { return await metaService.getAdSet(accessToken, id); } catch { return undefined; }
+      // This result's NAME is rendered into the prompt the user approves, so the node must be
+      // proven to belong to the selected account first — otherwise an id from another ad account
+      // discloses that account's ad set name to this user.
+      try { return await metaService.getAdSet(accessToken, id, account_id); } catch { return undefined; }
     };
     const resolveAd = async (id?: string) => {
       if (!id || !accessToken) return undefined;

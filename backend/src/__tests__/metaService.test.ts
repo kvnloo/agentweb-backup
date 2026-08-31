@@ -109,8 +109,12 @@ describe('MetaService', () => {
 
     describe('Campaign Operations', () => {
         it('should get a single campaign', async () => {
+             // Graph returns `account_id` because getCampaign now asks for it in the same call
+             // to verify ownership; it is stripped before the caller sees the payload.
              const mockCampaignData = { id: 'camp_1', name: 'Campaign 1' };
-             const mockGet = jest.fn().mockResolvedValue({ _data: mockCampaignData });
+             const mockGet = jest.fn().mockResolvedValue({
+                 _data: { ...mockCampaignData, account_id: mockAdAccountId },
+             });
              (Campaign as unknown as jest.Mock).mockImplementation(() => ({
                  get: mockGet,
              }));
@@ -120,6 +124,27 @@ describe('MetaService', () => {
              expect(Campaign).toHaveBeenCalledWith('camp_1');
              expect(mockGet).toHaveBeenCalled();
              expect(result).toEqual(mockCampaignData);
+        });
+
+        /*
+         * getCampaign accepted `adAccountId` and never used it. A node id is global, so it
+         * returned any campaign the token could reach — and one caller renders the result's NAME
+         * into the confirmation prompt a user approves, so an id from another ad account
+         * disclosed that account's campaign name to this user.
+         */
+        it('refuses a campaign owned by a different ad account, without naming the owner', async () => {
+             const mockGet = jest.fn().mockResolvedValue({
+                 _data: { id: 'camp_1', name: "Other tenant's campaign", account_id: '9998887776' },
+             });
+             (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get: mockGet }));
+
+             await expect(
+                 service.getCampaign(mockAdAccountId, mockAccessToken, 'camp_1'),
+             ).rejects.toThrow(/not available in the selected ad account/i);
+
+             await expect(
+                 service.getCampaign(mockAdAccountId, mockAccessToken, 'camp_1'),
+             ).rejects.toThrow(expect.not.stringContaining('9998887776') as any);
         });
 
         it('should list campaigns', async () => {

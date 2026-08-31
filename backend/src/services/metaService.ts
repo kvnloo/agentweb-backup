@@ -1217,8 +1217,18 @@ export class MetaService {
       const campaign = new Campaign(campaignId);
       const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap'];
       this.log(`Fetching campaign: ${campaignId}`);
-      const result = await campaign.get(fields);
-      return result._data;
+      /*
+       * `adAccountId` was accepted and never used: a node id is global, so this returned any
+       * campaign the token could reach. It matters more here than on a plain list, because one
+       * caller renders the result's NAME into the confirmation prompt a user approves — so an id
+       * from another ad account disclosed that account's campaign name to this user, which is
+       * precisely the oracle behaviour assertOwnedByAccount refuses to produce.
+       */
+      const result = await campaign.get(MetaService.withOwnershipField(fields));
+      const data = { ...(result?._data ?? {}) };
+      MetaService.assertOwnedByAccount(data.account_id, campaignId, 'Campaign', adAccountId);
+      if (!fields.includes('account_id')) delete data.account_id;
+      return data;
     } catch (error) {
       return this.handleError(error, 'getCampaign');
     }
@@ -1502,7 +1512,14 @@ export class MetaService {
    * Get a single ad set with the fields needed to confirm a write target
    * (name + the campaign it belongs to).
    */
-  public async getAdSet(accessToken: string, adSetId: string) {
+  public async getAdSet(
+    accessToken: string,
+    adSetId: string,
+    /** When supplied, the node is verified to belong to this ad account before anything is
+     *  returned. Optional so existing read-back callers are unchanged; the callers whose result
+     *  reaches a user-facing prompt pass it. */
+    adAccountId?: string,
+  ) {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
@@ -1516,8 +1533,15 @@ export class MetaService {
         'start_time', 'end_time'
       ];
       this.log(`Fetching ad set: ${adSetId}`);
-      const result = await adSet.get(fields);
-      return result._data;
+      const result = await adSet.get(
+        adAccountId ? MetaService.withOwnershipField(fields) : fields,
+      );
+      const data = { ...(result?._data ?? {}) };
+      if (adAccountId) {
+        MetaService.assertOwnedByAccount(data.account_id, adSetId, 'Ad set', adAccountId);
+        if (!fields.includes('account_id')) delete data.account_id;
+      }
+      return data;
     } catch (error) {
       return this.handleError(error, 'getAdSet');
     }
