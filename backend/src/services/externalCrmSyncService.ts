@@ -527,7 +527,19 @@ export class ExternalCrmSyncService {
     if (config.apiKeyEncrypted) return true;
     if (!config.accountId) return false;
     const account = await getAccountById(config.accountId, config.userId).catch(() => null);
-    return !!account;
+    if (!account) return false;
+    // Attio's per-workspace webhook registration can 403 on a missing OAuth
+    // scope (an account connected before webhook:read-write was requested) —
+    // ensureAttioWebhook flags this on the account itself rather than
+    // failing loudly, so without this check the account looks fully
+    // connected while real-time auto-pull is silently dead. Surface it the
+    // same way as a fully-missing account: reconnecting re-grants the scope
+    // and (createAccount replaces config wholesale on reconnect, not merges)
+    // clears both this flag and the stale webhook_id, so registration
+    // retries cleanly on the next config save. No-op for HubSpot/any
+    // provider that never sets this field.
+    if ((account.config as any)?.needs_reconnect) return false;
+    return true;
   }
 
   async testConnection(

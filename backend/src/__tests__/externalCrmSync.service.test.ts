@@ -839,6 +839,33 @@ describe('ExternalCrmSyncService', () => {
       const cfg = makeConfig({ accountId: 'acct1', apiKeyEncrypted: undefined });
       expect(await service.isAccountConnected(cfg)).toBe(false);
     });
+
+    // Regression: an Attio account can exist but be flagged needs_reconnect
+    // (webhook registration 403'd on a missing OAuth scope) — the account
+    // still resolves, so this must be an explicit check, not just presence.
+    // Without it, the account looked fully connected while real-time
+    // auto-pull was silently dead with no user-facing indication at all.
+    it('returns false when the resolved account is flagged needs_reconnect (e.g. missing Attio webhook scope)', async () => {
+      mockGetAccountById.mockResolvedValue({
+        account_id: 'acct1',
+        platform: 'attio',
+        userId: 'user1',
+        config: { needs_reconnect: true },
+      });
+      const cfg = makeConfig({ provider: 'attio', accountId: 'acct1', apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(false);
+    });
+
+    it('returns true for an Attio account with no needs_reconnect flag', async () => {
+      mockGetAccountById.mockResolvedValue({
+        account_id: 'acct1',
+        platform: 'attio',
+        userId: 'user1',
+        config: { webhook_id: 'wh_1' },
+      });
+      const cfg = makeConfig({ provider: 'attio', accountId: 'acct1', apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(true);
+    });
   });
 
   // ─── getDefaultMappings ─────────────────────────────────────────────────────

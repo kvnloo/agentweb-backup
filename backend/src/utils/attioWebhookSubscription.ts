@@ -29,6 +29,14 @@ export async function ensureAttioWebhook(userId: string, accountId: string): Pro
     if ((account.config as any).webhook_id) {
       return; // already registered
     }
+    if ((account.config as any).needs_reconnect) {
+      // Already flagged from a prior 403 (missing webhook:read-write scope).
+      // Without this guard, every config save re-attempts registration and
+      // silently re-403s forever until the user reconnects — reconnecting
+      // clears this flag (createAccount replaces config wholesale, not
+      // merges), which naturally lets the next save retry.
+      return;
+    }
 
     const baseUrl = process.env.BACKEND_URL;
     if (!baseUrl) {

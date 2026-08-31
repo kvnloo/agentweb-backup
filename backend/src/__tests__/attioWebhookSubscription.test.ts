@@ -107,6 +107,17 @@ describe('ensureAttioWebhook', () => {
     expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
   });
 
+  // Regression: without this guard, every config save re-attempted
+  // registration for an already-flagged account and silently re-403'd
+  // forever until the user reconnected (which clears the flag).
+  it('does not retry registration once already flagged needs_reconnect', async () => {
+    mockGetAccountById.mockResolvedValue(baseAccount({ needs_reconnect: true }));
+    await ensureAttioWebhook('user-1', 'acct-1');
+    expect(mockAttioServiceCreate).not.toHaveBeenCalled();
+    expect(mockRegisterWebhook).not.toHaveBeenCalled();
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+  });
+
   it('flags needs_reconnect on a 403 (missing webhook:read-write scope)', async () => {
     mockGetAccountById.mockResolvedValue(baseAccount());
     mockRegisterWebhook.mockRejectedValue({ response: { status: 403, data: { message: 'insufficient scope' } } });
