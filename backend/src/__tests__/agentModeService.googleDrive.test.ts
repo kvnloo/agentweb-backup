@@ -1077,6 +1077,55 @@ describe('AgentModeService - Google Drive methods', () => {
         expect(result.url).toMatch(/^https:\/\//);
       });
 
+      /*
+       * ENG-1476 follow-up: Drive's query grammar requires BOTH a backslash and a quote to be
+       * escaped inside a string literal. The call sites escaped only the quote, so a backslash
+       * in a value survived verbatim and could terminate the literal early — an opaque Drive
+       * 400 instead of a match, and the shape that lets a crafted value reach past the
+       * parent-folder clause the query is scoped by.
+       *
+       * Rather than restating the escaping algorithm (a test that mirrors the implementation
+       * proves nothing), these parse the emitted `q` the way Drive would and assert the
+       * literal ROUND-TRIPS back to exactly the caller's value, with the scoping clause intact
+       * outside it.
+       */
+      const parseDriveLiteral = (q: string) => {
+        const marker = "name = '";
+        const start = q.indexOf(marker);
+        if (start < 0) return null;
+        let i = start + marker.length;
+        let out = '';
+        while (i < q.length) {
+          if (q[i] === '\\') { out += q[i + 1]; i += 2; continue; }
+          if (q[i] === "'") return { value: out, rest: q.slice(i + 1) };
+          out += q[i]; i += 1;
+        }
+        return null; // unterminated literal — Drive would 400
+      };
+
+      it.each([
+        ['a trailing backslash', 'report\\'],
+        ['a quote-parity break-out attempt', "x\\' or name != '"],
+        ['a plain apostrophe', "Vince's ad"],
+      ])('keeps the Drive query literal well-formed and scoped for %s', async (_label, fileName) => {
+        mockDriveFiles.list.mockImplementation(() => Promise.resolve({ data: { files: [] } }));
+
+        await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, fileName, USER_ID);
+
+        const nameCall = mockDriveFiles.list.mock.calls.find(([a]: any) => a.q.includes('name = '));
+        expect(nameCall).toBeDefined();
+        const parsed = parseDriveLiteral(nameCall![0].q);
+
+        // The literal terminates (an unescaped backslash would swallow the closing quote)...
+        expect(parsed).not.toBeNull();
+        // ...it carries exactly what the caller asked for, no more and no less...
+        expect(parsed!.value).toBe(fileName);
+        // ...and nothing the caller supplied escaped into query syntax: the clause after the
+        // literal is still ours.
+        expect(parsed!.rest.trimStart()).toMatch(/^and trashed = false/);
+        expect(nameCall![0].q).toContain(`'${ROOT}' in parents`);
+      });
+
       it('names the sub-folder that needs sharing when it cannot be listed, instead of a bare "not found"', async () => {
         mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
           if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType')) {
