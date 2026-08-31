@@ -35591,13 +35591,66 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
            * recording, and conversions already recorded stay in reporting, exactly as a
            * REMOVED campaign still returns its historical metrics.
            */
-          if (args.confirm_conversion_action_removal !== true) {
+          /*
+           * ENG-1322 follow-up. The removal flag is BOUND to a disclosed approval, exactly
+           * as ENG-1526 bound override_tracking_check.
+           *
+           * `confirm_conversion_action_removal: true` used to be sufficient on its own, and
+           * the model sets its own arguments — so the only thing standing between a model
+           * that decided to "clean up" a conversion action and a permanent, unrecoverable
+           * removal was a sentence in the tool description asking it not to. ENG-941 already
+           * wrote down why that is not a control: "an override the model can introduce after
+           * approval is not user-granted, whatever the tool description says." This is the
+           * same shape guarding a strictly worse outcome — a removed conversion action cannot
+           * be re-enabled, and every campaign bidding toward it stops counting it.
+           *
+           * So: a claimed removal with no matching token HALTS and discloses, and issues an
+           * HMAC over this exact call. Only a replay presenting that token removes anything.
+           * A forged token, or a token minted for a DIFFERENT conversion action, falls back
+           * into a fresh disclosure rather than proceeding — which is the case that matters,
+           * because the destructive argument here is the resource name.
+           */
+          const removalClaimed = args.confirm_conversion_action_removal === true;
+          // Computed unconditionally, NOT only when the flag is claimed. The digest covers
+          // the call being disclosed, not the caller's intent to confirm — and the halt
+          // below has to hand back a usable token whether or not the flag was set. Gating
+          // it on the flag made the FIRST (unflagged) call disclose an empty string, which
+          // the model then replayed faithfully and was refused for, turning a two-step loop
+          // into three and making the token look broken. Issuing it here is not a weakening:
+          // the token is only ever returned alongside the disclosure of this exact resource
+          // name, which is what binds it.
+          const removalDigest = computeTrackingOverrideDigest(getJwtSecret(), {
+            customer_id, entity_type, action,
+            conversion_action_resource_name: args.conversion_action_resource_name,
+          });
+          const removalApproved =
+            removalClaimed && trackingOverrideTokenMatches(args.conversion_action_removal_token, removalDigest);
+
+          if (!removalApproved) {
+            const target = args.conversion_action_resource_name;
             return {
-              success: false,
-              error: 'CONVERSION_ACTION REMOVE stops this conversion action recording, permanently — '
-                + 'it cannot be re-enabled afterwards, and any campaign bidding toward it as a goal '
-                + 'will stop counting it. Conversions already recorded stay in your reports. Confirm '
-                + 'with the user, then retry with confirm_conversion_action_removal=true.',
+              success: true,
+              requiresConfirmation: true,
+              awaitingUserConfirmation: true,
+              summary: `Permanently stop conversion action ${target} from recording`,
+              confirmationPrompt:
+                `This PERMANENTLY stops a Google Ads conversion action from recording.\n\n`
+                + `It cannot be re-enabled afterwards, and any campaign bidding toward it as a `
+                + `goal will stop counting it — which changes how those campaigns bid. `
+                + `Conversions it already recorded stay in your reports, so this is not data `
+                + `loss, but it is not reversible either.\n\n`
+                + `Conversion action: ${target}\n\n`
+                + `Reply "yes" / "confirm" to remove it, or tell me to leave it alone.`,
+              confirmationDetail: `Permanently stop conversion action ${target} from recording`,
+              message:
+                `CONVERSION_ACTION REMOVE permanently stops ${target} recording and cannot be `
+                + `undone. Show the user the warning above and get explicit approval — do not `
+                + `decide this yourself. Once approved, call call_google_ads_api again with the `
+                + `same arguments PLUS conversion_action_removal_token exactly as returned here; `
+                + `without it nothing is removed.`,
+              // Only issued alongside a disclosure of this exact resource name, so the token
+              // can only ever approve the removal the user was actually shown.
+              conversion_action_removal_token: removalDigest,
             };
           }
           await googleAdsService.removeConversionAction(userId, customer_id, args.conversion_action_resource_name);
