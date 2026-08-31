@@ -1084,6 +1084,120 @@ describe('AgentModeService - Work Plan', () => {
         ]);
       });
     });
+
+    // ENG-1626: production session 822c1ed4 saw set_work_plan_status fail twice
+    // back-to-back with no system-level retry, while the customer watched the
+    // workplan progress bar stall with no explanation. A transient failure
+    // anywhere in the read-modify-write (session read or workPlan persist) should
+    // be retried once automatically before the tool reports failure.
+    describe('transient failure retry (ENG-1626)', () => {
+      const singleStepWorkPlan = () => ({
+        title: 'Plan',
+        steps: [{ stepCount: 1, title: 'Step 1', status: 'pending' as const }],
+        createdAt: '2026-08-27T17:00:00.000Z',
+        updatedAt: '2026-08-27T17:00:00.000Z',
+      });
+
+      it('retries once and succeeds after a transient (network) session read failure', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: singleStepWorkPlan(),
+        };
+
+        (chatbotDb.getChatSession as jest.Mock)
+          .mockRejectedValueOnce(new Error('socket hang up'))
+          .mockResolvedValueOnce(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.getChatSession).toHaveBeenCalledTimes(2);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(1);
+      });
+
+      it('retries once and succeeds after a transient (throttling/5xx) persist failure', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: singleStepWorkPlan(),
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock)
+          .mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException: 503 Service Unavailable'))
+          .mockResolvedValueOnce(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(2);
+      });
+
+      it('does NOT retry a non-transient (validation) exception — fails immediately with the real error', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: {
+            title: 'Plan',
+            // Deliberately out-of-order stepCount so updateSessionWorkPlan throws
+            // its own validation error — a model/data bug, not a transient blip.
+            steps: [{ stepCount: 2, title: 'Step 1', status: 'pending' as const }],
+            createdAt: '2026-08-27T17:00:00.000Z',
+            updatedAt: '2026-08-27T17:00:00.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockRejectedValue(
+          new Error('Invalid stepCount at index 0: expected 1 but got 2.')
+        );
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 2, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Invalid stepCount');
+        // Only ONE attempt — a validation bug will not be fixed by retrying the
+        // identical call, so it should not silently double the model's tool budget.
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(1);
+      });
+
+      it('gives up after a persistent transient failure and reports it as a normal failure', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: singleStepWorkPlan(),
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockRejectedValue(new Error('ETIMEDOUT'));
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.message).toBe('Failed to update work plan status');
+        expect(result.error).toContain('ETIMEDOUT');
+        // Exactly two attempts total (one retry), never an unbounded retry loop.
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledTimes(2);
+      });
+    });
   });
 
   describe('buildMarketingContext with work plan', () => {
