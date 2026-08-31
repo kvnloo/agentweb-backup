@@ -10,6 +10,17 @@ import type { DailyVolumeState } from './linkedInWritePacer';
 export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly';
 
 /**
+ * ENG-1616 — the subset of `PlatformType` that `postOnConnectedAccount` treats as
+ * social-posting-capable. Single source of truth for that allowlist: it used to be
+ * duplicated between `agentModeService.postOnConnectedAccount` and the scheduled
+ * publish consent guard's `resolveAccountPlatform`, both narrowing an account_id
+ * lookup to these platforms before matching — a drift between the two copies would
+ * silently break account resolution for the missing platform on one side, with no
+ * test or runtime signal to catch it.
+ */
+export const SOCIAL_POSTING_PLATFORMS: readonly PlatformType[] = ['twitter', 'linkedin', 'instagram', 'youtube'];
+
+/**
  * Base OAuth configuration shared across all platforms
  */
 export interface BaseOAuthConfig {
