@@ -30,6 +30,7 @@ import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
 import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
+import { parseToolCallArguments } from './repairToolCallArguments';
 import {
   buildToolResponseS3Header,
   buildToolResponseUnavailableHeader,
@@ -680,7 +681,12 @@ export async function executePreparedTools(
 
   for (const toolCall of responseToolCalls) {
     try {
-      const functionArgs = JSON.parse(toolCall.function.arguments);
+      // ENG-1477: a large or quote-rich value (report titles with a quoted
+      // phrase, HTML content with attribute quotes) sometimes comes back with
+      // an inner `"` the model failed to escape, which JSON.parse reads as an
+      // early string terminator. Retry through a repair pass before failing —
+      // see repairToolCallArguments.ts for the observed failure signature.
+      const functionArgs = parseToolCallArguments(toolCall.function.arguments);
 
       // Enforce skill-based tool access; block admin-only tools without admin access,
       // block context-restricted/shared-session tools even if the LLM hallucinates them.
