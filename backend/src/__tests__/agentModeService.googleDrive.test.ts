@@ -1146,6 +1146,139 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(finalCall).toBeDefined();
       expect(finalCall![0].q).toContain("mimeType != 'application/vnd.google-apps.folder'");
     });
+
+    it('surfaces inaccessibleFolders when a sub-folder cannot be listed, instead of silently shrinking the listing', async () => {
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType =')) {
+          return Promise.resolve({ data: { files: [{ id: SUB, name: '4x5' }] } });
+        }
+        if (q.includes(`'${SUB}' in parents`) && q.includes('mimeType =')) {
+          return Promise.reject(makeApiError(403, 'insufficientPermissions'));
+        }
+        return Promise.resolve({
+          data: {
+            files: [{ id: 'file-1', name: 'root.png', mimeType: 'image/png', size: '2048', modifiedTime: '2026-08-01T00:00:00Z' }],
+          },
+        });
+      });
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+
+      const gdriveKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${ROOT}`);
+      expect(gdriveKb).toBeDefined();
+      expect(gdriveKb.inaccessibleFolders).toEqual(['4x5']);
+    });
+  });
+
+  // ── readSingleKnowledgeBaseFile / read_knowledge_base_files — Google Drive
+  //    sub-folder traversal (ENG-1624) ────────────────────────────────────────
+  //
+  // readGoogleDriveSharedFile (behind read_knowledge_base_files) received the
+  // identical tree-walk and restricted-error fix as materializeKnowledgeBaseAsset,
+  // but had no test coverage of its own for either branch.
+
+  describe('readSingleKnowledgeBaseFile - Google Drive sub-folder traversal (ENG-1624)', () => {
+    const { userDb } = require('../services/db');
+    const ROOT = 'root-folder';
+    const SUB = '4x5-subfolder';
+
+    beforeEach(() => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: USER_ID,
+        googleDriveFolders: [{ folderId: ROOT, name: '8-18-26 Insurance Angle Ads' }],
+      });
+    });
+
+    it('reads a file nested in a sub-folder of the registered root, not just direct children', async () => {
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType')) {
+          return Promise.resolve({ data: { files: [{ id: SUB, name: '4x5' }] } });
+        }
+        if (q.includes(`'${SUB}' in parents`) && q.includes('mimeType')) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        if (q.includes("name = 'notes.txt'")) {
+          return Promise.resolve({
+            data: { files: [{ id: 'file-99', name: 'notes.txt', mimeType: 'text/plain', size: '12', modifiedTime: '2026-08-01T00:00:00Z' }] },
+          });
+        }
+        return Promise.resolve({ data: { files: [] } });
+      });
+      mockDriveFiles.get.mockResolvedValue({ data: Buffer.from('hello world') });
+
+      const result = await service.readSingleKnowledgeBaseFile(`gdrive:${ROOT}`, 'notes.txt', USER_ID);
+
+      const nameSearchCall = mockDriveFiles.list.mock.calls.find(
+        ([arg]: any) => arg.q.includes("name = 'notes.txt'")
+      );
+      expect(nameSearchCall).toBeDefined();
+      expect(nameSearchCall![0].q).toContain(`'${SUB}' in parents`);
+
+      expect(result.success).toBe(true);
+      expect(result.content).toContain('hello world');
+    });
+
+    it('names the sub-folder that needs sharing when it cannot be listed, instead of a bare "not found"', async () => {
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType')) {
+          return Promise.resolve({ data: { files: [{ id: SUB, name: '4x5' }] } });
+        }
+        if (q.includes(`'${SUB}' in parents`) && q.includes('mimeType')) {
+          return Promise.reject(makeApiError(403, 'insufficientPermissions'));
+        }
+        return Promise.resolve({ data: { files: [] } });
+      });
+
+      const result = await service.readSingleKnowledgeBaseFile(`gdrive:${ROOT}`, 'notes.txt', USER_ID);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('4x5');
+      expect(result.message).toMatch(/share/i);
+    });
+  });
+
+  // ── searchKnowledgeBase — Google Drive sub-folder traversal (ENG-1624) ──────
+  //
+  // The failing production session actually called search_knowledge_base, which
+  // still scoped queries to `'<folderId>' in parents` for each registered root
+  // directly — the exact root-cause bug, live in the one call site the customer
+  // hit first.
+
+  describe('searchKnowledgeBase - Google Drive sub-folder traversal (ENG-1624)', () => {
+    const { userDb } = require('../services/db');
+    const ROOT = 'root-folder';
+    const SUB = '4x5-subfolder';
+
+    beforeEach(() => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: USER_ID,
+        googleDriveFolders: [{ folderId: ROOT, name: '8-18-26 Insurance Angle Ads' }],
+      });
+    });
+
+    it('spans sub-folder ids in the fullText search query, not just the registered root', async () => {
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType')) {
+          return Promise.resolve({ data: { files: [{ id: SUB, name: '4x5' }] } });
+        }
+        if (q.includes(`'${SUB}' in parents`) && q.includes('mimeType')) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        if (q.includes('fullText contains')) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        return Promise.resolve({ data: { files: [] } });
+      });
+
+      await service.searchKnowledgeBase('insurance ad copy', 5, USER_ID);
+
+      const fullTextCall = mockDriveFiles.list.mock.calls.find(
+        ([arg]: any) => arg.q.includes('fullText contains')
+      );
+      expect(fullTextCall).toBeDefined();
+      expect(fullTextCall![0].q).toContain(`'${SUB}' in parents`);
+      expect(fullTextCall![0].q).toContain(`'${ROOT}' in parents`);
+    });
   });
 
   // ── markdownToDocsRequests ─────────────────────────────────────────────────
