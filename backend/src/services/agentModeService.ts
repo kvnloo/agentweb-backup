@@ -30600,6 +30600,14 @@ ${strippedHtml}`;
 
       return {
         success: false,
+        // ENG-1626: this is a deliberate business-rule gate, not a malfunction --
+        // blocked/reason lets recordToolFailure (agentToolGatewayService) recognize
+        // it as a ToolResultPolicyBlockedError and skip it, the same telemetry
+        // carve-out ENG-1636 established. Without this, a self-corrected refusal
+        // like this one incremented failedFunctions.set_work_plan_status and read
+        // as an infra flake on the failure-cluster dashboard.
+        blocked: true,
+        reason: 'workplan_out_of_order',
         message: 'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
         outOfOrderSteps,
         formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nComplete (or explicitly skip) the earlier step(s) first, then mark this step as completed.`
@@ -30614,6 +30622,10 @@ ${strippedHtml}`;
 
       return {
         success: false,
+        // ENG-1626: deliberate gate, see the out-of-order gate above for why
+        // blocked/reason is set here.
+        blocked: true,
+        reason: 'workplan_missing_function_calls',
         message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
         missingFunctionCalls,
         formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nPlease make the required function calls first, then mark the steps as completed.`
@@ -30628,6 +30640,10 @@ ${strippedHtml}`;
 
       return {
         success: false,
+        // ENG-1626: deliberate gate, see the out-of-order gate above for why
+        // blocked/reason is set here.
+        blocked: true,
+        reason: 'workplan_insufficient_assets',
         message: 'Cannot mark steps as completed. The required number of assets has not been generated yet.',
         insufficientAssets,
         formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nGenerate the remaining assets with generate_image, then mark the step completed. If the user has explicitly approved a smaller set, call modify_work_plan to lower the step's expected asset count first.`
@@ -30638,6 +30654,10 @@ ${strippedHtml}`;
     if (notFoundSteps.length > 0 && updatedSteps.length === 0) {
       return {
         success: false,
+        // ENG-1626: deliberate gate (bad stepCount), see the out-of-order gate
+        // above for why blocked/reason is set here.
+        blocked: true,
+        reason: 'workplan_step_not_found',
         message: `Steps not found: ${notFoundSteps.join(', ')}`
       };
     }
