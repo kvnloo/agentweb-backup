@@ -122,6 +122,42 @@ remote() {
       -o LogLevel=ERROR -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" "$@"
 }
 
+cleanup_failed_launch() {
+  local exit_code=$?
+  trap - ERR
+
+  # A failed readiness check used to leave a billable instance and its security
+  # group behind. Launch owns both resources until it reports success.
+  if [[ -n "${INSTANCE_ID:-}" ]]; then
+    warn "Launch failed; terminating instance $INSTANCE_ID..."
+    aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" \
+      --region "$REGION" >/dev/null 2>&1 || warn "Could not terminate $INSTANCE_ID"
+    aws ec2 wait instance-terminated --instance-ids "$INSTANCE_ID" \
+      --region "$REGION" 2>/dev/null || true
+  fi
+  if [[ -n "${SG_ID:-}" ]]; then
+    warn "Removing launch security group $SG_ID..."
+    aws ec2 delete-security-group --group-id "$SG_ID" \
+      --region "$REGION" 2>/dev/null || warn "Could not delete security group $SG_ID"
+  fi
+  if [[ -n "${LAUNCH_STATE_FILE:-}" ]]; then
+    rm -f "$LAUNCH_STATE_FILE"
+  fi
+  exit "$exit_code"
+}
+
+diagnose_ssh_failure() {
+  err "SSH endpoint did not become reachable; collecting launch diagnostics."
+  aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
+    --query 'Reservations[0].Instances[0].{State:State.Name,PublicIp:PublicIpAddress,Subnet:SubnetId,Vpc:VpcId,SecurityGroups:SecurityGroups[*].GroupId}' \
+    --output json >&2 || true
+  aws ec2 describe-instance-status --instance-ids "$INSTANCE_ID" --include-all-instances \
+    --region "$REGION" --query 'InstanceStatuses[0].{Instance:InstanceStatus.Status,System:SystemStatus.Status}' \
+    --output json >&2 || true
+  aws ec2 describe-security-groups --group-ids "$SG_ID" --region "$REGION" \
+    --query 'SecurityGroups[0].IpPermissions' --output json >&2 || true
+}
+
 
 ###############################################################################
 # launch
@@ -339,6 +375,8 @@ EOF
 
   log "Public IP: $PUBLIC_IP"
   save_state "$name"
+  LAUNCH_STATE_FILE="$(state_file_for "$name")"
+  trap 'cleanup_failed_launch' ERR
 
   # Wait for SSH
   log "Waiting for SSH to become available..."
@@ -350,7 +388,8 @@ EOF
     fi
     if [[ $i -eq 60 ]]; then
       err "SSH timeout after 5 minutes"
-      exit 1
+      diagnose_ssh_failure
+      false # ERR trap terminates the instance, security group, and state file.
     fi
     sleep 5
   done
@@ -515,6 +554,8 @@ VITE_DEBUG=true' > /home/ec2-user/agentweb/customer-portal/.env.local"
       sudo chmod +x /opt/watchdog.sh && \
       echo '0 * * * * /opt/watchdog.sh >> /var/log/watchdog.log 2>&1' | sudo crontab -"
   fi
+
+  trap - ERR
 
   echo ""
   log "========================================="
