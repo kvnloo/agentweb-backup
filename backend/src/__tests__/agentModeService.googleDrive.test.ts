@@ -1095,6 +1095,143 @@ describe('AgentModeService - Google Drive methods', () => {
         expect(result.message).toContain('4x5');
         expect(result.message).toMatch(/share/i);
       });
+
+      // ── Rework findings (post-review) ──────────────────────────────────────
+
+      it('does not call the registered root a "sub-folder" when the root itself cannot be listed', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType')) {
+            return Promise.reject(makeApiError(403, 'insufficientPermissions'));
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).not.toMatch(/sub-folder/i);
+        expect(result.message).toMatch(/itself could not be accessed/i);
+      });
+
+      it('follows nextPageToken when a folder has more sub-folders than fit in one page', async () => {
+        const PAGE1_CHILD = 'page-1-child';
+        const PAGE2_CHILD = 'page-2-child';
+        mockDriveFiles.list.mockImplementation(({ q, pageToken }: { q: string; pageToken?: string }) => {
+          if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType')) {
+            if (!pageToken) {
+              return Promise.resolve({ data: { files: [{ id: PAGE1_CHILD, name: 'p1' }], nextPageToken: 'tok-1' } });
+            }
+            if (pageToken === 'tok-1') {
+              return Promise.resolve({ data: { files: [{ id: PAGE2_CHILD, name: 'p2' }] } });
+            }
+          }
+          if ((q.includes(`'${PAGE1_CHILD}' in parents`) || q.includes(`'${PAGE2_CHILD}' in parents`)) && q.includes('mimeType')) {
+            return Promise.resolve({ data: { files: [] } });
+          }
+          if (q.includes("name = 'ad.png'")) {
+            return Promise.resolve({
+              data: { files: [{ id: 'file-1', name: 'ad.png', mimeType: 'image/png', size: '1024' }] },
+            });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+        mockDriveFiles.get.mockResolvedValue({ data: Buffer.from('bytes') });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        const nameSearchCall = mockDriveFiles.list.mock.calls.find(
+          ([arg]: any) => arg.q.includes("name = 'ad.png'")
+        );
+        expect(nameSearchCall).toBeDefined();
+        // Only reachable if the walker followed nextPageToken to discover the
+        // second page's child folder.
+        expect(nameSearchCall![0].q).toContain(`'${PAGE2_CHILD}' in parents`);
+        expect(result.success).toBe(true);
+      });
+
+      it('does not re-list a folder reachable via two different parents, and terminates', async () => {
+        const CHILD_A = 'child-a';
+        const CHILD_B = 'child-b';
+        const SHARED = 'shared-child';
+        let sharedListCalls = 0;
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (!q.includes('mimeType')) return Promise.resolve({ data: { files: [] } });
+          if (q.includes(`'${ROOT}' in parents`)) {
+            return Promise.resolve({ data: { files: [{ id: CHILD_A, name: 'a' }, { id: CHILD_B, name: 'b' }] } });
+          }
+          if (q.includes(`'${CHILD_A}' in parents`) || q.includes(`'${CHILD_B}' in parents`)) {
+            // Both A and B report the SAME child — a diamond in the folder graph.
+            return Promise.resolve({ data: { files: [{ id: SHARED, name: 'shared' }] } });
+          }
+          if (q.includes(`'${SHARED}' in parents`)) {
+            sharedListCalls++;
+            return Promise.resolve({ data: { files: [] } });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        // If the walk re-queued SHARED every time it was discovered (once via A,
+        // once via B), its children would be listed twice — or, with a real
+        // cycle instead of a diamond, the walk would never terminate.
+        expect(sharedListCalls).toBe(1);
+      });
+
+      it('reports ambiguity instead of silently materializing one candidate when the same name exists in two sub-folders', async () => {
+        const SUB_A = 'ratio-4x5';
+        const SUB_B = 'ratio-9x16';
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            if (q.includes(`'${ROOT}' in parents`)) {
+              return Promise.resolve({ data: { files: [{ id: SUB_A, name: '4x5' }, { id: SUB_B, name: '9x16' }] } });
+            }
+            return Promise.resolve({ data: { files: [] } });
+          }
+          if (q.includes("name = 'report.png'")) {
+            return Promise.resolve({
+              data: {
+                files: [
+                  { id: 'file-a', name: 'report.png', mimeType: 'image/png', size: '10', parents: [SUB_A] },
+                  { id: 'file-b', name: 'report.png', mimeType: 'image/png', size: '10', parents: [SUB_B] },
+                ],
+              },
+            });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'report.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/multiple/i);
+        expect(result.message).toContain('4x5');
+        expect(result.message).toContain('9x16');
+        // Must not have materialized (uploaded) either candidate.
+        expect(mockDriveFiles.get).not.toHaveBeenCalled();
+      });
+
+      it('flags an incomplete scan — and does not claim absence — when a tree exceeds the folder cap', async () => {
+        let depth = 0;
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            // Every folder in this synthetic tree has exactly one child, so the
+            // walk never runs out of folders to discover on its own — it must
+            // stop at the folder-count bound, not run away.
+            depth++;
+            return Promise.resolve({ data: { files: [{ id: `deep-${depth}`, name: `deep-${depth}` }] } });
+          }
+          // Target file search across the (truncated) tree — never matches.
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        // Must not read as a confirmed absence — the scan didn't cover the whole tree.
+        expect(result.message).not.toBe('File "ad.png" not found in Google Drive folder');
+        expect(result.message).toMatch(/stopped before covering it entirely|not a confirmed absence/i);
+      });
     });
   });
 
@@ -1168,6 +1305,70 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(gdriveKb).toBeDefined();
       expect(gdriveKb.inaccessibleFolders).toEqual(['4x5']);
     });
+
+    // ── Rework findings (post-review) ────────────────────────────────────────
+
+    it('flags folderScanIncomplete in both the per-KB field and the human-readable message when the tree exceeds the folder cap', async () => {
+      let depth = 0;
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          depth++;
+          return Promise.resolve({ data: { files: [{ id: `deep-${depth}`, name: `deep-${depth}` }] } });
+        }
+        return Promise.resolve({ data: { files: [] } });
+      });
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+
+      const gdriveKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${ROOT}`);
+      expect(gdriveKb.folderScanIncomplete).toBe(true);
+      expect(result.folderScanIncomplete).toBe(true);
+      // The model reads prose, not just structured fields.
+      expect(result.message).toMatch(/too large to fully scan|could not be accessed/i);
+    });
+
+    it('batches Drive queries across more than 50 folders and merges duplicate files by id', async () => {
+      const CHILDREN = Array.from({ length: 60 }, (_, i) => ({ id: `child-${i}`, name: `child-${i}` }));
+      const FILE_A = { id: 'file-a', name: 'a.png', mimeType: 'image/png', size: '10', modifiedTime: '2026-08-01T00:00:00Z' };
+      const FILE_B = { id: 'file-b', name: 'b.png', mimeType: 'image/png', size: '10', modifiedTime: '2026-08-02T00:00:00Z' };
+      const FILE_B_DUP = { ...FILE_B };
+      const FILE_C = { id: 'file-c', name: 'c.png', mimeType: 'image/png', size: '10', modifiedTime: '2026-08-03T00:00:00Z' };
+
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          if (q.includes(`'${ROOT}' in parents`)) {
+            return Promise.resolve({ data: { files: CHILDREN } });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        }
+
+        // Batched file-listing query — the 61 folder ids (root + 60 children)
+        // must be split across more than one query.
+        const idsInBatch = (q.match(/' in parents/g) || []).length;
+        expect(idsInBatch).toBeLessThanOrEqual(50);
+
+        // Batch 1 (the one containing the root) returns file-a and file-b;
+        // batch 2 returns file-b again (a legitimate multi-parent duplicate)
+        // plus file-c.
+        if (q.includes(`'${ROOT}' in parents`)) {
+          return Promise.resolve({ data: { files: [FILE_A, FILE_B] } });
+        }
+        return Promise.resolve({ data: { files: [FILE_B_DUP, FILE_C] } });
+      });
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+      const gdriveKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${ROOT}`);
+
+      const finalCalls = mockDriveFiles.list.mock.calls.filter(
+        ([arg]: any) => arg.q.includes("mimeType != 'application/vnd.google-apps.folder'")
+      );
+      expect(finalCalls.length).toBeGreaterThanOrEqual(2);
+
+      // Merged, de-duplicated by file id — not a per-batch fragment.
+      expect(gdriveKb.totalFiles).toBe(3);
+      expect(gdriveKb.files.map((f: any) => f.fileName).sort()).toEqual(['a.png', 'b.png', 'c.png']);
+      expect(gdriveKb.offset).toBe(0);
+    });
   });
 
   // ── readSingleKnowledgeBaseFile / read_knowledge_base_files — Google Drive
@@ -1235,6 +1436,37 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(result.message).toContain('4x5');
       expect(result.message).toMatch(/share/i);
     });
+
+    it('reports ambiguity instead of silently reading one candidate when the same name exists in two sub-folders', async () => {
+      const SUB_A = 'ratio-4x5';
+      const SUB_B = 'ratio-9x16';
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          if (q.includes(`'${ROOT}' in parents`)) {
+            return Promise.resolve({ data: { files: [{ id: SUB_A, name: '4x5' }, { id: SUB_B, name: '9x16' }] } });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        }
+        if (q.includes("name = 'report.txt'")) {
+          return Promise.resolve({
+            data: {
+              files: [
+                { id: 'file-a', name: 'report.txt', mimeType: 'text/plain', size: '10', parents: [SUB_A] },
+                { id: 'file-b', name: 'report.txt', mimeType: 'text/plain', size: '10', parents: [SUB_B] },
+              ],
+            },
+          });
+        }
+        return Promise.resolve({ data: { files: [] } });
+      });
+
+      const result = await service.readSingleKnowledgeBaseFile(`gdrive:${ROOT}`, 'report.txt', USER_ID);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/multiple/i);
+      expect(result.message).toContain('4x5');
+      expect(result.message).toContain('9x16');
+    });
   });
 
   // ── searchKnowledgeBase — Google Drive sub-folder traversal (ENG-1624) ──────
@@ -1278,6 +1510,23 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(fullTextCall).toBeDefined();
       expect(fullTextCall![0].q).toContain(`'${SUB}' in parents`);
       expect(fullTextCall![0].q).toContain(`'${ROOT}' in parents`);
+    });
+
+    it('does not present Drive results as exhaustive when a sub-folder could not be scanned', async () => {
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType')) {
+          return Promise.resolve({ data: { files: [{ id: SUB, name: '4x5' }] } });
+        }
+        if (q.includes(`'${SUB}' in parents`) && q.includes('mimeType')) {
+          return Promise.reject(makeApiError(403, 'insufficientPermissions'));
+        }
+        return Promise.resolve({ data: { files: [] } });
+      });
+
+      const result = await service.searchKnowledgeBase('insurance ad copy', 5, USER_ID);
+
+      expect(result.scanIncomplete).toBe(true);
+      expect(result.message).toMatch(/not confirmed exhaustive/i);
     });
   });
 
