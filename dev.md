@@ -1,3 +1,27 @@
+## ENG-1624: the "stopped caching the private key" claim describes a bug that never reached `main` (2026-08-31)
+
+A second correction to this same PR's history (see the entry directly below for the
+first). Commit `22bd000c6`'s message also says: "Also stop caching the parsed
+service-account secret (private key included) on `driveServiceAccountCredentials` —
+only `client_email` is needed... so keep just that." Read on its own, that describes
+fixing a security exposure that existed in the codebase.
+
+It didn't. `git log -p -- backend/src/services/agentModeService.ts` shows
+`driveServiceAccountCredentials` (the field that cached the full parsed secret) was
+introduced AND removed within this same unmerged PR branch — added by an earlier
+stage of the pipeline run that produced this PR, then replaced with the narrower
+`driveServiceAccountEmail` by the commit whose message makes the claim.
+`origin/main` never had a `driveServiceAccountCredentials` field at any point;
+`getGoogleDriveClient()` there never cached anything beyond what this PR adds. So
+nothing was "removed" in the sense of undoing a production exposure — the vulnerable
+code was draft-only and never shipped. What this PR actually does is *add* a narrow
+`driveServiceAccountEmail` cache (just the email, needed to name the account in a
+share-access error) and document why the rest of the secret isn't retained. That's
+good hygiene, but it's not the removal of a private-key leak, and describing it that
+way overstates what happened. Left uncorrected in the commit itself (same reasoning
+as the entry below — rewriting a pushed, already-in-PR commit isn't worth a
+force-push for a wording fix); noting the correction here instead.
+
 ## ENG-1624: sub-folder KB traversal fix is correct; one commit's stated motivation isn't (2026-08-31)
 
 Independent re-verification against the live prod session (`822c1ed4-133e-4081-b8c9-ee43547fd463`,
