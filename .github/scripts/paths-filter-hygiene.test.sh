@@ -451,10 +451,24 @@ for path in sys.argv[1:]:
         gates = re.findall(r"outputs\.([A-Za-z0-9_-]+)", d["if"])
         if not gates:
             continue
+        # Counted here, before the filter name is validated: counting inside
+        # the loop below would mean a job gated ONLY on a misspelled output
+        # never registered as audited, so the fail-open guard would stay quiet
+        # about the very shape it exists to catch. (CodeRabbit on #2677.)
+        audited_gated_jobs += 1
         for f in gates:
             if f not in filters:
+                # An output no filter defines evaluates to the empty string, so
+                # `== 'true'` is never satisfied and the job is skipped on every
+                # run, forever. A typo in a deploy gate silently turns the
+                # deploy off, which is worse than the gap this rule was written
+                # for -- and reads identically in review.
+                offenders.append(
+                    "%s: job '%s' is gated on outputs.%s, which no filter "
+                    "defines -- that output is always empty, so the job never "
+                    "runs" % (base, job, f)
+                )
                 continue
-            audited_gated_jobs += 1
             for script in sorted(set(d["scripts"])):
                 if not any(glob_to_re(p).match(script) for p in filters[f]):
                     offenders.append(
@@ -551,6 +565,23 @@ if [ -z "$(python3 "${GATING_AUDITOR}" "${WORKDIR}/gate-ungated.yml")" ]; then
 else
   fail "self-check: an ungated job is exempt from the script rule" \
     "a job that always runs cannot be skipped and must not be reported"
+fi
+
+# A gate naming a filter that does not exist. GitHub resolves the unknown
+# output to '', so the job is skipped on every run — a permanently disabled
+# deploy that reads exactly like a working one.
+mk_gating_workflow "${WORKDIR}/gate-typo.yml" \
+"              - 'backend/**'
+              - '.github/workflows/gate-typo.yml'
+              - '.github/scripts/eb-deploy.sh'" \
+  "needs.detect-changes.outputs.backendd == 'true'"
+typo_output=$(python3 "${GATING_AUDITOR}" "${WORKDIR}/gate-typo.yml")
+if grep -q 'which no filter defines' <<<"${typo_output}"; then
+  pass "self-check: a gate naming an undefined filter is flagged"
+else
+  fail "self-check: a gate naming an undefined filter is flagged" \
+    "a misspelled output silently disables the job it gates, and this audit" \
+    "would report the workflow clean"
 fi
 
 # The fail-open guard itself must be able to fire.
