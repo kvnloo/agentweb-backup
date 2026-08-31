@@ -468,6 +468,18 @@ function parseToolResultBody(content: unknown): any {
   }
 }
 
+/** A confirmed HTML-artifact URL plus the tool that produced it, so wording can tell create from update. */
+export interface ConfirmedArtifactRef {
+  url: string;
+  name: string;
+}
+
+/** create_html_file / create_html_from_template make a NEW file; update_html_file edits an existing one. */
+const CREATE_ARTIFACT_TOOLS: ReadonlySet<string> = new Set<string>([
+  'create_html_file',
+  'create_html_from_template',
+]);
+
 /**
  * Preview/artifact URLs a confirmed HTML tool call produced THIS turn, read from
  * the transcript. Same reasoning and scoping as `collectPublishActionsSince`: the
@@ -479,10 +491,10 @@ function parseToolResultBody(content: unknown): any {
 export function collectConfirmedArtifactUrls(
   messages: TranscriptToolMessage[] | null | undefined,
   sinceMs: number | null | undefined,
-): string[] {
+): ConfirmedArtifactRef[] {
   if (!Array.isArray(messages) || !Number.isFinite(sinceMs as number)) return [];
 
-  const urls: string[] = [];
+  const refs: ConfirmedArtifactRef[] = [];
   const seen = new Set<string>();
   for (const m of messages) {
     if (!m || m.role !== 'tool' || !m.name || !CONFIRMED_ARTIFACT_TOOLS.has(m.name)) continue;
@@ -494,17 +506,28 @@ export function collectConfirmedArtifactUrls(
     const url = parsed.s3_url;
     if (typeof url !== 'string' || !url || seen.has(url)) continue;
     seen.add(url);
-    urls.push(url);
+    refs.push({ url, name: m.name });
   }
-  return urls;
+  return refs;
+}
+
+/** "created"/"updated"/"created and updated", pluralized to match how many artifacts are named. */
+function describeArtifactAction(refs: ConfirmedArtifactRef[]): string {
+  const anyCreated = refs.some((r) => CREATE_ARTIFACT_TOOLS.has(r.name));
+  const anyUpdated = refs.some((r) => !CREATE_ARTIFACT_TOOLS.has(r.name));
+  const noun = refs.length > 1 ? 'HTML files' : 'HTML file';
+  const verb = anyCreated && anyUpdated ? 'created and updated' : anyCreated ? 'created' : 'updated';
+  return `${verb} your ${noun}`;
 }
 
 /** The visible notice appended after a confirmed HTML edit whose URL would otherwise be lost. */
-function buildArtifactNotice(urls: string[]): string {
+function buildArtifactNotice(refs: ConfirmedArtifactRef[]): string {
+  const urls = refs.map((r) => r.url);
   const links = urls.length === 1 ? urls[0] : urls.map((u, i) => `${i + 1}. ${u}`).join('\n');
+  const pronoun = urls.length > 1 ? 'them' : 'it';
   return (
-    `${CORRECTION_MARKER}, successfully: updated your HTML file. `
-    + `You can view it here — the error above did not affect this work:\n${links}`
+    `${CORRECTION_MARKER}, successfully: ${describeArtifactAction(refs)}. `
+    + `You can view ${pronoun} here — the error above did not affect this work:\n${links}`
   );
 }
 
@@ -518,19 +541,20 @@ function buildArtifactNotice(urls: string[]): string {
  */
 export function appendConfirmedArtifactNotice(
   content: string,
-  urls: string[] | null | undefined,
+  refs: ConfirmedArtifactRef[] | null | undefined,
 ): string {
   if (typeof content !== 'string' || content.trim().length === 0) return content;
-  if (!Array.isArray(urls) || urls.length === 0) return content;
+  if (!Array.isArray(refs) || refs.length === 0) return content;
 
   if (content.includes(CORRECTION_MARKER)) {
-    const missing = urls.filter((u) => !content.includes(u));
+    const missing = refs.filter((r) => !content.includes(r.url));
     if (missing.length === 0) return content;
-    const links = missing.length === 1 ? missing[0] : missing.map((u, i) => `${i + 1}. ${u}`).join('\n');
-    return `${content.replace(/\s+$/, '')} It also updated your HTML file — you can view it here:\n${links}`;
+    const links = missing.length === 1 ? missing[0].url : missing.map((r, i) => `${i + 1}. ${r.url}`).join('\n');
+    const pronoun = missing.length > 1 ? 'them' : 'it';
+    return `${content.replace(/\s+$/, '')} It also ${describeArtifactAction(missing)} — you can view ${pronoun} here:\n${links}`;
   }
 
-  return `${content.replace(/\s+$/, '')}\n\n${buildArtifactNotice(urls)}`;
+  return `${content.replace(/\s+$/, '')}\n\n${buildArtifactNotice(refs)}`;
 }
 
 /** Plain-language labels of every publish/deploy confirmed this run, de-duplicated. */
@@ -818,12 +842,12 @@ export function reconcileFalseDataWriteFailure(
  */
 export function reconcileFalseArtifactFailure(
   content: string,
-  artifactUrls: string[] | null | undefined,
+  artifactRefs: ConfirmedArtifactRef[] | null | undefined,
 ): string {
   if (typeof content !== 'string' || content.trim().length === 0) return content;
-  if (content.includes(CORRECTION_MARKER)) return appendConfirmedArtifactNotice(content, artifactUrls);
+  if (content.includes(CORRECTION_MARKER)) return appendConfirmedArtifactNotice(content, artifactRefs);
   if (!assertsUnsavedInterruption(content)) return content;
-  return appendConfirmedArtifactNotice(content, artifactUrls);
+  return appendConfirmedArtifactNotice(content, artifactRefs);
 }
 
 /**

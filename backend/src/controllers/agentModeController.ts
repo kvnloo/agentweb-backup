@@ -76,6 +76,7 @@ import {
   appendConfirmedArtifactNotice,
   collectConfirmedArtifactUrls,
   FalseFailureLedgerEntry,
+  ConfirmedArtifactRef,
 } from '../utils/falseFailureReport';
 import { collectLeadImportTotals, describeLeadImportTotals } from '../utils/leadImportLedger';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -1243,7 +1244,7 @@ interface DiagnosisResult {
   /** Publish/deploy calls this run is confirmed to have completed. */
   publishLedger: FalseFailureLedgerEntry[];
   /** ENG-1224: HTML preview URLs a confirmed create/update_html_file call produced this turn. */
-  artifactUrls: string[];
+  artifactUrls: ConfirmedArtifactRef[];
 }
 
 /**
@@ -1295,7 +1296,7 @@ async function loadPublishLedger(
 async function loadConfirmedArtifactUrls(
   sessionId: string,
   turnStartMs?: number | null,
-): Promise<string[]> {
+): Promise<ConfirmedArtifactRef[]> {
   if (typeof turnStartMs !== 'number') return [];
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -8063,7 +8064,7 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       let publishLedger: FalseFailureLedgerEntry[] = [];
-      let artifactUrls: string[] = [];
+      let artifactUrls: ConfirmedArtifactRef[] = [];
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
@@ -9020,7 +9021,7 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       let publishLedger: FalseFailureLedgerEntry[] = [];
-      let artifactUrls: string[] = [];
+      let artifactUrls: ConfirmedArtifactRef[] = [];
       if (!handledPartialTimeout && shareId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
