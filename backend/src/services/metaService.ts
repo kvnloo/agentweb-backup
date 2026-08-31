@@ -1255,8 +1255,15 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       if (options.campaignId) {
-        this.log(`Fetching single campaign ${options.campaignId}`, { fields });
-        const campaign = new Campaign(options.campaignId);
+        const wantedId = MetaService.resolveScopeId(options.campaignId, 'campaign_id')!;
+        this.log(`Fetching single campaign ${wantedId}`, { fields });
+        const campaign = new Campaign(wantedId);
+        // A node id is global — `new Campaign(id)` is NOT bounded by the ad account the way
+        // the `/act_X/` edge is, and one Meta OAuth token routinely spans several ad accounts.
+        // Without this the selected-account scope is advisory: a caller could read a campaign
+        // from an account it never selected. Same boundary the campaign-scoped list path
+        // already enforces below; this single-entity path just never got it.
+        await this.assertNodeInAccount(campaign, wantedId, 'Campaign', adAccountId);
         const result = await MetaService.withReadDeadline<any>(() => campaign.get(fields), 'single campaign fetch');
         return { campaigns: [result._data], truncated: false, pagesFetched: 1 };
       }
@@ -1387,10 +1394,13 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       if (options.adSetId) {
-        this.log(`Fetching single ad set ${options.adSetId}`, { fields });
-        const adSet = new AdSet(options.adSetId);
+        const wantedId = MetaService.resolveScopeId(options.adSetId, 'ad_set_id')!;
+        this.log(`Fetching single ad set ${wantedId}`, { fields });
+        const adSet = new AdSet(wantedId);
+        // Same global-node-id boundary as the single-campaign fetch above.
+        await this.assertNodeInAccount(adSet, wantedId, 'Ad set', adAccountId);
         const result = await MetaService.withReadDeadline<any>(() => adSet.get(fields), 'single ad set fetch');
-        return { adSets: [result._data], truncated: false, pagesFetched: 1, scope: { adSetId: options.adSetId } };
+        return { adSets: [result._data], truncated: false, pagesFetched: 1, scope: { adSetId: wantedId } };
       }
 
       const wantedCampaign = MetaService.resolveScopeId(campaignId, 'campaign_id');
