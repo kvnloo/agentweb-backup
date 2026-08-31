@@ -192,3 +192,25 @@ describe('payment_required — X credit exhaustion (402)', () => {
     expect(classifyToolErrorClass(err)).toBe('auth');
   });
 });
+
+// ENG-1626 (CodeRabbit): DynamoDB throttling from the AWS SDK v2 carries the
+// exception name as a STRING .code (not .status/.statusCode), and typically
+// ALSO carries a numeric statusCode of 400 -- classFromStatus(400) returns
+// 'invalid_args', so the string-code check must run before the numeric
+// status check or it never gets a chance to fire.
+describe('rate_limit — AWS SDK v2 DynamoDB throttling (ENG-1626)', () => {
+  it('classifies ThrottlingException as rate_limit even with statusCode 400', () => {
+    const err = Object.assign(new Error('Throttling'), { code: 'ThrottlingException', statusCode: 400 });
+    expect(classifyToolErrorClass(err)).toBe('rate_limit');
+  });
+
+  it('classifies ProvisionedThroughputExceededException as rate_limit even with statusCode 400', () => {
+    const err = Object.assign(new Error('Rate exceeded'), { code: 'ProvisionedThroughputExceededException', statusCode: 400 });
+    expect(classifyToolErrorClass(err)).toBe('rate_limit');
+  });
+
+  it('classifies ThrottlingException as rate_limit with no statusCode at all', () => {
+    const err = Object.assign(new Error('Throttling'), { code: 'ThrottlingException' });
+    expect(classifyToolErrorClass(err)).toBe('rate_limit');
+  });
+});

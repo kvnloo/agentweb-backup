@@ -142,6 +142,18 @@ export function classifyToolErrorClass(error: unknown): string {
       ?? GATEWAY_NAME_CLASSES[error.constructor?.name ?? ''];
     if (byName) return byName;
 
+    // AWS SDK v2 (DynamoDB et al.) puts the exception name in the STRING
+    // `.code` property (ENG-1626, CodeRabbit) — checked BEFORE the numeric
+    // status below, not after: these errors also carry a numeric
+    // `.statusCode` of 400, and classFromStatus(400) returns 'invalid_args'
+    // before this string check would otherwise ever run, silently discarding
+    // the real classification and disabling retry during throttling.
+    const stringCodeProp = (error as { code?: unknown }).code;
+    if (typeof stringCodeProp === 'string'
+      && (stringCodeProp === 'ThrottlingException' || stringCodeProp === 'ProvisionedThroughputExceededException')) {
+      return 'rate_limit';
+    }
+
     let statusProp = (error as { status?: unknown }).status
       ?? (error as { statusCode?: unknown }).statusCode;
     // `.code` is where twitter-api-v2's ApiResponseError puts the HTTP status
@@ -157,17 +169,6 @@ export function classifyToolErrorClass(error: unknown): string {
     if (typeof statusProp === 'number') {
       const byStatus = classFromStatus(statusProp);
       if (byStatus) return byStatus;
-    }
-
-    // AWS SDK v2 (DynamoDB et al.) puts the exception name in the STRING
-    // `.code` property rather than `.status`/`.statusCode` (ENG-1626,
-    // CodeRabbit) — a real DynamoDB throttling error would otherwise fall
-    // through to the unclassified legacy fallback and never be recognized as
-    // retryable by isRetryableErrorClass's 'rate_limit' set.
-    const codeProp = (error as { code?: unknown }).code;
-    if (typeof codeProp === 'string'
-      && (codeProp === 'ThrottlingException' || codeProp === 'ProvisionedThroughputExceededException')) {
-      return 'rate_limit';
     }
 
     const byMessage = classFromMessage(error.message ?? '');
