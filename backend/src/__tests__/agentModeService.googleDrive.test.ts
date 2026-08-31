@@ -919,9 +919,15 @@ describe('AgentModeService - Google Drive methods', () => {
 
       await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'ad.png', USER_ID);
 
-      expect(mockDriveFiles.list).toHaveBeenCalledWith(
-        expect.objectContaining({ supportsAllDrives: true, includeItemsFromAllDrives: true })
-      );
+      // Assert on the request options themselves rather than on the call's arity: these
+      // calls now also carry a per-request `timeout` as a second argument, and the invariant
+      // being pinned here is about the shared-drive flags, not how many arguments are passed.
+      expect(mockDriveFiles.list).toHaveBeenCalled();
+      for (const [requestOptions] of mockDriveFiles.list.mock.calls) {
+        expect(requestOptions).toEqual(
+          expect.objectContaining({ supportsAllDrives: true, includeItemsFromAllDrives: true }),
+        );
+      }
     });
 
     it('rejects non-image/video mimetypes without downloading or uploading', async () => {
@@ -1124,6 +1130,29 @@ describe('AgentModeService - Google Drive methods', () => {
         // literal is still ours.
         expect(parsed!.rest.trimStart()).toMatch(/^and trashed = false/);
         expect(nameCall![0].q).toContain(`'${ROOT}' in parents`);
+      });
+
+      /*
+       * ENG-1476 follow-up: the walk-wide DRIVE_LIST_WALK_MAX_MS is checked BETWEEN requests,
+       * so it bounds how many calls the walk makes but cannot interrupt one call that has
+       * already been issued and never answers — Node's fetch applies no default deadline.
+       * Every request the walk and the batched file query issue therefore carries its own
+       * timeout, the same split metaService uses (withReadDeadline alongside
+       * META_LIST_MAX_MS).
+       */
+      it('gives every folder-walk and file-query request its own timeout', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes('mimeType')) return Promise.resolve({ data: { files: [] } });
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(mockDriveFiles.list).toHaveBeenCalled();
+        for (const call of mockDriveFiles.list.mock.calls) {
+          expect(call[1]).toEqual(expect.objectContaining({ timeout: expect.any(Number) }));
+          expect(call[1].timeout).toBeGreaterThan(0);
+        }
       });
 
       it('names the sub-folder that needs sharing when it cannot be listed, instead of a bare "not found"', async () => {
