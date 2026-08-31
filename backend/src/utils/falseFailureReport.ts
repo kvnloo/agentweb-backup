@@ -49,7 +49,7 @@
  * since `toolCalls[]` does not survive the throw).
  */
 
-import { extractToolResponseS3Ref } from './toolResponseS3Ref';
+import { extractToolResponseHeader } from './toolResponseS3Ref';
 
 /** A tool-ledger entry (agentMode toolCalls[]): { name, result, error }. */
 export interface FalseFailureLedgerEntry {
@@ -456,10 +456,10 @@ const CONFIRMED_ARTIFACT_TOOLS: ReadonlySet<string> = new Set<string>([
   'create_html_from_template',
 ]);
 
-/** Parse a tool result body into JSON, stripping the S3-offload header first if present. */
+/** Parse a tool result body into JSON, stripping the leading recovery/notice header first if present. */
 function parseToolResultBody(content: unknown): any {
   if (typeof content !== 'string' || !content) return null;
-  const header = extractToolResponseS3Ref(content);
+  const header = extractToolResponseHeader(content);
   const body = header ? content.slice(header.length) : content;
   try {
     return JSON.parse(body);
