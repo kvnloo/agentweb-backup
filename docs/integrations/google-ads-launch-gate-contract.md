@@ -103,8 +103,13 @@ The lander's tag lives on the generated landing-page record:
 `googleAdsTrackingInstalled` carries more weight than its Meta sibling. A failed
 Meta injection still degrades to server-side capture via CAPI. Google has no
 server-side leg (see [Offline Import Is Closed](#offline-import-is-closed-by-google)),
-so `false` means the lander records nothing at all — exactly what RULE 7.5
-refuses a launch over.
+so `false` means **no Google Ads conversion can be recorded from this lander**,
+with no second path that picks it up.
+
+It does not mean the page carries no Google tag at all. GA4 or a GTM container
+can still be present, which is exactly why RULE 7.5 can pass a page whose Ads
+conversion tag is missing. Read this field for the Ads conversion question only,
+and the gate's own result for whether any Google tag was found.
 
 ## Two Detectors, Opposite Scopes
 
@@ -349,8 +354,14 @@ and the
 
 The gate is on the **developer token**, not the customer account. Tokens that
 sent no such request between January and June 2026 get no legacy access. Our
-upload path shipped 2026-08-20 — two months after the window closed — so it was
-never going to qualify, on any account.
+upload path shipped 2026-08-20, two months after that window closed.
+
+What was actually verified: **one** account (`validate_only`, 2026-08-31)
+returned the error above. The developer-token wording in Google's docs implies
+the lockout applies to every account reached through our token, and no request
+we know of was sent during the eligibility window, but neither the token's
+request history nor a second account was checked. Treat the account-wide
+conclusion as strongly indicated and not proven. See [Open Gaps](#open-gaps).
 
 Consequences to hold in mind:
 
