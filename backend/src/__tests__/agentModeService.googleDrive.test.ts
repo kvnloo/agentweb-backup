@@ -1268,6 +1268,34 @@ describe('AgentModeService - Google Drive methods', () => {
         expect(result.message).not.toBe('File "ad.png" not found in Google Drive folder');
         expect(result.message).toMatch(/stopped before covering it entirely|not a confirmed absence/i);
       });
+
+      it('flags an incomplete scan — and does not claim absence — when the tree walk exceeds its time bound', async () => {
+        jest.useFakeTimers();
+        try {
+          let depth = 0;
+          mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+            if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+              depth++;
+              // Every folder discovery "costs" wall-clock time — an unbounded
+              // (one-child-per-folder) tree that would run forever without a
+              // time bound, not just a large one.
+              jest.advanceTimersByTime(5_000);
+              return Promise.resolve({ data: { files: [{ id: `deep-${depth}`, name: `deep-${depth}` }] } });
+            }
+            return Promise.resolve({ data: { files: [] } });
+          });
+
+          const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+          expect(result.success).toBe(false);
+          expect(result.message).not.toBe('File "ad.png" not found in Google Drive folder');
+          expect(result.message).toMatch(/stopped before covering it entirely|not a confirmed absence/i);
+          // Bounded — a handful of folders inside the time budget, not hundreds.
+          expect(depth).toBeLessThan(10);
+        } finally {
+          jest.useRealTimers();
+        }
+      });
     });
   });
 
@@ -1541,6 +1569,94 @@ describe('AgentModeService - Google Drive methods', () => {
       // unbounded/runaway fetch.
       expect(callCount).toBeLessThanOrEqual(15);
       expect(gdriveKb.totalFilesIsLowerBound).toBe(true);
+    });
+
+    it('flags totalFilesIsLowerBound when the file query itself exceeds the time bound (not just the per-batch target)', async () => {
+      jest.useFakeTimers();
+      try {
+        let callCount = 0;
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            return Promise.resolve({ data: { files: [] } });
+          }
+          callCount++;
+          // Each simulated page "costs" wall-clock time past the walk's own
+          // budget — a slow/throttled Drive response, not a huge result set.
+          jest.advanceTimersByTime(20_000);
+          return Promise.resolve({
+            data: {
+              files: [{ id: 'file-1', name: 'a.png', mimeType: 'image/png', size: '10', modifiedTime: '2026-08-01T00:00:00Z' }],
+              nextPageToken: 'more-beyond',
+            },
+          });
+        });
+
+        const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+        const gdriveKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${ROOT}`);
+
+        expect(gdriveKb.totalFilesIsLowerBound).toBe(true);
+        // Stopped quickly once the bound tripped — not draining pages.
+        expect(callCount).toBeLessThanOrEqual(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    // ── Rework findings, round 3 (silent KB drop on error; no time budget) ─────
+    //
+    // queryDriveFilesAcrossFolders has no try/catch of its own — a 403 on one
+    // batch, a 429, a 5xx, or a malformed-query 400 all propagate up to the
+    // per-folder catch here. That catch used to just log and move on, which
+    // silently dropped the whole KB from `knowledge_bases`: no inaccessibleFolders,
+    // no folderScanIncomplete, nothing — indistinguishable from "this folder has
+    // no files." Round 2 (the BFS walk + batched, paginated queries) multiplied
+    // how many Drive calls a single listing makes, and therefore how often this
+    // catch is hit.
+
+    it('keeps a Drive knowledge base in the response — flagged, not dropped — when its file query throws', async () => {
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        return Promise.reject(makeApiError(500, 'internal error'));
+      });
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+      const gdriveKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${ROOT}`);
+
+      // Must fail against the old code: the old catch just logged and the KB
+      // never appeared in knowledge_bases at all.
+      expect(gdriveKb).toBeDefined();
+      expect(gdriveKb.listingFailed).toBe(true);
+      expect(gdriveKb.files).toEqual([]);
+      expect(result.message).toMatch(/could not be listed.*shown as empty|shown as empty.*not absent/i);
+    });
+
+    it('never puts the raw error object (or its message) in the returned payload', async () => {
+      const SENSITIVE_MARKER = 'SECRET_REQUEST_URL_WITH_TOKEN_abc123';
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        return Promise.reject(new Error(SENSITIVE_MARKER));
+      });
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+
+      expect(JSON.stringify(result)).not.toContain(SENSITIVE_MARKER);
+    });
+
+    it('states that Drive sources could not be enumerated at all when the whole-Drive path fails, rather than returning a Drive-free listing that looks complete', async () => {
+      const { userDb, taskDb } = require('../services/db');
+      (userDb.getUserById as jest.Mock).mockRejectedValue(new Error('DynamoDB unavailable'));
+      (taskDb.getTasksWithKnowledgeBase as jest.Mock).mockResolvedValue([]);
+      (taskDb.getAllPublicKnowledgeBaseTasks as jest.Mock).mockResolvedValue([]);
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+
+      expect(result.driveEnumerationFailed).toBe(true);
+      expect(result.message).toMatch(/could not be enumerated/i);
+      expect(result.message).not.toMatch(/^No Google Drive shared folders found here/);
     });
   });
 
