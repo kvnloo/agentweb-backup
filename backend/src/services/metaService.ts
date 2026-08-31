@@ -1227,7 +1227,7 @@ export class MetaService {
       const result = await campaign.get(MetaService.withOwnershipField(fields));
       const data = { ...(result?._data ?? {}) };
       MetaService.assertOwnedByAccount(data.account_id, campaignId, 'Campaign', adAccountId);
-      if (!fields.includes('account_id')) delete data.account_id;
+      delete data.account_id;
       return data;
     } catch (error) {
       return this.handleError(error, 'getCampaign');
@@ -1282,8 +1282,10 @@ export class MetaService {
         );
         const data = { ...(result?._data ?? {}) };
         MetaService.assertOwnedByAccount(data.account_id, wantedId, 'Campaign', adAccountId);
-        // Requested for the check, not by the caller — do not change the payload shape.
-        if (!fields.includes('account_id')) delete data.account_id;
+        // Always requested for the check, never by the caller: `account_id` is in neither
+        // READ_FIELDS allow-list, so resolveReadFields would have thrown on an explicit request
+        // for it. Dropped unconditionally, so the payload is exactly what the caller selected.
+        delete data.account_id;
         return { campaigns: [data], truncated: false, pagesFetched: 1 };
       }
       const account = new AdAccount(`act_${adAccountId}`);
@@ -1424,8 +1426,10 @@ export class MetaService {
         );
         const data = { ...(result?._data ?? {}) };
         MetaService.assertOwnedByAccount(data.account_id, wantedId, 'Ad set', adAccountId);
-        // Requested for the check, not by the caller — do not change the payload shape.
-        if (!fields.includes('account_id')) delete data.account_id;
+        // Always requested for the check, never by the caller: `account_id` is in neither
+        // READ_FIELDS allow-list, so resolveReadFields would have thrown on an explicit request
+        // for it. Dropped unconditionally, so the payload is exactly what the caller selected.
+        delete data.account_id;
         return { adSets: [data], truncated: false, pagesFetched: 1, scope: { adSetId: wantedId } };
       }
 
@@ -1539,7 +1543,7 @@ export class MetaService {
       const data = { ...(result?._data ?? {}) };
       if (adAccountId) {
         MetaService.assertOwnedByAccount(data.account_id, adSetId, 'Ad set', adAccountId);
-        if (!fields.includes('account_id')) delete data.account_id;
+        delete data.account_id;
       }
       return data;
     } catch (error) {

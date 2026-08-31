@@ -1251,7 +1251,13 @@ type GoogleAdsConfigShape = { customer_id: string; currency?: string; test_accou
  * backslashes it just introduced.
  */
 function escapeDriveQueryValue(value: string): string {
-  return String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  // A non-string reaching here used to throw on `.replace`; `String(...)` would instead embed the
+  // literal `undefined` and run a confidently wrong query. Refuse loudly rather than search for a
+  // file named "undefined" and report it missing.
+  if (typeof value !== 'string') {
+    throw new Error(`Drive query value must be a string, received ${value === null ? 'null' : typeof value}`);
+  }
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
 export class AgentModeService {

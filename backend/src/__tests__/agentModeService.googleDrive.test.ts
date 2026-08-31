@@ -1158,15 +1158,39 @@ describe('AgentModeService - Google Drive methods', () => {
         }
       });
 
-      it('never sends timeout: 0, which gaxios reads as no timeout at all', async () => {
-        // A budget that has all but expired must still floor above zero: `timeout: 0` would
-        // silently restore the unbounded request this exists to prevent.
-        mockDriveFiles.list.mockImplementation(() => Promise.resolve({ data: { files: [] } }));
+      it('never sends timeout: 0 once the walk budget is all but spent', async () => {
+        /*
+         * The floor only matters when `deadline - Date.now()` has gone to ~0, so the budget has
+         * to actually be consumed for this to pin anything — an assertion made against a fresh
+         * 15s budget passes against an implementation with no floor at all.
+         *
+         * Each folder-discovery call burns most of the budget, so by the later requests the
+         * remaining time is at or below the floor.
+         */
+        jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+        try {
+          let n = 0;
+          mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+            n += 1;
+            // Leaves ~500ms of the 15s budget, which is below the floor but still passes the
+            // loop's pre-check — the only window in which the floor is reachable at all.
+            if (n === 1) jest.advanceTimersByTime(14_500);
+            if (q.includes('mimeType') && n === 1) {
+              return Promise.resolve({ data: { files: [{ id: SUB, name: '4x5' }] } });
+            }
+            return Promise.resolve({ data: { files: [] } });
+          });
 
-        await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+          await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
 
-        for (const call of mockDriveFiles.list.mock.calls) {
-          expect(call[1].timeout).toBeGreaterThanOrEqual(1_000);
+          const timeouts = mockDriveFiles.list.mock.calls.map((c: any) => c[1].timeout);
+          expect(timeouts.length).toBeGreaterThan(1);
+          // Every one is floored, and at least one was issued on a spent budget — so this would
+          // fail against an implementation that passed the raw remaining time.
+          expect(Math.min(...timeouts)).toBeGreaterThanOrEqual(1_000);
+          expect(Math.min(...timeouts)).toBe(1_000);
+        } finally {
+          jest.useRealTimers();
         }
       });
 
