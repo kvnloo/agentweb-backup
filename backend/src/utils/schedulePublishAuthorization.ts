@@ -375,8 +375,7 @@ export function narrowPublishAuthorization(
  * literal consent covers. Matching `EQUIVALENT_PUBLISH_ROUTES` exactly, action for
  * action, is what keeps this an outcome-equivalent substitution instead of a scope
  * widening.
- */
-/**
+ *
  * ENG-1616 — `resolvedAccountPlatform` is the account_id's REAL platform, looked up
  * by the caller from storage (see `refuseUnauthorizedScheduledPublish`), for the
  * case where `args.account_id` is present. It is NOT attacker-controlled — unlike
