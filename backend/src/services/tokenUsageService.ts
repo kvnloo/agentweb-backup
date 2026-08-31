@@ -45,6 +45,49 @@ export interface TokenUsageStatus {
 }
 
 /**
+ * The customer-facing projection of `TokenUsageStatus` (ENG-1212 AC4).
+ *
+ * `costUsed` and `costAllowance` are dropped. `hasCostAllowance` replaces the
+ * only thing the client ever did with the latter — a null check.
+ */
+export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'costAllowance'> & {
+  /**
+   * Whether a dollar ceiling exists at all, without saying what it is.
+   *
+   * The portal never rendered `costAllowance`; it tested `costAllowance != null`
+   * to decide which dimension is the quota (UsageMeter, SubscriptionCard
+   * `showCostQuota`). This carries that one bit and nothing more.
+   */
+  hasCostAllowance: boolean;
+};
+
+/**
+ * Strip internal dollar amounts at the API boundary (ENG-1212 AC4: "No internal
+ * USD amounts are returned by customer APIs; authorized admin diagnostics may
+ * include them", and the ticket's own outcome, "without exposing dollar
+ * ceilings").
+ *
+ * The sibling `/usage-runway` route has always done this via `toCustomerRunway`;
+ * `/usage` returned `checkTokenUsage` verbatim, so `costUsed` and
+ * `costAllowance` reached every authenticated customer in plain USD. That was
+ * not a deliberate product choice — the UI states the opposite intent in two
+ * places: SubscriptionCard renders the cost quota "ONLY as a percentage bar
+ * (never the dollar figures)" and "Dollars stay admin-only; to the user this is
+ * simply 'usage'". `costUsed` had no non-test reader anywhere in the portal.
+ *
+ * `costPercentUsed` stays: a percentage is not a dollar amount, and it is what
+ * the bar actually renders. Admin dollar figures are unaffected — the partner
+ * portal builds them from subscription-type policy, not from this endpoint.
+ *
+ * Strip at the boundary, once, here — the internal type is unchanged, so
+ * emailService and the policy services keep the figures they need.
+ */
+export function toCustomerTokenUsage(status: TokenUsageStatus): CustomerTokenUsageStatus {
+  const { costUsed: _costUsed, costAllowance, ...customerSafe } = status;
+  return { ...customerSafe, hasCostAllowance: costAllowance != null };
+}
+
+/**
  * For org members, returns the org owner's userId so that all quota checks
  * and usage increments are applied to the owner (the subscription holder).
  * Returns the original userId for solo users and org owners.
