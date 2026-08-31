@@ -1026,6 +1026,126 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(readContentSpy).not.toHaveBeenCalled();
       readContentSpy.mockRestore();
     });
+
+    // ── ENG-1624: sub-folder traversal ────────────────────────────────────────
+    // Phoenix Technologies' registered KB folder held only sub-folders (ratio
+    // folders like "4x5"); the approved ad creatives lived inside those. Every
+    // Drive query here was scoped to `'<folderId>' in parents` (direct children
+    // only), so files nested under a sub-folder resolved as not-found.
+    describe('sub-folder traversal (ENG-1624)', () => {
+      const ROOT = 'root-folder';
+      const SUB = '4x5-subfolder';
+
+      beforeEach(() => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue({
+          userId: USER_ID,
+          googleDriveFolders: [{ folderId: ROOT, name: '8-18-26 Insurance Angle Ads' }],
+        });
+      });
+
+      it('materializes a file nested in a sub-folder of the registered root, not just direct children', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          // Sub-folder discovery under the registered root
+          if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType')) {
+            return Promise.resolve({ data: { files: [{ id: SUB, name: '4x5' }] } });
+          }
+          // Sub-folder discovery under the sub-folder — no further nesting
+          if (q.includes(`'${SUB}' in parents`) && q.includes('mimeType')) {
+            return Promise.resolve({ data: { files: [] } });
+          }
+          // Target file search across the whole resolved tree
+          if (q.includes("name = 'ad.png'")) {
+            return Promise.resolve({
+              data: { files: [{ id: 'file-99', name: 'ad.png', mimeType: 'image/png', size: '2048' }] },
+            });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+        mockDriveFiles.get.mockResolvedValue({ data: Buffer.from('fake-png-bytes') });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        // The fix must actually search inside the sub-folder — not just return
+        // success by coincidence of a loose mock.
+        const nameSearchCall = mockDriveFiles.list.mock.calls.find(
+          ([arg]: any) => arg.q.includes("name = 'ad.png'")
+        );
+        expect(nameSearchCall).toBeDefined();
+        expect(nameSearchCall![0].q).toContain(`'${SUB}' in parents`);
+
+        expect(result.success).toBe(true);
+        expect(result.url).toMatch(/^https:\/\//);
+      });
+
+      it('names the sub-folder that needs sharing when it cannot be listed, instead of a bare "not found"', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType')) {
+            return Promise.resolve({ data: { files: [{ id: SUB, name: '4x5' }] } });
+          }
+          if (q.includes(`'${SUB}' in parents`) && q.includes('mimeType')) {
+            return Promise.reject(makeApiError(403, 'insufficientPermissions'));
+          }
+          // No file matches because the sub-folder couldn't be enumerated
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('4x5');
+        expect(result.message).toMatch(/share/i);
+      });
+    });
+  });
+
+  // ── listKnowledgeBaseFiles — Google Drive sub-folder recursion (ENG-1624) ──
+
+  describe('listKnowledgeBaseFiles - Google Drive sub-folder recursion (ENG-1624)', () => {
+    const { userDb, taskDb } = require('../services/db');
+    const ROOT = 'root-folder';
+    const SUB = '4x5-subfolder';
+
+    beforeEach(() => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: USER_ID,
+        googleDriveFolders: [{ folderId: ROOT, name: '8-18-26 Insurance Angle Ads' }],
+      });
+      (taskDb.getTasksWithKnowledgeBase as jest.Mock).mockResolvedValue([]);
+      (taskDb.getAllPublicKnowledgeBaseTasks as jest.Mock).mockResolvedValue([]);
+    });
+
+    it('enumerates files nested in a sub-folder instead of listing the sub-folder as a 0-byte entry', async () => {
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType =')) {
+          return Promise.resolve({ data: { files: [{ id: SUB, name: '4x5' }] } });
+        }
+        if (q.includes(`'${SUB}' in parents`) && q.includes('mimeType =')) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        // Final listing query — excludes folder entries, spans the whole tree
+        return Promise.resolve({
+          data: {
+            files: [{ id: 'file-1', name: 'ad.png', mimeType: 'image/png', size: '2048', modifiedTime: '2026-08-01T00:00:00Z' }],
+          },
+        });
+      });
+
+      const result = await service.listKnowledgeBaseFiles(USER_ID, { kb_type: 'google-drive' });
+
+      const gdriveKb = result.knowledge_bases.find((kb: any) => kb.identifier === `gdrive:${ROOT}`);
+      expect(gdriveKb).toBeDefined();
+      expect(gdriveKb.files).toEqual([
+        expect.objectContaining({ fileName: 'ad.png', mimeType: 'image/png' }),
+      ]);
+      // No 0-byte folder placeholder for the "4x5" sub-folder itself
+      expect(gdriveKb.files.some((f: any) => f.fileName === '4x5')).toBe(false);
+
+      const finalCall = mockDriveFiles.list.mock.calls.find(
+        ([arg]: any) => !arg.q.includes('mimeType =') && arg.q.includes(`'${SUB}' in parents`)
+      );
+      expect(finalCall).toBeDefined();
+      expect(finalCall![0].q).toContain("mimeType != 'application/vnd.google-apps.folder'");
+    });
   });
 
   // ── markdownToDocsRequests ─────────────────────────────────────────────────
