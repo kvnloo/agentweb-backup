@@ -395,6 +395,7 @@ import {
   validateAndRepairToolArgs,
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { isRetryableErrorClass } from './agentMode/core/errorRetryability';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
@@ -30233,7 +30234,43 @@ ${strippedHtml}`;
     updates: Array<{ stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string }>,
     sessionId: string
   ): Promise<any> {
-    try {
+    // ENG-1626: set_work_plan_status persists workplan step progression — a
+    // production session (822c1ed4) hit set_work_plan_status twice while the
+    // customer watched "Step 9 of 10" live, with no system-level retry, so a
+    // transient DynamoDB/network blip anywhere in the read-modify-write below
+    // surfaced immediately as a customer-visible failure. One transparent retry
+    // for a classified-transient error (timeout/network/rate_limit/upstream_5xx)
+    // before giving up — the same classifier the model-visible retry guidance
+    // already uses, so this and that guidance never disagree about what's
+    // retryable. Deliberate gate refusals (missing steps, out-of-order
+    // completion, etc.) never throw, so they pass straight through on the
+    // first attempt untouched.
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        return await this.setWorkPlanStatusAttempt(updates, sessionId);
+      } catch (error) {
+        lastError = error;
+        const errorClass = classifyToolErrorClass(error);
+        if (attempt < 2 && isRetryableErrorClass(errorClass)) {
+          console.warn(`AgentMode: set_work_plan_status failed with a transient error (${errorClass}) for session ${sessionId}; retrying once`);
+          continue;
+        }
+        break;
+      }
+    }
+    console.error('AgentMode: Error setting work plan status:', lastError);
+    return {
+      success: false,
+      message: 'Failed to update work plan status',
+      error: lastError instanceof Error ? lastError.message : 'Unknown error'
+    };
+  }
+
+  private async setWorkPlanStatusAttempt(
+    updates: Array<{ stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string }>,
+    sessionId: string
+  ): Promise<any> {
       // ENG-1188 (Greptile): consistentRead, not the default eventually-consistent
       // read -- a turn that writes an "Image generated" marker and then
       // immediately calls set_work_plan_status in the same turn can otherwise race
@@ -30587,14 +30624,6 @@ ${strippedHtml}`;
         notFoundSteps: notFoundSteps.length > 0 ? notFoundSteps : undefined,
         formattedContent
       };
-    } catch (error) {
-      console.error('AgentMode: Error setting work plan status:', error);
-      return {
-        success: false,
-        message: 'Failed to update work plan status',
-        error: error instanceof Error ? error.message : 'Unknown error'
-      };
-    }
   }
 
   public async listBooks(userId: string, type?: string, status?: string): Promise<any> {
