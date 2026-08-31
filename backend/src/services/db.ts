@@ -5568,8 +5568,24 @@ export const crmDb = {
    *
    * Stored as: externalCrmSyncConfigs: { hubspot: {...}, attio: {...} }
    *
-   * Uses if_not_exists so the parent map is initialised automatically if absent.
    * Pass config=null to REMOVE the provider key without touching the other provider.
+   *
+   * CodeRabbit finding (ENG-1380): when the provider's config already exists,
+   * this used to replace externalCrmSyncConfigs.<provider> wholesale (read the
+   * map, merge in JS, write the whole map back) — a concurrent
+   * updateLeadListCrmSyncStatus nested-path write landing between the read and
+   * the write here would be silently clobbered by this call's stale snapshot
+   * of the sync-status fields. Now writes field-by-field via targeted nested
+   * paths instead (same convention as updateLeadListCrmSyncStatus), so this
+   * call only ever touches the specific keys present on `config` and can never
+   * stomp a sibling field a concurrent writer just set. The whole-map
+   * read-modify-write is kept ONLY for the provider's first-ever save, where
+   * externalCrmSyncConfigs.<provider> doesn't exist yet — DynamoDB's SET
+   * map.key fails against a not-yet-existing parent path (if_not_exists +
+   * nested path are evaluated simultaneously against the original item state,
+   * not sequentially), and no concurrent per-field writer can be racing a key
+   * that doesn't exist yet anyway, so a single whole-object write is both safe
+   * and simplest for that one case.
    */
   async setLeadListCrmSyncConfig(
     listId: string,
@@ -5580,10 +5596,6 @@ export const crmDb = {
       let params: any;
 
       if (config !== null) {
-        // Read the current map, merge the provider key in JS, write the whole map back.
-        // This avoids the DynamoDB limitation where SET map.key fails when the parent
-        // map doesn't yet exist on the item (if_not_exists + nested path evaluated
-        // simultaneously against the original item state, not sequentially).
         const current = await dynamodb.get({
           TableName: `${TABLE_PREFIX}AW-LeadLists`,
           Key: { listId },
@@ -5591,21 +5603,55 @@ export const crmDb = {
           ExpressionAttributeNames: { '#ecs': 'externalCrmSyncConfigs' },
         }).promise();
         const existingMap = (current.Item?.externalCrmSyncConfigs as Record<string, any>) ?? {};
-        const mergedMap = { ...existingMap, [provider]: config };
 
-        params = {
-          TableName: `${TABLE_PREFIX}AW-LeadLists`,
-          Key: { listId },
-          UpdateExpression: 'SET #ecs = :mergedMap, #updatedAt = :now',
-          ExpressionAttributeNames: {
-            '#ecs': 'externalCrmSyncConfigs',
-            '#updatedAt': 'updatedAt',
-          },
-          ExpressionAttributeValues: {
-            ':mergedMap': mergedMap,
-            ':now': new Date().toISOString(),
-          },
-        };
+        if (existingMap[provider] === undefined) {
+          const mergedMap = { ...existingMap, [provider]: config };
+          params = {
+            TableName: `${TABLE_PREFIX}AW-LeadLists`,
+            Key: { listId },
+            UpdateExpression: 'SET #ecs = :mergedMap, #updatedAt = :now',
+            ExpressionAttributeNames: {
+              '#ecs': 'externalCrmSyncConfigs',
+              '#updatedAt': 'updatedAt',
+            },
+            ExpressionAttributeValues: {
+              ':mergedMap': mergedMap,
+              ':now': new Date().toISOString(),
+            },
+          };
+        } else {
+          const setExpressions: string[] = [];
+          const removeExpressions: string[] = [];
+          const names: Record<string, string> = { '#ecs': 'externalCrmSyncConfigs', '#provider': provider, '#updatedAt': 'updatedAt' };
+          const values: Record<string, any> = { ':now': new Date().toISOString() };
+
+          for (const [field, value] of Object.entries(config)) {
+            names[`#${field}`] = field;
+            if (value === undefined) {
+              // Matches the old wholesale-replace semantics: a field absent
+              // (or explicitly undefined) from `config` never persisted,
+              // since the whole provider sub-object was replaced by `config`
+              // as marshalled — undefined-valued keys are dropped on write.
+              removeExpressions.push(`#ecs.#provider.#${field}`);
+            } else {
+              values[`:${field}`] = value;
+              setExpressions.push(`#ecs.#provider.#${field} = :${field}`);
+            }
+          }
+          setExpressions.push('#updatedAt = :now');
+
+          const updateExpressionParts: string[] = [];
+          if (setExpressions.length > 0) updateExpressionParts.push(`SET ${setExpressions.join(', ')}`);
+          if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(', ')}`);
+
+          params = {
+            TableName: `${TABLE_PREFIX}AW-LeadLists`,
+            Key: { listId },
+            UpdateExpression: updateExpressionParts.join(' '),
+            ExpressionAttributeNames: names,
+            ExpressionAttributeValues: values,
+          };
+        }
       } else {
         params = {
           TableName: `${TABLE_PREFIX}AW-LeadLists`,
