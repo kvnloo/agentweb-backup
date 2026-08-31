@@ -2079,7 +2079,19 @@ function stripMarkdownEmphasis(content: string): string {
 // singular, but a model that pluralizes it would otherwise skip this pattern
 // entirely (verified live: bypasses stripping, so the trailer's prose reaches
 // the confirmation detector completely unstripped).
-const NEXT_STEP_TRAILER = /👉?\s*next\s*steps?\s*:(?:(?!👉?\s*next\s*steps?\s*:)[\s\S])*$/iu;
+//
+// ENG-1256: the label separator accepts a colon OR a dash (em/en/hyphen), not
+// just the mandated literal ":". "👉 Next Step — Ask Harsha to confirm..." is
+// at least as idiomatic an LLM label style as the colon the system prompt
+// specifies, and a colon-only regex left it completely unstripped (proven via
+// the same extracted-regex harness used for the dash/plural gaps above: a
+// short-bridge "confirm ... before ... continu[es]" recommendation inside a
+// "👉 Next Step — ..." trailer matched the confirmation-halt patterns exactly
+// like the colon case is designed NOT to). A bare period or no punctuation at
+// all is deliberately NOT included — those are far weaker signals that a line
+// is the boilerplate label rather than "next step" used as an ordinary noun
+// phrase in prose, and would risk stripping real message content.
+const NEXT_STEP_TRAILER = /👉?\s*next\s*steps?\s*[:\-–—]\s*(?:(?!👉?\s*next\s*steps?\s*[:\-–—])[\s\S])*$/iu;
 
 function stripNextStepTrailer(content: string): string {
   return content.replace(NEXT_STEP_TRAILER, '');
