@@ -261,6 +261,13 @@ export function mapUnipileItemToPreview(item: any): PreviewProspect {
  *                                            { error } envelope from
  *                                            `handleError`. Route returns
  *                                            502.
+ *                       'search_unavailable' — the raw Unipile response was
+ *                                            empty AND a probeSearchCapability
+ *                                            control query confirms the
+ *                                            account can't search at all
+ *                                            (ENG-975/ENG-1559) — a platform
+ *                                            outage, not "no prospects match".
+ *                                            Route returns 503.
  */
 export type PreviewResult =
   | {
@@ -271,7 +278,11 @@ export type PreviewResult =
     }
   | {
       ok: false;
-      error: "no_filters" | "no_linkedin_account" | "unipile_error";
+      error:
+        | "no_filters"
+        | "no_linkedin_account"
+        | "unipile_error"
+        | "search_unavailable";
       message?: string;
     };
 
@@ -359,6 +370,23 @@ export async function searchProspectsPreview(
   const rawItems: any[] = Array.isArray(searchResult?.items)
     ? searchResult!.items
     : [];
+
+  // ENG-975/ENG-1559: an empty raw response is ambiguous — it means either
+  // "nobody matches" or "this account can no longer search" (a Unipile/
+  // LinkedIn outage relays as HTTP 200 with items:[], byte-for-byte
+  // identical to a genuine no-match). This preview always runs a fresh
+  // first-page search (no cursor/pagination here), so there's no
+  // "running out of pages" case to exempt — mirrors the check
+  // `agentModeService`'s search-people action runs before it will report an
+  // empty result as fact. Checked on the RAW response, before the ENG-1002
+  // anonymized-item filter below, so a genuinely degraded account is never
+  // misread as "every result happened to be out-of-network".
+  if (rawItems.length === 0) {
+    const capability = await linkedInOutreachService.probeSearchCapability(accountId);
+    if (capability === "degraded") {
+      return { ok: false, error: "search_unavailable" };
+    }
+  }
 
   // ENG-1002: drop LinkedIn's anonymized out-of-network hits BEFORE the slice.
   // These cards are handed straight to POST /api/onboarding/outreach/save,

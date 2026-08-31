@@ -12,6 +12,8 @@ let mockUser: any = {
 
 let mockUsers: Record<string, any> = {};
 let mockOrgs: Record<string, any> = {};
+let mockSubscriptionType = 'Starter';
+let mockSubscriptionResolution: { subscriptionType: string; resolved: boolean } | undefined;
 
 // Mock auth middleware
 jest.mock('../middleware/auth', () => ({
@@ -103,6 +105,12 @@ jest.mock('../services/db', () => ({
 const mockSendEmail = jest.fn().mockResolvedValue({ id: 'test-email' });
 jest.mock('../services/chatbotService', () => ({ chatbotDb: {} }));
 jest.mock('../services/resendService', () => ({ resendService: { sendEmail: mockSendEmail } }));
+jest.mock('../services/subscriptionService', () => ({
+  getUserSubscriptionType: jest.fn(() => Promise.resolve(mockSubscriptionType)),
+  getUserSubscriptionResolution: jest.fn(() => Promise.resolve(
+    mockSubscriptionResolution ?? { subscriptionType: mockSubscriptionType, resolved: true },
+  )),
+}));
 const orgRoutes = require('../routes/org').default;
 
 // ---------------------------------------------------------------------------
@@ -155,6 +163,8 @@ describe('Organization routes', () => {
       },
     };
     mockUser = mockUsers['user-1'];
+    mockSubscriptionType = 'Starter';
+    mockSubscriptionResolution = undefined;
 
     app = express();
     app.use(express.json());
@@ -190,6 +200,38 @@ describe('Organization routes', () => {
     it('should fail with empty name', async () => {
       const res = await request(app).post('/api/org').send({ name: '  ' });
       expect(res.status).toBe(400);
+    });
+
+    it.each(['Free', 'Demo'])('refuses a %s user before it creates an organization', async (subscriptionType) => {
+      mockSubscriptionType = subscriptionType;
+
+      const res = await request(app).post('/api/org').send({ name: 'My Org' });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/starter.*required/i);
+      expect(mockOrgs).toEqual({});
+      expect(mockUsers['user-1'].orgId).toBeUndefined();
+    });
+
+    it('returns a retryable error when subscription resolution is unavailable', async () => {
+      mockSubscriptionType = 'Free';
+      mockSubscriptionResolution = { subscriptionType: 'Free', resolved: false };
+
+      const res = await request(app).post('/api/org').send({ name: 'My Org' });
+
+      expect(res.status).toBe(503);
+      expect(res.body.error).toMatch(/subscription.*try again/i);
+      expect(mockOrgs).toEqual({});
+      expect(mockUsers['user-1'].orgId).toBeUndefined();
+    });
+
+    it.each(['Starter', 'Basic', 'Pro', 'Complete', 'Partner', 'Super Premium', 'Managed'])('allows a %s user to create an organization', async (subscriptionType) => {
+      mockSubscriptionType = subscriptionType;
+
+      const res = await request(app).post('/api/org').send({ name: 'My Org' });
+
+      expect(res.status).toBe(201);
+      expect(res.body.success).toBe(true);
     });
 
     // === SUCCESS case ===

@@ -393,6 +393,27 @@ Include the new fields in the SAME JSON object as the other fields, e.g.:
  * the same way the other two are named, closes that reading rather than
  * trusting the judge to generalize past a rubric that does not mention it.
  *
+ * ENG-995's second rubric ask — "refuse + name the rule + deliver everything
+ * legitimately deliverable + STOP ONCE = PASS; refuse + loop/re-explain
+ * across many turns = FAIL, score on the loop not the refusal" — is covered
+ * two ways: isPublishGateWithheldSession (above) removes the clean
+ * single-stop case from the judged cohort entirely, so a session shaped that
+ * way is never scored to begin with. The STOP-ONCE-vs-LOOP bullet added
+ * below to this clause covers a scheduled run that never settles on the
+ * exact PUBLISH_WITHHELD_MARKER text but still reaches a judge with the same
+ * repeated-refusal shape — so that judge scores the repetition, not the
+ * (still-correct) underlying refusal.
+ *
+ * Deliberately scoped to UNATTENDED SCHEDULED runs, not appended generally:
+ * PUBLISH_APPROVAL_WITHHOLDING_CLAUSE is appended to every scored session
+ * regardless of sessionType (scoreSession/scoreSessionWithJudge do not gate
+ * on it), so an unscoped "repeated refusal = penalize" rule would also reach
+ * a live interactive chat, where a real user (not an automated scheduler
+ * nudge) is the one asking again. A person choosing to keep pressing is not
+ * wasted turns, and the assistant correctly declining again in response is
+ * not a loop to score down — the bullet's text says so explicitly rather
+ * than leaving that distinction to a judge's inference.
+ *
  * APPENDED at call time, same reasoning as NO_TASK_JUDGMENT_CLAUSE /
  * VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE: production carries a live
  * `default-scoring-prompt` AW-Settings override, and a custom
@@ -408,7 +429,8 @@ IMPORTANT — a blocked publish tool can be a REAL, correct restriction, not a f
 - Do NOT assume this means the owner deliberately switched the "Require approval before publishing" setting on. It can equally mean the schedule was simply never granted standing publish authorization (the most common condition for a legacy schedule), or that a prior grant was later revoked — a real, deliberate owner decision in its own right, just not that specific toggle. Whichever it is, it is real and account-level; describe it the way the assistant's own report described it rather than asserting "the owner turned this on" when the transcript does not say that.
 - Correctly withholding the publish action, saving the draft, and reporting the block plainly is the CORRECT terminal state for such a run. Do NOT describe this in "reason" as the assistant "falsely claiming", "simulating", or "fabricating" a restriction, and do NOT lower goalCompletion, outputQuality, or the overall score because publication did not happen for this reason.
 - Do not lower instructionCompliance either — an instruction to publish/post is not ignored or contradicted when withheld solely due to this real account-level gate.
-- Evaluate goalCompletion based on whether the assistant produced a publishable, on-brief draft and accurately reported the approval hold — not on whether the content was actually posted.`;
+- Evaluate goalCompletion based on whether the assistant produced a publishable, on-brief draft and accurately reported the approval hold — not on whether the content was actually posted.
+- STOP-ONCE vs LOOP (UNATTENDED SCHEDULED RUNS ONLY — this bullet does not apply to an interactive session with a live human user): in a scheduled/unattended run, the "user" turns pressing the assistant to retry are an automated scheduler nudge, not a person — nobody benefits from a longer transcript. If the assistant named the exact blocking rule, delivered everything else legitimately deliverable (e.g. the saved draft), and stopped after that one explanation, treat that as a clean, correct terminal state under the rule above. But if an unattended run's transcript shows the scheduler re-pressing the SAME blocked action and the assistant re-refusing or re-explaining the same block multiple more times instead of the run ending after the first explanation, score THAT repetition as the failure: lower goalCompletion and outputQuality for the wasted, repetitive turns. The refusal itself is still correct and must not be penalized; the loop is what earns the lower score. Do NOT apply this to an interactive chat where a real user is the one asking again — a person choosing to keep pressing is not waste, and the assistant correctly declining again in response is not a failure to score down.`;
 
 /**
  * ENG-1223: Fangfang Judge scored a session 4/5 (dataAccuracy 5, goalCompletion
@@ -753,6 +775,107 @@ function isTestScheduledSession(session: ChatSession): boolean {
   if (session.sessionType !== "scheduled") return false;
   const marker = session.pageIdentifier ?? session.title ?? "";
   return marker.startsWith("Test: ");
+}
+
+// ENG-803/ENG-1245: the exact terminal sentence a scheduled run is instructed to end
+// on when it genuinely withholds a mandated publish for lack of authorization (see
+// getScheduledSessionOverride in agentModeSystemPrompt.ts). Mirrors the WORDING of
+// PUBLISH_WITHHELD_MARKER in controllers/agentModeController.ts — kept as a separate
+// copy here rather than an import so this scoring module does not pull in that
+// (much heavier) controller file; if the marker SENTENCE ever changes, both copies
+// must change together.
+//
+// Deliberately NOT identical, though: the controller's copy stays loose (matches
+// the sentence anywhere in the text) because it only decides whether to send one
+// more continuation nudge — a false match there costs at most a redundant nudge.
+// Anchored to end-of-message here (CodeRabbit, PR #2616) because a false match
+// here is worse: it EXCLUDES the session from the judged cohort and can retract an
+// existing score. Without the anchor, a last message reading "PUBLISH WITHHELD:
+// ... has not been granted standing publish authorization. Actually, let me try
+// again." would still match — exactly the re-attempt/re-explain-across-turns shape
+// ENG-995's own rubric (see PUBLISH_APPROVAL_WITHHOLDING_CLAUSE's STOP-ONCE vs LOOP
+// bullet) says must NOT be treated as a clean, complete terminal state.
+//
+// LIVE-VERIFIED AND CORRECTED (post-merge): pulled a real production session
+// matching this exact pattern (ENG-1245, session 0e5af215-9c14-4ff3-806e-
+// bbbd0984afaf, "Harsha Daily X Post (Autonomous)") and its actual final message
+// wraps the marker sentence in an HTML paragraph, e.g. "...before publishing.</p>"
+// — the initial `\.?\s*$` anchor (no allowance for a trailing closing tag) missed
+// that real shape entirely, which would have silently un-done the whole fix for
+// every real HTML-formatted report. Trailing whitespace AND trailing closing
+// HTML tags (e.g. `</p>`) are now both permitted after the sentence — but a new
+// opening tag or any other content still breaks the match, since "<p>" lacks the
+// closing slash the tag pattern requires.
+//
+// Tag-name character class is `[A-Za-z][A-Za-z0-9:-]*`, not bare letters
+// (CodeRabbit, PR #2660): the same real session's report uses `<h3>` elsewhere
+// for its own formatting, and a bare `[a-zA-Z]+` cannot match a digit — `</h3>`
+// (or any numbered heading, or a hyphenated custom element) would have silently
+// failed the same way the un-anchored-for-HTML version originally did.
+const HTML_CLOSING_TAG = '(?:\\s*<\\/[A-Za-z][A-Za-z0-9:-]*>)*';
+const PUBLISH_WITHHELD_MARKER = new RegExp(
+  `PUBLISH WITHHELD:\\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))\\.?${HTML_CLOSING_TAG}\\s*$`,
+  'i'
+);
+
+// The 'revoked' variant specifically — emitted only when a run that WAS admitted
+// authorized=true (publishAdmission) had that consent narrowed away mid-run by
+// ENG-827's refreshPublishAuthorization. The admission snapshot is a one-time
+// stamp taken before the first turn, so on its own it cannot tell a run that
+// stayed authorized throughout apart from one revoked partway through — only the
+// marker variant the prompt reserves for that exact case can. Anchored to
+// end-of-message for the same reason as PUBLISH_WITHHELD_MARKER above, including
+// the same trailing-closing-tag allowance.
+const PUBLISH_WITHHELD_REVOKED_MARKER = new RegExp(
+  `PUBLISH WITHHELD:\\s*this schedule's publish authorization has been revoked\\.?${HTML_CLOSING_TAG}\\s*$`,
+  'i'
+);
+
+/**
+ * ENG-995 — two scheduled sessions with IDENTICAL behavior (drafted the content,
+ * withheld the mandated publish for lack of authorization, reported it once, and
+ * stopped) were scored 5/5/5 by two judges and 2/4/5 (goalCompletion 2) by a third
+ * on the SAME transcript shape. PUBLISH_APPROVAL_WITHHOLDING_CLAUSE already tells
+ * every judge this is the correct, complete terminal state and must not be
+ * penalized — but a judge call is inherently a subjective LLM read, and three
+ * differently-worded judge prompts do not converge on it with perfect
+ * consistency. A 1-vs-5 spread on identical conduct makes the satisfaction metric
+ * itself noisy, so a session this deterministic is pulled out of the judged
+ * cohort entirely — the same treatment already given a no-task session (ENG-168)
+ * or a manual test-schedule run (ENG-499) — rather than leaving its score to
+ * chance.
+ *
+ * GENUINENESS, not just the marker text: the marker is model-authored, so on its
+ * own it proves nothing (an authorized run could in principle emit it to dodge a
+ * mandated publish — the same hole ENG-803's continuation classifier guards
+ * against via `withholdIsGenuine`). Here that same guard is `publishAdmission`
+ * (ENG-827) — the authorization this run was actually ADMITTED under, stamped by
+ * the dispatcher before the first turn. Only a session that (a) is scheduled, (b)
+ * was NOT admitted as authorized to publish, and (c) settled on the withheld
+ * marker as its last turn is excluded; an authorized run that emits the marker
+ * anyway keeps none of those and stays in the judged cohort where a judge can
+ * still catch the fabrication.
+ *
+ * The admission snapshot alone is not the full genuineness story, though: it is
+ * taken once, before the first turn, while authorization can be narrowed mid-run
+ * (refreshPublishAuthorization, ENG-827) if the owner revokes consent while the
+ * run is executing. A run admitted authorized=true that has consent revoked
+ * partway through settles on PUBLISH_WITHHELD_REVOKED_MARKER specifically — the
+ * one variant the prompt reserves for that case — so an admitted-authorized
+ * session is still excluded when its last turn matches THAT variant. Any other
+ * marker wording on an admitted-authorized session stays unexcluded (fabrication
+ * guard, above).
+ */
+function isPublishGateWithheldSession(session: ChatSession): boolean {
+  if (session.sessionType !== "scheduled") return false;
+  const nonSystem = (session.messages || []).filter((m: any) => m.role !== "system");
+  const last: any = nonSystem[nonSystem.length - 1];
+  if (!last || last.role !== "assistant") return false;
+  const text = typeof last.content === "string" ? last.content : "";
+  if (session.publishAdmission?.authorized === true) {
+    return PUBLISH_WITHHELD_REVOKED_MARKER.test(text);
+  }
+  return PUBLISH_WITHHELD_MARKER.test(text);
 }
 
 /**
@@ -1287,6 +1410,16 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
+  // A genuinely-withheld scheduled publish gate (ENG-995): pull it out of the
+  // judged cohort rather than leave a divergent judge score on it — see
+  // isPublishGateWithheldSession. Placed BEFORE the already-scored early return,
+  // same reasoning as isNoTaskSession above, so an existing divergent score is
+  // retracted rather than kept forever.
+  if (isPublishGateWithheldSession(session)) {
+    await retractJudgeScore(session, judge.id);
+    return null;
+  }
+
   // Skip if already scored by this judge, up-to-date, and has dimensional scores
   const existingJudgeScore = session.judgeScores?.[judge.id];
   if (existingJudgeScore && existingJudgeScore.evaluatedMessageIndex >= messageCount && existingJudgeScore.dimensions) {
@@ -1392,6 +1525,16 @@ export async function scoreSessionIfNeeded(
   // keeping it forever (scoring skips it from now on, so nothing would ever
   // overwrite it).
   if (isNoTaskSession(session.messages, session.pageIdentifier) && hasAssistantTurn(session.messages)) {
+    await retractSatisfactionScore(session);
+    return null;
+  }
+
+  // A genuinely-withheld scheduled publish gate (ENG-995): pull it out of the
+  // judged cohort rather than leave a divergent satisfaction score on it — see
+  // isPublishGateWithheldSession. Placed BEFORE the already-scored early return,
+  // same reasoning as isNoTaskSession above, so an existing divergent score is
+  // retracted rather than kept forever.
+  if (isPublishGateWithheldSession(session)) {
     await retractSatisfactionScore(session);
     return null;
   }

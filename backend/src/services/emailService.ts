@@ -1337,20 +1337,20 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       });
 
       // A block can be caused by either the token-count cap or the dollar cost cap
-      // (ENG-200). When the cost cap is the trigger — the only reason a user with an
-      // unlimited token allowance can be blocked — render a cost-based message so it
-      // doesn't misleadingly read "N/A tokens".
+      // (ENG-200). Which dimension gated only picks which percentage to read — never
+      // the wording: the raw figures and the "cost" vs "token" dimension name are
+      // never surfaced to the customer, matching the in-app UsageMeter policy of a
+      // percentage of "monthly usage" only (ENG-1566).
       const { blockedByCost } = deriveBlockedByCost(usageStatus);
+      const limitPercent = Math.round(
+        blockedByCost ? (usageStatus.costPercentUsed ?? 100) : (usageStatus.percentUsed ?? 100)
+      );
 
-      const limitLabel = blockedByCost ? 'Monthly Cost Limit Reached' : 'Monthly Token Limit Reached';
-      const limitReasonText = blockedByCost ? 'monthly cost limit' : 'monthly token limit';
-      const usageLine = blockedByCost
-        ? `<strong>Spend:</strong> $${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month.`
-        : `<strong>Usage:</strong> ${usageStatus.used.toLocaleString()} / ${usageStatus.allowance != null ? usageStatus.allowance.toLocaleString() : 'N/A'} tokens used this month.`;
-      const usageLineText = blockedByCost
-        ? `Spend: $${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month.`
-        : `Usage: ${usageStatus.used.toLocaleString()} / ${usageStatus.allowance != null ? usageStatus.allowance.toLocaleString() : 'N/A'} tokens used this month.`;
-      const allowanceResetNoun = blockedByCost ? 'cost allowance' : 'token allowance';
+      const limitLabel = 'Monthly Usage Limit Reached';
+      const limitReasonText = 'monthly usage limit';
+      const usageLine = `<strong>Usage:</strong> ${limitPercent}% of your monthly allowance used.`;
+      const usageLineText = `Usage: ${limitPercent}% of your monthly allowance used.`;
+      const allowanceResetNoun = 'usage allowance';
 
       const html = `
         <html>

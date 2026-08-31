@@ -14,6 +14,15 @@ export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
   costUsedMicroUsd: number;
   tokenUsed: number;
   mode: LlmUsageModeDecision;
+  /**
+   * Whether ANY credit moved this cycle's spend or ceiling (ENG-1215 AC4).
+   *
+   * Credits are stored as month totals with no per-day timeline, so the state
+   * at an arbitrary earlier day of the cycle cannot be reconstructed. Callers
+   * that reason about a PAST moment — the forecast backtest — need to know that
+   * and decline rather than compute against today's adjusted figures.
+   */
+  creditsApplied: boolean;
 }> {
   // A number of legacy controller unit tests replace the token/subscription
   // modules with deliberately partial Jest mocks. Keep those unrelated tests
@@ -33,6 +42,7 @@ export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
       billingUserId: userId,
       policy: null,
       costUsedMicroUsd: 0,
+      creditsApplied: false,
       tokenUsed: 0,
       mode: evaluateLlmUsageMode({ costUsedMicroUsd: 0, tokenUsed: 0, policy: null }),
     };
@@ -64,5 +74,9 @@ export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
     costUsedMicroUsd,
     tokenUsed: usage.totalTokens,
     mode: evaluateLlmUsageMode({ costUsedMicroUsd, tokenUsed: usage.totalTokens, policy }),
+    creditsApplied:
+      adjustment.purchasedMicroUsd > 0 ||
+      adjustment.adminGrantedMicroUsd > 0 ||
+      adjustment.migrationOffsetMicroUsd > 0,
   };
 }

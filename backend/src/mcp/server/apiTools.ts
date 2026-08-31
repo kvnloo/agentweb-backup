@@ -19,6 +19,13 @@ import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService
 // share them instead of keeping a second copy. Behaviour unchanged.
 import { ctx, jsonResult } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
+import { resolveClientScopedContext } from './adminClientScope';
+
+const CLIENT_ID_SCHEMA_PROPERTY = {
+  type: 'string' as const,
+  description:
+    "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected.",
+};
 
 function normalizeSkillQuery(value: unknown): string {
   return String(value ?? '')
@@ -318,11 +325,20 @@ mcpToolRegistry.register({
   name: 'list_tasks',
   definition: {
     name: 'list_tasks',
-    description: 'List all tasks owned by the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List all tasks owned by the authenticated user, or a specific client (admin-only, via client_id).',
+    inputSchema: {
+      type: 'object',
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/tasks', context: ctx(context) });
+  /** Lists tasks for the caller, or (admin-only) for `args.client_id`'s account. */
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/tasks',
+      context: await resolveClientScopedContext(context, args?.client_id, 'list_tasks')
+    });
     return jsonResult(data);
   }
 });
@@ -487,11 +503,20 @@ mcpToolRegistry.register({
   name: 'list_scheduled_chats',
   definition: {
     name: 'list_scheduled_chats',
-    description: 'List all scheduled chats for the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List all scheduled chats for the authenticated user, or a specific client (admin-only, via client_id).',
+    inputSchema: {
+      type: 'object',
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/agent-mode/scheduled-chats', context: ctx(context) });
+  /** Lists scheduled chats for the caller, or (admin-only) for `args.client_id`'s account. */
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/agent-mode/scheduled-chats',
+      context: await resolveClientScopedContext(context, args?.client_id, 'list_scheduled_chats')
+    });
     return jsonResult(data);
   }
 });
@@ -862,11 +887,20 @@ mcpToolRegistry.register({
   name: 'list_lead_lists',
   definition: {
     name: 'list_lead_lists',
-    description: 'List all lead lists for the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List all lead lists for the authenticated user, or for a specific client (admin-only, via client_id).',
+    inputSchema: {
+      type: 'object',
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/crm/lists', context: ctx(context) });
+  /** Lists lead lists for the caller, or (admin-only) for `args.client_id`'s account. */
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/crm/lists',
+      context: await resolveClientScopedContext(context, args?.client_id, 'list_lead_lists')
+    });
     return jsonResult(data);
   }
 });
@@ -917,7 +951,7 @@ mcpToolRegistry.register({
   name: 'manage_leads',
   definition: {
     name: 'manage_leads',
-    description: 'Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list".',
+    description: 'Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list". Admin-only: pass client_id to read a specific client\'s list ("list"/"get" actions only) instead of the caller\'s own. Not supported for "add"/"update"/"delete" — cross-account mutation is pending a separate authorization review (ENG-1557).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -928,14 +962,38 @@ mcpToolRegistry.register({
         lead_ids: { type: 'array', items: { type: 'string' }, description: 'Lead IDs to delete (for delete action)' },
         updates: { type: 'object', description: 'Fields to update (for update action)' },
         limit: { type: 'number', description: 'Max leads to return (list action)' },
-        last_key: { type: 'string', description: 'Pagination key (list action)' }
+        last_key: { type: 'string', description: 'Pagination key (list action)' },
+        client_id: {
+          type: 'string',
+          description: "Admin-only, read actions only ('list'/'get'). Scope to a specific client's list instead of the caller's own — accepts the client's email or userId. Rejected for 'add'/'update'/'delete' (ENG-1557: cross-account writes need a separate authorization review).",
+        },
       },
       required: ['action', 'list_id']
     }
   },
+  /**
+   * CRUD dispatch for a lead list's leads. `args.client_id` (admin-only) scopes
+   * `list`/`get` to a specific client's list; `add`/`update`/`delete` reject it
+   * outright (ENG-1557: cross-account writes are pending authorization review).
+   */
   execute: async (args: any, context: any) => {
-    const c = ctx(context);
     const listId = args.list_id;
+    const isWriteAction = args.action === 'add' || args.action === 'update' || args.action === 'delete';
+    // CodeRabbit (PR #2651): reject ANY present client_id on a write action,
+    // not just non-empty strings — a number/object/boolean is still "provided,"
+    // and the earlier string-only check let those silently fall through to a
+    // caller-scoped write instead of being rejected loudly.
+    const hasClientId = args.client_id !== undefined && args.client_id !== null;
+    if (isWriteAction && hasClientId) {
+      // ENG-1557: cross-account mutation via client_id needs its own authorization
+      // contract (staff roles, attribution, audit) before it ships — reads
+      // (list/get) don't carry that risk and are unaffected. Fail loud rather
+      // than silently writing to the caller's own list instead of the client's.
+      throw new Error(
+        `client_id is not supported for manage_leads action "${args.action}" — cross-account writes are pending ENG-1557's authorization review. Only "list" and "get" support client_id today.`
+      );
+    }
+    const c = isWriteAction ? ctx(context) : await resolveClientScopedContext(context, args.client_id, 'manage_leads');
     switch (args.action) {
       case 'list': {
         const qp: Record<string, string> = {};
@@ -980,7 +1038,7 @@ mcpToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Search leads across lists using structured filters.',
+    description: 'Search leads across lists using structured filters. Admin-only: pass client_id to search a specific client\'s leads instead of the caller\'s own.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -998,14 +1056,16 @@ mcpToolRegistry.register({
           },
           description: 'Array of filter conditions'
         },
-        limit: { type: 'number', description: 'Max results (default 20, max 50)' }
+        limit: { type: 'number', description: 'Max results (default 20, max 50)' },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY
       },
       required: ['list_id', 'filters']
     }
   },
+  /** Searches leads for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: '/api/emma/search-leads', context: ctx(context),
+      method: 'POST', path: '/api/emma/search-leads', context: await resolveClientScopedContext(context, args.client_id, 'search_leads'),
       body: { list_id: args.list_id, filters: args.filters, limit: args.limit }
     });
     return jsonResult(data);
@@ -1380,19 +1440,35 @@ mcpToolRegistry.register({
   name: 'list_connected_accounts',
   definition: {
     name: 'list_connected_accounts',
-    description: 'List all connected social media and integration accounts.',
+    description: `List all connected social media and integration accounts.
+
+GOOGLE ADS SPEND RISK (ENG-1362). google_ads rows carry test_account and can_spend.
+  test_account: true = Google guarantees the account CANNOT serve ads and CANNOT spend.
+  test_account: false = real, billable.
+  test_account absent = never recorded; treat as billable.
+  can_spend = false ONLY when test_account is true.
+Never infer this from account_name — a fully billable account can be named "Test".
+
+Admin-only: pass client_id to list a specific client's connected accounts instead of the caller's own.`,
     inputSchema: {
       type: 'object',
       properties: {
-        platform: { type: 'string', description: 'Filter by platform (e.g., "linkedin", "meta", "unipile")' }
+        platform: { type: 'string', description: 'Filter by platform (e.g., "linkedin", "meta", "unipile")' },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY
       },
       required: []
     }
   },
+  /** Lists connected accounts for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
     const qp: Record<string, string> = {};
     if (args.platform) qp.platform = args.platform;
-    const data = await mcpFetch({ method: 'GET', path: '/api/oauth/connected-accounts', context: ctx(context), queryParams: qp });
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/oauth/connected-accounts',
+      context: await resolveClientScopedContext(context, args.client_id, 'list_connected_accounts'),
+      queryParams: qp
+    });
     return jsonResult(data);
   }
 });
@@ -2065,6 +2141,7 @@ const WORK_PLAN_STEP_ALIASES: Record<string, string> = {
   user_instructions: 'userInstructions',
   step_count: 'stepCount',
   expected_asset_count: 'expectedAssetCount',
+  expected_asset_count_tools: 'expectedAssetCountTools',
 };
 
 const normalizeWorkPlanSteps = (steps: any): any => {
@@ -2162,7 +2239,8 @@ mcpToolRegistry.register({
               skillIds: { type: 'array', items: { type: 'string' }, description: 'Skill IDs attached to this step (from list_skills / resolve_skill). Alias: skill_ids.' },
               userInstructions: { type: 'string', description: 'Instructions shown to the user for this step. Alias: user_instructions.' },
               stepCount: { type: 'number', description: 'Step order, 1-based. Defaults to the array position. In steps_mode="merge" this is what selects the existing step to amend. Alias: step_count.' },
-              expectedAssetCount: { type: 'number', description: 'For a step that must produce a fixed number of media assets (e.g. "generate 18 images"), the required count. The step cannot be marked completed until that many images/videos have been generated in the run, which stops it being closed with only some produced. Note the count is per run, not per step: assets generated by earlier steps of the same run also count towards it. Omit for steps with no fixed asset count. Alias: expected_asset_count.' }
+              expectedAssetCount: { type: 'number', description: 'For a step that must produce a fixed number of media assets (e.g. "generate 18 images"), the required count. The step cannot be marked completed until that many assets have been produced SINCE THE PREVIOUS STEP RESOLVED — an earlier step\'s assets never count toward a later step\'s requirement. Omit for steps with no fixed asset count. Alias: expected_asset_count.' },
+              expectedAssetCountTools: { type: 'array', items: { type: 'string' }, description: 'Which tool name(s) count toward expectedAssetCount, for a step that calls more than one asset-producing tool that aren\'t interchangeable (e.g. a step that builds a few reusable HTML templates via create_html_file AND takes one screenshot per requested size via playwright_browser_take_screenshot — only the screenshot count is "the N things"). Named tools are summed. Omit when the step calls only one asset-producing tool, or when every asset-producing tool it calls should count as the same deliverable — the count then falls back to the largest count among them. Alias: expected_asset_count_tools.' }
             },
             required: ['title']
           },
@@ -2175,7 +2253,7 @@ mcpToolRegistry.register({
         },
         confirm_step_removal: {
           type: 'boolean',
-          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content.'
+          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount, expectedAssetCountTools) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content.'
         }
       },
       required: ['action']
@@ -3007,82 +3085,6 @@ Typical prompts this answers:
   },
 });
 
-// ─── CRM lead segmentation ──────────────────────────────────────────────────
-
-mcpToolRegistry.register({
-  name: 'get_leads_by_crm_criteria',
-  definition: {
-    name: 'get_leads_by_crm_criteria',
-    description: `Preview which CRM leads (from AW-Leads, scoped to the caller's own lead lists) match a segment query. Use this before creating a drip campaign to confirm who will be targeted. Read-only — does not persist a campaign.
-
-Supported criteria (all optional; leaving a criterion unset means "any"):
-- \`lifecycle\`: lifecycle stage of the lead. One of \`unknown\`, \`inbox\`, \`signed_up\`, \`in_deal\`, \`trialing\`, \`paying\`, \`at_risk\`, \`churned\`.
-- \`min_heat_score\`: minimum heat score (0-100). Leads below this score are excluded. Missing heat scores count as 0.
-- \`utm_source\`: exact-match filter on the lead's attribution source (e.g. \`linkedin\`, \`google\`, \`newsletter\`).
-- \`lead_list_id\`: scope to a single lead list. If omitted, every list owned by the caller is searched.
-- \`limit\`: maximum number of sample leads to return (default 20, max 100). The \`total\` field always reflects the full matching count.
-
-Example:
-  action inputs: { lifecycle: "trialing", min_heat_score: 50, limit: 10 }
-  response: { total: 42, sampleSize: 10, leads: [...], criteria: {...} }`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        lifecycle: {
-          type: 'string',
-          enum: [
-            'unknown',
-            'inbox',
-            'signed_up',
-            'in_deal',
-            'trialing',
-            'paying',
-            'at_risk',
-            'churned',
-          ],
-          description: 'Lifecycle stage filter.',
-        },
-        min_heat_score: {
-          type: 'number',
-          description: 'Minimum heat score (0-100). Leads below this value are excluded.',
-        },
-        utm_source: {
-          type: 'string',
-          description: 'Exact-match filter on attribution source (e.g. linkedin, google).',
-        },
-        lead_list_id: {
-          type: 'string',
-          description: 'Restrict to a single lead list. Omit to search every list owned by caller.',
-        },
-        limit: {
-          type: 'integer',
-          description: 'Sample size to return. Default 20, max 100.',
-        },
-      },
-      required: [],
-      additionalProperties: false,
-    },
-  },
-  execute: async (args: any, context: any) => {
-    const body: Record<string, any> = {};
-    if (typeof args.lifecycle === 'string') body.lifecycle = args.lifecycle;
-    if (typeof args.min_heat_score === 'number')
-      body.minHeatScore = args.min_heat_score;
-    if (typeof args.utm_source === 'string') body.utmSource = args.utm_source;
-    if (typeof args.lead_list_id === 'string')
-      body.leadListId = args.lead_list_id;
-    if (typeof args.limit === 'number') body.limit = args.limit;
-
-    const data = await mcpFetch({
-      method: 'POST',
-      path: '/api/drip-campaigns/preview-segment',
-      context: ctx(context),
-      body,
-    });
-    return jsonResult(data);
-  },
-});
-
 mcpToolRegistry.register({
   name: 'get_registration_status',
   definition: {
@@ -3360,11 +3362,16 @@ mcpToolRegistry.register({
   name: 'get_account_status',
   definition: {
     name: 'get_account_status',
-    description: "Get the current user's account status, subscription plan, and usage.",
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: "Get the current user's account status, subscription plan, and usage. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
+    inputSchema: {
+      type: 'object',
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const c = ctx(context);
+  /** Reports the caller's own account status, or (admin-only) `args.client_id`'s. */
+  execute: async (args: any, context: any) => {
+    const c = await resolveClientScopedContext(context, args?.client_id, 'get_account_status');
 
     // Plan/status comes from /api/auth/me. Let auth errors propagate — if we can't
     // resolve the account, returning a fake "status" would be misleading.
@@ -3382,10 +3389,26 @@ mcpToolRegistry.register({
 
     // Curate a stable, minimal shape. Never echo the raw /me payload — it carries
     // sensitive fields (stripe ids, tokens, internal flags).
+    //
+    // ENG-1540: `subscription_status` is only ever populated on the org OWNER's
+    // record by a live Stripe subscription sync — an owner whose paid access
+    // was granted out-of-band (admin/manual comp, no Stripe subscription object)
+    // never gets the field set at all, org members riding that owner's billing
+    // inherit the same gap, and it stays unset indefinitely (no ongoing owner
+    // -side sync ever revisits it). Defaulting that absence to the literal
+    // 'inactive' told a currently-paying-and-unblocked Pro customer their
+    // subscription was inactive. A paid, non-Free plan with no persisted status
+    // means "active but never synced", not "inactive".
+    // `||`, not `??`: auth.ts's own sync trigger (`!user.subscription_status`)
+    // already treats an empty string as missing, so this has to match or a
+    // stray '' would pass through unresolved instead of deriving a real status.
+    const subscriptionStatus =
+      me?.subscription_status ||
+      (me?.subscriptionType && me.subscriptionType !== 'Free' ? 'active' : 'inactive');
     return jsonResult({
       email: me?.email ?? null,
       subscription_plan: me?.subscriptionType ?? 'Free',
-      subscription_status: me?.subscription_status ?? 'inactive',
+      subscription_status: subscriptionStatus,
       current_period_end: me?.current_period_end ?? null,
       allowed_features: Array.isArray(me?.allowedPages) ? me.allowedPages : [],
       api_key_count: apiKeyCount,

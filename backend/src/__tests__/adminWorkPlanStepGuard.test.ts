@@ -167,6 +167,56 @@ describe('PUT /api/admin/work-plans/:planId — destructive step guard (ENG-1221
       expect(written[0].title).toBe(TEN[0].title);
     });
 
+    // ENG-1331 (post-launch hardening): merge mode's own copy-then-overlay
+    // architecture (mergeWorkPlanSteps starts from `{...existingStep}`, then
+    // overlays only the keys present in the caller's payload) already means a
+    // field absent from the has()-gated builder below is left alone, not erased —
+    // verified live before writing this. Kept as a property test anyway: it is
+    // the behavior an admin actually relies on when editing one field of a step.
+    it('preserves expectedAssetCountTools through a merge-mode edit to an UNRELATED field', async () => {
+      const withTools = {
+        ...plan,
+        steps: TEN.map((s) =>
+          s.stepCount === 3
+            ? { ...s, expectedAssetCount: 12, expectedAssetCountTools: ['playwright_browser_take_screenshot'] }
+            : s
+        ),
+      };
+      mockGetWorkPlan.mockResolvedValue(withTools);
+
+      const res = await request(app)
+        .put('/api/admin/work-plans/plan-1')
+        .send({ steps: [{ stepCount: 3, description: 'rewritten, nothing else touched' }], steps_mode: 'merge' });
+
+      expect(res.status).toBe(200);
+      const written = mockUpdateWorkPlan.mock.calls[0][0].steps;
+      const step3 = written.find((s: any) => s.stepCount === 3);
+      expect(step3.description).toBe('rewritten, nothing else touched');
+      expect(step3.expectedAssetCount).toBe(12);
+      expect(step3.expectedAssetCountTools).toEqual(['playwright_browser_take_screenshot']);
+    });
+
+    // ENG-1331 (post-launch hardening): the REAL bug live-testing found. The
+    // admin merge route's hand-picked field list (has('expectedAssetCount'),
+    // etc.) never learned about expectedAssetCountTools, so an admin's EXPLICIT
+    // merge-mode request to set it was silently ignored — HTTP 200, no warning,
+    // the field just never reached the write. Confirmed by reverting the fix and
+    // re-running this exact test before restoring it: without the has() line,
+    // `written` step 2 carries no expectedAssetCountTools key at all.
+    it('actually applies an explicit merge-mode SET of expectedAssetCountTools', async () => {
+      const res = await request(app)
+        .put('/api/admin/work-plans/plan-1')
+        .send({
+          steps: [{ stepCount: 2, expectedAssetCountTools: ['playwright_browser_take_screenshot'] }],
+          steps_mode: 'merge',
+        });
+      expect(res.status).toBe(200);
+      const written = mockUpdateWorkPlan.mock.calls[0][0].steps;
+      expect(written.find((s: any) => s.stepCount === 2).expectedAssetCountTools).toEqual([
+        'playwright_browser_take_screenshot',
+      ]);
+    });
+
     it('targets a title-only merge entry by its title, not by its array position', async () => {
       // The route synthesises a stepCount for an entry that carried none —
       // normalizeWorkPlanSteps fills in the array position — and merge target
@@ -302,6 +352,35 @@ describe('PUT /api/admin/work-plans/:planId — destructive step guard (ENG-1221
       expect(res.status).toBe(400);
       expect(res.body.message).toMatch(/steps_mode/i);
       expect(mockUpdateWorkPlan).not.toHaveBeenCalled();
+    });
+  });
+
+  // ENG-1331 (post-launch hardening): a replace stores exactly
+  // normalizeWorkPlanSteps' output, so this exercises the workPlanSteps.ts
+  // field-list fix directly through the route — not the merge builder above,
+  // which is a separate code path with its own has()-gated field list.
+  describe('replace mode carries expectedAssetCountTools through (ENG-1331)', () => {
+    it('keeps expectedAssetCountTools on a step re-sent in full during a replace', async () => {
+      const withTools = {
+        ...plan,
+        steps: TEN.map((s) =>
+          s.stepCount === 3
+            ? { ...s, expectedAssetCount: 12, expectedAssetCountTools: ['playwright_browser_take_screenshot'] }
+            : s
+        ),
+      };
+      mockGetWorkPlan.mockResolvedValue(withTools);
+
+      const full = withTools.steps.map((s: any) => ({ ...s }));
+      const res = await request(app)
+        .put('/api/admin/work-plans/plan-1')
+        .send({ steps: full });
+
+      expect(res.status).toBe(200);
+      const written = mockUpdateWorkPlan.mock.calls[0][0].steps;
+      expect(written.find((s: any) => s.stepCount === 3).expectedAssetCountTools).toEqual([
+        'playwright_browser_take_screenshot',
+      ]);
     });
   });
 

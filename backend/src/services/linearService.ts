@@ -190,8 +190,6 @@ export async function listOpenBugCanonicals(limit = 30): Promise<OpenCanonical[]
 export interface IssueCommentDetail {
   body: string;
   createdAt: string;
-  /** Linear user id of the comment's author, or undefined for a system/deleted-user comment. */
-  authorId?: string;
 }
 
 /**
@@ -209,7 +207,7 @@ export interface IssueCommentDetail {
  */
 export async function getIssueCommentsDetailed(issueId: string): Promise<IssueCommentDetail[]> {
   const data = await linearGraphQL(
-    `query($id: String!) { issue(id: $id) { comments(first: 250, orderBy: createdAt) { nodes { body createdAt user { id } } pageInfo { hasNextPage } } } }`,
+    `query($id: String!) { issue(id: $id) { comments(first: 250, orderBy: createdAt) { nodes { body createdAt } pageInfo { hasNextPage } } } }`,
     { id: issueId },
   );
   if (data?.issue?.comments?.pageInfo?.hasNextPage) {
@@ -217,11 +215,7 @@ export async function getIssueCommentsDetailed(issueId: string): Promise<IssueCo
       `[linear] issue ${issueId} has >250 comments — the page is truncated and the OLDEST comments were dropped; reporter-ticket markers may be missing. Add pagination to getIssueCommentsDetailed.`,
     );
   }
-  return (data?.issue?.comments?.nodes || []).map((c: any) => ({
-    body: c?.body || '',
-    createdAt: c?.createdAt || '',
-    authorId: c?.user?.id || undefined,
-  }));
+  return (data?.issue?.comments?.nodes || []).map((c: any) => ({ body: c?.body || '', createdAt: c?.createdAt || '' }));
 }
 
 /** Add a comment to a Linear issue (used to record additional reporters on a canonical). */

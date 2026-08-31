@@ -46,9 +46,14 @@ const CONTEXT_FRESHNESS = `## CONTEXT FRESHNESS (replace all hardcoded facts)
   org. Never apply another organization's ICP or brand.`;
 
 const SAFETY_VOLUME_LIMITS = `## SAFETY & VOLUME LIMITS (apply in ALL modes, including scheduled/unattended runs)
-- HARD CAPS per run: max 5 LinkedIn invites, 10 LinkedIn messages, 25 emails,
-  0 deletions. In UNATTENDED runs these caps are absolute — when reached,
-  QUEUE remaining items with a summary for human review; never exceed.
+- HARD CAPS per run: max 25 emails, 0 deletions.
+  In UNATTENDED runs these caps are absolute — when reached, QUEUE remaining
+  items with a summary for human review; never exceed.
+- LinkedIn invites and messages are capped PER DAY by the backend, not by a fixed
+  number here. Do not self-count: the send-invite/send-message/send-inmail tool
+  call itself refuses with a clear reason once the account's daily cap is
+  reached. On that refusal, STOP sending on this account and queue the rest for
+  a later run — do not retry and do not switch to a different account.
 - In interactive mode, any send beyond the cap requires explicit user
   confirmation listing exact recipients and message text.
 - NEVER delete leads, lists, or drafts in an unattended run under any
@@ -59,6 +64,20 @@ const SAFETY_VOLUME_LIMITS = `## SAFETY & VOLUME LIMITS (apply in ALL modes, inc
   list_connected_accounts. If the required account is missing or the session
   is dead, mark items QUEUED with the reason. Never send from a different
   account than the designated owner's.`;
+
+/**
+ * Additive to SAFETY_VOLUME_LIMITS, ONLY for skills that actually declare
+ * linkedin_outreach in toolNames (Blindspot 5: a prompt instructing a tool
+ * call the skill can't make just fails). Cross-Channel is the only skill in
+ * this file that sends LinkedIn outreach; AEO does not, so it stays out.
+ */
+const LINKEDIN_PREMIUM_CAP_ASK = `- The LinkedIn daily invite cap above is SELF-REPORTED, not detected. If this
+  account's cap has never been confirmed and you're in a live/interactive
+  turn, ASK the user whether their connected LinkedIn account has Premium,
+  then call linkedin_outreach action set-daily-invite-cap (30 if yes, 10 if
+  no — never guess). In an unattended/scheduled run there's no one to ask —
+  proceed at whatever is already configured (defaults to 10) and say so in
+  the ledger.`;
 
 const LEARN_FROM_OUTCOMES = `## LEARN FROM OUTCOMES
 - At the START of an outreach run, review the last run's results:
@@ -262,6 +281,7 @@ succeeded unless the tool result confirms it.
 ${CONTEXT_FRESHNESS}
 
 ${SAFETY_VOLUME_LIMITS}
+${LINKEDIN_PREMIUM_CAP_ASK}
 
 ${FAILURE_HANDLING}
 

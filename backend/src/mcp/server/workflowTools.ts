@@ -34,6 +34,7 @@
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import { ctx, jsonResult } from './toolHelpers';
+import { resolveClientScopedContext } from './adminClientScope';
 
 /**
  * Read one profile section.
@@ -229,11 +230,22 @@ mcpToolRegistry.register({
     name: 'emma_get_account_status',
     description:
       "Get this account's plan, usage, and remaining quota. " +
-      'Call this when a tool returns a quota error, to see how much allowance is left.',
-    inputSchema: { type: 'object', properties: {} },
+      'Call this when a tool returns a quota error, to see how much allowance is left. ' +
+      "Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_id: {
+          type: 'string',
+          description:
+            "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected.",
+        },
+      },
+    },
   },
-  execute: async (_args: any, context: any) => {
-    const me: any = await mcpFetch({ method: 'GET', path: '/api/auth/me', context: ctx(context) });
+  /** Reports the caller's own account status, or (admin-only) `args.client_id`'s. */
+  execute: async (args: any, context: any) => {
+    const me: any = await mcpFetch({ method: 'GET', path: '/api/auth/me', context: await resolveClientScopedContext(context, args?.client_id, 'emma_get_account_status') });
     return jsonResult({
       email: me?.email,
       plan: me?.subscriptionType ?? me?.plan ?? null,
