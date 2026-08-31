@@ -1408,16 +1408,40 @@ export class ExternalCrmSyncService {
     success: boolean
   ): Promise<void> {
     const now = new Date().toISOString();
-    if (direction === 'push') config.lastPushSyncAt = now;
-    else config.lastPullSyncAt = now;
-    config.lastSyncStatus = success ? 'success' : 'error';
+    // Reload the latest persisted config immediately before writing, rather
+    // than writing back the in-memory `config` this call was passed —
+    // saveUpdatedConfig/setLeadListCrmSyncConfig overwrites this provider's
+    // entire config entry wholesale (read-modify-write at the provider-map
+    // level, not per-field), and `config` can be stale by the time this
+    // runs: a webhook job processes up to 200 events with real API calls
+    // per list, and pushAllLeads/pullAllContacts run a full list sync.
+    // Writing the stale snapshot back verbatim would silently clobber a
+    // concurrent PUT /config save (field mapping changes, webhookEnabled
+    // toggle, etc.) that landed in between. Falls back to the passed
+    // `config` only if the reload itself fails or finds nothing (e.g. the
+    // config was deleted mid-operation) — worse than a perfectly atomic
+    // update, but better than losing the status update entirely.
+    const latest = await this.getConfig(config.userId, config.listId, config.provider).catch(() => null);
+    const target: ExternalCrmSyncConfig = latest ?? config;
+
+    if (direction === 'push') target.lastPushSyncAt = now;
+    else target.lastPullSyncAt = now;
+    target.lastSyncStatus = success ? 'success' : 'error';
     if (success) {
-      config.lastSyncError = undefined;
-      config.lastSyncErrorCategory = undefined;
-      config.lastSyncErrorCount = undefined;
+      target.lastSyncError = undefined;
+      target.lastSyncErrorCategory = undefined;
+      target.lastSyncErrorCount = undefined;
+    } else if (target !== config) {
+      // The caller may have stamped detailed error info onto its own
+      // `config` object right before calling this (e.g. pushAllLeads's
+      // categorizeErrors result) — the fresh reload won't have picked that
+      // up, so carry it over onto the object we're actually persisting.
+      target.lastSyncError = config.lastSyncError;
+      target.lastSyncErrorCategory = config.lastSyncErrorCategory;
+      target.lastSyncErrorCount = config.lastSyncErrorCount;
     }
-    config.updatedAt = now;
-    await this.saveUpdatedConfig(config);
+    target.updatedAt = now;
+    await this.saveUpdatedConfig(target);
   }
 
   private async syncHubSpotStatusOptions(

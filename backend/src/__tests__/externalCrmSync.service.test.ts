@@ -868,6 +868,87 @@ describe('ExternalCrmSyncService', () => {
     });
   });
 
+  // ─── updateSyncTimestamp ────────────────────────────────────────────────────
+  // CodeRabbit-flagged: setLeadListCrmSyncConfig overwrites a provider's
+  // entire config entry wholesale (read-modify-write at the provider-map
+  // level, not per-field). Writing back the in-memory `config` this function
+  // is passed — which can be stale by the time a long-running push/pull/
+  // webhook job finishes — would silently clobber a concurrent PUT /config
+  // save that landed in between. updateSyncTimestamp must reload the latest
+  // config and merge only the status fields onto it.
+
+  describe('updateSyncTimestamp', () => {
+    function mockListWithHubSpotConfig(cfg: ExternalCrmSyncConfig) {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        listId: cfg.listId,
+        userId: cfg.userId,
+        externalCrmSyncConfigs: { hubspot: cfg },
+      });
+    }
+
+    it('reloads the latest config and preserves a concurrent field change instead of clobbering it', async () => {
+      const stale = makeConfig({
+        contactFieldMapping: [{ agentwebField: 'email', crmProperty: 'email', direction: 'both', enabled: true }],
+      });
+      const concurrentlySaved = makeConfig({
+        contactFieldMapping: [
+          { agentwebField: 'email', crmProperty: 'email', direction: 'both', enabled: true },
+          { agentwebField: 'phone', crmProperty: 'phone', direction: 'both', enabled: true }, // added concurrently
+        ],
+      });
+      mockListWithHubSpotConfig(concurrentlySaved);
+
+      await service.updateSyncTimestamp(stale, 'push', true);
+
+      const saved = (crmDb.setLeadListCrmSyncConfig as jest.Mock).mock.calls[0][2];
+      expect(saved.contactFieldMapping).toHaveLength(2); // the concurrent addition survived
+      expect(saved.lastPushSyncAt).toBeDefined();
+      expect(saved.lastSyncStatus).toBe('success');
+    });
+
+    it('falls back to the passed config when the reload finds nothing, rather than losing the update', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
+      const cfg = makeConfig();
+
+      await service.updateSyncTimestamp(cfg, 'pull', true);
+
+      const saved = (crmDb.setLeadListCrmSyncConfig as jest.Mock).mock.calls[0][2];
+      expect(saved.lastPullSyncAt).toBeDefined();
+      expect(saved.lastSyncStatus).toBe('success');
+    });
+
+    it('carries the caller-set error detail onto the freshly reloaded config on failure', async () => {
+      const cfg = makeConfig();
+      cfg.lastSyncError = 'Some leads could not be synced';
+      cfg.lastSyncErrorCategory = 'data';
+      cfg.lastSyncErrorCount = 3;
+      // Reload returns a distinct object with none of that error detail set —
+      // simulating that only the CALLER (pushAllLeads) knows about it.
+      mockListWithHubSpotConfig(makeConfig());
+
+      await service.updateSyncTimestamp(cfg, 'push', false);
+
+      const saved = (crmDb.setLeadListCrmSyncConfig as jest.Mock).mock.calls[0][2];
+      expect(saved.lastSyncStatus).toBe('error');
+      expect(saved.lastSyncError).toBe('Some leads could not be synced');
+      expect(saved.lastSyncErrorCategory).toBe('data');
+      expect(saved.lastSyncErrorCount).toBe(3);
+    });
+
+    it('clears error fields on the reloaded config when success:true', async () => {
+      const stale = makeConfig();
+      const reloaded = makeConfig({ lastSyncError: 'old error', lastSyncErrorCategory: 'data', lastSyncErrorCount: 1 });
+      mockListWithHubSpotConfig(reloaded);
+
+      await service.updateSyncTimestamp(stale, 'push', true);
+
+      const saved = (crmDb.setLeadListCrmSyncConfig as jest.Mock).mock.calls[0][2];
+      expect(saved.lastSyncError).toBeUndefined();
+      expect(saved.lastSyncErrorCategory).toBeUndefined();
+      expect(saved.lastSyncErrorCount).toBeUndefined();
+    });
+  });
+
   // ─── getDefaultMappings ─────────────────────────────────────────────────────
 
   describe('getDefaultMappings', () => {
