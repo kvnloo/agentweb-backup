@@ -1974,14 +1974,19 @@ const AWAITING_CONFIRMATION_PATTERNS: RegExp[] = [
   /\b(?:await(?:ing)?|wait\s+for)\b[^\n.?!]*\b(?:confirmation|approval|sign-?off|go-?ahead|your\s+(?:go|response|reply|input|approval))\b/i,
   // "confirm to proceed" / "confirm before I continue/generate/build/send/deliver"
   // (an explicit confirm-gate ahead of the deliverable action, not just "proceed").
-  // ENG-1256: the bridge excludes em/en dashes (—/–) as well as sentence
-  // punctuation. An em dash introduces a fresh clause/aside in normal prose
-  // ("...before merge — #2414 creates AW-LlmChargeEvents..."), so without this
-  // exclusion the wildcard bridges "confirm ... before" in one clause to an
-  // unrelated action verb ("creates") in the NEXT clause across the dash,
-  // false-firing on a finished report's "Ask X to confirm whether Y had
-  // approval before merge" recommendation (live repro).
-  /\bconfirm\b[^\n.?!—–]*\b(?:to|before)\b[^\n.?!—–]*\b(?:proceed|continu|generat|build|start|begin|send|creat|draft|deliver|run\b)/i,
+  // ENG-1256: each bridge is bounded to a handful of WORDS, not an unbounded
+  // run of any character. Excluding only the em dash (an earlier version of
+  // this pattern) fixed the exact live repro string but not the underlying
+  // flaw: "confirm ... before ... <action>" bridging across an ENTIRELY
+  // separate clause is just as wrong when that clause is introduced by a
+  // comma ("... before merge, since #2414 creates ...") or any other
+  // separator — the dash was never the real signal, clause distance was. A
+  // genuine confirm-gate ("confirm before I proceed", "confirm to continue
+  // and I'll generate...") always has its gate verb within a couple of
+  // words; bounding the gap keeps those matching while rejecting a
+  // recommendation that merely mentions "confirm" and a verb from that list
+  // several clauses apart.
+  /\bconfirm\b\s+(?:[^\s.?!\n]+\s+){0,6}\b(?:to|before)\b\s+(?:[^\s.?!\n]+\s+){0,4}\b(?:proceed|continu|generat|build|start|begin|send|creat|draft|deliver|run\b)/i,
   // Numbered/lettered option prompt: "Reply 1 (…) or 2 (…)", "reply with option 2".
   // Opus emitted this exact form ("Reply 1 … or 2 …") instead of "Reply go" (ENG-369).
   /\breply\s+(?:with\s+)?(?:option\s+)?["'“]?\d\b/i,
@@ -2059,8 +2064,8 @@ function stripMarkdownEmphasis(content: string): string {
 // The mandated trailer is required to be the FINAL line of every message, but
 // live transcripts don't reliably preserve a literal newline before it (see
 // the ENG-1256 repro strings below), so this can't anchor on "^|\n". Instead
-// the trailing `(?:(?!👉?\s*next\s*step\s*:)[\s\S])*$` clause forbids the
-// matched suffix from containing another "next step:" occurrence, which
+// the trailing `(?:(?!👉?\s*next\s*steps?\s*:)[\s\S])*$` clause forbids the
+// matched suffix from containing another "next step(s):" occurrence, which
 // forces the regex engine to land on the LAST occurrence in the string (a
 // standard "match the final instance" technique for a non-global pattern).
 // Without it, a message that quotes/echoes an earlier "👉 Next Step:" line
@@ -2070,7 +2075,11 @@ function stripMarkdownEmphasis(content: string): string {
 // a whole code point (👉 is a surrogate pair); without /u, only the trailing
 // low-surrogate code unit is optional and the high surrogate is a mandatory
 // literal, so a trailer without the emoji would fail to strip at all.
-const NEXT_STEP_TRAILER = /👉?\s*next\s*step\s*:(?:(?!👉?\s*next\s*step\s*:)[\s\S])*$/iu;
+// `steps?` tolerates plural drift ("👉 Next Steps:") — the mandated wording is
+// singular, but a model that pluralizes it would otherwise skip this pattern
+// entirely (verified live: bypasses stripping, so the trailer's prose reaches
+// the confirmation detector completely unstripped).
+const NEXT_STEP_TRAILER = /👉?\s*next\s*steps?\s*:(?:(?!👉?\s*next\s*steps?\s*:)[\s\S])*$/iu;
 
 function stripNextStepTrailer(content: string): string {
   return content.replace(NEXT_STEP_TRAILER, '');
