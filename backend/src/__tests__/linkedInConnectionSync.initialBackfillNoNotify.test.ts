@@ -56,10 +56,10 @@ jest.mock('../services/dripSequenceDb', () => ({
 }));
 
 const mockFindLeadsByLinkedin = jest.fn().mockResolvedValue([]);
-const mockGetAllUsers = jest.fn().mockResolvedValue([]);
+const mockScanWithFilter = jest.fn().mockResolvedValue([]);
 jest.mock('../services/db', () => ({
   crmDb: { findLeadsByLinkedin: (...a: any[]) => mockFindLeadsByLinkedin(...a) },
-  userDb: { getAllUsers: (...a: any[]) => mockGetAllUsers(...a) },
+  userDb: { scanWithFilter: (...a: any[]) => mockScanWithFilter(...a) },
 }));
 
 const mockGetSetting = jest.fn().mockResolvedValue(null);
@@ -95,7 +95,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   // Single site-wide account to sync.
   mockGetSetting.mockResolvedValue({ settingValue: JSON.stringify([{ account_id: 'acct-1', enabled: true }]) });
-  mockGetAllUsers.mockResolvedValue([]);
+  mockScanWithFilter.mockResolvedValue([]);
   // Enable the notify/enroll kill-switches so the "processes normally" assertions
   // reflect the backfill gate, not the global mute (which is covered elsewhere).
   process.env.LINKEDIN_CONNECTION_NOTIFY = 'true';
