@@ -136,6 +136,44 @@ describe('buildUnavailableCapabilityNotice', () => {
     expect(notice).toContain('audit_ad_utm_coverage');
   });
 
+  it('fires when the failed install landed BEFORE the refusal in the same assistant message', () => {
+    /*
+     * Parallel tool calls in one assistant message land in the ledger in whatever order the
+     * model emitted them. The old predicate required the install to come strictly AFTER the
+     * refusal, so this identical turn armed or disarmed the notice purely on that ordering —
+     * a model that asks for the skill first and then tries the tool (the more sensible order)
+     * silently got no notice at all.
+     */
+    const notice = buildUnavailableCapabilityNotice([
+      { name: 'install_skills', result: { success: false, message: 'not available with your current subscription' } },
+      { name: 'audit_ad_utm_coverage', error: gateError('audit_ad_utm_coverage') },
+    ] as any);
+
+    expect(notice).toContain('audit_ad_utm_coverage');
+  });
+
+  it('fires when the install was PARTIAL — success:true with some skills refused', () => {
+    /*
+     * A partial install reports `success: true` because something installed, while the ONE
+     * skill the gated tool needed may be exactly the one that was refused. Reading that as a
+     * clean install disarmed the notice on the shape it is most likely to be needed for.
+     */
+    const notice = buildUnavailableCapabilityNotice([
+      { name: 'audit_ad_utm_coverage', error: gateError('audit_ad_utm_coverage') },
+      {
+        name: 'install_skills',
+        result: {
+          success: true,
+          message: 'Successfully installed 1 skill(s). 1 skill(s) were not available with your subscription.',
+          installedSkills: ['Some Other Skill'],
+          rejectedSkillIds: ['utm-audit'],
+        },
+      },
+    ] as any);
+
+    expect(notice).toContain('audit_ad_utm_coverage');
+  });
+
   it('warns that content below it did not come from the missing tool', () => {
     // The whole point: the reader must not take what follows as that tool's output.
     const notice = buildUnavailableCapabilityNotice([
