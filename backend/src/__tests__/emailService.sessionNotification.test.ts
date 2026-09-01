@@ -1,4 +1,5 @@
 import { emailService } from '../services/emailService';
+import { settingsService } from '../services/settingsService';
 
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
@@ -6,9 +7,19 @@ jest.mock('../services/chatbotService', () => ({
   },
 }));
 
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    claimSetMember: jest.fn(),
+    releaseSetMember: jest.fn(),
+  },
+}));
+
 describe('emailService.sendSessionNotificationEmail', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Default: every claim wins (fresh session/recipient pair), matching the prior
+    // no-dedup behavior for tests that aren't exercising ENG-1297 directly.
+    (settingsService.claimSetMember as jest.Mock).mockResolvedValue(true);
   });
 
   it('sends via sendEmailStrict (system SMTP sender, throws on failure)', async () => {
@@ -85,5 +96,51 @@ describe('emailService.sendSessionNotificationEmail', () => {
     await emailService.sendSessionNotificationEmail(['r@example.com'], 'session-555', 'Report body');
 
     expect(softSpy).not.toHaveBeenCalled();
+  });
+
+  // ENG-1297: a post-completion scheduler nudge (or any other caller) resending a
+  // notification for a session that already sent it must not produce a second email.
+  describe('duplicate-send guard (ENG-1297)', () => {
+    it('claims an idempotency key scoped to the session and recipients before sending', async () => {
+      jest.spyOn(emailService, 'sendEmailStrict').mockResolvedValue({ messageId: 'msg-1' });
+
+      await emailService.sendSessionNotificationEmail(['B@Example.com', 'a@example.com'], 'session-666', 'Report');
+
+      expect(settingsService.claimSetMember).toHaveBeenCalledWith(
+        'notify-session:session-666',
+        'a@example.com,b@example.com'
+      );
+    });
+
+    it('skips sending and returns duplicate:true when the claim is already held', async () => {
+      (settingsService.claimSetMember as jest.Mock).mockResolvedValue(false);
+      const spy = jest.spyOn(emailService, 'sendEmailStrict').mockResolvedValue({ messageId: 'msg-1' });
+
+      const result = await emailService.sendSessionNotificationEmail(['r@example.com'], 'session-777', 'Report');
+
+      expect(spy).not.toHaveBeenCalled();
+      expect(result).toEqual({ sent: false, duplicate: true });
+    });
+
+    it('returns sent:true after a fresh send', async () => {
+      jest.spyOn(emailService, 'sendEmailStrict').mockResolvedValue({ messageId: 'msg-1' });
+
+      const result = await emailService.sendSessionNotificationEmail(['r@example.com'], 'session-888', 'Report');
+
+      expect(result).toEqual({ sent: true, duplicate: false });
+    });
+
+    it('releases the claim when the send fails, so a genuine retry can still succeed', async () => {
+      jest.spyOn(emailService, 'sendEmailStrict').mockRejectedValue(new Error('SMTP error'));
+
+      await expect(
+        emailService.sendSessionNotificationEmail(['r@example.com'], 'session-999', 'Report')
+      ).rejects.toThrow('SMTP error');
+
+      expect(settingsService.releaseSetMember).toHaveBeenCalledWith(
+        'notify-session:session-999',
+        'r@example.com'
+      );
+    });
   });
 });
