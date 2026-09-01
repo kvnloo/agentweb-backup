@@ -10,6 +10,17 @@ import type { DailyVolumeState } from './linkedInWritePacer';
 export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly';
 
 /**
+ * ENG-1616 — the subset of `PlatformType` that `postOnConnectedAccount` treats as
+ * social-posting-capable. Single source of truth for that allowlist: it used to be
+ * duplicated between `agentModeService.postOnConnectedAccount` and the scheduled
+ * publish consent guard's `resolveAccountPlatform`, both narrowing an account_id
+ * lookup to these platforms before matching — a drift between the two copies would
+ * silently break account resolution for the missing platform on one side, with no
+ * test or runtime signal to catch it.
+ */
+export const SOCIAL_POSTING_PLATFORMS: readonly PlatformType[] = ['twitter', 'linkedin', 'instagram', 'youtube'];
+
+/**
  * Base OAuth configuration shared across all platforms
  */
 export interface BaseOAuthConfig {
@@ -290,6 +301,17 @@ export interface AttioConfig extends BaseOAuthConfig {
   account_type: 'oauth';
   workspace_id: string;
   workspace_name: string;
+  // Set after a real-time webhook subscription is registered against this
+  // workspace (POST /v2/webhooks — Attio's model is per-workspace, unlike
+  // HubSpot's single app-wide subscription list). `webhook_signing_key` is
+  // the secret Attio returns at creation time — it's shown only once and
+  // must be persisted immediately for HMAC verification of inbound events.
+  webhook_id?: string;
+  webhook_signing_key?: string;
+  // Set when webhook registration fails with 403 (missing webhook:read-write
+  // scope on this token — e.g. connected before the scope was added to the
+  // app). Cleared on reconnect, same pattern as TwitterXConfig/CalendlyConfig.
+  needs_reconnect?: boolean;
 }
 
 export interface GoogleAdsConfig extends BaseOAuthConfig {
@@ -1022,6 +1044,50 @@ export const getAccountsByCalendlyUserUri = async (
     return matches;
   } catch (error) {
     console.error('Error resolving Calendly user_uri to accounts:', error);
+    return [];
+  }
+};
+
+/**
+ * Find the user (and the specific connected account) that owns a given Attio
+ * workspace_id. Used by the incoming Attio webhook to resolve which tenant(s)
+ * a delivery belongs to.
+ *
+ * Returns every match, not a single best-guess userId, following the same
+ * ENG-994 lesson `getAccountsByCalendlyUserUri` already documents above:
+ * two tenants could in principle connect the same underlying Attio workspace
+ * independently, each with their own webhook subscription and signing key —
+ * a single-match resolver would silently drop one tenant's deliveries on a
+ * collision. The caller verifies each candidate's own webhook_signing_key
+ * against the delivery's signature rather than committing to a guess.
+ */
+export const getAccountsByAttioWorkspaceId = async (
+  workspaceId: string
+): Promise<Array<{ userId: string; account: ConnectedAccountConfig }>> => {
+  try {
+    const { userDb } = await import('./db');
+    // Deliberately scanWithFilter, not getAllUsers(): this runs on every
+    // incoming Attio webhook, unauthenticated until a candidate's signing key
+    // verifies below — getAllUsers() additionally starts three count queries
+    // (tasks/workflows/chat sessions) per user for admin-dashboard display,
+    // irrelevant here and multiplying the cost of every delivery. A full
+    // table scan is still unavoidable without a dedicated workspace-to-account
+    // index (a schema change, gated separately), but skipping the per-user
+    // fan-out removes the dominant, easily-avoidable cost.
+    const users = await userDb.scanWithFilter('attribute_exists(connected_accounts)', {});
+    const matches: Array<{ userId: string; account: ConnectedAccountConfig }> = [];
+
+    for (const user of users) {
+      const accounts = normalizeAccounts((user as User).connected_accounts);
+      for (const account of accounts) {
+        if (account.platform === 'attio' && (account.config as AttioConfig).workspace_id === workspaceId) {
+          matches.push({ userId: user.userId, account });
+        }
+      }
+    }
+    return matches;
+  } catch (error) {
+    console.error('Error resolving Attio workspace_id to accounts:', error);
     return [];
   }
 };

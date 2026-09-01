@@ -39,6 +39,14 @@ jest.mock('../services/db', () => ({
   chatDb: { getChatSession: jest.fn() },
 }));
 
+// updateScheduledChat now gates on isSubscriptionFeatureEnabled before doing
+// anything else — without this mock the real function runs (no AWS creds in
+// the test environment), so the handler never reaches scheduleDb.updateSchedule
+// at all and every assertion in this file fails with "0 calls".
+jest.mock('../services/subscriptionService', () => ({
+  isSubscriptionFeatureEnabled: jest.fn(async () => true),
+}));
+
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 
 const SCHEDULE_ID = 'sc-1365';

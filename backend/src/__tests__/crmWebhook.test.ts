@@ -22,14 +22,17 @@ jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListById: jest.fn(),
     getLeadByEmail: jest.fn(),
+    getLeadByAttioRecordId: jest.fn().mockResolvedValue(null),
     updateLead: jest.fn(),
   },
 }));
 
+const mockUpdateSyncTimestamp = jest.fn().mockResolvedValue(undefined);
 jest.mock('../services/externalCrmSyncService', () => ({
   externalCrmSyncService: {
     getConfig: jest.fn(),
     resolveAuthForList: jest.fn(),
+    updateSyncTimestamp: (...a: any[]) => mockUpdateSyncTimestamp(...a),
   },
 }));
 
@@ -42,10 +45,17 @@ jest.mock('../services/hubspotService', () => ({
 }));
 
 const mockAttioGetPersonValues = jest.fn();
+const mockAttioSvcExtras = {
+  loadAttributeTypes: jest.fn().mockResolvedValue(new Map([
+    ['object:people:email_addresses', 'email_address'],
+    ['object:people:phone_numbers', 'phone_number'],
+  ])),
+  getCompanyById: jest.fn().mockResolvedValue(null),
+};
 jest.mock('../services/attioService', () => ({
   AttioService: {
-    fromToken: jest.fn().mockReturnValue({ getPersonValues: mockAttioGetPersonValues }),
-    create: jest.fn().mockResolvedValue({ getPersonValues: mockAttioGetPersonValues }),
+    fromToken: jest.fn().mockReturnValue({ getPersonValues: mockAttioGetPersonValues, ...mockAttioSvcExtras }),
+    create: jest.fn().mockResolvedValue({ getPersonValues: mockAttioGetPersonValues, ...mockAttioSvcExtras }),
   },
 }));
 
@@ -69,7 +79,19 @@ const mockConfig = (provider: string) => ({
   webhookSecret: VALID_SECRET,
   deleteOnPull: false,
   autoSyncEnabled: false,
-  contactFieldMapping: [],
+  // Mirrors DEFAULT_ATTIO_CONTACT_MAPPING (externalCrmSyncService.ts) — the
+  // Attio webhook path is config-driven now (ENG-1380), so its tests need a
+  // realistic mapping. HubSpot's webhook handler hardcodes its own field
+  // list and never reads this, so it's safe to share across both providers.
+  contactFieldMapping: [
+    { agentwebField: 'email', crmProperty: 'email_addresses', direction: 'both', enabled: true },
+    { agentwebField: 'firstName', crmProperty: 'first_name', direction: 'both', enabled: true },
+    { agentwebField: 'lastName', crmProperty: 'last_name', direction: 'both', enabled: true },
+    { agentwebField: 'phone', crmProperty: 'phone_numbers', direction: 'both', enabled: true },
+    { agentwebField: 'title', crmProperty: 'job_title', direction: 'both', enabled: true },
+    { agentwebField: 'company', crmProperty: 'company', direction: 'both', enabled: true },
+    { agentwebField: 'linkedin', crmProperty: 'linkedin', direction: 'push', enabled: true },
+  ],
   dealFieldMapping: [],
   customFieldMapping: [],
   createdAt: '2026-01-01T00:00:00Z',
@@ -280,6 +302,72 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
       'lead-3',
       expect.objectContaining({ firstName: 'Alice', lastName: 'Smith', title: 'CTO' })
     );
+    // Live-caught gap: a webhook-driven update applied the data change but
+    // never stamped lastPullSyncAt, so the CRM Sync dialog's "last pulled"
+    // indicator looked permanently stale even though auto-pull was working.
+    expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.anything(), 'pull', true);
+  });
+
+  // CodeRabbit-flagged: without a per-event try/catch, a throw from
+  // applyAttioPersonEvent aborted the loop AND skipped updateSyncTimestamp
+  // entirely (the throw propagates past it) — a failed delivery left
+  // lastPullSyncAt/lastSyncStatus silently stale with zero indication
+  // anything went wrong, reintroducing the exact invisible-failure problem
+  // the stamp exists to prevent.
+  it('stamps lastPullSyncAt with success:false when applying the Attio event throws', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue(mockConfig('attio'));
+    mockAttioGetPersonValues.mockResolvedValue({
+      email_addresses: [{ email_address: 'attio@company.com' }],
+      name: [{ first_name: 'Alice', last_name: 'Smith' }],
+    });
+    const existingLead = { leadId: 'lead-3', email: 'attio@company.com', firstName: 'Alice' };
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existingLead);
+    (crmDb.updateLead as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+
+    const event = {
+      event_type: 'record.updated',
+      workspace_id: 'ws-abc',
+      data: {
+        object: { slug: 'people' },
+        record: { id: { record_id: 'rec-xyz' } },
+      },
+    };
+
+    const res = await request(app)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send(event);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.anything(), 'pull', false);
+  });
+
+  // CodeRabbit-flagged: the per-event try/catch above only covers
+  // applyAttioPersonEvent failures — a throw from auth/service resolution
+  // (e.g. a bad or expired manual token) happens BEFORE the loop even
+  // starts, and previously skipped updateSyncTimestamp entirely too.
+  it('stamps lastPullSyncAt with success:false when Attio auth/service resolution throws', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue(mockConfig('attio'));
+    (externalCrmSyncService.resolveAuthForList as jest.Mock).mockRejectedValueOnce(new Error('token decryption failed'));
+
+    const event = {
+      event_type: 'record.updated',
+      workspace_id: 'ws-abc',
+      data: {
+        object: { slug: 'people' },
+        record: { id: { record_id: 'rec-xyz' } },
+      },
+    };
+
+    const res = await request(app)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send(event);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.anything(), 'pull', false);
   });
 
   it('skips Attio event for non-people objects (e.g. companies)', async () => {
