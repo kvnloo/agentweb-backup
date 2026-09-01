@@ -176,8 +176,9 @@ describe('executePreparedTools', () => {
      * port is) converts a `success: false` result into a tool failure first, so the entry does
      * carry an `error`.
      *
-     * buildUnavailableCapabilityNotice keys off exactly that. This test is what keeps the two
-     * from drifting: unwire the downgrade and it fails here, not silently in production.
+     * Anything reading the ledger to decide whether the install worked keys off exactly that,
+     * so this test is what keeps the two from drifting: unwire the downgrade and it fails here,
+     * not silently in production.
      */
     it('a refused install_skills reaches the ledger as a failure, not a bare success', async () => {
       const ports = makePorts({

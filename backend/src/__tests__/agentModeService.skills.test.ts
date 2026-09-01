@@ -57,7 +57,6 @@ jest.mock('../mcp/client/toolRegistry', () => ({
 // Import the mocked modules to access the mock functions
 import { skillService } from '../services/skillService';
 import { chatbotDb } from '../services/chatbotService';
-import { buildUnavailableCapabilityNotice } from '../services/agentMode/core/synthesisResidue';
 
 
 describe('AgentModeService - Skills', () => {
@@ -144,17 +143,18 @@ describe('AgentModeService - Skills', () => {
     });
 
     /*
-     * The END-TO-END shape, not a hand-built fixture.
+     * The outcome has to survive MINIMIZATION, not just be returned.
      *
-     * `buildUnavailableCapabilityNotice`'s own unit tests construct ledger entries directly
-     * (`{ name: 'install_skills', result: { success: false } }`), a shape the pipeline never
-     * produced: the dispatcher stores `extractMinimalToolResult(result, 'install_skills')`, and
-     * that function had no install_skills branch, so the real entry was `result: {}` — no
-     * `error`, no `success: false`. The notice read that as a SUCCESSFUL install and suppressed
-     * itself. The feature was inert in production while every one of its tests passed, which is
-     * exactly the trap `extractMinimalToolResult`'s ENG-1207 comment documents.
+     * The dispatcher does not store the result — it stores
+     * `extractMinimalToolResult(result, 'install_skills')`, and that function's default branch
+     * returns `{}`. So a refusal that reads perfectly here can still reach the ledger as an
+     * empty object with no `success: false` at all, and anything downstream reading the ledger
+     * to find out whether the install worked sees a shape indistinguishable from a clean one.
      *
-     * So this test crosses the real seam: refusal -> minimization -> predicate.
+     * That is not hypothetical: `extractMinimalToolResult`'s own ENG-1207 comment records
+     * `reconcileUnconsumedCursors` being inert in production for exactly this reason while all
+     * of its unit tests passed, because those tests built ledger entries by hand and so never
+     * crossed this function. This test crosses it deliberately.
      */
     it('a refused install still reads as a failure AFTER ledger minimization', async () => {
       (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
@@ -162,20 +162,15 @@ describe('AgentModeService - Skills', () => {
       const refusal = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
       const ledgerResult = (agentModeService as any).extractMinimalToolResult(refusal, 'install_skills');
 
-      // The field the predicate reads must survive minimization at all.
       expect(ledgerResult.success).toBe(false);
-
-      const notice = buildUnavailableCapabilityNotice([
-        { name: 'audit_ad_utm_coverage', error: 'Tool "audit_ad_utm_coverage" is not available. You must install the required skill first using install_skills.' },
-        { name: 'install_skills', result: ledgerResult },
-      ] as any);
-
-      expect(notice).toContain('audit_ad_utm_coverage');
+      // The refusal must still be readable in the ledger, not just in the returned object.
+      expect(String(ledgerResult.message)).toMatch(/not available with your current subscription/i);
     });
 
     it('a PARTIAL install survives minimization as partial, not as a clean success', async () => {
-      // success:true (something installed) + the refused ids, so the notice can tell a
-      // half-granted install from a granted one.
+      // success:true (something installed) + the refused ids. Without the ids the ledger says
+      // only "the install succeeded", which is true and useless: the one skill the gated tool
+      // needed may be exactly the one that was refused.
       (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([
         { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
       ]);
@@ -190,14 +185,8 @@ describe('AgentModeService - Skills', () => {
       expect(partial.rejectedSkillIds).toEqual(['utm-audit']);
 
       const ledgerResult = (agentModeService as any).extractMinimalToolResult(partial, 'install_skills');
+      expect(ledgerResult.success).toBe(true);
       expect(ledgerResult.rejectedSkillIds).toEqual(['utm-audit']);
-
-      const notice = buildUnavailableCapabilityNotice([
-        { name: 'audit_ad_utm_coverage', error: 'Tool "audit_ad_utm_coverage" is not available. You must install the required skill first using install_skills.' },
-        { name: 'install_skills', result: ledgerResult },
-      ] as any);
-
-      expect(notice).toContain('audit_ad_utm_coverage');
     });
 
     it('should filter out unpublished skills', async () => {

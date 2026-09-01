@@ -46,7 +46,7 @@ import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoAssetUrl,
@@ -3539,15 +3539,6 @@ export class AgentModeService {
       // standing down one guard silently disables the other.
       const falseClaimGuardEnabled = process.env.AGENT_FALSE_CLAIM_GUARD !== 'false';
 
-      // Kill switch for the unavailable-capability notice below — ON by default; set
-      // AGENT_UNAVAILABLE_CAPABILITY_NOTICE=false to stand it down. Its two sibling guards in
-      // the same block each have one and this did not, which is the difference between a bad
-      // banner being a config change and a bad banner being a revert-and-redeploy. It is also
-      // the guard that most needs one: it is UNCONDITIONAL, so a false positive prepends a
-      // scary warning to an otherwise correct answer on every affected turn.
-      const unavailableCapabilityNoticeEnabled =
-        process.env.AGENT_UNAVAILABLE_CAPABILITY_NOTICE !== 'false';
-
       let wasCancelled = false;
       // ENG-244: set true when the loop exits because the step budget (maxIterations)
       // was exhausted. This is the deterministic signal a long data-gathering
@@ -4136,30 +4127,6 @@ export class AgentModeService {
                 `${falseClaim.actual} succeeded asset-producing call(s) in session ${sessionId} — appending a correction`
               );
               content = `${content}\n\n${buildFalseClaimCorrectionFooter(falseClaim, toolCalls)}`;
-              if (responseMessage) responseMessage.content = content;
-            }
-          }
-
-          /*
-           * A capability the skill gate refused, and which never afterwards succeeded, is
-           * stated ABOVE the answer — unconditionally, not gated on detecting a false claim.
-           *
-           * The false-claim guard above already existed when a live delegated session produced
-           * a fabricated "UTM Tagging Audit Summary — PASS, 6/6 ads tagged" table after
-           * `audit_ad_utm_coverage` was gated and `install_skills` was refused by subscription.
-           * It caught that one only because the claim carried a checkable number, and it put the
-           * correction BELOW the fabricated table. Both are why this is prepended and why it
-           * does not try to decide whether the prose claims the tool ran: that a tool was
-           * refused and never succeeded is a fact in the ledger, so this cannot false-positive.
-           */
-          if (unavailableCapabilityNoticeEnabled && content) {
-            const unavailableNotice = buildUnavailableCapabilityNotice(toolCalls);
-            if (unavailableNotice) {
-              console.warn(
-                `AgentMode: a gated tool never succeeded in session ${sessionId} — prepending an ` +
-                `unavailable-capability notice so the answer cannot read as that tool's output`
-              );
-              content = `${unavailableNotice}\n\n${content}`;
               if (responseMessage) responseMessage.content = content;
             }
           }
@@ -5969,9 +5936,10 @@ export class AgentModeService {
          *
          * A partial install returns `success: true` — something did install — so every
          * "did the install work" test downstream reads it as clean, while the one skill the
-         * model actually needed may be exactly the one that was refused.
-         * `buildUnavailableCapabilityNotice` keys off this array to tell those apart, and it
-         * cannot key off a sentence.
+         * model actually needed may be exactly the one that was refused. That distinction is
+         * the whole outcome of the call, and a sentence inside `message` is not something any
+         * consumer can key off: not the model, which has to be told WHICH ids it did not get,
+         * and not any future guard, which would be reduced to string-matching prose.
          */
         result.rejectedSkillIds = rejectedSkillIds;
       }
@@ -6632,10 +6600,10 @@ export class AgentModeService {
      *
      * What that downgrade cannot see is a PARTIAL install: it returns `success: true` because
      * something installed, so no error is raised, while the one skill the gated tool needed may
-     * be exactly the one that was refused. `rejectedSkillIds` is the only fact that separates
-     * those two, and the default `{}` below stripped it — which is what
-     * `buildUnavailableCapabilityNotice` needs to tell a half-granted install from a granted
-     * one.
+     * be exactly the one that was refused. `rejectedSkillIds` is the only fact that separates a
+     * half-granted install from a granted one, and the default `{}` below stripped it — leaving
+     * the ledger asserting a clean install on the exact shape where the model did not get what
+     * it asked for.
      *
      * `success`/`message` ride along so the ledger entry is self-describing rather than
      * depending on the downgrade staying wired the way it is today. Ids and a short message,
@@ -6655,9 +6623,9 @@ export class AgentModeService {
       const a = (actualResult && typeof actualResult === 'object' ? actualResult : {}) as Record<string, any>;
       return {
         // `success` only when the result actually carries it. Defaulting a missing flag to
-        // false would let an unrecognised shape read as a FAILED install, and this feeds an
-        // unconditional warning banner — putting one above a correct answer is the expensive
-        // direction to be wrong here.
+        // false would let an unrecognised shape read as a FAILED install — reporting a failure
+        // that did not happen is the expensive direction to be wrong here, so an absent flag
+        // stays absent rather than being invented.
         ...(a.success !== undefined ? { success: a.success === true } : {}),
         ...(a.message !== undefined ? { message: a.message } : {}),
         ...(Array.isArray(a.installedSkills) ? { installedSkills: a.installedSkills } : {}),
