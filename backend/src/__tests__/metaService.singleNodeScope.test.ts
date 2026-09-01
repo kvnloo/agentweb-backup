@@ -11,7 +11,7 @@
 // which account actually owns the node.
 
 import { MetaService } from '../services/metaService';
-import { FacebookAdsApi, AdAccount, Campaign, AdSet } from 'facebook-nodejs-business-sdk';
+import { FacebookAdsApi, AdAccount, Campaign, AdSet, Ad } from 'facebook-nodejs-business-sdk';
 
 jest.mock('facebook-nodejs-business-sdk', () => ({
   FacebookAdsApi: { init: jest.fn() },
@@ -19,7 +19,10 @@ jest.mock('facebook-nodejs-business-sdk', () => ({
   Campaign: jest.fn().mockImplementation(() => ({ get: jest.fn() })),
   AdSet: jest.fn().mockImplementation(() => ({ get: jest.fn() })),
   AdCreative: Object.assign(jest.fn(), { Fields: {} }),
-  Ad: Object.assign(jest.fn(), { Fields: {}, Status: {} }),
+  Ad: Object.assign(
+    jest.fn().mockImplementation(() => ({ get: jest.fn() })),
+    { Fields: {}, Status: {} },
+  ),
   CustomAudience: jest.fn(),
   User: jest.fn(),
 }));
@@ -127,6 +130,61 @@ describe('single-entity Meta node reads are bounded by the selected ad account',
     const result = await service.listAdSets(SELECTED, token, undefined, { adSetId: 'as_9' });
     expect(result.adSets).toEqual([{ id: 'as_9', name: 'Mine' }]);
     expect(result.scope).toEqual({ adSetId: 'as_9' });
+  });
+
+  /*
+   * getAd took no ad-account argument at all and did no ownership check, so it returned any ad
+   * the token could reach. That matters because buildMetaWriteConfirmation's resolveAd renders
+   * the result's NAME into the prompt the USER approves — the same disclosure getCampaign and
+   * getAdSet were both hardened against on this branch, on the resolver sitting between them.
+   */
+  it('AD single fetch: refuses an ad owned by a different ad account', async () => {
+    const get = nodeGet(OTHER_TENANT, { id: 'ad_9', name: 'Someone else’s ad' });
+    (Ad as unknown as jest.Mock).mockImplementation(() => ({ get }));
+
+    await expect(service.getAd(token, 'ad_9', SELECTED)).rejects.toThrow(
+      /not available in the selected ad account/i,
+    );
+  });
+
+  it('AD single fetch: the refusal does not disclose the owning account (no oracle)', async () => {
+    const get = nodeGet(OTHER_TENANT, { id: 'ad_9', name: 'Someone else’s ad' });
+    (Ad as unknown as jest.Mock).mockImplementation(() => ({ get }));
+
+    const message = await refusalMessage(service.getAd(token, 'ad_9', SELECTED));
+    expect(message).toMatch(/not available in the selected ad account/i);
+    expect(message).not.toContain(OTHER_TENANT);
+    expect(message).not.toContain('Someone else’s ad');
+  });
+
+  it('AD single fetch: returns an ad owned by the selected account, without the ownership field', async () => {
+    const get = nodeGet(SELECTED, { id: 'ad_9', name: 'Mine' });
+    (Ad as unknown as jest.Mock).mockImplementation(() => ({ get }));
+
+    const result = await service.getAd(token, 'ad_9', SELECTED);
+    expect(result).toEqual({ id: 'ad_9', name: 'Mine' });
+    // account_id was requested only to answer ownership; it is not part of the payload.
+    expect(result.account_id).toBeUndefined();
+    expect(get.mock.calls[0][0]).toContain('account_id');
+  });
+
+  it('AD single fetch: verifies ownership in ONE Graph call, not a separate probe', async () => {
+    const get = nodeGet(SELECTED, { id: 'ad_9', name: 'Mine' });
+    (Ad as unknown as jest.Mock).mockImplementation(() => ({ get }));
+
+    await service.getAd(token, 'ad_9', SELECTED);
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  it('AD single fetch: an omitted account leaves existing read-back callers unchanged', async () => {
+    // The parameter is optional so the post-write read-backs keep working exactly as before;
+    // only the callers whose result reaches a user-facing prompt pass it.
+    const get = jest.fn().mockResolvedValue({ _data: { id: 'ad_9', name: 'Mine' } });
+    (Ad as unknown as jest.Mock).mockImplementation(() => ({ get }));
+
+    const result = await service.getAd(token, 'ad_9');
+    expect(result).toEqual({ id: 'ad_9', name: 'Mine' });
+    expect(get.mock.calls[0][0]).not.toContain('account_id');
   });
 
   it('an `act_`-prefixed selected account still matches a bare owner id', async () => {
