@@ -135,14 +135,40 @@ export const fetchWithRetryAndPaging = async (url: string, pagesRemaining: numbe
     
     // Recursively fetch next page
     const nextPageData = await fetchWithRetryAndPaging(data.paging.next, pagesRemaining - 1);
-    
+
     // Merge the data arrays
     if (data.data && Array.isArray(data.data) && nextPageData.data && Array.isArray(nextPageData.data)) {
       data.data = [...data.data, ...nextPageData.data];
+    } else {
+      /*
+       * A page that could not be merged is a page that was NOT read, and the caller has to be
+       * told — otherwise page 1's rows are returned as the whole list.
+       *
+       * `fetchWithRetry` RETURNS a non-ok Response once its retries are exhausted rather than
+       * throwing, so a persistent 429/403/400 on page 2 arrives here as
+       * `{ error: {...} }` — no `data`, no `paging`. The merge guard above skipped it silently,
+       * `delete data.paging` then ran, and the caller (which can only see page 1's own `error`
+       * field) reported page 1's rows as `Found N campaign(s) (complete list).` A branch meant
+       * to add a completeness signal was upgrading a neutral count into a false guarantee.
+       *
+       * Reuses `pagingTruncated` rather than adding a second flag: every caller that already
+       * refuses to call a truncated read complete gets this case for free, and "the list is
+       * short and we know it" is the same fact whichever way the read stopped.
+       */
+      console.warn(`Meta API: paging stopped — a page did not return a usable data array for ${redactGraphUrl(url)}`);
+      data.pagingTruncated = true;
+      // The Graph error from the failed page, so a caller can say WHY rather than only that the
+      // list is short. Never overwrite this page's own error, and never the whole response.
+      if (nextPageData?.error !== undefined && data.pagingError === undefined) {
+        data.pagingError = nextPageData.error;
+      }
     }
-    
+
     // A downstream page that stopped at the bound makes THIS result incomplete too.
     if (nextPageData?.pagingTruncated) data.pagingTruncated = true;
+    if (nextPageData?.pagingError !== undefined && data.pagingError === undefined) {
+      data.pagingError = nextPageData.pagingError;
+    }
 
     // Remove paging info since we've fetched all pages
     delete data.paging;

@@ -16082,14 +16082,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
        * `limit`, so Meta serves its default page size. A bounded read that reports a bare count
        * is the ENG-1584 sentence — "Found N campaign(s)" reads as "these are all of them". The
        * helper reports `pagingTruncated`; say so rather than discarding it.
+       *
+       * `pagingTruncated` now covers BOTH stop reasons — the page bound and a page that came
+       * back unreadable — because `fetchWithRetry` returns a non-ok Response once its retries
+       * are exhausted instead of throwing. The `campaignsData.error` check above only ever sees
+       * page 1, so a 429 on page 2 used to reach here indistinguishable from a complete read.
+       * The wording no longer names the page bound as the cause, and the failed page's own
+       * Graph message is passed through when there is one.
        */
       const campaignsTruncated = campaignsData.pagingTruncated === true;
+      const pagingErrorMessage = typeof campaignsData.pagingError?.message === 'string'
+        ? campaignsData.pagingError.message
+        : undefined;
       return {
         success: true,
         complete: !campaignsTruncated,
         ...(campaignsTruncated ? { hasMore: true } : {}),
         message: campaignsTruncated
-          ? `Found ${campaigns.length} campaign(s), but THIS LIST IS INCOMPLETE — the read stopped at its page bound. Do NOT conclude a campaign is absent from it.`
+          ? `Found ${campaigns.length} campaign(s), but THIS LIST IS INCOMPLETE — the read stopped before the end of the account`
+            + `${pagingErrorMessage ? ` (${pagingErrorMessage})` : ''}. Do NOT conclude a campaign is absent from it.`
           : `Found ${campaigns.length} campaign(s) (complete list).`,
         campaigns: campaigns,
         totalCount: campaigns.length
