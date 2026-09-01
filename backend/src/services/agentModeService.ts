@@ -2558,6 +2558,7 @@ export class AgentModeService {
       humanPaced = false,
       timeoutMs,
       fallbackModels,
+      taskClass,
     } = options || {};
 
     // AgentWeb owns model selection; OpenRouter owns transport, provider
@@ -2683,13 +2684,25 @@ export class AgentModeService {
     };
 
     // A single 1.5s retry wasn't enough to clear a burst-triggered 429 — prod
-    // sessions on the LinkedIn Post Factory schedule (which fires several tool
-    // calls back-to-back) needed the full 15-60min scheduled-run backoff to
-    // recover from what OpenRouter reported as rate-limited. One extra
-    // attempt, backed by the Retry-After header when the provider sends one,
-    // gives a rate limit real room to clear within the same run before
+    // sessions on the LinkedIn Post Factory SCHEDULED schedule (which fires
+    // several tool calls back-to-back) needed the full 15-60min scheduled-run
+    // backoff to recover from what OpenRouter reported as rate-limited. One
+    // extra attempt, backed by the Retry-After header when the provider sends
+    // one, gives a rate limit real room to clear within the same run before
     // falling back to that expensive path.
-    const maxAttempts = 3;
+    //
+    // Scoped to scheduled_background ONLY: this loop is shared by every
+    // caller of callLLM, including a live interactive chat with a human
+    // staring at the screen. Retry-After can legitimately be tens of seconds,
+    // and honoring it across two retries could add up to ~2 minutes of dead
+    // air to an interactive turn that used to fail fast after ~1.5s — a much
+    // worse outcome for that caller than the original single-short-retry
+    // behavior. A headless scheduled run has no one watching and already
+    // tolerates a much larger backoff at the schedule level, so it's the only
+    // context where trading latency for a better shot at recovery is a clear
+    // win rather than a regression.
+    const isScheduledLlmCall = taskClass === 'scheduled_background';
+    const maxAttempts = isScheduledLlmCall ? 3 : 2;
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
@@ -2728,7 +2741,11 @@ export class AgentModeService {
       } catch (error) {
         lastError = error;
         if (attempt < maxAttempts && isRetryableLlmCallError(error)) {
-          const retryAfterMs = getRetryAfterMs(error);
+          // Retry-After is only honored for scheduled calls (see maxAttempts
+          // comment above) — an interactive/other caller keeps the original
+          // fixed, short backoff so a live turn still fails fast rather than
+          // trusting a provider-reported wait that could be tens of seconds.
+          const retryAfterMs = isScheduledLlmCall ? getRetryAfterMs(error) : undefined;
           const backoffMs = retryAfterMs ?? 1500 * Math.pow(2, attempt - 1);
           console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms${retryAfterMs !== undefined ? ' (honoring Retry-After)' : ''}`, {
             error: error instanceof Error ? error.message : String(error),
