@@ -77,6 +77,8 @@ import {
   applyAnswer,
   buildPendingUserQuestion,
   checkQuestionGate,
+  findAnsweredObjectiveCandidate,
+  summarizeAnsweredObjectiveQuestions,
   findQuestionByKind,
   renderQuestionPrompt,
   verifyExplicitStatement,
@@ -359,6 +361,7 @@ import {
   trackingOverrideTokenMatches,
 } from './metaLaunchGate';
 import { HubSpotService } from './hubspotService';
+import { handleAttioApi as handleAttioApiImpl } from './agentMode/attioTools';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
@@ -19104,6 +19107,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     objective: string,
     quote: string,
     objectiveKind: string,
+    sourceQuestionId?: string,
   ): Promise<void> {
     const question = buildPendingUserQuestion({
       questionId: uuidv4(),
@@ -19115,7 +19119,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           consequence: 'Confirmed by the user\'s own words — not shown as a card.',
           recommended: true,
           why: `The user explicitly stated this: "${quote}"`,
-          payload: { objective },
+          payload: { objective, ...(sourceQuestionId ? { sourceQuestionId } : {}) },
         },
         {
           // Structural placeholder only — the primitive requires 2–4 options
@@ -19136,7 +19140,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       optionId: 'confirmed',
       delegated: false,
       answeredBy: 'user',
-      rationale: `Explicitly stated by the user: "${quote}"`,
+      rationale: sourceQuestionId
+        ? `Consumed answered objective card ${sourceQuestionId}`
+        : `Explicitly stated by the user: "${quote}"`,
       at: new Date().toISOString(),
     });
     await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
@@ -19258,6 +19264,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
     }
 
+    const { consumedQuestionIds, hasAnsweredObjectiveCard } = summarizeAnsweredObjectiveQuestions(
+      session?.pendingUserQuestion,
+      session?.answeredQuestions,
+      AgentModeService.META_OBJECTIVE_VALUES,
+    );
+    const looseCandidate = findAnsweredObjectiveCandidate(
+      session?.pendingUserQuestion,
+      session?.answeredQuestions,
+      {
+        accountId: account_id,
+        validObjectives: AgentModeService.META_OBJECTIVE_VALUES,
+        bindsLabel: (objective, text) => Boolean(AgentModeService.META_OBJECTIVE_KEYWORDS[objective]?.test(text)),
+        consumedQuestionIds,
+      },
+    );
+    if (looseCandidate) {
+      await this.persistExplicitObjectiveConfirmation(
+        sessionId,
+        looseCandidate.objective,
+        `answered objective card ${looseCandidate.question.questionId}`,
+        objectiveKind,
+        looseCandidate.question.questionId,
+      );
+      return { allowed: true, objective: looseCandidate.objective };
+    }
+
     // Path 3: nothing settled — surface the blocking ask ourselves. Never
     // proceed on a guess (this is the load-bearing refusal). Recommendation is
     // STATIC per the 80/20 design (Harsha, 2026-07-20) — OUTCOME_LEADS is the
@@ -19298,6 +19330,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const question = buildPendingUserQuestion({
       questionId: uuidv4(),
       question: 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.',
+      intro: hasAnsweredObjectiveCard
+        ? 'You answered an objective question earlier, but it did not match this campaign and account, so I need this one confirmed.'
+        : undefined,
       options,
       immutable: true,
       allowEmmaDecide: true,
@@ -32354,7 +32389,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountsWithOwnerIncludingOrgShared, getAccountByIdConsistent } = await import('./connectedAccountsDb');
+      const { getAccountsWithOwnerIncludingOrgShared, getAccountByIdConsistent, SOCIAL_POSTING_PLATFORMS } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       // Fetch all accessible accounts (own + org-shared) once, so org-shared accounts
@@ -32363,7 +32398,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // which returns null for accounts owned by an org member — use this instead.
       const allAccounts = await getAccountsWithOwnerIncludingOrgShared(userId);
       const socialAccounts = allAccounts.filter((a: any) =>
-        ['twitter', 'linkedin', 'instagram', 'youtube'].includes(a.platform)
+        (SOCIAL_POSTING_PLATFORMS as readonly string[]).includes(a.platform)
       );
 
       let account: any;
@@ -37134,6 +37169,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return { success: false, error: err?.message ?? 'HubSpot API call failed.', hubspotError: err?.response?.data ?? null, status: err?.response?.status ?? null };
     }
   }
+
+  /**
+   * Emma tool: read-only Attio lead counts, for CPL/attribution reporting,
+   * plus Attio list/list-entry management. Extracted to
+   * services/agentMode/attioTools.ts (self-contained, no monolith coupling)
+   * per this file's subtraction-biased complexity policy.
+   */
+  public async handleAttioApi(userId: string, args: any): Promise<any> {
+    return handleAttioApiImpl(userId, args);
+  }
+
 
 }
 

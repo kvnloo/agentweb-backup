@@ -2,6 +2,22 @@ import { CrmAdapter, CrmAuth } from './crmAdapterTypes';
 import { ExternalCrmSyncConfig, FieldMapping, SyncResult } from '../externalCrmSyncService';
 import { AttioService } from '../attioService';
 import { crmDb } from '../db';
+import { buildSyncedMetadataBase, buildFailedMetadata } from '../../utils/leadSyncStatus';
+import { validateEmail } from '../../utils/validation';
+import { mergeCustomFields } from '../../utils/customFieldsGuard';
+
+/**
+ * System list-identity mapping, mirroring HUBSPOT_LIST_IDENTITY_MAPPING
+ * (hubspotAdapter.ts) exactly. Push-only (the values are owned by Emma).
+ * pushLeads injects these at push time when a stored config doesn't already
+ * carry them, so lists connected before this feature shipped sync the fields
+ * without a manual re-save. An explicit config entry (re-mapped or disabled
+ * in the dialog) always wins.
+ */
+export const ATTIO_LIST_IDENTITY_MAPPING: FieldMapping[] = [
+    { agentwebField: 'listName', crmProperty: 'lead_list_name', direction: 'push', enabled: true },
+    { agentwebField: 'listId', crmProperty: 'lead_list_id', direction: 'push', enabled: true },
+];
 
 /**
  * Attio CRM Adapter
@@ -18,6 +34,25 @@ import { crmDb } from '../db';
  * The resolved token is cached on the instance for the lifetime of the operation.
  */
 export class AttioAdapter implements CrmAdapter {
+
+    /** agentwebFields that carry only source-list identity, not lead content. */
+    private static readonly LIST_IDENTITY_FIELDS = new Set(
+        ATTIO_LIST_IDENTITY_MAPPING.map(m => m.agentwebField)
+    );
+
+    /**
+     * Returns the custom mapping with the system list-identity mappings
+     * (listName/listId) appended for any agentwebField the config doesn't already
+     * define. An existing entry — whether the user re-mapped its Attio attribute
+     * or disabled it — is left untouched so explicit configuration always wins.
+     * Lets lists connected before this feature shipped sync listName/listId
+     * without a manual re-save. Mirrors hubspotAdapter.ts's identical method.
+     */
+    private withListIdentityMappings(customMapping: FieldMapping[]): FieldMapping[] {
+        const present = new Set(customMapping.map(m => m.agentwebField));
+        const missing = ATTIO_LIST_IDENTITY_MAPPING.filter(m => !present.has(m.agentwebField));
+        return missing.length > 0 ? [...customMapping, ...missing] : customMapping;
+    }
 
     // ─── Auth ──────────────────────────────────────────────────────────────────
 
@@ -48,13 +83,36 @@ export class AttioAdapter implements CrmAdapter {
         const result: SyncResult = { successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] };
         const svc = await this.getSvc(auth);
 
+        // Resolve the source list's display name once so leads can be enriched
+        // with listName/listId before mapping. Mirrors hubspotAdapter.ts's
+        // identical resolution — falls back to config.listName, then undefined,
+        // so a failed/absent lookup never aborts the push.
+        let resolvedListName = config.listName;
+        try {
+            const list = await crmDb.getLeadListById(config.listId);
+            if ((list as any)?.name) resolvedListName = (list as any).name;
+        } catch (err: any) {
+            console.warn(`[AttioAdapter] failed to resolve list name for ${config.listId}: ${err?.message}`);
+        }
+
+        // Ensure the system list-identity mappings (listName/listId) are present.
+        // Configs created before this feature shipped don't carry them in their
+        // stored customFieldMapping, so inject them here unless the config
+        // already has an explicit entry for that agentwebField.
+        const effectiveCustomMapping = this.withListIdentityMappings(config.customFieldMapping);
+
         // Load person-level attribute types first.
         // ── 1. Load person-level attribute types ─────────────────────────────────
         const attrCache = await svc.loadAttributeTypes('people');
 
-        const customPersonMappings = config.customFieldMapping.filter(
+        const customPersonMappings = effectiveCustomMapping.filter(
             m => m.enabled && m.direction !== 'pull'
         );
+        // Attio attribute slugs (post-ensure) that carry only list identity — used
+        // to decide whether a lead has any real content worth syncing (see the
+        // hasRealProps guard below). Populated once the ensure loop below resolves
+        // each mapping's final slug.
+        const listIdentitySlugs = new Set<string>();
         const ensuredSlugs = new Set<string>();
         const resolvedSlugs = new Map<string, string>();
         for (const m of customPersonMappings) {
@@ -71,6 +129,9 @@ export class AttioAdapter implements CrmAdapter {
                     if (!attrCache.has(`object:people:${finalSlug}`)) {
                         attrCache.set(`object:people:${finalSlug}`, type);
                     }
+                    if (AttioAdapter.LIST_IDENTITY_FIELDS.has(m.agentwebField)) {
+                        listIdentitySlugs.add(finalSlug);
+                    }
                 })
                 .catch((e: any) => {
                     const errDetails = e.response?.data?.message || e.message || 'Unknown error';
@@ -79,13 +140,77 @@ export class AttioAdapter implements CrmAdapter {
         }
         console.log(`[AttioAdapter] Ensured person-level slugs:`, Array.from(ensuredSlugs));
 
+        // ── 2. Resolve the deal list (Attio's Deal/Opportunity analog) ───────────
+        // Attio has no native Deal object. AgentWeb represents "a deal" as an entry
+        // in a dedicated Attio List, with deal-shaped fields (value, stage, etc.)
+        // stored as per-entry attributes and linked to the synced Person record.
+        // Resolved once per push run, not per lead. A failure here is non-critical
+        // — it degrades to person-only sync for the rest of the run rather than
+        // failing every lead, since list/attribute setup is best-effort.
+        const dealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'pull');
+        let dealListId: string | undefined;
+        const dealSlugs = new Map<string, string>();  // mapped crmProperty -> resolved Attio list-attribute slug
+        const dealTypes = new Map<string, string>();  // resolved slug -> Attio attribute type
+        if (dealMappings.length > 0) {
+            try {
+                dealListId = config.attioDealListId;
+                if (!dealListId) {
+                    dealListId = await svc.findOrCreateList(config.listName || 'AgentWeb Deals', 'people');
+                    config.attioDealListId = dealListId;
+                }
+                for (const m of dealMappings) {
+                    const rawSlug = m.crmProperty;
+                    const type = (rawSlug.includes('value') || rawSlug.includes('amount')) ? 'number' : 'text';
+                    try {
+                        const finalSlug = await svc.ensureListAttribute(dealListId, rawSlug, rawSlug.replace(/_/g, ' '), type);
+                        dealSlugs.set(rawSlug, finalSlug);
+                        dealTypes.set(finalSlug, type);
+                    } catch (e: any) {
+                        console.error(`[AttioAdapter] Failed to ensure deal-list attribute "${rawSlug}":`, e.response?.data?.message || e.message);
+                    }
+                }
+            } catch (e: any) {
+                console.error('[AttioAdapter] Failed to resolve deal list — degrading to person-only sync:', e.response?.data?.message || e.message);
+                dealListId = undefined;
+            }
+        }
+
         // ── 4. Sync each lead ───────────────────────────────────────────────────
         for (const lead of leads) {
             try {
+                // Guard against non-email values (e.g. a social/profile URL landing
+                // in the email field). An invalid email used to fall through to the
+                // update/create-by-id branches silently — the record still synced,
+                // but with no email at all, and the lead was reported a clean
+                // success. Surface it as a per-lead error instead, mirroring
+                // hubspotAdapter.ts's identical guard. An empty email is allowed —
+                // those push via create/update-by-id below, unaffected.
+                const trimmedEmail = typeof lead.email === 'string' ? lead.email.trim() : '';
+                if (trimmedEmail && !validateEmail(trimmedEmail)) {
+                    result.errorCount++;
+                    const msg = `Invalid email "${trimmedEmail}" — skipped (not a valid email address)`;
+                    console.warn(`[AttioAdapter] Invalid email for lead=${lead.leadId} — skipped (not a valid email address)`);
+                    result.errors.push(`${trimmedEmail}: ${msg}`);
+                    await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+                        syncMetadata: buildFailedMetadata(lead.syncMetadata, msg),
+                    }).catch((updateErr: any) => { });
+                    continue;
+                }
+
+                // Enrich with the source lead-list identity so listName/listId
+                // mappings resolve. listId is already on the lead; listName is not,
+                // so we graft the resolved name on (without persisting it back).
+                // Mirrors hubspotAdapter.ts's identical enrichment.
+                const enrichedLead = {
+                    ...lead,
+                    listId: lead.listId ?? config.listId,
+                    listName: lead.listName ?? resolvedListName,
+                };
+
                 // Determine if we need to resolve a company relationship
                 let companyId: string | undefined;
                 const companyMapping = config.contactFieldMapping.find(m => m.enabled && m.direction !== 'pull' && m.crmProperty === 'company');
-                const companyName = companyMapping ? this.getNestedValue(lead, companyMapping.agentwebField) : undefined;
+                const companyName = companyMapping ? this.getNestedValue(enrichedLead, companyMapping.agentwebField) : undefined;
 
                 if (companyName) {
                     const existingCompany = await svc.findCompanyByName(companyName);
@@ -98,9 +223,9 @@ export class AttioAdapter implements CrmAdapter {
                 }
 
                 // Build person values including custom mapped person attributes.
-                const personValues = this.buildPersonValues(lead, config.contactFieldMapping, attrCache, companyId);
+                const personValues = this.buildPersonValues(enrichedLead, config.contactFieldMapping, attrCache, companyId);
                 for (const m of customPersonMappings) {
-                    const value = this.getNestedValue(lead, m.agentwebField) ?? lead.customFields?.[m.agentwebField];
+                    const value = this.getNestedValue(enrichedLead, m.agentwebField) ?? enrichedLead.customFields?.[m.agentwebField];
                     if (value != null && String(value).trim() !== '') {
                         const finalSlug = resolvedSlugs.get(m.crmProperty);
                         if (!finalSlug) continue;
@@ -118,14 +243,29 @@ export class AttioAdapter implements CrmAdapter {
                     }
                 }
 
+                // Skip leads with no real content. List identity is injected onto
+                // every lead, so a lead carrying ONLY list-identity attributes (e.g.
+                // an empty email-less lead) has nothing worth syncing — pushing it
+                // would create a junk Attio Person tagged with just a list. Mirrors
+                // hubspotAdapter.ts's identical hasRealProps guard.
+                const hasRealProps = Object.keys(personValues).some(k => !listIdentitySlugs.has(k));
+                if (!hasRealProps) continue;
+
                 let personId: string | undefined;
+                // Tracks whether this lead was counted as new or updated, so a
+                // later deal-entry failure can demote the count it already
+                // incremented (mirrors hubspotAdapter.ts's demote() pattern).
+                let personWasNew = false;
 
                 // Only treat as email if it looks like a real address (not a placeholder like "unknown").
-                const hasEmail = lead.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(lead.email);
+                // Invalid emails already handled (and skipped) by the guard above,
+                // so an email present here is either valid or absent.
+                const hasEmail = trimmedEmail && validateEmail(trimmedEmail);
 
                 if (hasEmail) {
                     const { recordId, isNew } = await svc.upsertPersonByValues(personValues);
                     personId = recordId;
+                    personWasNew = isNew;
                     if (isNew) result.newCount++; else result.updatedCount++;
                 } else if (lead.syncMetadata?.attio_record_id || lead.customFields?.attio_record_id || lead.attioRecordId) {
                     const existingId = lead.syncMetadata?.attio_record_id || lead.customFields?.attio_record_id || lead.attioRecordId;
@@ -140,6 +280,7 @@ export class AttioAdapter implements CrmAdapter {
                         if (status === 404) {
                             // Record was deleted from Attio — create a new one
                             personId = await svc.createPersonByValues(personValues);
+                            personWasNew = true;
                             result.newCount++;
                             // Clear stale record ID so it gets overwritten below
                             lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_record_id: undefined };
@@ -149,6 +290,7 @@ export class AttioAdapter implements CrmAdapter {
                     }
                 } else {
                     personId = await svc.createPersonByValues(personValues);
+                    personWasNew = true;
                     result.newCount++;
                 }
 
@@ -166,12 +308,82 @@ export class AttioAdapter implements CrmAdapter {
                     lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_record_id: personId };
                 }
 
+                // Deal-list entry sync. A failure here demotes the lead to an
+                // error (mirrors hubspotAdapter.ts's demote() pattern) — the
+                // Person record synced, but the lead as a whole didn't fully
+                // sync, so it must not be counted or reported as success.
+                if (dealListId) {
+                    try {
+                        const entryValues = this.buildDealEntryValues(lead, dealMappings, dealSlugs, dealTypes);
+                        let existingEntryId = lead.syncMetadata?.attio_list_entry_id;
+                        let entryId: string | undefined = existingEntryId;
+
+                        if (existingEntryId) {
+                            try {
+                                await svc.updateListEntry(dealListId, existingEntryId, entryValues);
+                            } catch (updateErr: any) {
+                                // A stamped entry id can go stale after changePipeline
+                                // re-points this list's deal list — the entry lives in
+                                // the OLD list, not dealListId. Self-heal: treat a 404
+                                // as "gone, recreate it" via the same fallback an
+                                // entry-less lead already uses, rather than a bulk
+                                // migration copier run at re-point time.
+                                if (updateErr?.response?.status !== 404) throw updateErr;
+                                existingEntryId = undefined;
+                                entryId = undefined;
+                            }
+                        }
+                        if (!existingEntryId) {
+                            const foundEntryId = await svc.findListEntry(dealListId, personId);
+                            if (foundEntryId) {
+                                await svc.updateListEntry(dealListId, foundEntryId, entryValues);
+                                entryId = foundEntryId;
+                            } else {
+                                entryId = await svc.addPersonToList(dealListId, personId, entryValues);
+                            }
+                        }
+
+                        if (entryId && entryId !== existingEntryId) {
+                            // Stamp attio_deal_list_id alongside the entry id so a
+                            // later delete (deleteLeadFromCrm) targets the list this
+                            // entry actually lives in, not whatever attioDealListId
+                            // the config happens to point at by then — changePipeline
+                            // re-points the config without migrating existing leads'
+                            // pointers (self-heals lazily on next push, same as here),
+                            // so those can diverge for a lead not yet re-pushed.
+                            await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+                                syncMetadata: { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId, attio_deal_list_id: dealListId },
+                            }).catch((err: any) => { });
+                            lead.syncMetadata = { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId, attio_deal_list_id: dealListId };
+                        }
+                    } catch (e: any) {
+                        const msg = e.response?.data?.message || e.message || 'Unknown error';
+                        console.error(`[AttioAdapter] Deal-list sync failed for lead ${lead.leadId}:`, msg);
+                        result.errorCount++;
+                        if (personWasNew) result.newCount--; else result.updatedCount--;
+                        result.errors.push(`${lead.email || lead.leadId}: deal sync failed - ${msg}`);
+                        await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+                            syncMetadata: buildFailedMetadata(lead.syncMetadata, msg),
+                        }).catch((updateErr: any) => { });
+                        continue;
+                    }
+                }
+
+                // Stamp the provider-agnostic sync status (Gap 1: without this,
+                // the CRM leads page's synced badge/filter never recognizes an
+                // Attio-only sync, since it primarily reads syncMetadata.syncStatus).
+                await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+                    syncMetadata: buildSyncedMetadataBase(lead.syncMetadata, new Date().toISOString()),
+                }).catch((err: any) => { });
 
                 result.successCount++;
             } catch (err: any) {
                 result.errorCount++;
                 const msg = err.response?.data?.message || err.response?.data || err.message || 'Unknown error';
                 result.errors.push(`${lead.email || lead.leadId}: ${msg}`);
+                await crmDb.updateLead(lead.listId || config.listId, lead.leadId, {
+                    syncMetadata: buildFailedMetadata(lead.syncMetadata, msg),
+                }).catch((updateErr: any) => { });
             }
         }
 
@@ -194,12 +406,72 @@ export class AttioAdapter implements CrmAdapter {
         const pullCustomMappings = config.customFieldMapping.filter(
             m => m.enabled && m.direction !== 'push'
         );
+        // Attio-only, pull-only (not wired into the webhook auto-sync — a Company
+        // record change never touches the linked Person's own attributes, so
+        // there's no reliable real-time trigger; this rides on Pull re-resolving
+        // each person's company fresh every run). Attribute types loaded once per
+        // run, only when actually configured, to avoid an extra API call for the
+        // common case where no company fields are mapped.
+        const pullCompanyMappings = (config.companyFieldMapping || []).filter(
+            m => m.enabled && m.direction !== 'push'
+        );
+        const companiesAttrCache = pullCompanyMappings.length > 0
+            ? await svc.loadAttributeTypes('companies')
+            : new Map<string, string>();
+        // Cache one getCompanyValues() call per distinct company for the whole
+        // run — otherwise every person sharing the same company re-fetches it,
+        // an N+1 pattern this list's own person count doesn't need to pay for.
+        const companyValuesCache = new Map<string, Record<string, any>>();
+        const pullDealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'push');
         const standardEntryFields = ['company'];
+        const nativeDealFields = ['status', 'dealValue', 'dealCurrency'];
+        // Mirrors hubspotAdapter.ts's pull-side nativeFields allow-list exactly.
+        // A contactFieldMapping targeting any other agentwebField must route to
+        // customFields — crmDb.batchCreateLeads/createLead/updateLead only write
+        // a fixed whitelist of top-level lead columns and silently drop anything
+        // else, so writing it to leadData[agentwebField] directly loses the data.
+        const nativeFields = ['firstName', 'lastName', 'email', 'phone', 'company', 'title', 'linkedin', 'notes'];
 
-        let cursor: string | undefined;
+        // Bulk-prefetch the deal list's entries (Attio's Deal analog) once per
+        // pull run, keyed by person id — avoids an API call per person, unlike
+        // HubSpot's per-contact association lookup, since Attio's List Entries
+        // are bulk-queryable. Only reads a list that already exists (pull must
+        // not create one — that's push's job); a prefetch failure is
+        // non-critical and degrades to contact-only pull for the whole run.
+        const dealEntriesByPersonId = new Map<string, { entryId: string; values: Record<string, any> }>();
+        let dealAttrCache: Map<string, string> | undefined;
+        if (pullDealMappings.length > 0 && config.attioDealListId) {
+            try {
+                dealAttrCache = await svc.loadAttributeTypes('people', config.attioDealListId);
+                // Bounded so an enormous deal list can't retain an unbounded number
+                // of entries in memory for one pull run — people beyond this many
+                // pages of deal entries simply pull without their deal fields
+                // (non-critical, same graceful-degrade convention as a total
+                // prefetch failure below).
+                const MAX_DEAL_PREFETCH_PAGES = 200;
+                let dealOffset: number | undefined = 0;
+                let dealPages = 0;
+                do {
+                    const { entries, nextOffset: nextDealOffset } = await svc.listListEntriesDetailed(config.attioDealListId, dealOffset);
+                    for (const entry of entries) {
+                        dealEntriesByPersonId.set(entry.personRecordId, { entryId: entry.entryId, values: entry.values });
+                    }
+                    dealOffset = nextDealOffset;
+                    dealPages++;
+                    if (dealOffset !== undefined && dealPages >= MAX_DEAL_PREFETCH_PAGES) {
+                        console.warn(`[Attio-Pull] Deal-list ${config.attioDealListId} has more than ${MAX_DEAL_PREFETCH_PAGES} pages of entries — stopping prefetch early, some people will pull without deal fields.`);
+                        break;
+                    }
+                } while (dealOffset !== undefined);
+            } catch (e: any) {
+                console.error('[Attio-Pull] Failed to prefetch deal-list entries (non-critical):', e.response?.data?.message || e.message);
+            }
+        }
+
+        let offset: number | undefined = 0;
 
         do {
-            const { people, nextCursor } = await svc.listPeople(cursor);
+            const { people, nextOffset } = await svc.listPeople(offset);
             const pageLeadData: any[] = [];
 
             for (const person of people) {
@@ -232,7 +504,13 @@ export class AttioAdapter implements CrmAdapter {
                             val = this.extractAttioValue(personValues[slug], type);
                         }
 
-                        if (val != null && val !== '') leadData[m.agentwebField] = val;
+                        if (val != null && val !== '') {
+                            if (nativeFields.includes(m.agentwebField)) {
+                                leadData[m.agentwebField] = val;
+                            } else {
+                                customFields[m.agentwebField] = val;
+                            }
+                        }
                     }
 
                     for (const m of pullCustomMappings) {
@@ -244,6 +522,53 @@ export class AttioAdapter implements CrmAdapter {
                         }
                     }
 
+                    // Company field mapping — a separate fetch from the company-name
+                    // resolution above (getCompanyById), only made when the user has
+                    // actually mapped additional Company attributes. One extra API
+                    // call per person with a linked company, but only when opted in
+                    // (default empty mapping = zero extra calls for existing users).
+                    if (pullCompanyMappings.length > 0) {
+                        const companyRef = personValues['company']?.[0]?.target_record_id;
+                        if (companyRef) {
+                            try {
+                                let companyValues = companyValuesCache.get(companyRef);
+                                if (!companyValues) {
+                                    companyValues = await svc.getCompanyValues(companyRef);
+                                    companyValuesCache.set(companyRef, companyValues);
+                                }
+                                for (const m of pullCompanyMappings) {
+                                    const slug = m.crmProperty;
+                                    const type = companiesAttrCache.get(`object:companies:${slug}`) || 'text';
+                                    const val = this.extractAttioValue(companyValues[slug], type);
+                                    if (val != null && val !== '') {
+                                        customFields[m.agentwebField] = val;
+                                    }
+                                }
+                            } catch (e: any) {
+                                console.error(`[Attio-Pull] Failed to fetch company values for companyRef ${companyRef} (non-critical):`, e.message);
+                            }
+                        }
+                    }
+
+                    const dealEntry = dealEntriesByPersonId.get(personId);
+                    if (dealEntry && pullDealMappings.length > 0) {
+                        for (const m of pullDealMappings) {
+                            const slug = m.crmProperty;
+                            const type = dealAttrCache?.get(`list:${config.attioDealListId}:${slug}`) || 'text';
+                            const val = this.extractAttioValue(dealEntry.values[slug], type);
+                            if (val != null && val !== '') {
+                                if (nativeDealFields.includes(m.agentwebField)) {
+                                    leadData[m.agentwebField] = val;
+                                } else {
+                                    customFields[m.agentwebField] = val;
+                                }
+                            }
+                        }
+                        syncMetadata.attio_list_entry_id = dealEntry.entryId;
+                        // See pushLeads' identical stamp for why: lets a later
+                        // delete target the list this entry actually lives in.
+                        syncMetadata.attio_deal_list_id = config.attioDealListId;
+                    }
 
                 } catch (e: any) {
                     console.error(`[Attio-Pull] Failed to fetch values for person ${personId}:`, e.message);
@@ -274,8 +599,8 @@ export class AttioAdapter implements CrmAdapter {
                 }
             }
 
-            cursor = nextCursor;
-        } while (cursor);
+            offset = nextOffset;
+        } while (offset !== undefined);
 
         return result;
     }
@@ -290,6 +615,88 @@ export class AttioAdapter implements CrmAdapter {
         if (!externalIds.recordId) return;
         const svc = await this.getSvc(auth);
         await svc.deletePerson(externalIds.recordId);
+    }
+
+    // ─── Webhook: list-entry (deal-analog) events ─────────────────────────────────
+
+    /**
+     * Applies a single `list-entry.*` webhook event — the Deal-analog side of
+     * real-time auto-pull, alongside applyAttioPersonEvent's Person side.
+     * Reuses gap 2's field-extraction/routing logic (extractAttioValue,
+     * nativeDealFields) narrowed to the one changed entry, via a targeted
+     * single-entry fetch (AttioService.getListEntry) rather than
+     * re-paginating the whole deal list per event.
+     *
+     * `list-entry.deleted` clears the link (syncMetadata.attio_list_entry_id)
+     * rather than deleting the lead itself — a deal being removed doesn't
+     * mean the person is gone, unlike record.deleted's hard-delete.
+     */
+    async applyListEntryWebhookEvent(
+        listId: string,
+        config: ExternalCrmSyncConfig,
+        svc: AttioService,
+        entryId: string,
+        eventType: string,
+        // Deal-list attribute types are scoped to config.attioDealListId. A
+        // caller processing many list-entry events across lists in one job
+        // can fetch this once per distinct deal-list id and share it —
+        // otherwise every event refetches it fresh, with no cache of its own.
+        sharedDealAttrCache?: Map<string, string>,
+    ): Promise<void> {
+        if (!config.attioDealListId) return;
+        const pullDealMappings = config.dealFieldMapping.filter(m => m.enabled && m.direction !== 'push');
+        if (pullDealMappings.length === 0) return;
+
+        if (eventType === 'list-entry.deleted') {
+            const lead = await crmDb.getLeadByAttioListEntryId(listId, entryId);
+            if (!lead) return;
+            // syncMetadata is a whole-object SET at the DynamoDB layer (no
+            // per-key REMOVE support), so the cleared key must be genuinely
+            // absent from the merged object, not set to undefined — an
+            // explicit `undefined` value would still be a key on the object
+            // as far as DynamoDB's marshaller is concerned.
+            const syncMetadata = { ...(lead.syncMetadata || {}) };
+            delete syncMetadata.attio_list_entry_id;
+            delete syncMetadata.attio_deal_list_id;
+            await crmDb.updateLead(listId, lead.leadId, { syncMetadata });
+            console.log(`[AttioWebhook] Cleared deal link on lead ${lead.leadId} in list ${listId} (entry ${entryId} deleted)`);
+            return;
+        }
+
+        const entry = await svc.getListEntry(config.attioDealListId, entryId);
+        if (!entry) return; // not in our deal list — irrelevant event
+
+        const lead = await crmDb.getLeadByAttioRecordId(listId, entry.personRecordId);
+        if (!lead) return; // deal entry for a person we haven't pulled/pushed — nothing to update
+
+        const dealAttrCache = sharedDealAttrCache ?? await svc.loadAttributeTypes('people', config.attioDealListId);
+        const nativeDealFields = ['status', 'dealValue', 'dealCurrency'];
+        const leadUpdates: Record<string, any> = {};
+        const customFieldUpdates: Record<string, any> = {};
+
+        for (const m of pullDealMappings) {
+            const slug = m.crmProperty;
+            const type = dealAttrCache.get(`list:${config.attioDealListId}:${slug}`) || 'text';
+            const val = this.extractAttioValue(entry.values[slug], type);
+            if (val == null || val === '') continue;
+            if (nativeDealFields.includes(m.agentwebField)) {
+                leadUpdates[m.agentwebField] = val;
+            } else {
+                customFieldUpdates[m.agentwebField] = val;
+            }
+        }
+
+        if (Object.keys(customFieldUpdates).length > 0) {
+            leadUpdates.customFields = mergeCustomFields(
+                lead.customFields,
+                customFieldUpdates,
+                { source: 'attioAdapter.applyListEntryWebhookEvent', listId, leadId: lead.leadId },
+            );
+        }
+        leadUpdates.syncMetadata = { ...(lead.syncMetadata || {}), attio_list_entry_id: entryId, attio_deal_list_id: config.attioDealListId };
+
+        await crmDb.updateLead(listId, lead.leadId, leadUpdates);
+        console.log(`[AttioWebhook] Updated deal fields on lead ${lead.leadId} in list ${listId} from entry ${entryId}`);
     }
 
     // ─── Field mapping helpers ────────────────────────────────────────────────────
@@ -367,13 +774,42 @@ export class AttioAdapter implements CrmAdapter {
         return values;
     }
 
+    private buildDealEntryValues(
+        lead: any,
+        dealMappings: FieldMapping[],
+        dealSlugs: Map<string, string>,
+        dealTypes: Map<string, string>
+    ): Record<string, any[]> {
+        const entryValues: Record<string, any> = {};
+
+        for (const m of dealMappings) {
+            const finalSlug = dealSlugs.get(m.crmProperty);
+            if (!finalSlug) continue; // attribute-ensure failed for this field — skip it
+
+            const value = this.getNestedValue(lead, m.agentwebField) ?? lead.customFields?.[m.agentwebField];
+            if (value == null || typeof value === 'object') continue;
+            const strValue = String(value).trim();
+            if (!strValue) continue;
+
+            const type = dealTypes.get(finalSlug) || 'text';
+            entryValues[finalSlug] = [this.formatAttioValue(strValue, type)];
+        }
+
+        return entryValues;
+    }
+
     private formatAttioValue(value: any, type: string): any {
         const str = String(value);
         const cleanType = type.replace(/-/g, '_');
         switch (cleanType) {
             case 'status': return { status: str };
-            case 'select': return { select: { target: str } };
-            case 'number': return { number_value: Number(str) };
+            // select/number shapes confirmed against Attio's official docs
+            // (docs.attio.com/rest-api/attribute-types/attribute-types-select
+            // and .../attribute-types-number): select writes as {option: str},
+            // number writes as {value: num} — matches extractAttioValue's
+            // read-side entry.option?.title / entry.value below exactly.
+            case 'select': return { option: str };
+            case 'number': return { value: Number(str) };
             case 'currency': return { currency_value: Number(String(value).replace(/[^0-9.]/g, '')) };
             case 'checkbox': return { value: str === 'true' || str === '1' };
             case 'personal_name': {
@@ -393,20 +829,28 @@ export class AttioAdapter implements CrmAdapter {
 
 
     private extractAttioValue(values: any[], type: string): any {
-        if (!values || !values.length) return undefined;
-        const entry = values[0];
-        const cleanType = type.replace(/-/g, '_');
-        switch (cleanType) {
-            case 'status': return entry.status?.title ?? entry.status?.target;
-            case 'select': return entry.select?.title ?? entry.select?.target;
-            case 'currency': return entry.currency_value;
-            case 'number': return entry.number_value;
-            case 'email_address': return entry.email_address;
-            case 'phone_number': return entry.original_phone_number;
-            case 'personal_name':
-            case 'name':
-                return `${entry.first_name || ''} ${entry.last_name || ''}`.trim();
-            default: return entry.value;
-        }
+        return extractAttioValue(values, type);
+    }
+}
+
+// Shared with applyAttioPersonEvent (attioPersonWebhookEvent.ts) so the
+// webhook auto-pull path interprets Attio value shapes identically to
+// pullContacts's manual pull — a standalone export rather than a private
+// class method since it has no adapter-instance state.
+export function extractAttioValue(values: any[], type: string): any {
+    if (!values || !values.length) return undefined;
+    const entry = values[0];
+    const cleanType = type.replace(/-/g, '_');
+    switch (cleanType) {
+        case 'status': return entry.status?.title ?? entry.status?.target;
+        case 'select': return entry.option?.title ?? entry.option?.target;
+        case 'currency': return entry.currency_value;
+        case 'number': return entry.value;
+        case 'email_address': return entry.email_address;
+        case 'phone_number': return entry.original_phone_number;
+        case 'personal_name':
+        case 'name':
+            return `${entry.first_name || ''} ${entry.last_name || ''}`.trim();
+        default: return entry.value;
     }
 }
