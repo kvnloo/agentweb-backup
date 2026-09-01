@@ -247,6 +247,62 @@ describe('GenerateMarketingResponseWorkerService', () => {
       expect(caught.code).toBeUndefined();
     });
 
+    // ENG-1670: whether OpenRouter actually sent a Retry-After header is
+    // conditional, not guaranteed — restoring the answer onto the rejected
+    // Error means a future recurrence of this failure class is self-
+    // diagnosing from the durable session record, rather than needing logs
+    // that expire in 14 days (the exact wall the original investigation hit).
+    it('should restore retryAfterHeaderPresent and retryAfterMs from a worker error message', async () => {
+      const promise = workerService.runInWorker(mockParams);
+
+      await waitForSend();
+
+      const messageHandler = messageHandlers.get('default');
+      const sendCall = mockWorker.send.mock.calls[0];
+      const requestId = sendCall[0].requestId;
+      messageHandler!({
+        type: 'error',
+        requestId,
+        error: 'I\'m currently experiencing high demand. Please wait a moment and try again.',
+        stack: 'Error stack trace',
+        status: 429,
+        retryAfterHeaderPresent: true,
+        retryAfterMs: 20000,
+      });
+
+      await expect(promise).rejects.toMatchObject({
+        retryAfterHeaderPresent: true,
+        retryAfterMs: 20000,
+      });
+    });
+
+    it('should restore retryAfterHeaderPresent: false without a retryAfterMs', async () => {
+      const promise = workerService.runInWorker(mockParams);
+
+      await waitForSend();
+
+      const messageHandler = messageHandlers.get('default');
+      const sendCall = mockWorker.send.mock.calls[0];
+      const requestId = sendCall[0].requestId;
+      messageHandler!({
+        type: 'error',
+        requestId,
+        error: 'I\'m currently experiencing high demand. Please wait a moment and try again.',
+        stack: 'Error stack trace',
+        status: 429,
+        retryAfterHeaderPresent: false,
+      });
+
+      let caught: any;
+      try {
+        await promise;
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught.retryAfterHeaderPresent).toBe(false);
+      expect(caught.retryAfterMs).toBeUndefined();
+    });
+
     it('should handle worker process errors', async () => {
       const promise = workerService.runInWorker(mockParams);
 
