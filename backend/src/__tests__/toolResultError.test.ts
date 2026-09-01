@@ -106,4 +106,30 @@ describe('toolResultError', () => {
     expect(err!.name).toBe('ToolResultPolicyBlockedError');
     expect(err).toMatchObject({ reason: 'publish_consent' });
   });
+
+  describe('ENG-1300 — a numeric `code` on the result rides along on the reconstructed Error', () => {
+    it('attaches success:false code so status-based classification still fires', () => {
+      const err = toolResultError({
+        success: false,
+        code: 403,
+        error: 'Your X account is missing the "list.read" permission needed to read X Lists. Go to Settings → Connected Accounts and reconnect your X account to grant List access.',
+      });
+      expect(err).toMatchObject({ code: 403 });
+      // The real regression: this message text alone matches none of
+      // classifyToolErrorClass's message-based patterns, so without `.code`
+      // riding along it silently fell back to the generic 'Error' class.
+      expect(classifyToolErrorClass(err)).toBe('auth');
+    });
+
+    it('attaches isError:true code the same way', () => {
+      const err = toolResultError({ isError: true, code: 429, message: 'Too many requests' });
+      expect(err).toMatchObject({ code: 429 });
+      expect(classifyToolErrorClass(err)).toBe('rate_limit');
+    });
+
+    it('leaves the Error without a code when the result carries none (no regression)', () => {
+      const err = toolResultError({ success: false, error: 'Ad account not configured' });
+      expect((err as { code?: number })?.code).toBeUndefined();
+    });
+  });
 });

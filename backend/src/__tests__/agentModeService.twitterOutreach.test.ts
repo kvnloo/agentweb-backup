@@ -705,6 +705,22 @@ describe('AgentModeService.twitterOutreach', () => {
     expect(res.error).toMatch(/list\.read|reconnect/i);
   });
 
+  it('ENG-1300: preserves the mapListScopeError 403 code on the returned result, not just its message', async () => {
+    // Mirrors what TwitterService.mapListScopeError actually throws (a 403-coded
+    // Error) rather than a plain Error, so this exercises the exact shape that
+    // reaches _twitterOutreachImpl's catch in production. Asserting only the
+    // message text (as the test above does) passed even when `.code` was
+    // silently dropped here — this is the assertion that would have caught it.
+    const scopeError: Error & { code?: number } = new Error(
+      'Your X account is missing the "list.read" permission needed to read X Lists. Go to Settings → Connected Accounts and reconnect your X account to grant List access.'
+    );
+    scopeError.code = 403;
+    mockGetListTweets.mockRejectedValueOnce(scopeError);
+    const res = await service.twitterOutreach('u', { action: 'get_list_tweets', x_list_id: 'L1' });
+    expect(res.success).toBe(false);
+    expect(res.code).toBe(403);
+  });
+
   it('block calls blockUser with handle', async () => {
     const res = await service.twitterOutreach('u', { action: 'block', handle: '@spammer' });
     expect(mockBlockUser).toHaveBeenCalledWith(OWNER, 'tw1', '@spammer');
