@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { isSuppressedSendResult } from '../utils/nonProdEmailGuard';
 
 import { resendService } from './resendService';
 import { deriveBlockedByCost } from './tokenUsageService';
@@ -74,7 +75,7 @@ export const emailService = {
 
   async sendEmail(to: string | string[], subject: string, text: string, html: string, cc?: string | string[]) {
     try {
-      await resendService.sendEmail({
+      const result = await resendService.sendEmail({
         from: SYSTEM_FROM,
         to,
         cc,
@@ -85,6 +86,12 @@ export const emailService = {
       });
       const toList = Array.isArray(to) ? to.join(', ') : to;
       const ccList = cc ? (Array.isArray(cc) ? cc.join(', ') : cc) : '';
+      // Never claim delivery for a send the non-prod guard blocked — the log is
+      // the only record this best-effort path leaves behind.
+      if (isSuppressedSendResult(result)) {
+        console.log('Email suppressed by the non-prod guard, not sent to:', toList, cc ? `CC: ${ccList}` : '');
+        return;
+      }
       console.log('Email sent successfully to:', toList, cc ? `CC: ${ccList}` : '');
     } catch (error) {
       console.error('Error sending email:', error);
@@ -124,6 +131,18 @@ export const emailService = {
       replyTo: SUPPORT_REPLY_TO
     });
 
+    // A suppressed send did not leave the box, so it cannot satisfy this
+    // method's contract — its whole purpose is that the caller's audit row
+    // reflects ground truth. Checked BEFORE the messageId check, because the
+    // guard deliberately supplies a string id (so it is not misread as a
+    // provider failure) and that id would otherwise be recorded as a delivery.
+    if (isSuppressedSendResult(result)) {
+      throw new Error(
+        'sendEmailStrict: send suppressed by the non-prod email guard — ' +
+          'no message left the box. Add the recipient to NONPROD_EMAIL_ALLOWLIST, ' +
+          'or set NONPROD_EMAIL_ALLOW_ALL=true for a deliberate delivery test.',
+      );
+    }
     const messageId = (result && typeof (result as any).id === 'string')
       ? (result as any).id
       : null;

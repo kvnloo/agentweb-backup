@@ -69,7 +69,7 @@ import { buildConfigServiceDeps } from '../services/enrichmentConfigDeps';
 import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentServiceV3';
 import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import { sanitizeLeadForResponse } from '../utils/enrichmentMetadataPresentation';
-import { getHubspotConnection, getMappedAgentwebFields, mappedFieldChanged, resolveSyncStatus } from '../utils/leadSyncStatus';
+import { getExternalCrmConnection, getMappedAgentwebFields, mappedFieldChanged, resolveSyncStatus } from '../utils/leadSyncStatus';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 
@@ -1824,10 +1824,11 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
-    // HubSpot connection drives the sync-status filter + per-lead resolution.
-    // The syncStatus param is only honored when the list is actually connected.
-    const hsConn = getHubspotConnection(list);
-    const syncStatusFilter = hsConn.connected ? syncStatusQuery : '';
+    // The connected CRM (HubSpot or Attio — a list is only ever connected to
+    // one) drives the sync-status filter + per-lead resolution. The
+    // syncStatus param is only honored when the list is actually connected.
+    const crmConn = getExternalCrmConnection(list);
+    const syncStatusFilter = crmConn.connected ? syncStatusQuery : '';
 
     // Validate inputs
     const validPage = Math.max(1, page);
@@ -1907,7 +1908,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
           const normalized = (lead.linkedin as string).trim().toLowerCase().replace(/\/?$/, '/');
           if (!connectedLinkedInUrlSet.has(normalized)) return false;
         }
-        if (syncStatusFilter && resolveSyncStatus(lead, hsConn.connected) !== syncStatusFilter) {
+        if (syncStatusFilter && resolveSyncStatus(lead, crmConn.connected) !== syncStatusFilter) {
           return false;
         }
         return true;
@@ -1971,7 +1972,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
             engagementCountLast7Days: engagementCounts.last7Days,
             totalAllMessages: engagementCounts.totalAllMessages,
           }),
-          syncStatus: resolveSyncStatus(lead, hsConn.connected),
+          syncStatus: resolveSyncStatus(lead, crmConn.connected),
         };
       })
     );
@@ -1987,7 +1988,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       totalPages: knownTotalPages ?? (hasMoreLeads ? null : validPage), // null means unknown total
       hasMore: hasMoreLeads,
       totalFilteredCount, // Total ICP count when icpsOnly is enabled, null otherwise
-      hubspotConnected: hsConn.connected,
+      crmConnected: crmConn.connected,
     });
   } catch (error: any) {
     console.error('Error fetching leads:', error);
@@ -2049,11 +2050,11 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
-    // Stamp an initial per-lead sync status when this list is connected to
-    // HubSpot. If auto-sync is on, the subsequent autoSyncLead push overwrites
-    // this with 'synced'/'sync_failed' via the adapter.
-    const hsConn = getHubspotConnection(list);
-    if (hsConn.connected) {
+    // Stamp an initial per-lead sync status when this list is connected to a
+    // CRM (HubSpot or Attio). If auto-sync is on, the subsequent autoSyncLead
+    // push overwrites this with 'synced'/'sync_failed' via the adapter.
+    const crmConn = getExternalCrmConnection(list);
+    if (crmConn.connected) {
       leadData.syncMetadata = { ...(leadData.syncMetadata || {}), syncStatus: 'sync_pending' };
     }
 
@@ -2604,15 +2605,15 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       updates.selectedSenderId = normalizedSenderId;
     }
 
-    // When this list is connected to HubSpot with auto-sync OFF, a change to a
-    // HubSpot-mapped field on an already-synced lead means it needs re-pushing —
+    // When this list is connected to a CRM with auto-sync OFF, a change to a
+    // CRM-mapped field on an already-synced lead means it needs re-pushing —
     // surface that as update_pending so it shows in the sync filter. With
     // auto-sync ON the adapter sets synced/sync_failed instead, so we skip.
-    const hsConnUpd = getHubspotConnection(list);
-    if (hsConnUpd.connected && !hsConnUpd.autoSyncEnabled) {
+    const crmConnUpd = getExternalCrmConnection(list);
+    if (crmConnUpd.connected && !crmConnUpd.autoSyncEnabled) {
       const existingForSync = await crmDb.getLeadById(listId, leadId);
       if (existingForSync && resolveSyncStatus(existingForSync, true) === 'synced'
-          && mappedFieldChanged(existingForSync, updates, getMappedAgentwebFields(hsConnUpd.config))) {
+          && mappedFieldChanged(existingForSync, updates, getMappedAgentwebFields(crmConnUpd.config))) {
         updates.syncMetadata = { ...(existingForSync.syncMetadata || {}), syncStatus: 'update_pending' };
       }
     }

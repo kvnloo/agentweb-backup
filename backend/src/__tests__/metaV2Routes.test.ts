@@ -124,8 +124,12 @@ describe('Meta V2 Routes', () => {
   describe('GET /campaigns-and-adsets', () => {
     it('should return campaigns, adsets, and pages', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-      (metaService.listCampaigns as jest.Mock).mockResolvedValue([{ id: 'camp1', name: 'Campaign 1' }]);
-      (metaService.listAdSets as jest.Mock).mockResolvedValue([{ id: 'adset1', name: 'Ad Set 1' }]);
+      (metaService.listCampaigns as jest.Mock).mockResolvedValue({
+        campaigns: [{ id: 'camp1', name: 'Campaign 1' }], truncated: false, pagesFetched: 1,
+      });
+      (metaService.listAdSets as jest.Mock).mockResolvedValue({
+        adSets: [{ id: 'adset1', name: 'Ad Set 1' }], truncated: false, pagesFetched: 1, scope: {},
+      });
       (metaService.getPages as jest.Mock).mockResolvedValue([{ id: 'page1', name: 'Page 1' }]);
 
       const response = await request(app).get('/api/meta/v2/campaigns-and-adsets');
@@ -165,11 +169,15 @@ describe('Meta V2 Routes', () => {
       ],
     };
 
+    // ENG-1625: listPixels now returns { pixels, truncated, pagesFetched } rather than a
+    // bare array — this wraps a fixture the same way the real implementation would.
+    const pixelsResult = (pixels: any[]) => ({ pixels, truncated: false, pagesFetched: 1 });
+
     it('aggregates pixels across every connected account', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
       (metaService.listPixels as jest.Mock)
-        .mockResolvedValueOnce([{ id: 'pxA1' }])
-        .mockResolvedValueOnce([{ id: 'pxB1' }, { id: 'pxB2' }]);
+        .mockResolvedValueOnce(pixelsResult([{ id: 'pxA1' }]))
+        .mockResolvedValueOnce(pixelsResult([{ id: 'pxB1' }, { id: 'pxB2' }]));
 
       const response = await request(app).get('/api/meta/v2/pixels');
 
@@ -188,7 +196,7 @@ describe('Meta V2 Routes', () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
       (metaService.listPixels as jest.Mock)
         .mockRejectedValueOnce(new Error('token expired'))
-        .mockResolvedValueOnce([{ id: 'pxB1' }]);
+        .mockResolvedValueOnce(pixelsResult([{ id: 'pxB1' }]));
 
       const response = await request(app).get('/api/meta/v2/pixels');
 
@@ -210,8 +218,8 @@ describe('Meta V2 Routes', () => {
     it('serves a second request from cache instead of re-hitting Meta', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
       (metaService.listPixels as jest.Mock)
-        .mockResolvedValueOnce([{ id: 'pxA1' }])
-        .mockResolvedValueOnce([{ id: 'pxB1' }]);
+        .mockResolvedValueOnce(pixelsResult([{ id: 'pxA1' }]))
+        .mockResolvedValueOnce(pixelsResult([{ id: 'pxB1' }]));
 
       const first = await request(app).get('/api/meta/v2/pixels');
       expect(first.status).toBe(200);
@@ -243,8 +251,8 @@ describe('Meta V2 Routes', () => {
 
       (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
       (metaService.listPixels as jest.Mock)
-        .mockResolvedValueOnce([{ id: 'pxA1' }])
-        .mockResolvedValueOnce([{ id: 'pxB1' }]);
+        .mockResolvedValueOnce(pixelsResult([{ id: 'pxA1' }]))
+        .mockResolvedValueOnce(pixelsResult([{ id: 'pxB1' }]));
 
       const after = await request(app).get('/api/meta/v2/pixels');
       expect(after.body.pixels).toHaveLength(2);
@@ -253,13 +261,13 @@ describe('Meta V2 Routes', () => {
 
     it('does not serve one user\'s pixels to another', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
-      (metaService.listPixels as jest.Mock).mockResolvedValue([{ id: 'pxA1' }]);
+      (metaService.listPixels as jest.Mock).mockResolvedValue(pixelsResult([{ id: 'pxA1' }]));
       await request(app).get('/api/meta/v2/pixels');
 
       // The cache is keyed by userId; clearing it stands in for a different caller, since
       // this suite's auth mock pins one user. What matters is that a miss refetches.
       __clearPixelsCacheForTests();
-      (metaService.listPixels as jest.Mock).mockResolvedValue([{ id: 'someone-else' }]);
+      (metaService.listPixels as jest.Mock).mockResolvedValue(pixelsResult([{ id: 'someone-else' }]));
 
       const response = await request(app).get('/api/meta/v2/pixels');
       expect(response.body.pixels.every((p: any) => p.pixelId === 'someone-else')).toBe(true);
@@ -281,7 +289,7 @@ describe('Meta V2 Routes', () => {
 
     it('returns an empty list when every connected account has zero pixels', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
-      (metaService.listPixels as jest.Mock).mockResolvedValue([]);
+      (metaService.listPixels as jest.Mock).mockResolvedValue(pixelsResult([]));
 
       const response = await request(app).get('/api/meta/v2/pixels');
 
@@ -350,8 +358,8 @@ describe('Meta V2 Routes', () => {
         account.config.token_expires_at = Date.now() + 60 * 24 * 60 * 60 * 1000;
         return { attempted: true, refreshed: true };
       });
-      (metaService.listCampaigns as jest.Mock).mockResolvedValue([]);
-      (metaService.listAdSets as jest.Mock).mockResolvedValue([]);
+      (metaService.listCampaigns as jest.Mock).mockResolvedValue({ campaigns: [], truncated: false, pagesFetched: 1 });
+      (metaService.listAdSets as jest.Mock).mockResolvedValue({ adSets: [], truncated: false, pagesFetched: 1, scope: {} });
       (metaService.getPages as jest.Mock).mockResolvedValue([]);
 
       const response = await request(app).get('/api/meta/v2/campaigns-and-adsets');
