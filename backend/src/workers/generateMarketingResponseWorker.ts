@@ -190,6 +190,12 @@ process.on('message', async (message: any) => {
     // "unexpected system error" instead of the correct transient-retry copy).
     const status = (error as any)?.status;
     const code = (error as any)?.code;
+    // ENG-1670: whether OpenRouter actually sent a Retry-After header is not
+    // guaranteed — forwarding the answer (not just the friendly message) means
+    // a future recurrence of this failure class is self-diagnosing from the
+    // durable session record instead of needing logs that expire in 14 days.
+    const retryAfterHeaderPresent = (error as any)?.retryAfterHeaderPresent;
+    const retryAfterMs = (error as any)?.retryAfterMs;
     process.send!({
       type: 'error',
       requestId,
@@ -202,7 +208,9 @@ process.on('message', async (message: any) => {
       ...(originalMessage ? { originalMessage } : {}),
       ...(partialUsageMessages?.length ? { partialUsageMessages } : {}),
       ...(status !== undefined ? { status } : {}),
-      ...(code !== undefined ? { code } : {})
+      ...(code !== undefined ? { code } : {}),
+      ...(retryAfterHeaderPresent !== undefined ? { retryAfterHeaderPresent } : {}),
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {})
     });
   }
 });

@@ -228,6 +228,16 @@ export class GenerateMarketingResponseWorkerService {
         if (message.code !== undefined) {
           error.code = message.code;
         }
+        // ENG-1670: restore whether OpenRouter actually sent a Retry-After header
+        // for this occurrence, so a future recurrence of this failure class is
+        // self-diagnosing from the persisted session record instead of needing
+        // logs that have already rotated out by the time anyone investigates.
+        if (message.retryAfterHeaderPresent !== undefined) {
+          error.retryAfterHeaderPresent = message.retryAfterHeaderPresent;
+        }
+        if (message.retryAfterMs !== undefined) {
+          error.retryAfterMs = message.retryAfterMs;
+        }
         pending.reject(error);
       }
     });

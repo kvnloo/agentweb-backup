@@ -327,6 +327,35 @@ export function isVerificationFunctionCallRetryPress(text: string): boolean {
 export function pressesIrreversiblePublishWrite(text: string): boolean {
   return isVerificationFunctionCallRetryPress(text) && IRREVERSIBLE_PUBLISH_TOOLS.some((tool) => text.includes(tool));
 }
+
+// ENG-1670: a blind fixed backoff is a guess — OpenRouter documents that a
+// 429/5xx can carry `retry-after` (seconds, or an HTTP-date) or the proactive
+// `retry-after-ms`, and the OpenAI SDK's own (disabled here via maxRetries: 0)
+// retry logic already trusts that header over a computed default when it's
+// present and under 60s. Mirror that instead of guessing: honoring the
+// provider's own signal is correct regardless of whether that signal turns
+// out to be 1.5s or 45s, where a fixed backoff is only right by luck.
+//
+// Shared by callLLM's in-call retry loop AND generateMarketingResponse's
+// outer catch (which persists whether a header was actually present, once the
+// call has exhausted its retries and the whole turn is failing) — one
+// definition, so both readings of the same header can never disagree.
+export function getRetryAfterMs(error: unknown): number | undefined {
+  const headers = (error as any)?.headers;
+  if (!headers) return undefined;
+  const msHeader = headers['retry-after-ms'];
+  if (msHeader) {
+    const ms = parseFloat(msHeader);
+    if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
+  }
+  const secHeader = headers['retry-after'];
+  if (secHeader) {
+    const seconds = parseFloat(secHeader);
+    const ms = !Number.isNaN(seconds) ? seconds * 1000 : Date.parse(secHeader) - Date.now();
+    if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
+  }
+  return undefined;
+}
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import {
@@ -2653,31 +2682,6 @@ export class AgentModeService {
       return errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx';
     };
 
-    // ENG-1670: a blind fixed backoff is a guess — OpenRouter documents that a
-    // 429/5xx can carry `retry-after` (seconds, or an HTTP-date) or the
-    // proactive `retry-after-ms`, and the OpenAI SDK's own (disabled here via
-    // maxRetries: 0) retry logic already trusts that header over a computed
-    // default when it's present and under 60s. Mirror that instead of
-    // guessing: honoring the provider's own signal is correct regardless of
-    // whether that signal turns out to be 1.5s or 45s, where a fixed backoff
-    // is only right by luck.
-    const getRetryAfterMs = (error: unknown): number | undefined => {
-      const headers = (error as any)?.headers;
-      if (!headers) return undefined;
-      const msHeader = headers['retry-after-ms'];
-      if (msHeader) {
-        const ms = parseFloat(msHeader);
-        if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
-      }
-      const secHeader = headers['retry-after'];
-      if (secHeader) {
-        const seconds = parseFloat(secHeader);
-        const ms = !Number.isNaN(seconds) ? seconds * 1000 : Date.parse(secHeader) - Date.now();
-        if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
-      }
-      return undefined;
-    };
-
     // A single 1.5s retry wasn't enough to clear a burst-triggered 429 — prod
     // sessions on the LinkedIn Post Factory schedule (which fires several tool
     // calls back-to-back) needed the full 15-60min scheduled-run backoff to
@@ -4803,6 +4807,16 @@ export class AgentModeService {
       wrappedError.originalMessage = error?.message || String(error);
       if (error?.status) wrappedError.status = error.status;
       if (error?.code) wrappedError.code = error.code;
+      // ENG-1670: whether the provider actually sent a Retry-After header is not
+      // guaranteed (OpenRouter's own docs: conditional, not promised even for a
+      // single-provider model). Rather than that staying an unanswerable question
+      // every time this fires, persist the answer for THIS occurrence — the last
+      // investigation into this exact failure class had no way to tell, because
+      // nothing captured it and the raw provider response doesn't survive past
+      // this catch block otherwise.
+      wrappedError.retryAfterHeaderPresent = Boolean((error as any)?.headers?.['retry-after'] || (error as any)?.headers?.['retry-after-ms']);
+      const retryAfterMs = getRetryAfterMs(error);
+      if (retryAfterMs !== undefined) wrappedError.retryAfterMs = retryAfterMs;
       if (partialResponseMessages.length > 0) {
         wrappedError.partialUsageMessages = partialResponseMessages;
       }
