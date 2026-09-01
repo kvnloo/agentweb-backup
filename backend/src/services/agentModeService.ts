@@ -3504,6 +3504,15 @@ export class AgentModeService {
       // standing down one guard silently disables the other.
       const falseClaimGuardEnabled = process.env.AGENT_FALSE_CLAIM_GUARD !== 'false';
 
+      // Kill switch for the unavailable-capability notice below — ON by default; set
+      // AGENT_UNAVAILABLE_CAPABILITY_NOTICE=false to stand it down. Its two sibling guards in
+      // the same block each have one and this did not, which is the difference between a bad
+      // banner being a config change and a bad banner being a revert-and-redeploy. It is also
+      // the guard that most needs one: it is UNCONDITIONAL, so a false positive prepends a
+      // scary warning to an otherwise correct answer on every affected turn.
+      const unavailableCapabilityNoticeEnabled =
+        process.env.AGENT_UNAVAILABLE_CAPABILITY_NOTICE !== 'false';
+
       let wasCancelled = false;
       // ENG-244: set true when the loop exits because the step budget (maxIterations)
       // was exhausted. This is the deterministic signal a long data-gathering
@@ -4108,7 +4117,7 @@ export class AgentModeService {
            * does not try to decide whether the prose claims the tool ran: that a tool was
            * refused and never succeeded is a fact in the ledger, so this cannot false-positive.
            */
-          if (content) {
+          if (unavailableCapabilityNoticeEnabled && content) {
             const unavailableNotice = buildUnavailableCapabilityNotice(toolCalls);
             if (unavailableNotice) {
               console.warn(
@@ -5920,6 +5929,16 @@ export class AgentModeService {
 
       if (rejectedSkillIds.length > 0) {
         result.message += ` ${rejectedSkillIds.length} skill(s) were not available with your subscription.`;
+        /*
+         * The refusal has to be a FIELD, not just prose appended to `message`.
+         *
+         * A partial install returns `success: true` — something did install — so every
+         * "did the install work" test downstream reads it as clean, while the one skill the
+         * model actually needed may be exactly the one that was refused.
+         * `buildUnavailableCapabilityNotice` keys off this array to tell those apart, and it
+         * cannot key off a sentence.
+         */
+        result.rejectedSkillIds = rejectedSkillIds;
       }
 
       return result;
@@ -6565,6 +6584,37 @@ export class AgentModeService {
         verification: actualResult.verification,
         recovery: actualResult.recovery,
         retryable: actualResult.retryable,
+      };
+    }
+
+    /*
+     * install_skills: the OUTCOME survives minimization.
+     *
+     * `installSkills` never throws — every refusal path returns `{ success: false, message }`,
+     * which the dispatcher pushes through its SUCCESS path (toolDispatch.ts:1164). The default
+     * `{}` below then stripped `success`, so the ledger entry for a refused install was
+     * indistinguishable from a completed one: `{ name: 'install_skills', result: {} }`, with no
+     * `error` and no `success: false`.
+     *
+     * `buildUnavailableCapabilityNotice` reads exactly those fields to decide whether the model
+     * was blocked from a capability it asked for, so with them stripped it read every failed
+     * install as a success and suppressed itself — the ENG-1207 trap documented below, hit a
+     * second time: the guard was inert in production while its unit tests passed, because those
+     * tests built ledger entries by hand and never crossed this function.
+     *
+     * `rejectedSkillIds` is here for the same reason: a PARTIAL install reports `success: true`
+     * because something installed, and only this field says the skill the gated tool needed may
+     * have been the one refused. Ids and a short message, never a payload.
+     */
+    if (toolName === 'install_skills') {
+      const r = (result && typeof result === 'object' ? result : {}) as Record<string, any>;
+      return {
+        success: r.success === true,
+        ...(r.message !== undefined ? { message: r.message } : {}),
+        ...(Array.isArray(r.installedSkills) ? { installedSkills: r.installedSkills } : {}),
+        ...(Array.isArray(r.rejectedSkillIds) && r.rejectedSkillIds.length > 0
+          ? { rejectedSkillIds: r.rejectedSkillIds }
+          : {}),
       };
     }
 

@@ -247,6 +247,23 @@ function isReportedFailure(call: ExecutedToolCall): boolean {
 }
 
 /**
+ * True for an `install_skills` call that installed SOME of what was asked for and had the
+ * rest refused.
+ *
+ * That result carries `success: true` (something was installed), so every failure test above
+ * reads it as a clean install — and a partial install is exactly the shape where the ONE skill
+ * the gated tool needed is the one that was refused. Treating it as a clean success disarmed
+ * the notice on the case it is most likely to be needed for.
+ *
+ * `rejectedSkillIds` is set by `agentModeService.installSkills` precisely so this is a fact in
+ * the result rather than something inferred from prose in `message`.
+ */
+function isPartialInstall(call: ExecutedToolCall): boolean {
+  const rejected = (call.result as { rejectedSkillIds?: unknown } | null | undefined)?.rejectedSkillIds;
+  return Array.isArray(rejected) && rejected.length > 0;
+}
+
+/**
  * ENG-1188 root-cause fix recommendation #2: a ledger of tool NAMES and counts
  * told the user work happened, but not how to get it — "save_file — 1 succeeded"
  * is not a deliverable. `extractMinimalToolResult` (agentModeService.ts) already
@@ -684,26 +701,41 @@ export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]):
   /*
    * Fires only when the model ATTEMPTED to obtain the capability and could not.
    *
-   * Two failure modes this narrowing exists for, both found in review:
+   * Three failure modes this narrowing exists for, all found in review:
    *
    *  - The gate refuses ANY name not in the session's allowed set, including one the model tried
    *    speculatively and then simply did without. Warning there puts a banner above a perfectly
    *    correct answer, and a warning that appears when nothing is wrong is one people learn to
    *    skip — exactly when it finally matters. If no install was attempted, the model was not
    *    blocked from something it needed.
-   *  - An install that FAILED is not always shaped as a throw: several `installSkills` paths
-   *    return `{ success: false, message }` with no `error` key at all. Keying "the install
-   *    worked" off a missing `error` therefore read a failed install as a success and disarmed
-   *    this notice on precisely the live incident it was written for. `isReportedFailure` is the
-   *    existing helper for that shape.
+   *  - An install that FAILED is not always shaped as a throw: `installSkills` NEVER throws —
+   *    every one of its paths returns `{ success: false, message }` with no `error` key at all.
+   *    Keying "the install worked" off a missing `error` therefore read a failed install as a
+   *    success and disarmed this notice on precisely the live incident it was written for.
+   *    `isReportedFailure` is the existing helper for that shape, and it only works because
+   *    `extractMinimalToolResult` now keeps `success` on an install_skills ledger entry — the
+   *    default `{}` used to strip exactly the field this reads.
+   *  - A PARTIAL install reports `success: true` because SOMETHING installed, while the skill
+   *    the gated tool needed may be the one that was refused (`isPartialInstall`).
+   *
+   * Note what is deliberately NOT required: that the install came AFTER the refusal. Parallel
+   * tool calls in one assistant message land in the ledger in an arbitrary order, so requiring
+   * `install > refusal` let the identical turn arm or disarm this notice depending on which of
+   * the two the model happened to emit first. Whether the model could obtain the capability is
+   * a property of the TURN, not of the ordering within it.
    */
-  let installAttemptedAfter = -1;
+  let installAttempted = false;
+  let installFailed = false;
   let installSucceededAfter = -1;
   calls.forEach((call, i) => {
     if (call?.name !== 'install_skills') return;
-    installAttemptedAfter = i;
+    installAttempted = true;
     const threw = call?.error !== undefined && call?.error !== null;
-    if (!threw && !isReportedFailure(call)) installSucceededAfter = i;
+    if (threw || isReportedFailure(call) || isPartialInstall(call)) {
+      installFailed = true;
+    } else {
+      installSucceededAfter = i;
+    }
   });
 
   const succeeded = new Set<string>();
@@ -722,10 +754,13 @@ export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]):
     if (classifyToolErrorClass(err) !== 'tool_unavailable') return;
     // Ran successfully at some point in the turn — the capability is present.
     if (succeeded.has(name)) return;
-    // Never tried to obtain it: doing without a speculative tool is not a missing capability.
-    if (installAttemptedAfter <= i) return;
     // Obtained it and chose not to re-run the tool — the model's call, not a gap it papered over.
     if (installSucceededAfter > i) return;
+    // Never tried to obtain it: doing without a speculative tool is not a missing capability.
+    if (!installAttempted) return;
+    // Every install this turn came back clean, so nothing stopped the model from getting what
+    // it asked for. Only an install that could NOT deliver means a capability was missing.
+    if (!installFailed) return;
     unavailable.add(name);
   });
 
