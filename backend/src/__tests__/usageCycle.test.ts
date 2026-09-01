@@ -209,3 +209,28 @@ describe('formatResetDateLong — calendar validity (CodeRabbit, portal #1134)',
     expect(formatResetDateLong('2026-12-31')).toBe('December 31, 2026');
   });
 });
+
+describe('years below 100 (CodeRabbit, #2702)', () => {
+  it('does not remap year 1 to 1901 anywhere in the cycle helpers', () => {
+    // `Date.UTC(1, 9, 1)` is 1901-10-01, not 0001-10-01. Two different failure
+    // modes came out of that: the validation probe rejected a legitimate date
+    // (fail closed, which CodeRabbit flagged), and resetDateFromMonth returned a
+    // WRONG date that no caller could detect (which it did not).
+    expect(resetDateFromMonth('0001-09')).toBe('0001-10-01');
+    expect(formatResetDateLong('0001-02-28')).toBe('February 28, 0001');
+    expect(resolveCycle('0001-09-17').cycleResetDate).toBe('0001-10-01');
+  });
+
+  it('still rejects an impossible day in such a year', () => {
+    // Preserving the year must not weaken the calendar check. Year 1 is not a
+    // leap year under the proleptic Gregorian rule the Date object applies.
+    expect(formatResetDateLong('0001-02-30')).toBeNull();
+    expect(formatResetDateLong('0001-02-29')).toBeNull();
+  });
+
+  it('leaves ordinary years untouched', () => {
+    expect(resetDateFromMonth('2026-09')).toBe('2026-10-01');
+    expect(formatResetDateLong('2026-10-01')).toBe('October 1, 2026');
+    expect(resolveCycle('2026-09-17').cycleResetDate).toBe('2026-10-01');
+  });
+});

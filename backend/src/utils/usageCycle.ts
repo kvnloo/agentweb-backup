@@ -15,6 +15,24 @@
  * re-derive it, and so none of them can quietly disagree about the date.
  */
 
+/**
+ * A UTC date that preserves years below 100.
+ *
+ * `Date.UTC(year, ...)` and `new Date(year, ...)` both apply the legacy
+ * two-digit-year mapping: years 0-99 become 1900-1999, so `Date.UTC(1, 1, 28)`
+ * is 1901, not year 1. `setUTCFullYear` has no such remapping. Unreachable for
+ * a billing cycle -- `getCurrentMonth()` reads the system clock -- but the two
+ * failure modes differ and one of them is silent: the round-trip probe would
+ * merely reject year 1 (fail closed), while `resetDateFromMonth` would return
+ * `1901-10-01` for `0001-09` and no caller could tell. Raised by CodeRabbit on
+ * the probe; the silent one is the reason both go through here.
+ */
+function utcDatePreservingYear(year: number, monthIndex: number, day: number): Date {
+  const d = new Date(0);
+  d.setUTCFullYear(year, monthIndex, day);
+  return d;
+}
+
 /** UTC calendar day, `YYYY-MM-DD`. */
 export function utcDay(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -30,7 +48,7 @@ export function resolveCycle(today: string): { cycleStartDate: string; cycleRese
   const [year, month] = today.split("-").map(Number);
   return {
     cycleStartDate: `${year}-${String(month).padStart(2, "0")}-01`,
-    cycleResetDate: utcDay(new Date(Date.UTC(year, month, 1))),
+    cycleResetDate: utcDay(utcDatePreservingYear(year, month, 1)),
   };
 }
 
@@ -42,7 +60,7 @@ export function resetDateFromMonth(month: string | null | undefined): string | n
   const year = Number(m[1]);
   const monthNum = Number(m[2]);
   if (monthNum < 1 || monthNum > 12) return null;
-  return utcDay(new Date(Date.UTC(year, monthNum, 1)));
+  return utcDay(utcDatePreservingYear(year, monthNum, 1));
 }
 
 const MONTH_NAMES = [
@@ -79,7 +97,7 @@ export function formatResetDateLong(isoDate: string | null | undefined): string 
   // this the backend would render "February 31, 2026"; the portal's sibling
   // `formatDay` had the worse version of the same gap, where Date's silent
   // normalization turned it into a plausible but WRONG day (CodeRabbit, #1134).
-  const probe = new Date(Date.UTC(year, monthNum - 1, day));
+  const probe = utcDatePreservingYear(year, monthNum - 1, day);
   if (
     probe.getUTCFullYear() !== year ||
     probe.getUTCMonth() !== monthNum - 1 ||
