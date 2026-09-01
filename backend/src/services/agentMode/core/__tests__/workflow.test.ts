@@ -27,6 +27,7 @@ import {
   describeFailedAtStep,
   collectEntityIdsFromCheckpoints,
   findGatedParameterKeys,
+  findOutputParameterNameCollisions,
   type WorkflowDefinition,
   type WorkflowStepDefinition,
   type WorkflowRunState,
@@ -310,6 +311,29 @@ describe('findGatedParameterKeys', () => {
 
   it('returns an empty set when no step gates anything', () => {
     expect(findGatedParameterKeys(makeDefinition([makeStep()]))).toEqual(new Set());
+  });
+});
+
+describe('findOutputParameterNameCollisions', () => {
+  it('returns empty when no gated key matches any step output name', () => {
+    const stepA = makeStep({
+      id: 'a',
+      outputs: ['campaign_id'],
+      requiredParameters: [{ key: 'objective', questionKind: 'workflow_meta_objective', payloadField: 'objective' }],
+    });
+    expect(findOutputParameterNameCollisions(makeDefinition([stepA]))).toEqual([]);
+  });
+
+  it('flags a gated key that collides with a step output name, even across different steps', () => {
+    const stepA = makeStep({ id: 'a', outputs: ['campaign_id'] });
+    const stepB = makeStep({
+      id: 'b',
+      // Malformed: this gated key shares a name with stepA's output. Letting
+      // this through would leave it to merge order whether a later step
+      // sees the real checkpointed campaign_id or this resolved parameter.
+      requiredParameters: [{ key: 'campaign_id', questionKind: 'workflow_some_kind', payloadField: 'campaign_id' }],
+    });
+    expect(findOutputParameterNameCollisions(makeDefinition([stepA, stepB]))).toEqual(['campaign_id']);
   });
 });
 

@@ -381,3 +381,56 @@ describe('ENG-397 hardening — an optimistic-lock conflict is surfaced, not sil
     expect(outcome.run).toBe(preTransitionRun);
   });
 });
+
+describe('ENG-397 hardening — a gated parameter cannot collide with a step output name', () => {
+  it('startWorkflow rejects a definition where a gated key shares a name with an earlier step output', async () => {
+    wireSessionStore({});
+    const colliderStep: WorkflowStepDefinition = {
+      id: 'collider_step',
+      inputs: [],
+      outputs: ['campaign_id'],
+      // Malformed on purpose: 'campaign_id' is both this step's OWN gated
+      // input name and (via create_campaign, the first step) an output name.
+      requiredParameters: [{ key: 'campaign_id', questionKind: 'workflow_some_kind', payloadField: 'campaign_id' }],
+      execute: jest.fn(async () => ({ campaign_id: 'should_not_run' })),
+      verify: jest.fn(async (): Promise<import('../services/agentMode/core/workflow').WorkflowStepVerification> => ({ verified: true, verifiedFields: {} })),
+    };
+    const definition: WorkflowDefinition = {
+      workflowId: 'colliding_workflow',
+      steps: [buildCreateCampaignStep({ accessToken: 'token', adAccountId: 'act_1' }), colliderStep],
+    };
+
+    await expect(startWorkflow(SESSION_ID, definition, INITIAL_PARAMS)).rejects.toThrow(/name collision/i);
+    expect(mockUpdateSessionWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('defense-in-depth: even if a colliding run/definition pair reaches advanceWorkflow directly, the checkpointed entity id wins over the resolved parameter value', async () => {
+    // Simulates bypassing startWorkflow's guard (e.g. a future caller
+    // constructing a run without going through it) to prove the runtime
+    // merge order itself is safe, not just the entry-point validation.
+    const colliderStep: WorkflowStepDefinition = {
+      id: 'collider_step',
+      inputs: ['campaign_id'],
+      outputs: ['tag_id'],
+      requiredParameters: [],
+      execute: jest.fn(async (params: Record<string, unknown>) => ({ tag_id: `tag_for_${params.campaign_id}` })),
+      verify: jest.fn(async (): Promise<import('../services/agentMode/core/workflow').WorkflowStepVerification> => ({ verified: true, verifiedFields: {} })),
+    };
+    const definition: WorkflowDefinition = { workflowId: 'colliding_workflow', steps: [colliderStep] };
+
+    const runWithStaleParam: WorkflowRunState = {
+      ...buildWorkflowRunState({ runId: 'run_1', workflowId: definition.workflowId, createdAt: '2026-01-01T00:00:00.000Z' }),
+      // A stale/answered parameter happens to share the 'campaign_id' name
+      // with a checkpointed entity id below — the checkpoint must win.
+      resolvedParameters: { campaign_id: 'STALE_WRONG_VALUE' },
+      checkpoints: [
+        { stepId: 'unrelated_prior_step', status: 'verified', entityIds: { campaign_id: 'camp_real' }, verifiedFields: {}, verifiedAt: '2026-01-01T00:05:00.000Z' },
+      ],
+    };
+    wireSessionStore({ workflowRun: runWithStaleParam });
+
+    await advanceWorkflow(SESSION_ID, definition);
+
+    expect(colliderStep.execute as jest.Mock).toHaveBeenCalledWith(expect.objectContaining({ campaign_id: 'camp_real' }));
+  });
+});
