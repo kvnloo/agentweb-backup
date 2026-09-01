@@ -8,6 +8,7 @@
 
 import {
   repairUnescapedQuotes,
+  hasDuplicateObjectKeys,
   parseToolCallArguments,
   isTruncatedJsonPrefix,
   TruncatedToolCallArgumentsError,
@@ -93,6 +94,65 @@ describe('repairUnescapedQuotes (ENG-1477)', () => {
     const raw = '{"tags":["a","say "hi" now"]}';
     expect(JSON.parse(repairUnescapedQuotes(raw))).toEqual({
       tags: ['a', 'say "hi" now'],
+    });
+  });
+});
+
+describe('hasDuplicateObjectKeys (ENG-1477 security follow-up)', () => {
+  it('returns false for well-formed JSON with no repeated keys', () => {
+    expect(hasDuplicateObjectKeys('{"title":"ok","content_draft":"hi","n":3}')).toBe(false);
+  });
+
+  it('returns false when the same key text appears only as a nested value, never as a key', () => {
+    expect(hasDuplicateObjectKeys('{"title":"the \\"title\\" field is required"}')).toBe(false);
+  });
+
+  it('returns true when a top-level key is repeated', () => {
+    expect(hasDuplicateObjectKeys('{"title":"Real Title","content_draft":"x","title":"HACKED"}')).toBe(true);
+  });
+
+  it('returns true when a key is repeated inside a nested object, not just top-level', () => {
+    expect(hasDuplicateObjectKeys('{"a":{"b":"1","b":"2"}}')).toBe(true);
+  });
+
+  it('does not confuse array elements with object keys', () => {
+    // Same string repeated twice, but as array elements — never followed by
+    // `:`, so never in key position. Must not be flagged.
+    expect(hasDuplicateObjectKeys('{"tags":["x","x"]}')).toBe(false);
+  });
+
+  it('tracks a fresh key-set per nested object, so the same key name in sibling objects is fine', () => {
+    expect(hasDuplicateObjectKeys('{"a":{"id":"1"},"b":{"id":"2"}}')).toBe(false);
+  });
+});
+
+describe('parseToolCallArguments — argument injection via repair (ENG-1477 security follow-up)', () => {
+  // ENG-1477 review finding: repairUnescapedQuotes's comma heuristic decides a
+  // quote is a real string terminator whenever what follows merely LOOKS LIKE
+  // the next property (`"key":`). Untrusted echoed content in content_draft
+  // (e.g. scraped text) that happens to contain that exact shape gets split
+  // into fake structure, and JSON.parse silently keeps the LAST occurrence of
+  // a duplicate key — clobbering a legitimate argument with attacker-supplied
+  // content. Reproduced directly: without the hasDuplicateObjectKeys guard,
+  // this exact payload parses "successfully" with title overwritten to
+  // 'HACKED"' and content_draft truncated to just the text before it.
+  it('refuses to accept a repair that would inject/overwrite a top-level key via a lookalike property', () => {
+    const raw = '{"title":"Real Title","content_draft":"Intro: "quoted phrase", "title":"HACKED""}';
+    let expected: Error | undefined;
+    try {
+      JSON.parse(raw);
+    } catch (e) {
+      expected = e as Error;
+    }
+    // Must fail the same way a direct JSON.parse would — never silently
+    // return an object with the injected/overwritten title.
+    expect(() => parseToolCallArguments(raw)).toThrow(expected!.message);
+  });
+
+  it('still recovers the legitimate unescaped-quote case that does not create a duplicate key', () => {
+    const raw = '{"title":"Phoenix FFL Merchants — "Creative Fatigue" Audit"}';
+    expect(parseToolCallArguments(raw)).toEqual({
+      title: 'Phoenix FFL Merchants — "Creative Fatigue" Audit',
     });
   });
 });
