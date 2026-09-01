@@ -43,6 +43,32 @@ describe('promptRisksFabricatedMetrics (ENG-1027)', () => {
     expect(promptRisksFabricatedMetrics(prompt)).toBe(false);
   });
 
+  // ENG-1027 (round 3): an independent fresh-eyes review of this PR found the
+  // original regex missed exactly the categories the tool description itself names
+  // ("a table, chart, or list of metrics") — bare "chart", bare "table"/"metrics"
+  // phrasing, and percent-complete phrasing that doesn't literally say "progress
+  // bar". Verified each of these was a false negative against the pre-fix regex
+  // before adding coverage.
+  it('flags chart-shaped prompts (bar chart, pie chart) with no values supplied', () => {
+    expect(promptRisksFabricatedMetrics('Create a bar chart showing quarterly revenue growth')).toBe(true);
+    expect(promptRisksFabricatedMetrics('A pie chart breaking down traffic sources')).toBe(true);
+  });
+
+  it('flags bare "table"/"metrics" phrasing that isn\'t prefixed with "data"/"comparison"', () => {
+    expect(promptRisksFabricatedMetrics('Design a table listing this month\'s ad performance metrics')).toBe(true);
+    expect(promptRisksFabricatedMetrics('Show a list of key metrics for the campaign: reach, impressions, spend')).toBe(true);
+  });
+
+  it('flags completion-percentage phrasing that doesn\'t say "progress bar" verbatim', () => {
+    expect(promptRisksFabricatedMetrics('a completion percentage shown as 82% done')).toBe(true);
+    expect(promptRisksFabricatedMetrics('a circular progress ring showing 45% complete')).toBe(true);
+    expect(promptRisksFabricatedMetrics('A bar labeled 82% complete, nothing else')).toBe(true);
+  });
+
+  it('does not flag ordinary furniture/scene "table" mentions (bare "table" stays qualified)', () => {
+    expect(promptRisksFabricatedMetrics('A photo of two friends chatting at a cafe table over coffee')).toBe(false);
+  });
+
   it('handles empty/non-string input', () => {
     expect(promptRisksFabricatedMetrics('')).toBe(false);
     expect(promptRisksFabricatedMetrics(undefined as any)).toBe(false);
