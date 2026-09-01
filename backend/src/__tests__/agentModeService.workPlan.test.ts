@@ -556,7 +556,7 @@ describe('AgentModeService - Work Plan', () => {
         );
       });
 
-      it('bypasses the failIfAwaitingExists guard when replacing a stale input with the next step\'s', async () => {
+      it('clears the stale input as its own guarded step before writing the next step\'s (preserves the pendingUserQuestion guard)', async () => {
         const freshWorkPlan = {
           title: 'Project Plan',
           steps: [
@@ -590,10 +590,20 @@ describe('AgentModeService - Work Plan', () => {
           mockSessionId,
         );
 
-        expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenCalledWith(
+        // Two calls, in order: clear the known-stale record by exact requestId match...
+        expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenNthCalledWith(
+          1,
+          mockSessionId,
+          null,
+          { requireStillAwaiting: 'req-step-1' },
+        );
+        // ...then write the next step's request with the guard fully intact (still
+        // checking pendingUserQuestion, not just pendingWorkPlanInput).
+        expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenNthCalledWith(
+          2,
           mockSessionId,
           expect.objectContaining({ stepCount: 2, title: 'Target subreddits' }),
-          { failIfAwaitingExists: false },
+          { failIfAwaitingExists: true },
         );
       });
 
