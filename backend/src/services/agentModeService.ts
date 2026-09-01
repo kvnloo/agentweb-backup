@@ -2642,12 +2642,38 @@ export class AgentModeService {
       return errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx';
     };
 
-    // ENG-1670: a single 1.5s retry wasn't enough to clear a burst-triggered
-    // 429 — prod sessions on the LinkedIn Post Factory schedule (which fires
-    // several tool calls back-to-back) needed the full 15-60min scheduled-run
-    // backoff to recover from what OpenRouter reported as rate-limited. One
-    // extra attempt with a longer second backoff gives a rate limit more room
-    // to clear within the same run, before falling back to that expensive path.
+    // ENG-1670: a blind fixed backoff is a guess — OpenRouter documents that a
+    // 429/5xx can carry `retry-after` (seconds, or an HTTP-date) or the
+    // proactive `retry-after-ms`, and the OpenAI SDK's own (disabled here via
+    // maxRetries: 0) retry logic already trusts that header over a computed
+    // default when it's present and under 60s. Mirror that instead of
+    // guessing: honoring the provider's own signal is correct regardless of
+    // whether that signal turns out to be 1.5s or 45s, where a fixed backoff
+    // is only right by luck.
+    const getRetryAfterMs = (error: unknown): number | undefined => {
+      const headers = (error as any)?.headers;
+      if (!headers) return undefined;
+      const msHeader = headers['retry-after-ms'];
+      if (msHeader) {
+        const ms = parseFloat(msHeader);
+        if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
+      }
+      const secHeader = headers['retry-after'];
+      if (secHeader) {
+        const seconds = parseFloat(secHeader);
+        const ms = !Number.isNaN(seconds) ? seconds * 1000 : Date.parse(secHeader) - Date.now();
+        if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
+      }
+      return undefined;
+    };
+
+    // A single 1.5s retry wasn't enough to clear a burst-triggered 429 — prod
+    // sessions on the LinkedIn Post Factory schedule (which fires several tool
+    // calls back-to-back) needed the full 15-60min scheduled-run backoff to
+    // recover from what OpenRouter reported as rate-limited. One extra
+    // attempt, backed by the Retry-After header when the provider sends one,
+    // gives a rate limit real room to clear within the same run before
+    // falling back to that expensive path.
     const maxAttempts = 3;
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -2687,8 +2713,9 @@ export class AgentModeService {
       } catch (error) {
         lastError = error;
         if (attempt < maxAttempts && isRetryableLlmCallError(error)) {
-          const backoffMs = 1500 * Math.pow(2, attempt - 1);
-          console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms`, {
+          const retryAfterMs = getRetryAfterMs(error);
+          const backoffMs = retryAfterMs ?? 1500 * Math.pow(2, attempt - 1);
+          console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms${retryAfterMs !== undefined ? ' (honoring Retry-After)' : ''}`, {
             error: error instanceof Error ? error.message : String(error),
           });
           await this.sleep(backoffMs);
