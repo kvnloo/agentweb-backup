@@ -59,6 +59,7 @@ import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHisto
 import {
   describeImageReportsFabricatedMetrics,
   FABRICATED_METRICS_CHECK_PROMPT,
+  FABRICATED_METRICS_CHECK_TIMEOUT_MS,
   FABRICATED_METRICS_WARNING,
   promptRisksFabricatedMetrics,
 } from './agentMode/dataFabricationGuard';
@@ -25748,7 +25749,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     imageModel?: string,
     logoImage?: string,
     confirm?: boolean,
-    category?: string
+    category?: string,
+    metricsVerified?: boolean
   ): Promise<any> {
     // ENG-343: the producing flow must self-declare the eval use case — Matt's
     // review feedback differs entirely between ads and organic posts, and a
@@ -26004,18 +26006,33 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // instruction-following-dependent, and live verification showed the image
         // model can invent metrics even in prompts that never asked for real data
         // (a bare "metrics preview" dashboard element is enough). For prompts shaped
-        // like a dashboard/table without concrete values already supplied, run one
-        // bounded describe_image check against the actual output and surface a
-        // warning so Emma discloses rather than silently presenting invented numbers.
+        // like a dashboard/table that Emma hasn't declared use verified real values
+        // (metricsVerified), run one bounded describe_image check against the actual
+        // output and surface a warning so Emma discloses rather than silently
+        // presenting invented numbers. Timeboxed tighter than describe_image's own
+        // 90s ENG-294 bound — this is an added, best-effort safety net the user never
+        // explicitly asked for, not worth spending that much turn budget on.
         let dataReliabilityWarning: string | undefined;
-        if (promptRisksFabricatedMetrics(prompt)) {
+        if (promptRisksFabricatedMetrics(prompt, metricsVerified)) {
+          console.log(`AgentMode: generate_image data-fabrication check triggered (session ${sessionId})`);
           try {
-            const visionCheck = await this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT);
+            const visionCheck = await Promise.race([
+              this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT),
+              new Promise<never>((_, reject) =>
+                setTimeout(
+                  () => reject(new Error(`data-fabrication check timed out after ${FABRICATED_METRICS_CHECK_TIMEOUT_MS}ms`)),
+                  FABRICATED_METRICS_CHECK_TIMEOUT_MS
+                )
+              ),
+            ]);
             if (visionCheck?.success && describeImageReportsFabricatedMetrics(visionCheck.description)) {
               dataReliabilityWarning = FABRICATED_METRICS_WARNING;
+              console.log(`AgentMode: generate_image data-fabrication check WARNED (session ${sessionId})`);
+            } else {
+              console.log(`AgentMode: generate_image data-fabrication check clear (session ${sessionId})`);
             }
           } catch (visionErr) {
-            console.warn('AgentMode: generate_image data-fabrication check failed (non-fatal):', visionErr);
+            console.warn('AgentMode: generate_image data-fabrication check failed/timed out (non-fatal):', visionErr);
           }
         }
 
