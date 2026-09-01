@@ -10,7 +10,7 @@
 // the same guard. These pin that they now have it, and that the refusal does not disclose
 // which account actually owns the node.
 
-import { MetaService } from '../services/metaService';
+import { MetaService, isMetaAccountScopeRefusal } from '../services/metaService';
 import { FacebookAdsApi, AdAccount, Campaign, AdSet, Ad } from 'facebook-nodejs-business-sdk';
 
 jest.mock('facebook-nodejs-business-sdk', () => ({
@@ -233,5 +233,53 @@ describe('single-entity Meta node reads are bounded by the selected ad account',
       service.listCampaigns(SELECTED, token, { campaignId: '   ' }),
     ).rejects.toThrow(/campaign_id/i);
     expect(getCampaigns).not.toHaveBeenCalled();
+  });
+
+  /*
+   * The refusal has to be RECOGNISABLE, not just correct.
+   *
+   * Callers of these reads guard them with a best-effort `catch` written for a transient Graph
+   * blip — buildMetaWriteConfirmation is the one that matters, because it renders the result
+   * into a prompt the user approves. A tenancy refusal arriving through that same catch as an
+   * anonymous Error was swallowed as a network hiccup: the prompt degraded to `ID <id>` and the
+   * write proceeded to confirmation, which is the gate approving exactly what this guard
+   * refused.
+   *
+   * These pin the predicate against the REAL thrown error rather than a hand-written message,
+   * so a reworded refusal fails here instead of silently disarming every caller that reads it.
+   */
+  describe('a tenancy refusal is distinguishable from a transient failure', () => {
+    it('recognises the ownership refusal actually thrown by a single-node read', async () => {
+      const get = nodeGet(OTHER_TENANT, { id: 'ad_9', name: 'Someone else’s ad' });
+      (Ad as unknown as jest.Mock).mockImplementation(() => ({ get }));
+
+      let thrown: unknown;
+      try {
+        await service.getAd(token, 'ad_9', SELECTED);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeDefined();
+      expect(isMetaAccountScopeRefusal(thrown)).toBe(true);
+    });
+
+    it('does not recognise a transient Graph failure as a tenancy refusal', async () => {
+      // The whole point of the split: a blip must keep the best-effort behaviour.
+      expect(isMetaAccountScopeRefusal(new Error('Meta unreachable'))).toBe(false);
+      expect(isMetaAccountScopeRefusal(new Error('(#17) User request limit reached'))).toBe(false);
+      expect(isMetaAccountScopeRefusal(undefined)).toBe(false);
+      expect(isMetaAccountScopeRefusal('not an error')).toBe(false);
+    });
+
+    it('does not recognise the unverifiable-lookup refusal, which IS retryable', async () => {
+      // assertNodeInAccount throws this when the ownership probe itself could not complete.
+      // It means "we could not look", not "this is out of scope", and must not block a caller
+      // that is allowed to degrade.
+      expect(
+        isMetaAccountScopeRefusal(
+          new Error('Could not verify the requested ad against the selected ad account; please retry.'),
+        ),
+      ).toBe(false);
+    });
   });
 });
