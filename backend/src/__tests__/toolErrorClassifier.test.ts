@@ -64,6 +64,24 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('Validation failed: url is required'))).toBe('invalid_args');
   });
 
+  // ENG-1672: a schedule write blocked by DynamoDB's 400KB item ceiling
+  // ("Scheduled chat is too large to save...") fell through every pattern here
+  // (only "too long"/"too short" matched) and landed on the generic legacy
+  // "Error" class, indistinguishable from a random unclassified failure. It is a
+  // client-fixable, non-retryable condition like any other "too long" rejection.
+  // The projected size (e.g. "391KB") does not reliably start with a 4 or 5, so
+  // this must not depend on the incidental "400KB" status-code-shaped digits
+  // elsewhere in the message.
+  it('classifies an item-size-blocked schedule write as invalid_args', () => {
+    expect(classifyToolErrorClass(err(
+      'Scheduled chat is too large to save (about 391KB against the per-item limit) '
+      + 'even after dropping saved history. The starting message is 10240 characters — shorten it and try again.'
+    ))).toBe('invalid_args');
+    expect(classifyToolErrorClass(err(
+      'API error (400): Scheduled chat is too large to save — it exceeds the per-item limit.'
+    ))).toBe('invalid_args');
+  });
+
   it('classifies not-found and network failures', () => {
     expect(classifyToolErrorClass(err('Request failed with status code 404'))).toBe('not_found');
     expect(classifyToolErrorClass(err('getaddrinfo ENOTFOUND api.example.com'))).toBe('network');
