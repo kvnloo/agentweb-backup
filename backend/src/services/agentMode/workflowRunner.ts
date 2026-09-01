@@ -116,14 +116,18 @@ export async function advanceWorkflow(sessionId: string, definition: WorkflowDef
   }
 
   // A declared output execute() failed to return a usable value for would
-  // otherwise checkpoint as a fake entity id — either the literal string
-  // "undefined"/"null" (String(undefined) === 'undefined'), or an empty
-  // string / stringified object from some other malformed return — and get
-  // threaded into a later step's input as if it were real. Fail loud here
-  // instead of trusting execute() honored its contract.
+  // otherwise checkpoint as a fake entity id — the literal string
+  // "undefined"/"null" (String(undefined) === 'undefined'), a stringified
+  // object, NaN/Infinity ("NaN" is not a real id either), or a
+  // whitespace-only string — and get threaded into a later step's input as
+  // if it were real. Fail loud here instead of trusting execute() honored
+  // its contract.
   const invalidOutputs = step.outputs.filter((k) => {
     const value = executeResult[k];
-    return value === undefined || value === null || value === '' || (typeof value !== 'string' && typeof value !== 'number');
+    if (value === undefined || value === null) return true;
+    if (typeof value === 'number') return !Number.isFinite(value);
+    if (typeof value === 'string') return value.trim() === '';
+    return true; // any other type (object, boolean, array, ...) is not a valid entity id
   });
   if (invalidOutputs.length > 0) {
     const failedRun = recordStepFailure(

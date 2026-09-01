@@ -3236,8 +3236,16 @@ export class ChatbotDB {
         };
 
     if (guard) {
+      // attribute_exists(sessionId) is REQUIRED here, not optional belt-and-
+      // braces: attribute_not_exists(workflowRun) is satisfied identically
+      // whether the field is merely absent on an existing row or the whole
+      // session item doesn't exist at all — DynamoDB's conditional UpdateItem
+      // creates the item if missing. Without this, a session deleted between
+      // the caller's existence check and this write (or a caller that never
+      // checked) would silently upsert a partial ChatSession row instead of
+      // failing the guard.
       params.ConditionExpression =
-        'attribute_not_exists(workflowRun) OR workflowRun.#wStatus IN (:completedStatus, :failedStatus)';
+        'attribute_exists(sessionId) AND (attribute_not_exists(workflowRun) OR workflowRun.#wStatus IN (:completedStatus, :failedStatus))';
       params.ExpressionAttributeNames = { '#wStatus': 'status' };
       params.ExpressionAttributeValues[':completedStatus'] = 'completed';
       params.ExpressionAttributeValues[':failedStatus'] = 'failed';
