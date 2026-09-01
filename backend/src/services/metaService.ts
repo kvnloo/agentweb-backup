@@ -2441,7 +2441,14 @@ export class MetaService {
   /**
    * Get a single ad with its creative reference
    */
-  public async getAd(accessToken: string, adId: string) {
+  public async getAd(
+    accessToken: string,
+    adId: string,
+    /** When supplied, the node is verified to belong to this ad account before anything is
+     *  returned. Optional so existing read-back callers are unchanged; the callers whose result
+     *  reaches a user-facing prompt pass it. Same treatment getAdSet received. */
+    adAccountId?: string,
+  ) {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
@@ -2453,8 +2460,22 @@ export class MetaService {
         'creative{id,name,body,title,image_url,thumbnail_url,object_story_spec,status}'
       ];
       this.log(`Fetching ad: ${adId}`);
-      const result = await ad.get(fields);
-      return result._data;
+      /*
+       * An ad id is a GLOBAL node id, so this returns any ad the token can reach — and one Meta
+       * OAuth token routinely spans several ad accounts. buildMetaWriteConfirmation renders this
+       * result's NAME into the prompt the user approves, so an ad_id from another ad account
+       * disclosed that account's ad name to this user. getCampaign and getAdSet were both given
+       * this check; getAd, the resolver sitting between them, was not.
+       */
+      const result = await ad.get(
+        adAccountId ? MetaService.withOwnershipField(fields) : fields,
+      );
+      const data = { ...(result?._data ?? {}) };
+      if (adAccountId) {
+        MetaService.assertOwnedByAccount(data.account_id, adId, 'Ad', adAccountId);
+        delete data.account_id;
+      }
+      return data;
     } catch (error) {
       return this.handleError(error, 'getAd');
     }

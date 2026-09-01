@@ -19105,7 +19105,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     };
     const resolveAd = async (id?: string) => {
       if (!id || !accessToken) return undefined;
-      try { return await metaService.getAd(accessToken, id); } catch { return undefined; }
+      // Same reason as resolveAdSet above: this result's NAME is rendered into the prompt the
+      // user approves, so an ad id from another ad account the token can reach would disclose
+      // that account's ad name to this user.
+      try { return await metaService.getAd(accessToken, id, account_id); } catch { return undefined; }
     };
     const nameOf = (entity: any, id?: string) =>
       entity?.name ? `"${entity.name}" (${entity.id || id})` : (id ? `ID ${id}` : 'unknown');
