@@ -23474,6 +23474,48 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     };
   }
 
+  /**
+   * The two "the name search did not finish" refusals, kept in one place because they are one
+   * decision: whether the thing that stopped the read is worth trying again.
+   *
+   * `failed` — a request errored (5xx, a transport blip, the per-request timeout firing on one
+   * unlucky call). That is transient by nature, so "retry" is a remedy that can actually work.
+   *
+   * `capped` with no failure — the ONLY way to reach that here is
+   * `queryDriveFilesAcrossFolders` crossing DRIVE_LIST_WALK_MAX_MS. (Its other capping path,
+   * `batchCount >= perBatchTarget`, cannot fire on a zero-result search.) That bound is
+   * wall-clock, spent walking a folder tree whose size does not change between attempts, and it
+   * is a SECOND such budget after `getGoogleDriveFolderTreeIds` already spent up to the same
+   * amount enumerating the sub-folders. A tree big enough to exhaust it therefore exhausts it
+   * again, in the same place, on every retry.
+   *
+   * So the two branches must not share a remedy. Telling the model to "retry the read" on the
+   * capped branch is the ENG-1636 failure in miniature — naming a remedy that cannot work — and
+   * worse than useless here, because the retry is not free: each attempt burns up to two 15s
+   * budgets and the turn's own time, and a deterministic non-answer repeated is a loop. The
+   * capped branch is given remedies that change the SCOPE of the search, which is the only
+   * variable that can move the outcome.
+   */
+  private driveNameSearchIncompleteMessage(fileName: string, rootName: string, failed?: any): string {
+    const preamble =
+      `Could not determine whether "${fileName}" is in Google Drive folder "${rootName}" — `;
+    if (failed) {
+      return preamble
+        + `the file search itself failed (${this.classifyDriveError(failed)}). This is a FAILED read, not a `
+        + `confirmed absence: do not report the file as missing. Retry the read.`;
+    }
+    return preamble
+      + `the file search ran out of its time budget before it had covered the whole folder tree. `
+      + `This is an INCOMPLETE read, not a confirmed absence: do not report the file as missing. `
+      + `Do NOT retry this same call — the budget is a fixed wall-clock bound spent walking this `
+      + `folder's sub-folders, so a tree this large will stop in the same place every time. `
+      + `The only thing that changes the outcome is a SMALLER search scope: ask the user for the `
+      + `file's direct Google Drive link, or for the specific sub-folder it lives in so that `
+      + `sub-folder can be registered as its own knowledge base source. If neither is available, `
+      + `tell the user plainly that this folder is too large to search within the read budget — `
+      + `do not describe it as a temporary glitch and do not try again.`;
+  }
+
   // Helper: read a file from a Google Drive shared folder
   private async readGoogleDriveSharedFile(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
     const folderId = kbIdentifier.replace('gdrive:', '');
@@ -23521,20 +23563,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
          * name query is what would have found the file, so if IT did not complete, nothing here
          * knows whether the file is there.
          */
-        if (nameQueryFailed) {
+        if (nameQueryFailed || nameQueryCapped) {
           return {
             success: false,
-            message: `Could not determine whether "${fileName}" is in Google Drive folder "${rootName}" — the file `
-              + `search itself failed (${this.classifyDriveError(nameQueryFailed)}). This is a FAILED read, not a `
-              + `confirmed absence: do not report the file as missing. Retry the read.`
-          };
-        }
-        if (nameQueryCapped) {
-          return {
-            success: false,
-            message: `Could not determine whether "${fileName}" is in Google Drive folder "${rootName}" — the file `
-              + `search stopped before it finished. This is an INCOMPLETE read, not a confirmed absence: do not `
-              + `report the file as missing. Retry the read.`
+            message: this.driveNameSearchIncompleteMessage(fileName, rootName, nameQueryFailed)
           };
         }
         if (rootRestricted) {
@@ -23672,21 +23704,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (files.length === 0) {
         // Same distinction readGoogleDriveSharedFile draws, for the same reason: the helper
         // reports a failed request as `failed`/`capped` instead of throwing, so ignoring both
-        // flags turned an errored search into a definitive "not found".
-        if (nameQueryFailed) {
+        // flags turned an errored search into a definitive "not found". Shared wording too, so
+        // the transient/deterministic split cannot drift between the two call sites.
+        if (nameQueryFailed || nameQueryCapped) {
           return {
             success: false,
-            message: `Could not determine whether "${fileName}" is in Google Drive folder "${rootName}" — the file `
-              + `search itself failed (${this.classifyDriveError(nameQueryFailed)}). This is a FAILED read, not a `
-              + `confirmed absence: do not report the file as missing. Retry the read.`
-          };
-        }
-        if (nameQueryCapped) {
-          return {
-            success: false,
-            message: `Could not determine whether "${fileName}" is in Google Drive folder "${rootName}" — the file `
-              + `search stopped before it finished. This is an INCOMPLETE read, not a confirmed absence: do not `
-              + `report the file as missing. Retry the read.`
+            message: this.driveNameSearchIncompleteMessage(fileName, rootName, nameQueryFailed)
           };
         }
         if (rootRestricted) {

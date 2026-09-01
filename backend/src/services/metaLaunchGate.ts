@@ -513,21 +513,38 @@ export async function runMetaTrackingGate(
   }
   if (adId && destinationUrls.length === 0) {
     /*
-     * "Not found in a partial search" is not "not there". If either read stopped at its bound
-     * the ad may simply never have been looked at, and saying it "may belong to a different
-     * campaign" sends the reader to fix a cause that is not theirs — the ENG-1636 failure,
-     * where a pre-flight named a remedy that did not match the real reason.
+     * "Not found in a partial search" is not "not there". But the two reads that could have
+     * stopped short answer DIFFERENT questions, so a single `adsTruncated || accountWideTruncated`
+     * flag made the message describe a read that had not stopped at all — the ENG-1636 failure
+     * again, a pre-flight naming a remedy that does not match the real reason.
+     *
+     * `adsTruncated` is the CAMPAIGN-scoped list. When that stops short, nothing here knows the
+     * ad is absent from the campaign, and narrowing to the containing ad set is a real remedy —
+     * a smaller read can finish where the campaign-wide one could not.
+     *
+     * `accountWideTruncated` is the fallback that looks for the ad anywhere in the account, and
+     * it only runs when the campaign-scoped read already came back WITHOUT the ad. So when the
+     * campaign read was complete (`truncated: false`) and only the fallback truncated, the
+     * collapsed flag reported "the ad list for campaign X was too large to read completely" about
+     * a read that completed, told the user to narrow to an ad set that does not contain the ad,
+     * and suppressed the one accurate sentence — that the ad may belong to a different campaign.
+     * Narrowing the request cannot help when the ad is not in this campaign at all.
      */
-    const searchWasIncomplete = adsTruncated || accountWideTruncated;
-    const message = searchWasIncomplete
+    const message = adsTruncated
       ? `Launch blocked: could not verify Meta tracking for ad ${adId}. The ad list for campaign ` +
         `${campaignId} was too large to read completely, so the ad was not necessarily absent — it ` +
         `may simply not have been reached. Narrow the request to the ad set that contains the ad, ` +
         `supply the destination on the request, or use an explicit tracking-check override.`
-      : `Launch blocked: could not verify Meta tracking because ad ${adId} was not found in campaign ` +
-        `${campaignId}. The ad this launch would activate may belong to a different campaign, so the ` +
-        `check cannot tell where it sends people. Retry with the campaign that actually contains the ad, ` +
-        `supply the destination on the request, or use an explicit tracking-check override.`;
+      : accountWideTruncated
+        ? `Launch blocked: could not verify Meta tracking because ad ${adId} was not found in campaign ` +
+          `${campaignId}, and the account-wide search for it was too large to read completely, so where ` +
+          `it does live could not be established. The ad this launch would activate may belong to a ` +
+          `different campaign. Retry with the campaign that actually contains the ad, supply the ` +
+          `destination on the request, or use an explicit tracking-check override.`
+        : `Launch blocked: could not verify Meta tracking because ad ${adId} was not found in campaign ` +
+          `${campaignId}. The ad this launch would activate may belong to a different campaign, so the ` +
+          `check cannot tell where it sends people. Retry with the campaign that actually contains the ad, ` +
+          `supply the destination on the request, or use an explicit tracking-check override.`;
     await record(sessionId, {
       accountId, campaignId, action, outcome: override ? 'overridden' : 'blocked',
       urlResults: [], checkedAt: new Date().toISOString(),
