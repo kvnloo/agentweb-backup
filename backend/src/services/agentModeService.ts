@@ -2129,6 +2129,17 @@ export class AgentModeService {
   /** Media types the vision APIs decode natively. */
   private static readonly VISION_NATIVE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
+  // ENG-1670: a scheduled run's own tool-calling loop can fire several Gemini
+  // calls back-to-back within one turn (prod-verified: 4 calls in ~22s on the
+  // "LinkedIn Post Factory" schedule) with nothing pacing them — the schedule
+  // jitter fix (agentModeController.calculateNextRunTime) addresses platform-
+  // wide clustering across DIFFERENT schedules, but does nothing for a single
+  // session's own rapid iteration cadence. Scoped tightly: scheduled runs only
+  // (never adds latency to a live interactive user watching the screen), and
+  // Gemini only (the provider this class of 429 was confirmed against) — not a
+  // blanket delay on every model or every turn.
+  private static readonly SCHEDULED_GEMINI_ITERATION_PACING_MS = 1500;
+
   /**
    * Normalize uploaded image bytes to a vision-decodable representation. This
    * remains local image hygiene; text/tool model routing is handled separately.
@@ -3732,6 +3743,23 @@ export class AgentModeService {
               (t: any) => t.function?.name !== 'install_skills'
             );
           }
+        }
+
+        // ENG-1670: pace out a scheduled run's own back-to-back Gemini calls within
+        // this turn. Narrow guard: scheduled only (never adds latency for a live
+        // interactive user), Gemini only (the provider this failure was confirmed
+        // against), iteration > 1 only (the turn's first call has nothing preceding
+        // it in this turn to burst against), and skipped once the turn is already
+        // racing its own wall-clock cap — this is defense against this session's own
+        // request rate, not worth trading against the ENG-907 time budget it would
+        // otherwise eat into.
+        if (
+          isScheduledSession
+          && iteration > 1
+          && llmModel.startsWith('gemini')
+          && !forceFinalSynthesis
+        ) {
+          await this.sleep(AgentModeService.SCHEDULED_GEMINI_ITERATION_PACING_MS);
         }
 
         // Trim large old tool results to prevent context window overflow
