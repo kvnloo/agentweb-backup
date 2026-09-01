@@ -32,6 +32,33 @@ const SPEND_ENTITIES = new Set(['CAMPAIGN', 'AD_SET', 'AD']);
  */
 const SPEND_ACTIONS = new Set(['CREATE', 'UPDATE', 'COPY_AD']);
 
+/**
+ * Launches that put NO PRE-EXISTING AD live, so the completeness of the campaign's ad list
+ * cannot change their verdict.
+ *
+ * A CAMPAIGN or AD_SET CREATE makes an empty container: whatever it is created as, it holds
+ * zero ads at the moment it is created and can send traffic nowhere. The two ENG-600 launch
+ * flows are the same shape — `executeAudienceCampaignLaunch` creates an audience, optionally a
+ * lookalike, and one ad set, and no ads at all.
+ *
+ * They are listed here because the ad-list truncation block below is about ads this launch
+ * would ACTIVATE, and these activate none. Blocking them on a truncated read refused a launch
+ * over ads it was never going to touch, and the remedy the block offers — "narrow the launch to
+ * a single ad" — cannot be followed for an entity that does not exist yet. An AD CREATE is
+ * deliberately NOT here: it does create something that serves, and when its destination is not
+ * on the request the campaign's ad list is what the check falls back on.
+ *
+ * Scope boundary, stated rather than implied: this only lifts the TRUNCATION block. These
+ * launches are still checked against the campaign's readable destinations, which is the
+ * pre-existing (and separately arguable) behaviour, unchanged here.
+ */
+const NO_EXISTING_ADS_ACTIONS = new Set([
+  'CAMPAIGN_CREATE',
+  'AD_SET_CREATE',
+  'TARGETED_AUDIENCE_LAUNCH',
+  'RETARGETING_LAUNCH',
+]);
+
 export interface MetaGateCredentials {
   accountId: string;
   accessToken: string;
@@ -527,9 +554,13 @@ export async function runMetaTrackingGate(
    * be done for an entity that does not exist yet.
    *
    * The completeness of the ad list only matters when the ad list is what the decision rests on.
-   * When the destination came from the request, it does not.
+   * It does not when the destination came from the request (`destinationCameFromRequest`), and it
+   * does not when the launch activates no pre-existing ad at all (`NO_EXISTING_ADS_ACTIONS`) —
+   * the audience-launch path and a plain AD_SET/CAMPAIGN CREATE, which the paragraph above named
+   * as victims but which the `destinationCameFromRequest` escape does not actually cover, because
+   * `executeAudienceCampaignLaunch` passes no `pendingDestinations` argument at all.
    */
-  if (!adId && adsTruncated && !destinationCameFromRequest) {
+  if (!adId && adsTruncated && !destinationCameFromRequest && !NO_EXISTING_ADS_ACTIONS.has(action)) {
     const message =
       `Launch blocked: could not verify Meta tracking because the ad list for campaign ${campaignId} ` +
       `was too large to read completely, so some ads in this launch were never checked. Narrow the ` +
