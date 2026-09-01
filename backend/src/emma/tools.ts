@@ -6028,7 +6028,14 @@ emmaToolRegistry.register({
         format_requirements: { type: "string", description: "Optional additional formatting instructions (e.g. 'use dark theme', 'include charts', 'brand color #1a73e8', 'add a CTA button to book a demo')." },
         document_type: { type: "string", enum: ["document", "email"], description: "Optional. Use 'email' for a one-off newsletter/marketing email so the HTML is email-client-safe (table-based layout, inline CSS, 600px container, no JS). Use 'document' (default) for reports, summaries, audits, and other web-style documents." }
       },
-      required: ["title", "content_draft"]
+      required: ["title", "content_draft"],
+      // ENG-1477: reject any argument outside the four named above. The
+      // handler below only ever reads args.title/content_draft/
+      // format_requirements/document_type by name, so an extra key is
+      // already inert — this makes that safety a schema-enforced guarantee
+      // (agentToolGatewayService.ts's validator) rather than an incidental
+      // property of how execute() happens to be written.
+      additionalProperties: false
     }
   },
   execute: async (args: any, context?: any) => {
@@ -6105,7 +6112,12 @@ emmaToolRegistry.register({
           description: 'REQUIRED: The complete content of the file to save as a string. You must provide the full file content - this tool cannot retrieve content from previous operations.'
         }
       },
-      required: ["file_name", "file_content"]
+      required: ["file_name", "file_content"],
+      // ENG-1477: same reasoning as create_html_file above — the handler
+      // only reads file_name/file_content by name, so reject anything else
+      // at the schema level instead of relying on it being harmlessly
+      // ignored.
+      additionalProperties: false
     }
   },
   execute: async (args: any, context?: any) => {
