@@ -11,7 +11,14 @@ export const SCORING_MODEL = "gemini-3.1-flash-lite";
 // the completion budget before the JSON is emitted — too low a cap causes
 // finish_reason=length with truncated/empty JSON. Non-thinking models still
 // stop after ~80 tokens, so a high cap adds no cost for them.
-const SCORING_MAX_COMPLETION_TOKENS = 2000;
+//
+// ENG-1669: 2000 was still not enough in practice — confirmed against
+// production (2026-09-01): two real custom-judge scoring calls truncated
+// mid-JSON ("Unterminated string in JSON...", "Expected ',' or '}' after
+// property value...") on judges with long (8k-10k char) system prompts that
+// encourage detailed reasoning. Doubled; non-thinking models are unaffected
+// per the note above.
+export const SCORING_MAX_COMPLETION_TOKENS = 4000;
 
 const MAX_TOOL_CONTENT_FOR_SCORING = 500; // chars per tool result in scoring context
 
@@ -1264,7 +1271,19 @@ export async function scoreSession(
 
   const raw = res.choices?.[0]?.message?.content ?? "{}";
   const parsed = JSON.parse(raw);
-  const score = Math.max(1, Math.min(5, Math.round(parsed.score)));
+  // ENG-1669: a missing/non-numeric "score" field used to flow straight through
+  // Math.round/Math.max/Math.min as NaN — no code path checked for it — and the
+  // resulting NaN only surfaced when DynamoDB's SDK rejected it at the point of
+  // persisting, as an opaque "cannot be converted to a numeric value: NaN"
+  // error far removed from the actual cause. Fail at the source instead, with a
+  // message that says what actually went wrong.
+  const rawScore = finiteNumber(parsed.score);
+  if (rawScore === undefined) {
+    throw new Error(
+      `Judge response missing or non-numeric "score" field (got ${JSON.stringify(parsed.score)})`
+    );
+  }
+  const score = Math.max(1, Math.min(5, Math.round(rawScore)));
   const reason = parsed.reason || "No reason provided";
   const guarded = applyFabricationGuard(
     manifest.count,
@@ -1352,7 +1371,16 @@ export async function scoreSessionWithJudge(
 
   const raw = res.choices?.[0]?.message?.content ?? "{}";
   const parsed = JSON.parse(raw);
-  const score = Math.max(1, Math.min(5, Math.round(parsed.score)));
+  // ENG-1669: see scoreSession's identical guard — a missing/non-numeric
+  // "score" here previously reached chatbotDb.updateSessionJudgeScore as NaN
+  // and failed opaquely inside the DynamoDB SDK instead of at the source.
+  const rawScore = finiteNumber(parsed.score);
+  if (rawScore === undefined) {
+    throw new Error(
+      `Judge response missing or non-numeric "score" field (got ${JSON.stringify(parsed.score)})`
+    );
+  }
+  const score = Math.max(1, Math.min(5, Math.round(rawScore)));
   const reason = parsed.reason || "No reason provided";
   const guarded = applyFabricationGuard(
     manifest.count,
