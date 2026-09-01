@@ -261,6 +261,35 @@ describe('emailService.sendScheduledChatTokenLimitEmail', () => {
     expect(htmlContent).not.toContain('$');
   });
 
+  it('names the reset DATE, not "the start of each billing period" (ENG-1344)', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatTokenLimitEmail(
+      'user@example.com',
+      'My Schedule',
+      'schedule-123',
+      {
+        used: 5000000,
+        allowance: null,
+        effectiveAllowance: null,
+        percentUsed: 0,
+        costUsed: 42.5,
+        costAllowance: 40,
+        costPercentUsed: 106,
+        month: '2026-09',
+      }
+    );
+
+    const [, , textContent, htmlContent] = spy.mock.calls[0];
+    for (const body of [textContent, htmlContent]) {
+      expect(body).toContain('resets on October 1, 2026');
+      // The vague sentence the escalating customer could not decode.
+      expect(body).not.toContain('resets at the start of each billing period');
+    }
+    // ENG-1566 still holds: a date is not a dollar figure.
+    expect(htmlContent).not.toContain('$');
+  });
+
   it('renders a percentage-only message when the cost cap is the cause — never the raw dollar spend (ENG-1566)', async () => {
     const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
 

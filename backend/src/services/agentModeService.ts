@@ -56,6 +56,13 @@ import {
   promptRequestsLogo,
 } from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory } from './agentMode/core/toolDispatch';
+import {
+  describeImageReportsFabricatedMetrics,
+  FABRICATED_METRICS_CHECK_PROMPT,
+  FABRICATED_METRICS_CHECK_TIMEOUT_MS,
+  FABRICATED_METRICS_WARNING,
+  promptRisksFabricatedMetrics,
+} from './agentMode/dataFabricationGuard';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
@@ -328,6 +335,35 @@ export function isVerificationFunctionCallRetryPress(text: string): boolean {
 // like generate_image)? Used only to sharpen the suppression log line.
 export function pressesIrreversiblePublishWrite(text: string): boolean {
   return isVerificationFunctionCallRetryPress(text) && IRREVERSIBLE_PUBLISH_TOOLS.some((tool) => text.includes(tool));
+}
+
+// ENG-1670: a blind fixed backoff is a guess — OpenRouter documents that a
+// 429/5xx can carry `retry-after` (seconds, or an HTTP-date) or the proactive
+// `retry-after-ms`, and the OpenAI SDK's own (disabled here via maxRetries: 0)
+// retry logic already trusts that header over a computed default when it's
+// present and under 60s. Mirror that instead of guessing: honoring the
+// provider's own signal is correct regardless of whether that signal turns
+// out to be 1.5s or 45s, where a fixed backoff is only right by luck.
+//
+// Shared by callLLM's in-call retry loop AND generateMarketingResponse's
+// outer catch (which persists whether a header was actually present, once the
+// call has exhausted its retries and the whole turn is failing) — one
+// definition, so both readings of the same header can never disagree.
+export function getRetryAfterMs(error: unknown): number | undefined {
+  const headers = (error as any)?.headers;
+  if (!headers) return undefined;
+  const msHeader = headers['retry-after-ms'];
+  if (msHeader) {
+    const ms = parseFloat(msHeader);
+    if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
+  }
+  const secHeader = headers['retry-after'];
+  if (secHeader) {
+    const seconds = parseFloat(secHeader);
+    const ms = !Number.isNaN(seconds) ? seconds * 1000 : Date.parse(secHeader) - Date.now();
+    if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
+  }
+  return undefined;
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
@@ -2131,6 +2167,17 @@ export class AgentModeService {
   /** Media types the vision APIs decode natively. */
   private static readonly VISION_NATIVE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
+  // ENG-1670: a scheduled run's own tool-calling loop can fire several Gemini
+  // calls back-to-back within one turn (prod-verified: 4 calls in ~22s on the
+  // "LinkedIn Post Factory" schedule) with nothing pacing them — the schedule
+  // jitter fix (agentModeController.calculateNextRunTime) addresses platform-
+  // wide clustering across DIFFERENT schedules, but does nothing for a single
+  // session's own rapid iteration cadence. Scoped tightly: scheduled runs only
+  // (never adds latency to a live interactive user watching the screen), and
+  // Gemini only (the provider this class of 429 was confirmed against) — not a
+  // blanket delay on every model or every turn.
+  private static readonly SCHEDULED_GEMINI_ITERATION_PACING_MS = 1500;
+
   /**
    * Normalize uploaded image bytes to a vision-decodable representation. This
    * remains local image hygiene; text/tool model routing is handled separately.
@@ -2568,6 +2615,7 @@ export class AgentModeService {
       humanPaced = false,
       timeoutMs,
       fallbackModels,
+      taskClass,
     } = options || {};
 
     // AgentWeb owns model selection; OpenRouter owns transport, provider
@@ -2692,8 +2740,28 @@ export class AgentModeService {
       return errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx';
     };
 
+    // A single 1.5s retry wasn't enough to clear a burst-triggered 429 — prod
+    // sessions on the LinkedIn Post Factory SCHEDULED schedule (which fires
+    // several tool calls back-to-back) needed the full 15-60min scheduled-run
+    // backoff to recover from what OpenRouter reported as rate-limited. One
+    // extra attempt, backed by the Retry-After header when the provider sends
+    // one, gives a rate limit real room to clear within the same run before
+    // falling back to that expensive path.
+    //
+    // Scoped to scheduled_background ONLY: this loop is shared by every
+    // caller of callLLM, including a live interactive chat with a human
+    // staring at the screen. Retry-After can legitimately be tens of seconds,
+    // and honoring it across two retries could add up to ~2 minutes of dead
+    // air to an interactive turn that used to fail fast after ~1.5s — a much
+    // worse outcome for that caller than the original single-short-retry
+    // behavior. A headless scheduled run has no one watching and already
+    // tolerates a much larger backoff at the schedule level, so it's the only
+    // context where trading latency for a better shot at recovery is a clear
+    // win rather than a regression.
+    const isScheduledLlmCall = taskClass === 'scheduled_background';
+    const maxAttempts = isScheduledLlmCall ? 3 : 2;
     let lastError: unknown;
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const res = await client.chat.completions.create(
           params,
@@ -2729,11 +2797,17 @@ export class AgentModeService {
         return res;
       } catch (error) {
         lastError = error;
-        if (attempt < 2 && isRetryableLlmCallError(error)) {
-          console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying once`, {
+        if (attempt < maxAttempts && isRetryableLlmCallError(error)) {
+          // Retry-After is only honored for scheduled calls (see maxAttempts
+          // comment above) — an interactive/other caller keeps the original
+          // fixed, short backoff so a live turn still fails fast rather than
+          // trusting a provider-reported wait that could be tens of seconds.
+          const retryAfterMs = isScheduledLlmCall ? getRetryAfterMs(error) : undefined;
+          const backoffMs = retryAfterMs ?? 1500 * Math.pow(2, attempt - 1);
+          console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms${retryAfterMs !== undefined ? ' (honoring Retry-After)' : ''}`, {
             error: error instanceof Error ? error.message : String(error),
           });
-          await this.sleep(1500);
+          await this.sleep(backoffMs);
           continue;
         }
         break;
@@ -3758,6 +3832,23 @@ export class AgentModeService {
               (t: any) => t.function?.name !== 'install_skills'
             );
           }
+        }
+
+        // ENG-1670: pace out a scheduled run's own back-to-back Gemini calls within
+        // this turn. Narrow guard: scheduled only (never adds latency for a live
+        // interactive user), Gemini only (the provider this failure was confirmed
+        // against), iteration > 1 only (the turn's first call has nothing preceding
+        // it in this turn to burst against), and skipped once the turn is already
+        // racing its own wall-clock cap — this is defense against this session's own
+        // request rate, not worth trading against the ENG-907 time budget it would
+        // otherwise eat into.
+        if (
+          isScheduledSession
+          && iteration > 1
+          && llmModel.startsWith('gemini')
+          && !forceFinalSynthesis
+        ) {
+          await this.sleep(AgentModeService.SCHEDULED_GEMINI_ITERATION_PACING_MS);
         }
 
         // Trim large old tool results to prevent context window overflow
@@ -4851,6 +4942,16 @@ export class AgentModeService {
       wrappedError.originalMessage = error?.message || String(error);
       if (error?.status) wrappedError.status = error.status;
       if (error?.code) wrappedError.code = error.code;
+      // ENG-1670: whether the provider actually sent a Retry-After header is not
+      // guaranteed (OpenRouter's own docs: conditional, not promised even for a
+      // single-provider model). Rather than that staying an unanswerable question
+      // every time this fires, persist the answer for THIS occurrence — the last
+      // investigation into this exact failure class had no way to tell, because
+      // nothing captured it and the raw provider response doesn't survive past
+      // this catch block otherwise.
+      wrappedError.retryAfterHeaderPresent = Boolean((error as any)?.headers?.['retry-after'] || (error as any)?.headers?.['retry-after-ms']);
+      const retryAfterMs = getRetryAfterMs(error);
+      if (retryAfterMs !== undefined) wrappedError.retryAfterMs = retryAfterMs;
       if (partialResponseMessages.length > 0) {
         wrappedError.partialUsageMessages = partialResponseMessages;
       }
@@ -6382,7 +6483,11 @@ export class AgentModeService {
         // returns success:true with no imageUrl. Dropping this flag made that state
         // indistinguishable from a broken generation downstream (the auto-revision
         // path reported it as "failed to extract asset URL").
-        ...(actualResult.awaitingUserConfirmation === true && { awaitingUserConfirmation: true })
+        ...(actualResult.awaitingUserConfirmation === true && { awaitingUserConfirmation: true }),
+        // ENG-1027: the post-generation data-fabrication check's warning must survive
+        // this minimizer (everything unnamed here is dropped) or Emma never sees it
+        // and silently presents invented numbers as real data.
+        ...(actualResult.dataReliabilityWarning && { dataReliabilityWarning: actualResult.dataReliabilityWarning })
       };
     }
 
@@ -26447,7 +26552,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     imageModel?: string,
     logoImage?: string,
     confirm?: boolean,
-    category?: string
+    category?: string,
+    metricsVerified?: boolean
   ): Promise<any> {
     // ENG-343: the producing flow must self-declare the eval use case — Matt's
     // review feedback differs entirely between ads and organic posts, and a
@@ -26699,6 +26805,36 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           },
         });
 
+        // ENG-1027 data-fabrication backstop: the tool-description guidance alone is
+        // instruction-following-dependent, and live verification showed the image
+        // model can invent metrics even in prompts that never asked for real data
+        // (a bare "metrics preview" dashboard element is enough). For prompts shaped
+        // like a dashboard/table that Emma hasn't declared use verified real values
+        // (metricsVerified), run one bounded describe_image check against the actual
+        // output and surface a warning so Emma discloses rather than silently
+        // presenting invented numbers. Timeboxed tighter than describe_image's own
+        // 90s ENG-294 bound — this is an added, best-effort safety net the user never
+        // explicitly asked for, not worth spending that much turn budget on.
+        let dataReliabilityWarning: string | undefined;
+        if (promptRisksFabricatedMetrics(prompt, metricsVerified)) {
+          console.log(`AgentMode: generate_image data-fabrication check triggered (session ${sessionId})`);
+          try {
+            const visionCheck = await withTimeoutOrReject(
+              this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT),
+              FABRICATED_METRICS_CHECK_TIMEOUT_MS,
+              'generate_image data-fabrication check'
+            );
+            if (visionCheck?.success && describeImageReportsFabricatedMetrics(visionCheck.description)) {
+              dataReliabilityWarning = FABRICATED_METRICS_WARNING;
+              console.log(`AgentMode: generate_image data-fabrication check WARNED (session ${sessionId})`);
+            } else {
+              console.log(`AgentMode: generate_image data-fabrication check clear (session ${sessionId})`);
+            }
+          } catch (visionErr) {
+            console.warn('AgentMode: generate_image data-fabrication check failed/timed out (non-fatal):', visionErr);
+          }
+        }
+
         return {
           success: true,
           message: `✅ Image "${result.filename}" generated successfully!`,
@@ -26708,6 +26844,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           size: size,
           quality: quality,
           imageModel: imageModelUsed,
+          ...(dataReliabilityWarning ? { dataReliabilityWarning } : {}),
           ...(fallbackUsed ? { fallbackUsed: true, primaryError } : {})
         };
       } else {

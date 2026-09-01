@@ -184,6 +184,7 @@ async function handleSlackSessionResponse(params: {
   // Generate the response
   const { generateSessionResponse } = await import('../controllers/agentModeController');
   const { agentModeService } = await import('../services/agentModeService');
+  const { cronJobRegistry } = await import('../utils/cronJobRegistry');
 
   const llmModel = session.llmModel || await agentModeService.getDefaultModel();
   if (!session.llmModel) {
@@ -223,13 +224,16 @@ async function handleSlackSessionResponse(params: {
   }
 
   try {
-    const response = await generateSessionResponse(
+    // ENG-1189: this turn's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener.
+    const response = await cronJobRegistry.track('slackAgentTurn', generateSessionResponse(
       session.sessionId,
       userMessage,
       user.userId,
       llmModel,
       attachments
-    );
+    ));
 
     // Remove the thinking message
     if (thinkingTs) {
@@ -768,6 +772,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             const { chatbotDb } = await import('../services/chatbotService');
             const { generateSessionResponse } = await import('../controllers/agentModeController');
             const { agentModeService } = await import('../services/agentModeService');
+            const { cronJobRegistry } = await import('../utils/cronJobRegistry');
 
             const session = await chatbotDb.getChatSession(sessionId);
             if (!session) {
@@ -823,7 +828,10 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             const llmModel = session.llmModel || await agentModeService.getDefaultModel();
 
             try {
-              const response = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments);
+              // ENG-1189: this turn's tool calls self-call back into this
+              // process via mcpFetch — tracked so a deploy mid-run waits for
+              // it instead of abandoning it against a closed listener.
+              const response = await cronJobRegistry.track('slackThreadAgentTurn', generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments));
               if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
               if (response.content) await postThreadResponse(channel, threadTs, citeForSlack(response));
             } catch (genError) {
