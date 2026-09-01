@@ -101,15 +101,40 @@ describe('emailService.sendSessionNotificationEmail', () => {
   // ENG-1297: a post-completion scheduler nudge (or any other caller) resending a
   // notification for a session that already sent it must not produce a second email.
   describe('duplicate-send guard (ENG-1297)', () => {
-    it('claims an idempotency key scoped to the session and recipients before sending', async () => {
+    it('claims an idempotency key scoped to the session, recipients, and content before sending', async () => {
       jest.spyOn(emailService, 'sendEmailStrict').mockResolvedValue({ messageId: 'msg-1' });
 
       await emailService.sendSessionNotificationEmail(['B@Example.com', 'a@example.com'], 'session-666', 'Report');
 
       expect(settingsService.claimSetMember).toHaveBeenCalledWith(
         'notify-session:session-666',
-        'a@example.com,b@example.com'
+        expect.stringContaining(JSON.stringify(['a@example.com', 'b@example.com']))
       );
+    });
+
+    it('builds a collision-safe recipient signature (JSON, not a bare comma-join)', async () => {
+      // A single recipient string containing an embedded comma must NOT normalize to
+      // the same signature as the equivalent two-recipient array — a bare
+      // `.join(',')` would collide these two calls and wrongly suppress the second.
+      jest.spyOn(emailService, 'sendEmailStrict').mockResolvedValue({ messageId: 'msg-1' });
+
+      await emailService.sendSessionNotificationEmail(['a@x.com,b@x.com'], 'session-json-1', 'Report');
+      await emailService.sendSessionNotificationEmail(['a@x.com', 'b@x.com'], 'session-json-2', 'Report');
+
+      const [, embeddedCommaMember] = (settingsService.claimSetMember as jest.Mock).mock.calls[0];
+      const [, splitRecipientsMember] = (settingsService.claimSetMember as jest.Mock).mock.calls[1];
+      expect(embeddedCommaMember).not.toBe(splitRecipientsMember);
+    });
+
+    it('claims independently for different content, so a legitimate second notification is not permanently suppressed', async () => {
+      jest.spyOn(emailService, 'sendEmailStrict').mockResolvedValue({ messageId: 'msg-1' });
+
+      await emailService.sendSessionNotificationEmail(['r@example.com'], 'session-content-1', 'First report body');
+      await emailService.sendSessionNotificationEmail(['r@example.com'], 'session-content-2', 'Second, different report body');
+
+      const [, firstMember] = (settingsService.claimSetMember as jest.Mock).mock.calls[0];
+      const [, secondMember] = (settingsService.claimSetMember as jest.Mock).mock.calls[1];
+      expect(firstMember).not.toBe(secondMember);
     });
 
     it('skips sending and returns duplicate:true when the claim is already held', async () => {
@@ -130,17 +155,15 @@ describe('emailService.sendSessionNotificationEmail', () => {
       expect(result).toEqual({ sent: true, duplicate: false });
     });
 
-    it('releases the claim when the send fails, so a genuine retry can still succeed', async () => {
+    it('releases the same claim member when the send fails, so a genuine retry can still succeed', async () => {
       jest.spyOn(emailService, 'sendEmailStrict').mockRejectedValue(new Error('SMTP error'));
 
       await expect(
         emailService.sendSessionNotificationEmail(['r@example.com'], 'session-999', 'Report')
       ).rejects.toThrow('SMTP error');
 
-      expect(settingsService.releaseSetMember).toHaveBeenCalledWith(
-        'notify-session:session-999',
-        'r@example.com'
-      );
+      const [, claimedMember] = (settingsService.claimSetMember as jest.Mock).mock.calls[0];
+      expect(settingsService.releaseSetMember).toHaveBeenCalledWith('notify-session:session-999', claimedMember);
     });
   });
 });
