@@ -23,6 +23,7 @@ import {
   markBlockedOnParameter,
   collectEntityIdsFromCheckpoints,
   findGatedParameterKeys,
+  findOutputParameterNameCollisions,
 } from './core/workflow';
 
 export async function startWorkflow(
@@ -30,6 +31,17 @@ export async function startWorkflow(
   definition: WorkflowDefinition,
   initialParameters?: Record<string, unknown>,
 ): Promise<WorkflowRunState> {
+  // A malformed definition where a gated parameter key and a step output
+  // share a name would leave it to merge order to decide, at runtime,
+  // whether a later step sees the real checkpointed entity or a stale/
+  // answered parameter value — reject this at start time instead.
+  const collisions = findOutputParameterNameCollisions(definition);
+  if (collisions.length > 0) {
+    throw new Error(
+      `startWorkflow: workflow definition has name collision(s) between a step output and a gated parameter — a resolved parameter could silently override a checkpointed entity id: ${collisions.join(', ')}`,
+    );
+  }
+
   // A gated key (objective, budget_mode, ...) MUST come from a
   // human-attributed AskUserQuestion answer, never a caller-supplied initial
   // value — resolveStepParameters only checks presence, not provenance, so
@@ -99,11 +111,18 @@ export async function advanceWorkflow(sessionId: string, definition: WorkflowDef
   const at = () => new Date().toISOString();
 
   // "campaign_id feeds the next step": merge prior VERIFIED steps' checkpointed
-  // entity IDs ahead of resolvedParameters, so a step declaring an input that
+  // entity IDs with resolvedParameters, so a step declaring an input that
   // matches an earlier step's output name receives it automatically — without
   // ever persisting entity IDs into run.resolvedParameters itself (they stay
   // sourced from the checkpoints, the single place this data lives).
-  const executionInput = { ...collectEntityIdsFromCheckpoints(run), ...resolution.resolvedParameters };
+  //
+  // Checkpointed entity IDs are spread LAST (winning any name collision):
+  // startWorkflow already rejects a definition where a gated-parameter key
+  // collides with a step output name, but this order is the defense-in-depth
+  // backstop — verified, checkpointed state is strictly more trustworthy than
+  // a resolved parameter value, so it must win even if some future caller
+  // path constructs a run/definition pair that bypasses that check.
+  const executionInput = { ...resolution.resolvedParameters, ...collectEntityIdsFromCheckpoints(run) };
 
   let executeResult: Record<string, unknown>;
   try {

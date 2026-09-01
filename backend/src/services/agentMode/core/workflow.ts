@@ -97,6 +97,22 @@ export function findGatedParameterKeys(definition: WorkflowDefinition): Set<stri
   return new Set(definition.steps.flatMap((step) => step.requiredParameters.map((req) => req.key)));
 }
 
+/**
+ * Names used as BOTH a step's declared output and a gated parameter key
+ * anywhere in the definition. workflowRunner builds a step's execution input
+ * by merging checkpointed entity IDs with resolvedParameters — if a
+ * definition let these two namespaces collide, whichever side "wins" the
+ * merge would silently determine whether a later step acts on the real
+ * checkpointed entity or a stale/answered parameter value with the same
+ * name. A definition with this collision is malformed and should be
+ * rejected at start time (see workflowRunner.startWorkflow), not left to an
+ * implicit merge-order rule to paper over.
+ */
+export function findOutputParameterNameCollisions(definition: WorkflowDefinition): string[] {
+  const outputNames = new Set(definition.steps.flatMap((step) => step.outputs));
+  return [...findGatedParameterKeys(definition)].filter((key) => outputNames.has(key));
+}
+
 export type WorkflowRunStatus = 'in_progress' | 'blocked_on_parameter' | 'completed' | 'failed';
 
 /** Persisted per-attempted-step record. Absence of an entry for a step id
