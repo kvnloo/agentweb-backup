@@ -397,6 +397,50 @@ describe('executePreparedTools', () => {
     expect((ports as any).__execOrder).toEqual([]);
   });
 
+  // ENG-1477: create_html_file/save_file calls carrying a title or content
+  // value with an unescaped inner quote (a quoted phrase, or HTML markup
+  // like class="...") used to fail here with "Failed to parse arguments:
+  // Expected ',' or '}' after property value" even though the call was
+  // otherwise well-formed. The repair pass in parseToolCallArguments should
+  // recover it and let the call reach the gateway.
+  it('recovers a tool call whose arguments contain an unescaped inner quote', async () => {
+    const ports = makePorts({
+      executePreparedAgentTool: async (i: any) => ({ received: i.args }),
+    });
+    const raw = '{"title":"Phoenix FFL Merchants — "Creative Fatigue" Audit","content_draft":"<div class="header">Hi</div>"}';
+    const input = makeInput([toolCall('a', 'read_brand_guidelines', raw)], ports);
+    const result = await executePreparedTools(input);
+
+    expect(input.toolCallsLedger[0].error).toBeUndefined();
+    expect(input.toolCallsLedger[0].arguments).toEqual({
+      title: 'Phoenix FFL Merchants — "Creative Fatigue" Audit',
+      content_draft: '<div class="header">Hi</div>',
+    });
+    expect(result.failedCounterUpdates).toEqual({});
+    expect((ports as any).__execOrder).toEqual(['read_brand_guidelines']);
+  });
+
+  // ENG-1477 follow-up: production evidence (AW-ChatMessages, session
+  // 02ab5f5e...) showed the real prod failures were not unescaped quotes at
+  // all — every one was a clean JSON prefix cut off mid-object, always
+  // missing the required trailing field, never an unescaped quote anywhere.
+  // That shape must be told "retry the same call", not ENG-124's default
+  // "don't retry, fix your args" (there is nothing to fix).
+  it('classifies a genuinely truncated tool call as retryable, not invalid_args', async () => {
+    const ports = makePorts();
+    // No unescaped quote anywhere — a clean prefix that stops dead with no
+    // closing brace, matching the real production failure shape exactly.
+    const raw = '{"title":"Phoenix FFL Merchants — 30-Day Report","format_requirements":"Dark theme"';
+    const input = makeInput([toolCall('a', 'create_html_file', raw)], ports);
+    const result = await executePreparedTools(input);
+
+    expect(input.toolCallsLedger[0].error).toMatch(/Failed to parse arguments/);
+    expect(input.messages[0].content).toContain('Retryable: yes');
+    expect(input.messages[0].content).toContain('cut off');
+    expect(result.failedCounterUpdates).toEqual({ create_html_file: 1 });
+    expect((ports as any).__execOrder).toEqual([]);
+  });
+
   it('sets skillsUpdated when install_skills is called', async () => {
     const ports = makePorts();
     const input = makeInput([toolCall('a', 'install_skills', '{}')], ports);

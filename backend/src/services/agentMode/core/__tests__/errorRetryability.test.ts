@@ -3,7 +3,8 @@
  * retry-spiral half). Every tool error fed back to the model must carry an
  * explicit retryable: yes/no verdict + an actionable next step, derived from
  * the toolErrorClassifier classes:
- *   rate_limit / timeout / network / upstream_5xx      → retryable
+ *   rate_limit / timeout / network / upstream_5xx /
+ *   truncated_response                                 → retryable
  *   auth / upstream_rejected / invalid_args (schema
  *   reject) / tool_unavailable / invalid_output /
  *   policy_blocked                                     → NOT retryable (stop retrying)
@@ -20,7 +21,7 @@ import {
 } from '../errorRetryability';
 
 describe('isRetryableErrorClass', () => {
-  it.each(['rate_limit', 'timeout', 'network', 'upstream_5xx'])(
+  it.each(['rate_limit', 'timeout', 'network', 'upstream_5xx', 'truncated_response'])(
     'transient class %s is retryable',
     (cls) => expect(isRetryableErrorClass(cls)).toBe(true),
   );
@@ -76,6 +77,12 @@ describe('retryabilityLine', () => {
   it('unknown class gets the conservative default (no identical retry)', () => {
     const line = retryabilityLine('Error');
     expect(line).toContain('Retryable: no');
+  });
+
+  it('truncated_response says yes — retry the same call, nothing to fix (ENG-1477)', () => {
+    const line = retryabilityLine('truncated_response');
+    expect(line).toContain('Retryable: yes');
+    expect(line.toLowerCase()).toContain('cut off');
   });
 });
 

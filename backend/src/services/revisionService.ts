@@ -142,9 +142,13 @@ async function runAgentModeRevision(
       : [{ functionName: 'update_html_file', minCount: 1 }];
 
   const { runVerifiedChat } = await import('../controllers/agentModeController');
+  const { cronJobRegistry } = await import('../utils/cronJobRegistry');
 
   try {
-    const result = await runVerifiedChat({
+    // ENG-1189: this run's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener.
+    const result = await cronJobRegistry.track('revisionServiceVerifiedChat', runVerifiedChat({
       sessionId: agentSessionId,
       userId: session.userId,
       startingMessage: revisionMessage,
@@ -154,7 +158,7 @@ async function runAgentModeRevision(
       maxAttempts: 5,
       approvedRevisionImageSources:
         approval.assetType === 'image' ? [approval.assetUrl] : undefined,
-    });
+    }));
 
     console.log(`Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
 

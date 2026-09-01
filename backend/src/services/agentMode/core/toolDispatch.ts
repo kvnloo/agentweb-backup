@@ -31,6 +31,7 @@ import { ToolResultPolicyBlockedError } from '../../../utils/toolResultError';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
 import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
+import { parseToolCallArguments, TruncatedToolCallArgumentsError } from './repairToolCallArguments';
 import {
   buildToolResponseS3Header,
   buildToolResponseUnavailableHeader,
@@ -681,7 +682,12 @@ export async function executePreparedTools(
 
   for (const toolCall of responseToolCalls) {
     try {
-      const functionArgs = JSON.parse(toolCall.function.arguments);
+      // ENG-1477: a large or quote-rich value (report titles with a quoted
+      // phrase, HTML content with attribute quotes) sometimes comes back with
+      // an inner `"` the model failed to escape, which JSON.parse reads as an
+      // early string terminator. Retry through a repair pass before failing —
+      // see repairToolCallArguments.ts for the observed failure signature.
+      const functionArgs = parseToolCallArguments(toolCall.function.arguments);
 
       // Enforce skill-based tool access; block admin-only tools without admin access,
       // block context-restricted/shared-session tools even if the LLM hallucinates them.
@@ -853,11 +859,17 @@ export async function executePreparedTools(
     } catch (error) {
       console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
       const errMsg = error instanceof Error ? error.message : String(error);
-      // ENG-124: unparseable args are never retryable as-is — emit the corrected-
-      // arguments verdict alongside the formatted error.
+      // ENG-124: unparseable args are never retryable as-is — EXCEPT when the
+      // arguments were genuinely truncated mid-stream (ENG-1477 follow-up):
+      // there is no bad argument to fix there, so "fix your args" is actively
+      // wrong guidance and just burns retries on cosmetic variations of an
+      // already-complete call. classifyToolErrorClass recognizes
+      // TruncatedToolCallArgumentsError by name and routes it to the
+      // retryable 'truncated_response' class instead of the hardcoded
+      // 'invalid_args' used for every other parse failure.
       const errorContent = appendRetryabilityGuidance(
         ports.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`),
-        'invalid_args',
+        error instanceof TruncatedToolCallArgumentsError ? classifyToolErrorClass(error) : 'invalid_args',
       );
       appendPreflightToolFailure(toolCall, undefined, `Failed to parse arguments: ${errMsg}`, errorContent);
     }
