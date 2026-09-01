@@ -26016,15 +26016,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (promptRisksFabricatedMetrics(prompt, metricsVerified)) {
           console.log(`AgentMode: generate_image data-fabrication check triggered (session ${sessionId})`);
           try {
-            const visionCheck = await Promise.race([
+            const visionCheck = await withTimeoutOrReject(
               this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT),
-              new Promise<never>((_, reject) =>
-                setTimeout(
-                  () => reject(new Error(`data-fabrication check timed out after ${FABRICATED_METRICS_CHECK_TIMEOUT_MS}ms`)),
-                  FABRICATED_METRICS_CHECK_TIMEOUT_MS
-                )
-              ),
-            ]);
+              FABRICATED_METRICS_CHECK_TIMEOUT_MS,
+              'generate_image data-fabrication check'
+            );
             if (visionCheck?.success && describeImageReportsFabricatedMetrics(visionCheck.description)) {
               dataReliabilityWarning = FABRICATED_METRICS_WARNING;
               console.log(`AgentMode: generate_image data-fabrication check WARNED (session ${sessionId})`);

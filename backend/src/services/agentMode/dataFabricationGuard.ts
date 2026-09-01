@@ -30,9 +30,20 @@ function isNonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.trim().length > 0;
 }
 
-/** Dashboard/table/metrics-shaped UI language that invites the model to invent values. */
+/**
+ * Dashboard/table/metrics-shaped UI language that invites the model to invent
+ * values. Bare "metrics" and "chart" are intentionally unqualified — both are
+ * low-ambiguity signals in an image-generation prompt (unlike "table", which is
+ * also ordinary furniture, so it stays qualified to avoid flagging something like
+ * "a laptop on a kitchen table"). This must cover the exact categories the tool
+ * description warns about — "a table, chart, or list of metrics" — a fresh
+ * independent review of this PR (round 3) found the original regex missed bare
+ * "chart", bare "table"/"metrics" phrasing, and percent-complete phrasing that
+ * doesn't say "progress bar" verbatim (e.g. "45% complete", "a completion
+ * percentage"), which are exactly the categories the guidance itself names.
+ */
 const DATA_SHAPE_RE =
-  /\b(dashboard|status\s+tracker|metrics?\s+(?:preview|panel|card)|kpi|stat(?:s|istic)?\s*(?:card|panel|preview|block)|progress\s+(?:bar|preview)|data[- ]?table|infographic|scorecard|analytics\s+(?:card|panel|dashboard)|comparison\s+table)\b/i;
+  /\b(dashboard|status\s+tracker|chart|metrics?|kpi|stat(?:s|istic)?\s*(?:card|panel|preview|block)|progress\s+(?:bar|preview|ring|indicator|wheel)|completion\s+percentage|percent(?:age)?\s+complete|%\s*complete\b|data[- ]?table|table\s+(?:of|showing|listing|comparing|with)|infographic|scorecard|analytics\s+(?:card|panel|dashboard)|comparison\s+table)\b/i;
 
 /**
  * Does this generate_image prompt describe a dashboard/table/metrics-shaped layout
