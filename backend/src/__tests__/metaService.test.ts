@@ -142,9 +142,24 @@ describe('MetaService', () => {
                  service.getCampaign(mockAdAccountId, mockAccessToken, 'camp_1'),
              ).rejects.toThrow(/not available in the selected ad account/i);
 
-             await expect(
-                 service.getCampaign(mockAdAccountId, mockAccessToken, 'camp_1'),
-             ).rejects.toThrow(expect.not.stringContaining('9998887776') as any);
+             /*
+              * Asserted on the MESSAGE. `rejects.toThrow(expect.not.stringContaining(x))` reads
+              * like a check on the text and is not one: jest hands `toThrow` the Error OBJECT,
+              * so `stringContaining` is false for every error and its negation is
+              * unconditionally true. An error whose message literally contained '9998887776'
+              * passed it, so the no-oracle property — the whole reason this guard refuses
+              * generically instead of explaining itself — pinned nothing.
+              */
+             let refusal = '';
+             try {
+                 await service.getCampaign(mockAdAccountId, mockAccessToken, 'camp_1');
+                 throw new Error('expected the cross-account read to be refused');
+             } catch (err: any) {
+                 refusal = String(err?.message ?? err);
+             }
+             expect(refusal).toMatch(/not available in the selected ad account/i);
+             expect(refusal).not.toContain('9998887776');
+             expect(refusal).not.toContain('act_9998887776');
         });
 
         it('should list campaigns', async () => {

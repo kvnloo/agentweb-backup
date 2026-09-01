@@ -25,6 +25,23 @@ jest.mock('facebook-nodejs-business-sdk', () => ({
 }));
 jest.mock('../utils/secretsManager', () => ({ getMetaCredentials: jest.fn() }));
 
+/**
+ * The message of the error a refusal rejects with — never the Error object.
+ *
+ * `expect(p).rejects.toThrow(expect.not.stringContaining(x))` reads like an assertion about
+ * the text and is not one: jest passes the Error OBJECT to the matcher, `stringContaining`
+ * is false for a non-string, and `not.stringContaining` is therefore unconditionally true.
+ * Getting the message out first is what makes the no-oracle assertions real.
+ */
+async function refusalMessage(promise: Promise<unknown>): Promise<string> {
+  try {
+    await promise;
+  } catch (err: any) {
+    return String(err?.message ?? err);
+  }
+  throw new Error('expected the call to be refused, but it resolved');
+}
+
 /** Graph answers the payload and `account_id` in one response, because the read asks for both. */
 function nodeGet(ownerAccountId: string, data: Record<string, any>) {
   return jest.fn().mockImplementation(() =>
@@ -57,9 +74,18 @@ describe('single-entity Meta node reads are bounded by the selected ad account',
     (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get }));
 
     // A guard that names the other tenant answers the very question it is refusing.
-    await expect(
+    //
+    // Asserted on the MESSAGE, deliberately. `rejects.toThrow(expect.not.stringContaining(x))`
+    // was vacuous: jest hands `toThrow` the Error OBJECT, so `stringContaining` is false for
+    // every error and its negation is unconditionally true. An error whose message literally
+    // contained the account id passed that assertion, which left the most security-relevant
+    // property in this change pinning nothing at all.
+    const message = await refusalMessage(
       service.listCampaigns(SELECTED, token, { campaignId: 'camp_9' }),
-    ).rejects.toThrow(expect.not.stringContaining(OTHER_TENANT) as any);
+    );
+    expect(message).toMatch(/not available in the selected ad account/i);
+    expect(message).not.toContain(OTHER_TENANT);
+    expect(message).not.toContain(`act_${OTHER_TENANT}`);
   });
 
   it('CAMPAIGN single fetch: verifies ownership in ONE Graph call, not a separate probe', () => {
