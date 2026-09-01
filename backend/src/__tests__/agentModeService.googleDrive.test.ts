@@ -1295,6 +1295,24 @@ describe('AgentModeService - Google Drive methods', () => {
         expect(sharedListCalls).toBe(1);
       });
 
+      // Same defect as readSingleKnowledgeBaseFile above: both callers ignored the helper's
+      // `failed`/`capped` flags and turned an errored search into a definitive "not found".
+      it('does not claim the asset is absent when the name query itself failed', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            return Promise.resolve({ data: { files: [] } });
+          }
+          return Promise.reject(makeApiError(500, 'Drive did not respond within 8000ms'));
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).not.toMatch(/not found/i);
+        expect(result.message).toMatch(/could not determine/i);
+        expect(result.message).toMatch(/failed/i);
+      });
+
       it('reports ambiguity instead of silently materializing one candidate when the same name exists in two sub-folders', async () => {
         const SUB_A = 'ratio-4x5';
         const SUB_B = 'ratio-9x16';
@@ -2107,6 +2125,32 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(result.success).toBe(false);
       expect(result.message).toContain('4x5');
       expect(result.message).toMatch(/share/i);
+    });
+
+    /*
+     * queryDriveFilesAcrossFolders no longer throws on a failed request — it merges what it
+     * already has and reports `failed`/`capped` instead, so that a partial read is degraded to
+     * incomplete rather than discarded. This caller destructured only `files` and so read that
+     * empty map as a definitive absence: a timeout or 5xx on the NAME query produced
+     * `File "X" not found in Google Drive folder "Y"`, a confident absence claim from a read
+     * that errored. Before the helper caught the error, the rejection reached the outer try and
+     * correctly said the read had failed.
+     */
+    it('does not claim the file is absent when the name query itself failed', async () => {
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        // The name query — the one that would have found the file — times out.
+        return Promise.reject(makeApiError(500, 'Drive did not respond within 8000ms'));
+      });
+
+      const result = await service.readSingleKnowledgeBaseFile(`gdrive:${ROOT}`, 'notes.txt', USER_ID);
+
+      expect(result.success).toBe(false);
+      expect(result.message).not.toMatch(/not found/i);
+      expect(result.message).toMatch(/could not determine/i);
+      expect(result.message).toMatch(/failed/i);
     });
 
     it('reports ambiguity instead of silently reading one candidate when the same name exists in two sub-folders', async () => {
