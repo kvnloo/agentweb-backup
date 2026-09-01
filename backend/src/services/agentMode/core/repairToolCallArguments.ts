@@ -208,19 +208,101 @@ export function isTruncatedJsonPrefix(raw: string): boolean {
 }
 
 /**
+ * SECURITY (ENG-1477 review): does `text` — assumed already well-formed JSON,
+ * i.e. every unescaped `"` is a genuine string boundary — contain the same
+ * key twice within any single object? `repairUnescapedQuotes`'s comma
+ * heuristic decides a quote is a real string terminator whenever what follows
+ * merely LOOKS LIKE the next property (`"key":`). That shape check can't tell
+ * a legitimate next property from untrusted echoed content (e.g. scraped
+ * HTML/text in `content_draft`) that happens to contain the same lookalike
+ * text — so content crafted as `...", "title":"HACKED"` inside a string value
+ * gets split into real structure, and `JSON.parse` silently keeps the LAST
+ * occurrence of a duplicate key, overwriting a legitimate argument (verified:
+ * `title` gets clobbered this way with no error at all).
+ *
+ * A well-formed tool-call arguments object never legitimately repeats a key
+ * within the same object — schemas define each property once. So a duplicate
+ * key surviving into the repaired-and-reparsed result is proof the heuristic
+ * mis-fired and turned string content into fake structure, not a case to
+ * silently accept. This walks the repaired text as a strict tokenizer (no
+ * heuristics needed here — repair already resolved every ambiguous quote),
+ * tracking one key-set per open object, and returns true on the first key
+ * seen twice in the same object.
+ */
+export function hasDuplicateObjectKeys(text: string): boolean {
+  let inString = false;
+  let escaped = false;
+  let stringContent = '';
+  const containerStack: JsonContainer[] = [];
+  const keySetStack: Set<string>[] = [];
+  const n = text.length;
+
+  for (let i = 0; i < n; i++) {
+    const ch = text[i];
+
+    if (!inString) {
+      if (ch === '"') {
+        inString = true;
+        stringContent = '';
+      } else if (ch === '{') {
+        containerStack.push('object');
+        keySetStack.push(new Set());
+      } else if (ch === '[') {
+        containerStack.push('array');
+      } else if (ch === '}' || ch === ']') {
+        const closed = containerStack.pop();
+        if (closed === 'object') keySetStack.pop();
+      }
+      continue;
+    }
+
+    if (escaped) {
+      stringContent += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = false;
+      // A string immediately followed by `:` while directly inside an object
+      // is unambiguously a key — a JSON value is never followed by `:`.
+      const j = nextNonSpaceIndex(text, i + 1);
+      const isKeyPosition = containerStack[containerStack.length - 1] === 'object'
+        && j < n && text[j] === ':';
+      if (isKeyPosition) {
+        const keys = keySetStack[keySetStack.length - 1];
+        if (keys.has(stringContent)) return true;
+        keys.add(stringContent);
+      }
+      continue;
+    }
+    stringContent += ch;
+  }
+
+  return false;
+}
+
+/**
  * Parse a tool call's raw `arguments` string, falling back to
  * `repairUnescapedQuotes` when the direct parse fails. If neither the raw
  * text nor the repaired text parses, and the raw text is a clean JSON prefix
  * that simply never finished (see `isTruncatedJsonPrefix`), throws
  * `TruncatedToolCallArgumentsError` instead — otherwise throws the ORIGINAL
  * `JSON.parse` error (preserving today's message/position for logging).
+ *
+ * A repaired text that parses cleanly but contains a duplicate object key
+ * (see `hasDuplicateObjectKeys`) is treated the same as a repair that didn't
+ * help at all — the injected/overwritten result is never returned.
  */
 export function parseToolCallArguments(raw: string): any {
   try {
     return JSON.parse(raw);
   } catch (primaryError) {
     const repaired = repairUnescapedQuotes(raw);
-    if (repaired !== raw) {
+    if (repaired !== raw && !hasDuplicateObjectKeys(repaired)) {
       try {
         return JSON.parse(repaired);
       } catch {
