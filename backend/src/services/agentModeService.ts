@@ -4090,11 +4090,22 @@ export class AgentModeService {
             try {
               const args = JSON.parse(statusCall.function.arguments || '{}');
               if (Array.isArray(args.updates)) {
-                await this.setWorkPlanStatus(args.updates, sessionId);
-                console.warn(
-                  `AgentMode: Applied the discarded set_work_plan_status call in session ${sessionId} ` +
-                  'despite the forced synthesis — the underlying work already finished'
-                );
+                const statusResult = await this.setWorkPlanStatus(args.updates, sessionId);
+                if (statusResult?.success) {
+                  console.warn(
+                    `AgentMode: Applied the discarded set_work_plan_status call in session ${sessionId} ` +
+                    'despite the forced synthesis — the underlying work already finished'
+                  );
+                } else {
+                  // CodeRabbit (PR #2713): setWorkPlanStatus can reject an update (out-of-order,
+                  // missing required calls, insufficient assets, unknown step) without throwing —
+                  // logging an unconditional "Applied" here would misreport a rejected update as
+                  // a success. Report what actually happened instead.
+                  console.warn(
+                    `AgentMode: Discarded set_work_plan_status call in session ${sessionId} was rejected ` +
+                    `(${statusResult?.message || 'no message'}) — the step's status was not changed`
+                  );
+                }
               }
             } catch (statusError) {
               console.error(
@@ -31561,6 +31572,21 @@ ${strippedHtml}`;
           && resolvedStepCounts.has(session.pendingWorkPlanInput.stepCount),
       );
 
+      // CodeRabbit (PR #2713): bypassing failIfAwaitingExists entirely for the write
+      // below would also skip its pendingUserQuestion check, letting a NEW work-plan
+      // input land while a genuinely concurrent ask_user_question is still awaiting --
+      // two simultaneous prompts, an invalid state neither surface expects. Clear the
+      // known-stale record as its OWN guarded step first (matched by requestId, so a
+      // race that already replaced it fails closed instead of clobbering the newer
+      // one), THEN let the write below keep its full, unmodified guard -- it now
+      // correctly finds pendingWorkPlanInput cleared while still enforcing the
+      // pendingUserQuestion half of the check.
+      if (staleInputForResolvedStep) {
+        await chatbotDb.updateSessionWorkPlanInputRequest(sessionId, null, {
+          requireStillAwaiting: session.pendingWorkPlanInput!.requestId,
+        });
+      }
+
       if (nextInputStep?.inputRequest) {
         await chatbotDb.updateSessionWorkPlanInputRequest(
           sessionId,
@@ -31569,12 +31595,8 @@ ${strippedHtml}`;
             requestId: uuidv4(),
             stepCount: nextInputStep.stepCount,
           }),
-          { failIfAwaitingExists: !staleInputForResolvedStep },
+          { failIfAwaitingExists: true },
         );
-      } else if (staleInputForResolvedStep) {
-        await chatbotDb.updateSessionWorkPlanInputRequest(sessionId, null, {
-          requireStillAwaiting: session.pendingWorkPlanInput!.requestId,
-        });
       }
 
       // Update function counts if they were modified
