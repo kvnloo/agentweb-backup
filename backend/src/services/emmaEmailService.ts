@@ -6,6 +6,7 @@ import { generateSessionResponse } from '../controllers/agentModeController';
 import { agentModeService } from './agentModeService';
 import { userDb } from './db';
 import { uploadFileToS3 } from '../utils/s3Utils';
+import { cronJobRegistry } from '../utils/cronJobRegistry';
 
 interface InboundEmailEvent {
   emailId: string;
@@ -284,13 +285,16 @@ export class EmmaEmailService {
       ? `${event.subject}\n\n${messageBody}`
       : messageBody || event.subject || '';
     const llmModel = await agentModeService.getDefaultModel();
-    const agentResponse = await generateSessionResponse(
+    // ENG-1189: this turn's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener.
+    const agentResponse = await cronJobRegistry.track('emmaEmailAgentTurn', generateSessionResponse(
       sessionId,
       fullMessage,
       userId,
       llmModel,
       attachments
-    );
+    ));
     const emmaResponse = agentResponse.content;
 
     // 9. Create ishare URL
