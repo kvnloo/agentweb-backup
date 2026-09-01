@@ -77,6 +77,8 @@ import {
   applyAnswer,
   buildPendingUserQuestion,
   checkQuestionGate,
+  findAnsweredObjectiveCandidate,
+  summarizeAnsweredObjectiveQuestions,
   findQuestionByKind,
   renderQuestionPrompt,
   verifyExplicitStatement,
@@ -19105,6 +19107,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     objective: string,
     quote: string,
     objectiveKind: string,
+    sourceQuestionId?: string,
   ): Promise<void> {
     const question = buildPendingUserQuestion({
       questionId: uuidv4(),
@@ -19116,7 +19119,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           consequence: 'Confirmed by the user\'s own words — not shown as a card.',
           recommended: true,
           why: `The user explicitly stated this: "${quote}"`,
-          payload: { objective },
+          payload: { objective, ...(sourceQuestionId ? { sourceQuestionId } : {}) },
         },
         {
           // Structural placeholder only — the primitive requires 2–4 options
@@ -19137,7 +19140,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       optionId: 'confirmed',
       delegated: false,
       answeredBy: 'user',
-      rationale: `Explicitly stated by the user: "${quote}"`,
+      rationale: sourceQuestionId
+        ? `Consumed answered objective card ${sourceQuestionId}`
+        : `Explicitly stated by the user: "${quote}"`,
       at: new Date().toISOString(),
     });
     await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
@@ -19259,6 +19264,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
     }
 
+    const { consumedQuestionIds, hasAnsweredObjectiveCard } = summarizeAnsweredObjectiveQuestions(
+      session?.pendingUserQuestion,
+      session?.answeredQuestions,
+      AgentModeService.META_OBJECTIVE_VALUES,
+    );
+    const looseCandidate = findAnsweredObjectiveCandidate(
+      session?.pendingUserQuestion,
+      session?.answeredQuestions,
+      {
+        accountId: account_id,
+        validObjectives: AgentModeService.META_OBJECTIVE_VALUES,
+        bindsLabel: (objective, text) => Boolean(AgentModeService.META_OBJECTIVE_KEYWORDS[objective]?.test(text)),
+        consumedQuestionIds,
+      },
+    );
+    if (looseCandidate) {
+      await this.persistExplicitObjectiveConfirmation(
+        sessionId,
+        looseCandidate.objective,
+        `answered objective card ${looseCandidate.question.questionId}`,
+        objectiveKind,
+        looseCandidate.question.questionId,
+      );
+      return { allowed: true, objective: looseCandidate.objective };
+    }
+
     // Path 3: nothing settled — surface the blocking ask ourselves. Never
     // proceed on a guess (this is the load-bearing refusal). Recommendation is
     // STATIC per the 80/20 design (Harsha, 2026-07-20) — OUTCOME_LEADS is the
@@ -19299,6 +19330,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const question = buildPendingUserQuestion({
       questionId: uuidv4(),
       question: 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.',
+      intro: hasAnsweredObjectiveCard
+        ? 'You answered an objective question earlier, but it did not match this campaign and account, so I need this one confirmed.'
+        : undefined,
       options,
       immutable: true,
       allowEmmaDecide: true,
@@ -34148,10 +34182,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const { list_id, lead_id } = args;
           if (!list_id || !lead_id) throw new Error('list_id and lead_id are required for update-conversation-history');
 
-          // Resolve the Unipile attendee/provider ID for this contact
+          // Resolve the Unipile attendee/provider ID for this contact. When a raw
+          // provider_id is supplied directly (not a profile_url), it has not been
+          // validated against Unipile yet — resolveProviderId only validates the
+          // profile_url path. getMessagesWithContact treats a 404 from Unipile's
+          // chat_attendee lookup as "never messaged" (ENG-1623), which is
+          // indistinguishable from a 404 caused by an invalid/nonexistent
+          // provider_id. Without this check, a bad provider_id would silently
+          // "succeed" with 0 messages instead of surfacing a clear error.
           const providerId = isUrl
             ? await linkedInOutreachService.resolveProviderId(target, true, account_id)
-            : target;
+            : await linkedInOutreachService.getProfile(target, account_id).then(() => target);
 
           // Load the lead to get the normalized LinkedIn URL used as the storage key
           const { crmDb } = await import('./db');
