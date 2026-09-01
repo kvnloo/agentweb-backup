@@ -23384,16 +23384,47 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
       // lets an ambiguous name (same filename in two sub-folders) be detected and
       // reported instead of one candidate being picked arbitrarily.
-      const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
-        drive,
-        folderIds,
-        `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
-        'files(id, name, mimeType, size, modifiedTime, parents)',
-        2
-      );
+      const { files: filesMap, capped: nameQueryCapped, failed: nameQueryFailed } =
+        await this.queryDriveFilesAcrossFolders(
+          drive,
+          folderIds,
+          `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
+          'files(id, name, mimeType, size, modifiedTime, parents)',
+          2
+        );
       const files = Array.from(filesMap.values());
 
       if (files.length === 0) {
+        /*
+         * "Searched and absent" versus "could not search" — the whole point of this branch.
+         *
+         * queryDriveFilesAcrossFolders swallows a request failure and reports it as
+         * `failed`/`capped` rather than throwing (throwing would discard rows it had already
+         * merged). Destructuring only `files` therefore turned a timeout or 5xx on the name
+         * query into a confident `File "X" not found in Google Drive folder "Y"` — a definitive
+         * absence claim from a read that errored. Before the helper caught the error the
+         * rejection reached the outer try and said the read failed, which was correct.
+         *
+         * Checked before the folder-scan signals below because it is the stronger fact: the
+         * name query is what would have found the file, so if IT did not complete, nothing here
+         * knows whether the file is there.
+         */
+        if (nameQueryFailed) {
+          return {
+            success: false,
+            message: `Could not determine whether "${fileName}" is in Google Drive folder "${rootName}" — the file `
+              + `search itself failed (${this.classifyDriveError(nameQueryFailed)}). This is a FAILED read, not a `
+              + `confirmed absence: do not report the file as missing. Retry the read.`
+          };
+        }
+        if (nameQueryCapped) {
+          return {
+            success: false,
+            message: `Could not determine whether "${fileName}" is in Google Drive folder "${rootName}" — the file `
+              + `search stopped before it finished. This is an INCOMPLETE read, not a confirmed absence: do not `
+              + `report the file as missing. Retry the read.`
+          };
+        }
         if (rootRestricted) {
           return {
             success: false,
@@ -23516,16 +23547,36 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
       // lets an ambiguous name (same filename in two sub-folders) be detected and
       // reported instead of one candidate being materialized arbitrarily.
-      const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
-        drive,
-        folderIds,
-        `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
-        'files(id, name, mimeType, size, parents)',
-        2
-      );
+      const { files: filesMap, capped: nameQueryCapped, failed: nameQueryFailed } =
+        await this.queryDriveFilesAcrossFolders(
+          drive,
+          folderIds,
+          `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
+          'files(id, name, mimeType, size, parents)',
+          2
+        );
       const files = Array.from(filesMap.values());
 
       if (files.length === 0) {
+        // Same distinction readGoogleDriveSharedFile draws, for the same reason: the helper
+        // reports a failed request as `failed`/`capped` instead of throwing, so ignoring both
+        // flags turned an errored search into a definitive "not found".
+        if (nameQueryFailed) {
+          return {
+            success: false,
+            message: `Could not determine whether "${fileName}" is in Google Drive folder "${rootName}" — the file `
+              + `search itself failed (${this.classifyDriveError(nameQueryFailed)}). This is a FAILED read, not a `
+              + `confirmed absence: do not report the file as missing. Retry the read.`
+          };
+        }
+        if (nameQueryCapped) {
+          return {
+            success: false,
+            message: `Could not determine whether "${fileName}" is in Google Drive folder "${rootName}" — the file `
+              + `search stopped before it finished. This is an INCOMPLETE read, not a confirmed absence: do not `
+              + `report the file as missing. Retry the read.`
+          };
+        }
         if (rootRestricted) {
           return {
             success: false,
