@@ -217,6 +217,17 @@ export class GenerateMarketingResponseWorkerService {
         if (message.partialUsageMessages?.length) {
           error.partialUsageMessages = message.partialUsageMessages;
         }
+        // ENG-1670: restore the original provider error's status/code so
+        // classifyZeroAssistantFailure (agentModeController) can tell a
+        // transient 429 apart from a real system error — without these, a
+        // rate-limited scheduled run gets misreported to the user as an
+        // "unexpected system error" instead of the accurate retry-in-progress copy.
+        if (message.status !== undefined) {
+          error.status = message.status;
+        }
+        if (message.code !== undefined) {
+          error.code = message.code;
+        }
         pending.reject(error);
       }
     });
