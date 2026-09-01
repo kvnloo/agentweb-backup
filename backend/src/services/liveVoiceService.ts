@@ -32,6 +32,7 @@ import {
   recordOnboardingEvent,
   recordOnboardingFailure,
 } from './onboardingTelemetry';
+import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -857,6 +858,49 @@ export function closeLiveSession(sessionId: string, socketId?: string): void {
  */
 export function hasLiveSession(sessionId: string): boolean {
   return activeSessions.has(sessionId);
+}
+
+/**
+ * ENG-1189: waits for every in-flight Gemini Live tool execution, across all
+ * active live-voice sessions, to finish — up to the same drain ceiling used
+ * elsewhere in runDrain(). These tool calls (e.g. manage_scheduled_chat) run
+ * agentModeService.executeTool() in-process and self-call back into this
+ * same process via mcpFetch's http://localhost:${PORT}, exactly like the
+ * REST /generate and Emma-chatbot turns already drained — closing the
+ * listener while one is in flight breaks it unrecoverably, not transiently.
+ *
+ * Deliberately checks in-flight TOOL CALLS (toolExecutions' settled flag),
+ * not whether a live-voice SESSION is still open: a session can sit
+ * connected but idle indefinitely (the user just isn't talking), and
+ * draining on session presence would routinely block shutdown for the full
+ * ceiling waiting on a call nobody is actively using.
+ *
+ * Tools in ONBOARDING_LIVE_TOOLS (read-mostly lookups — list_connected_accounts,
+ * search_knowledge_base, etc.) bypass toolExecutions tracking entirely and are
+ * NOT covered here; manage_scheduled_chat and the rest of the general Agent
+ * Mode tool set always go through the tracked path this drains.
+ */
+export async function drainLiveVoiceToolExecutions(
+  ceilingMs: number = DRAIN_CEILING_MS,
+  pollIntervalMs: number = DRAIN_POLL_INTERVAL_MS
+): Promise<{ drained: boolean; stuckCount: number }> {
+  const countInFlight = (): number => {
+    let count = 0;
+    for (const entry of activeSessions.values()) {
+      for (const execution of entry.toolExecutions.values()) {
+        if (!execution.settled) count++;
+      }
+    }
+    return count;
+  };
+
+  const deadline = Date.now() + ceilingMs;
+  let stuckCount = countInFlight();
+  while (stuckCount > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    stuckCount = countInFlight();
+  }
+  return stuckCount > 0 ? { drained: false, stuckCount } : { drained: true, stuckCount: 0 };
 }
 
 // ---------------------------------------------------------------------------

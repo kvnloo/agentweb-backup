@@ -84,6 +84,85 @@ describe('httpClient', () => {
         mcpFetch({ method: 'GET', path: '/api/test', context: { userId: 'user-123' } })
       ).rejects.toThrow('API error (403): Forbidden');
     });
+
+    // ENG-1189: a raw network failure (undici's TypeError('fetch failed') on a self-call,
+    // e.g. because the backend process was mid-restart) used to propagate to the LLM as the
+    // bare, unactionable string "fetch failed" with no endpoint/method/cause and no retry —
+    // so a transient connection blip permanently blocked the tool call (manage_scheduled_chat
+    // in production, session 2318c99c-6b45-47ae-95cb-12fe85939c8d, failed 3 times this way).
+    it('should retry a transient network failure and surface method/path/cause once retries are exhausted', async () => {
+      const networkError = () => {
+        const err = new TypeError('fetch failed');
+        (err as any).cause = { code: 'ECONNREFUSED', message: 'connect ECONNREFUSED 127.0.0.1:3001' };
+        return err;
+      };
+      const fetchMock = jest.fn().mockRejectedValue(networkError());
+      global.fetch = fetchMock as any;
+
+      await expect(
+        mcpFetch({ method: 'PUT', path: '/api/agent-mode/scheduled-chats/sched-1', context: { userId: 'user-123' } })
+      ).rejects.toThrow(/PUT.*\/api\/agent-mode\/scheduled-chats\/sched-1.*ECONNREFUSED/s);
+
+      // Bounded retry: exactly SELF_CALL_MAX_ATTEMPTS (3), not unbounded.
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    // ENG-1189 code review: retrying blindly risks silently duplicating a
+    // non-idempotent self-call (e.g. POST .../execute) if the network error
+    // occurred after the server already processed the request. Only GET/PUT
+    // are safe to repeat, so a POST must fail after a single attempt.
+    it('should NOT retry a transient network failure for a non-idempotent POST', async () => {
+      const networkError = () => {
+        const err = new TypeError('fetch failed');
+        (err as any).cause = { code: 'ECONNRESET', message: 'socket hang up' };
+        return err;
+      };
+      const fetchMock = jest.fn().mockRejectedValue(networkError());
+      global.fetch = fetchMock as any;
+
+      await expect(
+        mcpFetch({ method: 'POST', path: '/api/tasks/task-1/execute', context: { userId: 'user-123' } })
+      ).rejects.toThrow(/POST.*\/api\/tasks\/task-1\/execute.*ECONNRESET/s);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    // A genuine request timeout aborts with a distinct AbortError, not the
+    // TypeError('fetch failed') this retry targets — must not be retried,
+    // and must fail immediately with no backoff delay.
+    it('should NOT retry an AbortError (real timeout)', async () => {
+      const fetchMock = jest.fn().mockRejectedValue(new DOMException('The operation was aborted', 'AbortError'));
+      global.fetch = fetchMock as any;
+
+      await expect(
+        mcpFetch({ method: 'GET', path: '/api/test', context: { userId: 'user-123' } })
+      ).rejects.toThrow(/GET.*\/api\/test/s);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('should succeed if a transient network failure resolves on retry', async () => {
+      const networkError = () => {
+        const err = new TypeError('fetch failed');
+        (err as any).cause = { code: 'ECONNRESET', message: 'socket hang up' };
+        return err;
+      };
+      const mockResponse = {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: () => Promise.resolve({ success: true }),
+      };
+      const fetchMock = jest.fn()
+        .mockRejectedValueOnce(networkError())
+        .mockResolvedValueOnce(mockResponse);
+      global.fetch = fetchMock as any;
+
+      const result = await mcpFetch({ method: 'GET', path: '/api/test', context: { userId: 'user-123' } });
+
+      expect(result).toEqual({ success: true });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
   });
 
   // ─── SUCCESS tests ────────────────────────────────────────────────────
