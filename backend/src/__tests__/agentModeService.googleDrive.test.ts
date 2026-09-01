@@ -1628,6 +1628,81 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(finalCall![0].q).toContain("mimeType != 'application/vnd.google-apps.folder'");
     });
 
+    /*
+     * modified_after/modified_before reach this method as a bare `type: "string"` off the tool
+     * schema, with no validation anywhere, and were interpolated UNESCAPED into the same `q` as
+     * the parent-folder clause. Drive's `or` binds looser than `and`, so
+     * `"2020-01-01' or name != 'x"` ORs the parent scoping away — and the Drive client is a
+     * SHARED service account with drive.readonly, so what comes back is other tenants' file
+     * names, ids, sizes and modifiedTimes.
+     */
+    describe('date filters cannot escape the parent-folder clause', () => {
+      const INJECTION = "2020-01-01' or name != 'x";
+
+      it('refuses a crafted modified_after before any Drive query runs', async () => {
+        mockDriveFiles.list.mockResolvedValue({ data: { files: [] } });
+
+        const result = await service.listKnowledgeBaseFiles(USER_ID, {
+          kb_type: 'google-drive',
+          modified_after: INJECTION,
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/YYYY-MM-DD/);
+        // The point of the assertion: no `q` was ever built from it, scoped or otherwise.
+        const injected = mockDriveFiles.list.mock.calls.filter(([arg]: any) => arg.q.includes('name !='));
+        expect(injected).toHaveLength(0);
+      });
+
+      it('refuses a crafted modified_before too', async () => {
+        mockDriveFiles.list.mockResolvedValue({ data: { files: [] } });
+
+        const result = await service.listKnowledgeBaseFiles(USER_ID, {
+          kb_type: 'google-drive',
+          modified_before: INJECTION,
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/YYYY-MM-DD/);
+        expect(mockDriveFiles.list.mock.calls.filter(([arg]: any) => arg.q.includes('name !='))).toHaveLength(0);
+      });
+
+      it('refuses a date that is not a real calendar day', async () => {
+        mockDriveFiles.list.mockResolvedValue({ data: { files: [] } });
+
+        const result = await service.listKnowledgeBaseFiles(USER_ID, {
+          kb_type: 'google-drive',
+          modified_after: '2026-02-31',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/not a real calendar date/i);
+      });
+
+      it('still applies a well-formed date, inside the quoted literal and after the parent clause', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes('mimeType =')) return Promise.resolve({ data: { files: [] } });
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.listKnowledgeBaseFiles(USER_ID, {
+          kb_type: 'google-drive',
+          modified_after: '2026-04-15',
+          modified_before: '2026-04-22',
+        });
+
+        expect(result.success).toBe(true);
+        const listingCall = mockDriveFiles.list.mock.calls.find(([arg]: any) => !arg.q.includes('mimeType ='));
+        expect(listingCall).toBeDefined();
+        const q: string = listingCall![0].q;
+        expect(q).toContain(`'${ROOT}' in parents`);
+        expect(q).toContain("modifiedTime >= '2026-04-15T00:00:00'");
+        expect(q).toContain("modifiedTime <= '2026-04-22T23:59:59'");
+        // Quote parity: every literal in the query is closed, so nothing escaped one.
+        expect((q.match(/'/g) || []).length % 2).toBe(0);
+      });
+    });
+
     it('surfaces inaccessibleFolders when a sub-folder cannot be listed, instead of silently shrinking the listing', async () => {
       mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
         if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType =')) {
