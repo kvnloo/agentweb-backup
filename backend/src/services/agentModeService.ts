@@ -327,7 +327,7 @@ export function isVerificationFunctionCallRetryPress(text: string): boolean {
 export function pressesIrreversiblePublishWrite(text: string): boolean {
   return isVerificationFunctionCallRetryPress(text) && IRREVERSIBLE_PUBLISH_TOOLS.some((tool) => text.includes(tool));
 }
-import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
+import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags, isMetaAccountScopeRefusal } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import {
   isAnonymizedIdentifier,
@@ -19055,6 +19055,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * stops the agent acting on an ambiguous target (e.g. publishing an ad into the
    * wrong campaign). ID→name lookups degrade gracefully to the raw ID if Meta is
    * unreachable — confirmation must still be required even when resolution fails.
+   *
+   * `tenancyRefused` is the ONE resolution failure that must not degrade: see the resolvers
+   * below. The caller blocks the write on it instead of prompting.
    */
   private async buildMetaWriteConfirmation(
     userId: string,
@@ -19065,7 +19068,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     ad_set_id: string | undefined,
     ad_id: string | undefined,
     params: any
-  ): Promise<{ summary: string; target: Record<string, any> }> {
+  ): Promise<{ summary: string; target: Record<string, any>; tenancyRefused: boolean }> {
     let accessToken = '';
     try {
       ({ accessToken } = await this.getMetaCredentials(userId, account_id));
@@ -19076,24 +19079,48 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const target: Record<string, any> = { entity_type, action, account_id };
     const lines: string[] = [];
 
-    // Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
+    /*
+     * Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
+     *
+     * That `catch` was written for a transient Graph blip, and for that it is right: a name we
+     * could not fetch degrades to the raw id and the user is still asked to approve.
+     *
+     * The ownership check these resolvers now pass `account_id` to throws through the SAME
+     * catch, and it does not mean "we could not look" — it means "we looked, and this node is
+     * not in the selected ad account". Swallowed as a blip, the prompt degraded to `ID <id>`
+     * and the write went on to confirmation, which is the gate approving a write to a node the
+     * guard had already refused. A refusal that only makes the prompt vaguer is not a guard.
+     *
+     * So the two are told apart (`isMetaAccountScopeRefusal`) and only the transient one keeps
+     * the best-effort behaviour. The refusal is recorded as a bare boolean on purpose: WHICH
+     * node was refused, what it is called, and which account owns it are exactly the oracle
+     * details `assertOwnedByAccount` refuses to emit, and they must not be reconstructed here.
+     */
+    let tenancyRefused = false;
+    const degradeUnlessRefused = (err: unknown): undefined => {
+      if (isMetaAccountScopeRefusal(err)) tenancyRefused = true;
+      return undefined;
+    };
     const resolveCampaign = async (id?: string) => {
       if (!id || !accessToken) return undefined;
-      try { return await metaService.getCampaign(account_id, accessToken, id); } catch { return undefined; }
+      try { return await metaService.getCampaign(account_id, accessToken, id); }
+      catch (err) { return degradeUnlessRefused(err); }
     };
     const resolveAdSet = async (id?: string) => {
       if (!id || !accessToken) return undefined;
       // This result's NAME is rendered into the prompt the user approves, so the node must be
       // proven to belong to the selected account first — otherwise an id from another ad account
       // discloses that account's ad set name to this user.
-      try { return await metaService.getAdSet(accessToken, id, account_id); } catch { return undefined; }
+      try { return await metaService.getAdSet(accessToken, id, account_id); }
+      catch (err) { return degradeUnlessRefused(err); }
     };
     const resolveAd = async (id?: string) => {
       if (!id || !accessToken) return undefined;
       // Same reason as resolveAdSet above: this result's NAME is rendered into the prompt the
       // user approves, so an ad id from another ad account the token can reach would disclose
       // that account's ad name to this user.
-      try { return await metaService.getAd(accessToken, id, account_id); } catch { return undefined; }
+      try { return await metaService.getAd(accessToken, id, account_id); }
+      catch (err) { return degradeUnlessRefused(err); }
     };
     const nameOf = (entity: any, id?: string) =>
       entity?.name ? `"${entity.name}" (${entity.id || id})` : (id ? `ID ${id}` : 'unknown');
@@ -19201,7 +19228,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
     }
 
-    return { summary: lines.join(' '), target };
+    return { summary: lines.join(' '), target, tenancyRefused };
   }
 
   private static readonly META_OBJECTIVE_VALUES = [
@@ -19635,9 +19662,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const overrideApproved =
       overrideClaimed && trackingOverrideTokenMatches((params as any)?.tracking_override_token, overrideDigest);
     if (AgentModeService.isMetaWriteAction(entity_type, action) && (!confirmed || (overrideClaimed && !overrideApproved))) {
-      const { summary, target } = await this.buildMetaWriteConfirmation(
+      const { summary, target, tenancyRefused } = await this.buildMetaWriteConfirmation(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
+      /*
+       * A node the ownership guard refused is out of scope for this write, full stop. Asking the
+       * user to approve it — even under a degraded `ID <id>` label — would be the gate granting
+       * exactly what the guard exists to deny, since an approval here is what unlocks the
+       * confirmed replay. Refuse before the prompt is built.
+       *
+       * The refusal says nothing about the node beyond the selected account the caller already
+       * supplied: no name, no owning account, no id. `assertOwnedByAccount` withholds those
+       * because a block that answers "which account owns this?" is the oracle it is preventing,
+       * and relaying it through the confirmation gate would hand back the same answer.
+       */
+      if (tenancyRefused) {
+        const refusal =
+          `Blocked: the target of this Meta Ads ${entity_type} ${action} is not available in the selected ` +
+          `ad account (${account_id}), so it was not prepared for confirmation and nothing was sent to Meta. ` +
+          `Do not ask the user to approve this change. If the target belongs to a different ad account, ` +
+          `select that account and try again.`;
+        return {
+          success: false,
+          blocked: true,
+          reason: 'account_scope',
+          message: refusal,
+          // Same reason as the validation branch above: `error` is what the model actually reads.
+          error: `ACCOUNT_SCOPE_REFUSED: ${refusal}`,
+        } as any;
+      }
       // `awaitingUserConfirmation` + `confirmationPrompt` are consumed by the agent loop
       // (collectConfirmationPrompt) to HALT the turn and surface the prompt to the user.
       // The turn cannot continue until a NEW human message arrives — the model cannot

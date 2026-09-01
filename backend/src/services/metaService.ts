@@ -272,6 +272,33 @@ function parseBusinessUseCaseUsage(response: { headers?: { get?: (name: string) 
   }
 }
 
+/**
+ * The one sentence every ad-account ownership refusal carries (`assertOwnedByAccount`).
+ *
+ * A constant, not a literal repeated at the read site, because the pairing is load-bearing: a
+ * caller that has to tell "this node belongs to another ad account" apart from "Meta blipped"
+ * gets it wrong silently if the wording drifts, and gets it wrong in the permissive direction.
+ */
+export const META_ACCOUNT_SCOPE_REFUSAL_MARKER = 'is not available in the selected ad account';
+
+/**
+ * True only for a refusal thrown by the ad-account ownership guard — never for a transient
+ * Graph failure.
+ *
+ * Both arrive at a caller's `catch` as an Error, and they mean opposite things. A timeout, a
+ * 5xx or a rate limit says "we could not look"; this says "we looked, and the node is out of
+ * scope". A caller that treats the second as the first degrades to a best-effort path and
+ * carries on with a node it has been told not to touch.
+ *
+ * Deliberately does NOT match `assertNodeInAccount`'s unverifiable-lookup message ("Could not
+ * verify the requested … please retry"), which is a genuine transient and must keep the
+ * best-effort behaviour.
+ */
+export function isMetaAccountScopeRefusal(error: unknown): boolean {
+  const message = (error as { message?: unknown } | null | undefined)?.message;
+  return typeof message === 'string' && message.includes(META_ACCOUNT_SCOPE_REFUSAL_MARKER);
+}
+
 export class MetaService {
   private static instance: MetaService;
 
@@ -2205,7 +2232,7 @@ export class MetaService {
     const refuse = (serverDetail: string): never => {
       console.warn(`[MetaService] scope ownership refused: ${serverDetail}`);
       throw new Error(
-        `The requested ${nodeLabel.toLowerCase()} is not available in the selected ad account. ` +
+        `The requested ${nodeLabel.toLowerCase()} ${META_ACCOUNT_SCOPE_REFUSAL_MARKER}. ` +
         `If it belongs to a different ad account, select that account and try again.`,
       );
     };
