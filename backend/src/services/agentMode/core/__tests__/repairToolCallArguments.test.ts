@@ -6,7 +6,12 @@
  * though the call was otherwise well-formed.
  */
 
-import { repairUnescapedQuotes, parseToolCallArguments } from '../repairToolCallArguments';
+import {
+  repairUnescapedQuotes,
+  parseToolCallArguments,
+  isTruncatedJsonPrefix,
+  TruncatedToolCallArgumentsError,
+} from '../repairToolCallArguments';
 
 describe('repairUnescapedQuotes (ENG-1477)', () => {
   it('escapes an unescaped quote inside a string value', () => {
@@ -58,6 +63,91 @@ describe('repairUnescapedQuotes (ENG-1477)', () => {
     expect(JSON.parse(repairUnescapedQuotes(raw))).toEqual({
       title: 'Chart',
       content_draft: 'data: [1, "two", 3]',
+    });
+  });
+
+  // Follow-up gap: a literal `]`/`}` right after a quote used to be treated as
+  // ALWAYS terminal, regardless of container — so an embedded array/object
+  // literal whose LAST element is itself quoted mis-terminated the string one
+  // character early, at the quote closing that last element.
+  it('keeps a quote open when it is immediately followed by an embedded (non-real) array-closing bracket', () => {
+    const raw = '{"title":"Config","content_draft":"Use ["a","b","c"] as the default list."}';
+    expect(JSON.parse(repairUnescapedQuotes(raw))).toEqual({
+      title: 'Config',
+      content_draft: 'Use ["a","b","c"] as the default list.',
+    });
+  });
+
+  it('keeps a quote open when it is immediately followed by an embedded (non-real) object-closing brace inside an array element', () => {
+    // Mirror of the `]` case, on the `}` side: a quote+`}` immediately after
+    // can only be a real terminator when the container is actually an
+    // object — here the string is an ARRAY element, so the embedded `{"x"}`
+    // is just prose and must not close the string early.
+    const raw = '{"tags":["a","Use {"x"} as an example"]}';
+    expect(JSON.parse(repairUnescapedQuotes(raw))).toEqual({
+      tags: ['a', 'Use {"x"} as an example'],
+    });
+  });
+
+  it('still terminates a real string on `]` when the container genuinely is an array', () => {
+    const raw = '{"tags":["a","say "hi" now"]}';
+    expect(JSON.parse(repairUnescapedQuotes(raw))).toEqual({
+      tags: ['a', 'say "hi" now'],
+    });
+  });
+});
+
+describe('isTruncatedJsonPrefix (ENG-1477 follow-up)', () => {
+  it('flags a payload that stops mid-object with no closing brace', () => {
+    expect(isTruncatedJsonPrefix('{"title":"Phoenix FFL Merchants — 30-Day Report"')).toBe(true);
+  });
+
+  it('flags a payload that stops mid-string (unterminated quote)', () => {
+    expect(isTruncatedJsonPrefix('{"title":"cut off partway thro')).toBe(true);
+  });
+
+  it('does not flag a complete, self-closed object', () => {
+    expect(isTruncatedJsonPrefix('{"title":"ok","content_draft":"hi"}')).toBe(false);
+  });
+
+  it('does not flag genuinely malformed-but-complete JSON (depth returns to 0)', () => {
+    expect(isTruncatedJsonPrefix('{not json}')).toBe(false);
+  });
+
+  it('ignores brackets embedded inside string content when computing depth', () => {
+    // The trailing `]` here is prose inside the string, not real structure —
+    // depth never left 0 because of it, so this is NOT a truncation.
+    expect(isTruncatedJsonPrefix('{"content_draft":"Use [1,2,3] as the list."}')).toBe(false);
+  });
+});
+
+describe('parseToolCallArguments — truncation (ENG-1477 follow-up)', () => {
+  it('throws TruncatedToolCallArgumentsError for a clean prefix missing the closing brace', () => {
+    const raw = '{"title":"Phoenix FFL Merchants — 30-Day Meta Performance and Creative Fatigue Report"';
+    expect(() => parseToolCallArguments(raw)).toThrow(TruncatedToolCallArgumentsError);
+  });
+
+  it('throws TruncatedToolCallArgumentsError for a payload missing the required trailing field entirely', () => {
+    // Matches the real production shape: title + format_requirements present,
+    // content_draft never started, no trailing comma, no closing brace.
+    const raw = '{"title":"Report","format_requirements":"Dark theme with Manrope font."';
+    expect(() => parseToolCallArguments(raw)).toThrow(TruncatedToolCallArgumentsError);
+  });
+
+  it('still throws the original JSON.parse error for non-truncated malformed JSON', () => {
+    let expected: Error | undefined;
+    try {
+      JSON.parse('{not json}');
+    } catch (e) {
+      expected = e as Error;
+    }
+    expect(() => parseToolCallArguments('{not json}')).toThrow(expected!.message);
+  });
+
+  it('does not misclassify a recoverable unescaped-quote payload as truncated', () => {
+    const raw = '{"title":"Phoenix FFL Merchants — "Creative Fatigue" Audit"}';
+    expect(parseToolCallArguments(raw)).toEqual({
+      title: 'Phoenix FFL Merchants — "Creative Fatigue" Audit',
     });
   });
 });

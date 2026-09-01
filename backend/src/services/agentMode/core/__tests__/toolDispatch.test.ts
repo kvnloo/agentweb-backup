@@ -420,6 +420,27 @@ describe('executePreparedTools', () => {
     expect((ports as any).__execOrder).toEqual(['read_brand_guidelines']);
   });
 
+  // ENG-1477 follow-up: production evidence (AW-ChatMessages, session
+  // 02ab5f5e...) showed the real prod failures were not unescaped quotes at
+  // all — every one was a clean JSON prefix cut off mid-object, always
+  // missing the required trailing field, never an unescaped quote anywhere.
+  // That shape must be told "retry the same call", not ENG-124's default
+  // "don't retry, fix your args" (there is nothing to fix).
+  it('classifies a genuinely truncated tool call as retryable, not invalid_args', async () => {
+    const ports = makePorts();
+    // No unescaped quote anywhere — a clean prefix that stops dead with no
+    // closing brace, matching the real production failure shape exactly.
+    const raw = '{"title":"Phoenix FFL Merchants — 30-Day Report","format_requirements":"Dark theme"';
+    const input = makeInput([toolCall('a', 'create_html_file', raw)], ports);
+    const result = await executePreparedTools(input);
+
+    expect(input.toolCallsLedger[0].error).toMatch(/Failed to parse arguments/);
+    expect(input.messages[0].content).toContain('Retryable: yes');
+    expect(input.messages[0].content).toContain('cut off');
+    expect(result.failedCounterUpdates).toEqual({ create_html_file: 1 });
+    expect((ports as any).__execOrder).toEqual([]);
+  });
+
   it('sets skillsUpdated when install_skills is called', async () => {
     const ports = makePorts();
     const input = makeInput([toolCall('a', 'install_skills', '{}')], ports);
