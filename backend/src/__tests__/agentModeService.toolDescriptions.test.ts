@@ -218,6 +218,23 @@ describe('AgentModeService - Tool Descriptions', () => {
       expect(systemPrompt).toContain('only pasted third-party message text');
       expect(systemPrompt).toContain('do not assume a drafting task');
     });
+
+    it('should include the multi-ask coverage guard', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('Multi-Ask Coverage Guard');
+      expect(systemPrompt).toContain('enumerate every ask before acting');
+    });
+
+    it('should treat a requested draft as the primary deliverable over a related tool action', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('that draft IS the primary deliverable');
+      expect(systemPrompt).toContain('never a substitute for it');
+    });
+
+    it('should require a per-ask status line and forbid silently dropping an ask', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('Never silently drop an ask');
+    });
   });
 
 
