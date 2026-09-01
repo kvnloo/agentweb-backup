@@ -116,7 +116,7 @@ import {
   runScheduleSelfImprovement,
   SCHEDULE_PROMPT_REVISION_LIMIT,
 } from '../controllers/agentModeController';
-import { SCHEDULE_ITEM_BUDGET_BYTES, estimateDynamoItemBytes } from '../utils/dynamoItemBudget';
+import { SCHEDULE_ITEM_BUDGET_BYTES, PROMPT_REVISIONS_BUDGET_BYTES, estimateDynamoItemBytes } from '../utils/dynamoItemBudget';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -355,6 +355,47 @@ describe('updateScheduledChat prompt revision history', () => {
     // Oldest ("rev 0") dropped; newest entry is the just-replaced "current prompt".
     expect(updates.promptRevisions[0].startingMessage).toBe('rev 1');
     expect(updates.promptRevisions[SCHEDULE_PROMPT_REVISION_LIMIT - 1].startingMessage).toBe('current prompt');
+  });
+
+  // ENG-1672: a self-improve schedule snapshots a FULL prompt on every daily
+  // reflection. With a ~35KB prompt, promptRevisions alone reaches ~330KB from
+  // just 9 entries — well under the flat SCHEDULE_PROMPT_REVISION_LIMIT (10) count,
+  // but already 95%+ of DynamoDB's 400KB item ceiling (the reported schedule's
+  // actual numbers). Bound promptRevisions by its OWN byte budget too, so a
+  // self-improving schedule cannot creep the whole item toward the edge just by
+  // running its normal daily cycle, well before the count limit ever kicks in.
+  it('prunes prompt revisions by byte budget even when under the count limit', async () => {
+    const bigRevisions = Array.from({ length: 8 }, (_, i) => ({
+      startingMessage: 'p'.repeat(35000),
+      updatedAt: new Date(2026, 7, i + 1).toISOString(),
+    }));
+
+    mockScheduleDb.getScheduleById.mockResolvedValue({
+      scheduleId: 'sched-selfimprove',
+      userId: mockUserId,
+      scheduleName: 'S',
+      startingMessage: 'p'.repeat(35000),
+      frequency: 'daily',
+      emailNotifications: ['owner@example.com'],
+      selfImprove: true,
+      promptRevisions: bigRevisions,
+    } as any);
+
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      params: { scheduleId: 'sched-selfimprove' },
+      body: { startingMessage: 'q'.repeat(10000) },
+    } as unknown as Request;
+
+    await agentModeController.updateScheduledChat(req, makeRes());
+
+    const updates = mockScheduleDb.updateSchedule.mock.calls[0][1] as any;
+    expect(updates.promptRevisions.length).toBeLessThan(bigRevisions.length + 1);
+    const revisionBytes = estimateDynamoItemBytes({ promptRevisions: updates.promptRevisions });
+    expect(revisionBytes).toBeLessThanOrEqual(PROMPT_REVISIONS_BUDGET_BYTES);
+    // The newest revision (the prompt this edit just replaced) always survives.
+    expect(updates.promptRevisions[updates.promptRevisions.length - 1].startingMessage)
+      .toBe('p'.repeat(35000));
   });
 });
 
