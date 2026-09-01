@@ -789,6 +789,99 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create).toHaveBeenCalledTimes(2);
   });
 
+  // ENG-1670: a fixed backoff is a guess. OpenRouter documents a `retry-after`
+  // (seconds, or an HTTP-date) or proactive `retry-after-ms` response header
+  // on a 429/5xx, and the OpenAI SDK's own (disabled) retry logic already
+  // trusts it over a computed default when present and under 60s -- honoring
+  // it here means the wait is right regardless of whether the provider's
+  // actual cooldown is 1.5s or 45s, which a hardcoded value can't be.
+  it('honors a numeric retry-after-ms header over the computed backoff', async () => {
+    const service = new AgentModeService();
+    const error = Object.assign(new Error('rate limited'), {
+      status: 429,
+      headers: { 'retry-after-ms': '7500' },
+    });
+    const create = jest.fn().mockRejectedValue(error);
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const sleep = jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+    await expect(service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'interactive_chat' } as any,
+    )).rejects.toBe(error);
+
+    expect(sleep).toHaveBeenNthCalledWith(1, 7500);
+    expect(sleep).toHaveBeenNthCalledWith(2, 7500);
+  });
+
+  it('honors a retry-after header expressed in seconds', async () => {
+    const service = new AgentModeService();
+    const error = Object.assign(new Error('rate limited'), {
+      status: 429,
+      headers: { 'retry-after': '20' },
+    });
+    const create = jest.fn().mockRejectedValue(error);
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const sleep = jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+    await expect(service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'interactive_chat' } as any,
+    )).rejects.toBe(error);
+
+    expect(sleep).toHaveBeenNthCalledWith(1, 20000);
+  });
+
+  it('ignores an out-of-range retry-after header and falls back to the computed backoff', async () => {
+    const service = new AgentModeService();
+    // 90s exceeds the SDK's own "reasonable" bound (< 60s) -- honoring it
+    // blindly would stall the run far longer than the provider likely meant,
+    // or than a scheduled run's own turn budget can absorb.
+    const error = Object.assign(new Error('rate limited'), {
+      status: 429,
+      headers: { 'retry-after': '90' },
+    });
+    const create = jest.fn().mockRejectedValue(error);
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const sleep = jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+    await expect(service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'interactive_chat' } as any,
+    )).rejects.toBe(error);
+
+    expect(sleep).toHaveBeenNthCalledWith(1, 1500);
+    expect(sleep).toHaveBeenNthCalledWith(2, 3000);
+  });
+
+  it('falls back to the computed backoff when no retry-after header is present', async () => {
+    const service = new AgentModeService();
+    const error = Object.assign(new Error('rate limited'), { status: 429, headers: {} });
+    const create = jest.fn().mockRejectedValue(error);
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const sleep = jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+    await expect(service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'interactive_chat' } as any,
+    )).rejects.toBe(error);
+
+    expect(sleep).toHaveBeenNthCalledWith(1, 1500);
+    expect(sleep).toHaveBeenNthCalledWith(2, 3000);
+  });
+
   // 2026-08-19: was adminOnly: true on every new-roster entry (gated as
   // unproven-in-our-stack). Harsha: "i'm fine to include open source /
   // open router stuff for all users not just isadmin" — removed from all
