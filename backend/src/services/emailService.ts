@@ -10,6 +10,7 @@ import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, reso
 import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
+import { resetDateFromMonth, formatResetDateLong } from '../utils/usageCycle';
 
 // ENG-351: resolve {{cite:N}} markers in Emma's text to inline source attributions, using the
 // citation metadata on the session's last assistant message. Email has no chip renderer, so this
@@ -1342,6 +1343,10 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       // also-exceeded token counter would be worded in tokens, contradicting the
       // in-app message the same block produces.
       costEnforced?: boolean;
+      // ENG-1344: the billing month (`YYYY-MM`), used to name the reset DATE.
+      // Optional only because this type under-declared the `TokenUsageStatus` the
+      // sole caller has always passed whole — every runtime call already carries it.
+      month?: string;
     }
   ) {
     try {
@@ -1370,6 +1375,14 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       const usageLine = `<strong>Usage:</strong> ${limitPercent}% of your monthly allowance used.`;
       const usageLineText = `Usage: ${limitPercent}% of your monthly allowance used.`;
       const allowanceResetNoun = 'usage allowance';
+      // ENG-1344: "resets at the start of each billing period" is the exact
+      // vagueness the escalating customer could not decode. Name the day when we
+      // can derive it; keep the old sentence when we cannot, rather than guess.
+      const resetIso = resetDateFromMonth(usageStatus.month);
+      const resetLabel = formatResetDateLong(resetIso);
+      const allowanceResetClause = resetLabel
+        ? `Your ${allowanceResetNoun} resets on ${resetLabel}.`
+        : `Your ${allowanceResetNoun} resets at the start of each billing period.`;
 
       const html = `
         <html>
@@ -1403,7 +1416,7 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
                   ${usageLine}
                 </p>
                 <p style="margin: 10px 0 0 0; line-height: 1.6;">
-                  Your ${allowanceResetNoun} resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+                  ${allowanceResetClause} To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
                 </p>
               </div>
             </div>
@@ -1425,7 +1438,7 @@ Your scheduled chat "${scheduleName}" was scheduled to run at ${currentDate}, bu
 
 ${usageLineText}
 
-Your ${allowanceResetNoun} resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+${allowanceResetClause} To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
 
 ---
 This is an automated email from your scheduled chat.

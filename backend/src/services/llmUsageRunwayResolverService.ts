@@ -45,6 +45,7 @@ import {
   computeUsageRunway,
   type UsageRunway,
 } from "./llmUsageForecastService";
+import { utcDay, resolveCycle } from "../utils/usageCycle";
 
 export interface ResolvedUsageRunway {
   billingUserId: string;
@@ -54,18 +55,6 @@ export interface ResolvedUsageRunway {
   runway: UsageRunway | null;
 }
 
-/** UTC calendar day, `YYYY-MM-DD`. */
-function utcDay(date: Date): string {
-  return date.toISOString().slice(0, 10);
-}
-
-function resolveCycle(today: string): { cycleStartDate: string; cycleResetDate: string } {
-  const [year, month] = today.split("-").map(Number);
-  const cycleStartDate = `${year}-${String(month).padStart(2, "0")}-01`;
-  // Month 12 rolls to January of the next year; Date.UTC handles the overflow.
-  const resetMs = Date.UTC(year, month, 1);
-  return { cycleStartDate, cycleResetDate: utcDay(new Date(resetMs)) };
-}
 
 export async function resolveUsageRunway(
   userId: string,
