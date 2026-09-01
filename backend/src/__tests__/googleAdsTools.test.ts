@@ -56,6 +56,8 @@ jest.mock('../services/googleAdsService', () => ({
 
 import { AgentModeService } from '../services/agentModeService';
 import { googleAdsService } from '../services/googleAdsService';
+import { emmaToolRegistry } from '../emma/registry';
+import '../emma/tools';
 
 let service: AgentModeService;
 beforeEach(() => {
@@ -1167,5 +1169,32 @@ describe('handleCallGoogleAdsApi — a PAUSED create must not come back ENABLED 
       '1234567890',
       expect.objectContaining({ status: 'ENABLED' }),
     );
+  });
+});
+
+// ENG-1668. Production session 87334a61-2e06-4018-960e-9e7759403423 showed
+// gemini-3.7-flash calling KEYWORD UPDATE, KEYWORD ADD_NEGATIVE, and BUDGET
+// UPDATE without the resource-name argument each one requires, even though
+// the top-of-tool ACTION MATRIX names it. The per-field `description` for
+// budget_resource_name, campaign_resource_name, and criterion_resource_name
+// — the text a model leans on when scanning an individual parameter — did
+// not mention these three action combos at all, only ones it does NOT gate
+// (CAMPAIGN CREATE, ADD_PROXIMITY/AD_GROUP LIST, KEYWORD REMOVE). Assert the
+// field descriptions name every write action that actually requires them, so
+// a future edit to the ACTION MATRIX can't drift out of sync with the
+// per-field docs again.
+describe('call_google_ads_api tool schema — per-field description coverage (ENG-1668)', () => {
+  const properties = emmaToolRegistry.getTool('call_google_ads_api')!.definition.inputSchema.properties as Record<string, { description?: string }>;
+
+  it('documents budget_resource_name as required for BUDGET UPDATE', () => {
+    expect(properties.budget_resource_name.description).toMatch(/BUDGET UPDATE/);
+  });
+
+  it('documents campaign_resource_name as usable for KEYWORD ADD_NEGATIVE', () => {
+    expect(properties.campaign_resource_name.description).toMatch(/ADD_NEGATIVE/);
+  });
+
+  it('documents criterion_resource_name as required for KEYWORD UPDATE', () => {
+    expect(properties.criterion_resource_name.description).toMatch(/KEYWORD UPDATE/);
   });
 });
