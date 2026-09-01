@@ -11046,7 +11046,12 @@ export const agentModeController = {
           }
         }
       };
-      backgroundRun().catch(err => {
+      // ENG-1189: unlike its sibling runScheduledChat dispatch sites in this
+      // file, this one wasn't wrapped in trackScheduledRun — the graceful
+      // shutdown drain never waited for it, so a deploy mid-run left this
+      // self-calling run to fail against a closed listener the same way
+      // manage_scheduled_chat did.
+      trackScheduledRun(backgroundRun().catch(err => {
         console.error('AgentMode: Background test run error:', err);
         const { reportUIError } = require('../utils/errorReporter');
         reportUIError({
@@ -11059,7 +11064,7 @@ export const agentModeController = {
             'Run ID': runId,
           },
         }).catch((reportErr: Error) => console.error('errorReporter failed:', reportErr));
-      });
+      }));
 
       res.json({
         runId,
