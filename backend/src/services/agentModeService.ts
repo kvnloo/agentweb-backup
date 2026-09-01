@@ -2642,8 +2642,15 @@ export class AgentModeService {
       return errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx';
     };
 
+    // ENG-1670: a single 1.5s retry wasn't enough to clear a burst-triggered
+    // 429 — prod sessions on the LinkedIn Post Factory schedule (which fires
+    // several tool calls back-to-back) needed the full 15-60min scheduled-run
+    // backoff to recover from what OpenRouter reported as rate-limited. One
+    // extra attempt with a longer second backoff gives a rate limit more room
+    // to clear within the same run, before falling back to that expensive path.
+    const maxAttempts = 3;
     let lastError: unknown;
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const res = await client.chat.completions.create(
           params,
@@ -2679,11 +2686,12 @@ export class AgentModeService {
         return res;
       } catch (error) {
         lastError = error;
-        if (attempt < 2 && isRetryableLlmCallError(error)) {
-          console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying once`, {
+        if (attempt < maxAttempts && isRetryableLlmCallError(error)) {
+          const backoffMs = 1500 * Math.pow(2, attempt - 1);
+          console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms`, {
             error: error instanceof Error ? error.message : String(error),
           });
-          await this.sleep(1500);
+          await this.sleep(backoffMs);
           continue;
         }
         break;
