@@ -55,6 +55,21 @@ describe('findModelMention', () => {
       .toBe('anthropic.claude-opus-4-8');
   });
 
+  describe('verb-to-mention distance boundary', () => {
+    // The window is a DISTANCE from the mention, so five tokens may intervene.
+    // Pinned in both directions: a silently widened window costs precision, a
+    // silently narrowed one drops real requests.
+    const withGap = (n: number) => `use ${'word '.repeat(n)}Opus 5`;
+
+    it.each([0, 1, 2, 3, 4, 5])('matches with %i intervening token(s)', (n) => {
+      expect(findModelMention(withGap(n), index)?.modelId).toBe(OPUS_5);
+    });
+
+    it.each([6, 7])('does not match with %i intervening tokens', (n) => {
+      expect(findModelMention(withGap(n), index)).toBeNull();
+    });
+  });
+
   it.each([
     // No request verb — a mention is not a request.
     'the Opus 5 write-up looks good',
@@ -94,9 +109,13 @@ describe('buildModelMentionAck', () => {
     expect(note).toMatch(/model selector/i);
   });
 
-  it('says the model is unavailable when the account cannot select it', () => {
+  it('says the model cannot be SELECTED, not that it is unavailable', () => {
+    // ENG-759 made Opus 5 the fleet default while the picker still refuses opus
+    // for a non-admin, so "isn't available on your account" would contradict the
+    // badge on that same user's earlier turns. Selection is what is blocked.
     const note = buildModelMentionAck(mention, FLASH_LITE, false, index);
-    expect(note).toMatch(/isn't available on your account/i);
+    expect(note).toMatch(/can't be selected on your account/i);
+    expect(note).not.toMatch(/isn't available on your account/i);
     expect(note).toContain('Gemini 3.1 Flash Lite');
   });
 
@@ -158,6 +177,6 @@ describe('reconcileModelMentionAck', () => {
     const isSelectable = jest.fn().mockReturnValue(false);
     const out = reconcileModelMentionAck(reply, 'use Opus 5', FLASH_LITE, index, isSelectable);
     expect(isSelectable).toHaveBeenCalledWith(OPUS_5);
-    expect(out).toMatch(/isn't available on your account/i);
+    expect(out).toMatch(/can't be selected on your account/i);
   });
 });

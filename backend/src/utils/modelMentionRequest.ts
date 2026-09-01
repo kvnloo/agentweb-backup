@@ -82,7 +82,18 @@ const REQUEST_VERBS = new Set([
   'route', 'reroute',
 ]);
 
-/** How many tokens may sit between the verb and the model name. */
+/**
+ * How far back to look for the request verb, measured in tokens from the model
+ * name. The verb may sit up to this many positions before the mention, so at
+ * most FIVE tokens intervene: "switch this session over to Opus 5" matches,
+ * one word longer does not.
+ *
+ * (CodeRabbit read the previous one-line comment as "six may sit between" and
+ * proposed widening the window by one. The window is a distance, which is what
+ * the constant is named for; the comment was what was wrong. Pinned by the
+ * boundary tests in __tests__/modelMentionRequest.test.ts so it cannot drift
+ * back into ambiguity.)
+ */
 const MAX_VERB_DISTANCE_TOKENS = 6;
 
 interface Token {
@@ -236,9 +247,18 @@ export function buildModelMentionAck(
   const wantedLabel = label(index, mention.modelId);
 
   if (!isMentionSelectable) {
+    // "can't be selected", NOT "isn't available on your account".
+    //
+    // The two are not the same here and the stronger claim would sometimes be
+    // false: `updateSessionLlmModel` refuses Opus for a non-admin
+    // (agentModeController.ts:12828), but ENG-759 made Opus 5 the configured
+    // fleet default, so a non-admin can be RUNNING a model the picker will not
+    // let them choose. Saying it is unavailable to them would contradict the
+    // badge on their own earlier turns. Selection is the thing that is actually
+    // blocked, so that is what the note says.
     return (
-      `Note: ${wantedLabel} isn't available on your account, so this reply ran ` +
-      `on ${ranLabel}. The models you can use are listed in the model selector ` +
+      `Note: ${wantedLabel} can't be selected on your account, so this reply ran ` +
+      `on ${ranLabel}. The models you can choose are listed in the model selector ` +
       `above the message box.`
     );
   }

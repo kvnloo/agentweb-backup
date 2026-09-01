@@ -30,10 +30,15 @@ const FLASH_LITE = 'gemini-3.1-flash-lite';
 const OPUS_5 = 'anthropic.claude-opus-5';
 const REPLY = 'Here are the 107 leads, sorted by revenue.';
 
-function mockDeps({ isAdmin = false }: { isAdmin?: boolean } = {}) {
+function mockDeps({ isAdmin = false, policyDecision = undefined }: { isAdmin?: boolean; policyDecision?: any } = {}) {
   const mockChatbotService = require('../services/chatbotService');
   mockChatbotService.chatbotDb = {
-    getChatSession: jest.fn().mockResolvedValue({ sessionId: 'test-session', messages: [], associatedSkills: null }),
+    getChatSession: jest.fn().mockResolvedValue({
+      sessionId: 'test-session',
+      messages: [],
+      associatedSkills: null,
+      ...(policyDecision ? { llmUsagePolicyDecision: policyDecision } : {}),
+    }),
     addMessagesToSession: jest.fn().mockResolvedValue(undefined),
   };
 
@@ -81,8 +86,8 @@ describe('AgentModeService - ENG-1205 named-model acknowledgement', () => {
     expect(result.content).toContain(REPLY);
     expect(result.content).toContain('Claude Opus 5');
     expect(result.content).toContain('Gemini 3.1 Flash Lite');
-    // A non-admin cannot select Opus at all, so this is the entitlement branch.
-    expect(result.content).toMatch(/isn't available on your account/i);
+    // A non-admin cannot select Opus, so this is the entitlement branch.
+    expect(result.content).toMatch(/can't be selected on your account/i);
   });
 
   it('tells an entitled user how to actually switch, rather than that it is unavailable', async () => {
@@ -90,7 +95,7 @@ describe('AgentModeService - ENG-1205 named-model acknowledgement', () => {
     const result = await run('please use Opus 5 for this one', FLASH_LITE);
 
     expect(result.content).toMatch(/can't change models from a chat message/i);
-    expect(result.content).not.toMatch(/isn't available on your account/i);
+    expect(result.content).not.toMatch(/can't be selected on your account/i);
     expect(result.content).toContain('Claude Opus 5');
   });
 
@@ -136,5 +141,59 @@ describe('AgentModeService - ENG-1205 named-model acknowledgement', () => {
     mockDeps();
     const result = await run('use Opus 5 please', FLASH_LITE);
     expect(result.content).toBe(REPLY);
+  });
+
+  /**
+   * ENG-1205 — the correction must reach the PERSISTED message, or it vanishes
+   * on reload and the badge is left disagreeing with the picker for no stated
+   * reason. Stamped beside `llm`, the per-message provenance seam from ENG-892.
+   */
+  describe('per-message correction stamp', () => {
+    const CORRECTED = {
+      requestedModel: OPUS_5,
+      effectiveModel: FLASH_LITE,
+      modelSelection: 'corrected',
+      modelSelectionReason: 'requested_model_unavailable_using_default',
+    };
+
+    it('stamps the correction on the assistant message the turn produced', async () => {
+      mockDeps({ policyDecision: CORRECTED });
+      const result = await run('summarise the leads', FLASH_LITE);
+
+      const assistant = result.responseMessages.find((m: any) => m.role === 'assistant');
+      expect(assistant.llm).toBe(FLASH_LITE);
+      expect(assistant.modelCorrection).toEqual({
+        requestedModel: OPUS_5,
+        effectiveModel: FLASH_LITE,
+      });
+    });
+
+    it('stamps nothing when the request was honored', async () => {
+      mockDeps({
+        policyDecision: { requestedModel: FLASH_LITE, effectiveModel: FLASH_LITE, modelSelection: 'honored' },
+      });
+      const result = await run('summarise the leads', FLASH_LITE);
+
+      const assistant = result.responseMessages.find((m: any) => m.role === 'assistant');
+      expect(assistant.llm).toBe(FLASH_LITE);
+      expect(assistant.modelCorrection).toBeUndefined();
+    });
+
+    it('stamps nothing when the session decision describes a different turn', async () => {
+      // The slot is overwritten every turn; a resumed run must not borrow it.
+      mockDeps({ policyDecision: CORRECTED });
+      const result = await run('summarise the leads', 'gemini-3.5-flash');
+
+      const assistant = result.responseMessages.find((m: any) => m.role === 'assistant');
+      expect(assistant.modelCorrection).toBeUndefined();
+    });
+
+    it('stamps nothing when the session carries no decision at all', async () => {
+      mockDeps();
+      const result = await run('summarise the leads', FLASH_LITE);
+
+      const assistant = result.responseMessages.find((m: any) => m.role === 'assistant');
+      expect(assistant.modelCorrection).toBeUndefined();
+    });
   });
 });

@@ -62,6 +62,7 @@ import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type Judge
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
+import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
@@ -3062,6 +3063,17 @@ export class AgentModeService {
       }
 
       const isAdmin = currentUser?.isAdmin === true;
+
+      // ENG-1205: the correction this turn was admitted under, stamped onto the
+      // turn's assistant messages beside `llm` so a reload can still explain why
+      // the badge disagrees with the picker. The controller wrote this decision
+      // onto the session immediately before dispatch; `resolveTurnModelCorrection`
+      // rejects a slot that does not describe THIS turn, so a resumed or replayed
+      // run degrades to no stamp rather than borrowing a newer turn's model.
+      const turnModelCorrection = resolveTurnModelCorrection(
+        (currentSession as any)?.llmUsagePolicyDecision,
+        llmModel,
+      );
       // Admin tools are available to real admins OR to messages arriving via admin delegated access.
       // iShare sessions always block admin tools even if somehow isDelegatedAccess is set.
       const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
@@ -3903,6 +3915,12 @@ export class AgentModeService {
 
         // Add LLM model to the response message
         responseMessage.llm = llmModel;
+        // ENG-1205: and, when the model that ran is not the one that was asked
+        // for, what was asked for — `llm` alone cannot distinguish "you picked
+        // this" from "you were given this".
+        if (turnModelCorrection) {
+          responseMessage.modelCorrection = turnModelCorrection;
+        }
 
         // Attach token usage from the LLM response to the message
         const responseUsage = response.usage;
