@@ -19,7 +19,8 @@
  */
 import { Request, Response, NextFunction } from 'express';
 import { AuthenticatedRequest } from './auth';
-import { checkTokenUsage } from '../services/tokenUsageService';
+import { checkTokenUsage, toCustomerTokenUsage } from '../services/tokenUsageService';
+import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 
 export type EmmaRouteBudget = 'metered' | 'exempt';
 
@@ -170,11 +171,25 @@ export async function requireEmmaTokenBudget(
   try {
     const usageStatus = await checkTokenUsage(user.userId);
     if (!usageStatus.allowed) {
-      // Same contract as controllers/chatbot.ts:156-159, so an MCP caller that
-      // runs out of quota is indistinguishable from a web caller that does.
+      // Same contract as controllers/chatbot.ts, so an MCP caller that runs out
+      // of quota is indistinguishable from a web caller that does — now enforced
+      // by SHARING the producer rather than by copying the literal, which is what
+      // let the two drift (ENG-1344 AC6).
+      //
+      // Two defects fixed here, both live:
+      //  - `tokenUsage: usageStatus` sent the RAW status, so `costUsed` and
+      //    `costAllowance` reached every over-quota MCP caller in plain USD.
+      //    ENG-1212 AC4 closed that on /usage and chatbot.ts and missed this
+      //    surface entirely.
+      //  - "Monthly token limit reached" names a unit that has not gated anyone
+      //    since ENG-1116 flipped enforcement to cost, and "contact support or
+      //    upgrade your plan" is the dead end ENG-1035 was raised about: no
+      //    reset date, no remedy an agent can relay.
+      const blockCopy = buildUsageBlockCopy({ month: usageStatus.month });
       res.status(429).json({
-        error: 'Monthly token limit reached. Please contact support or upgrade your plan.',
-        tokenUsage: usageStatus,
+        error: blockCopy.message,
+        usageBlock: blockCopy,
+        tokenUsage: toCustomerTokenUsage(usageStatus),
       });
       return;
     }
