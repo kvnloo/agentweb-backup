@@ -21916,11 +21916,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const restricted: Array<{ id: string; name: string }> = [];
     let rootRestricted = false;
     let truncated = false;
+    /*
+     * "The walk is incomplete" and "stop walking" are DIFFERENT facts, and conflating them cost
+     * the whole tree.
+     *
+     * `truncated` is what the caller is told; `stopWalk` is what ends the loop. Only two things
+     * genuinely mean there is no point continuing: the wall-clock deadline, and the maxFolders
+     * bound (both apply to the walk as a whole). A transient failure on ONE sub-folder applies
+     * to that sub-folder alone — the 403/401 branch below has always taken that view, skipping
+     * the folder and walking on. Setting `truncated` from the error branch made the loop
+     * condition `!truncated` abandon the entire BFS, so a single 502 on sub-folder 3 of 40 left
+     * the remaining 37 unvisited, with the same "incomplete" signal a much smaller gap produces.
+     */
+    let stopWalk = false;
     const deadline = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
 
-    while (queue.length > 0 && !truncated) {
+    while (queue.length > 0 && !stopWalk) {
       if (Date.now() >= deadline) {
         truncated = true;
+        stopWalk = true;
         break;
       }
       const current = queue.shift()!;
@@ -21928,6 +21942,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       do {
         if (Date.now() >= deadline) {
           truncated = true;
+          stopWalk = true;
           break;
         }
         let resp: any;
@@ -21957,6 +21972,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
              * so the tree is partial and every conclusion drawn from it is provisional. Without
              * this, a fired per-request timeout left `truncated` false and a caller reported a
              * definitive "file not found" from a search that never completed.
+             *
+             * Records the incompleteness WITHOUT ending the walk (see `stopWalk` above): the
+             * other 39 sub-folders can still be listed, and a partial tree covering 39 of 40 is
+             * worth far more than one covering 2.
              */
             truncated = true;
           }
@@ -21968,6 +21987,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           if (!f.id || folderIdSet.has(f.id)) continue;
           if (folderIds.length >= maxFolders) {
             truncated = true;
+            stopWalk = true;
             break;
           }
           folderIdSet.add(f.id);
@@ -21976,7 +21996,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           queue.push(f.id);
         }
 
-        pageToken = truncated ? undefined : (resp.data.nextPageToken || undefined);
+        pageToken = stopWalk ? undefined : (resp.data.nextPageToken || undefined);
       } while (pageToken);
     }
 
