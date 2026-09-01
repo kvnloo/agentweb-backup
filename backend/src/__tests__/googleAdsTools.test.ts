@@ -6,6 +6,7 @@ jest.mock('../services/googleAdsService', () => ({
     listBudgets: jest.fn().mockResolvedValue([{ resourceName: 'customers/123/campaignBudgets/1', name: 'Test Budget', amountMicros: '10000000', explicitlyShared: false, referenceCount: 1 }]),
     listBiddingStrategies: jest.fn().mockResolvedValue([{ resourceName: 'customers/123/biddingStrategies/555', id: '555', name: 'Portfolio tCPA', type: 'TARGET_CPA', status: 'ENABLED' }]),
     createBudget: jest.fn().mockResolvedValue({ resourceName: 'customers/123/campaignBudgets/1' }),
+    updateBudget: jest.fn().mockResolvedValue(undefined),
     createCampaign: jest.fn().mockResolvedValue({ resourceName: 'customers/123/campaigns/1' }),
     pauseCampaign: jest.fn().mockResolvedValue(undefined),
     resumeCampaign: jest.fn().mockResolvedValue(undefined),
@@ -117,6 +118,29 @@ describe('handleCallGoogleAdsApi', () => {
     });
     expect(result.success).toBe(true);
     expect(result.budgetResourceName).toBeDefined();
+  });
+
+  it('handles BUDGET UPDATE action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'BUDGET',
+      action: 'UPDATE',
+      budget_resource_name: 'customers/123/campaignBudgets/1',
+      amount_micros: 20_000_000,
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.updateBudget).toHaveBeenCalledWith('user-123', '1234567890', 'customers/123/campaignBudgets/1', 20_000_000);
+  });
+
+  it('returns error for BUDGET UPDATE without budget_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'BUDGET',
+      action: 'UPDATE',
+      amount_micros: 20_000_000,
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/budget_resource_name/i);
   });
 
   it('handles LOCATION SEARCH action', async () => {
