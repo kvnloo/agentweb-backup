@@ -58,7 +58,7 @@ jest.mock('../services/dripSequenceDb', () => ({
 
 jest.mock('../services/db', () => ({
   crmDb: { findLeadsByLinkedin: jest.fn().mockResolvedValue([]) },
-  userDb: { getAllUsers: jest.fn().mockResolvedValue([]) },
+  userDb: { scanWithFilter: jest.fn().mockResolvedValue([]) },
 }));
 
 const mockGetSetting = jest.fn();

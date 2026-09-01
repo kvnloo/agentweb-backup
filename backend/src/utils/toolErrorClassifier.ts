@@ -12,7 +12,8 @@
  * breaking change for historical queries:
  *   timeout | auth | rate_limit | quota_exceeded | invalid_args | not_found |
  *   network | upstream_5xx | policy_blocked | repeated_failure |
- *   tool_unavailable | upstream_rejected | empty_result | invalid_output
+ *   tool_unavailable | upstream_rejected | empty_result | invalid_output |
+ *   truncated_response
  *
  * The three trailing classes were added 2026-06-14 after a 7-day production
  * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
@@ -56,6 +57,11 @@ const GATEWAY_NAME_CLASSES: Record<string, string> = {
   // Typed X credit-exhaustion (ENG-664) — classify by name so a 402 clusters as
   // a billing stop even when it crosses a module/mock boundary.
   XCreditsExhaustedError: 'payment_required',
+  // A tool call's arguments were a clean-but-incomplete JSON prefix — the
+  // stream was cut off mid-generation, not a formatting mistake (ENG-1477
+  // follow-up; see repairToolCallArguments.ts). Distinct from invalid_args so
+  // the model gets retry guidance instead of "fix your arguments first".
+  TruncatedToolCallArgumentsError: 'truncated_response',
 };
 
 function classFromStatus(status: number): string | null {
