@@ -20,6 +20,7 @@ import {
   sendTextTurn,
   closeLiveSession,
   hasLiveSession,
+  drainLiveVoiceToolExecutions,
 } from './services/liveVoiceService';
 import {
   getEffectiveLiveUserId,
@@ -372,24 +373,27 @@ const runDrain = async (reason: string): Promise<void> => {
 
   // 3. Drain the LLM worker (scheduled chats / EMMA runs), every other
   //    in-flight cron job (LinkedIn sync, drip worker, meta token refresh,
-  //    etc. — see cronJobRegistry), AND in-flight interactive Agent Mode
-  //    turns, concurrently, up to the same ceiling, so the total wait is the
-  //    max of the three rather than their sum.
+  //    etc. — see cronJobRegistry), in-flight interactive Agent Mode turns,
+  //    AND in-flight Gemini Live Voice tool calls, concurrently, up to the
+  //    same ceiling, so the total wait is the max of the four rather than
+  //    their sum.
   //
   //    This MUST run BEFORE the HTTP listener closes below (ENG-1189): every
   //    one of these self-calls back into THIS process via mcpFetch's
   //    http://localhost:${PORT} — the marketing-response worker is a forked
   //    child process that inherits the same PORT, and an interactive turn's
-  //    tool calls run right here. Closing the listener first (as this used
-  //    to do) meant any of that in-flight work's self-calls failed with an
-  //    unrecoverable "fetch failed" for the rest of the process's life —
-  //    not a transient blip, since server.close() refuses every new loopback
-  //    connection a retry would need, no matter how long the retry waits.
+  //    (or a live-voice tool call's) tool calls run right here. Closing the
+  //    listener first (as this used to do) meant any of that in-flight
+  //    work's self-calls failed with an unrecoverable "fetch failed" for the
+  //    rest of the process's life — not a transient blip, since
+  //    server.close() refuses every new loopback connection a retry would
+  //    need, no matter how long the retry waits.
   const { drainActiveSessionGenerations } = await import('./controllers/agentModeController');
-  const [, cronDrain, sessionDrain] = await Promise.all([
+  const [, cronDrain, sessionDrain, liveVoiceDrain] = await Promise.all([
     generateMarketingResponseWorkerService.shutdown(),
     cronJobRegistry.drain(),
     drainActiveSessionGenerations(),
+    drainLiveVoiceToolExecutions(),
   ]);
   if (!cronDrain.drained) {
     console.warn(
@@ -400,6 +404,11 @@ const runDrain = async (reason: string): Promise<void> => {
   if (!sessionDrain.drained) {
     console.warn(
       `[gracefulShutdown] Interactive session drain ceiling reached — ${sessionDrain.stuckCount} turn(s) still in-flight`
+    );
+  }
+  if (!liveVoiceDrain.drained) {
+    console.warn(
+      `[gracefulShutdown] Live voice tool-call drain ceiling reached — ${liveVoiceDrain.stuckCount} call(s) still in-flight`
     );
   }
 
