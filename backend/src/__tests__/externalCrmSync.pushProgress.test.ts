@@ -13,6 +13,7 @@ jest.mock('../services/db', () => ({
     getLeadById: jest.fn(),
     updateLead: jest.fn().mockResolvedValue(undefined),
     setLeadListCrmSyncConfig: jest.fn(),
+    updateLeadListCrmSyncStatus: jest.fn().mockResolvedValue(undefined),
   },
   userDb: { getUserById: jest.fn().mockResolvedValue(null) },
 }));

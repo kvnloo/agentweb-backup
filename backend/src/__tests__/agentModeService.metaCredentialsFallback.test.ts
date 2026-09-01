@@ -97,7 +97,10 @@ describe('AgentModeService - getMetaCredentials fallback to adAccount', () => {
       adAccount: '883347640787043'
     };
     (userDb.getUserById as jest.Mock).mockResolvedValue(userWithLegacyAccount);
-    (metaService.listCampaigns as jest.Mock).mockResolvedValue([{ id: 'c1', name: 'Campaign 1' }]);
+    // metaService.listCampaigns returns { campaigns, truncated, pagesFetched },
+    // not a bare array (ENG-1625) — a stale bare-array mock here silently
+    // makes `result?.campaigns ?? []` resolve to [], masking a real result.
+    (metaService.listCampaigns as jest.Mock).mockResolvedValue({ campaigns: [{ id: 'c1', name: 'Campaign 1' }], truncated: false, pagesFetched: 1 });
 
     const result = await agentModeService.listMetaAdsCampaignsNew('user1');
 
@@ -118,7 +121,7 @@ describe('AgentModeService - getMetaCredentials fallback to adAccount', () => {
       adAccount: '883347640787043'
     };
     (userDb.getUserById as jest.Mock).mockResolvedValue(userWithOnlyLinkedIn);
-    (metaService.listCampaigns as jest.Mock).mockResolvedValue([]);
+    (metaService.listCampaigns as jest.Mock).mockResolvedValue({ campaigns: [], truncated: false, pagesFetched: 1 });
 
     const result = await agentModeService.listMetaAdsCampaignsNew('user1');
 
@@ -142,7 +145,7 @@ describe('AgentModeService - getMetaCredentials fallback to adAccount', () => {
       adAccount: '883347640787043'
     };
     (userDb.getUserById as jest.Mock).mockResolvedValue(userWithBoth);
-    (metaService.listCampaigns as jest.Mock).mockResolvedValue([]);
+    (metaService.listCampaigns as jest.Mock).mockResolvedValue({ campaigns: [], truncated: false, pagesFetched: 1 });
 
     await agentModeService.listMetaAdsCampaignsNew('user1');
 
@@ -158,7 +161,7 @@ describe('AgentModeService - getMetaCredentials fallback to adAccount', () => {
       adAccount: 'act_883347640787043'
     };
     (userDb.getUserById as jest.Mock).mockResolvedValue(userWithActPrefix);
-    (metaService.listCampaigns as jest.Mock).mockResolvedValue([]);
+    (metaService.listCampaigns as jest.Mock).mockResolvedValue({ campaigns: [], truncated: false, pagesFetched: 1 });
 
     await agentModeService.listMetaAdsCampaignsNew('user1');
 

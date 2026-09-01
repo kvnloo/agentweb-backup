@@ -7,8 +7,11 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb, userDb, tempEmailDb } from '../services/db';
 import { dripSequenceDb } from '../services/dripSequenceDb';
-import { getUserIdByHubSpotPortalId } from '../services/connectedAccountsDb';
+import { getUserIdByHubSpotPortalId, getAccountsByAttioWorkspaceId } from '../services/connectedAccountsDb';
 import { HubSpotService } from '../services/hubspotService';
+import { AttioService } from '../services/attioService';
+import { AttioAdapter } from '../services/adapters/attioAdapter';
+import { applyAttioPersonEvent } from '../utils/attioPersonWebhookEvent';
 import { getHubSpotClientSecretForAppId } from '../config/integrations';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { agentModeService } from '../services/agentModeService';
@@ -1100,41 +1103,245 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 // ─────────────────────────────────────────────────────────────────────────────
 // ATTIO WEBHOOK RECEIVER
 //
-// Attio sends events here for each user who has registered a webhook.
-// The payload identifies the workspace via workspace_id — matched against
-// connected accounts to find the user.
+// Attio's model is per-workspace (each connected account registers its own
+// webhook subscription via AttioService.registerWebhook — see
+// utils/attioWebhookSubscription.ts) rather than HubSpot's single app-wide
+// subscription list, but the request-handling shape mirrors HubSpot's
+// handler below: ACK 200 immediately, verify the signature, dedup via the
+// durable job queue, then demux across every list bound to the matched
+// workspace.
 //
-// Events handled:
-//   record.created  → log for future sync (pull new person into leads)
-//   record.updated  → log for future sync (update matching lead)
-//   record.deleted  → log for future sync (flag lead as removed)
+// Events handled: record.created/updated/deleted (People only — Companies
+// are skipped, matching HubSpot's own webhook scope, which doesn't touch
+// Companies either) and list-entry.created/updated/deleted (the Deal-analog,
+// for parity with HubSpot's deal.propertyChange handling).
 // ─────────────────────────────────────────────────────────────────────────────
-router.post('/attio', async (req: express.Request, res: express.Response) => {
+
+const attioAdapter = new AttioAdapter();
+
+function verifyAttioSignature(signingKey: string, rawBody: Buffer, signature: string): boolean {
   try {
-    const event = req.body;
-    const eventType: string = event?.event_type ?? event?.type ?? 'unknown';
-    const workspaceId: string = event?.workspace_id ?? '';
-    const objectType: string = event?.data?.object?.slug ?? '';
-    const recordId: string = event?.data?.record?.id?.record_id ?? '';
+    const expected = crypto.createHmac('sha256', signingKey).update(rawBody).digest('hex');
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  } catch {
+    return false;
+  }
+}
 
-    console.log(`[Attio Webhook] event=${eventType} object=${objectType} record=${recordId} workspace=${workspaceId}`);
+interface AttioJobPayload {
+  workspaceId: string;
+  accountId: string; // the specific matched account's id — resolved at signature-verification time
+  userId: string;
+  events: any[];
+}
 
-    // Only process people and companies record events
-    const isRelevantObject = objectType === 'people' || objectType === 'companies';
-    const isRelevantEvent = ['record.created', 'record.updated', 'record.deleted'].includes(eventType);
+export async function processAttioWebhookJob(payload: AttioJobPayload): Promise<void> {
+  const svc = await AttioService.create(payload.userId, payload.accountId);
+  const lists = await crmDb.getLeadListsByUserId(payload.userId);
+  const matchingLists = (lists as any[]).filter(
+    l => l.externalCrmSyncConfigs?.attio?.accountId === payload.accountId,
+  );
 
-    if (!isRelevantObject || !isRelevantEvent) {
-      return res.status(200).json({ received: true, processed: false, reason: 'event not in scope' });
+  // Person attribute types are workspace-wide, not list-scoped, and
+  // loadAttributeTypes has no cache of its own — without sharing one fetch
+  // across this whole job, every record.* event (times every matching list)
+  // reissues the same Attio HTTP request. Fetched lazily (only if the
+  // delivery actually contains a record.* event) and once, then handed to
+  // every applyAttioPersonEvent call below.
+  let peopleAttrCache: Map<string, string> | undefined;
+  if (payload.events.some(e => (e?.event_type ?? '').startsWith('record.'))) {
+    peopleAttrCache = await svc.loadAttributeTypes('people');
+  }
+  // Deal-list attribute types ARE list-scoped (config.attioDealListId), so
+  // cache per distinct deal list id instead — different AgentWeb lists can
+  // point at different Attio deal lists.
+  const dealAttrCacheByListId = new Map<string, Map<string, string>>();
+
+  // CodeRabbit finding (ENG-1380): a per-event failure was recorded into
+  // lastSyncStatus but the job itself still resolved normally, so the
+  // durable job queue called markJobComplete instead of markJobFailed —
+  // a transient failure (Attio fetch error, DynamoDB delete error) was
+  // never retried by the queue's bounded-retry mechanism. OR'd across every
+  // list, not reset per-list, and only thrown after the loop below finishes
+  // — every matching list must still be fully attempted regardless of an
+  // earlier list's failure, exactly as before; only whether the job as a
+  // whole gets retried changes.
+  let anyJobEventFailed = false;
+
+  for (const list of matchingLists) {
+    const syncConfig = await externalCrmSyncService.getConfig(payload.userId, list.listId, 'attio');
+    if (!syncConfig || syncConfig.webhookEnabled === false) continue;
+
+    // Live-caught gap: a webhook-driven update applies correctly (the lead's
+    // data genuinely changes), but nothing stamped lastPullSyncAt/lastSyncStatus
+    // for it — only a manual "Pull" click did. The CRM Sync dialog's "last
+    // pulled" indicator looked permanently stale even while auto-pull was
+    // working. Stamp once per list per job (not per event) once at least one
+    // relevant event was actually attempted against it — set before the call,
+    // not after, so a thrown error still counts as an attempt (and correctly
+    // marks the stamp as a failure, not skips it entirely).
+    let appliedAnyEvent = false;
+    let anyEventFailed = false;
+
+    for (const event of payload.events) {
+      const eventType: string = event?.event_type ?? '';
+      try {
+        if (eventType.startsWith('record.')) {
+          appliedAnyEvent = true;
+          // applyAttioPersonEvent catches its own fetch/deletion failures
+          // internally and returns false rather than throwing (CodeRabbit
+          // finding, ENG-1380) — check the return value, not just the catch.
+          const applied = await applyAttioPersonEvent(list.listId, syncConfig, svc, event, peopleAttrCache);
+          if (!applied) anyEventFailed = true;
+        } else if (eventType.startsWith('list-entry.')) {
+          const entryId: string = event?.id?.entry_id ?? event?.data?.entry_id ?? '';
+          if (entryId) {
+            appliedAnyEvent = true;
+            const dealListId = syncConfig.attioDealListId;
+            let dealAttrCache = dealListId ? dealAttrCacheByListId.get(dealListId) : undefined;
+            if (dealListId && !dealAttrCache) {
+              dealAttrCache = await svc.loadAttributeTypes('people', dealListId);
+              dealAttrCacheByListId.set(dealListId, dealAttrCache);
+            }
+            await attioAdapter.applyListEntryWebhookEvent(list.listId, syncConfig, svc, entryId, eventType, dealAttrCache);
+          }
+        }
+      } catch (err: any) {
+        console.error(`[Attio Webhook] Failed to apply ${eventType} to list ${list.listId}:`, err?.message ?? err);
+        anyEventFailed = true;
+      }
     }
 
-    // TODO: Trigger sync handler when sync service is implemented
-    // await attioSyncService.handleWebhookEvent(workspaceId, eventType, event.data);
-
-    res.status(200).json({ received: true, processed: true });
-  } catch (error: any) {
-    console.error('[Attio Webhook] error:', error);
-    res.status(200).json({ received: true, processed: false, error: error.message });
+    if (appliedAnyEvent) {
+      await externalCrmSyncService.updateSyncTimestamp(syncConfig, 'pull', !anyEventFailed);
+    }
+    if (anyEventFailed) anyJobEventFailed = true;
   }
+
+  // Thrown only after every matching list has been attempted — the caller's
+  // markJobFailed/retry path re-processes this same payload later. Safe to
+  // retry the whole delivery: every event application here (person create/
+  // update, list-entry field merge) is an idempotent upsert, so re-applying
+  // an event that already succeeded on a prior attempt is a no-op, not a
+  // duplicate side effect.
+  if (anyJobEventFailed) {
+    throw new Error('[Attio Webhook] One or more events failed to apply — see prior logs for detail');
+  }
+}
+
+registerProcessor('attio_webhook', processAttioWebhookJob);
+
+router.post('/attio', (req: express.Request, res: express.Response) => {
+  // Attio's webhook-URL verification handshake, if it applies here — echo
+  // X-Hook-Secret back so the subscription activates. (Also handled in
+  // crmWebhook.ts's per-list endpoint; kept defensively for this endpoint
+  // too since it's cheap and the create-webhook flow doesn't rule it out.)
+  const hookSecret = req.headers['x-hook-secret'] as string | undefined;
+  if (hookSecret) {
+    res.set('X-Hook-Secret', hookSecret);
+    return res.status(200).json({ received: true });
+  }
+
+  // Return 200 immediately — Attio retries on non-2xx or timeout (at-least-once
+  // delivery, up to 10 retries over ~3 days). All processing is fire-and-forget.
+  res.status(200).json({ received: true });
+
+  void (async () => {
+    try {
+      const rawBody = req.body as Buffer;
+      const payload: any = JSON.parse(rawBody.toString('utf8'));
+      // Real shape (live-verified, ENG-1380): { webhook_id, events: [{ event_type,
+      // id: { workspace_id, object_id, record_id, ... }, actor }] }. workspace_id
+      // lives on each individual event's `id`, not at the top level — the original
+      // stub's `event?.workspace_id` assumption never matched a real delivery.
+      const rawEvents: any[] = Array.isArray(payload?.events) ? payload.events : [payload];
+      // Real deliveries carry a handful of events at most; cap defensively so a
+      // malformed or oversized body can't fan out into an unbounded number of
+      // per-event Attio API calls and DB writes in processAttioWebhookJob.
+      const MAX_EVENTS_PER_DELIVERY = 200;
+      if (rawEvents.length > MAX_EVENTS_PER_DELIVERY) {
+        console.warn(`[Attio Webhook] Delivery carries ${rawEvents.length} events — processing only the first ${MAX_EVENTS_PER_DELIVERY}`);
+      }
+      const events = rawEvents.slice(0, MAX_EVENTS_PER_DELIVERY);
+      const workspaceId: string = events[0]?.id?.workspace_id ?? '';
+      if (!workspaceId) {
+        console.warn('[Attio Webhook] No workspace_id on delivery — ignored');
+        return;
+      }
+
+      const candidates = await getAccountsByAttioWorkspaceId(workspaceId);
+      if (candidates.length === 0) {
+        console.warn(`[Attio Webhook] No connected account found for workspace ${workspaceId}`);
+        return;
+      }
+
+      // Attio-Signature (duplicated as X-Attio-Signature for legacy support) —
+      // HMAC-SHA256 of the raw body with the matched account's own signing
+      // key. Try each candidate's key rather than committing to a single
+      // guess (same multi-tenant-collision defense as getAccountsByAttioWorkspaceId
+      // itself documents).
+      const signature = (req.headers['attio-signature'] ?? req.headers['x-attio-signature']) as string | undefined;
+      // Fail closed: the unsigned-request bypass is only allowed when
+      // NODE_ENV is explicitly 'development', mirroring this codebase's own
+      // TABLE_PREFIX convention (constants.ts) of treating anything that
+      // isn't exactly 'development' as needing production-safe behavior.
+      // The previous `isProd = NODE_ENV === 'production'` check was
+      // fail-open: an unset, staging, mistyped, or otherwise non-'production'
+      // NODE_ENV value in a real deployment let a completely unauthenticated
+      // request through, matched against the first candidate account, and
+      // processed as if legitimate.
+      const isDev = process.env.NODE_ENV === 'development';
+      let matched: { userId: string; accountId: string } | null = null;
+
+      if (signature) {
+        for (const { userId, account } of candidates) {
+          const signingKey = (account.config as any).webhook_signing_key;
+          if (signingKey && verifyAttioSignature(signingKey, rawBody, signature)) {
+            matched = { userId, accountId: account.account_id };
+            break;
+          }
+        }
+        if (!matched) {
+          console.warn(`[Attio Webhook] Signature did not verify against any connected account for workspace ${workspaceId} — request ignored`);
+          return;
+        }
+      } else if (!isDev) {
+        console.warn('[Attio Webhook] Missing Attio-Signature — request rejected (unsigned requests are only allowed when NODE_ENV=development)');
+        return;
+      } else {
+        console.warn('[Attio Webhook] No Attio-Signature header — proceeding without verification (dev only)');
+        matched = { userId: candidates[0].userId, accountId: candidates[0].account.account_id };
+      }
+
+      const dedupeKey = (req.headers['idempotency-key'] as string | undefined)
+        ?? crypto.createHash('sha256').update(rawBody).digest('hex');
+      const jobPayload: AttioJobPayload = { workspaceId, accountId: matched.accountId, userId: matched.userId, events };
+
+      const enqueueResult = await enqueueJob('attio_webhook', dedupeKey, jobPayload, { claimImmediately: true });
+      if (enqueueResult === 'duplicate') {
+        console.log(`[Attio Webhook] Duplicate delivery (${dedupeKey.slice(0, 12)}...) — already queued, skipping`);
+        return;
+      }
+
+      const stopHeartbeat = enqueueResult === 'enqueued' ? startHeartbeat('attio_webhook', dedupeKey) : () => {};
+      try {
+        await processAttioWebhookJob(jobPayload);
+        if (enqueueResult === 'enqueued') {
+          await markJobComplete('attio_webhook', dedupeKey);
+        }
+      } catch (processingError: any) {
+        if (enqueueResult === 'enqueued') {
+          await markJobFailed('attio_webhook', dedupeKey, processingError);
+        } else {
+          console.error('[Attio Webhook] Processing failed with no durable record (queue unavailable):', processingError?.message ?? processingError);
+        }
+      } finally {
+        stopHeartbeat();
+      }
+    } catch (error: any) {
+      console.error('[Attio Webhook] error:', error);
+    }
+  })();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -6,6 +6,44 @@ import { getAccountsByUserId, getAccountById } from './connectedAccountsDb';
 const _created = axios.create?.({ timeout: 15000 });
 const axiosInstance: typeof axios = (_created ?? axios) as typeof axios;
 
+// Retry-After parsing: HTTP spec allows either a delta-seconds integer or an
+// HTTP-date. Live-verified (ENG-1380, a real 429 triggered against Attio's
+// API) that Attio always sends the HTTP-date form (e.g. "Thu, 27 Aug 2026
+// 08:45:29 GMT") — unlike HubSpot's, which sends plain delta-seconds. A
+// naive parseInt() on a date string always yields NaN, silently discarding
+// Attio's actual instructed wait and falling back to the flat default every
+// time. Disambiguate on the header's shape rather than trying Date.parse()
+// first: Date.parse('0') and Date.parse('600') both return non-NaN (but
+// bogus) timestamps, so checking for a pure-digit string first is required
+// to keep delta-seconds inputs (still handled, for spec-compliance/safety)
+// from being misread as dates.
+function parseRetryAfterSeconds(headerValue: string | undefined): number {
+  if (!headerValue) return 10;
+  const trimmed = String(headerValue).trim();
+  if (/^\d+$/.test(trimmed)) return parseInt(trimmed, 10);
+  const asDate = Date.parse(trimmed);
+  if (!isNaN(asDate)) return Math.max(0, Math.ceil((asDate - Date.now()) / 1000));
+  return 10;
+}
+
+// Retry once on 429 — respect Retry-After header, default 10s. Mirrors
+// hubspotService.ts's identical interceptor.
+if (_created) {
+  _created.interceptors.response.use(
+    (res) => res,
+    async (err) => {
+      const config = err?.config as any;
+      if (err?.response?.status === 429 && config && !config.__attioRetried) {
+        config.__attioRetried = true;
+        const retryAfter = Math.min(parseRetryAfterSeconds(err.response.headers?.['retry-after']), 60);
+        await new Promise(r => setTimeout(r, retryAfter * 1000));
+        return _created.request(config);
+      }
+      throw err;
+    }
+  );
+}
+
 const ATTIO_API_BASE = 'https://api.attio.com/v2';
 
 export interface AttioPerson {
@@ -23,6 +61,13 @@ export interface AttioCompany {
   recordId: string;
   name: string;
   domainNames?: string[];
+}
+
+/** A single Attio List Entry, reshaped from the raw API response. */
+export interface AttioListEntry {
+  entryId: string;
+  personRecordId: string;
+  values: Record<string, any>;
 }
 
 // ─── Module-level account resolver ───────────────────────────────────────────
@@ -60,6 +105,12 @@ export class AttioService {
   private readonly _token: string;
   private readonly _userId?: string;
   private readonly _accountId?: string;
+  // object_id -> api_slug, lazily populated by getObjectSlug(). object/slug
+  // mappings are effectively permanent within a workspace, so a per-instance
+  // cache (this instance's lifetime — one webhook job, one request) is
+  // enough to avoid a GET /v2/objects call per event without needing a
+  // module-level cache or TTL.
+  private objectSlugCache: Map<string, string> | null = null;
 
   private constructor(token: string, userId?: string, accountId?: string) {
     this._token = token;
@@ -138,19 +189,27 @@ export class AttioService {
 
   // ─── People ───────────────────────────────────────────────────────────────
 
-  async listPeople(cursor?: string): Promise<{ people: AttioPerson[]; nextCursor?: string }> {
-    const body: any = { limit: 50 };
-    if (cursor) body.cursor = cursor;
-
+  // POST /objects/{object}/records/query uses limit/offset pagination, not
+  // cursor — confirmed against Attio's own docs (docs.attio.com/rest-api/
+  // guides/pagination and .../endpoint-reference/records/list-records, which
+  // uses this exact endpoint as its offset-pagination example). There is no
+  // next_cursor in the response; end-of-results is inferred from a
+  // short/empty page. The previous cursor-based implementation always sent
+  // no cursor param, so Attio always returned page 1, and the response never
+  // carried next_cursor — every call silently returned at most 50 people
+  // with no way to reach a second page, for any list.
+  async listPeople(offset: number = 0): Promise<{ people: AttioPerson[]; nextOffset?: number }> {
+    const limit = 50;
     const res = await axiosInstance.post(
       `${this.baseUrl}/objects/people/records/query`,
-      body,
+      { limit, offset },
       { headers: this.headers() }
     );
 
+    const people = ((res.data as any)?.data ?? []).map((r: any) => this.mapPerson(r));
     return {
-      people: ((res.data as any)?.data ?? []).map((r: any) => this.mapPerson(r)),
-      nextCursor: (res.data as any)?.next_cursor,
+      people,
+      nextOffset: people.length === limit ? offset + limit : undefined,
     };
   }
 
@@ -294,19 +353,19 @@ export class AttioService {
 
   // ─── Companies ────────────────────────────────────────────────────────────
 
-  async listCompanies(cursor?: string): Promise<{ companies: AttioCompany[]; nextCursor?: string }> {
-    const body: any = { limit: 50 };
-    if (cursor) body.cursor = cursor;
-
+  // See listPeople's comment — same endpoint family, same limit/offset contract.
+  async listCompanies(offset: number = 0): Promise<{ companies: AttioCompany[]; nextOffset?: number }> {
+    const limit = 50;
     const res = await axiosInstance.post(
       `${this.baseUrl}/objects/companies/records/query`,
-      body,
+      { limit, offset },
       { headers: this.headers() }
     );
 
+    const companies = ((res.data as any)?.data ?? []).map((r: any) => this.mapCompany(r));
     return {
-      companies: ((res.data as any)?.data ?? []).map((r: any) => this.mapCompany(r)),
-      nextCursor: (res.data as any)?.next_cursor,
+      companies,
+      nextOffset: companies.length === limit ? offset + limit : undefined,
     };
   }
 
@@ -347,11 +406,31 @@ export class AttioService {
   // Attio Lists are named collections of People or Company records.
   // Use the /v2/lists endpoint. Lists are scoped per object type (people/companies).
 
-  async getAllLists(): Promise<Array<{ id: string; name: string }>> {
+  /**
+   * Resolves an Attio object_id (a UUID, e.g. from a webhook event's
+   * `id.object_id`) to its api_slug (e.g. 'people', 'companies'). Live-caught
+   * bug (ENG-1380): webhook payloads never carry a slug directly — only this
+   * UUID — so anything trying to filter events by object type needs this
+   * lookup. Cached per-instance since the mapping is effectively permanent.
+   */
+  async getObjectSlug(objectId: string): Promise<string | null> {
+    if (!this.objectSlugCache) {
+      const res = await axiosInstance.get(`${this.baseUrl}/objects`, { headers: this.headers() });
+      this.objectSlugCache = new Map(
+        ((res.data as any)?.data ?? [])
+          .filter((o: any) => o?.id?.object_id && o?.api_slug)
+          .map((o: any) => [o.id.object_id as string, o.api_slug as string])
+      );
+    }
+    return this.objectSlugCache.get(objectId) ?? null;
+  }
+
+  async getAllLists(): Promise<Array<{ id: string; name: string; parentObject: 'people' | 'companies' | string }>> {
     const res = await axiosInstance.get(`${this.baseUrl}/lists`, { headers: this.headers() });
     return ((res.data as any)?.data ?? []).map((l: any) => ({
       id: l.id?.list_id as string,
       name: l.name as string,
+      parentObject: l.parent_object as string,
     }));
   }
 
@@ -398,8 +477,8 @@ export class AttioService {
     listId: string,
     recordId: string,
     entryValues?: Record<string, any[]>
-  ): Promise<void> {
-    await axiosInstance.post(
+  ): Promise<string | undefined> {
+    const res = await axiosInstance.post(
       `${this.baseUrl}/lists/${listId}/entries`,
       {
         data: {
@@ -410,6 +489,7 @@ export class AttioService {
       },
       { headers: this.headers() }
     );
+    return (res.data as any)?.data?.id?.entry_id;
   }
 
   // ─── List entry attributes ────────────────────────────────────────────────
@@ -493,7 +573,7 @@ export class AttioService {
     const found = existing.find(a => this.toSlug(a.api_slug) === slug);
     if (found) return found.api_slug;
 
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/people/attributes`,
       {
         data: {
@@ -514,10 +594,11 @@ export class AttioService {
 
   async findListEntry(
     listId: string,
-    personRecordId: string
+    recordId: string,
+    objectSlug: 'people' | 'companies' = 'people'
   ): Promise<string | null> {
     const res = await axiosInstance.get(
-      `${this.baseUrl}/objects/people/records/${personRecordId}/entries`,
+      `${this.baseUrl}/objects/${objectSlug}/records/${recordId}/entries`,
       { headers: this.headers() }
     );
     const entries = (res.data as any)?.data ?? [];
@@ -540,8 +621,20 @@ export class AttioService {
     );
   }
 
-  async addCompanyToList(listId: string, recordId: string): Promise<void> {
-    await axiosInstance.post(
+  async deleteListEntry(listId: string, entryId: string): Promise<void> {
+    await axiosInstance.delete(
+      `${this.baseUrl}/lists/${listId}/entries/${entryId}`,
+      { headers: this.headers() }
+    );
+  }
+
+  // No deleteList() — live-verified against Attio's REST API (ENG-1380):
+  // there is no delete-list endpoint at all (List/Create/Get/Update exist,
+  // Delete doesn't), and update-a-list's fields have no archive/is_archived
+  // option either. Deleting a list is only possible through Attio's own UI.
+
+  async addCompanyToList(listId: string, recordId: string): Promise<string | undefined> {
+    const res = await axiosInstance.post(
       `${this.baseUrl}/lists/${listId}/entries`,
       {
         data: {
@@ -552,8 +645,42 @@ export class AttioService {
       },
       { headers: this.headers() }
     );
+    return (res.data as any)?.data?.id?.entry_id;
   }
 
+  // ─── Webhooks ──────────────────────────────────────────────────────────────
+  // Attio's webhook model is per-workspace (register against this token, not
+  // an app-wide subscription list like HubSpot's) — confirmed against
+  // docs.attio.com. One create call carries every event type we want in a
+  // single `subscriptions` array; the returned `secret` is shown exactly
+  // once and must be persisted by the caller immediately.
+
+  /**
+   * Registers a webhook subscription for this workspace covering Person/
+   * Company record changes and Deal-analog (List Entry) changes — the same
+   * event scope HubSpot's webhook already covers for contacts + deals.
+   */
+  async registerWebhook(targetUrl: string): Promise<{ webhookId: string; secret: string }> {
+    const res = await axiosInstance.post(
+      `${this.baseUrl}/webhooks`,
+      {
+        data: {
+          target_url: targetUrl,
+          subscriptions: [
+            { event_type: 'record.created', filter: null },
+            { event_type: 'record.updated', filter: null },
+            { event_type: 'record.deleted', filter: null },
+            { event_type: 'list-entry.created', filter: null },
+            { event_type: 'list-entry.updated', filter: null },
+            { event_type: 'list-entry.deleted', filter: null },
+          ],
+        },
+      },
+      { headers: this.headers() }
+    );
+    const data = (res.data as any)?.data;
+    return { webhookId: data?.id?.webhook_id, secret: data?.secret };
+  }
 
   // ─── Sync helpers (used by AttioAdapter) ──────────────────────────────────
 
@@ -620,12 +747,16 @@ export class AttioService {
     return this.getRecordValues('people', recordId);
   }
 
+  async getCompanyValues(recordId: string): Promise<Record<string, any>> {
+    return this.getRecordValues('companies', recordId);
+  }
+
 
 
   // ─── Generic Records ──────────────────────────────────────────────────────
 
   async createRecord(objectSlug: string, values: Record<string, any>): Promise<string> {
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/${objectSlug}/records`,
       { data: { values } },
       { headers: this.headers() }
@@ -634,7 +765,7 @@ export class AttioService {
   }
 
   async updateRecord(objectSlug: string, recordId: string, values: Record<string, any>): Promise<void> {
-    await axios.patch(
+    await axiosInstance.patch(
       `${this.baseUrl}/objects/${objectSlug}/records/${recordId}`,
       { data: { values } },
       { headers: this.headers() }
@@ -642,7 +773,7 @@ export class AttioService {
   }
 
   async getRecordValues(objectSlug: string, recordId: string): Promise<Record<string, any>> {
-    const res = await axios.get(
+    const res = await axiosInstance.get(
       `${this.baseUrl}/objects/${objectSlug}/records/${recordId}`,
       { headers: this.headers() }
     );
@@ -650,7 +781,7 @@ export class AttioService {
   }
 
   async deleteRecord(objectSlug: string, recordId: string): Promise<void> {
-    await axios.delete(
+    await axiosInstance.delete(
       `${this.baseUrl}/objects/${objectSlug}/records/${recordId}`,
       { headers: this.headers() }
     );
@@ -661,7 +792,7 @@ export class AttioService {
     filter: Record<string, any>,
     limit: number = 50
   ): Promise<any[]> {
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/${objectSlug}/records/query`,
       { filter, limit },
       { headers: this.headers() }
@@ -672,7 +803,7 @@ export class AttioService {
 
 
   async getAllObjectAttributes(objectSlug: string): Promise<Array<{ api_slug: string; title: string; type: string; is_system_attribute: boolean; attribute_id: string }>> {
-    const res = await axios.get(
+    const res = await axiosInstance.get(
       `${this.baseUrl}/objects/${objectSlug}/attributes`,
       { headers: this.headers() }
     );
@@ -697,7 +828,7 @@ export class AttioService {
     const found = existing.find(a => this.toSlug(a.api_slug) === slug);
     if (found) return found.api_slug;
 
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/${objectSlug}/attributes`,
       {
         data: {
@@ -719,7 +850,7 @@ export class AttioService {
   // ─── Attribute Statuses ───────────────────────────────────────────────────
 
   async listAttributeStatuses(objectSlug: string, attributeSlug: string): Promise<Array<{ id: string; title: string }>> {
-    const res = await axios.get(
+    const res = await axiosInstance.get(
       `${this.baseUrl}/objects/${objectSlug}/attributes/${attributeSlug}/statuses`,
       { headers: this.headers() }
     );
@@ -736,7 +867,7 @@ export class AttioService {
     if (found) return found.title;
 
     // Create the status if it doesn't exist
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       `${this.baseUrl}/objects/${objectSlug}/attributes/${attributeSlug}/statuses`,
       {
         data: {
@@ -751,20 +882,103 @@ export class AttioService {
 
   // ─── List entries ─────────────────────────────────────────────────────────
 
+  // POST /lists/{list}/entries/query also uses limit/offset pagination, not
+  // cursor — same contract as listPeople above (confirmed via Attio's
+  // pagination docs); no next_cursor in the response, end-of-results
+  // inferred from a short/empty page.
   async listListEntries(
     listId: string,
-    cursor?: string
-  ): Promise<{ entries: any[]; nextCursor?: string }> {
-    const body: any = { limit: 50 };
-    if (cursor) body.cursor = cursor;
+    offset: number = 0
+  ): Promise<{ entries: any[]; nextOffset?: number }> {
+    const limit = 50;
     const res = await axiosInstance.post(
       `${this.baseUrl}/lists/${listId}/entries/query`,
-      body,
+      { limit, offset },
       { headers: this.headers() }
     );
+    const entries = (res.data as any).data ?? [];
     return {
-      entries: (res.data as any).data ?? [],
-      nextCursor: (res.data as any).next_cursor,
+      entries,
+      nextOffset: entries.length === limit ? offset + limit : undefined,
     };
+  }
+
+  /**
+   * Total entry count for a list. Attio's list-entries endpoint doesn't return
+   * a total in its response envelope, so this pages through with
+   * listListEntries and sums — same page-and-sum shape as
+   * businessFunnelService.fetchLeadCount for AgentWeb's own lead lists.
+   * Bounded at MAX_COUNT_PAGES (50 entries/page, so 10,000 entries tallied
+   * exactly) so an enormous or pathological list can't turn a single Emma
+   * CPL-reporting call into an unbounded API-call fan-out — `capped: true`
+   * tells the caller the real total may be higher than `count`.
+   */
+  async countListEntries(listId: string): Promise<{ count: number; capped: boolean }> {
+    const MAX_COUNT_PAGES = 200;
+    let total = 0;
+    let offset: number | undefined = 0;
+    let pages = 0;
+    let capped = false;
+    do {
+      const { entries, nextOffset } = await this.listListEntries(listId, offset);
+      total += entries.length;
+      offset = nextOffset;
+      pages++;
+      if (offset !== undefined && pages >= MAX_COUNT_PAGES) {
+        capped = true;
+        break;
+      }
+    } while (offset !== undefined);
+    return { count: total, capped };
+  }
+
+  /**
+   * Same page of list entries as listListEntries, reshaped into a typed,
+   * caller-friendly form (entryId, personRecordId, values) instead of the
+   * raw Attio response shape — keeps adapters from touching raw API shapes
+   * directly. Entries missing either id are dropped (defensive — matches
+   * findListEntry's null-safety style; shouldn't happen in practice).
+   */
+  async listListEntriesDetailed(
+    listId: string,
+    offset: number = 0
+  ): Promise<{ entries: AttioListEntry[]; nextOffset?: number }> {
+    const { entries, nextOffset } = await this.listListEntries(listId, offset);
+    const detailed = entries
+      .map((e: any) => ({
+        entryId: e?.id?.entry_id as string | undefined,
+        personRecordId: e?.parent_record_id as string | undefined,
+        values: (e?.entry_values ?? {}) as Record<string, any>,
+      }))
+      .filter((e): e is AttioListEntry => !!e.entryId && !!e.personRecordId);
+    return { entries: detailed, nextOffset };
+  }
+
+  /**
+   * Fetches one list entry directly by id (GET /v2/lists/{list}/entries/{entry_id})
+   * instead of paginating through listListEntriesDetailed to find it — the
+   * targeted read a webhook handler needs when it only has an entryId from
+   * the event payload. Requesting it scoped to `listId` doubles as a
+   * membership check: a 404 means the entry isn't in that list (wrong list,
+   * or already deleted), which the caller treats as "not found", not an error.
+   */
+  async getListEntry(listId: string, entryId: string): Promise<AttioListEntry | null> {
+    try {
+      const res = await axiosInstance.get(
+        `${this.baseUrl}/lists/${listId}/entries/${entryId}`,
+        { headers: this.headers() }
+      );
+      const e = (res.data as any)?.data;
+      const reshaped: AttioListEntry = {
+        entryId: e?.id?.entry_id,
+        personRecordId: e?.parent_record_id,
+        values: e?.entry_values ?? {},
+      };
+      if (!reshaped.entryId || !reshaped.personRecordId) return null;
+      return reshaped;
+    } catch (err: any) {
+      if (err?.response?.status === 404) return null;
+      throw err;
+    }
   }
 }
