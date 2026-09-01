@@ -4072,6 +4072,49 @@ export class AgentModeService {
             `AgentMode: Discarding ${responseMessage.tool_calls.length} tool call(s) requested during the ` +
             `forced final synthesis in session ${sessionId} — the turn's time budget is spent`
           );
+
+          // ENG-1682 follow-up: a step's deliverable can genuinely finish (e.g.
+          // create_html_file succeeds) in the very turn the time budget runs out —
+          // one tool call before the model would have marked the step completed.
+          // Discarding set_work_plan_status like every other call here leaves that
+          // step stuck "pending" in DynamoDB forever even though the work is done,
+          // which is the same "no visible end results" failure this ticket is
+          // about. Apply it directly instead of executing it through the normal
+          // loop: it's a single bounded DB write, not another LLM round trip, so it
+          // costs nothing against the reserve held back for the forced synthesis
+          // call below, and it closes the gap without reopening the loop.
+          const statusCall = responseMessage.tool_calls.find(
+            (call: any) => call.function?.name === 'set_work_plan_status'
+          );
+          if (statusCall) {
+            try {
+              const args = JSON.parse(statusCall.function.arguments || '{}');
+              if (Array.isArray(args.updates)) {
+                const statusResult = await this.setWorkPlanStatus(args.updates, sessionId);
+                if (statusResult?.success) {
+                  console.warn(
+                    `AgentMode: Applied the discarded set_work_plan_status call in session ${sessionId} ` +
+                    'despite the forced synthesis — the underlying work already finished'
+                  );
+                } else {
+                  // CodeRabbit (PR #2713): setWorkPlanStatus can reject an update (out-of-order,
+                  // missing required calls, insufficient assets, unknown step) without throwing —
+                  // logging an unconditional "Applied" here would misreport a rejected update as
+                  // a success. Report what actually happened instead.
+                  console.warn(
+                    `AgentMode: Discarded set_work_plan_status call in session ${sessionId} was rejected ` +
+                    `(${statusResult?.message || 'no message'}) — the step's status was not changed`
+                  );
+                }
+              }
+            } catch (statusError) {
+              console.error(
+                `AgentMode: Failed to apply the discarded set_work_plan_status call in session ${sessionId}:`,
+                statusError
+              );
+            }
+          }
+
           delete responseMessage.tool_calls;
         }
 
@@ -31507,6 +31550,43 @@ ${strippedHtml}`;
       const nextInputStep = workPlan.steps
         .sort((a: any, b: any) => a.stepCount - b.stepCount)
         .find((s: any) => s.status === 'pending' && s.inputRequest);
+
+      // ENG-1682: a step's own pendingWorkPlanInput is only cleared by the
+      // structured WorkPlanInputCard submission (updateSessionWorkPlanInputRequest
+      // with a null value). A user who answers the step conversationally in chat
+      // instead -- the ordinary way people talk to Emma -- never hits that path,
+      // so the now-resolved step's request stays status:'awaiting' forever. The
+      // customer portal's Details surface (the default landing view) treats any
+      // 'awaiting' input as still-active and hides the entire message list --
+      // every later step's deliverable included -- behind that stale card for
+      // the rest of the session. Clear it the moment its own step resolves, the
+      // same instant we'd otherwise replace it with the next step's request.
+      const resolvedStepCounts = new Set(
+        updatedSteps
+          .filter(s => s.status === 'completed' || s.status === 'skipped')
+          .map(s => s.stepCount),
+      );
+      const staleInputForResolvedStep = Boolean(
+        session.pendingWorkPlanInput
+          && session.pendingWorkPlanInput.status === 'awaiting'
+          && resolvedStepCounts.has(session.pendingWorkPlanInput.stepCount),
+      );
+
+      // CodeRabbit (PR #2713): bypassing failIfAwaitingExists entirely for the write
+      // below would also skip its pendingUserQuestion check, letting a NEW work-plan
+      // input land while a genuinely concurrent ask_user_question is still awaiting --
+      // two simultaneous prompts, an invalid state neither surface expects. Clear the
+      // known-stale record as its OWN guarded step first (matched by requestId, so a
+      // race that already replaced it fails closed instead of clobbering the newer
+      // one), THEN let the write below keep its full, unmodified guard -- it now
+      // correctly finds pendingWorkPlanInput cleared while still enforcing the
+      // pendingUserQuestion half of the check.
+      if (staleInputForResolvedStep) {
+        await chatbotDb.updateSessionWorkPlanInputRequest(sessionId, null, {
+          requireStillAwaiting: session.pendingWorkPlanInput!.requestId,
+        });
+      }
+
       if (nextInputStep?.inputRequest) {
         await chatbotDb.updateSessionWorkPlanInputRequest(
           sessionId,
