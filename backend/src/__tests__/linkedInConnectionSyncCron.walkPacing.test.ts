@@ -85,7 +85,11 @@ jest.mock('../services/linkedInSentInvitationsSyncService', () => ({
   syncSentInvitationsForAccount: (...a: any[]) => mockSyncSentInvitationsForAccount(...a),
 }));
 
-import { runLinkedInConnectionSync, __resetWalkPacingForTests } from '../cron/linkedInConnectionSyncCron';
+import {
+  runLinkedInConnectionSync,
+  __resetWalkPacingForTests,
+  getAllUnipileAccountIds,
+} from '../cron/linkedInConnectionSyncCron';
 
 /** The `mode` the cron asked for on each sent-invitation walk. */
 const modes = () =>
@@ -194,5 +198,31 @@ describe('full walks are paced, and only a completed one counts', () => {
     // Both full on the first pass, both incremental on the second — one account's
     // walk must not start another account's clock.
     expect(modes()).toEqual(['full', 'full', 'incremental', 'incremental']);
+  });
+});
+
+describe('getAllUnipileAccountIds — per-user resilience', () => {
+  it('resolves every well-formed user even when another user has a malformed connected_accounts value', async () => {
+    mockGetSetting.mockResolvedValue(null); // no site-wide accounts — isolate to the per-user path
+    mockScanWithFilter.mockResolvedValue([
+      { userId: 'user-good-1', connected_accounts: [{ platform: 'unipile', account_id: 'acc-good-1' }] },
+      // Malformed: connected_accounts present (passes the `if (!user.connected_accounts) continue`
+      // guard) but not an array, so `for...of` throws for this user specifically.
+      { userId: 'user-bad', connected_accounts: 'not-an-array' },
+      { userId: 'user-good-2', connected_accounts: [{ platform: 'unipile', account_id: 'acc-good-2' }] },
+    ]);
+
+    const { ids, ownerByAccountId } = await getAllUnipileAccountIds();
+
+    expect(ids.sort()).toEqual(['acc-good-1', 'acc-good-2']);
+    expect(ownerByAccountId.get('acc-good-1')).toBe('user-good-1');
+    expect(ownerByAccountId.get('acc-good-2')).toBe('user-good-2');
+  });
+
+  it('propagates a genuine scan failure rather than returning a misleadingly-empty result', async () => {
+    mockGetSetting.mockResolvedValue(null);
+    mockScanWithFilter.mockRejectedValue(new Error('DynamoDB scan failed'));
+
+    await expect(getAllUnipileAccountIds()).rejects.toThrow('DynamoDB scan failed');
   });
 });

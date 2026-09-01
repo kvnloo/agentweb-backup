@@ -124,23 +124,34 @@ export async function getAllUnipileAccountIds(): Promise<{
     }
   } catch { /* ignore */ }
 
-  // Per-user connected Unipile accounts
+  // Per-user connected Unipile accounts. The scan call itself is deliberately
+  // NOT wrapped in a try/catch — a genuine failure here (DB unreachable,
+  // throttled) must propagate (see the function-level doc comment above). But
+  // each USER's record is processed in its own try/catch: one malformed
+  // connected_accounts value (e.g. not an array) must not discard every other
+  // account already resolved in this same call — that would turn a single
+  // bad record into a total outage for every other customer's health check,
+  // which is worse than the original bug this rewrite fixed.
   const { userDb } = await import('../services/db');
   const users = await userDb.scanWithFilter('attribute_exists(connected_accounts)', {});
   for (const user of users) {
     if (!user.connected_accounts) continue;
-    for (const acct of user.connected_accounts as any[]) {
-      if (acct.platform === 'unipile') {
-        const accountId = acct.config?.unipile_account_id || acct.account_id;
-        if (accountId) {
-          ids.add(accountId);
-          // First owner wins; an account shared across users has no single owner
-          // to attribute to, and overwriting would make the choice arbitrary.
-          if (user.userId && !ownerByAccountId.has(accountId)) {
-            ownerByAccountId.set(accountId, String(user.userId));
+    try {
+      for (const acct of user.connected_accounts as any[]) {
+        if (acct.platform === 'unipile') {
+          const accountId = acct.config?.unipile_account_id || acct.account_id;
+          if (accountId) {
+            ids.add(accountId);
+            // First owner wins; an account shared across users has no single owner
+            // to attribute to, and overwriting would make the choice arbitrary.
+            if (user.userId && !ownerByAccountId.has(accountId)) {
+              ownerByAccountId.set(accountId, String(user.userId));
+            }
           }
         }
       }
+    } catch (error) {
+      console.error(`${TAG} Skipping malformed connected_accounts for user ${user.userId}:`, error);
     }
   }
 
