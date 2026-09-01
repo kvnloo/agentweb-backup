@@ -163,7 +163,24 @@ describe('fetchWithRetryAndPaging', () => {
    * at 625 rows where they were previously unbounded — silently shrinking dashboards, which is
    * the defect this file exists to prevent, introduced by the guard against it.
    */
-  it('keeps a default bound generous enough not to shrink an unlimited caller', () => {
+  it('keeps a default bound generous enough not to shrink an unlimited caller', async () => {
+    /*
+     * Driven through the DEFAULT bound rather than asserted on the constant. `expect(
+     * META_PAGING_MAX_PAGES).toBeGreaterThanOrEqual(500)` pins a number, not a behaviour: it
+     * stays green if the default argument stops being that constant, which is the way this
+     * could actually regress.
+     *
+     * 501 pages at Meta's unlimited-caller default of 25 rows a page is 12,525 rows, against the
+     * 625 a 25-page bound would have left those six dashboard reads with. What this actually
+     * catches is the plausible regression: the default quietly becoming metaService's
+     * META_LIST_MAX_PAGES (25), which pairs with an explicit limit=100 these callers do not set.
+     */
+    const served = mockPages(501);
+    const data = await fetchWithRetryAndPaging(graphUrl(0));
+
+    expect(served()).toBe(501);
+    expect(data.data).toHaveLength(501);
+    expect(data.pagingTruncated).toBeUndefined();
     expect(META_PAGING_MAX_PAGES).toBeGreaterThanOrEqual(500);
   });
 });

@@ -2409,8 +2409,29 @@ describe('AgentModeService - Google Drive methods', () => {
       const result: any = await service.searchKnowledgeBase('iceberg', 5, USER_ID);
 
       expect(fullTextAttempts).toBeGreaterThan(0);
-      // Whatever it says, it must not be a confident "nothing found".
-      expect(JSON.stringify(result)).toMatch(/incomplete|could not|not exhaustive|partial/i);
+      // Named fields, not `JSON.stringify(result)` against a loose regex — the query string
+      // itself, or any unrelated prose, could satisfy /incomplete|could not|partial/ without the
+      // read ever having been reported as incomplete.
+      expect(result.scanIncomplete).toBe(true);
+      expect(result.message).toMatch(/not confirmed exhaustive/i);
+    });
+
+    /*
+     * The other way this whole source can vanish: an exception BEFORE (or outside) the file
+     * query — getGoogleDriveClient failing, or escapeDriveQueryValue refusing a non-string
+     * query, whose throw lands in exactly this catch. It logged and continued without touching
+     * driveScanIncomplete, so a search missing an entire source reported success and no caveat.
+     */
+    it('reports an incomplete search when the whole Drive source failed', async () => {
+      mockDriveFiles.list.mockRejectedValue(makeApiError(500, 'Internal Error'));
+      const secretsManager = require('../utils/secretsManager');
+      secretsManager.getSecret = jest.fn().mockRejectedValue(new Error('Secrets Manager unavailable'));
+
+      const result: any = await service.searchKnowledgeBase('iceberg', 5, USER_ID);
+
+      expect(result.success).toBe(true);
+      expect(result.scanIncomplete).toBe(true);
+      expect(result.message).toMatch(/not confirmed exhaustive/i);
     });
 
     it('does not present Drive results as exhaustive when a sub-folder could not be scanned', async () => {

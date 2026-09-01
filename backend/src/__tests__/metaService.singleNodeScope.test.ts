@@ -173,7 +173,35 @@ describe('single-entity Meta node reads are bounded by the selected ad account',
     (Ad as unknown as jest.Mock).mockImplementation(() => ({ get }));
 
     await service.getAd(token, 'ad_9', SELECTED);
+    // The call count alone would also be 1 if ownership were never checked, so what makes this
+    // an assertion is that THAT call is the one carrying account_id: the payload read answered
+    // ownership itself rather than a second probe doing it.
     expect(get).toHaveBeenCalledTimes(1);
+    expect(get.mock.calls[0][0]).toEqual(expect.arrayContaining(['account_id', 'name']));
+  });
+
+  /*
+   * `if (adAccountId)` treated a caller that SUPPLIED an empty string as one that supplied
+   * nothing and skipped the ownership check entirely, so a scope that failed to resolve
+   * silently widened the read to any node the token can reach. getCampaign fails closed on the
+   * same input, because assertOwnedByAccount refuses a blank selected account.
+   */
+  it('AD_SET single fetch: an empty selected account fails closed rather than skipping the check', async () => {
+    const get = nodeGet(OTHER_TENANT, { id: 'as_9', name: 'Someone else’s ad set' });
+    (AdSet as unknown as jest.Mock).mockImplementation(() => ({ get }));
+
+    await expect(service.getAdSet(token, 'as_9', '')).rejects.toThrow(
+      /not available in the selected ad account/i,
+    );
+  });
+
+  it('AD single fetch: an empty selected account fails closed rather than skipping the check', async () => {
+    const get = nodeGet(OTHER_TENANT, { id: 'ad_9', name: 'Someone else’s ad' });
+    (Ad as unknown as jest.Mock).mockImplementation(() => ({ get }));
+
+    await expect(service.getAd(token, 'ad_9', '')).rejects.toThrow(
+      /not available in the selected ad account/i,
+    );
   });
 
   it('AD single fetch: an omitted account leaves existing read-back callers unchanged', async () => {
