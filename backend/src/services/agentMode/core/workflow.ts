@@ -113,6 +113,29 @@ export function findOutputParameterNameCollisions(definition: WorkflowDefinition
   return [...findGatedParameterKeys(definition)].filter((key) => outputNames.has(key));
 }
 
+/**
+ * Every gated `key` used by more than one distinct (questionKind,
+ * payloadField) pair across the definition. resolveStepParameters treats
+ * "key already present in resolvedParameters" as "already resolved,"
+ * regardless of which step's requirement put it there — if two steps
+ * declare the SAME key for two DIFFERENT questions (different questionKind
+ * and/or payloadField), the first step's answer silently satisfies the
+ * second step's gate without ever checking whether a human actually
+ * answered that second, semantically different question. A definition with
+ * this conflict is malformed and should be rejected at start time.
+ */
+export function findConflictingGatedParameterKeys(definition: WorkflowDefinition): string[] {
+  const variantsByKey = new Map<string, Set<string>>();
+  for (const step of definition.steps) {
+    for (const req of step.requiredParameters) {
+      const variants = variantsByKey.get(req.key) ?? new Set<string>();
+      variants.add(`${req.questionKind}::${req.payloadField}`);
+      variantsByKey.set(req.key, variants);
+    }
+  }
+  return [...variantsByKey.entries()].filter(([, variants]) => variants.size > 1).map(([key]) => key);
+}
+
 export type WorkflowRunStatus = 'in_progress' | 'blocked_on_parameter' | 'completed' | 'failed';
 
 /** Persisted per-attempted-step record. Absence of an entry for a step id

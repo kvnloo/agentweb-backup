@@ -24,6 +24,7 @@ import {
   collectEntityIdsFromCheckpoints,
   findGatedParameterKeys,
   findOutputParameterNameCollisions,
+  findConflictingGatedParameterKeys,
 } from './core/workflow';
 
 export async function startWorkflow(
@@ -39,6 +40,19 @@ export async function startWorkflow(
   if (collisions.length > 0) {
     throw new Error(
       `startWorkflow: workflow definition has name collision(s) between a step output and a gated parameter — a resolved parameter could silently override a checkpointed entity id: ${collisions.join(', ')}`,
+    );
+  }
+
+  // Two steps declaring the SAME gated key for two DIFFERENT questions
+  // (different questionKind and/or payloadField) would let the first step's
+  // answer silently satisfy the second step's gate — resolveStepParameters
+  // only checks "is this key already present," not "was THIS question
+  // answered." Reject at start time rather than let a later step skip its
+  // own AskUserQuestion gate.
+  const conflictingKeys = findConflictingGatedParameterKeys(definition);
+  if (conflictingKeys.length > 0) {
+    throw new Error(
+      `startWorkflow: gated parameter key(s) used with inconsistent questionKind/payloadField across steps: ${conflictingKeys.join(', ')}`,
     );
   }
 
