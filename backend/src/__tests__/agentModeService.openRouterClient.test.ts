@@ -740,17 +740,174 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
   // provider fallback" — session b32ec8af, 2026-08-26, showed that invariant
   // was wrong: a single 429 that survives OpenRouter's own provider-fallback
   // pool killed an entire session with no retry anywhere in callLLM). callLLM
-  // now retries a fully-exhausted transient failure exactly ONCE, bounded so
-  // it cannot itself compound with OpenRouter's fallback (getOpenRouterClient
-  // still pins maxRetries: 0 above — no SDK-level auto-retry).
-  it('retries a 429 that survives OpenRouter provider fallback exactly once, then gives up', async () => {
+  // retries a fully-exhausted transient failure, bounded so it cannot itself
+  // compound with OpenRouter's fallback (getOpenRouterClient still pins
+  // maxRetries: 0 above — no SDK-level auto-retry).
+  //
+  // ENG-1670: the single retry this test used to pin (2 total attempts) still
+  // wasn't enough — prod sessions on the "LinkedIn Post Factory" SCHEDULED
+  // schedule hit a 429 from bursting several tool calls back-to-back and
+  // needed the full 15-60min scheduled-run backoff to recover, because the
+  // in-call retry gave up after one 1.5s wait. Now 3 total attempts with
+  // exponential backoff -- but ONLY for taskClass: 'scheduled_background'.
+  // A live interactive turn (or any other task class) keeps the original
+  // 2-attempt/fixed-1.5s behavior: see the "does not extend retries" block
+  // below for why honoring a large Retry-After there would be a regression,
+  // not an improvement.
+  it('retries a scheduled-background 429 up to twice, then gives up', async () => {
     const service = new AgentModeService();
     const error = Object.assign(new Error('rate limited'), { status: 429 });
     const create = jest.fn().mockRejectedValue(error);
     jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
       chat: { completions: { create } },
     } as any);
+    const sleep = jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+    await expect(service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'scheduled_background' } as any,
+    )).rejects.toBe(error);
+
+    expect(create).toHaveBeenCalledTimes(3);
+    expect(sleep).toHaveBeenNthCalledWith(1, 1500);
+    expect(sleep).toHaveBeenNthCalledWith(2, 3000);
+  });
+
+  it('stops retrying as soon as a scheduled-background call succeeds', async () => {
+    const service = new AgentModeService();
+    const error = Object.assign(new Error('rate limited'), { status: 429 });
+    const create = jest.fn()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValueOnce({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
     jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+    await service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'scheduled_background' } as any,
+    );
+
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  // ENG-1670: a fixed backoff is a guess. OpenRouter documents a `retry-after`
+  // (seconds, or an HTTP-date) or proactive `retry-after-ms` response header
+  // on a 429/5xx, and the OpenAI SDK's own (disabled) retry logic already
+  // trusts it over a computed default when present and under 60s -- honoring
+  // it here means the wait is right regardless of whether the provider's
+  // actual cooldown is 1.5s or 45s, which a hardcoded value can't be. Only
+  // exercised for taskClass: 'scheduled_background' -- see below for why
+  // every other caller deliberately does NOT get this.
+  it('honors a numeric retry-after-ms header for a scheduled-background call', async () => {
+    const service = new AgentModeService();
+    const error = Object.assign(new Error('rate limited'), {
+      status: 429,
+      headers: { 'retry-after-ms': '7500' },
+    });
+    const create = jest.fn().mockRejectedValue(error);
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const sleep = jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+    await expect(service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'scheduled_background' } as any,
+    )).rejects.toBe(error);
+
+    expect(sleep).toHaveBeenNthCalledWith(1, 7500);
+    expect(sleep).toHaveBeenNthCalledWith(2, 7500);
+  });
+
+  it('honors a retry-after header expressed in seconds for a scheduled-background call', async () => {
+    const service = new AgentModeService();
+    const error = Object.assign(new Error('rate limited'), {
+      status: 429,
+      headers: { 'retry-after': '20' },
+    });
+    const create = jest.fn().mockRejectedValue(error);
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const sleep = jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+    await expect(service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'scheduled_background' } as any,
+    )).rejects.toBe(error);
+
+    expect(sleep).toHaveBeenNthCalledWith(1, 20000);
+  });
+
+  it('ignores an out-of-range retry-after header and falls back to the computed backoff (scheduled)', async () => {
+    const service = new AgentModeService();
+    // 90s exceeds the SDK's own "reasonable" bound (< 60s) -- honoring it
+    // blindly would stall the run far longer than the provider likely meant,
+    // or than a scheduled run's own turn budget can absorb.
+    const error = Object.assign(new Error('rate limited'), {
+      status: 429,
+      headers: { 'retry-after': '90' },
+    });
+    const create = jest.fn().mockRejectedValue(error);
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const sleep = jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+    await expect(service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'scheduled_background' } as any,
+    )).rejects.toBe(error);
+
+    expect(sleep).toHaveBeenNthCalledWith(1, 1500);
+    expect(sleep).toHaveBeenNthCalledWith(2, 3000);
+  });
+
+  it('falls back to the computed backoff when no retry-after header is present (scheduled)', async () => {
+    const service = new AgentModeService();
+    const error = Object.assign(new Error('rate limited'), { status: 429, headers: {} });
+    const create = jest.fn().mockRejectedValue(error);
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const sleep = jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+    await expect(service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'scheduled_background' } as any,
+    )).rejects.toBe(error);
+
+    expect(sleep).toHaveBeenNthCalledWith(1, 1500);
+    expect(sleep).toHaveBeenNthCalledWith(2, 3000);
+  });
+
+  // ENG-1670 SAFETY FIX: found during a pre-merge review that the 3-attempt /
+  // Retry-After-honoring behavior above was originally unscoped -- callLLM has
+  // no other notion of caller type, so it applied to EVERY caller, including a
+  // live interactive chat. Honoring a large Retry-After across two retries
+  // could have added up to ~2 minutes of dead air to an interactive turn that
+  // used to fail fast after ~1.5s: a regression, not an improvement, for a
+  // human staring at the screen. These pin that interactive (and any
+  // non-scheduled) caller is completely unaffected by the scheduled-only fix.
+  it('does NOT extend retries or honor Retry-After for an interactive_chat call', async () => {
+    const service = new AgentModeService();
+    const error = Object.assign(new Error('rate limited'), {
+      status: 429,
+      headers: { 'retry-after': '45' }, // a large, legitimate wait a provider might report
+    });
+    const create = jest.fn().mockRejectedValue(error);
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const sleep = jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
 
     await expect(service.callLLM(
       'gpt-5.5',
@@ -758,7 +915,56 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       { taskClass: 'interactive_chat' } as any,
     )).rejects.toBe(error);
 
+    // Original ENG-1626 behavior: exactly 2 attempts, one short fixed wait,
+    // Retry-After ignored regardless of its value.
     expect(create).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(1500);
+  });
+
+  it('does NOT extend retries when no taskClass is given at all', async () => {
+    const service = new AgentModeService();
+    const error = Object.assign(new Error('rate limited'), {
+      status: 429,
+      headers: { 'retry-after': '45' },
+    });
+    const create = jest.fn().mockRejectedValue(error);
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const sleep = jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+    await expect(service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+    )).rejects.toBe(error);
+
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(1500);
+  });
+
+  it('does NOT extend retries for a non-scheduled, non-interactive task class (e.g. mcp_api)', async () => {
+    const service = new AgentModeService();
+    const error = Object.assign(new Error('rate limited'), {
+      status: 429,
+      headers: { 'retry-after': '45' },
+    });
+    const create = jest.fn().mockRejectedValue(error);
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const sleep = jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+    await expect(service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'mcp_api' } as any,
+    )).rejects.toBe(error);
+
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(1500);
   });
 
   // 2026-08-19: was adminOnly: true on every new-roster entry (gated as

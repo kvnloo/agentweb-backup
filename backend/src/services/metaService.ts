@@ -1318,7 +1318,7 @@ export class MetaService {
       const account = new AdAccount(`act_${adAccountId}`);
       const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
       this.log(`Listing campaigns for account: ${adAccountId}`, { fields, ...params });
-      const cursor = await MetaService.withReadDeadline(() => account.getCampaigns(fields, params), 'campaign list');
+      const cursor = await MetaService.withReadDeadline(async () => account.getCampaigns(fields, params), 'campaign list');
       const { items, truncated, pagesFetched } = await this.drainCursor(
         cursor,
         options.maxPages ?? META_LIST_MAX_PAGES
@@ -2432,7 +2432,7 @@ export class MetaService {
         params.filtering = [{ field: 'campaign.id', operator: 'IN', value: [campaignId] }];
       }
       this.log(`Listing ads for UTM audit in account: ${adAccountId}`, { fields, campaignId });
-      const cursor = await MetaService.withReadDeadline(() => account.getAds(fields, params), 'UTM audit ad list');
+      const cursor = await MetaService.withReadDeadline(async () => account.getAds(fields, params), 'UTM audit ad list');
       const { items: pages, truncated, pagesFetched } = await this.drainCursor(
         cursor,
         options.maxPages ?? META_LIST_MAX_PAGES
@@ -2770,7 +2770,7 @@ export class MetaService {
       const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
       this.log(`Listing custom audiences for account: ${adAccountId}`, { fields });
       const cursor = await MetaService.withReadDeadline(
-        () => account.getCustomAudiences(fields, params),
+        async () => account.getCustomAudiences(fields, params),
         'custom audience list',
       );
       const { items, truncated, pagesFetched } = await this.drainCursor(
@@ -3174,7 +3174,7 @@ export class MetaService {
       const fields = ['id', 'name', 'last_fired_time', 'is_created_by_business'];
       const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
       this.log(`Listing pixels for account: ${adAccountId}`, { fields });
-      const cursor = await MetaService.withReadDeadline(() => account.getAdsPixels(fields, params), 'pixel list');
+      const cursor = await MetaService.withReadDeadline(async () => account.getAdsPixels(fields, params), 'pixel list');
       const { items, truncated, pagesFetched } = await this.drainCursor(
         cursor,
         options.maxPages ?? META_LIST_MAX_PAGES

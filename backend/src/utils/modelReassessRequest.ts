@@ -49,11 +49,25 @@ const NEGATION_PATTERN =
 const EXPLANATORY_QUESTION_PATTERN =
   /\b(?:what does|what is|what would|why would|how does|how would|can you explain|explain what|what happens)\b[^.!]*\?/i;
 
+/**
+ * Exported (ENG-1205) so the named-model detector in ./modelMentionRequest.ts
+ * applies the SAME two guards rather than growing a second, drifting copy of
+ * them. "Don't switch to Opus 5" and "what would switching to Opus 5 do?" are
+ * not requests, whichever detector reads them.
+ */
+export function hasNegation(messageContent: string): boolean {
+  return NEGATION_PATTERN.test(messageContent);
+}
+
+export function isExplanatoryQuestion(messageContent: string): boolean {
+  return EXPLANATORY_QUESTION_PATTERN.test(messageContent);
+}
+
 export function looksLikeModelChangeRequest(messageContent: string | null | undefined): boolean {
   if (!messageContent || typeof messageContent !== 'string') return false;
   if (!MODEL_CHANGE_REQUEST_PATTERN.test(messageContent)) return false;
-  if (NEGATION_PATTERN.test(messageContent)) return false;
-  if (EXPLANATORY_QUESTION_PATTERN.test(messageContent)) return false;
+  if (hasNegation(messageContent)) return false;
+  if (isExplanatoryQuestion(messageContent)) return false;
   return true;
 }
 
