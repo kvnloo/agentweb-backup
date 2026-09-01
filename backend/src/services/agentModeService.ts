@@ -1260,6 +1260,38 @@ function escapeDriveQueryValue(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
+/**
+ * Validate a model-supplied Drive date filter, returning the `YYYY-MM-DD` day it names.
+ *
+ * `modified_after`/`modified_before` reach `list_knowledge_base_files` as a bare
+ * `type: "string"` with no schema constraint and no validation anywhere, and were interpolated
+ * UNESCAPED into the same `q` as the parent-folder clause. Drive's `or` binds looser than `and`,
+ * so `modified_after = "2020-01-01' or name != 'x"` ORs the parent scoping away and matches
+ * everything the query can see — and the Drive client is a SHARED service account holding
+ * `drive.readonly`, so that is other tenants' file names, ids, sizes and modifiedTimes.
+ *
+ * Escaping alone would fix the injection. Validating as well is what stops the OTHER failure:
+ * a value that is merely malformed (a full ISO datetime, say) produced
+ * `'2026-04-15T10:00:00ZT00:00:00'` and an opaque Drive 400 rather than a usable error.
+ *
+ * Deliberately strict — a calendar day, which is the only shape the caller then wraps in
+ * `T00:00:00`/`T23:59:59`. Anything else is refused with the expected format named, rather than
+ * guessed at.
+ */
+function validateDriveDateFilter(value: string, label: string): string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new Error(
+      `${label} must be a calendar date in YYYY-MM-DD form (e.g. "2026-04-15"); received ${JSON.stringify(value)}.`,
+    );
+  }
+  // Rejects 2026-02-31 and friends: Date normalises them, so round-tripping is the check.
+  const parsed = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+    throw new Error(`${label} is not a real calendar date: ${JSON.stringify(value)}.`);
+  }
+  return value;
+}
+
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
   // ENG-1295 hardening: self-consistency cache for perform_data_analysis. Keyed by
@@ -22584,6 +22616,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       console.log('AgentMode: Listing knowledge base files for user:', userId, 'options:', options);
 
+      // Refuse a malformed date filter here, before any source is read, so the caller gets the
+      // expected format back instead of a per-folder Drive 400 buried in `listingFailed`.
+      try {
+        if (options?.modified_after) validateDriveDateFilter(options.modified_after, 'modified_after');
+        if (options?.modified_before) validateDriveDateFilter(options.modified_before, 'modified_before');
+      } catch (dateError: any) {
+        return { success: false, message: dateError?.message || 'Invalid date filter' };
+      }
+
       // Get user's private knowledge bases
       const userKnowledgeBaseTasks = await taskDb.getTasksWithKnowledgeBase(userId);
 
@@ -22713,11 +22754,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // Exclude folder entries themselves — previously these showed up as
               // 0-byte files instead of being descended into.
               let extraClause = `mimeType != 'application/vnd.google-apps.folder' and trashed = false`;
+              /*
+               * Escaped exactly like the `name`/`fullText` literals beside it. These two were
+               * missed when escapeDriveQueryValue was introduced, and they sit in the same `q`
+               * as the parent-folder clause that scopes this read to the caller's own folders —
+               * so an unescaped quote here reached past that scoping on a SHARED, read-all
+               * service account. Already validated to YYYY-MM-DD at the top of this method, so
+               * this is the second lock rather than the first.
+               */
               if (options?.modified_after) {
-                extraClause += ` and modifiedTime >= '${options.modified_after}T00:00:00'`;
+                extraClause += ` and modifiedTime >= '${escapeDriveQueryValue(options.modified_after)}T00:00:00'`;
               }
               if (options?.modified_before) {
-                extraClause += ` and modifiedTime <= '${options.modified_before}T23:59:59'`;
+                extraClause += ` and modifiedTime <= '${escapeDriveQueryValue(options.modified_before)}T23:59:59'`;
               }
 
               // ENG-1624: the tree can span more folders than fit in one `q` string
