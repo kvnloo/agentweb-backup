@@ -96,6 +96,8 @@ import {
   type SubscriptionFeatureId,
 } from '../services/subscriptionService';
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
+import { resetSentence } from "../utils/usageCycle";
+import { buildUsageBlockCopy } from "../utils/usageBlockCopy";
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { emmaToolRegistry } from '../emma/registry';
@@ -4639,9 +4641,19 @@ export async function runScheduledChat(
       const limitPercent = Math.round(
         blockedByCost ? (usageStatus.costPercentUsed ?? 100) : (usageStatus.percentUsed ?? 100)
       );
-      const blockMessage = usageStatus.usageMode === 'paused'
-        ? 'Scheduled chat cannot run: AI usage is paused until the next reset or additional usage is added.'
-        : `Scheduled chat cannot run: you've reached your monthly usage limit (${limitPercent}% used).`;
+      // ENG-1344: both branches used to end at the word "reset" with no date. The
+      // reset sentence is appended rather than interpolated so the percentage
+      // branch keeps its own leading clause, and so a month we cannot parse drops
+      // the sentence instead of rendering "resets on null".
+      const blockMessage = [
+        usageStatus.usageMode === 'paused'
+          ? 'Scheduled chat cannot run: AI usage is paused.'
+          : `Scheduled chat cannot run: you've reached your monthly usage limit (${limitPercent}% used).`,
+        resetSentence(usageStatus.month),
+        'Add usage or upgrade your plan to keep working before then.',
+      ]
+        .filter(Boolean)
+        .join(' ');
 
       const tokenLimitResult = {
         scheduleId: schedule.scheduleId,
@@ -7666,6 +7678,9 @@ export const agentModeController = {
 
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
+      // Composed once for every refusal path below so the three 429s cannot
+      // disagree with each other either (ENG-1344 AC6).
+      const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month });
       if (!usageStatus.allowed) {
         if (usageStatus.usagePolicyVersion) {
           modelPolicyDecision = await resolveEffectiveModelForUser({
@@ -7680,7 +7695,10 @@ export const agentModeController = {
             toStoredModelPolicyDecision(modelPolicyDecision),
           );
           return res.status(429).json({
-            error: 'AI usage is paused until your next reset or additional usage is added.',
+            // ENG-1344 AC6: one server-side producer for both the flat string and
+            // the structured copy, so no client can word this block differently.
+            error: usageBlockCopy.message,
+            usageBlock: usageBlockCopy,
             code: 'usage_paused',
             usageMode: modelPolicyDecision.usageMode,
             requestedModel: modelPolicyDecision.requestedModel,
@@ -7693,7 +7711,10 @@ export const agentModeController = {
           });
         }
         return res.status(429).json({
-          error: 'AI usage is paused until your next reset or additional usage is added.',
+          // ENG-1344 AC6: one server-side producer for both the flat string and
+          // the structured copy, so no client can word this block differently.
+          error: usageBlockCopy.message,
+          usageBlock: usageBlockCopy,
           code: 'usage_paused',
           usageMode: 'paused',
         });
@@ -7746,7 +7767,10 @@ export const agentModeController = {
           toStoredModelPolicyDecision(modelPolicyDecision),
         );
         return res.status(429).json({
-          error: 'AI usage is paused until your next reset or additional usage is added.',
+          // ENG-1344 AC6: one server-side producer for both the flat string and
+          // the structured copy, so no client can word this block differently.
+          error: usageBlockCopy.message,
+          usageBlock: usageBlockCopy,
           code: 'usage_paused',
           usageMode: 'paused',
           requestedModel: modelPolicyDecision.requestedModel,
