@@ -18,6 +18,7 @@
 
 import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from './termination';
 import { buildTurnTimeBudgetNudge } from '../../../utils/turnTimeBudget';
+import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 
 /**
  * Residue is short by nature — it is the tail of a structure the model failed to
@@ -271,6 +272,24 @@ function isDeferred(call: ExecutedToolCall): boolean {
 function isReportedFailure(call: ExecutedToolCall): boolean {
   return resultFlags(call)?.success === false;
 }
+
+/**
+ * True for an `install_skills` call that installed SOME of what was asked for and had the
+ * rest refused.
+ *
+ * That result carries `success: true` (something was installed), so every failure test above
+ * reads it as a clean install — and a partial install is exactly the shape where the ONE skill
+ * the gated tool needed is the one that was refused. Treating it as a clean success disarmed
+ * the notice on the case it is most likely to be needed for.
+ *
+ * `rejectedSkillIds` is set by `agentModeService.installSkills` precisely so this is a fact in
+ * the result rather than something inferred from prose in `message`.
+ */
+function isPartialInstall(call: ExecutedToolCall): boolean {
+  const rejected = (call.result as { rejectedSkillIds?: unknown } | null | undefined)?.rejectedSkillIds;
+  return Array.isArray(rejected) && rejected.length > 0;
+}
+
 
 /**
  * ENG-1188 root-cause fix recommendation #2: a ledger of tool NAMES and counts
@@ -684,6 +703,106 @@ export function detectFalseCompletionClaim(
  * very count the correction is stating (e.g. "only 4 of 12" next to a list that
  * includes 40 unrelated successes from earlier steps).
  */
+/**
+ * A line stating, as fact, that a capability could not run this turn — or null when every tool
+ * that was refused later succeeded.
+ *
+ * PREPENDED by the caller, and deliberately UNCONDITIONAL rather than gated on detecting a false
+ * claim in the prose. Both of those are the lessons from the live case this exists for: a
+ * delegated session where the skill gate refused `audit_ad_utm_coverage`, `install_skills` was
+ * refused by subscription, and the model then ran an unrelated AD LIST and presented a confident
+ * "UTM Tagging Audit Summary — PASS, 6/6 ads tagged" table built from it. A correction WAS
+ * produced by `buildFalseClaimCorrectionFooter` — but appended below the fabricated table, and
+ * only because that particular claim happened to carry a checkable number.
+ *
+ * So this does not try to decide whether the answer claims the tool ran. Whether a tool was
+ * refused by the gate and never afterwards succeeded is a FACT already in the ledger, needing no
+ * inference, so it cannot false-positive: it only ever states something that definitively
+ * happened. And a claim phrased in a way no detector anticipates is exactly the case a
+ * conditional guard misses, which is why this one is not conditional.
+ *
+ * Redundant when the model was already honest about it. That is the cheap direction to be wrong.
+ */
+export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]): string | null {
+  const calls = toolCalls ?? [];
+
+  /*
+   * Fires only when the model ATTEMPTED to obtain the capability and could not.
+   *
+   * Three failure modes this narrowing exists for, all found in review:
+   *
+   *  - The gate refuses ANY name not in the session's allowed set, including one the model tried
+   *    speculatively and then simply did without. Warning there puts a banner above a perfectly
+   *    correct answer, and a warning that appears when nothing is wrong is one people learn to
+   *    skip — exactly when it finally matters. If no install was attempted, the model was not
+   *    blocked from something it needed.
+   *  - An install that FAILED is not always shaped as a throw: `installSkills` NEVER throws —
+   *    every one of its paths returns `{ success: false, message }`. In today's wiring the
+   *    dispatcher's `toolResultError` downgrade does convert that into a ledger `error`, so the
+   *    throw check happens to catch it; `isReportedFailure` reads the returned shape directly
+   *    so this does not silently depend on that downgrade staying wired.
+   *  - A PARTIAL install reports `success: true` because SOMETHING installed, while the skill
+   *    the gated tool needed may be the one that was refused (`isPartialInstall`). Nothing
+   *    upstream flags this one: no error is raised, because from installSkills' point of view
+   *    the call succeeded.
+   *
+   * Note what is deliberately NOT required: that the install came AFTER the refusal. Parallel
+   * tool calls in one assistant message land in the ledger in an arbitrary order, so requiring
+   * `install > refusal` let the identical turn arm or disarm this notice depending on which of
+   * the two the model happened to emit first. Whether the model could obtain the capability is
+   * a property of the TURN, not of the ordering within it.
+   */
+  let installAttempted = false;
+  let installFailed = false;
+  let installSucceededAfter = -1;
+  calls.forEach((call, i) => {
+    if (call?.name !== 'install_skills') return;
+    installAttempted = true;
+    const threw = call?.error !== undefined && call?.error !== null;
+    if (threw || isReportedFailure(call) || isPartialInstall(call)) {
+      installFailed = true;
+    } else {
+      installSucceededAfter = i;
+    }
+  });
+
+  const succeeded = new Set<string>();
+  for (const call of calls) {
+    const name = typeof call?.name === 'string' ? call.name : '';
+    if (!name) continue;
+    const threw = call?.error !== undefined && call?.error !== null;
+    if (!threw && !isReportedFailure(call)) succeeded.add(name);
+  }
+
+  const unavailable = new Set<string>();
+  calls.forEach((call, i) => {
+    const name = typeof call?.name === 'string' ? call.name : '';
+    if (!name || call?.error === undefined || call?.error === null) return;
+    const err = call.error instanceof Error ? call.error : new Error(String(call.error));
+    if (classifyToolErrorClass(err) !== 'tool_unavailable') return;
+    // Ran successfully at some point in the turn — the capability is present.
+    if (succeeded.has(name)) return;
+    // Obtained it and chose not to re-run the tool — the model's call, not a gap it papered over.
+    if (installSucceededAfter > i) return;
+    // Never tried to obtain it: doing without a speculative tool is not a missing capability.
+    if (!installAttempted) return;
+    // Every install this turn came back clean, so nothing stopped the model from getting what
+    // it asked for. Only an install that could NOT deliver means a capability was missing.
+    if (!installFailed) return;
+    unavailable.add(name);
+  });
+
+  if (unavailable.size === 0) return null;
+  const names = [...unavailable].sort();
+  const one = names.length === 1;
+  return (
+    `⚠️ ${one ? 'This capability was' : 'These capabilities were'} not available this turn and did not run: ` +
+    `${names.map((n) => `\`${n}\``).join(', ')}. ` +
+    `Anything below that would normally come from ${one ? 'it' : 'them'} was not produced by ${one ? 'that tool' : 'those tools'}.`
+  );
+}
+
+
 export function buildFalseClaimCorrectionFooter(
   claim: FalseCompletionClaim,
   toolCalls: ExecutedToolCall[],

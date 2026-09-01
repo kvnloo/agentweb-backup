@@ -52,7 +52,7 @@ import {
   normalizeOpenRouterResponseMetadata,
   normalizeOpenRouterErrorMetadata,
 } from './agentMode/openRouterMetadata';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoAssetUrl,
@@ -3794,6 +3794,15 @@ export class AgentModeService {
       // standing down one guard silently disables the other.
       const falseClaimGuardEnabled = process.env.AGENT_FALSE_CLAIM_GUARD !== 'false';
 
+      // Kill switch for the unavailable-capability notice below — ON by default; set
+      // AGENT_UNAVAILABLE_CAPABILITY_NOTICE=false to stand it down. Its two sibling guards in
+      // the same block each have one and this did not, which is the difference between a bad
+      // banner being a config change and a bad banner being a revert-and-redeploy. It is also
+      // the guard that most needs one: it is UNCONDITIONAL, so a false positive prepends a
+      // scary warning to an otherwise correct answer on every affected turn.
+      const unavailableCapabilityNoticeEnabled =
+        process.env.AGENT_UNAVAILABLE_CAPABILITY_NOTICE !== 'false';
+
       let wasCancelled = false;
       // ENG-244: set true when the loop exits because the step budget (maxIterations)
       // was exhausted. This is the deterministic signal a long data-gathering
@@ -4451,6 +4460,31 @@ export class AgentModeService {
               if (responseMessage) responseMessage.content = content;
             }
           }
+
+          /*
+           * A capability the skill gate refused, and which never afterwards succeeded, is
+           * stated ABOVE the answer — unconditionally, not gated on detecting a false claim.
+           *
+           * The false-claim guard above already existed when a live delegated session produced
+           * a fabricated "UTM Tagging Audit Summary — PASS, 6/6 ads tagged" table after
+           * `audit_ad_utm_coverage` was gated and `install_skills` was refused by subscription.
+           * It caught that one only because the claim carried a checkable number, and it put the
+           * correction BELOW the fabricated table. Both are why this is prepended and why it
+           * does not try to decide whether the prose claims the tool ran: that a tool was
+           * refused and never succeeded is a fact in the ledger, so this cannot false-positive.
+           */
+          if (unavailableCapabilityNoticeEnabled && content) {
+            const unavailableNotice = buildUnavailableCapabilityNotice(toolCalls);
+            if (unavailableNotice) {
+              console.warn(
+                `AgentMode: a gated tool never succeeded in session ${sessionId} — prepending an ` +
+                `unavailable-capability notice so the answer cannot read as that tool's output`
+              );
+              content = `${unavailableNotice}\n\n${content}`;
+              if (responseMessage) responseMessage.content = content;
+            }
+          }
+
 
           if (requireWorkPlanDisposition) {
             const latestSession = await chatbotDb.getChatSession(sessionId, true);
