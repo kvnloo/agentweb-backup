@@ -81,7 +81,10 @@ describe('AgentModeService - List Meta Ads Campaigns', () => {
       const result = await agentModeService['listMetaAdsCampaigns']('user123');
 
       expect(result.success).toBe(true);
-      expect(result.message).toBe('Found 3 campaign(s)');
+      // A read that really did reach the end of the account is allowed to say so. The two
+      // tests at the bottom of this file pin the other half: it must not say so otherwise.
+      expect(result.message).toBe('Found 3 campaign(s) (complete list).');
+      expect(result.complete).toBe(true);
       expect(result.campaigns).toHaveLength(3);
       expect(result.totalCount).toBe(3);
 
@@ -128,7 +131,7 @@ describe('AgentModeService - List Meta Ads Campaigns', () => {
       const result = await agentModeService['listMetaAdsCampaigns']('user123');
 
       expect(result.success).toBe(true);
-      expect(result.message).toBe('Found 0 campaign(s)');
+      expect(result.message).toBe('Found 0 campaign(s) (complete list).');
       expect(result.campaigns).toHaveLength(0);
       expect(result.totalCount).toBe(0);
     });
@@ -277,6 +280,77 @@ describe('AgentModeService - List Meta Ads Campaigns', () => {
       expect(result.campaigns).toHaveLength(3);
       expect(result.totalCount).toBe(3);
       expect(callCount).toBeGreaterThan(1); // Should have made multiple calls for pagination
+    });
+
+    /*
+     * "(complete list)" is a guarantee, and it was being asserted on a read that could silently
+     * drop pages.
+     *
+     * `fetchWithRetry` RETURNS a non-ok Response once its retries are exhausted rather than
+     * throwing, so a persistent 429/403/400 on page 2 arrives as `{ error: {...} }` with no
+     * `data` and no `paging`. The paging helper's merge guard skipped it, `pagingTruncated` was
+     * never set, and the `campaignsData.error` check here only ever sees PAGE 1 — so page 1's
+     * rows came back as `Found 2 campaign(s) (complete list).`
+     */
+    it('does not call the list complete when a later page failed to read', async () => {
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ id: 'user123', adAccount: '123456789' });
+
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        if (url.includes('after=cursor123')) {
+          // Retries exhausted — fetchWithRetry hands the non-ok Response straight back.
+          return Promise.resolve({
+            ok: false,
+            status: 429,
+            json: () => Promise.resolve({ error: { message: '(#4) Application request limit reached', code: 4 } }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            data: [
+              { id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' },
+              { id: 'camp2', name: 'Campaign 2', status: 'ACTIVE', objective: 'OUTCOME_SALES' },
+            ],
+            paging: { next: 'https://graph.facebook.com/v25.0/act_123456789/campaigns?after=cursor123' },
+          }),
+        });
+      }) as jest.Mock;
+
+      const result = await agentModeService['listMetaAdsCampaigns']('user123');
+
+      // Page 1's rows are still returned — they were genuinely read.
+      expect(result.campaigns).toHaveLength(2);
+      expect(result.complete).toBe(false);
+      expect(result.hasMore).toBe(true);
+      expect(result.message).not.toContain('complete list');
+      expect(result.message).toMatch(/INCOMPLETE/);
+    });
+
+    it('says WHY the list is short when the failed page reported a Graph error', async () => {
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ id: 'user123', adAccount: '123456789' });
+
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        if (url.includes('after=cursor123')) {
+          return Promise.resolve({
+            ok: false,
+            status: 429,
+            json: () => Promise.resolve({ error: { message: '(#4) Application request limit reached', code: 4 } }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+            paging: { next: 'https://graph.facebook.com/v25.0/act_123456789/campaigns?after=cursor123' },
+          }),
+        });
+      }) as jest.Mock;
+
+      const result = await agentModeService['listMetaAdsCampaigns']('user123');
+
+      expect(result.message).toContain('Application request limit reached');
     });
   });
 });

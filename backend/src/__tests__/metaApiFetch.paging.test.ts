@@ -87,6 +87,77 @@ describe('fetchWithRetryAndPaging', () => {
   });
 
   /*
+   * `fetchWithRetry` RETURNS a non-ok Response once its retries are exhausted rather than
+   * throwing, so a persistent 429/403/400 on page 2 arrives as `{ error: {...} }` with no
+   * `data` and no `paging`. The merge guard skipped it, `delete data.paging` ran, and the
+   * caller — which can only check page 1's own `error` field — reported page 1's rows as a
+   * COMPLETE list. This is the same bad sentence as an unannounced bound, arrived at from the
+   * other direction.
+   */
+  function mockPageThenGraphError(graphError: any) {
+    let served = 0;
+    (global as any).fetch = jest.fn().mockImplementation(() => {
+      served++;
+      if (served === 1) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ data: [{ id: 'row1' }], paging: { next: graphUrl(1) } }),
+        });
+      }
+      // Retries exhausted: fetchWithRetry hands back the non-ok Response itself.
+      return Promise.resolve({ ok: false, status: 429, json: () => Promise.resolve({ error: graphError }) });
+    });
+    return () => served;
+  }
+
+  it('flags a page that came back unreadable, so page 1 cannot read as the whole list', async () => {
+    mockPageThenGraphError({ message: '(#4) Application request limit reached', code: 4 });
+    const data = await fetchWithRetryAndPaging(graphUrl(0));
+
+    expect(data.data).toHaveLength(1);
+    expect(data.pagingTruncated).toBe(true);
+  });
+
+  it('surfaces the failed page’s Graph error so a caller can say WHY the list is short', async () => {
+    mockPageThenGraphError({ message: '(#4) Application request limit reached', code: 4 });
+    const data = await fetchWithRetryAndPaging(graphUrl(0));
+
+    expect(data.pagingError?.message).toContain('Application request limit reached');
+  });
+
+  it('propagates a mid-read page failure up through every enclosing page', async () => {
+    // The failure is on page 3, so pages 1 and 2 both have to carry it — a caller only ever
+    // sees the OUTERMOST result.
+    let served = 0;
+    (global as any).fetch = jest.fn().mockImplementation(() => {
+      served++;
+      if (served <= 2) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ data: [{ id: `row${served}` }], paging: { next: graphUrl(served) } }),
+        });
+      }
+      return Promise.resolve({ ok: false, status: 500, json: () => Promise.resolve({ error: { message: 'boom' } }) });
+    });
+
+    const data = await fetchWithRetryAndPaging(graphUrl(0));
+
+    expect(data.data).toHaveLength(2);
+    expect(data.pagingTruncated).toBe(true);
+    expect(data.pagingError?.message).toBe('boom');
+  });
+
+  it('does not flag a healthy read as truncated', async () => {
+    mockPages(3);
+    const data = await fetchWithRetryAndPaging(graphUrl(0));
+
+    expect(data.pagingTruncated).toBeUndefined();
+    expect(data.pagingError).toBeUndefined();
+  });
+
+  /*
    * The default bound must stay far above what routes/meta.ts's dashboard reads need. Those six
    * calls set no `limit`, so Meta serves 25 rows a page: a 25-page bound would have capped them
    * at 625 rows where they were previously unbounded — silently shrinking dashboards, which is
