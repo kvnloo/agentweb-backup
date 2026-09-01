@@ -56,6 +56,10 @@ describe('scheduledRunAwaitsConfirmation — unattended confirmation-halt detect
     'Reply **1**, **2**, or **3** — I recommend option 3.',
     'How would you like me to proceed with the report?',
     'Which option would you prefer: the metadata table or the full export?',
+    // ENG-1256: genuine "confirm which ... you" halt — must still fire after
+    // splitting "which" out of the "confirm one of/the following/option"
+    // pattern into its own "you"-anchored pattern.
+    "Please confirm which of these you'd like me to use before I proceed.",
   ];
 
   it.each(confirmationHalts)('fires on confirmation halt: %s', (text) => {
@@ -81,6 +85,71 @@ describe('scheduledRunAwaitsConfirmation — unattended confirmation-halt detect
     'The customer chose the annual plan; renewal is confirmed. Summary below.',
     'Sent 12 replies across the 2 campaigns. Full log attached.',
     '',
+    // ENG-1256: live production repro. The mandated trailing "👉 Next Step:" line
+    // is a recommendation, not a question to the user, but its wording can still
+    // trip a keyword-shaped pattern — here "confirm ... which" from the pattern
+    // meant to catch "please confirm one of these" style human-directed asks.
+    // The deliverable above this line was already fully delivered; the run is
+    // NOT paused awaiting anyone's reply.
+    "The digest above is complete and accurate — every number, author, and quoted finding comes directly from the `get_pr_digest` result. " +
+      "👉 Next Step: Worth having someone verify click-ID capture on Every.io's lander and confirm which of the two pixels the ads are actually configured against.",
+    // Same shape, different Next Step wording — a recommendation ADDRESSED TO A
+    // THIRD PARTY ("Harsha"), not the user, that happens to contain "confirm ...
+    // before ... creat[es]" — the exact live production repro (ENG-1256 second
+    // recurrence), where "creates AW-LlmChargeEvents" a few clauses later
+    // completed the "confirm … before … creat" pattern meant for genuine
+    // confirm-before-you-build halts.
+    "Filed as #2323 and #2414 — merged and deployed. " +
+      "👉 Next Step: Ask Harsha to confirm whether #2323 and #2414 actually had his data-plane approval before merge — " +
+      "#2414 creates AW-LlmChargeEvents and ships a guarded production reset command, so an unapproved merge there has real billing blast radius.",
+    // ENG-1256: defense-in-depth. The SAME two production strings above, but as
+    // plain message content with NO "👉 Next Step:" wrapper — i.e. this asserts
+    // the AWAITING_CONFIRMATION_PATTERNS themselves were tightened (em/en-dash
+    // clause boundaries excluded from the "confirm ... before ... creat[es]"
+    // bridge; "confirm ... which" now requires a "you" anchor), not merely that
+    // the trailer-stripping regex happens to remove them. Trailer-stripping has
+    // already regressed twice (bold emphasis, first-vs-last occurrence); this
+    // guards against a false positive reappearing even if the trailer strip
+    // itself has a future gap or this wording appears in a message body.
+    "Worth having someone verify click-ID capture on Every.io's lander and confirm which of the two pixels the ads are actually configured against.",
+    "Ask Harsha to confirm whether #2323 and #2414 actually had his data-plane approval before merge — " +
+      "#2414 creates AW-LlmChargeEvents and ships a guarded production reset command, so an unapproved merge there has real billing blast radius.",
+    // ENG-1256: an earlier version of this fix only excluded the em dash
+    // character from the "confirm ... before ... creat[es]" bridge, which
+    // defeated the ONE production string that happened to use an em dash but
+    // left the underlying flaw (unbounded-distance clause bridging) intact —
+    // any other clause separator reproduces the same false positive. Proven
+    // live: swapping the em dash for ", since" still matched pre-fix.
+    "Ask Harsha to confirm whether #2323 and #2414 actually had his data-plane approval before merge, " +
+      "since #2414 creates AW-LlmChargeEvents and ships a guarded production reset command, so an unapproved merge there has real billing blast radius.",
+    "Ask Harsha to confirm whether #2323 and #2414 actually had his data-plane approval before merge " +
+      "and creates AW-LlmChargeEvents as part of the same migration.",
+    // ENG-1256: NEXT_STEP_TRAILER required the literal singular "step" and
+    // did not strip a pluralized "👉 Next Steps:" trailer AT ALL (verified: a
+    // model that pluralizes the mandated line bypasses trailer-stripping
+    // entirely, so the false-positive prose below reaches the detector
+    // completely unstripped). Combined with the comma-separated wording
+    // above, this reproduces the original bug through a second, independent
+    // route if either gap alone were still open.
+    "The digest above is complete and accurate. " +
+      "👉 Next Steps: Ask Harsha to confirm whether #2323 and #2414 actually had his data-plane approval before merge, " +
+      "since #2414 creates AW-LlmChargeEvents and ships a guarded production reset command.",
+    "The digest above is complete and accurate. " +
+      "👉 Next Steps: Worth having someone verify click-ID capture on Every.io's lander and confirm which of the two pixels the ads are actually configured against.",
+    // ENG-1256: NEXT_STEP_TRAILER required the literal colon separator and did
+    // not strip a trailer that uses a dash instead (verified: "👉 Next Step —"
+    // bypassed stripping entirely, same class of gap as the plural-drift case
+    // above). A dash-labeled recommendation about a third party confirming
+    // something before an unrelated party's action must not fire.
+    "The digest above is complete and accurate. " +
+      "👉 Next Step — Ask Harsha to confirm before he continues merging #2323 and #2414.",
+    "The digest above is complete and accurate. " +
+      "👉 Next Step – Ask Harsha to confirm before he continues merging #2323 and #2414.",
+    "The digest above is complete and accurate. " +
+      "👉 Next Step - Ask Harsha to confirm before he continues merging #2323 and #2414.",
+    // Plural drift AND dash drift together — both gaps closed by the same regex.
+    "The digest above is complete and accurate. " +
+      "👉 Next Steps — Ask Harsha to confirm before he continues merging #2323 and #2414.",
   ];
 
   it.each(cleanOrActionable)('does NOT fire on clean/actionable report: %s', (text) => {
@@ -111,5 +180,36 @@ The best-effort approach is an aggregate summary. Should I proceed with that ins
         content: "Reply 'go' to proceed with the best-effort approach.",
       })
     ).toBe(true);
+  });
+
+  // ── ENG-1256: trailer-stripping must only remove the LAST occurrence ────────
+  describe('Next Step trailer stripping only removes the LAST occurrence', () => {
+    it('does NOT delete a genuine halt that follows a quoted/echoed earlier trailer', () => {
+      const msg =
+        "Last run's 👉 Next Step: was to confirm the sender domain. " +
+        'That is done. Should I proceed with sending the campaign now? ' +
+        '👉 Next Step: Reply to confirm and I will send it.';
+      expect(scheduledRunAwaitsConfirmation(msg)).toBe(true);
+    });
+
+    it('still excludes a single mandated trailer at the end (no regression)', () => {
+      const msg =
+        'The digest is complete and delivered above. ' +
+        '👉 Next Step: Ask Harsha to confirm whether this shipped with approval.';
+      expect(scheduledRunAwaitsConfirmation(msg)).toBe(false);
+    });
+
+    it('strips the trailer even when it lacks the 👉 emoji (surrogate-pair-safe optional match)', () => {
+      // Without the /u flag, `👉?` treats the emoji's mandatory high-surrogate
+      // code unit as a required literal, so a trailer missing the emoji entirely
+      // fails to match — stripping is inert, and the trailer's own "confirm ...
+      // before ... creat[es]" wording (mirroring the live ENG-1256 repro) then
+      // falls straight into the confirmation-halt pattern below.
+      const msg =
+        'The digest is complete and delivered above. ' +
+        'Next Step: Ask Harsha to confirm whether this shipped with approval before merge — ' +
+        'it creates AW-LlmChargeEvents and ships a guarded reset command.';
+      expect(scheduledRunAwaitsConfirmation(msg)).toBe(false);
+    });
   });
 });

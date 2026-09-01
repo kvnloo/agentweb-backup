@@ -18,6 +18,7 @@ import { generateMarketingResponseWorkerService } from '../services/generateMark
 import { resolveInboundAnswer, resolveTypedTextAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { buildWorkPlanInputRequest, resolveWorkPlanInputAnswer, WorkPlanInputRequestError } from '../services/agentMode/core/workPlanInputRequest';
 import type { WorkPlanTurnDisposition } from '../services/agentMode/core/workPlanTurnDisposition';
+import { priorTurnNeedsWorkPlanDispositionRetry } from '../services/agentMode/core/workPlanTurnDisposition';
 import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
@@ -26,6 +27,8 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
+import { cronJobRegistry } from '../utils/cronJobRegistry';
+import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
 import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, classifyPublishStall } from '../utils/publishPressCircuitBreaker';
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
@@ -72,7 +75,11 @@ import {
   stripUnfoundedEntityCounts,
   reconcileFalseDataWriteFailure,
   appendConfirmedDataWriteNotice,
+  reconcileFalseArtifactFailure,
+  appendConfirmedArtifactNotice,
+  collectConfirmedArtifactUrls,
   FalseFailureLedgerEntry,
+  ConfirmedArtifactRef,
 } from '../utils/falseFailureReport';
 import { collectLeadImportTotals, describeLeadImportTotals } from '../utils/leadImportLedger';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -305,6 +312,31 @@ function toStoredModelPolicyDecision(decision: EffectiveModelPolicyDecision) {
 }
 
 /**
+ * Is this user an admin? Read lazily and never allowed to fail a request.
+ *
+ * ENG-1205: `resolveEffectiveModelForUser` passed a hardcoded `false` to
+ * `getSupportedModels`, so an admin-only model — one the picker itself offers an
+ * admin, because `getModelOptions` passes the REAL flag — was absent from the
+ * supported set at dispatch and got silently rewritten to the system default
+ * with `modelSelection: 'corrected'`. The admin picked Claude Opus 4.6 and the
+ * turn ran on the default with no error and, until portal #1030, no visible
+ * badge change either.
+ *
+ * The subject is the SESSION OWNER, not the caller: a delegated admin session
+ * (ftan acting for founders, ENG-1200) must not widen the owner's entitlement.
+ * A failed read degrades to non-admin — the pre-existing behavior exactly.
+ */
+async function isUserAdmin(userId: string): Promise<boolean> {
+  try {
+    if (typeof userDb?.getUserById !== 'function') return false;
+    return (await userDb.getUserById(userId))?.isAdmin === true;
+  } catch (adminLookupError) {
+    console.error(`AgentMode: failed to resolve admin status for ${userId}; treating as non-admin:`, adminLookupError);
+    return false;
+  }
+}
+
+/**
  * One server-owned model decision for interactive, MCP, and scheduled paths.
  * The caller's model id is only a preference; current cost state and the
  * admin-managed policy decide what can actually reach the provider.
@@ -322,7 +354,7 @@ async function resolveEffectiveModelForUser(input: {
   // Older controller unit tests intentionally use partial service doubles.
   // The runtime service always has these methods; the identity fallbacks keep
   // unrelated legacy contracts on their original full-choice behavior.
-  const supportedModelIds = typeof agentModeService.getSupportedModels === 'function'
+  let supportedModelIds = typeof agentModeService.getSupportedModels === 'function'
     ? await agentModeService.getSupportedModels(false)
     : [input.requestedModel, input.backupModel, systemDefaultModel].filter((model): model is string => Boolean(model));
   const requestedResolution = input.requestedModel
@@ -335,6 +367,24 @@ async function resolveEffectiveModelForUser(input: {
         ? agentModeService.resolveGenerationModel(input.backupModel)
         : { model: input.backupModel, fellBack: false, requestedModel: input.backupModel })
     : null;
+  // ENG-1205: widen to the admin catalog ONLY when the resolved request is
+  // missing from the non-admin set but present in the admin one — i.e. exactly
+  // when the hardcoded `false` above would have caused a silent correction.
+  // Keyed on the CANONICAL id, because that is what `selectPolicyModel` compares
+  // against `supportedModelIds`; testing the raw request would miss a legacy
+  // alias and re-open the same silent correction it is here to close. On every
+  // other turn this costs nothing: no extra read, no behavior change.
+  const canonicalRequestedModel = requestedResolution?.model || input.requestedModel;
+  if (
+    canonicalRequestedModel
+    && !supportedModelIds.includes(canonicalRequestedModel)
+    && typeof agentModeService.getSupportedModels === 'function'
+  ) {
+    const adminModelIds = await agentModeService.getSupportedModels(true);
+    if (adminModelIds.includes(canonicalRequestedModel) && await isUserAdmin(input.userId)) {
+      supportedModelIds = adminModelIds;
+    }
+  }
   const decision = selectPolicyModel({
     usageMode: usage.mode.usageMode,
     requestedModel: requestedResolution?.model || input.requestedModel,
@@ -365,6 +415,20 @@ async function resolveScheduleBackup(input: {
     : [input.requestedBackupModel, systemDefaultModel].filter((model): model is string => Boolean(model));
   const supported = new Set(supportedModelIds);
   const requested = input.requestedBackupModel?.trim();
+  // ENG-1205: same hardcoded-`false` defect as the model resolver above, on the
+  // schedule-backup path. Here it surfaces as a loud InvalidScheduledBackupModelError
+  // rather than a silent rewrite, but it still rejects a model the picker itself
+  // offered this admin. Widen only when that is what actually happened.
+  if (
+    requested
+    && !supported.has(requested)
+    && typeof agentModeService.getSupportedModels === 'function'
+  ) {
+    const adminModelIds = await agentModeService.getSupportedModels(true);
+    if (adminModelIds.includes(requested) && await isUserAdmin(input.userId)) {
+      adminModelIds.forEach((id) => supported.add(id));
+    }
+  }
 
   // ENG-1211: a backup is now only ever a user's explicit preference, and nothing
   // below the hard cap consults it. Two behaviors are therefore deleted:
@@ -805,6 +869,31 @@ export function releaseSessionGeneration(sessionId: string): void {
 }
 
 /**
+ * ENG-1189: waits for every in-flight interactive Agent Mode turn (tracked by
+ * activeSessionGenerations, held for the full turn including its tool-call
+ * loop) to finish, up to the same drain ceiling used for cron/worker
+ * shutdown. server.ts's runDrain() awaits this BEFORE closing the HTTP
+ * listener — every MCP tool self-call (mcpFetch) reaches this same process
+ * via http://localhost:${PORT}, so closing the listener first left an
+ * in-flight turn's tool calls permanently failing (not transiently) for the
+ * rest of the process's life, since server.close() stops accepting the new
+ * loopback connection each retry needs.
+ */
+export async function drainActiveSessionGenerations(
+  ceilingMs: number = DRAIN_CEILING_MS,
+  pollIntervalMs: number = DRAIN_POLL_INTERVAL_MS
+): Promise<{ drained: boolean; stuckCount: number }> {
+  const deadline = Date.now() + ceilingMs;
+  while (activeSessionGenerations.size > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+  if (activeSessionGenerations.size > 0) {
+    return { drained: false, stuckCount: activeSessionGenerations.size };
+  }
+  return { drained: true, stuckCount: 0 };
+}
+
+/**
  * ENG-1239: subset of activeSessionGenerations sessions whose lock is currently held by
  * a background media auto-continuation (scheduleAutoMediaContinuation) rather than a real
  * customer request. Before this existed, a genuine customer message that happened to
@@ -1239,6 +1328,8 @@ interface DiagnosisResult {
   message: string | null;
   /** Publish/deploy calls this run is confirmed to have completed. */
   publishLedger: FalseFailureLedgerEntry[];
+  /** ENG-1224: HTML preview URLs a confirmed create/update_html_file call produced this turn. */
+  artifactUrls: ConfirmedArtifactRef[];
 }
 
 /**
@@ -1279,6 +1370,32 @@ async function loadPublishLedger(
   }
 }
 
+/**
+ * ENG-1224: HTML preview URLs (create_html_file / update_html_file /
+ * create_html_from_template) this turn is confirmed to have produced. Same
+ * retry contract as `loadPublishLedger` — a single transient DynamoDB blip must
+ * not silently drop a link the user is relying on — but an unreadable session
+ * degrades to "nothing to show" rather than UNKNOWN: unlike the publish ledger,
+ * nothing downstream treats an empty result here as license to re-run work.
+ */
+async function loadConfirmedArtifactUrls(
+  sessionId: string,
+  turnStartMs?: number | null,
+): Promise<ConfirmedArtifactRef[]> {
+  if (typeof turnStartMs !== 'number') return [];
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const session = await chatbotDb.getChatSession(sessionId);
+      return collectConfirmedArtifactUrls(session?.messages as any, turnStartMs);
+    } catch (readError) {
+      if (attempt === 3) {
+        console.error(`loadConfirmedArtifactUrls: session ${sessionId} unreadable after 3 attempts:`, readError);
+      }
+    }
+  }
+  return [];
+}
+
 async function getDiagnosticErrorMessage(
   error: unknown,
   sessionId: string,
@@ -1301,6 +1418,12 @@ async function getDiagnosticErrorMessage(
     const importTotals = typeof turnStartMs === 'number'
       ? collectLeadImportTotals(session?.messages as any, turnStartMs)
       : null;
+    // ENG-1224: read straight off the transcript, same reasoning as importTotals —
+    // the in-loop toolCalls[] ledger (with its result.s3_url) does not survive the
+    // throw, but the persisted tool message does.
+    const artifactUrls = typeof turnStartMs === 'number'
+      ? collectConfirmedArtifactUrls(session?.messages as any, turnStartMs)
+      : [];
     const context: DiagnosisContext = {
       errorType: classifyErrorType(error),
       errorMessage: error instanceof Error ? error.message : String(error),
@@ -1336,15 +1459,19 @@ async function getDiagnosticErrorMessage(
       //      Last because both share CORRECTION_MARKER and first-writer wins; a
       //      landed publish is the more expensive thing to have re-run.
       message: message
-        ? reconcileFalseDataWriteFailure(
-            reconcileFalseFailureReport(stripUnfoundedEntityCounts(message, foundedCounts), publishLedger),
-            publishLedger,
+        ? reconcileFalseArtifactFailure(
+            reconcileFalseDataWriteFailure(
+              reconcileFalseFailureReport(stripUnfoundedEntityCounts(message, foundedCounts), publishLedger),
+              publishLedger,
+            ),
+            artifactUrls,
           )
         : null,
       publishLedger,
+      artifactUrls,
     };
   } catch {
-    return { message: null, publishLedger: [] };
+    return { message: null, publishLedger: [], artifactUrls: [] };
   }
 }
 
@@ -2617,13 +2744,34 @@ const AWAITING_CONFIRMATION_PATTERNS: RegExp[] = [
   // "Awaiting/wait for your confirmation/approval/go-ahead/sign-off/response before proceeding"
   /\b(?:await(?:ing)?|wait\s+for)\b[^\n.?!]*\b(?:confirmation|approval|sign-?off|go-?ahead|your\s+(?:go|response|reply|input|approval))\b/i,
   // "confirm to proceed" / "confirm before I continue/generate/build/send/deliver"
-  // (an explicit confirm-gate ahead of the deliverable action, not just "proceed")
-  /\bconfirm\b[^\n.?!]*\b(?:to|before)\b[^\n.?!]*\b(?:proceed|continu|generat|build|start|begin|send|creat|draft|deliver|run\b)/i,
+  // (an explicit confirm-gate ahead of the deliverable action, not just "proceed").
+  // ENG-1256: each bridge is bounded to a handful of WORDS, not an unbounded
+  // run of any character. Excluding only the em dash (an earlier version of
+  // this pattern) fixed the exact live repro string but not the underlying
+  // flaw: "confirm ... before ... <action>" bridging across an ENTIRELY
+  // separate clause is just as wrong when that clause is introduced by a
+  // comma ("... before merge, since #2414 creates ...") or any other
+  // separator — the dash was never the real signal, clause distance was. A
+  // genuine confirm-gate ("confirm before I proceed", "confirm to continue
+  // and I'll generate...") always has its gate verb within a couple of
+  // words; bounding the gap keeps those matching while rejecting a
+  // recommendation that merely mentions "confirm" and a verb from that list
+  // several clauses apart.
+  /\bconfirm\b\s+(?:[^\s.?!\n]+\s+){0,6}\b(?:to|before)\b\s+(?:[^\s.?!\n]+\s+){0,4}\b(?:proceed|continu|generat|build|start|begin|send|creat|draft|deliver|run\b)/i,
   // Numbered/lettered option prompt: "Reply 1 (…) or 2 (…)", "reply with option 2".
   // Opus emitted this exact form ("Reply 1 … or 2 …") instead of "Reply go" (ENG-369).
   /\breply\s+(?:with\s+)?(?:option\s+)?["'“]?\d\b/i,
-  // "please confirm one of these / the following / which option / your choice below"
-  /\bconfirm\b[^\n.?!]*\b(?:one of|which\b|the following|your\s+(?:choice|preference|selection)|these\b|option\b)/i,
+  // "please confirm one of these / the following / your choice below"
+  /\bconfirm\b[^\n.?!—–]*\b(?:one of|the following|your\s+(?:choice|preference|selection)|these\b|option\b)/i,
+  // "confirm which (option/approach) ... you'd like" — split out from the
+  // pattern above and scoped to require "you" in the same clause. ENG-1256:
+  // a bare "confirm ... which" (no "you" anchor) matched a finished report's
+  // "...confirm which of the two pixels the ads are actually configured
+  // against" (live repro) — a third party fact-check, not a question to the
+  // user. Requiring "you" distinguishes an actual human-directed choice
+  // ("confirm which of these you'd like") from prose that merely uses
+  // "which" to refer to something else entirely.
+  /\bconfirm\b[^\n.?!—–]*\bwhich\b[^\n.?!—–]*\byou\b/i,
   // "get/need/require/request your confirmation", "awaiting your confirmation"
   /\b(?:get|need|needs|require[sd]?|request(?:ing)?|await(?:ing)?)\s+(?:your\s+)?confirmation\b/i,
   // "need you to confirm/decide/choose/pick/select …" (asks the human to make the call)
@@ -2671,9 +2819,58 @@ function stripMarkdownEmphasis(content: string): string {
   return content.replace(/[*_`~]+/g, '').replace(/[^\S\n]+/g, ' ');
 }
 
+// ENG-1256: the system prompt (agentModeSystemPrompt.ts) MANDATES that every
+// single message — finished or not — end with "👉 Next Step: [1 recommended
+// action]". That line is a recommendation the model is addressing to whoever
+// acts on it next (often a THIRD PARTY, e.g. "Ask Harsha to confirm…", "Have
+// someone verify…"), not a question the model is asking the user to unblock
+// itself. Its wording is otherwise unconstrained prose, so it can innocently
+// contain words like "confirm" or "approval" and trip a keyword-shaped pattern
+// meant to catch the model halting for a reply (live repro: "confirm which of
+// the two pixels…" matched the "confirm one of/which/these/option" pattern).
+// A genuine mid-run halt asks its actual question in the message BODY, before
+// this trailer (see the ENG-480 scope-clarification tests), so excluding the
+// trailer from detection does not blind it to a real confirmation request.
+//
+// The mandated trailer is required to be the FINAL line of every message, but
+// live transcripts don't reliably preserve a literal newline before it (see
+// the ENG-1256 repro strings below), so this can't anchor on "^|\n". Instead
+// the trailing `(?:(?!👉?\s*next\s*steps?\s*:)[\s\S])*$` clause forbids the
+// matched suffix from containing another "next step(s):" occurrence, which
+// forces the regex engine to land on the LAST occurrence in the string (a
+// standard "match the final instance" technique for a non-global pattern).
+// Without it, a message that quotes/echoes an earlier "👉 Next Step:" line
+// before its real halt question would match at that EARLIER occurrence and
+// strip everything from there to end-of-string — silently deleting the
+// genuine halt question that follows it. The /u flag makes `👉?` optional as
+// a whole code point (👉 is a surrogate pair); without /u, only the trailing
+// low-surrogate code unit is optional and the high surrogate is a mandatory
+// literal, so a trailer without the emoji would fail to strip at all.
+// `steps?` tolerates plural drift ("👉 Next Steps:") — the mandated wording is
+// singular, but a model that pluralizes it would otherwise skip this pattern
+// entirely (verified live: bypasses stripping, so the trailer's prose reaches
+// the confirmation detector completely unstripped).
+//
+// ENG-1256: the label separator accepts a colon OR a dash (em/en/hyphen), not
+// just the mandated literal ":". "👉 Next Step — Ask Harsha to confirm..." is
+// at least as idiomatic an LLM label style as the colon the system prompt
+// specifies, and a colon-only regex left it completely unstripped (proven via
+// the same extracted-regex harness used for the dash/plural gaps above: a
+// short-bridge "confirm ... before ... continu[es]" recommendation inside a
+// "👉 Next Step — ..." trailer matched the confirmation-halt patterns exactly
+// like the colon case is designed NOT to). A bare period or no punctuation at
+// all is deliberately NOT included — those are far weaker signals that a line
+// is the boilerplate label rather than "next step" used as an ordinary noun
+// phrase in prose, and would risk stripping real message content.
+const NEXT_STEP_TRAILER = /👉?\s*next\s*steps?\s*[:\-–—]\s*(?:(?!👉?\s*next\s*steps?\s*[:\-–—])[\s\S])*$/iu;
+
+function stripNextStepTrailer(content: string): string {
+  return content.replace(NEXT_STEP_TRAILER, '');
+}
+
 export function scheduledRunAwaitsConfirmation(content: string): boolean {
   if (!content || typeof content !== 'string') return false;
-  const normalized = stripMarkdownEmphasis(content);
+  const normalized = stripMarkdownEmphasis(stripNextStepTrailer(content));
   return AWAITING_CONFIRMATION_PATTERNS.some((re) => re.test(normalized));
 }
 
@@ -2814,13 +3011,23 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
   if (!content || typeof content !== 'string') return false;
   // Fast path: the regex catches the common forms with zero LLM cost/latency.
   if (scheduledRunAwaitsConfirmation(content)) return true;
+  // ENG-1256: same exclusion as the regex path — the mandated "👉 Next Step:"
+  // trailer is USUALLY a recommendation, not a question to the user. But the
+  // system prompt's own scheduling-suggestion example (agentModeSystemPrompt.ts
+  // ~183-184) shows a genuine user-directed question CAN live entirely inside
+  // that line ("👉 Next Step: Want this to run automatically every week?...").
+  // So when stripping the trailer leaves nothing, any halt in this message can
+  // only be inside the trailer itself — judge the ORIGINAL unstripped content
+  // instead of short-circuiting to "no halt", or that whole class of halt goes
+  // permanently undetected by both the regex and this judge fallback.
+  const judgeableContent = stripNextStepTrailer(content).trim() || content;
   try {
     const llmPromise = agentModeService.callLLM(
       CONFIRMATION_JUDGE_MODEL,
       [
         { role: 'system', content: CONFIRMATION_JUDGE_SYSTEM },
         // The closing of the message is where a halt lives; cap input for cost.
-        { role: 'user', content: content.slice(-2500) },
+        { role: 'user', content: judgeableContent.slice(-2500) },
       ],
       { temperature: 0, max_completion_tokens: 3, taskClass: 'scheduled_background' }
     );
@@ -5813,6 +6020,14 @@ export async function runScheduledChat(
         const incompleteMessage = mayHavePublished
           ? null
           : zeroAssistantIncompleteMessage(error);
+        // ENG-1670: whether OpenRouter actually sent a Retry-After header for
+        // THIS occurrence — persisted so a future recurrence of this exact
+        // failure class is self-diagnosing from the durable session record,
+        // rather than needing logs that expire in 14 days (which is what made
+        // the original investigation into this failure class unable to answer
+        // the question at all).
+        const retryAfterHeaderPresent = (error as any)?.retryAfterHeaderPresent;
+        const retryAfterMs = (error as any)?.retryAfterMs;
         if (incompleteMessage) try {
           await chatbotDb.addMessageToSession(sessionId, {
             role: 'assistant',
@@ -5823,6 +6038,8 @@ export async function runScheduledChat(
               isErrorMessage: true,
               jobIncomplete: true,
               failureClass,
+              ...(retryAfterHeaderPresent !== undefined ? { retryAfterHeaderPresent } : {}),
+              ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
             },
           });
         } catch (persistError) {
@@ -5938,6 +6155,13 @@ export async function runScheduledChat(
         // Outcome settled — now the transcript can state it truthfully.
         if (sessionId) {
           try {
+            // ENG-1670: this is a SEPARATE persist site from the incompleteMessage
+            // one above (that one is forced null exactly when mayHavePublished,
+            // which is how we got here) — re-derive rather than reuse, matching
+            // this function's existing style of re-deriving classifyZeroAssistantFailure
+            // per write site instead of hoisting it across branches.
+            const retryAfterHeaderPresent = (error as any)?.retryAfterHeaderPresent;
+            const retryAfterMs = (error as any)?.retryAfterMs;
             await chatbotDb.addMessageToSession(sessionId, {
               role: 'assistant',
               content: zeroAssistantPublishedMessage(publishedActions, publishedRunDidResume, publishedRunPaused),
@@ -5947,6 +6171,8 @@ export async function runScheduledChat(
                 isErrorMessage: true,
                 jobIncomplete: true,
                 failureClass: classifyZeroAssistantFailure(error),
+                ...(retryAfterHeaderPresent !== undefined ? { retryAfterHeaderPresent } : {}),
+                ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
               },
             });
           } catch (persistError) {
@@ -6664,7 +6890,17 @@ export async function generateSessionResponse(
   // Check if this is the first user message (excluding system message)
   const userMessages = session.messages?.filter(msg => msg.role === 'user') || [];
   const isFirstMessage = userMessages.length === 0;
+  // ENG-1626: if the immediately-preceding assistant turn failed to reach a
+  // structured workplan disposition (e.g. a decision-card creation that
+  // silently failed even after the in-turn retry), re-enforce the check on
+  // THIS turn too — regardless of what the customer typed — so the retry
+  // happens automatically instead of depending on them asking for it by name
+  // (production case: the customer had to type "Please retry creating the
+  // card" verbatim before anything happened).
+  const lastMessage = session.messages?.[session.messages.length - 1];
+  const priorTurnFailedDisposition = priorTurnNeedsWorkPlanDispositionRetry(lastMessage);
   const enforceWorkPlanDisposition = requireWorkPlanDisposition
+    || priorTurnFailedDisposition
     || (Boolean(session.workPlan) && isFirstMessage);
 
   // If this is the first message, add system message with version info first
@@ -6942,8 +7178,40 @@ export async function generateSessionResponse(
   };
 }
 
+// ENG-1670: every daily/weekly/monthly/hourly schedule fires at the EXACT same UTC
+// second forever — nothing here ever nudged it. Schedule-creation UIs push users
+// toward round times (9:00:00, 14:45:00), so an unknown number of independent
+// schedules across the whole platform collide on the identical clock second, all
+// competing for one shared OpenRouter/Gemini quota (prod-confirmed: two unrelated
+// schedules, different users, both pinned to :00-second marks — 14:00:00.000Z and
+// 14:45:00.000Z exactly). A stable per-schedule offset spreads that collision across
+// a ~1-minute window.
+//
+// Deliberately capped at 0-59 (never 60-119): the caller applies this with an
+// ABSOLUTE setUTCSeconds, and a value >= 60 overflows into the minute field. That
+// overflow would get baked into the stored nextRunTime, which becomes next cycle's
+// `fromDate` — and since the "preserve time from fromDate" logic downstream can't
+// tell an overflowed minute apart from a genuine one, re-applying the same overflow
+// on top of it drifts the schedule later by another minute every single cycle,
+// forever (verified empirically before landing this — a 76s jitter walked a daily
+// schedule from 14:45 to 14:51 over 6 days with no bound). Staying under 60 means
+// the minute field is never touched, so the offset is exactly reproduced every time
+// rather than compounding.
+export function stableJitterSeconds(seedId: string): number {
+  let hash = 0;
+  for (let i = 0; i < seedId.length; i++) {
+    hash = (hash * 31 + seedId.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash) % 60; // 0-59 seconds, forward-only, never overflows into minutes
+}
+
 // Helper function to calculate next run time based on frequency
-const calculateNextRunTime = (frequency: string, fromDate: Date, frequencyIntervalDays?: number): Date => {
+export const calculateNextRunTime = (
+  frequency: string,
+  fromDate: Date,
+  frequencyIntervalDays?: number,
+  jitterSeedId?: string,
+): Date => {
   const now = new Date();
   let nextRun = new Date(fromDate);
 
@@ -7025,6 +7293,14 @@ const calculateNextRunTime = (frequency: string, fromDate: Date, frequencyInterv
       while (nextRun <= now) {
         nextRun.setUTCDate(nextRun.getUTCDate() + 1);
       }
+  }
+
+  // ABSOLUTE set, not additive — this must overwrite whatever seconds value is
+  // already on nextRun (including a jitter offset baked in from a prior cycle),
+  // not add to it, or the offset compounds by its own value every cycle instead
+  // of staying fixed (verified empirically before landing this).
+  if (jitterSeedId) {
+    nextRun.setUTCSeconds(stableJitterSeconds(jitterSeedId), 0);
   }
 
   return nextRun;
@@ -8022,20 +8298,26 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       let publishLedger: FalseFailureLedgerEntry[] = [];
+      let artifactUrls: ConfirmedArtifactRef[] = [];
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
             publishLedger = (await loadPublishLedger(sessionId, turnStartCalledFunctions)) || [];
-            // ENG-1173: same blanket "send it again" advice, same duplicate risk after
-            // a confirmed CRM write. The publish notice wins if both apply.
-            diagnosticContent = appendConfirmedDataWriteNotice(
-              appendConfirmedPublishNotice(
-                'The server restarted while processing your request. Please send your message again.',
+            artifactUrls = await loadConfirmedArtifactUrls(sessionId, turnStartMsForDiagnosis);
+            // ENG-1173/ENG-1224: same blanket "send it again" advice, same duplicate
+            // risk after a confirmed CRM write or lost link after a confirmed HTML
+            // edit. The publish notice wins if more than one applies.
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(
+                  'The server restarted while processing your request. Please send your message again.',
+                  publishLedger,
+                ),
                 publishLedger,
               ),
-              publishLedger,
+              artifactUrls,
             );
           } else {
             const userMessage = req.body?.userMessage || '';
@@ -8044,21 +8326,26 @@ export const agentModeController = {
             );
             diagnosticContent = diagnosis.message;
             publishLedger = diagnosis.publishLedger;
+            artifactUrls = diagnosis.artifactUrls;
           }
         }
 
         const errorAssistantMessage: ChatMessage = {
-          // ENG-971: the fallback carries no outcome at all, just blanket retry
-          // advice — so when the ledger confirms a publish, name it. Applied ONLY to
-          // the fixed string: a diagnosis message has already been judged on its own
-          // prose, and a truthful one must not collect a "Correction" banner.
+          // ENG-971/ENG-1224: the fallback carries no outcome at all, just blanket
+          // retry advice — so when the ledger confirms a publish, data write, or HTML
+          // edit, name it. Applied ONLY to the fixed string: a diagnosis message has
+          // already been judged on its own prose, and a truthful one must not collect
+          // a "Correction" banner.
           role: 'assistant',
-          content: diagnosticContent || appendConfirmedDataWriteNotice(
-            appendConfirmedPublishNotice(
-              'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedArtifactNotice(
+            appendConfirmedDataWriteNotice(
+              appendConfirmedPublishNotice(
+                'I encountered an error processing your request. Please try sending your message again.',
+                publishLedger,
+              ),
               publishLedger,
             ),
-            publishLedger,
+            artifactUrls,
           ),
           timestamp: new Date().toISOString(),
           metadata: {
@@ -8968,38 +9255,47 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       let publishLedger: FalseFailureLedgerEntry[] = [];
+      let artifactUrls: ConfirmedArtifactRef[] = [];
       if (!handledPartialTimeout && shareId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
             publishLedger = (await loadPublishLedger(shareId, turnStartCalledFunctions)) || [];
-            // ENG-1173: see the matching comment on the regular /generate path.
-            diagnosticContent = appendConfirmedDataWriteNotice(
-              appendConfirmedPublishNotice(
-                'The server restarted while processing your request. Please send your message again.',
+            artifactUrls = await loadConfirmedArtifactUrls(shareId, sharedTurnStartMs);
+            // ENG-1173/ENG-1224: see the matching comment on the regular /generate path.
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(
+                  'The server restarted while processing your request. Please send your message again.',
+                  publishLedger,
+                ),
                 publishLedger,
               ),
-              publishLedger,
+              artifactUrls,
             );
           } else {
             const userMessage = req.body?.userMessage || '';
             const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage, turnStartCalledFunctions, sharedTurnStartMs);
             diagnosticContent = diagnosis.message;
             publishLedger = diagnosis.publishLedger;
+            artifactUrls = diagnosis.artifactUrls;
           }
         }
 
         const errorAssistantMessage: ChatMessage = {
-          // ENG-971: see the matching comment in generateResponse — the fixed
-          // fallback gets the ledger's confirmed outcome, model prose does not.
+          // ENG-971/ENG-1224: see the matching comment in generateResponse — the
+          // fixed fallback gets the ledger's confirmed outcome, model prose does not.
           role: 'assistant',
-          content: diagnosticContent || appendConfirmedDataWriteNotice(
-            appendConfirmedPublishNotice(
-              'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedArtifactNotice(
+            appendConfirmedDataWriteNotice(
+              appendConfirmedPublishNotice(
+                'I encountered an error processing your request. Please try sending your message again.',
+                publishLedger,
+              ),
               publishLedger,
             ),
-            publishLedger,
+            artifactUrls,
           ),
           timestamp: new Date().toISOString(),
           metadata: {
@@ -10130,7 +10426,7 @@ export const agentModeController = {
         scheduledNextRunTime = providedDate.toISOString();
       } else {
         // Default behavior: calculate next run time (9 AM UTC = 1 AM PST)
-        const calculatedTime = calculateNextRunTime(scheduleFrequency, now, frequencyIntervalDays);
+        const calculatedTime = calculateNextRunTime(scheduleFrequency, now, frequencyIntervalDays, scheduleId);
         scheduledNextRunTime = calculatedTime.toISOString();
       }
 
@@ -11019,7 +11315,12 @@ export const agentModeController = {
           }
         }
       };
-      backgroundRun().catch(err => {
+      // ENG-1189: unlike its sibling runScheduledChat dispatch sites in this
+      // file, this one wasn't wrapped in trackScheduledRun — the graceful
+      // shutdown drain never waited for it, so a deploy mid-run left this
+      // self-calling run to fail against a closed listener the same way
+      // manage_scheduled_chat did.
+      trackScheduledRun(backgroundRun().catch(err => {
         console.error('AgentMode: Background test run error:', err);
         const { reportUIError } = require('../utils/errorReporter');
         reportUIError({
@@ -11032,7 +11333,7 @@ export const agentModeController = {
             'Run ID': runId,
           },
         }).catch((reportErr: Error) => console.error('errorReporter failed:', reportErr));
-      });
+      }));
 
       res.json({
         runId,
@@ -11467,7 +11768,7 @@ export const agentModeController = {
 
           // Calculate next run based on the current nextRunTime to preserve the scheduled time
           const currentNextRun = new Date(schedule.nextRunTime);
-          const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun, schedule.frequencyIntervalDays);
+          const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun, schedule.frequencyIntervalDays, schedule.scheduleId);
 
           if (scheduleVariables.length > 0 && !isVariableRequestSatisfied) {
             const requestedVariableNames = missingVariableNames.length > 0
@@ -12520,7 +12821,16 @@ export const agentModeController = {
       // Ensure attachments is always an array
       const attachmentsArray = Array.isArray(attachments) ? attachments : [];
       console.log('AgentMode verifiedGenerate: Passing attachments to runVerifiedChat:', attachmentsArray.length, attachmentsArray);
-      const result = await runVerifiedChat({
+      // ENG-1189: runVerifiedChat is also called by scheduled runs (already
+      // drained separately via scheduledRunTracker/cronJobRegistry), so this
+      // interactive call is tracked at THIS call site specifically — not
+      // inside runVerifiedChat itself, which would double-count scheduled
+      // work. Unlike /generate, this endpoint has no per-session concurrency
+      // lock to reuse (activeSessionGenerations would be wrong here: two
+      // concurrent calls for the same session would race each other's
+      // add/delete), so it's tracked via cronJobRegistry's generic in-flight
+      // tracker instead — the same one server.ts's drain already awaits.
+      const result = await cronJobRegistry.track('verifiedGenerateTurn', runVerifiedChat({
         sessionId,
         userId: user.userId,
         startingMessage: startingMessage.trim(),
@@ -12531,7 +12841,7 @@ export const agentModeController = {
         // ENG-636: interactive endpoint — the user's live session renders the
         // pendingUserQuestion card, so a park reaches a human who can answer.
         parkNotifiable: true
-      });
+      }));
 
       // If client disconnected, don't try to send response
       // The results are already saved to the session
@@ -13061,6 +13371,10 @@ export const agentModeController = {
       }
 
       const now = new Date();
+      // Generated here (rather than at the schedule-object build below) so it can
+      // seed the jitter that spreads this schedule's fire time off the exact round
+      // second every other platform-wide default-timed schedule collides on.
+      const scheduleId = uuidv4();
       let scheduledNextRunTime: string;
       if (nextRunTime) {
         const providedDate = new Date(nextRunTime);
@@ -13069,7 +13383,7 @@ export const agentModeController = {
         }
         scheduledNextRunTime = providedDate.toISOString();
       } else {
-        scheduledNextRunTime = calculateNextRunTime(frequency, now, interval).toISOString();
+        scheduledNextRunTime = calculateNextRunTime(frequency, now, interval, scheduleId).toISOString();
       }
 
       // Build normalized variable values from template variables
@@ -13094,7 +13408,6 @@ export const agentModeController = {
         ? [user.email]
         : baseEmails;
 
-      const scheduleId = uuidv4();
       const scheduleBackup = await resolveScheduleBackup({
         userId: user.userId,
         requestedBackupModel: overrideBackupModel,

@@ -3278,6 +3278,13 @@ router.get("/chat-sessions", async (req, res) => {
     );
 
     // Sync mode: batch-score sessions that need it (default + all judges)
+    let scoringSummary: {
+      scored: number;
+      skipped: number;
+      failed: number;
+      notAttempted: number;
+      timedOut: boolean;
+    } | undefined;
     // ENG-1332: coverage metadata travels with the response so a caller (e.g.
     // the Daily Satisfaction Score Report) can state its own denominator
     // honestly instead of inferring one from sessions.length.
@@ -3352,6 +3359,31 @@ router.get("/chat-sessions", async (req, res) => {
         );
       }
 
+      // ENG-929: attach each session's scoring verdict. sync=true promises to
+      // score whatever is unscored, but a scorer that failed and a session that
+      // is legitimately unscorable both used to come back as
+      // `satisfactionScore: null` — so the Daily Satisfaction Score Report
+      // silently under-sampled (four completed, expensive sessions, including
+      // the most expensive in the window, were simply missing). Reporting the
+      // outcome per session makes "we could not score this" visible.
+      const byId = new Map(sessionsWithMessages.map((s: any) => [s.sessionId, s]));
+      for (const outcome of backfill.outcomes) {
+        const session = byId.get(outcome.sessionId) as any;
+        if (!session) continue;
+        session.scoringOutcome = {
+          status: outcome.status,
+          ...(outcome.reason ? { reason: outcome.reason } : {}),
+          ...(outcome.judgeErrors ? { judgeErrors: outcome.judgeErrors } : {}),
+        };
+      }
+      scoringSummary = {
+        scored: backfill.outcomes.filter((o) => o.status === "scored").length,
+        skipped: backfill.outcomes.filter((o) => o.status === "skipped").length,
+        failed: backfill.outcomes.filter((o) => o.status === "failed").length,
+        notAttempted: backfill.outcomes.filter((o) => o.status === "not-attempted").length,
+        timedOut: backfill.timedOut,
+      };
+
       const newlyScored = inRangeSessions.filter(
         (session: any) =>
           session.satisfactionScore?.evaluatedAt && !alreadyScoredIds.has(session.sessionId)
@@ -3394,6 +3426,7 @@ router.get("/chat-sessions", async (req, res) => {
     res.json({
       sessions: nonEmptySessions,
       nextCursor,
+      ...(scoringSummary ? { scoringSummary } : {}),
       ...(scoringCoverage ? { scoringCoverage } : {}),
     });
   } catch (error) {
@@ -4694,7 +4727,11 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-ses
     const planUserId = plan.userId;
     const { generateSessionResponse } = await import('../controllers/agentModeController');
     const { io } = await import('../server');
-    generateSessionResponse(session.sessionId, initialMessage, planUserId, modelToUse, workItemAttachments.length > 0 ? workItemAttachments : undefined)
+    const { cronJobRegistry } = await import('../utils/cronJobRegistry');
+    // ENG-1189: this turn's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener.
+    cronJobRegistry.track('gtmPlanAdminAgentTurn', generateSessionResponse(session.sessionId, initialMessage, planUserId, modelToUse, workItemAttachments.length > 0 ? workItemAttachments : undefined))
       .then(() => {
         console.log(`GTM work item session ${session.sessionId}: AI response generated (admin)`);
         io.to(`user:${planUserId}`).emit("gtm-session-ready", {
