@@ -42,6 +42,18 @@ export async function startWorkflow(
     );
   }
 
+  // updateSessionWorkflowRun's failIfActiveExists guard is satisfied by
+  // `attribute_not_exists(workflowRun)`, which DynamoDB's conditional
+  // UpdateItem treats as true whether the field is merely absent on an
+  // existing item OR the whole item doesn't exist — an UpdateItem call
+  // creates the row if missing. Without this check, a bad or stale
+  // sessionId would silently upsert a near-empty ChatSession row instead
+  // of failing loud.
+  const existingSession = await chatbotDb.getChatSession(sessionId);
+  if (!existingSession) {
+    throw new Error(`startWorkflow: no session found for sessionId '${sessionId}'`);
+  }
+
   const run = buildWorkflowRunState({
     runId: uuidv4(),
     workflowId: definition.workflowId,

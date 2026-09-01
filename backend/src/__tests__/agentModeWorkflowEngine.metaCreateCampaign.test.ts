@@ -282,6 +282,24 @@ describe('ENG-397 hardening — initialParameters cannot bypass the AskUserQuest
   });
 });
 
+describe('ENG-397 hardening — startWorkflow refuses to operate on a nonexistent session', () => {
+  it('rejects a sessionId with no existing session, before writing anything', async () => {
+    // DynamoDB's conditional UpdateItem creates the item if it's missing —
+    // attribute_not_exists(workflowRun) is satisfied just as readily by "the
+    // whole session row doesn't exist" as by "it exists with no active run."
+    // Without an explicit existence check, a bad/stale sessionId would
+    // silently create a near-empty ChatSession row instead of failing loud.
+    mockGetChatSession.mockResolvedValue(null);
+    const definition = makeDefinition();
+
+    await expect(startWorkflow('session_does_not_exist', definition, INITIAL_PARAMS)).rejects.toThrow(
+      /no session found/i,
+    );
+
+    expect(mockUpdateSessionWorkflowRun).not.toHaveBeenCalled();
+  });
+});
+
 describe('ENG-397 hardening — a throwing verify() fails the step instead of leaving it unresolved', () => {
   it('catches a verify() exception and fails the step, rather than leaving the run in_progress and letting a retry re-execute (duplicate creation)', async () => {
     const throwingStep: WorkflowStepDefinition = {
