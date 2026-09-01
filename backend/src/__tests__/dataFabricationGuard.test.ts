@@ -18,20 +18,29 @@ describe('promptRisksFabricatedMetrics (ENG-1027)', () => {
     expect(promptRisksFabricatedMetrics(prompt)).toBe(true);
   });
 
-  it('does not flag a data-table prompt that already supplies concrete values', () => {
+  // ENG-1027 (round 2): live re-verification found the fix ITSELF fabricating a
+  // number — Emma wrote "progress bar indicator at 75%" straight into a
+  // generate_image prompt with no sourced progress data behind it, and it rendered
+  // exactly as asked. An earlier version of this heuristic skipped the check
+  // whenever a $/% value was already present, reasoning that meant real data had
+  // been supplied — that suppression is precisely what let this slip past
+  // undetected. The check must still fire here: a concrete-looking value already
+  // in the prompt is not proof it's real.
+  it('still flags a dashboard prompt that already contains a self-invented percentage (the "75%" regression)', () => {
+    const prompt =
+      'Card 2 (Center): Active highlighted card labeled "STAGE 2", with a glowing status pill "IN PROGRESS" ' +
+      'and progress bar indicator at 75%.';
+    expect(promptRisksFabricatedMetrics(prompt)).toBe(true);
+  });
+
+  it('flags a data-table prompt even when it already contains concrete-looking values', () => {
     const prompt = 'A data table showing Total Spend $12,450 and Conversion Rate 2.8% for this campaign.';
-    expect(promptRisksFabricatedMetrics(prompt)).toBe(false);
+    expect(promptRisksFabricatedMetrics(prompt)).toBe(true);
   });
 
   it('does not flag a prompt with no dashboard/data shape at all', () => {
     const prompt = 'A candid phone snapshot of a laptop on a kitchen table at night, warm lamp light.';
     expect(promptRisksFabricatedMetrics(prompt)).toBe(false);
-  });
-
-  it('is not tripped by unrelated digits like image dimensions', () => {
-    const prompt = 'A minimalist status tracker dashboard graphic with a metrics preview, 1080x1080 square format.';
-    // "1080x1080" has no $ or % so it must not be mistaken for a supplied real value.
-    expect(promptRisksFabricatedMetrics(prompt)).toBe(true);
   });
 
   it('handles empty/non-string input', () => {
