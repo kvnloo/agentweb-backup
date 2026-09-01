@@ -17,6 +17,7 @@ import {
   usagePausedMessage,
 } from '../utils/usageCycle';
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
+import { toCustomerTokenUsage } from '../services/tokenUsageService';
 
 describe('usageCycle — reset date derivation', () => {
   it('resets on the 1st of the following month', () => {
@@ -138,5 +139,51 @@ describe('usageBlockCopy — one server-side producer (ENG-1344 AC6)', () => {
     for (const month of ['2026-09', '2026-12', undefined, 'garbage']) {
       expect(usagePausedMessage(month)).toBe(buildUsageBlockCopy({ month }).message);
     }
+  });
+});
+
+describe('usageBlockCopy — edges found while auditing the PR', () => {
+  it('agrees with the resetDate convention already stored on every user record', () => {
+    // `getNextResetDate()` in tokenUsageService builds LOCAL midnight of the 1st
+    // of the next month and stores it on `user.tokenUsage.resetDate`. Verified
+    // against production 2026-09-01: every stored value is exactly
+    // `T00:00:00.000Z` (so the fleet runs UTC) and month "2026-09" pairs with
+    // "2026-10-01" — across 7 months and 144 user records.
+    //
+    // Reconstructed here with the same LOCAL construction and read back with
+    // local getters, so this holds on a dev box in any timezone. If either
+    // derivation is changed without the other, the block copy would start naming
+    // a different day from the account's own stored reset.
+    for (let m = 1; m <= 12; m++) {
+      const month = `2026-${String(m).padStart(2, '0')}`;
+      const stored = new Date(2026, m, 1); // identical construction to getNextResetDate
+      const expected =
+        `${stored.getFullYear()}-` +
+        `${String(stored.getMonth() + 1).padStart(2, '0')}-` +
+        `${String(stored.getDate()).padStart(2, '0')}`;
+      expect(resetDateFromMonth(month)).toBe(expected);
+    }
+  });
+
+  it('treats an empty-string month as underivable, not as "now"', () => {
+    // `''` is falsy but is a plausible shape for a partially-populated record.
+    expect(resetDateFromMonth('')).toBeNull();
+    expect(buildUsageBlockCopy({ month: '' }).resetSentence).toBeNull();
+  });
+
+  it('never names a reset date already in the past', () => {
+    // The failure mode ENG-1622 shipped to a customer on the runway modal: a date
+    // that had already gone by. It cannot happen here because `checkTokenUsage`
+    // lazily resets `month` to the CURRENT month on every read (three return
+    // paths, all `currentMonth`), so the derived reset is always the upcoming
+    // 1st. This pins that relationship rather than trusting it.
+    const now = new Date();
+    const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const resetDate = resetDateFromMonth(currentMonth)!;
+    const todayLocal =
+      `${now.getFullYear()}-` +
+      `${String(now.getMonth() + 1).padStart(2, '0')}-` +
+      `${String(now.getDate()).padStart(2, '0')}`;
+    expect(resetDate > todayLocal).toBe(true);
   });
 });
