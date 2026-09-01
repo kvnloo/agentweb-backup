@@ -434,3 +434,31 @@ describe('ENG-397 hardening — a gated parameter cannot collide with a step out
     expect(colliderStep.execute as jest.Mock).toHaveBeenCalledWith(expect.objectContaining({ campaign_id: 'camp_real' }));
   });
 });
+
+describe('ENG-397 hardening — a gated key cannot be reused for two different questions', () => {
+  it('startWorkflow rejects a definition where the same key is gated by two different questionKind/payloadField pairs', async () => {
+    wireSessionStore({});
+    const stepA: WorkflowStepDefinition = {
+      id: 'step_a',
+      inputs: [],
+      outputs: ['a_id'],
+      requiredParameters: [{ key: 'target_id', questionKind: 'workflow_kind_a', payloadField: 'target_id' }],
+      execute: jest.fn(async () => ({ a_id: 'should_not_run' })),
+      verify: jest.fn(async (): Promise<import('../services/agentMode/core/workflow').WorkflowStepVerification> => ({ verified: true, verifiedFields: {} })),
+    };
+    const stepB: WorkflowStepDefinition = {
+      id: 'step_b',
+      inputs: [],
+      outputs: ['b_id'],
+      // Same key name as stepA ('target_id'), but a DIFFERENT question —
+      // without this guard, stepA's answer would silently satisfy this gate.
+      requiredParameters: [{ key: 'target_id', questionKind: 'workflow_kind_b', payloadField: 'target_id' }],
+      execute: jest.fn(async () => ({ b_id: 'should_not_run' })),
+      verify: jest.fn(async (): Promise<import('../services/agentMode/core/workflow').WorkflowStepVerification> => ({ verified: true, verifiedFields: {} })),
+    };
+    const definition: WorkflowDefinition = { workflowId: 'conflicting_workflow', steps: [stepA, stepB] };
+
+    await expect(startWorkflow(SESSION_ID, definition)).rejects.toThrow(/inconsistent questionKind\/payloadField/i);
+    expect(mockUpdateSessionWorkflowRun).not.toHaveBeenCalled();
+  });
+});

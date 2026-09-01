@@ -28,6 +28,7 @@ import {
   collectEntityIdsFromCheckpoints,
   findGatedParameterKeys,
   findOutputParameterNameCollisions,
+  findConflictingGatedParameterKeys,
   type WorkflowDefinition,
   type WorkflowStepDefinition,
   type WorkflowRunState,
@@ -334,6 +335,46 @@ describe('findOutputParameterNameCollisions', () => {
       requiredParameters: [{ key: 'campaign_id', questionKind: 'workflow_some_kind', payloadField: 'campaign_id' }],
     });
     expect(findOutputParameterNameCollisions(makeDefinition([stepA, stepB]))).toEqual(['campaign_id']);
+  });
+});
+
+describe('findConflictingGatedParameterKeys', () => {
+  it('returns empty when the same key is always gated by the same questionKind/payloadField', () => {
+    const stepA = makeStep({
+      id: 'a',
+      requiredParameters: [{ key: 'objective', questionKind: 'workflow_meta_objective', payloadField: 'objective' }],
+    });
+    const stepB = makeStep({
+      id: 'b',
+      requiredParameters: [{ key: 'objective', questionKind: 'workflow_meta_objective', payloadField: 'objective' }],
+    });
+    expect(findConflictingGatedParameterKeys(makeDefinition([stepA, stepB]))).toEqual([]);
+  });
+
+  it('flags a key gated by two different questionKind/payloadField pairs across steps', () => {
+    const stepA = makeStep({
+      id: 'a',
+      requiredParameters: [{ key: 'target_id', questionKind: 'workflow_kind_a', payloadField: 'target_id' }],
+    });
+    const stepB = makeStep({
+      id: 'b',
+      // Same key name, DIFFERENT question — without this guard, stepA's
+      // answer would silently satisfy stepB's (different) gate.
+      requiredParameters: [{ key: 'target_id', questionKind: 'workflow_kind_b', payloadField: 'target_id' }],
+    });
+    expect(findConflictingGatedParameterKeys(makeDefinition([stepA, stepB]))).toEqual(['target_id']);
+  });
+
+  it('flags a conflict when only payloadField differs (same questionKind)', () => {
+    const stepA = makeStep({
+      id: 'a',
+      requiredParameters: [{ key: 'shared_key', questionKind: 'workflow_kind_a', payloadField: 'field_one' }],
+    });
+    const stepB = makeStep({
+      id: 'b',
+      requiredParameters: [{ key: 'shared_key', questionKind: 'workflow_kind_a', payloadField: 'field_two' }],
+    });
+    expect(findConflictingGatedParameterKeys(makeDefinition([stepA, stepB]))).toEqual(['shared_key']);
   });
 });
 
