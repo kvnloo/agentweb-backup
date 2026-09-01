@@ -1967,6 +1967,23 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     content: string,
     subject?: string
   ) {
+    const emailListForClaim = Array.isArray(toEmails) ? toEmails : [toEmails];
+    // ENG-1297: a scheduled run's automated completion nudge can re-invoke this after
+    // the notification for THIS session + recipient set has already gone out (the
+    // nudge fires because an unrelated requirement is still unmet, not because the
+    // notification failed) — the observed production outcome was a duplicate report
+    // email. Claim atomically BEFORE sending so a repeat call for the same session
+    // and recipients is a no-op instead of a second send; a different recipient set
+    // (or a different session) claims independently, so a session that legitimately
+    // notifies more than one audience is unaffected.
+    const recipientSignature = emailListForClaim.map(e => e.trim().toLowerCase()).sort().join(',');
+    const notifyClaimKey = `notify-session:${sessionId}`;
+    const claimed = await settingsService.claimSetMember(notifyClaimKey, recipientSignature);
+    if (!claimed) {
+      console.log(`Session notification to ${emailListForClaim.join(', ')} for session ${sessionId} was already sent — skipping duplicate.`);
+      return { sent: false, duplicate: true };
+    }
+
     try {
       const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -2056,9 +2073,18 @@ Sent via AgentWeb: ${customerFrontendUrl}
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       await this.sendEmailStrict(emailList, emailSubject, text, html);
       console.log(`Session notification email sent to: ${emailList.join(', ')}`);
+      return { sent: true, duplicate: false };
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending session notification email to ${emailList.join(', ')}:`, error);
+      // The primary action failed, so release the claim — a retry (nudge-driven or
+      // otherwise) must be allowed to actually send, not get silently swallowed as
+      // "already sent" for a notification that never went out.
+      try {
+        await settingsService.releaseSetMember(notifyClaimKey, recipientSignature);
+      } catch (releaseError) {
+        console.error(`Failed to release notify-session claim for session ${sessionId}:`, releaseError);
+      }
       throw error; // Let the tool surface the error to the agent
     }
   },
