@@ -68,9 +68,25 @@ export function formatResetDateLong(isoDate: string | null | undefined): string 
   if (!isoDate) return null;
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate);
   if (!m) return null;
+  const year = Number(m[1]);
   const monthNum = Number(m[2]);
   const day = Number(m[3]);
   if (monthNum < 1 || monthNum > 12 || day < 1 || day > 31) return null;
+  // A shape check is not a calendar check: `day <= 31` still admits 2026-02-31.
+  // Round-trip it through UTC purely to VALIDATE — every getter here is a UTC
+  // getter, so this stays host-timezone independent, and the returned string is
+  // still built from the parsed components rather than from the Date. Without
+  // this the backend would render "February 31, 2026"; the portal's sibling
+  // `formatDay` had the worse version of the same gap, where Date's silent
+  // normalization turned it into a plausible but WRONG day (CodeRabbit, #1134).
+  const probe = new Date(Date.UTC(year, monthNum - 1, day));
+  if (
+    probe.getUTCFullYear() !== year ||
+    probe.getUTCMonth() !== monthNum - 1 ||
+    probe.getUTCDate() !== day
+  ) {
+    return null;
+  }
   return `${MONTH_NAMES[monthNum - 1]} ${day}, ${m[1]}`;
 }
 

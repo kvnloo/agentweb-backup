@@ -187,3 +187,25 @@ describe('usageBlockCopy — edges found while auditing the PR', () => {
     expect(resetDate > todayLocal).toBe(true);
   });
 });
+
+describe('formatResetDateLong — calendar validity (CodeRabbit, portal #1134)', () => {
+  it('rejects impossible calendar days rather than rendering them', () => {
+    expect(formatResetDateLong('2026-02-31')).toBeNull();
+    expect(formatResetDateLong('2026-04-31')).toBeNull();
+    expect(formatResetDateLong('2026-06-31')).toBeNull();
+  });
+
+  it('accepts the leap day only in a leap year', () => {
+    expect(formatResetDateLong('2028-02-29')).toBe('February 29, 2028');
+    expect(formatResetDateLong('2026-02-29')).toBeNull();
+    // 2100 is NOT a leap year — divisible by 100 but not 400.
+    expect(formatResetDateLong('2100-02-29')).toBeNull();
+    expect(formatResetDateLong('2000-02-29')).toBe('February 29, 2000');
+  });
+
+  it('still accepts every real month end', () => {
+    expect(formatResetDateLong('2026-01-31')).toBe('January 31, 2026');
+    expect(formatResetDateLong('2026-04-30')).toBe('April 30, 2026');
+    expect(formatResetDateLong('2026-12-31')).toBe('December 31, 2026');
+  });
+});
