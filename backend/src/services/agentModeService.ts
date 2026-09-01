@@ -31507,6 +31507,28 @@ ${strippedHtml}`;
       const nextInputStep = workPlan.steps
         .sort((a: any, b: any) => a.stepCount - b.stepCount)
         .find((s: any) => s.status === 'pending' && s.inputRequest);
+
+      // ENG-1682: a step's own pendingWorkPlanInput is only cleared by the
+      // structured WorkPlanInputCard submission (updateSessionWorkPlanInputRequest
+      // with a null value). A user who answers the step conversationally in chat
+      // instead -- the ordinary way people talk to Emma -- never hits that path,
+      // so the now-resolved step's request stays status:'awaiting' forever. The
+      // customer portal's Details surface (the default landing view) treats any
+      // 'awaiting' input as still-active and hides the entire message list --
+      // every later step's deliverable included -- behind that stale card for
+      // the rest of the session. Clear it the moment its own step resolves, the
+      // same instant we'd otherwise replace it with the next step's request.
+      const resolvedStepCounts = new Set(
+        updatedSteps
+          .filter(s => s.status === 'completed' || s.status === 'skipped')
+          .map(s => s.stepCount),
+      );
+      const staleInputForResolvedStep = Boolean(
+        session.pendingWorkPlanInput
+          && session.pendingWorkPlanInput.status === 'awaiting'
+          && resolvedStepCounts.has(session.pendingWorkPlanInput.stepCount),
+      );
+
       if (nextInputStep?.inputRequest) {
         await chatbotDb.updateSessionWorkPlanInputRequest(
           sessionId,
@@ -31515,8 +31537,12 @@ ${strippedHtml}`;
             requestId: uuidv4(),
             stepCount: nextInputStep.stepCount,
           }),
-          { failIfAwaitingExists: true },
+          { failIfAwaitingExists: !staleInputForResolvedStep },
         );
+      } else if (staleInputForResolvedStep) {
+        await chatbotDb.updateSessionWorkPlanInputRequest(sessionId, null, {
+          requireStillAwaiting: session.pendingWorkPlanInput!.requestId,
+        });
       }
 
       // Update function counts if they were modified
