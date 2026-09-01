@@ -6622,30 +6622,44 @@ export class AgentModeService {
     /*
      * install_skills: the OUTCOME survives minimization.
      *
-     * `installSkills` never throws — every refusal path returns `{ success: false, message }`,
-     * which the dispatcher pushes through its SUCCESS path (toolDispatch.ts:1164). The default
-     * `{}` below then stripped `success`, so the ledger entry for a refused install was
-     * indistinguishable from a completed one: `{ name: 'install_skills', result: {} }`, with no
-     * `error` and no `success: false`.
+     * `installSkills` never throws — every refusal path returns `{ success: false, message }`.
+     * A HARD refusal does still reach the ledger with an `error`, because the dispatcher's
+     * downgrade (toolDispatch.ts, `toolResultError`) converts a `success: false` result into a
+     * tool failure. Verified end-to-end through executePreparedTools, not assumed.
      *
-     * `buildUnavailableCapabilityNotice` reads exactly those fields to decide whether the model
-     * was blocked from a capability it asked for, so with them stripped it read every failed
-     * install as a success and suppressed itself — the ENG-1207 trap documented below, hit a
-     * second time: the guard was inert in production while its unit tests passed, because those
-     * tests built ledger entries by hand and never crossed this function.
+     * What that downgrade cannot see is a PARTIAL install: it returns `success: true` because
+     * something installed, so no error is raised, while the one skill the gated tool needed may
+     * be exactly the one that was refused. `rejectedSkillIds` is the only fact that separates
+     * those two, and the default `{}` below stripped it — which is what
+     * `buildUnavailableCapabilityNotice` needs to tell a half-granted install from a granted
+     * one.
      *
-     * `rejectedSkillIds` is here for the same reason: a PARTIAL install reports `success: true`
-     * because something installed, and only this field says the skill the gated tool needed may
-     * have been the one refused. Ids and a short message, never a payload.
+     * `success`/`message` ride along so the ledger entry is self-describing rather than
+     * depending on the downgrade staying wired the way it is today. Ids and a short message,
+     * never a payload.
      */
     if (toolName === 'install_skills') {
-      const r = (result && typeof result === 'object' ? result : {}) as Record<string, any>;
+      // Some registries hand results back wrapped as a JSON string in `content` (see the
+      // branches above). Parse it the same way, so the outcome is read from wherever it is.
+      let actualResult = result;
+      if (result?.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error('AgentMode: Failed to parse install_skills result.content as JSON:', e);
+        }
+      }
+      const a = (actualResult && typeof actualResult === 'object' ? actualResult : {}) as Record<string, any>;
       return {
-        success: r.success === true,
-        ...(r.message !== undefined ? { message: r.message } : {}),
-        ...(Array.isArray(r.installedSkills) ? { installedSkills: r.installedSkills } : {}),
-        ...(Array.isArray(r.rejectedSkillIds) && r.rejectedSkillIds.length > 0
-          ? { rejectedSkillIds: r.rejectedSkillIds }
+        // `success` only when the result actually carries it. Defaulting a missing flag to
+        // false would let an unrecognised shape read as a FAILED install, and this feeds an
+        // unconditional warning banner — putting one above a correct answer is the expensive
+        // direction to be wrong here.
+        ...(a.success !== undefined ? { success: a.success === true } : {}),
+        ...(a.message !== undefined ? { message: a.message } : {}),
+        ...(Array.isArray(a.installedSkills) ? { installedSkills: a.installedSkills } : {}),
+        ...(Array.isArray(a.rejectedSkillIds) && a.rejectedSkillIds.length > 0
+          ? { rejectedSkillIds: a.rejectedSkillIds }
           : {}),
       };
     }

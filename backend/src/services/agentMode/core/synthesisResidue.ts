@@ -709,14 +709,14 @@ export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]):
    *    skip — exactly when it finally matters. If no install was attempted, the model was not
    *    blocked from something it needed.
    *  - An install that FAILED is not always shaped as a throw: `installSkills` NEVER throws —
-   *    every one of its paths returns `{ success: false, message }` with no `error` key at all.
-   *    Keying "the install worked" off a missing `error` therefore read a failed install as a
-   *    success and disarmed this notice on precisely the live incident it was written for.
-   *    `isReportedFailure` is the existing helper for that shape, and it only works because
-   *    `extractMinimalToolResult` now keeps `success` on an install_skills ledger entry — the
-   *    default `{}` used to strip exactly the field this reads.
+   *    every one of its paths returns `{ success: false, message }`. In today's wiring the
+   *    dispatcher's `toolResultError` downgrade does convert that into a ledger `error`, so the
+   *    throw check happens to catch it; `isReportedFailure` reads the returned shape directly
+   *    so this does not silently depend on that downgrade staying wired.
    *  - A PARTIAL install reports `success: true` because SOMETHING installed, while the skill
-   *    the gated tool needed may be the one that was refused (`isPartialInstall`).
+   *    the gated tool needed may be the one that was refused (`isPartialInstall`). Nothing
+   *    upstream flags this one: no error is raised, because from installSkills' point of view
+   *    the call succeeded.
    *
    * Note what is deliberately NOT required: that the install came AFTER the refusal. Parallel
    * tool calls in one assistant message land in the ledger in an arbitrary order, so requiring
