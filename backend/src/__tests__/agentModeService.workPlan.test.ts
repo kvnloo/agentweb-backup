@@ -499,6 +499,143 @@ describe('AgentModeService - Work Plan', () => {
       );
     });
 
+    // ENG-1682 (prod session f771b626-…): a step's own pendingWorkPlanInput is only
+    // cleared by the structured WorkPlanInputCard submission. A user who answers the
+    // step conversationally in chat instead never hits that path, so the stale
+    // "awaiting" request stuck around for the rest of the session — permanently
+    // hiding the customer portal's Details surface (its default landing view) behind
+    // an already-answered card, since that surface treats any 'awaiting' input as
+    // still-active. setWorkPlanStatus must clear (or replace) the request the moment
+    // its own step resolves, regardless of how the step got answered.
+    describe('pendingWorkPlanInput cleanup on step resolution', () => {
+      const inputRequestFor = (stepCount: number, title: string) => ({
+        title,
+        prompt: `Describe ${title}`,
+        fields: [{ id: 'value', label: title, type: 'text' as const, required: true }],
+      });
+
+      it('clears a stale awaiting input once its own step resolves and no later step needs input', async () => {
+        const freshWorkPlan = {
+          title: 'Project Plan',
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'pending' as const, inputRequest: inputRequestFor(1, 'Target customer') },
+            { stepCount: 2, title: 'Step 2', status: 'pending' as const },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T09:00:00.000Z',
+        };
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: freshWorkPlan,
+          pendingWorkPlanInput: {
+            requestId: 'req-step-1',
+            stepCount: 1,
+            title: 'Target customer',
+            prompt: 'Describe Target customer',
+            fields: [{ id: 'value', label: 'Target customer', type: 'text' }],
+            status: 'awaiting',
+            createdAt: '2025-01-15T09:00:00.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed', notes: 'User answered in chat' }],
+          mockSessionId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenCalledWith(
+          mockSessionId,
+          null,
+          { requireStillAwaiting: 'req-step-1' },
+        );
+      });
+
+      it('bypasses the failIfAwaitingExists guard when replacing a stale input with the next step\'s', async () => {
+        const freshWorkPlan = {
+          title: 'Project Plan',
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'pending' as const, inputRequest: inputRequestFor(1, 'Target customer') },
+            { stepCount: 2, title: 'Step 2', status: 'pending' as const, inputRequest: inputRequestFor(2, 'Target subreddits') },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T09:00:00.000Z',
+        };
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: freshWorkPlan,
+          pendingWorkPlanInput: {
+            requestId: 'req-step-1',
+            stepCount: 1,
+            title: 'Target customer',
+            prompt: 'Describe Target customer',
+            fields: [{ id: 'value', label: 'Target customer', type: 'text' }],
+            status: 'awaiting',
+            createdAt: '2025-01-15T09:00:00.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed', notes: 'User answered in chat' }],
+          mockSessionId,
+        );
+
+        expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({ stepCount: 2, title: 'Target subreddits' }),
+          { failIfAwaitingExists: false },
+        );
+      });
+
+      it('leaves an unrelated still-open awaiting input untouched', async () => {
+        const freshWorkPlan = {
+          title: 'Project Plan',
+          steps: [
+            { stepCount: 1, title: 'Step 1', status: 'pending' as const },
+            { stepCount: 2, title: 'Step 2', status: 'pending' as const },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T09:00:00.000Z',
+        };
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: freshWorkPlan,
+          // Belongs to step 2, which is NOT being resolved by this call.
+          pendingWorkPlanInput: {
+            requestId: 'req-step-2',
+            stepCount: 2,
+            title: 'Something else',
+            prompt: 'Describe something else',
+            fields: [{ id: 'value', label: 'Something else', type: 'text' }],
+            status: 'awaiting',
+            createdAt: '2025-01-15T09:00:00.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed', notes: 'Done' }],
+          mockSessionId,
+        );
+
+        expect(chatbotDb.updateSessionWorkPlanInputRequest).not.toHaveBeenCalled();
+      });
+    });
+
     // Asset-count completion gate (xCures incident, prod session 7c8ff5b2-…): a step
     // declaring expectedAssetCount may not be completed until that many media assets
     // have actually been produced this session (counted from "Image generated:" markers).
