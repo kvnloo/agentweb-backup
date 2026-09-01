@@ -61,10 +61,10 @@ jest.mock('../services/dripSequenceDb', () => ({
 }));
 
 const mockFindLeadsByLinkedin = jest.fn().mockResolvedValue([]);
-const mockGetAllUsers = jest.fn().mockResolvedValue([]);
+const mockScanWithFilter = jest.fn().mockResolvedValue([]);
 jest.mock('../services/db', () => ({
   crmDb: { findLeadsByLinkedin: (...a: any[]) => mockFindLeadsByLinkedin(...a) },
-  userDb: { getAllUsers: (...a: any[]) => mockGetAllUsers(...a) },
+  userDb: { scanWithFilter: (...a: any[]) => mockScanWithFilter(...a) },
 }));
 
 const mockGetSetting = jest.fn().mockResolvedValue(null);
@@ -85,7 +85,11 @@ jest.mock('../services/linkedInSentInvitationsSyncService', () => ({
   syncSentInvitationsForAccount: (...a: any[]) => mockSyncSentInvitationsForAccount(...a),
 }));
 
-import { runLinkedInConnectionSync, __resetWalkPacingForTests } from '../cron/linkedInConnectionSyncCron';
+import {
+  runLinkedInConnectionSync,
+  __resetWalkPacingForTests,
+  getAllUnipileAccountIds,
+} from '../cron/linkedInConnectionSyncCron';
 
 /** The `mode` the cron asked for on each sent-invitation walk. */
 const modes = () =>
@@ -103,7 +107,7 @@ beforeEach(() => {
   __resetWalkPacingForTests();
   jest.clearAllMocks();
   mockGetSetting.mockResolvedValue({ settingValue: JSON.stringify([{ account_id: 'acct-1', enabled: true }]) });
-  mockGetAllUsers.mockResolvedValue([]);
+  mockScanWithFilter.mockResolvedValue([]);
   mockListConnections.mockResolvedValue(TWO_CONNECTIONS);
   mockListSentInvitations.mockResolvedValue({ items: [] });
   mockSyncSentInvitationsForAccount.mockResolvedValue(0);
@@ -194,5 +198,43 @@ describe('full walks are paced, and only a completed one counts', () => {
     // Both full on the first pass, both incremental on the second — one account's
     // walk must not start another account's clock.
     expect(modes()).toEqual(['full', 'full', 'incremental', 'incremental']);
+  });
+});
+
+describe('getAllUnipileAccountIds — per-user resilience', () => {
+  it('resolves every well-formed user even when another user has a malformed connected_accounts value', async () => {
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockGetSetting.mockResolvedValue(null); // no site-wide accounts — isolate to the per-user path
+    mockScanWithFilter.mockResolvedValue([
+      { userId: 'user-good-1', connected_accounts: [{ platform: 'unipile', account_id: 'acc-good-1' }] },
+      // Malformed: connected_accounts present (passes the `if (!user.connected_accounts) continue`
+      // guard) but not an array. NOT a string — strings are iterable in JS, so
+      // `for...of` walks characters without throwing and would silently pass this
+      // test for the wrong reason (caught in independent review). A plain object
+      // is genuinely non-iterable AND a realistic real-world shape: a single
+      // account object stored unwrapped instead of inside an array.
+      { userId: 'user-bad', connected_accounts: { platform: 'unipile', account_id: 'acc-bad' } },
+      { userId: 'user-good-2', connected_accounts: [{ platform: 'unipile', account_id: 'acc-good-2' }] },
+    ]);
+
+    const { ids, ownerByAccountId } = await getAllUnipileAccountIds();
+
+    expect(ids.sort()).toEqual(['acc-good-1', 'acc-good-2']);
+    expect(ownerByAccountId.get('acc-good-1')).toBe('user-good-1');
+    expect(ownerByAccountId.get('acc-good-2')).toBe('user-good-2');
+    // Proves the catch branch itself actually ran for user-bad, not just that
+    // the end-to-end ids happen to match by coincidence.
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Skipping malformed connected_accounts for user user-bad'),
+      expect.anything(),
+    );
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('propagates a genuine scan failure rather than returning a misleadingly-empty result', async () => {
+    mockGetSetting.mockResolvedValue(null);
+    mockScanWithFilter.mockRejectedValue(new Error('DynamoDB scan failed'));
+
+    await expect(getAllUnipileAccountIds()).rejects.toThrow('DynamoDB scan failed');
   });
 });
