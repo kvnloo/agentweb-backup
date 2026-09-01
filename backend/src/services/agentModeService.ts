@@ -34625,7 +34625,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // collapsing to a bare "Request failed with code 403" — see describeXApiError.
       const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_manage_post failed:', errorMessage);
-      return { success: false, message: 'Twitter action failed', error: errorMessage };
+      // ENG-1300: same gap as twitterOutreach's catch — this flattens every thrown
+      // error to a message string, which is all toolResultError has to reconstruct
+      // an Error from downstream, so the numeric HTTP status (twitter-api-v2 puts
+      // it on `.code`) must ride along on the result object or a write-path 401/403
+      // (e.g. a reply blocked by X's engagement-gate scope) never classifies as
+      // auth/config either.
+      const code = typeof (error as { code?: unknown })?.code === 'number' ? (error as { code: number }).code : undefined;
+      return { success: false, message: 'Twitter action failed', error: errorMessage, ...(code !== undefined ? { code } : {}) };
     }
   }
 
