@@ -48,6 +48,31 @@ const STRUCTURAL_ONLY = /^[\s{}[\],:"']+$/;
 const HISTORY_ECHO_PREFIX = /^\[(?:Result of \S+:|Previously called )/;
 
 /**
+ * ENG-1224 (Variant B): the internal control-directive text this loop itself
+ * injects as a budget nudge — see turnTimeBudget.ts's final-synthesis warning
+ * ("...Do not call any more tools. Write your final answer NOW...") and the
+ * step-budget warning ("Stop all searching/pagination immediately..."). Both
+ * are OUR instructions TO the model, never something a user asked for.
+ *
+ * Production session d5898ffd (model gemini-3.1-flash-lite, under loop stress
+ * after a tool error) echoed the injected instruction back verbatim as its
+ * final answer instead of following it — the entire final turn was the literal
+ * string "Do not call any more tools." A reply that opens with this phrasing is
+ * the model parroting its own context, not answering, exactly like the history
+ * echo above.
+ *
+ * Scoped to phrasing that actually appears in an injected nudge: "Do not call
+ * any more tools" (`buildTurnTimeBudgetNudge`, `turnTimeBudget.ts`) and "Stop
+ * all searching/pagination immediately" (the step-budget warning,
+ * `agentModeService.ts`). Earlier revisions also matched "stop calling tools"
+ * and "no more tool call(s)?", but no code path ever injects either phrase —
+ * being anchored-and-short, they risked misclassifying a genuine final answer
+ * that happens to open with similar wording as unusable synthesis.
+ */
+const INTERNAL_DIRECTIVE_ECHO_RE =
+  /^(?:\[SYSTEM(?:\s+WARNING)?\]\s*)?(?:do\s*n[o']?t\s+call\s+any\s+(?:more|further)\s+tools|stop\s+all\s+searching(?:\s*\/\s*pagination)?)\b/i;
+
+/**
  * ENG-1188: a gemini-3.1-pro-preview work-plan session generated and
  * screenshot-verified the corrected assets, then closed with the model echoing the
  * injected synthesis nudge back verbatim — 3 repeats in 744 chars — instead of
@@ -173,10 +198,12 @@ export function isUnusableSynthesis(content: unknown): boolean {
   if (typeof content !== 'string') return false;
   const trimmed = content.trim();
   if (trimmed.length === 0) return false;
-  // Checked before the length cap: a history echo, a nudge echo, and a repetition
-  // collapse are all either long by nature or an intentionally short exact-match.
+  // Checked before the length cap: a history echo, a nudge echo, a leaked
+  // internal directive, and a repetition collapse are all either long by
+  // nature or an intentionally short exact/prefix match.
   if (HISTORY_ECHO_PREFIX.test(trimmed)) return true;
   if (isNudgeEcho(trimmed)) return true;
+  if (INTERNAL_DIRECTIVE_ECHO_RE.test(trimmed)) return true;
   if (isDegenerateRepetition(trimmed)) return true;
   if (trimmed.length > MAX_RESIDUE_LENGTH) return false;
   if (!STRUCTURAL_ONLY.test(trimmed)) return false;
