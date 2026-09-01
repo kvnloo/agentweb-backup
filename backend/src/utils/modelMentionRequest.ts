@@ -197,13 +197,57 @@ function matchLengthAt(tokens: Token[], index: number, key: string): number {
  * not a request), then a longest-match scan for a registered model name led by a
  * request verb.
  */
+/** Char range of the sentence containing `index`, using the same breaks as the verb scan. */
+function sentenceBoundsAt(
+  tokens: Token[],
+  index: number,
+  messageContent: string,
+): { start: number; end: number } {
+  let first = index;
+  while (first > 0 && !tokens[first].followsSentenceBreak) first--;
+  let afterLast = index + 1;
+  while (afterLast < tokens.length && !tokens[afterLast].followsSentenceBreak) afterLast++;
+  return {
+    start: tokens[first].start,
+    // Up to the next sentence's first token (or end of string) so the sentence's
+    // own terminating "?" is inside the range — `isExplanatoryQuestion` needs it.
+    end: afterLast < tokens.length ? tokens[afterLast].start : messageContent.length,
+  };
+}
+
+/**
+ * The model this message asks to be used, or null.
+ *
+ * ## Why the guards are scoped, and not applied to the whole message
+ *
+ * ENG-1565 tests its guards against the entire message, which is right for its
+ * detector: its trigger is the bare word "model", so any nearby negation is
+ * plausibly about the model. Inheriting that unchanged was a mistake here, and
+ * it cost a production verification turn to find. The message
+ *
+ *     "Use Opus 5 model and reply with just the word OK. Do not call any tools."
+ *
+ * names a model unambiguously, in its own sentence — and got silence, because
+ * "Do not" appeared in a LATER, unrelated sentence. Worse are the ones a real
+ * customer would send:
+ *
+ *     "Use Opus 5 and don't use tables"
+ *     "Switch to Opus 5, no need to summarise first"
+ *     "Use Opus 5 — I can't get good output from Flash"
+ *
+ * The last is the ENG-1200 complaint almost verbatim, and a whole-message guard
+ * answers it with exactly the silence this ticket exists to remove.
+ *
+ * So a negation only suppresses a mention when it could actually be negating it:
+ * in the SAME sentence, and BEFORE it. "Don't use Opus 5" still stays silent;
+ * "use Opus 5, don't use tables" no longer does. The explanatory-question guard
+ * is scoped to the mention's sentence for the same reason.
+ */
 export function findModelMention(
   messageContent: string | null | undefined,
   index: ModelMentionIndex,
 ): ModelMention | null {
   if (!messageContent || typeof messageContent !== 'string') return null;
-  if (hasNegation(messageContent)) return null;
-  if (isExplanatoryQuestion(messageContent)) return null;
 
   const tokens = tokenize(messageContent);
   for (let i = 0; i < tokens.length; i++) {
@@ -211,6 +255,12 @@ export function findModelMention(
       const length = matchLengthAt(tokens, i, key);
       if (!length) continue;
       if (!hasLeadingRequestVerb(tokens, i)) continue;
+
+      const sentence = sentenceBoundsAt(tokens, i, messageContent);
+      // Only text leading up to the mention can negate it.
+      if (hasNegation(messageContent.slice(sentence.start, tokens[i].start))) continue;
+      if (isExplanatoryQuestion(messageContent.slice(sentence.start, sentence.end))) continue;
+
       return {
         modelId,
         matchedText: messageContent.slice(tokens[i].start, tokens[i + length - 1].end),

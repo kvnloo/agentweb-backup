@@ -70,6 +70,36 @@ describe('findModelMention', () => {
     });
   });
 
+  describe('negation is scoped to the mention, not the whole message', () => {
+    // Found by a real production verification turn on 2026-09-01: the message
+    // below named Opus 5 in its own sentence and got silence, because "Do not"
+    // appeared in a LATER, unrelated sentence. A whole-message guard answers a
+    // legitimate request with exactly the silence this ticket exists to remove.
+    it.each([
+      'Use Opus 5 model and reply with just the word OK. Do not call any tools.',
+      "Use Opus 5 and don't use tables",
+      'Switch to Opus 5, no need to summarise first',
+      // The ENG-1200 complaint, almost verbatim.
+      "Use Opus 5 — I can't get good output from Flash",
+      'Do not call any tools. Use Opus 5.',
+    ])('still fires on %p', (text) => {
+      expect(findModelMention(text, index)?.modelId).toBe(OPUS_5);
+    });
+
+    it.each([
+      // A negation BEFORE the mention, in its own sentence, still suppresses.
+      "don't use Opus 5",
+      'never switch to Opus 5 without asking me first',
+      "Please don't switch to Opus 5 for this one",
+      // An explanatory question about the mention likewise.
+      'What does it mean to use Opus 5?',
+      // ...even when another sentence would have matched on its own.
+      'Summarise the leads. What does it mean to use Opus 5?',
+    ])('still stays silent on %p', (text) => {
+      expect(findModelMention(text, index)).toBeNull();
+    });
+  });
+
   it.each([
     // No request verb — a mention is not a request.
     'the Opus 5 write-up looks good',
