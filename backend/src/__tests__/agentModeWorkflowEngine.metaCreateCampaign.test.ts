@@ -232,6 +232,32 @@ describe('ENG-397 hardening — a missing declared output fails the step instead
     // not something worth reading back and comparing.
     expect(brokenStep.verify as jest.Mock).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ['NaN', NaN],
+    ['Infinity', Infinity],
+    ['-Infinity', -Infinity],
+    ['a whitespace-only string', '   '],
+    ['an object', { not: 'an id' }],
+  ])('fails the step when execute() returns %s as a declared output, rather than checkpointing it as an entity id', async (_label, badValue) => {
+    const brokenStep: WorkflowStepDefinition = {
+      id: 'broken_step',
+      inputs: [],
+      outputs: ['thing_id'],
+      requiredParameters: [],
+      execute: jest.fn(async () => ({ thing_id: badValue })),
+      verify: jest.fn(async (): Promise<import('../services/agentMode/core/workflow').WorkflowStepVerification> => ({ verified: true, verifiedFields: {} })),
+    };
+    const definition: WorkflowDefinition = { workflowId: 'broken_workflow', steps: [brokenStep] };
+    wireSessionStore({ workflowRun: buildWorkflowRunState({ runId: 'run_1', workflowId: definition.workflowId, createdAt: '2026-01-01T00:00:00.000Z' }) });
+
+    const outcome = await advanceWorkflow(SESSION_ID, definition);
+
+    expect(outcome.kind).toBe('step_failed');
+    if (outcome.kind !== 'step_failed') throw new Error('unreachable');
+    expect(outcome.run.checkpoints[0].entityIds).toBeUndefined();
+    expect(brokenStep.verify as jest.Mock).not.toHaveBeenCalled();
+  });
 });
 
 describe('ENG-397 hardening — budget_mode is verified, not just gated', () => {
