@@ -88,6 +88,7 @@ import { validateNewChatHeroGreeting } from '../utils/newChatHeroGreeting';
 import { normalizeEmailList } from '../utils/validation';
 import {
   MAX_ATOMIC_RUN_RESULT_REMOVALS,
+  PROMPT_REVISIONS_BUDGET_BYTES,
   SCHEDULE_ITEM_BUDGET_BYTES,
   estimateDynamoItemBytes,
   getScheduleStorageDiagnostics,
@@ -10703,7 +10704,13 @@ export const agentModeController = {
       // Whenever the prompt actually changes, snapshot the PREVIOUS prompt into the
       // revision history so it can be reverted. This applies to every update path —
       // manual edits, Emma's manage_scheduled_chat tool, and self-improve. Keep the
-      // most recent SCHEDULE_PROMPT_REVISION_LIMIT revisions only.
+      // most recent SCHEDULE_PROMPT_REVISION_LIMIT revisions only, AND bound them to
+      // PROMPT_REVISIONS_BUDGET_BYTES (ENG-1672): a self-improve schedule snapshots a
+      // FULL prompt on every reflection, so a large prompt reaches a dangerous share
+      // of the item's 400KB ceiling from just a handful of revisions — well before
+      // the flat count limit ever triggers. Bounding by bytes here, not just count,
+      // is what keeps a self-improving schedule from wedging itself out of being
+      // editable through its own normal daily cycle.
       const previousStartingMessage = existingSchedule.startingMessage || '';
       if (effectiveStartingMessage !== previousStartingMessage) {
         const existingRevisions = Array.isArray((existingSchedule as any).promptRevisions)
@@ -10713,7 +10720,13 @@ export const agentModeController = {
           ...existingRevisions,
           { startingMessage: previousStartingMessage, updatedAt: now.toISOString() },
         ];
-        updates.promptRevisions = nextRevisions.slice(-SCHEDULE_PROMPT_REVISION_LIMIT);
+        const { kept: byteBudgetedRevisions } = trimListToItemBudget(
+          {},
+          'promptRevisions',
+          nextRevisions,
+          PROMPT_REVISIONS_BUDGET_BYTES,
+        );
+        updates.promptRevisions = byteBudgetedRevisions.slice(-SCHEDULE_PROMPT_REVISION_LIMIT);
       }
 
       const { variables: normalizedVariables, error: variableError } =
