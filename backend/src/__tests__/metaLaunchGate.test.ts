@@ -478,6 +478,85 @@ describe('referenced creative destinations (ENG-941)', () => {
     });
   });
 
+  /*
+   * The `!destinationCameFromRequest` escape above does not reach the launches that create an
+   * EMPTY container, because they carry no destination to supply: `executeAudienceCampaignLaunch`
+   * calls this gate with no `pendingDestinations` argument at all, and a plain AD_SET CREATE with
+   * no link_url has none either.
+   *
+   * Those launches put ZERO pre-existing ads live — the new ad set contains no ads and can send
+   * traffic nowhere — so the campaign's unread ads cannot be "some ads in this launch that were
+   * never checked". And "Narrow the launch to a single ad" is not a remedy anyone can follow for
+   * an entity that does not exist.
+   */
+  describe('a truncated ad list and a launch that activates no existing ad', () => {
+    it('does not block the audience-launch path, which creates an ad set and no ads', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'TARGETED_AUDIENCE_LAUNCH', false, 'sess-c',
+      );
+
+      expect(out.proceed).toBe(true);
+    });
+
+    it('does not block the retargeting-launch path either', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'RETARGETING_LAUNCH', false, 'sess-c',
+      );
+
+      expect(out.proceed).toBe(true);
+    });
+
+    it('does not block a plain AD_SET CREATE that carries no link_url', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'AD_SET_CREATE', false, 'sess-c', {}, undefined, [], [],
+      );
+
+      expect(out.proceed).toBe(true);
+    });
+
+    it('still blocks an AD_CREATE with no destination — that one really does start serving', async () => {
+      // The boundary: an AD CREATE makes something that serves, and with no destination on the
+      // request the campaign's (unread) ad list is what the check would have to fall back on.
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'AD_CREATE', false, 'sess-c', {}, undefined, [], [],
+      );
+
+      expect(out.proceed).toBe(false);
+      expect(out.blockResult.error).toMatch(/too large to read completely/i);
+    });
+
+    it('still checks the campaign destinations it CAN read for an empty-container launch', async () => {
+      // Lifting the truncation block is not lifting the gate: a readable, untracked destination
+      // still blocks these launches exactly as before.
+      mockListAds.mockResolvedValue({
+        items: [{ adId: 'a1', campaignId: CAMPAIGN, destinationUrls: ['https://dark.example/lp'] }],
+        truncated: true,
+        pagesFetched: 25,
+      });
+      // ...Once, not a new default: the describes below this one have no beforeEach of their
+      // own and inherit whatever mock state the previous test left behind.
+      mockPreflight.mockResolvedValueOnce({
+        ok: false, results: [{ url: 'https://dark.example/lp', status: 'missing', mechanisms: [] }],
+        blockedUrls: ['https://dark.example/lp'], message: 'no tracking found',
+      });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'TARGETED_AUDIENCE_LAUNCH', false, 'sess-c',
+      );
+
+      expect(out.proceed).toBe(false);
+      expect(out.blockResult.error).toMatch(/no tracking found/i);
+    });
+  });
+
   it('resolves a referenced creative to its destination and checks it', async () => {
     mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     const resolveCreativeDestinations = jest.fn().mockResolvedValue(['https://site.example/referenced']);
