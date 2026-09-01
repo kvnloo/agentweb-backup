@@ -6029,6 +6029,13 @@ export async function runScheduledChat(
         // Outcome settled — now the transcript can state it truthfully.
         if (sessionId) {
           try {
+            // ENG-1670: this is a SEPARATE persist site from the incompleteMessage
+            // one above (that one is forced null exactly when mayHavePublished,
+            // which is how we got here) — re-derive rather than reuse, matching
+            // this function's existing style of re-deriving classifyZeroAssistantFailure
+            // per write site instead of hoisting it across branches.
+            const retryAfterHeaderPresent = (error as any)?.retryAfterHeaderPresent;
+            const retryAfterMs = (error as any)?.retryAfterMs;
             await chatbotDb.addMessageToSession(sessionId, {
               role: 'assistant',
               content: zeroAssistantPublishedMessage(publishedActions, publishedRunDidResume, publishedRunPaused),
@@ -6038,6 +6045,8 @@ export async function runScheduledChat(
                 isErrorMessage: true,
                 jobIncomplete: true,
                 failureClass: classifyZeroAssistantFailure(error),
+                ...(retryAfterHeaderPresent !== undefined ? { retryAfterHeaderPresent } : {}),
+                ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
               },
             });
           } catch (persistError) {
