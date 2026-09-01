@@ -281,3 +281,59 @@ describe('ENG-397 hardening — initialParameters cannot bypass the AskUserQuest
     expect(run.status).toBe('in_progress');
   });
 });
+
+describe('ENG-397 hardening — a throwing verify() fails the step instead of leaving it unresolved', () => {
+  it('catches a verify() exception and fails the step, rather than leaving the run in_progress and letting a retry re-execute (duplicate creation)', async () => {
+    const throwingStep: WorkflowStepDefinition = {
+      id: 'throwing_step',
+      inputs: [],
+      outputs: ['thing_id'],
+      requiredParameters: [],
+      execute: jest.fn(async () => ({ thing_id: 'x1' })),
+      verify: jest.fn(async () => {
+        throw new Error('read-back network timeout');
+      }),
+    };
+    const definition: WorkflowDefinition = { workflowId: 'throwing_workflow', steps: [throwingStep] };
+    wireSessionStore({ workflowRun: buildWorkflowRunState({ runId: 'run_1', workflowId: definition.workflowId, createdAt: '2026-01-01T00:00:00.000Z' }) });
+
+    const first = await advanceWorkflow(SESSION_ID, definition);
+    expect(first.kind).toBe('step_failed');
+    if (first.kind !== 'step_failed') throw new Error('unreachable');
+    expect(first.run.status).toBe('failed');
+    expect(first.run.checkpoints[0].discrepancy).toEqual({ error: 'read-back network timeout' });
+
+    // A retry must NOT re-execute (which would create a second real entity) —
+    // findNextStep returns null once the run is 'failed'.
+    const second = await advanceWorkflow(SESSION_ID, definition);
+    expect(second.kind).toBe('step_failed');
+    expect(throwingStep.execute as jest.Mock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ENG-397 hardening — an optimistic-lock conflict is surfaced, not silently trusted', () => {
+  it('returns a conflict outcome (not the transition result) when the persistence write loses the version race', async () => {
+    mockCreateCampaign.mockResolvedValue({ id: 'camp_1' });
+    mockGetCampaign.mockResolvedValue({ id: 'camp_1', objective: 'OUTCOME_LEADS', daily_budget: 5000 });
+
+    const definition = makeDefinition();
+    const preTransitionRun = buildWorkflowRunState({
+      runId: 'run_1',
+      workflowId: definition.workflowId,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      initialParameters: INITIAL_PARAMS,
+    });
+    mockGetChatSession.mockResolvedValue({ sessionId: SESSION_ID, workflowRun: preTransitionRun, answeredQuestions: answeredQuestionArchive() });
+    // Simulate a concurrent writer already having moved the version — every
+    // guarded write in this codebase's convention returns null on a lost race.
+    mockUpdateSessionWorkflowRun.mockResolvedValue(null);
+
+    const outcome = await advanceWorkflow(SESSION_ID, definition);
+
+    expect(outcome.kind).toBe('conflict');
+    if (outcome.kind !== 'conflict') throw new Error('unreachable');
+    // Must be the PRE-transition object, never the (unpersisted) local one a
+    // caller might mistake for having actually landed.
+    expect(outcome.run).toBe(preTransitionRun);
+  });
+});
