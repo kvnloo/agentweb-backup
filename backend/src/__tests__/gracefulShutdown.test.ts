@@ -242,6 +242,10 @@ describe('server.ts shutdown sequencing (source-pinned, ENG-1189)', () => {
     expect(serverSrc).toMatch(/drainActiveSessionGenerations/);
   });
 
+  it('tracks in-flight Gemini Live Voice tool calls as part of the drain', () => {
+    expect(serverSrc).toMatch(/drainLiveVoiceToolExecutions/);
+  });
+
   it('tracks the Emma-chatbot socket turn — the one path with no other in-flight coverage', () => {
     const messageHandlerSection = serverSrc.slice(
       serverSrc.indexOf("socket.on('message'"),
