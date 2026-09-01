@@ -315,7 +315,15 @@ describe('detectMrrCollectionGaps', () => {
   it('throws loudly when STRIPE_SECRET_KEY is not configured, instead of booking a silent $0', async () => {
     jest.resetModules();
     const key = process.env.STRIPE_SECRET_KEY;
-    delete process.env.STRIPE_SECRET_KEY;
+    // Set to '' rather than delete: the fresh require() below transitively
+    // re-imports revenueService.ts, whose module-level `dotenv.config()`
+    // call runs again. dotenv only fills in vars that are NOT already
+    // present in process.env — a deleted key qualifies as absent and gets
+    // silently repopulated from .env on any machine with a real Stripe key
+    // configured there (masking this test's whole premise), but an
+    // explicitly empty string still counts as "already set" and is left
+    // alone, while still failing the `if (!key)` check below.
+    process.env.STRIPE_SECRET_KEY = '';
     try {
       const { detectMrrCollectionGaps: detectWithoutKey } = require('../services/mrrCollectionGapService');
       await expect(detectWithoutKey()).rejects.toThrow('Missing STRIPE_SECRET_KEY');

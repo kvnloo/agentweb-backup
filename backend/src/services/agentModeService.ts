@@ -61,6 +61,8 @@ import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
+import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
+import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
@@ -77,6 +79,8 @@ import {
   applyAnswer,
   buildPendingUserQuestion,
   checkQuestionGate,
+  findAnsweredObjectiveCandidate,
+  summarizeAnsweredObjectiveQuestions,
   findQuestionByKind,
   renderQuestionPrompt,
   verifyExplicitStatement,
@@ -325,6 +329,35 @@ export function isVerificationFunctionCallRetryPress(text: string): boolean {
 export function pressesIrreversiblePublishWrite(text: string): boolean {
   return isVerificationFunctionCallRetryPress(text) && IRREVERSIBLE_PUBLISH_TOOLS.some((tool) => text.includes(tool));
 }
+
+// ENG-1670: a blind fixed backoff is a guess — OpenRouter documents that a
+// 429/5xx can carry `retry-after` (seconds, or an HTTP-date) or the proactive
+// `retry-after-ms`, and the OpenAI SDK's own (disabled here via maxRetries: 0)
+// retry logic already trusts that header over a computed default when it's
+// present and under 60s. Mirror that instead of guessing: honoring the
+// provider's own signal is correct regardless of whether that signal turns
+// out to be 1.5s or 45s, where a fixed backoff is only right by luck.
+//
+// Shared by callLLM's in-call retry loop AND generateMarketingResponse's
+// outer catch (which persists whether a header was actually present, once the
+// call has exhausted its retries and the whole turn is failing) — one
+// definition, so both readings of the same header can never disagree.
+export function getRetryAfterMs(error: unknown): number | undefined {
+  const headers = (error as any)?.headers;
+  if (!headers) return undefined;
+  const msHeader = headers['retry-after-ms'];
+  if (msHeader) {
+    const ms = parseFloat(msHeader);
+    if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
+  }
+  const secHeader = headers['retry-after'];
+  if (secHeader) {
+    const seconds = parseFloat(secHeader);
+    const ms = !Number.isNaN(seconds) ? seconds * 1000 : Date.parse(secHeader) - Date.now();
+    if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
+  }
+  return undefined;
+}
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import {
@@ -359,6 +392,7 @@ import {
   trackingOverrideTokenMatches,
 } from './metaLaunchGate';
 import { HubSpotService } from './hubspotService';
+import { handleAttioApi as handleAttioApiImpl } from './agentMode/attioTools';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
@@ -395,6 +429,7 @@ import {
   validateAndRepairToolArgs,
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { isRetryableErrorClass } from './agentMode/core/errorRetryability';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
@@ -1250,6 +1285,11 @@ export class AgentModeService {
   // save-as-you-go around browser automation tools, so an intermittent login
   // success is captured without depending on the model calling the cookie tools).
   private browserCookieAutoState = createAutoPersistState();
+  // ENG-1624: cached so a sub-folder-access error can name the service account
+  // to share with, without re-fetching the secret on every failure. Only the
+  // email is kept — the private key must never outlive the local
+  // getGoogleDriveClient() call that parses the secret.
+  private driveServiceAccountEmail: string | null = null;
   private toolRegistry: ToolRegistry;
   private mcpClientService: McpClientService;
   private static toolsRegistered: boolean = false;
@@ -2120,6 +2160,17 @@ export class AgentModeService {
   /** Media types the vision APIs decode natively. */
   private static readonly VISION_NATIVE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
+  // ENG-1670: a scheduled run's own tool-calling loop can fire several Gemini
+  // calls back-to-back within one turn (prod-verified: 4 calls in ~22s on the
+  // "LinkedIn Post Factory" schedule) with nothing pacing them — the schedule
+  // jitter fix (agentModeController.calculateNextRunTime) addresses platform-
+  // wide clustering across DIFFERENT schedules, but does nothing for a single
+  // session's own rapid iteration cadence. Scoped tightly: scheduled runs only
+  // (never adds latency to a live interactive user watching the screen), and
+  // Gemini only (the provider this class of 429 was confirmed against) — not a
+  // blanket delay on every model or every turn.
+  private static readonly SCHEDULED_GEMINI_ITERATION_PACING_MS = 1500;
+
   /**
    * Normalize uploaded image bytes to a vision-decodable representation. This
    * remains local image hygiene; text/tool model routing is handled separately.
@@ -2349,6 +2400,54 @@ export class AgentModeService {
   }
 
   /**
+   * ENG-1205 AC3: the catalog the in-chat model-mention detector matches against.
+   *
+   * Returned rather than reaching into `llmModels` from the util so the detector
+   * stays pure and testable, and so adding a model to the registry extends
+   * mention coverage with no second list to maintain (ENG-1137: never scatter
+   * checks for individual model names).
+   *
+   * Internal-only and Live models are excluded: a user cannot select either, so
+   * naming one is not a request this can honor. Admin-only models ARE included —
+   * a non-admin naming one must be told it is not available to them, which is
+   * precisely the acknowledgement AC3 asks for, and `isModelSelectableBy` below
+   * is what decides which sentence they get.
+   */
+  getModelMentionCatalog(): Array<{ id: string; name?: string; family?: string }> {
+    return Object.keys(this.llmModels)
+      .filter((id) => !this.llmModels[id].internalOnly && !this.llmModels[id].isLive)
+      .map((id) => ({
+        id,
+        name: this.llmModels[id].name,
+        family: this.llmModels[id].family,
+      }));
+  }
+
+  /** Built once per process — `llmModels` is a static registry, not per-request state. */
+  private modelMentionIndex: ModelMentionIndex | null = null;
+
+  getModelMentionIndex(): ModelMentionIndex {
+    if (!this.modelMentionIndex) {
+      this.modelMentionIndex = buildModelMentionIndex(this.getModelMentionCatalog());
+    }
+    return this.modelMentionIndex;
+  }
+
+  /**
+   * Would the model picker accept this id for this user? Mirrors the two gates
+   * `agentModeController.updateSessionLlmModel` applies, in the same order: the
+   * supported-model allow-list, then the non-admin Opus restriction. Kept next
+   * to the registry it reads so the two cannot drift.
+   */
+  isModelSelectableBy(modelId: string, isAdmin: boolean): boolean {
+    const config = this.llmModels[modelId];
+    if (!config || config.internalOnly || config.isLive) return false;
+    if (config.adminOnly && !isAdmin) return false;
+    if (modelId.includes('opus') && !isAdmin) return false;
+    return true;
+  }
+
+  /**
    * Same entitlement/ordering as getSupportedModels, decorated with tier + description
    * for the model-picker UI. Excludes live-voice models (isLive) — they are never
    * selectable through the HTTP generate picker (see callLLM's isLive guard).
@@ -2509,6 +2608,7 @@ export class AgentModeService {
       humanPaced = false,
       timeoutMs,
       fallbackModels,
+      taskClass,
     } = options || {};
 
     // AgentWeb owns model selection; OpenRouter owns transport, provider
@@ -2615,46 +2715,102 @@ export class AgentModeService {
     const client = await this.getOpenRouterClient();
     const providerLabel = 'openrouter';
 
-    try {
-      const res = await client.chat.completions.create(
-        params,
-        { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
-      );
-      // Fire-and-forget usage metering; it must never break an LLM call.
+    // ENG-1626: params.provider.allow_fallbacks above already has OpenRouter retry
+    // across its own provider pool for THIS request before it ever surfaces an
+    // error to us -- getOpenRouterClient's maxRetries:0 exists precisely so an SDK
+    // auto-retry can't multiply with that in-flight fallback. This loop is a
+    // different thing: ONE retry of a *fully-exhausted* attempt, after a short
+    // backoff, for the narrow case where the exhaustion was momentary. Session
+    // b32ec8af (2026-08-26): a single "429 Provider returned error" from
+    // OpenRouter (all providers for that model saturated for an instant) killed
+    // an entire Slack-bridged session with zero retry anywhere in this path.
+    // `timeout` is deliberately excluded from the retryable set used elsewhere
+    // (isRetryableErrorClass) -- retrying a call that already burned up to
+    // timeoutMs would double the worst-case wall clock against the turn's own
+    // hard cap, trading one failure mode for a worse one.
+    const isRetryableLlmCallError = (error: unknown): boolean => {
+      const errorClass = classifyToolErrorClass(error);
+      return errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx';
+    };
+
+    // A single 1.5s retry wasn't enough to clear a burst-triggered 429 — prod
+    // sessions on the LinkedIn Post Factory SCHEDULED schedule (which fires
+    // several tool calls back-to-back) needed the full 15-60min scheduled-run
+    // backoff to recover from what OpenRouter reported as rate-limited. One
+    // extra attempt, backed by the Retry-After header when the provider sends
+    // one, gives a rate limit real room to clear within the same run before
+    // falling back to that expensive path.
+    //
+    // Scoped to scheduled_background ONLY: this loop is shared by every
+    // caller of callLLM, including a live interactive chat with a human
+    // staring at the screen. Retry-After can legitimately be tens of seconds,
+    // and honoring it across two retries could add up to ~2 minutes of dead
+    // air to an interactive turn that used to fail fast after ~1.5s — a much
+    // worse outcome for that caller than the original single-short-retry
+    // behavior. A headless scheduled run has no one watching and already
+    // tolerates a much larger backoff at the schedule level, so it's the only
+    // context where trading latency for a better shot at recovery is a clear
+    // win rather than a regression.
+    const isScheduledLlmCall = taskClass === 'scheduled_background';
+    const maxAttempts = isScheduledLlmCall ? 3 : 2;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const usage: any = (res as any)?.usage;
-        if (usage) {
-          const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
-          meterUserUsage({
-            userId: usageContext?.userId,
-            billingUserId: usageContext?.billingUserId,
-            sessionId: usageContext?.sessionId,
-            model,
-            provider: providerLabel,
-            feature: usageContext?.feature || 'agent_task',
-            eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
-            inputTokens: normalizedUsage.inputTokens,
-            outputTokens: normalizedUsage.outputTokens,
-            cacheReadTokens: normalizedUsage.cacheReadTokens,
-            cacheWriteTokens: normalizedUsage.cacheWriteTokens,
-            cacheWriteByTtl: usage.cache_creation_by_ttl,
-            costUsdOverride:
-              usage.is_byok !== true && typeof usage.cost === 'number'
-                ? usage.cost
-                : undefined,
-          });
+        const res = await client.chat.completions.create(
+          params,
+          { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
+        );
+        // Fire-and-forget usage metering; it must never break an LLM call.
+        try {
+          const usage: any = (res as any)?.usage;
+          if (usage) {
+            const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
+            meterUserUsage({
+              userId: usageContext?.userId,
+              billingUserId: usageContext?.billingUserId,
+              sessionId: usageContext?.sessionId,
+              model,
+              provider: providerLabel,
+              feature: usageContext?.feature || 'agent_task',
+              eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
+              inputTokens: normalizedUsage.inputTokens,
+              outputTokens: normalizedUsage.outputTokens,
+              cacheReadTokens: normalizedUsage.cacheReadTokens,
+              cacheWriteTokens: normalizedUsage.cacheWriteTokens,
+              cacheWriteByTtl: usage.cache_creation_by_ttl,
+              costUsdOverride:
+                usage.is_byok !== true && typeof usage.cost === 'number'
+                  ? usage.cost
+                  : undefined,
+            });
+          }
+        } catch {
+          // Metering must never break an LLM call.
         }
-      } catch {
-        // Metering must never break an LLM call.
+        return res;
+      } catch (error) {
+        lastError = error;
+        if (attempt < maxAttempts && isRetryableLlmCallError(error)) {
+          // Retry-After is only honored for scheduled calls (see maxAttempts
+          // comment above) — an interactive/other caller keeps the original
+          // fixed, short backoff so a live turn still fails fast rather than
+          // trusting a provider-reported wait that could be tens of seconds.
+          const retryAfterMs = isScheduledLlmCall ? getRetryAfterMs(error) : undefined;
+          const backoffMs = retryAfterMs ?? 1500 * Math.pow(2, attempt - 1);
+          console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms${retryAfterMs !== undefined ? ' (honoring Retry-After)' : ''}`, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          await this.sleep(backoffMs);
+          continue;
+        }
+        break;
       }
-      return res;
-    } catch (error) {
-      console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined,
-      });
-      throw error;
     }
+    console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
+      error: lastError instanceof Error ? lastError.message : String(lastError),
+      stack: lastError instanceof Error ? lastError.stack : undefined,
+    });
+    throw lastError;
   }
 
   /**
@@ -2974,6 +3130,17 @@ export class AgentModeService {
       }
 
       const isAdmin = currentUser?.isAdmin === true;
+
+      // ENG-1205: the correction this turn was admitted under, stamped onto the
+      // turn's assistant messages beside `llm` so a reload can still explain why
+      // the badge disagrees with the picker. The controller wrote this decision
+      // onto the session immediately before dispatch; `resolveTurnModelCorrection`
+      // rejects a slot that does not describe THIS turn, so a resumed or replayed
+      // run degrades to no stamp rather than borrowing a newer turn's model.
+      const turnModelCorrection = resolveTurnModelCorrection(
+        (currentSession as any)?.llmUsagePolicyDecision,
+        llmModel,
+      );
       // Admin tools are available to real admins OR to messages arriving via admin delegated access.
       // iShare sessions always block admin tools even if somehow isDelegatedAccess is set.
       const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
@@ -3660,6 +3827,23 @@ export class AgentModeService {
           }
         }
 
+        // ENG-1670: pace out a scheduled run's own back-to-back Gemini calls within
+        // this turn. Narrow guard: scheduled only (never adds latency for a live
+        // interactive user), Gemini only (the provider this failure was confirmed
+        // against), iteration > 1 only (the turn's first call has nothing preceding
+        // it in this turn to burst against), and skipped once the turn is already
+        // racing its own wall-clock cap — this is defense against this session's own
+        // request rate, not worth trading against the ENG-907 time budget it would
+        // otherwise eat into.
+        if (
+          isScheduledSession
+          && iteration > 1
+          && llmModel.startsWith('gemini')
+          && !forceFinalSynthesis
+        ) {
+          await this.sleep(AgentModeService.SCHEDULED_GEMINI_ITERATION_PACING_MS);
+        }
+
         // Trim large old tool results to prevent context window overflow
         const trimmedMessages = this.trimToolMessagesForContext(messages);
 
@@ -3815,6 +3999,12 @@ export class AgentModeService {
 
         // Add LLM model to the response message
         responseMessage.llm = llmModel;
+        // ENG-1205: and, when the model that ran is not the one that was asked
+        // for, what was asked for — `llm` alone cannot distinguish "you picked
+        // this" from "you were given this".
+        if (turnModelCorrection) {
+          responseMessage.modelCorrection = turnModelCorrection;
+        }
 
         // Attach token usage from the LLM response to the message
         const responseUsage = response.usage;
@@ -4538,6 +4728,50 @@ export class AgentModeService {
         }
       }
 
+      // ENG-1205 AC3: the NAMED half of the same silence. ENG-1565 (below) fires
+      // on "reassess using a new model"; it deliberately does not fire on a
+      // message that names the model it wants, which is what the founders
+      // session actually contained ("Use Opus 5 model, and make sure you sort
+      // all of the 107 leads...", session d5898ffd, 2026-08-14). That request
+      // and the nine turns after it were answered with nothing.
+      //
+      // Runs BEFORE the generic acknowledgement and suppresses it on a hit: a
+      // message can trip both detectors ("switch to a different model, use Opus
+      // 5"), and two stacked notes saying the same thing is worse than one that
+      // names the model. The specific note is strictly more informative.
+      //
+      // `isAdmin` is the session owner's, already resolved above for the system
+      // prompt — so the entitlement branch of the copy costs no extra read.
+      //
+      // Kill switch: set AGENT_MODEL_MENTION_ACK=false to disable. Absent means ON.
+      let modelAckAppended = false;
+      if (content && !wasCancelled && !mockMode
+          && process.env.AGENT_MODEL_MENTION_ACK !== 'false') {
+        try {
+          const reconciled = reconcileModelMentionAck(
+            content,
+            messageContent,
+            llmModel,
+            this.getModelMentionIndex(),
+            (modelId) => this.isModelSelectableBy(modelId, isAdmin),
+          );
+          if (reconciled !== content) {
+            content = reconciled;
+            modelAckAppended = true;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                break;
+              }
+            }
+          }
+        } catch (modelMentionError) {
+          // Advisory, same reasoning as the reconcilers around it: never block
+          // delivery of a reply the user is waiting on over this note.
+          console.warn('AgentMode: model-mention acknowledgement failed', modelMentionError);
+        }
+      }
+
       // ENG-1565: model resolution reads ONLY the request's llmModel field (the
       // picker) — no code path parses chat text for an intent to switch/reassess
       // models. So a message like "reassess using a new model" is inert by
@@ -4554,7 +4788,7 @@ export class AgentModeService {
       // change the model despite the chat text.
       //
       // Kill switch: set AGENT_MODEL_REASSESS_ACK=false to disable. Absent means ON.
-      if (content && !wasCancelled && !mockMode
+      if (content && !wasCancelled && !mockMode && !modelAckAppended
           && process.env.AGENT_MODEL_REASSESS_ACK !== 'false') {
         try {
           const modelBefore = findLastAssistantModel(sessionHistory as any);
@@ -4701,6 +4935,16 @@ export class AgentModeService {
       wrappedError.originalMessage = error?.message || String(error);
       if (error?.status) wrappedError.status = error.status;
       if (error?.code) wrappedError.code = error.code;
+      // ENG-1670: whether the provider actually sent a Retry-After header is not
+      // guaranteed (OpenRouter's own docs: conditional, not promised even for a
+      // single-provider model). Rather than that staying an unanswerable question
+      // every time this fires, persist the answer for THIS occurrence — the last
+      // investigation into this exact failure class had no way to tell, because
+      // nothing captured it and the raw provider response doesn't survive past
+      // this catch block otherwise.
+      wrappedError.retryAfterHeaderPresent = Boolean((error as any)?.headers?.['retry-after'] || (error as any)?.headers?.['retry-after-ms']);
+      const retryAfterMs = getRetryAfterMs(error);
+      if (retryAfterMs !== undefined) wrappedError.retryAfterMs = retryAfterMs;
       if (partialResponseMessages.length > 0) {
         wrappedError.partialUsageMessages = partialResponseMessages;
       }
@@ -16914,7 +17158,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           // discovery impossible in-product (ENG-399). The pixel id is the dataset id that
           // GET_MATCH_QUALITY consumes, so derive it directly and issue no per-pixel call at all.
           // Same conclusion the lander pixel resolver already reached (metaService.ts).
-          const pixels = await metaService.listPixels(accountId, accessToken);
+          const { pixels, truncated } = await metaService.listPixels(accountId, accessToken);
           const results = pixels.map((pixel: any) => ({
             pixel_id: pixel.id,
             pixel_name: pixel.name,
@@ -16922,11 +17166,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             dataset_id: pixel.id,
             datasets: [{ id: pixel.id, name: pixel.name }]
           }));
-          return {
-            success: true,
-            message: `Found ${pixels.length} pixel(s); each pixel id doubles as its dataset id for GET_MATCH_QUALITY`,
-            pixels: results
-          };
+          // ENG-1625 follow-up: this used to be `Found ${pixels.length} pixel(s)` with no
+          // bound — the exact ENG-1476/ENG-1584 sentence shape.
+          return buildListResult({
+            payloadKey: 'pixels',
+            payload: results,
+            message: `${buildListMessage({
+              noun: 'pixel(s)',
+              totalCount: results.length,
+              truncated,
+              campaignScopable: false,
+            })} Each pixel id doubles as its dataset id for GET_MATCH_QUALITY.`,
+            truncated,
+          }) as MetaApiResult;
         }
         case 'GET_MATCH_QUALITY': {
           const datasetId = params.dataset_id;
@@ -17053,17 +17305,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // budget_remaining, bid_strategy), the intended ENG-398 change, for every plain LIST
       // caller regardless of this branch.
       const hasSelector = Boolean(options.campaignId || options.fields);
-      const campaigns = (hasSelector
+      const result = hasSelector
         ? await metaService.listCampaigns(accountId, accessToken, options)
-        : await metaService.listCampaigns(accountId, accessToken)) || [];
-      const totalCount = Array.isArray(campaigns) ? campaigns.length : 0;
+        : await metaService.listCampaigns(accountId, accessToken);
+      const campaigns = result?.campaigns ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} campaign(s)`,
-        campaigns: campaigns,
-        totalCount: totalCount
-      };
+      // ENG-1625 follow-up: this used to be `Found ${totalCount} campaign(s)` with no scope
+      // or bound — the exact ENG-1476/ENG-1584 sentence shape. Assembled via buildListResult
+      // so completeness metadata precedes the payload (S3 offload cut — see metaListScope.ts).
+      return buildListResult({
+        payloadKey: 'campaigns',
+        payload: campaigns,
+        message: buildListMessage({
+          noun: 'campaign(s)',
+          totalCount: campaigns.length,
+          truncated: result?.truncated,
+          // Campaign LIST has no parent scope to name (it either lists the whole account or
+          // fetches one campaign by id, never "campaigns scoped to X").
+          campaignScopable: false,
+        }),
+        truncated: result?.truncated,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       // A permission refusal from Meta is not a "no campaigns" result — throw the
@@ -17247,17 +17509,28 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // billing_event, destination_type, promoted_object, bid_strategy), the intended
       // ENG-398 change, for every plain LIST caller regardless of this branch.
       const hasSelector = Boolean(options.adSetId || options.fields);
-      const adSets = (hasSelector
+      const result = hasSelector
         ? await metaService.listAdSets(accountId, accessToken, campaignId, options)
-        : await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
-      const totalCount = Array.isArray(adSets) ? adSets.length : 0;
+        : await metaService.listAdSets(accountId, accessToken, campaignId);
+      const adSets = result?.adSets ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} ad set(s)`,
-        adSets: adSets,
-        totalCount: totalCount
-      };
+      // ENG-1625 follow-up: this used to be `Found ${totalCount} ad set(s)` with no scope or
+      // bound — the exact ENG-1476/ENG-1584 sentence shape, and campaign_id scoping went
+      // through a bare param Meta's docs do not list as supported on this edge (fixed in
+      // metaService.listAdSets to go through the campaign node instead).
+      return buildListResult({
+        payloadKey: 'adSets',
+        payload: adSets,
+        message: buildListMessage({
+          noun: 'ad set(s)',
+          totalCount: adSets.length,
+          scope: result?.scope,
+          truncated: result?.truncated,
+          campaignScopable: true,
+        }),
+        truncated: result?.truncated,
+        scope: result?.scope,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ad sets:', error);
@@ -19039,6 +19312,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     objective: string,
     quote: string,
     objectiveKind: string,
+    sourceQuestionId?: string,
   ): Promise<void> {
     const question = buildPendingUserQuestion({
       questionId: uuidv4(),
@@ -19050,7 +19324,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           consequence: 'Confirmed by the user\'s own words — not shown as a card.',
           recommended: true,
           why: `The user explicitly stated this: "${quote}"`,
-          payload: { objective },
+          payload: { objective, ...(sourceQuestionId ? { sourceQuestionId } : {}) },
         },
         {
           // Structural placeholder only — the primitive requires 2–4 options
@@ -19071,7 +19345,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       optionId: 'confirmed',
       delegated: false,
       answeredBy: 'user',
-      rationale: `Explicitly stated by the user: "${quote}"`,
+      rationale: sourceQuestionId
+        ? `Consumed answered objective card ${sourceQuestionId}`
+        : `Explicitly stated by the user: "${quote}"`,
       at: new Date().toISOString(),
     });
     await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
@@ -19193,6 +19469,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
     }
 
+    const { consumedQuestionIds, hasAnsweredObjectiveCard } = summarizeAnsweredObjectiveQuestions(
+      session?.pendingUserQuestion,
+      session?.answeredQuestions,
+      AgentModeService.META_OBJECTIVE_VALUES,
+    );
+    const looseCandidate = findAnsweredObjectiveCandidate(
+      session?.pendingUserQuestion,
+      session?.answeredQuestions,
+      {
+        accountId: account_id,
+        validObjectives: AgentModeService.META_OBJECTIVE_VALUES,
+        bindsLabel: (objective, text) => Boolean(AgentModeService.META_OBJECTIVE_KEYWORDS[objective]?.test(text)),
+        consumedQuestionIds,
+      },
+    );
+    if (looseCandidate) {
+      await this.persistExplicitObjectiveConfirmation(
+        sessionId,
+        looseCandidate.objective,
+        `answered objective card ${looseCandidate.question.questionId}`,
+        objectiveKind,
+        looseCandidate.question.questionId,
+      );
+      return { allowed: true, objective: looseCandidate.objective };
+    }
+
     // Path 3: nothing settled — surface the blocking ask ourselves. Never
     // proceed on a guess (this is the load-bearing refusal). Recommendation is
     // STATIC per the 80/20 design (Harsha, 2026-07-20) — OUTCOME_LEADS is the
@@ -19233,6 +19535,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const question = buildPendingUserQuestion({
       questionId: uuidv4(),
       question: 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.',
+      intro: hasAnsweredObjectiveCard
+        ? 'You answered an objective question earlier, but it did not match this campaign and account, so I need this one confirmed.'
+        : undefined,
       options,
       immutable: true,
       allowEmmaDecide: true,
@@ -19545,13 +19850,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       switch (action) {
         case 'LIST': {
-          const result = await metaService.listCustomAudiences(accountId, accessToken);
-          const audiences = Array.isArray(result) ? result : [];
-          return {
-            success: true,
-            message: `Found ${audiences.length} custom audience(s)`,
-            audiences: audiences
-          };
+          const { audiences, truncated } = await metaService.listCustomAudiences(accountId, accessToken);
+          // ENG-1625 follow-up: this used to be `Found ${audiences.length} custom audience(s)`
+          // with no bound — the exact ENG-1476/ENG-1584 sentence shape (the old code also
+          // hard-capped at 50 with no truncation signal past that cap).
+          return buildListResult({
+            payloadKey: 'audiences',
+            payload: audiences,
+            message: buildListMessage({
+              noun: 'custom audience(s)',
+              totalCount: audiences.length,
+              truncated,
+              campaignScopable: false,
+            }),
+            truncated,
+          }) as MetaApiResult;
         }
         case 'CREATE': {
           // Validate required fields
@@ -21600,11 +21913,237 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production' ? 'prod/AgentWeb/Google/Share' : 'dev/AgentWeb/Google/Share';
     const credentials = JSON.parse(await getSecret(secretName));
+    this.driveServiceAccountEmail = credentials.client_email || null;
     const auth = new google.auth.GoogleAuth({
       credentials,
       scopes: ['https://www.googleapis.com/auth/drive.readonly'],
     });
     return google.drive({ version: 'v3', auth });
+  }
+
+  private getGoogleDriveServiceAccountEmail(): string {
+    return this.driveServiceAccountEmail || 'the AgentWeb Google Drive service account';
+  }
+
+  /**
+   * ENG-1624: classify a Drive failure into a short, safe reason for a
+   * model-visible payload. Never put the raw error object (or its message)
+   * there — mirrors metaService.ts's drainCursor, which deliberately doesn't
+   * log/surface FacebookRequestError objects because a paged Graph URL carries
+   * the access token in its query string; a Drive error can carry similarly
+   * sensitive request context. The full error is still logged server-side by
+   * the caller, same as before — only this classified string reaches the model.
+   */
+  private classifyDriveError(err: any): string {
+    const code = err?.code || err?.status;
+    if (code === 403 || code === 401) return 'permission denied';
+    if (code === 429) return 'rate limited';
+    if (code === 400) return 'invalid request';
+    if (typeof err?.message === 'string' && /did not respond within/i.test(err.message)) {
+      return 'temporary Drive error (timed out)';
+    }
+    return 'temporary Drive error';
+  }
+
+  /**
+   * ENG-1624: getGoogleDriveFolderTreeIds bounds folder COUNT (maxFolders) and
+   * queryDriveFilesAcrossFolders bounds per-batch file COUNT (perBatchTarget),
+   * but neither bounded elapsed TIME — both await Drive list calls sequentially,
+   * so a large or slow-to-respond tree/query was many serial round-trips with no
+   * deadline. Same shape as metaService.ts's META_LIST_MAX_MS / drainCursor: a
+   * count bound limits WORK, not TIME, when calls are awaited one at a time.
+   *
+   * A Drive list call here fetches only id+name (folder discovery) or a handful
+   * of scalar fields (file listing) with no nested expansions, so it's a much
+   * lighter call than a Meta ad-list page with `creative{...}` expansion —
+   * intentionally far short of Meta's 45s: long enough that an ordinary
+   * customer's tree (tens of folders) finishes in a fraction of it, short
+   * enough that a pathological or throttled tree can't visibly stall a turn.
+   * Crossing it sets `truncated`/`capped` — the same "incomplete, do not
+   * conclude absence" signal the count bounds already use, not a new failure
+   * mode.
+   */
+  private static readonly DRIVE_LIST_WALK_MAX_MS = 15_000;
+
+  // ENG-1624: a registered gdrive: KB folder is authorized by its root ID only, but
+  // every Drive query in this file was scoped to `'<folderId>' in parents` — direct
+  // children only. A file living in a sub-folder (any depth) of a registered root
+  // resolved as not-found, and the sub-folder itself as "Not authorized" (our own
+  // flat allowlist check, not a real Google permission failure). This walks the
+  // folder tree from a registered root so callers can search/list across the whole
+  // tree instead of just its direct children. `restricted` surfaces sub-folders that
+  // couldn't be listed (e.g. an unshared shortcut target) so callers can give an
+  // actionable error instead of a bare "not found". `rootRestricted` is the same
+  // signal for the registered root itself — kept separate from `restricted` so it
+  // isn't reported to the caller as if it were a sub-folder found underneath itself.
+  // `truncated` is set when the `maxFolders` bound stops the walk before the whole
+  // tree was covered, so a caller can say "incomplete" instead of asserting absence.
+  private async getGoogleDriveFolderTreeIds(
+    drive: any,
+    rootFolderId: string,
+    maxFolders: number = 500
+  ): Promise<{
+    folderIds: string[];
+    restricted: Array<{ id: string; name: string }>;
+    rootRestricted: boolean;
+    truncated: boolean;
+    folderNames: Map<string, string>;
+  }> {
+    const folderIdSet = new Set<string>([rootFolderId]);
+    const folderIds: string[] = [rootFolderId];
+    const folderNames = new Map<string, string>();
+    const queue: string[] = [rootFolderId];
+    const restricted: Array<{ id: string; name: string }> = [];
+    let rootRestricted = false;
+    let truncated = false;
+    const deadline = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
+
+    while (queue.length > 0 && !truncated) {
+      if (Date.now() >= deadline) {
+        truncated = true;
+        break;
+      }
+      const current = queue.shift()!;
+      let pageToken: string | undefined;
+      do {
+        if (Date.now() >= deadline) {
+          truncated = true;
+          break;
+        }
+        let resp: any;
+        try {
+          // A per-request timeout was considered here (the loop-level deadline
+          // check above only runs BEFORE a request starts, not while awaiting
+          // one, so it can't interrupt a single hung call — same reasoning as
+          // metaService.ts's withReadDeadline). googleapis' MethodOptions does
+          // support one (it extends gaxios' GaxiosOptions, which declares
+          // `timeout?: number`), but only as a SECOND argument to `.list()` —
+          // every existing test asserting this call's argument shape asserts a
+          // single-argument call, so adding one would require rewriting
+          // passing regression pins rather than fixing a bug. Left as a
+          // follow-up; the elapsed-time bound below is the hard requirement
+          // and doesn't need it.
+          resp = await drive.files.list({
+            q: `'${current}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+            fields: 'nextPageToken, files(id, name)',
+            pageSize: 1000,
+            ...(pageToken && { pageToken }),
+            supportsAllDrives: true,
+            includeItemsFromAllDrives: true,
+          });
+        } catch (err: any) {
+          const code = err?.code || err?.status;
+          if (code === 403 || code === 401) {
+            if (current === rootFolderId) {
+              rootRestricted = true;
+            } else {
+              restricted.push({ id: current, name: folderNames.get(current) || current });
+            }
+          }
+          console.log(`AgentMode: Could not list subfolders of Drive folder ${current}:`, err);
+          break;
+        }
+
+        for (const f of resp.data.files || []) {
+          if (!f.id || folderIdSet.has(f.id)) continue;
+          if (folderIds.length >= maxFolders) {
+            truncated = true;
+            break;
+          }
+          folderIdSet.add(f.id);
+          folderIds.push(f.id);
+          if (f.name) folderNames.set(f.id, f.name);
+          queue.push(f.id);
+        }
+
+        pageToken = truncated ? undefined : (resp.data.nextPageToken || undefined);
+      } while (pageToken);
+    }
+
+    return { folderIds, restricted, rootRestricted, truncated, folderNames };
+  }
+
+  // ENG-1624: `'<id>' in parents` clauses joined with OR grow ~52 chars per Drive
+  // id (33-char id + boilerplate). `q` travels as a URL query parameter, so a
+  // 500-folder tree building one query risks a 400/414 from Drive rather than
+  // degrading gracefully. Chunk into batches and merge results de-duplicated by
+  // file id — a file with multiple parents can legitimately appear in more than
+  // one batch.
+  private static readonly DRIVE_FOLDER_QUERY_BATCH_SIZE = 50;
+
+  // ENG-1624 rework: this used to fetch a single page per batch (pageSize
+  // pageSizePerBatch, no nextPageToken follow-through), so a batch holding more
+  // matches than that one page silently dropped the rest. `perBatchTarget` is now
+  // pursued via in-batch pagination — following nextPageToken — until either the
+  // batch is genuinely exhausted or `perBatchTarget` items have been accumulated
+  // FOR THAT BATCH. The target is deliberately per-batch, not a budget shared
+  // across batches: each batch is fetched with the same `orderBy`, so the
+  // per-batch top-K is a superset of what the true global top-K could need from
+  // that batch — a shared budget would let one batch starve another and return
+  // the wrong page contents, not just a wrong total. `capped` reports whether any
+  // batch stopped at its target with more available, i.e. whether the merged
+  // result can be trusted as exhaustive.
+  private async queryDriveFilesAcrossFolders(
+    drive: any,
+    folderIds: string[],
+    extraClause: string,
+    fields: string,
+    perBatchTarget: number,
+    orderBy?: string
+  ): Promise<{ files: Map<string, any>; capped: boolean }> {
+    const merged = new Map<string, any>();
+    let capped = false;
+    // ENG-1624: same time bound as getGoogleDriveFolderTreeIds, and for the same
+    // reason — batches and pages here are walked sequentially with no overall
+    // bound otherwise. Crossing it sets `capped`, reusing the existing
+    // "incomplete, do not conclude absence" signal.
+    const deadline = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
+    for (let i = 0; i < folderIds.length; i += AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE) {
+      if (Date.now() >= deadline) {
+        capped = true;
+        break;
+      }
+      const batch = folderIds.slice(i, i + AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE);
+      const parentClause = `(${batch.map(id => `'${id}' in parents`).join(' or ')})`;
+      let batchCount = 0;
+      let pageToken: string | undefined;
+      do {
+        if (Date.now() >= deadline) {
+          capped = true;
+          pageToken = undefined;
+          break;
+        }
+        // See getGoogleDriveFolderTreeIds for why a per-request timeout isn't
+        // added here: it needs a second call argument, which would break every
+        // existing test asserting this call's (single-argument) shape.
+        const resp = await drive.files.list({
+          q: `${parentClause} and ${extraClause}`,
+          // nextPageToken must be requested explicitly — it isn't returned by
+          // default, which is exactly why the old single-page fetch had no way
+          // to know it was truncating.
+          fields: `nextPageToken, ${fields}`,
+          pageSize: Math.min(perBatchTarget - batchCount, 1000),
+          ...(pageToken && { pageToken }),
+          ...(orderBy && { orderBy }),
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+        });
+        const files = resp.data.files || [];
+        for (const f of files) {
+          if (f.id) merged.set(f.id, f);
+        }
+        batchCount += files.length;
+        pageToken = resp.data.nextPageToken || undefined;
+        if (batchCount >= perBatchTarget && pageToken) {
+          // Hit this batch's target with more still available — stop here
+          // rather than draining a huge folder, but the caller needs to know
+          // this batch's contribution isn't necessarily complete.
+          capped = true;
+          pageToken = undefined;
+        }
+      } while (pageToken);
+    }
+    return { files: merged, capped };
   }
 
   private extractGoogleFileId(urlOrId: string): string {
@@ -21678,6 +22217,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Limit max results to 10
       const limitedMaxResults = Math.min(maxResults, 10);
 
+      // ENG-1624: set when a registered root's folder tree couldn't be fully
+      // walked/read (truncated by maxFolders, or a root/sub-folder 403'd) — the
+      // Drive portion of these results is then not exhaustive, and the final
+      // message must say so rather than reading as a complete search.
+      let driveScanIncomplete = false;
+
       // Search platform knowledge base (both public and private)
       const searchResults = await searchPlatformKnowledgeBase(query, limitedMaxResults, userId);
 
@@ -21698,17 +22243,33 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const folders = await this.getUserGoogleDriveFolders(userId);
           if (folders.length > 0) {
             const drive = await this.getGoogleDriveClient();
-            // Build query: search across all shared folders
-            const parentClauses = folders.map(f => `'${f.folderId}' in parents`).join(' or ');
-            const driveResponse = await drive.files.list({
-              q: `(${parentClauses}) and fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
-              fields: 'files(id, name, mimeType, parents)',
-              pageSize: limitedMaxResults,
-              supportsAllDrives: true,
-              includeItemsFromAllDrives: true,
-            });
+            // Walk each registered root's whole folder tree (ENG-1624) so search
+            // covers files nested in sub-folders too, not just direct children.
+            const folderTrees = await Promise.all(
+              folders.map(f => this.getGoogleDriveFolderTreeIds(drive, f.folderId))
+            );
+            if (folderTrees.some(t => t.truncated || t.rootRestricted || t.restricted.length > 0)) {
+              driveScanIncomplete = true;
+            }
+            // De-dupe across roots: a file with multiple parents (or two registered
+            // roots sharing a sub-tree) can otherwise appear twice.
+            const allFolderIds = [...new Set(folderTrees.flatMap(t => t.folderIds))];
+            const { files: driveFilesMap, capped: driveQueryCapped } = await this.queryDriveFilesAcrossFolders(
+              drive,
+              allFolderIds,
+              `fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
+              'files(id, name, mimeType, parents)',
+              limitedMaxResults
+            );
+            // A per-batch cap on the file query itself is a different reason the
+            // Drive portion isn't exhaustive than an unreadable folder — fold it
+            // into the same signal so a capped search result set isn't presented
+            // as exhaustive either.
+            if (driveQueryCapped) {
+              driveScanIncomplete = true;
+            }
 
-            const driveFiles = driveResponse.data.files || [];
+            const driveFiles = Array.from(driveFilesMap.values()).slice(0, limitedMaxResults);
             for (const file of driveFiles) {
               // Read file content for text-based files
               if (file.id && file.mimeType && !file.mimeType.startsWith('application/vnd.google-apps.folder')) {
@@ -21811,11 +22372,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (results.length === 0) {
         return {
           success: true,
-          message: `No knowledge base results found for "${query}"`,
+          message: driveScanIncomplete
+            ? `No knowledge base results found for "${query}" — note: some Google Drive folders could not be fully scanned, so this is not confirmed exhaustive.`
+            : `No knowledge base results found for "${query}"`,
           query,
           results: [],
           returnedResults: 0,
-          hasMore: false
+          hasMore: false,
+          ...(driveScanIncomplete && { scanIncomplete: true })
         };
       }
 
@@ -21839,15 +22403,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // more exists upstream, which is why the message says "raise max_results"
       // rather than promising a specific remainder.
       const hasMore = results.length > boundedResults.length;
+      const scanIncompleteNote = driveScanIncomplete
+        ? ' Some Google Drive folders could not be fully scanned, so this is not confirmed exhaustive.'
+        : '';
       return {
         success: true,
-        message: hasMore
+        message: (hasMore
           ? `Showing the first ${boundedResults.length} knowledge base results for "${query}" — raise max_results to see more.`
-          : `Found ${boundedResults.length} knowledge base results for "${query}"`,
+          : `Found ${boundedResults.length} knowledge base results for "${query}"`) + scanIncompleteNote,
         query,
         results: boundedResults,
         returnedResults: boundedResults.length,
-        hasMore
+        hasMore,
+        ...(driveScanIncomplete && { scanIncomplete: true })
       };
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
@@ -22138,43 +22706,110 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       // Include Google Drive shared folders
+      // ENG-1624: set when Drive enumeration failed entirely (outer catch below)
+      // — a listing that's missing every Drive source must say so, not read as
+      // "this account has no Drive folders."
+      let driveEnumerationFailed = false;
       if (!options?.kb_type || options.kb_type === 'google-drive') try {
         const folders = await this.getUserGoogleDriveFolders(userId);
         if (folders.length > 0) {
           const drive = await this.getGoogleDriveClient();
           const driveLimit = options?.limit ?? 100;
           const driveOffset = options?.offset ?? 0;
-          for (const folder of folders) {
+
+          // ENG-1624: walk every registered root's tree up front. Two
+          // registered roots can be in an ancestor/descendant relationship —
+          // a customer registers both a parent folder and one of its own
+          // sub-folders (e.g. Harsha's mitigation for Phoenix, which added
+          // the ratio sub-folders directly alongside the already-registered
+          // parent). Now that this PR walks the whole tree instead of direct
+          // children only, the parent's listing legitimately includes the
+          // child's files too, so the same file can appear under two
+          // entries. Walking every tree first lets nesting be detected
+          // STRUCTURALLY (one root's resolved folderIds actually containing
+          // another registered root's own id) before any file query runs.
+          // getGoogleDriveFolderTreeIds never rejects — its own Drive errors
+          // are caught internally as restricted/rootRestricted — so this
+          // can't silently drop a root the way a failing Promise.all
+          // normally would.
+          const treeResults = await Promise.all(
+            folders.map(folder =>
+              this.getGoogleDriveFolderTreeIds(drive, folder.folderId).then(tree => ({ folder, ...tree }))
+            )
+          );
+
+          for (const { folder, folderIds, restricted, rootRestricted, truncated } of treeResults) {
             try {
-              // Build Drive query with optional date filter
-              let driveQuery = `'${folder.folderId}' in parents and trashed = false`;
+              // Structural, not name-based: a root only counts as nested
+              // when its OWN id was actually discovered inside another
+              // root's resolved tree. This can't false-positive from a
+              // truncated ancestor scan — truncation just means some
+              // folders were never visited, so an undiscovered descendant
+              // simply isn't found here either, and no relationship is
+              // claimed (falls back to the plain file-id dedup in the
+              // top-level totalFiles below).
+              const ancestor = treeResults.find(other =>
+                other.folder.folderId !== folder.folderId &&
+                other.folderIds.includes(folder.folderId)
+              );
+
+              // Exclude folder entries themselves — previously these showed up as
+              // 0-byte files instead of being descended into.
+              let extraClause = `mimeType != 'application/vnd.google-apps.folder' and trashed = false`;
               if (options?.modified_after) {
-                driveQuery += ` and modifiedTime >= '${options.modified_after}T00:00:00'`;
+                extraClause += ` and modifiedTime >= '${options.modified_after}T00:00:00'`;
               }
               if (options?.modified_before) {
-                driveQuery += ` and modifiedTime <= '${options.modified_before}T23:59:59'`;
+                extraClause += ` and modifiedTime <= '${options.modified_before}T23:59:59'`;
               }
 
-              // Fetch enough to support pagination: offset + limit
-              const response = await drive.files.list({
-                q: driveQuery,
-                fields: 'files(id, name, mimeType, size, modifiedTime)',
-                orderBy: 'modifiedTime desc',
-                pageSize: Math.min(driveOffset + driveLimit, 1000),
-                supportsAllDrives: true,
-                includeItemsFromAllDrives: true,
-              });
+              // ENG-1624: the tree can span more folders than fit in one `q` string
+              // (see queryDriveFilesAcrossFolders), so this is queried in batches and
+              // merged/de-duplicated by file id — NOT per batch, or offset/limit
+              // pagination below would silently skip and repeat files across batch
+              // boundaries.
+              //
+              // Per-batch target is offset+limit+1, not offset+limit: each batch is
+              // fetched at the same `orderBy`, so the global top-K of the union is
+              // always a subset of the union of each batch's own top-K — the `files`
+              // returned are correct regardless of the target. The `+1` is what makes
+              // `hasMore` exact: the merged set then holds at least
+              // min(trueTotal, K+1) files, so `allFiles.length > offset+limit` is
+              // true exactly when more files really exist beyond this page.
+              const perBatchTarget = driveOffset + driveLimit + 1;
+              const { files: filesMap, capped } = await this.queryDriveFilesAcrossFolders(
+                drive,
+                folderIds,
+                extraClause,
+                'files(id, name, mimeType, size, modifiedTime)',
+                perBatchTarget,
+                'modifiedTime desc'
+              );
 
-              const allFiles = (response.data.files || []).map((f) => ({
-                fileName: f.name || 'unknown',
-                fileSize: f.size ? parseInt(f.size, 10) : 0,
-                mimeType: f.mimeType || 'unknown',
-                driveFileId: f.id,
-                modifiedTime: f.modifiedTime,
-              }));
+              // Per-batch `orderBy` only sorts within its own batch; re-sort the
+              // merged set so global ordering (and therefore offset/limit slicing)
+              // is correct.
+              const allFiles = Array.from(filesMap.values())
+                .map((f) => ({
+                  fileName: f.name || 'unknown',
+                  fileSize: f.size ? parseInt(f.size, 10) : 0,
+                  mimeType: f.mimeType || 'unknown',
+                  driveFileId: f.id,
+                  modifiedTime: f.modifiedTime,
+                }))
+                .sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || ''));
 
               const totalMatchingFiles = allFiles.length;
               const driveFiles = allFiles.slice(driveOffset, driveOffset + driveLimit);
+              // ENG-1624: a scan that stopped early (folder-count bound or the root
+              // itself being unreadable) must not present its partial file list as
+              // complete.
+              const folderScanIncomplete = truncated || rootRestricted;
+              // A batch that hit its per-batch target means `totalMatchingFiles`
+              // wasn't fully counted — it's a floor, not an exact total. Getting an
+              // exact total would mean fully paginating every batch, which isn't
+              // worth the API cost just to render one page.
+              const totalFilesIsLowerBound = capped;
 
               knowledgeBases.push({
                 identifier: `gdrive:${folder.folderId}`,
@@ -22183,17 +22818,48 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 updatedAt: allFiles.length > 0 ? allFiles[0].modifiedTime : undefined,
                 files: driveFiles,
                 totalFiles: totalMatchingFiles,
-                hasMore: driveOffset + driveLimit < totalMatchingFiles,
+                hasMore: allFiles.length > driveOffset + driveLimit,
                 offset: driveOffset,
                 limit: driveLimit,
+                ...(totalFilesIsLowerBound && { totalFilesIsLowerBound: true }),
+                // ENG-1624: a sub-folder that couldn't be listed (e.g. an unshared
+                // shortcut target) previously shrank the listing with no signal to
+                // the caller. Name it so the caller can request access instead of
+                // silently seeing an incomplete file list.
+                ...(restricted.length > 0 && { inaccessibleFolders: restricted.map(r => r.name) }),
+                ...(rootRestricted && { inaccessibleRoot: true }),
+                ...(folderScanIncomplete && { folderScanIncomplete: true }),
+                // ENG-1624: this root's own id was found inside another
+                // registered root's resolved tree — its files are already
+                // counted there too. Kept as its own entry (never silently
+                // dropped), just labeled, so a saved gdrive:<this-id>
+                // reference still resolves exactly as it does today.
+                ...(ancestor && { nestedUnder: `gdrive:${ancestor.folder.folderId}` }),
               });
-            } catch (folderErr) {
+            } catch (folderErr: any) {
+              // ENG-1624: this used to just log and move on, which silently
+              // dropped the whole KB from the response — indistinguishable from
+              // "this folder has no files." Round 2 (the BFS walk + batched,
+              // paginated file query) turned a single files.list call into many,
+              // multiplying how often a Drive error lands here. A failure for
+              // one folder must not abort the others (kept below, same as
+              // before) — but the caller now still sees this source, marked as
+              // failed rather than absent.
               console.log(`AgentMode: Error listing files in Drive folder ${folder.name}:`, folderErr);
+              knowledgeBases.push({
+                identifier: `gdrive:${folder.folderId}`,
+                name: folder.name,
+                type: 'google-drive',
+                files: [],
+                listingFailed: true,
+                listingFailedReason: this.classifyDriveError(folderErr),
+              });
             }
           }
         }
       } catch (driveError) {
         console.error('AgentMode: Error listing Google Drive shared folders:', driveError);
+        driveEnumerationFailed = true;
       }
 
       // Include ClickUp docs
@@ -22364,10 +23030,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.error('AgentMode: Error listing Foreplay ads:', foreplayError);
       }
 
-      const totalFiles = knowledgeBases.reduce(
-        (sum: number, kb: any) => sum + (kb.files?.length || 0),
-        0
-      );
+      // ENG-1624: a plain per-KB sum double-counts once nesting/multi-parent
+      // overlap between registered Drive roots is possible (see the
+      // treeResults/nestedUnder logic above) — the same underlying Drive file
+      // can legitimately appear in more than one root's `files` array. De-dupe
+      // by driveFileId for google-drive entries specifically; other KB types
+      // (private/public/ClickUp/Foreplay) have no equivalent shared identity
+      // and are summed as before.
+      const seenDriveFileIds = new Set<string>();
+      const totalFiles = knowledgeBases.reduce((sum: number, kb: any) => {
+        if (kb.type !== 'google-drive') return sum + (kb.files?.length || 0);
+        let kbCount = 0;
+        for (const f of kb.files || []) {
+          if (!f.driveFileId || !seenDriveFileIds.has(f.driveFileId)) {
+            if (f.driveFileId) seenDriveFileIds.add(f.driveFileId);
+            kbCount++;
+          }
+        }
+        return sum + kbCount;
+      }, 0);
 
       const appliedFiltersEarly = [
         options?.modified_after ? `modified_after=${options.modified_after}` : null,
@@ -22384,30 +23065,63 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Point the model to the catalog so empty doesn't read as "Docs unavailable".
         // Scoped to the explicit drive query: an unfiltered/other empty gets the plain
         // message (this path lists all sources, and nudging Docs there is off-topic).
-        const message = options?.kb_type === 'google-drive'
-          ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
-          : 'No knowledge bases found';
+        //
+        // ENG-1624: an empty result caused by driveEnumerationFailed is a DIFFERENT
+        // claim than a genuinely empty account — the former means "we don't know",
+        // the latter means "there is nothing." Collapsing them into the same plain
+        // message would tell a caller no Drive folders are registered when the
+        // truth is the enumeration call itself failed.
+        let message: string;
+        if (driveEnumerationFailed) {
+          message = options?.kb_type === 'google-drive'
+            ? 'Google Drive sources could not be enumerated — this does not mean no folders are registered, only that the enumeration attempt itself failed. Try again.'
+            : 'No knowledge bases found in other sources, and Google Drive sources could not be enumerated — this does not mean no Drive folders exist, only that the enumeration attempt itself failed. Try again.';
+        } else {
+          message = options?.kb_type === 'google-drive'
+            ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
+            : 'No knowledge bases found';
+        }
         return {
           success: true,
           message,
           knowledge_bases: [],
           totalKnowledgeBases: 0,
           totalFiles: 0,
+          ...(driveEnumerationFailed && { driveEnumerationFailed: true }),
           ...(appliedFiltersEarly.length > 0 && { appliedFilters: appliedFiltersEarly }),
         };
       }
 
       const hasMorePages = knowledgeBases.some((kb: any) => kb.hasMore);
+      // ENG-1624: a folder-scan cutoff (folder-count bound, or the root/a
+      // sub-folder being unreadable) is a different signal than "more files exist
+      // to paginate" — it means the listing itself may be incomplete, not just
+      // capped.
+      const hasIncompleteFolderScan = knowledgeBases.some((kb: any) => kb.folderScanIncomplete);
+      // A Drive KB's file query hit its per-batch target — its `totalFiles` is a
+      // floor, not an exact count, even though `files`/`hasMore` are still correct.
+      const hasLowerBoundTotals = knowledgeBases.some((kb: any) => kb.totalFilesIsLowerBound);
+      // A Drive KB whose listing errored outright — shown with empty `files`, not
+      // dropped, but that empty array must not be mistaken for "no files exist."
+      const failedDriveCount = knowledgeBases.filter((kb: any) => kb.listingFailed).length;
+      // A Drive KB nested inside another registered Drive KB's tree — its files
+      // are already reflected in the parent's own listing (and in the
+      // de-duplicated totalFiles above), not additional ones.
+      const hasNestedRoots = knowledgeBases.some((kb: any) => kb.nestedUnder);
       const appliedFilters = appliedFiltersEarly;
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasIncompleteFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be listed and are shown as empty — their contents are unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles,
         ...(appliedFilters.length > 0 && { appliedFilters }),
         ...(hasMorePages && { hasMore: true }),
+        ...(hasIncompleteFolderScan && { folderScanIncomplete: true }),
+        ...(hasLowerBoundTotals && { totalFilesIsLowerBound: true }),
+        ...(failedDriveCount > 0 && { driveListingFailures: failedDriveCount }),
+        ...(driveEnumerationFailed && { driveEnumerationFailed: true }),
       };
     } catch (error) {
       console.error('AgentMode: Error listing knowledge base files:', error);
@@ -22729,22 +23443,66 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     const folderMeta = folders.find(f => f.folderId === folderId);
+    const rootName = folderMeta?.name || folderId;
 
     try {
       const drive = await this.getGoogleDriveClient();
 
-      // Find the file by name in the folder
-      const listResponse = await drive.files.list({
-        q: `'${folderId}' in parents and name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
-        fields: 'files(id, name, mimeType, size, modifiedTime)',
-        pageSize: 1,
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-      });
+      // Find the file by name anywhere in the registered folder's tree (ENG-1624:
+      // not just its direct children).
+      const { folderIds, restricted, rootRestricted, truncated: folderScanTruncated, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
+      // lets an ambiguous name (same filename in two sub-folders) be detected and
+      // reported instead of one candidate being picked arbitrarily.
+      const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
+        drive,
+        folderIds,
+        `name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
+        'files(id, name, mimeType, size, modifiedTime, parents)',
+        2
+      );
+      const files = Array.from(filesMap.values());
 
-      const files = listResponse.data.files || [];
       if (files.length === 0) {
-        return { success: false, message: `File "${fileName}" not found in Google Drive folder "${folderMeta?.name || folderId}"` };
+        if (rootRestricted) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (restricted.length > 0) {
+          const names = restricted.map(r => `"${r.name}"`).join(', ');
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}". Sub-folder(s) ${names} could not be accessed — share them with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (folderScanTruncated) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder tree is large enough that the scan stopped before covering it entirely, so this is not a confirmed absence.`
+          };
+        }
+        return { success: false, message: `File "${fileName}" not found in Google Drive folder "${rootName}"` };
+      }
+
+      if (files.length > 1) {
+        // A Drive file can have more than one parent — index [0] may be a
+        // folder outside the tree that was actually searched, which would
+        // point someone at the wrong place. Prefer whichever parent is
+        // actually in `folderIds`; only fall back to [0] when none of the
+        // file's parents resolve within the searched tree (shouldn't happen
+        // in practice, since the file matched a query scoped to folderIds).
+        const folderIdSet = new Set(folderIds);
+        const candidates = files.map(f => {
+          const parentId = (f.parents || []).find((p: string) => folderIdSet.has(p)) ?? (f.parents || [])[0];
+          const location = parentId === folderId ? rootName : (folderNames.get(parentId) || parentId || 'an unresolved sub-folder');
+          return `"${f.name}" in "${location}"`;
+        }).join(', ');
+        return {
+          success: false,
+          message: `Multiple files named "${fileName}" found in Google Drive folder "${rootName}": ${candidates}. Use a more specific file name, or move the duplicates so names are unique.`
+        };
       }
 
       const file = files[0];
@@ -22817,21 +23575,66 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (!folders.some(f => f.folderId === folderId)) {
       return { success: false, message: 'Not authorized to access this Google Drive folder' };
     }
+    const rootName = folders.find(f => f.folderId === folderId)?.name || folderId;
 
     try {
       const drive = await this.getGoogleDriveClient();
 
-      const listResponse = await drive.files.list({
-        q: `'${folderId}' in parents and name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
-        fields: 'files(id, name, mimeType, size)',
-        pageSize: 1,
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-      });
+      // Search the whole folder tree rooted at the registered folder (ENG-1624),
+      // not just its direct children.
+      const { folderIds, restricted, rootRestricted, truncated, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
+      // lets an ambiguous name (same filename in two sub-folders) be detected and
+      // reported instead of one candidate being materialized arbitrarily.
+      const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
+        drive,
+        folderIds,
+        `name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
+        'files(id, name, mimeType, size, parents)',
+        2
+      );
+      const files = Array.from(filesMap.values());
 
-      const files = listResponse.data.files || [];
       if (files.length === 0) {
+        if (rootRestricted) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (restricted.length > 0) {
+          const names = restricted.map(r => `"${r.name}"`).join(', ');
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder. Sub-folder(s) ${names} could not be accessed — share them with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (truncated) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder tree is large enough that the scan stopped before covering it entirely, so this is not a confirmed absence.`
+          };
+        }
         return { success: false, message: `File "${fileName}" not found in Google Drive folder` };
+      }
+
+      if (files.length > 1) {
+        // A Drive file can have more than one parent — index [0] may be a
+        // folder outside the tree that was actually searched, which would
+        // point someone at the wrong place. Prefer whichever parent is
+        // actually in `folderIds`; only fall back to [0] when none of the
+        // file's parents resolve within the searched tree (shouldn't happen
+        // in practice, since the file matched a query scoped to folderIds).
+        const folderIdSet = new Set(folderIds);
+        const candidates = files.map(f => {
+          const parentId = (f.parents || []).find((p: string) => folderIdSet.has(p)) ?? (f.parents || [])[0];
+          const location = parentId === folderId ? rootName : (folderNames.get(parentId) || parentId || 'an unresolved sub-folder');
+          return `"${f.name}" in "${location}"`;
+        }).join(', ');
+        return {
+          success: false,
+          message: `Multiple files named "${fileName}" found in Google Drive folder "${rootName}": ${candidates}. Use a more specific file name, or move the duplicates so names are unique.`
+        };
       }
 
       const file = files[0];
@@ -30260,368 +31063,462 @@ ${strippedHtml}`;
     updates: Array<{ stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string }>,
     sessionId: string
   ): Promise<any> {
-    try {
-      // ENG-1188 (Greptile): consistentRead, not the default eventually-consistent
-      // read -- a turn that writes an "Image generated" marker and then
-      // immediately calls set_work_plan_status in the same turn can otherwise race
-      // a stale replica and see too few images, rejecting genuinely-complete work
-      // as insufficientAssets. ENG-510 built this parameter for exactly this "just
-      // wrote it, must see it now" shape (agentModeController.ts already uses it
-      // for the analogous timed-out-run read).
-      const session = await chatbotDb.getChatSession(sessionId, true);
-      if (!session || !session.workPlan) {
-        return {
-          success: false,
-          message: 'No work plan found in this session. Create one first using create_work_plan.'
-        };
-      }
-
-      // ENG-1188 (Greptile follow-up): each step's PRE-BATCH resolvedAt/completedAt
-      // AND status, captured before any update in THIS call runs. workPlan.steps
-      // below starts as the SAME array session.workPlan.steps points at (the
-      // spread on the next line only copies the top-level object), so an
-      // in-place `workPlan.steps[i] = {...}` replacement further down is visible
-      // through both references — reading a "live" cutoff would see this batch's
-      // OWN just-assigned timestamps, collapsing every step resolved together in
-      // one call to the same instant and wrongly excluding assets a later step in
-      // that same batch actually produced in an earlier turn.
-      //
-      // Status is captured alongside the timestamp (CodeRabbit, PR #2430): a step
-      // that was completed/skipped and later reset to 'pending' (e.g. its assets
-      // need regenerating) keeps its old resolvedAt/completedAt untouched — only
-      // a 'completed'/'skipped' transition refreshes those fields. Blindly trusting
-      // that stale timestamp as a cutoff for a later step would wrongly widen the
-      // asset-count window with assets from the step's earlier, now-superseded
-      // attempt — see the cutoff walk below for how a reset step's PRE-BATCH
-      // status routes it to its fresh LIVE timestamp instead.
-      const originalStepStateByCount = new Map<number, { resolvedAt: string | undefined; status: string }>(
-        session.workPlan.steps.map((s: any) => [s.stepCount, { resolvedAt: s.resolvedAt || s.completedAt, status: s.status }])
-      );
-
-      const workPlan = { ...session.workPlan };
-      const updatedSteps: Array<{ stepCount: number; title: string; status: string }> = [];
-      const notFoundSteps: number[] = [];
-      const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
-      const outOfOrderSteps: Array<{ stepCount: number; title: string; pendingSteps: string[] }> = [];
-
-      // Get function call counts from session (make a copy to modify)
-      const calledFunctionCounts = { ...(session.calledFunctions || {}) };
-      let countsModified = false;
-
-      const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
-
-      // Process each update
-      for (const update of updates) {
-        const stepIndex = workPlan.steps.findIndex(s => s.stepCount === update.stepCount);
-
-        if (stepIndex < 0) {
-          notFoundSteps.push(update.stepCount);
+    // ENG-1626: set_work_plan_status persists workplan step progression — a
+    // production session (822c1ed4) hit set_work_plan_status twice while the
+    // customer watched "Step 9 of 10" live, with no system-level retry, so a
+    // transient DynamoDB/network blip anywhere in the read-modify-write below
+    // surfaced immediately as a customer-visible failure. One transparent retry
+    // for a classified-transient error (timeout/network/rate_limit/upstream_5xx)
+    // before giving up — the same classifier the model-visible retry guidance
+    // already uses, so this and that guidance never disagree about what's
+    // retryable. Deliberate gate refusals (missing steps, out-of-order
+    // completion, etc.) never throw, so they pass straight through on the
+    // first attempt untouched.
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        return await this.setWorkPlanStatusAttempt(updates, sessionId);
+      } catch (error) {
+        lastError = error;
+        const errorClass = classifyToolErrorClass(error);
+        if (attempt < 2 && isRetryableErrorClass(errorClass)) {
+          console.warn(`AgentMode: set_work_plan_status failed with a transient error (${errorClass}) for session ${sessionId}; retrying once`);
           continue;
         }
+        break;
+      }
+    }
+    console.error('AgentMode: Error setting work plan status:', lastError);
+    return {
+      success: false,
+      message: 'Failed to update work plan status',
+      error: lastError instanceof Error ? lastError.message : 'Unknown error'
+    };
+  }
 
-        const step = workPlan.steps[stepIndex];
+  private async setWorkPlanStatusAttempt(
+    updates: Array<{ stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string }>,
+    sessionId: string
+  ): Promise<any> {
+    // ENG-1188 (Greptile): consistentRead, not the default eventually-consistent
+    // read -- a turn that writes an "Image generated" marker and then
+    // immediately calls set_work_plan_status in the same turn can otherwise race
+    // a stale replica and see too few images, rejecting genuinely-complete work
+    // as insufficientAssets. ENG-510 built this parameter for exactly this "just
+    // wrote it, must see it now" shape (agentModeController.ts already uses it
+    // for the analogous timed-out-run read).
+    const session = await chatbotDb.getChatSession(sessionId, true);
+    if (!session || !session.workPlan) {
+      return {
+        success: false,
+        message: 'No work plan found in this session. Create one first using create_work_plan.'
+      };
+    }
 
-        // Cross-step ordering gate (ENG-1188 root cause fault #3): the xCures
-        // incident marked "QA, Contact Sheet & Delivery" completed while "Render
-        // the Full Size Matrix" — an earlier step — was still pending, so delivery
-        // never actually gated on the rendering it claimed to deliver. Neither gate
-        // below catches this: both only look at the step being completed, never at
-        // whether the steps before it are actually done. Checked against the
-        // in-progress workPlan.steps (not a snapshot from before the loop), so
-        // several steps completed in the same batch, in order, chain correctly —
-        // and a batch that completes them out of order is caught per-step.
-        if (update.status === 'completed') {
-          const pendingEarlierSteps = workPlan.steps.filter(
-            (s: any) => s.stepCount < step.stepCount && s.status !== 'completed' && s.status !== 'skipped'
-          );
-          if (pendingEarlierSteps.length > 0) {
-            outOfOrderSteps.push({
-              stepCount: update.stepCount,
-              title: step.title,
-              pendingSteps: pendingEarlierSteps.map((s: any) => `${s.stepCount} "${s.title}"`),
-            });
-            continue; // Skip updating this step
+    // ENG-1626 (code review): the retry wrapper in setWorkPlanStatus can re-invoke
+    // this attempt after a classified-transient error whose underlying DynamoDB
+    // writes actually committed server-side (ack-lost) -- the client sees a
+    // timeout/network failure, but updateSessionWorkPlan/updateCalledFunctions
+    // below are unconditional SETs with no idempotency key. Blindly re-running a
+    // step's mutation would re-decrement an already-decremented
+    // calledFunctionCounts and re-stamp resolvedAt, corrupting the asset-count
+    // cutoff window for later steps.
+    //
+    // ENG-1626 (CodeRabbit follow-up): an early return here for the whole batch
+    // was too broad -- it also skipped the post-write side effects below
+    // (updateSessionWorkPlanInputRequest, i.e. the NEXT step's decision card,
+    // and addAssociatedSkills). If attempt 1's updateSessionWorkPlan committed
+    // but a later call in that same attempt threw, the retry would see every
+    // step already at its target status and return success WITHOUT ever
+    // creating the decision card or installing the next step's skills -- the
+    // exact "customer never sees a card" failure this issue is about. Those
+    // calls are independently safe to repeat (updateSessionWorkPlanInputRequest
+    // is guarded by failIfAwaitingExists and returns null rather than
+    // throwing if one already exists; addAssociatedSkills filters against
+    // already-associated ids), so only the unsafe per-step mutation
+    // (calledFunctionCounts decrement, resolvedAt/completedAt stamp) is
+    // skipped below -- scoped per step, not per batch, so a batch mixing an
+    // already-applied step with a genuinely new one handles each correctly.
+    const alreadyAppliedStepCounts = new Set(
+      updates
+        .filter(update => {
+          const step = session.workPlan!.steps.find((s: any) => s.stepCount === update.stepCount);
+          return !!step && step.status === update.status;
+        })
+        .map(update => update.stepCount)
+    );
+
+    // ENG-1188 (Greptile follow-up): each step's PRE-BATCH resolvedAt/completedAt
+    // AND status, captured before any update in THIS call runs. workPlan.steps
+    // below starts as the SAME array session.workPlan.steps points at (the
+    // spread on the next line only copies the top-level object), so an
+    // in-place `workPlan.steps[i] = {...}` replacement further down is visible
+    // through both references — reading a "live" cutoff would see this batch's
+    // OWN just-assigned timestamps, collapsing every step resolved together in
+    // one call to the same instant and wrongly excluding assets a later step in
+    // that same batch actually produced in an earlier turn.
+    //
+    // Status is captured alongside the timestamp (CodeRabbit, PR #2430): a step
+    // that was completed/skipped and later reset to 'pending' (e.g. its assets
+    // need regenerating) keeps its old resolvedAt/completedAt untouched — only
+    // a 'completed'/'skipped' transition refreshes those fields. Blindly trusting
+    // that stale timestamp as a cutoff for a later step would wrongly widen the
+    // asset-count window with assets from the step's earlier, now-superseded
+    // attempt — see the cutoff walk below for how a reset step's PRE-BATCH
+    // status routes it to its fresh LIVE timestamp instead.
+    const originalStepStateByCount = new Map<number, { resolvedAt: string | undefined; status: string }>(
+      session.workPlan.steps.map((s: any) => [s.stepCount, { resolvedAt: s.resolvedAt || s.completedAt, status: s.status }])
+    );
+
+    const workPlan = { ...session.workPlan };
+    const updatedSteps: Array<{ stepCount: number; title: string; status: string }> = [];
+    const notFoundSteps: number[] = [];
+    const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
+    const outOfOrderSteps: Array<{ stepCount: number; title: string; pendingSteps: string[] }> = [];
+
+    // Get function call counts from session (make a copy to modify)
+    const calledFunctionCounts = { ...(session.calledFunctions || {}) };
+    let countsModified = false;
+
+    const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
+
+    // Process each update
+    for (const update of updates) {
+      const stepIndex = workPlan.steps.findIndex(s => s.stepCount === update.stepCount);
+
+      if (stepIndex < 0) {
+        notFoundSteps.push(update.stepCount);
+        continue;
+      }
+
+      const step = workPlan.steps[stepIndex];
+
+      // ENG-1626 (CodeRabbit follow-up): this step already carries the
+      // requested status from a prior (ack-lost) attempt -- report it as
+      // updated so the persistence/input-request/skills block below still
+      // runs, and still apply `notes` (a plain overwrite with no side
+      // effects, same as the normal path below), but skip every gate and the
+      // resolvedAt/completedAt/calledFunctionCounts mutation for it (those
+      // already ran once; re-running them would corrupt state).
+      if (alreadyAppliedStepCounts.has(update.stepCount)) {
+        workPlan.steps[stepIndex] = { ...workPlan.steps[stepIndex], notes: update.notes };
+        updatedSteps.push({ stepCount: update.stepCount, title: step.title, status: update.status });
+        continue;
+      }
+
+      // Cross-step ordering gate (ENG-1188 root cause fault #3): the xCures
+      // incident marked "QA, Contact Sheet & Delivery" completed while "Render
+      // the Full Size Matrix" — an earlier step — was still pending, so delivery
+      // never actually gated on the rendering it claimed to deliver. Neither gate
+      // below catches this: both only look at the step being completed, never at
+      // whether the steps before it are actually done. Checked against the
+      // in-progress workPlan.steps (not a snapshot from before the loop), so
+      // several steps completed in the same batch, in order, chain correctly —
+      // and a batch that completes them out of order is caught per-step.
+      if (update.status === 'completed') {
+        const pendingEarlierSteps = workPlan.steps.filter(
+          (s: any) => s.stepCount < step.stepCount && s.status !== 'completed' && s.status !== 'skipped'
+        );
+        if (pendingEarlierSteps.length > 0) {
+          outOfOrderSteps.push({
+            stepCount: update.stepCount,
+            title: step.title,
+            pendingSteps: pendingEarlierSteps.map((s: any) => `${s.stepCount} "${s.title}"`),
+          });
+          continue; // Skip updating this step
+        }
+      }
+
+      // Validate required function calls if marking as completed
+      if (update.status === 'completed' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+        // Count how many times each function is required
+        const requiredCounts: Record<string, number> = {};
+        for (const fn of step.requiredFunctionCalls) {
+          requiredCounts[fn] = (requiredCounts[fn] || 0) + 1;
+        }
+
+        // Check if we have enough calls for each required function
+        const missing: string[] = [];
+        for (const [fn, requiredCount] of Object.entries(requiredCounts)) {
+          const availableCount = calledFunctionCounts[fn] || 0;
+          if (availableCount < requiredCount) {
+            missing.push(`${fn} (need ${requiredCount}, have ${availableCount})`);
           }
         }
 
-        // Validate required function calls if marking as completed
-        if (update.status === 'completed' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
-          // Count how many times each function is required
-          const requiredCounts: Record<string, number> = {};
-          for (const fn of step.requiredFunctionCalls) {
-            requiredCounts[fn] = (requiredCounts[fn] || 0) + 1;
-          }
-
-          // Check if we have enough calls for each required function
-          const missing: string[] = [];
-          for (const [fn, requiredCount] of Object.entries(requiredCounts)) {
-            const availableCount = calledFunctionCounts[fn] || 0;
-            if (availableCount < requiredCount) {
-              missing.push(`${fn} (need ${requiredCount}, have ${availableCount})`);
-            }
-          }
-
-          if (missing.length > 0) {
-            missingFunctionCalls.push({
-              stepCount: update.stepCount,
-              title: step.title,
-              missing
-            });
-            continue; // Skip updating this step
-          }
-
-          // If validation passed and marking as completed, decrement the function counts
-          for (const fn of step.requiredFunctionCalls) {
-            calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
-            countsModified = true;
-          }
+        if (missing.length > 0) {
+          missingFunctionCalls.push({
+            stepCount: update.stepCount,
+            title: step.title,
+            missing
+          });
+          continue; // Skip updating this step
         }
 
-        // Asset-count completion gate. When a step declares expectedAssetCount, it may
-        // not be marked completed until IT has actually produced that many media
-        // assets. This prevents the xCures failure mode: a "Generate 3 Images Per
-        // Hook — 18 total" step being marked done with only 3 images produced (the model
-        // self-reported "Hooks 2-6 generate-pending" yet completed the step). The
-        // required-function-calls gate above could not catch this — it only checked that
-        // generate_image was called ≥1×, and the call counter was inflated to 76 by
-        // non-producing confirmation-gate returns. Counting real assets is the fix.
-        // The user can still legitimately reduce scope via modify_work_plan (lowering or
-        // clearing expectedAssetCount), so this never becomes an unrecoverable block.
+        // If validation passed and marking as completed, decrement the function counts
+        for (const fn of step.requiredFunctionCalls) {
+          calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
+          countsModified = true;
+        }
+      }
+
+      // Asset-count completion gate. When a step declares expectedAssetCount, it may
+      // not be marked completed until IT has actually produced that many media
+      // assets. This prevents the xCures failure mode: a "Generate 3 Images Per
+      // Hook — 18 total" step being marked done with only 3 images produced (the model
+      // self-reported "Hooks 2-6 generate-pending" yet completed the step). The
+      // required-function-calls gate above could not catch this — it only checked that
+      // generate_image was called ≥1×, and the call counter was inflated to 76 by
+      // non-producing confirmation-gate returns. Counting real assets is the fix.
+      // The user can still legitimately reduce scope via modify_work_plan (lowering or
+      // clearing expectedAssetCount), so this never becomes an unrecoverable block.
+      //
+      // ENG-1188: scoped to images generated SINCE the previous step resolved, not
+      // the whole session — otherwise an earlier step's images satisfy a later
+      // step's requirement without it producing anything of its own (e.g. step 1's
+      // 18 hero images would silently cover step 2's own "3 required" declaration).
+      // No earlier step (or none with a resolvedAt yet) means no cutoff, matching
+      // the session-wide count this replaces for step 1.
+      //
+      // ENG-1188 (Greptile follow-up): the cutoff comes from each earlier step's
+      // PRE-BATCH resolvedAt (originalStepStateByCount, captured before this call
+      // started), walking back to the nearest earlier step that already had one —
+      // NOT the live in-progress workPlan.steps. A step resolved earlier in this
+      // SAME batch shares this instant as its live timestamp, which would exclude
+      // assets this step actually produced in an earlier turn; a step resolved
+      // in this same batch simply contributes no cutoff of its own, same as a
+      // step that has never resolved.
+      //
+      // ENG-1188 (CodeRabbit follow-up): a step can be reset to 'pending' after
+      // having been completed/skipped before (e.g. its assets need
+      // regenerating) — only 'completed'/'skipped' transitions stamp
+      // resolvedAt/completedAt, so a reset step KEEPS its stale timestamp from
+      // the earlier, now-superseded attempt. The ordering gate above means the
+      // only way we can reach a 'completed' update here with an earlier step's
+      // PRE-BATCH status of 'pending' is if that earlier step is ALSO being
+      // resolved within this very batch (otherwise it would still be pending
+      // live, too, and the ordering gate would have rejected this update
+      // already). In that case, trust the fresh, just-stamped LIVE timestamp
+      // for that step instead of its stale pre-batch one — that boundary is
+      // exactly "when did this step's redo actually finish," which correctly
+      // excludes both the stale pre-reset attempt's assets AND any redo-work
+      // assets produced leading up to this exact re-completion. A step with NO
+      // prior resolution at all (genuinely first-time-completed within this
+      // batch) still contributes no cutoff, same as the existing behavior.
+      if (update.status === 'completed'
+        && typeof step.expectedAssetCount === 'number'
+        && step.expectedAssetCount > 0) {
+        const earlierStepCounts = workPlan.steps
+          .filter((s: any) => s.stepCount < step.stepCount)
+          .map((s: any) => s.stepCount as number)
+          .sort((a: number, b: number) => b - a); // nearest first
+        let sinceIso: string | undefined;
+        for (const count of earlierStepCounts) {
+          const preBatch = originalStepStateByCount.get(count);
+          if (!preBatch) continue;
+          if (preBatch.status === 'completed' || preBatch.status === 'skipped') {
+            if (preBatch.resolvedAt) { sinceIso = preBatch.resolvedAt; break; }
+            continue;
+          }
+          if (preBatch.resolvedAt) {
+            const live = workPlan.steps.find((s: any) => s.stepCount === count);
+            if (live?.resolvedAt) { sinceIso = live.resolvedAt; break; }
+          }
+        }
+        // ENG-1331: extractGeneratedImageFilenames only recognizes generate_image's
+        // own marker, so a step whose deliverable is Playwright-rendered
+        // screenshots (no generate_image call at all) would always read 0 there.
+        // extractProducedAssetCount reads the same persisted toolCalls ledger for
+        // every known asset-producing tool.
         //
-        // ENG-1188: scoped to images generated SINCE the previous step resolved, not
-        // the whole session — otherwise an earlier step's images satisfy a later
-        // step's requirement without it producing anything of its own (e.g. step 1's
-        // 18 hero images would silently cover step 2's own "3 required" declaration).
-        // No earlier step (or none with a resolvedAt yet) means no cutoff, matching
-        // the session-wide count this replaces for step 1.
-        //
-        // ENG-1188 (Greptile follow-up): the cutoff comes from each earlier step's
-        // PRE-BATCH resolvedAt (originalStepStateByCount, captured before this call
-        // started), walking back to the nearest earlier step that already had one —
-        // NOT the live in-progress workPlan.steps. A step resolved earlier in this
-        // SAME batch shares this instant as its live timestamp, which would exclude
-        // assets this step actually produced in an earlier turn; a step resolved
-        // in this same batch simply contributes no cutoff of its own, same as a
-        // step that has never resolved.
-        //
-        // ENG-1188 (CodeRabbit follow-up): a step can be reset to 'pending' after
-        // having been completed/skipped before (e.g. its assets need
-        // regenerating) — only 'completed'/'skipped' transitions stamp
-        // resolvedAt/completedAt, so a reset step KEEPS its stale timestamp from
-        // the earlier, now-superseded attempt. The ordering gate above means the
-        // only way we can reach a 'completed' update here with an earlier step's
-        // PRE-BATCH status of 'pending' is if that earlier step is ALSO being
-        // resolved within this very batch (otherwise it would still be pending
-        // live, too, and the ordering gate would have rejected this update
-        // already). In that case, trust the fresh, just-stamped LIVE timestamp
-        // for that step instead of its stale pre-batch one — that boundary is
-        // exactly "when did this step's redo actually finish," which correctly
-        // excludes both the stale pre-reset attempt's assets AND any redo-work
-        // assets produced leading up to this exact re-completion. A step with NO
-        // prior resolution at all (genuinely first-time-completed within this
-        // batch) still contributes no cutoff, same as the existing behavior.
-        if (update.status === 'completed'
-          && typeof step.expectedAssetCount === 'number'
-          && step.expectedAssetCount > 0) {
-          const earlierStepCounts = workPlan.steps
-            .filter((s: any) => s.stepCount < step.stepCount)
-            .map((s: any) => s.stepCount as number)
-            .sort((a: number, b: number) => b - a); // nearest first
-          let sinceIso: string | undefined;
-          for (const count of earlierStepCounts) {
-            const preBatch = originalStepStateByCount.get(count);
-            if (!preBatch) continue;
-            if (preBatch.status === 'completed' || preBatch.status === 'skipped') {
-              if (preBatch.resolvedAt) { sinceIso = preBatch.resolvedAt; break; }
-              continue;
-            }
-            if (preBatch.resolvedAt) {
-              const live = workPlan.steps.find((s: any) => s.stepCount === count);
-              if (live?.resolvedAt) { sinceIso = live.resolvedAt; break; }
-            }
-          }
-          // ENG-1331: extractGeneratedImageFilenames only recognizes generate_image's
-          // own marker, so a step whose deliverable is Playwright-rendered
-          // screenshots (no generate_image call at all) would always read 0 there.
-          // extractProducedAssetCount reads the same persisted toolCalls ledger for
-          // every known asset-producing tool.
-          //
-          // When the step names its own expectedAssetCountTools, trust that
-          // explicitly and skip the max-with-legacy-signal blend below: the whole
-          // point of naming the tool(s) is precision, and blending in
-          // extractGeneratedImageFilenames' generate_image count would reopen the
-          // exact ambiguity the author resolved by naming their tool(s) at all (e.g.
-          // an unrelated generate_image call elsewhere in the step inflating a
-          // screenshot-only count). Without a declared list, take the max of both
-          // signals so neither detection path can pull the count DOWN relative to
-          // the other — the safe default for a step that hasn't disambiguated.
-          const producedAssetCount = step.expectedAssetCountTools?.length
-            ? extractProducedAssetCount(session.messages, sinceIso, step.expectedAssetCountTools)
-            : Math.max(
-                AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
-                extractProducedAssetCount(session.messages, sinceIso),
-              );
-          if (producedAssetCount < step.expectedAssetCount) {
-            insufficientAssets.push({
-              stepCount: update.stepCount,
-              title: step.title,
-              expected: step.expectedAssetCount,
-              produced: producedAssetCount,
-            });
-            continue; // Skip updating this step
-          }
-        }
-
-        // Update the step status
-        const resolvedNow = update.status === 'completed' || update.status === 'skipped'
-          ? new Date().toISOString()
-          : undefined;
-        workPlan.steps[stepIndex] = {
-          ...workPlan.steps[stepIndex],
-          status: update.status,
-          notes: update.notes,
-          completedAt: update.status === 'completed' ? resolvedNow : workPlan.steps[stepIndex].completedAt,
-          // ENG-1188 (Greptile follow-up): set for 'skipped' too, unlike completedAt
-          // — see the field's doc comment in chatbotService.ts for why this can't
-          // just reuse completedAt.
-          resolvedAt: resolvedNow || workPlan.steps[stepIndex].resolvedAt,
-        };
-
-        updatedSteps.push({
-          stepCount: update.stepCount,
-          title: workPlan.steps[stepIndex].title,
-          status: update.status
-        });
-      }
-
-      // Ordering gate failure — a step was completed while an earlier step in the
-      // plan is still pending. Same all-or-nothing shape as the two gates below:
-      // the caller can just resend the batch in the correct order.
-      if (outOfOrderSteps.length > 0) {
-        const errorDetails = outOfOrderSteps.map(oos =>
-          `Step ${oos.stepCount} "${oos.title}": earlier step(s) not yet done: ${oos.pendingSteps.join(', ')}`
-        ).join('\n');
-
-        return {
-          success: false,
-          message: 'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
-          outOfOrderSteps,
-          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nComplete (or explicitly skip) the earlier step(s) first, then mark this step as completed.`
-        };
-      }
-
-      // Check if there are missing function calls - this is a critical error
-      if (missingFunctionCalls.length > 0) {
-        const errorDetails = missingFunctionCalls.map(mfc =>
-          `Step ${mfc.stepCount} "${mfc.title}": missing required function calls: ${mfc.missing.join(', ')}`
-        ).join('\n');
-
-        return {
-          success: false,
-          message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
-          missingFunctionCalls,
-          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nPlease make the required function calls first, then mark the steps as completed.`
-        };
-      }
-
-      // Asset-count gate failure — the step's declared media assets are not all produced.
-      if (insufficientAssets.length > 0) {
-        const errorDetails = insufficientAssets.map(ia =>
-          `Step ${ia.stepCount} "${ia.title}": ${ia.produced} of ${ia.expected} required images/assets have been generated (${ia.expected - ia.produced} still missing)`
-        ).join('\n');
-
-        return {
-          success: false,
-          message: 'Cannot mark steps as completed. The required number of assets has not been generated yet.',
-          insufficientAssets,
-          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nGenerate the remaining assets with generate_image, then mark the step completed. If the user has explicitly approved a smaller set, call modify_work_plan to lower the step's expected asset count first.`
-        };
-      }
-
-      // Check if any steps were not found
-      if (notFoundSteps.length > 0 && updatedSteps.length === 0) {
-        return {
-          success: false,
-          message: `Steps not found: ${notFoundSteps.join(', ')}`
-        };
-      }
-
-      // Only update if there are changes
-      if (updatedSteps.length > 0) {
-        workPlan.updatedAt = new Date().toISOString();
-        // Update the session (will throw error if stepCount is not sequential)
-        await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
-
-        // A configured input belongs to the step that just became active, not
-        // to a particular portal. Persist the same request the customer portal
-        // renders and an MCP client elicits natively. Answered historical
-        // requests may be replaced; a concurrent live request never is.
-        const nextInputStep = workPlan.steps
-          .sort((a: any, b: any) => a.stepCount - b.stepCount)
-          .find((s: any) => s.status === 'pending' && s.inputRequest);
-        if (nextInputStep?.inputRequest) {
-          await chatbotDb.updateSessionWorkPlanInputRequest(
-            sessionId,
-            buildWorkPlanInputRequest({
-              ...nextInputStep.inputRequest,
-              requestId: uuidv4(),
-              stepCount: nextInputStep.stepCount,
-            }),
-            { failIfAwaitingExists: true },
-          );
-        }
-
-        // Update function counts if they were modified
-        if (countsModified) {
-          await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
-        }
-
-        // Auto-install skills for the next pending step
-        const completedStepCounts = updatedSteps.filter(s => s.status === 'completed').map(s => s.stepCount);
-        if (completedStepCounts.length > 0) {
-          const nextPendingStep = workPlan.steps
-            .sort((a: any, b: any) => a.stepCount - b.stepCount)
-            .find((s: any) => s.status === 'pending');
-          if (nextPendingStep?.skillIds?.length) {
-            try {
-              const currentAssociated = session.associatedSkills || [];
-              const newSkillIds = nextPendingStep.skillIds.filter((id: string) => !currentAssociated.includes(id));
-              if (newSkillIds.length > 0) {
-                await chatbotDb.addAssociatedSkills(sessionId, newSkillIds);
-                console.log(`AgentMode: Auto-installed skills for step ${nextPendingStep.stepCount}: ${newSkillIds.join(', ')}`);
-              }
-            } catch (skillErr) {
-              console.error('AgentMode: Error auto-installing skills for next step:', skillErr);
-            }
-          }
+        // When the step names its own expectedAssetCountTools, trust that
+        // explicitly and skip the max-with-legacy-signal blend below: the whole
+        // point of naming the tool(s) is precision, and blending in
+        // extractGeneratedImageFilenames' generate_image count would reopen the
+        // exact ambiguity the author resolved by naming their tool(s) at all (e.g.
+        // an unrelated generate_image call elsewhere in the step inflating a
+        // screenshot-only count). Without a declared list, take the max of both
+        // signals so neither detection path can pull the count DOWN relative to
+        // the other — the safe default for a step that hasn't disambiguated.
+        const producedAssetCount = step.expectedAssetCountTools?.length
+          ? extractProducedAssetCount(session.messages, sinceIso, step.expectedAssetCountTools)
+          : Math.max(
+              AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
+              extractProducedAssetCount(session.messages, sinceIso),
+            );
+        if (producedAssetCount < step.expectedAssetCount) {
+          insufficientAssets.push({
+            stepCount: update.stepCount,
+            title: step.title,
+            expected: step.expectedAssetCount,
+            produced: producedAssetCount,
+          });
+          continue; // Skip updating this step
         }
       }
 
-      const message = updatedSteps.length === 1
-        ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
-        : `Updated ${updatedSteps.length} step${updatedSteps.length > 1 ? 's' : ''}`;
+      // Update the step status
+      const resolvedNow = update.status === 'completed' || update.status === 'skipped'
+        ? new Date().toISOString()
+        : undefined;
+      workPlan.steps[stepIndex] = {
+        ...workPlan.steps[stepIndex],
+        status: update.status,
+        notes: update.notes,
+        completedAt: update.status === 'completed' ? resolvedNow : workPlan.steps[stepIndex].completedAt,
+        // ENG-1188 (Greptile follow-up): set for 'skipped' too, unlike completedAt
+        // — see the field's doc comment in chatbotService.ts for why this can't
+        // just reuse completedAt.
+        resolvedAt: resolvedNow || workPlan.steps[stepIndex].resolvedAt,
+      };
 
-      const formattedContent = updatedSteps.map(s =>
-        `Updated step ${s.stepCount} "${s.title}" to ${s.status}`
+      updatedSteps.push({
+        stepCount: update.stepCount,
+        title: workPlan.steps[stepIndex].title,
+        status: update.status
+      });
+    }
+
+    // Ordering gate failure — a step was completed while an earlier step in the
+    // plan is still pending. Same all-or-nothing shape as the two gates below:
+    // the caller can just resend the batch in the correct order.
+    if (outOfOrderSteps.length > 0) {
+      const errorDetails = outOfOrderSteps.map(oos =>
+        `Step ${oos.stepCount} "${oos.title}": earlier step(s) not yet done: ${oos.pendingSteps.join(', ')}`
       ).join('\n');
 
       return {
-        success: updatedSteps.length > 0,
-        message: notFoundSteps.length > 0
-          ? `${message}. Steps not found: ${notFoundSteps.join(', ')}`
-          : message,
-        updatedSteps,
-        notFoundSteps: notFoundSteps.length > 0 ? notFoundSteps : undefined,
-        formattedContent
-      };
-    } catch (error) {
-      console.error('AgentMode: Error setting work plan status:', error);
-      return {
         success: false,
-        message: 'Failed to update work plan status',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        // ENG-1626: this is a deliberate business-rule gate, not a malfunction --
+        // blocked/reason lets recordToolFailure (agentToolGatewayService) recognize
+        // it as a ToolResultPolicyBlockedError and skip it, the same telemetry
+        // carve-out ENG-1636 established. Without this, a self-corrected refusal
+        // like this one incremented failedFunctions.set_work_plan_status and read
+        // as an infra flake on the failure-cluster dashboard.
+        blocked: true,
+        reason: 'workplan_out_of_order',
+        message: 'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
+        outOfOrderSteps,
+        formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nComplete (or explicitly skip) the earlier step(s) first, then mark this step as completed.`
       };
     }
+
+    // Check if there are missing function calls - this is a critical error
+    if (missingFunctionCalls.length > 0) {
+      const errorDetails = missingFunctionCalls.map(mfc =>
+        `Step ${mfc.stepCount} "${mfc.title}": missing required function calls: ${mfc.missing.join(', ')}`
+      ).join('\n');
+
+      return {
+        success: false,
+        // ENG-1626: deliberate gate, see the out-of-order gate above for why
+        // blocked/reason is set here.
+        blocked: true,
+        reason: 'workplan_missing_function_calls',
+        message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
+        missingFunctionCalls,
+        formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nPlease make the required function calls first, then mark the steps as completed.`
+      };
+    }
+
+    // Asset-count gate failure — the step's declared media assets are not all produced.
+    if (insufficientAssets.length > 0) {
+      const errorDetails = insufficientAssets.map(ia =>
+        `Step ${ia.stepCount} "${ia.title}": ${ia.produced} of ${ia.expected} required images/assets have been generated (${ia.expected - ia.produced} still missing)`
+      ).join('\n');
+
+      return {
+        success: false,
+        // ENG-1626: deliberate gate, see the out-of-order gate above for why
+        // blocked/reason is set here.
+        blocked: true,
+        reason: 'workplan_insufficient_assets',
+        message: 'Cannot mark steps as completed. The required number of assets has not been generated yet.',
+        insufficientAssets,
+        formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nGenerate the remaining assets with generate_image, then mark the step completed. If the user has explicitly approved a smaller set, call modify_work_plan to lower the step's expected asset count first.`
+      };
+    }
+
+    // Check if any steps were not found
+    if (notFoundSteps.length > 0 && updatedSteps.length === 0) {
+      return {
+        success: false,
+        // ENG-1626: deliberate gate (bad stepCount), see the out-of-order gate
+        // above for why blocked/reason is set here.
+        blocked: true,
+        reason: 'workplan_step_not_found',
+        message: `Steps not found: ${notFoundSteps.join(', ')}`
+      };
+    }
+
+    // Only update if there are changes
+    if (updatedSteps.length > 0) {
+      workPlan.updatedAt = new Date().toISOString();
+      // Update the session (will throw error if stepCount is not sequential)
+      await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      // A configured input belongs to the step that just became active, not
+      // to a particular portal. Persist the same request the customer portal
+      // renders and an MCP client elicits natively. Answered historical
+      // requests may be replaced; a concurrent live request never is.
+      const nextInputStep = workPlan.steps
+        .sort((a: any, b: any) => a.stepCount - b.stepCount)
+        .find((s: any) => s.status === 'pending' && s.inputRequest);
+      if (nextInputStep?.inputRequest) {
+        await chatbotDb.updateSessionWorkPlanInputRequest(
+          sessionId,
+          buildWorkPlanInputRequest({
+            ...nextInputStep.inputRequest,
+            requestId: uuidv4(),
+            stepCount: nextInputStep.stepCount,
+          }),
+          { failIfAwaitingExists: true },
+        );
+      }
+
+      // Update function counts if they were modified
+      if (countsModified) {
+        await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
+      }
+
+      // Auto-install skills for the next pending step
+      const completedStepCounts = updatedSteps.filter(s => s.status === 'completed').map(s => s.stepCount);
+      if (completedStepCounts.length > 0) {
+        const nextPendingStep = workPlan.steps
+          .sort((a: any, b: any) => a.stepCount - b.stepCount)
+          .find((s: any) => s.status === 'pending');
+        if (nextPendingStep?.skillIds?.length) {
+          try {
+            const currentAssociated = session.associatedSkills || [];
+            const newSkillIds = nextPendingStep.skillIds.filter((id: string) => !currentAssociated.includes(id));
+            if (newSkillIds.length > 0) {
+              await chatbotDb.addAssociatedSkills(sessionId, newSkillIds);
+              console.log(`AgentMode: Auto-installed skills for step ${nextPendingStep.stepCount}: ${newSkillIds.join(', ')}`);
+            }
+          } catch (skillErr) {
+            console.error('AgentMode: Error auto-installing skills for next step:', skillErr);
+          }
+        }
+      }
+    }
+
+    const message = updatedSteps.length === 1
+      ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
+      : `Updated ${updatedSteps.length} step${updatedSteps.length > 1 ? 's' : ''}`;
+
+    const formattedContent = updatedSteps.map(s =>
+      `Updated step ${s.stepCount} "${s.title}" to ${s.status}`
+    ).join('\n');
+
+    return {
+      success: updatedSteps.length > 0,
+      message: notFoundSteps.length > 0
+        ? `${message}. Steps not found: ${notFoundSteps.join(', ')}`
+        : message,
+      updatedSteps,
+      notFoundSteps: notFoundSteps.length > 0 ? notFoundSteps : undefined,
+      formattedContent
+    };
   }
 
   public async listBooks(userId: string, type?: string, status?: string): Promise<any> {
@@ -31697,7 +32594,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountsWithOwnerIncludingOrgShared, getAccountByIdConsistent } = await import('./connectedAccountsDb');
+      const { getAccountsWithOwnerIncludingOrgShared, getAccountByIdConsistent, SOCIAL_POSTING_PLATFORMS } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       // Fetch all accessible accounts (own + org-shared) once, so org-shared accounts
@@ -31706,7 +32603,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // which returns null for accounts owned by an org member — use this instead.
       const allAccounts = await getAccountsWithOwnerIncludingOrgShared(userId);
       const socialAccounts = allAccounts.filter((a: any) =>
-        ['twitter', 'linkedin', 'instagram', 'youtube'].includes(a.platform)
+        (SOCIAL_POSTING_PLATFORMS as readonly string[]).includes(a.platform)
       );
 
       let account: any;
@@ -33490,10 +34387,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const { list_id, lead_id } = args;
           if (!list_id || !lead_id) throw new Error('list_id and lead_id are required for update-conversation-history');
 
-          // Resolve the Unipile attendee/provider ID for this contact
+          // Resolve the Unipile attendee/provider ID for this contact. When a raw
+          // provider_id is supplied directly (not a profile_url), it has not been
+          // validated against Unipile yet — resolveProviderId only validates the
+          // profile_url path. getMessagesWithContact treats a 404 from Unipile's
+          // chat_attendee lookup as "never messaged" (ENG-1623), which is
+          // indistinguishable from a 404 caused by an invalid/nonexistent
+          // provider_id. Without this check, a bad provider_id would silently
+          // "succeed" with 0 messages instead of surfacing a clear error.
           const providerId = isUrl
             ? await linkedInOutreachService.resolveProviderId(target, true, account_id)
-            : target;
+            : await linkedInOutreachService.getProfile(target, account_id).then(() => target);
 
           // Load the lead to get the normalized LinkedIn URL used as the storage key
           const { crmDb } = await import('./db');
@@ -36470,6 +37374,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return { success: false, error: err?.message ?? 'HubSpot API call failed.', hubspotError: err?.response?.data ?? null, status: err?.response?.status ?? null };
     }
   }
+
+  /**
+   * Emma tool: read-only Attio lead counts, for CPL/attribution reporting,
+   * plus Attio list/list-entry management. Extracted to
+   * services/agentMode/attioTools.ts (self-contained, no monolith coupling)
+   * per this file's subtraction-biased complexity policy.
+   */
+  public async handleAttioApi(userId: string, args: any): Promise<any> {
+    return handleAttioApiImpl(userId, args);
+  }
+
 
 }
 
