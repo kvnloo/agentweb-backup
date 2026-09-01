@@ -4,7 +4,11 @@
  *   2. GenerateMarketingResponseWorkerService — drain-aware shutdown
  *   3. agentModeController — 503 guard when cron is disabled
  *   4. cronJobRegistry — drains concurrently with the worker shutdown
+ *   5. server.ts — drain-before-close ordering (ENG-1189)
  */
+
+import fs from 'fs';
+import path from 'path';
 
 // --------------------------------------------------------------------------
 // 1. instanceState
@@ -193,5 +197,79 @@ describe('cronJobRegistry drains concurrently with the worker shutdown', () => {
     // If the two ran sequentially this would be ~400ms; concurrently it's ~250ms.
     expect(elapsed).toBeGreaterThanOrEqual(240);
     expect(elapsed).toBeLessThan(400);
+  });
+});
+
+// --------------------------------------------------------------------------
+// 5. server.ts — drain-before-close ordering (ENG-1189)
+//
+// server.ts can't be `require`d directly in tests — importing it runs
+// `server.listen(...)` as a real side effect (see chatSocketHandler.ts's own
+// comment on this). So, like nginxProxyBuffers.test.ts does for EB config,
+// this asserts the invariant against the source text instead of behavior:
+// every MCP tool self-call (mcpFetch) loops back into THIS process's own
+// listener via http://localhost:${PORT}. If server.close()/io.close() ever
+// move back above the drain wait, in-flight self-calls break unrecoverably
+// again — not transiently, since a closed listener refuses every retry — for
+// as long as the process takes to actually exit (production-verified up to
+// several minutes: session 2318c99c-6b45-47ae-95cb-12fe85939c8d, 2026-08-12).
+// --------------------------------------------------------------------------
+describe('server.ts shutdown sequencing (source-pinned, ENG-1189)', () => {
+  const serverSrc = fs.readFileSync(
+    path.join(__dirname, '../server.ts'),
+    'utf8'
+  );
+
+  it('drains the worker/cron/session in-flight work before closing the HTTP listener', () => {
+    const drainCallIndex = serverSrc.indexOf('generateMarketingResponseWorkerService.shutdown(),');
+    const serverCloseIndex = serverSrc.indexOf('server.close((err)');
+
+    expect(drainCallIndex).toBeGreaterThan(-1);
+    expect(serverCloseIndex).toBeGreaterThan(-1);
+    expect(drainCallIndex).toBeLessThan(serverCloseIndex);
+  });
+
+  it('drains the worker/cron/session in-flight work before closing Socket.IO', () => {
+    const drainCallIndex = serverSrc.indexOf('generateMarketingResponseWorkerService.shutdown(),');
+    const ioCloseIndex = serverSrc.indexOf('io.close((err)');
+
+    expect(drainCallIndex).toBeGreaterThan(-1);
+    expect(ioCloseIndex).toBeGreaterThan(-1);
+    expect(drainCallIndex).toBeLessThan(ioCloseIndex);
+  });
+
+  it('tracks in-flight interactive Agent Mode turns as part of the drain', () => {
+    expect(serverSrc).toMatch(/drainActiveSessionGenerations/);
+  });
+
+  it('tracks the Emma-chatbot socket turn — the one path with no other in-flight coverage', () => {
+    const messageHandlerSection = serverSrc.slice(
+      serverSrc.indexOf("socket.on('message'"),
+      serverSrc.indexOf("socket.on('message'") + 400
+    );
+    expect(messageHandlerSection).toMatch(/cronJobRegistry\.track\('chatbotTurn',\s*handleSocketChatMessage/);
+  });
+});
+
+describe('agentModeController verifiedGenerate — drain coverage (ENG-1189)', () => {
+  it('tracks the interactive verifiedGenerate call via cronJobRegistry, not activeSessionGenerations', () => {
+    const controllerSrc = fs.readFileSync(
+      path.join(__dirname, '../controllers/agentModeController.ts'),
+      'utf8'
+    );
+
+    // verifiedGenerate has no per-session concurrency lock (unlike /generate),
+    // so reusing activeSessionGenerations here would be wrong: a second
+    // concurrent call for the same session would race the first call's
+    // add/delete and could clear tracking while the first is still running.
+    const verifiedGenerateIndex = controllerSrc.indexOf('async verifiedGenerate(req: Request, res: Response)');
+    const trackCallIndex = controllerSrc.indexOf("cronJobRegistry.track('verifiedGenerateTurn', runVerifiedChat");
+
+    expect(verifiedGenerateIndex).toBeGreaterThan(-1);
+    // 'verifiedGenerateTurn' is a job-name coined specifically for this call
+    // site, so a single occurrence positioned after the method declaration
+    // is enough to confirm it's inside verifiedGenerate's own body.
+    expect(trackCallIndex).toBeGreaterThan(verifiedGenerateIndex);
+    expect(controllerSrc.indexOf("cronJobRegistry.track('verifiedGenerateTurn'", trackCallIndex + 1)).toBe(-1);
   });
 });
