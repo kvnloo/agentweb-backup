@@ -260,13 +260,21 @@ io.on('connection', (socket: Socket) => {
   });
 
   // Handle chat messages
+  //
+  // ENG-1189: this Emma-chatbot turn runs in-process (no fork) and can
+  // dispatch MCP tools (including manage_scheduled_chat) via
+  // agentModeService.executeTool, but — unlike the Agent Mode /generate
+  // family — it was never tracked as in-flight work, so runDrain()'s wait
+  // below wouldn't hold the listener open for it. cronJobRegistry.track() is
+  // a drop-in wrap (untouched resolution/rejection), so this is a pure
+  // addition, not a behavior change.
   socket.on('message', (data: {
     sessionId: string;
     message: string;
     currentUrl?: string;
     pageContent?: string;
     portal?: 'customer' | 'partner';
-  }) => handleSocketChatMessage(socket, data));
+  }) => cronJobRegistry.track('chatbotTurn', handleSocketChatMessage(socket, data)));
 
   // Implement automatic reconnection
   socket.on('reconnect_attempt', () => {
@@ -362,7 +370,41 @@ const runDrain = async (reason: string): Promise<void> => {
     // ignore — scheduler may not have started
   }
 
-  // 3. Stop accepting new HTTP connections
+  // 3. Drain the LLM worker (scheduled chats / EMMA runs), every other
+  //    in-flight cron job (LinkedIn sync, drip worker, meta token refresh,
+  //    etc. — see cronJobRegistry), AND in-flight interactive Agent Mode
+  //    turns, concurrently, up to the same ceiling, so the total wait is the
+  //    max of the three rather than their sum.
+  //
+  //    This MUST run BEFORE the HTTP listener closes below (ENG-1189): every
+  //    one of these self-calls back into THIS process via mcpFetch's
+  //    http://localhost:${PORT} — the marketing-response worker is a forked
+  //    child process that inherits the same PORT, and an interactive turn's
+  //    tool calls run right here. Closing the listener first (as this used
+  //    to do) meant any of that in-flight work's self-calls failed with an
+  //    unrecoverable "fetch failed" for the rest of the process's life —
+  //    not a transient blip, since server.close() refuses every new loopback
+  //    connection a retry would need, no matter how long the retry waits.
+  const { drainActiveSessionGenerations } = await import('./controllers/agentModeController');
+  const [, cronDrain, sessionDrain] = await Promise.all([
+    generateMarketingResponseWorkerService.shutdown(),
+    cronJobRegistry.drain(),
+    drainActiveSessionGenerations(),
+  ]);
+  if (!cronDrain.drained) {
+    console.warn(
+      `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
+      cronDrain.stuckJobs
+    );
+  }
+  if (!sessionDrain.drained) {
+    console.warn(
+      `[gracefulShutdown] Interactive session drain ceiling reached — ${sessionDrain.stuckCount} turn(s) still in-flight`
+    );
+  }
+
+  // 4. Stop accepting new HTTP connections — safe now that in-flight
+  //    self-calls above have had their chance to complete.
   server.close((err) => {
     if (err) {
       console.error('Error closing HTTP server:', err);
@@ -371,7 +413,7 @@ const runDrain = async (reason: string): Promise<void> => {
     }
   });
 
-  // 4. Disconnect all Socket.IO clients (they auto-reconnect to the new instance)
+  // 5. Disconnect all Socket.IO clients (they auto-reconnect to the new instance)
   io.close((err) => {
     if (err) {
       console.error('Error closing Socket.IO:', err);
@@ -379,21 +421,6 @@ const runDrain = async (reason: string): Promise<void> => {
       console.log('Socket.IO connections closed');
     }
   });
-
-  // 5. Drain the LLM worker (scheduled chats / EMMA runs) and every other
-  //    in-flight cron job (LinkedIn sync, drip worker, meta token refresh,
-  //    etc. — see cronJobRegistry) concurrently, up to the same ceiling, so
-  //    the total wait is the max of the two rather than their sum.
-  const [, cronDrain] = await Promise.all([
-    generateMarketingResponseWorkerService.shutdown(),
-    cronJobRegistry.drain(),
-  ]);
-  if (!cronDrain.drained) {
-    console.warn(
-      `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
-      cronDrain.stuckJobs
-    );
-  }
 
   // 6. Close parent MCP clients after the drain (child has its own MCP instance)
   await agentModeService.shutdown();
