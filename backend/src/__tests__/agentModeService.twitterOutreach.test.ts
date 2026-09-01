@@ -259,6 +259,11 @@ describe('AgentModeService.twitterManagePost', () => {
     expect(res.error).toContain('Forbidden');
     expect(res.error).toContain('appropriate oauth1 app permissions');
     expect(res.error).not.toBe('Request failed with code 403');
+    // ENG-1300: twitterManagePost's catch has the same describeXApiError
+    // flattening twitterOutreach's did — this asserts the numeric status rides
+    // along on the result so classifyToolErrorClass sees 'auth', not the
+    // generic 'Error' class the message text alone cannot match.
+    expect(res.code).toBe(403);
   });
 
   it('surfaces the read-only reconnect guard error verbatim', async () => {
