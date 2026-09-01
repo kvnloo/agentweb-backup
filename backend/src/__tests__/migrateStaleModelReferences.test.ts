@@ -306,6 +306,9 @@ describe('applyCandidate — write-time behavior (ENG-1333)', () => {
     expect(params.ExpressionAttributeValues).not.toHaveProperty(':now');
     expect(params.UpdateExpression).toMatch(/#field = :new/);
     expect(params.ExpressionAttributeValues[':new']).toBe('gemini-3.1-pro-preview');
+    // The audit fact still needs to be recorded somewhere — just not on updatedAt.
+    expect(params.UpdateExpression).toMatch(/modelMigratedAt = :migratedAt/);
+    expect(params.ExpressionAttributeValues[':migratedAt']).toEqual(expect.any(String));
   });
 
   it('still applies the same non-updatedAt-touching write to the other scanned tables', async () => {
