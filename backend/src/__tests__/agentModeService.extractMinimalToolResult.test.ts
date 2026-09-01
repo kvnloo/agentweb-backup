@@ -178,6 +178,37 @@ describe('AgentModeService - extractMinimalToolResult', () => {
         filename: 'image.png'
       });
     });
+
+    // ENG-1027: this minimizer whitelists fields per tool — everything unnamed is
+    // dropped (ENG-736/ENG-1526 already hit this trap for other tools). Without this
+    // case, the post-generation data-fabrication warning would silently vanish before
+    // reaching Emma, exactly like the un-relayed approval tokens did.
+    it('preserves dataReliabilityWarning from a generate_image result', () => {
+      const result = {
+        success: true,
+        message: 'Image generated successfully',
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png',
+        dataReliabilityWarning: 'DATA RELIABILITY CHECK: this image appears to contain specific numbers...'
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'generate_image');
+
+      expect(minimalResult.dataReliabilityWarning).toBe(result.dataReliabilityWarning);
+    });
+
+    it('omits dataReliabilityWarning when the check did not fire', () => {
+      const result = {
+        success: true,
+        message: 'Image generated successfully',
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png'
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'generate_image');
+
+      expect(minimalResult.dataReliabilityWarning).toBeUndefined();
+    });
   });
 
   describe('generate_video result extraction', () => {
