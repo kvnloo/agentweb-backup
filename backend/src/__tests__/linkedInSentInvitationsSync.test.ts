@@ -39,7 +39,7 @@ jest.mock('../services/unipileSentInvitationsDb', () => ({
 jest.mock('../services/dripSequenceDb', () => ({
   dripSequenceDb: { getAllSequencesByTriggerType: jest.fn().mockResolvedValue([]) },
 }));
-jest.mock('../services/db', () => ({ crmDb: {}, userDb: { getAllUsers: jest.fn() } }));
+jest.mock('../services/db', () => ({ crmDb: {}, userDb: { scanWithFilter: jest.fn().mockResolvedValue([]) } }));
 jest.mock('../services/settingsService', () => ({ settingsService: { getSetting: jest.fn() } }));
 jest.mock('../services/leadListAlertService', () => ({ leadListAlertService: {} }));
 

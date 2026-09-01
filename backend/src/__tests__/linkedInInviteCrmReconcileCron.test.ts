@@ -52,10 +52,10 @@ jest.mock('../services/settingsService', () => ({
   settingsService: { getSetting: (...a: any[]) => mockGetSetting(...a) },
 }));
 
-const mockGetAllUsers = jest.fn();
+const mockScanWithFilter = jest.fn();
 jest.mock('../services/db', () => ({
   crmDb: {},
-  userDb: { getAllUsers: (...a: any[]) => mockGetAllUsers(...a) },
+  userDb: { scanWithFilter: (...a: any[]) => mockScanWithFilter(...a) },
 }));
 
 jest.mock('../services/dripSequenceDb', () => ({
@@ -87,7 +87,7 @@ describe('sync cron → invite CRM reconciliation', () => {
     process.env.LINKEDIN_INVITE_CRM_RECONCILE = 'true';
     // One per-user Unipile account, no site-wide accounts.
     mockGetSetting.mockResolvedValue(null);
-    mockGetAllUsers.mockResolvedValue([
+    mockScanWithFilter.mockResolvedValue([
       { userId: OWNER, connected_accounts: [{ platform: 'unipile', account_id: ACCOUNT }] },
     ]);
     mockListConnections.mockResolvedValue({ items: [], cursor: undefined });
@@ -116,7 +116,7 @@ describe('sync cron → invite CRM reconciliation', () => {
   });
 
   it('never writes for a site-wide account, which belongs to no single customer', async () => {
-    mockGetAllUsers.mockResolvedValue([]);
+    mockScanWithFilter.mockResolvedValue([]);
     mockGetSetting.mockResolvedValue({
       settingValue: JSON.stringify([{ account_id: 'shared-pool-account', enabled: true }]),
     });
@@ -157,7 +157,7 @@ describe('sync cron → invite CRM reconciliation', () => {
   });
 
   it('runs per account, so one owner-less account does not suppress the others', async () => {
-    mockGetAllUsers.mockResolvedValue([
+    mockScanWithFilter.mockResolvedValue([
       { userId: OWNER, connected_accounts: [{ platform: 'unipile', account_id: ACCOUNT }] },
       { userId: 'user_2', connected_accounts: [{ platform: 'unipile', account_id: 'acct_2' }] },
     ]);
