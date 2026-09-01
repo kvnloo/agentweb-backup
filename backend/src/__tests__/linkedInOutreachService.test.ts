@@ -2255,6 +2255,33 @@ describe('LinkedInOutreachService', () => {
       expect(mockUnipileClient.messaging.getAllMessagesFromChat).not.toHaveBeenCalled();
     });
 
+    it('returns empty array when Unipile 404s the attendee lookup (1st-degree connection never messaged — ENG-1623)', async () => {
+      // Unipile only creates a chat_attendee record once a chat exists. A 1st-degree
+      // connection who has never been messaged has no such record, so the lookup
+      // 404s instead of resolving with items: []. That must NOT be treated as a
+      // failure — it's simply "no conversation exists yet".
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 404, title: 'Attendee not found' },
+      });
+      (mockUnipileClient.messaging.getAllChatsFromAttendee as jest.Mock).mockRejectedValueOnce(apiError);
+
+      const result = await linkedInOutreachService.getMessagesWithContact('never-messaged-attendee', 'acct-1');
+
+      expect(result).toEqual([]);
+      expect(mockUnipileClient.messaging.getAllMessagesFromChat).not.toHaveBeenCalled();
+    });
+
+    it('rethrows a structured error for non-404 failures (e.g. auth/session errors)', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 401, title: 'Unauthorized' },
+      });
+      (mockUnipileClient.messaging.getAllChatsFromAttendee as jest.Mock).mockRejectedValueOnce(apiError);
+
+      await expect(
+        linkedInOutreachService.getMessagesWithContact('attendee-id', 'acct-1')
+      ).rejects.toThrow('Unauthorized');
+    });
+
     it('returns empty array when the resolved chat has no id (avoids account-wide message dump)', async () => {
       (mockUnipileClient.messaging.getAllChatsFromAttendee as jest.Mock).mockResolvedValueOnce({
         items: [{ id: undefined }],
