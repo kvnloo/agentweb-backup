@@ -1537,11 +1537,23 @@ export class MetaService {
         'start_time', 'end_time'
       ];
       this.log(`Fetching ad set: ${adSetId}`);
+      /*
+       * `adAccountId !== undefined/null`, not a truthiness test.
+       *
+       * `if (adAccountId)` treats a caller that SUPPLIED an empty string as one that supplied
+       * nothing, and skips the ownership check entirely — so a scope that failed to resolve
+       * silently widened the read to any ad set the token can reach. getCampaign fails closed
+       * on exactly that input (assertOwnedByAccount refuses when the selected account is
+       * blank); these two now agree. `undefined`/`null` still means "not supplied" and
+       * legitimately opts out, which is what the post-write read-back callers rely on. Same
+       * distinction resolveScopeId already draws for scope ids.
+       */
+      const scoped = adAccountId !== undefined && adAccountId !== null;
       const result = await adSet.get(
-        adAccountId ? MetaService.withOwnershipField(fields) : fields,
+        scoped ? MetaService.withOwnershipField(fields) : fields,
       );
       const data = { ...(result?._data ?? {}) };
-      if (adAccountId) {
+      if (scoped) {
         MetaService.assertOwnedByAccount(data.account_id, adSetId, 'Ad set', adAccountId);
         delete data.account_id;
       }
@@ -2075,6 +2087,33 @@ export class MetaService {
     return { items, truncated: false, pagesFetched };
   }
 
+  /** Add `account_id` to a field selection so a single-entity read can verify its own ownership. */
+  private static withOwnershipField(fields: string[]): string[] {
+    return fields.includes('account_id') ? fields : [...fields, 'account_id'];
+  }
+
+  /**
+   * Resolve a scope id that was SUPPLIED versus one that was omitted.
+   *
+   * `if (adSetId)` treats an explicitly-supplied empty string as absent, so a caller asking to
+   * scope a read silently gets a broader one — a campaign-wide or account-wide list returned
+   * for a request that named an ad set. That is the exact defect this change exists to remove,
+   * so an empty scope id is refused rather than quietly widened.
+   *
+   * `undefined`/`null` means "not supplied" and legitimately selects the broader source.
+   */
+  private static resolveScopeId(value: unknown, label: string): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    const trimmed = String(value).trim();
+    if (!trimmed) {
+      throw new Error(
+        `${label} was supplied but empty. Refusing to widen this read to a broader scope — ` +
+        `omit ${label} entirely to list without it.`,
+      );
+    }
+    return trimmed;
+  }
+
   /**
    * Bind a campaign / ad-set node to the SELECTED ad account before reading through it.
    *
@@ -2090,33 +2129,6 @@ export class MetaService {
    *
    * Fails closed on every uncertain branch: an unverifiable owner is refused, not returned.
    */
-  /**
-   * Resolve a scope id that was SUPPLIED versus one that was omitted.
-   *
-   * `if (adSetId)` treats an explicitly-supplied empty string as absent, so a caller asking to
-   * scope a read silently gets a broader one — a campaign-wide or account-wide list returned
-   * for a request that named an ad set. That is the exact defect this change exists to remove,
-   * so an empty scope id is refused rather than quietly widened.
-   *
-   * `undefined`/`null` means "not supplied" and legitimately selects the broader source.
-   */
-  /** Add `account_id` to a field selection so a single-entity read can verify its own ownership. */
-  private static withOwnershipField(fields: string[]): string[] {
-    return fields.includes('account_id') ? fields : [...fields, 'account_id'];
-  }
-
-  private static resolveScopeId(value: unknown, label: string): string | undefined {
-    if (value === undefined || value === null) return undefined;
-    const trimmed = String(value).trim();
-    if (!trimmed) {
-      throw new Error(
-        `${label} was supplied but empty. Refusing to widen this read to a broader scope — ` +
-        `omit ${label} entirely to list without it.`,
-      );
-    }
-    return trimmed;
-  }
-
   private async assertNodeInAccount(
     node: any,
     nodeId: string,
@@ -2467,11 +2479,14 @@ export class MetaService {
        * disclosed that account's ad name to this user. getCampaign and getAdSet were both given
        * this check; getAd, the resolver sitting between them, was not.
        */
+      // Fails closed on a supplied-but-empty account id, exactly as getAdSet and getCampaign do:
+      // "" is a scope that failed to resolve, not a caller opting out of scoping.
+      const scoped = adAccountId !== undefined && adAccountId !== null;
       const result = await ad.get(
-        adAccountId ? MetaService.withOwnershipField(fields) : fields,
+        scoped ? MetaService.withOwnershipField(fields) : fields,
       );
       const data = { ...(result?._data ?? {}) };
-      if (adAccountId) {
+      if (scoped) {
         MetaService.assertOwnedByAccount(data.account_id, adId, 'Ad', adAccountId);
         delete data.account_id;
       }

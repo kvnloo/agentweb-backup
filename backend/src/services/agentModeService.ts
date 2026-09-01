@@ -22281,8 +22281,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             }
           }
         } catch (driveError) {
+          /*
+           * The whole Drive source dropped out of this search, so the result set is missing an
+           * entire source — the strongest form of incomplete there is here.
+           *
+           * Logging and continuing on its own let that be reported as a successful search that
+           * simply found nothing in Drive. The escaper's own refusal (escapeDriveQueryValue
+           * throws on a non-string) lands right here, so the guard added to stop a confidently
+           * wrong query could itself produce a confidently wrong ANSWER. `driveScanIncomplete`
+           * is the existing signal for "do not read absence into this result"; it belongs on
+           * this branch more than on any of the narrower ones that already set it.
+           */
           console.log('AgentMode: Error searching Google Drive shared folders:', driveError);
-          // Don't fail the whole search if Drive search fails
+          driveScanIncomplete = true;
+          // Don't fail the whole search if Drive search fails — but never report it as complete.
         }
       }
 
