@@ -1266,6 +1266,84 @@ describe('AgentModeService - Google Drive methods', () => {
         expect(result.success).toBe(true);
       });
 
+      /*
+       * `truncated` doubled as the BFS loop condition (`while (queue.length > 0 && !truncated)`),
+       * so recording "this sub-folder could not be listed" also ABANDONED the walk: a 502 on
+       * sub-folder 3 of 40 left the other 37 unvisited. Note the asymmetry it introduced —
+       * a 403/401 takes the `restricted` branch and keeps walking, so a permission failure was
+       * handled better than a transient one.
+       */
+      it('keeps walking the rest of the tree after a transient error on one sub-folder', async () => {
+        const SUB_A = 'sub-a';
+        const SUB_B = 'sub-b';
+        const SUB_C = 'sub-c';
+        const listed: string[] = [];
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            if (q.includes(`'${ROOT}' in parents`)) {
+              return Promise.resolve({
+                data: {
+                  files: [{ id: SUB_A, name: 'a' }, { id: SUB_B, name: 'b' }, { id: SUB_C, name: 'c' }],
+                },
+              });
+            }
+            if (q.includes(`'${SUB_A}' in parents`)) {
+              listed.push(SUB_A);
+              return Promise.resolve({ data: { files: [] } });
+            }
+            if (q.includes(`'${SUB_B}' in parents`)) {
+              listed.push(SUB_B);
+              // Transient, NOT a permission answer — so it does not take the `restricted` branch.
+              return Promise.reject(makeApiError(502, 'Bad Gateway'));
+            }
+            if (q.includes(`'${SUB_C}' in parents`)) {
+              listed.push(SUB_C);
+              return Promise.resolve({ data: { files: [] } });
+            }
+            return Promise.resolve({ data: { files: [] } });
+          }
+          if (q.includes("name = 'ad.png'")) {
+            return Promise.resolve({
+              data: { files: [{ id: 'file-1', name: 'ad.png', mimeType: 'image/png', size: '10', parents: [SUB_C] }] },
+            });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+        mockDriveFiles.get.mockResolvedValue({ data: Buffer.from('bytes') });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        // C comes AFTER the failing B in the queue: it is only reached if the walk continued.
+        expect(listed).toContain(SUB_C);
+
+        // And the file living in C is found, rather than reported missing from a walk that quit.
+        const nameSearchCall = mockDriveFiles.list.mock.calls.find(
+          ([arg]: any) => arg.q.includes("name = 'ad.png'")
+        );
+        expect(nameSearchCall![0].q).toContain(`'${SUB_C}' in parents`);
+        expect(result.success).toBe(true);
+      });
+
+      it('still reports the walk as incomplete after a transient sub-folder error', async () => {
+        // Continuing the walk must not cost the incompleteness signal: the failed sub-folder was
+        // never read, so an empty result from this tree is still not a confirmed absence.
+        const SUB_A = 'sub-a';
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            if (q.includes(`'${ROOT}' in parents`)) {
+              return Promise.resolve({ data: { files: [{ id: SUB_A, name: 'a' }] } });
+            }
+            return Promise.reject(makeApiError(502, 'Bad Gateway'));
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/not a confirmed absence/i);
+      });
+
       it('does not re-list a folder reachable via two different parents, and terminates', async () => {
         const CHILD_A = 'child-a';
         const CHILD_B = 'child-b';
