@@ -25,6 +25,23 @@ describe('getGroupEmailRecipientIssue', () => {
     expect(getGroupEmailRecipientIssue('')).toBe('malformed');
     expect(getGroupEmailRecipientIssue(undefined)).toBe('malformed');
   });
+
+  it('flags each reserved test TLD, not just the exact example.* domains', () => {
+    expect(getGroupEmailRecipientIssue('user@foo.test')).toBe('test-domain');
+    expect(getGroupEmailRecipientIssue('user@bar.example')).toBe('test-domain');
+    expect(getGroupEmailRecipientIssue('user@baz.invalid')).toBe('test-domain');
+    expect(getGroupEmailRecipientIssue('user@qux.localhost')).toBe('test-domain');
+  });
+
+  // A non-string truthy email is reachable via lead-creation paths with no
+  // email type check upstream. Must not throw, and must be treated as
+  // malformed since it can never have valid email syntax.
+  it('does not throw and flags a non-string truthy email as malformed', () => {
+    expect(() => getGroupEmailRecipientIssue(12345 as unknown as string)).not.toThrow();
+    expect(getGroupEmailRecipientIssue(12345 as unknown as string)).toBe('malformed');
+    expect(getGroupEmailRecipientIssue(['user@agentweb.pro'] as unknown as string)).toBe('malformed');
+    expect(getGroupEmailRecipientIssue({ email: 'user@agentweb.pro' } as unknown as string)).toBe('malformed');
+  });
 });
 
 describe('isEligibleGroupEmailRecipient', () => {

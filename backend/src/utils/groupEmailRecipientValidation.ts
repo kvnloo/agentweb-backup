@@ -13,6 +13,10 @@
 const PROVIDER_DISALLOWED_TEST_DOMAINS = new Set([
   'example.com', 'example.net', 'example.org', 'example.edu',
 ]);
+// RFC 2606 reserved TLDs — a domain ending in one of these is reserved for
+// documentation/testing regardless of what precedes it (e.g. `foo.test`,
+// `bar.invalid`), so it's matched by suffix rather than exact domain.
+const RESERVED_TEST_TLD_SUFFIXES = ['.test', '.example', '.invalid', '.localhost'];
 
 // RFC 5322-ish local part: dot-separated atoms, no leading/trailing/repeated dots.
 const LOCAL_PART_RE = /^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/;
@@ -26,7 +30,8 @@ export type GroupEmailRecipientIssue = 'malformed' | 'test-domain';
  * null if the address is syntactically valid and not a disallowed test domain.
  */
 export function getGroupEmailRecipientIssue(email: string | undefined | null): GroupEmailRecipientIssue | null {
-  const trimmed = (email ?? '').trim();
+  if (typeof email !== 'string') return 'malformed';
+  const trimmed = email.trim();
   const atIdx = trimmed.lastIndexOf('@');
   if (atIdx <= 0 || atIdx === trimmed.length - 1) return 'malformed';
 
@@ -34,7 +39,9 @@ export function getGroupEmailRecipientIssue(email: string | undefined | null): G
   const domain = trimmed.slice(atIdx + 1).toLowerCase();
 
   if (!LOCAL_PART_RE.test(local) || !DOMAIN_RE.test(domain)) return 'malformed';
-  if (PROVIDER_DISALLOWED_TEST_DOMAINS.has(domain)) return 'test-domain';
+  if (PROVIDER_DISALLOWED_TEST_DOMAINS.has(domain) || RESERVED_TEST_TLD_SUFFIXES.some((tld) => domain.endsWith(tld))) {
+    return 'test-domain';
+  }
   return null;
 }
 

@@ -482,6 +482,149 @@ describe('CRM Group Email Endpoints', () => {
       expect(response.skippedInvalid).toBe(3);
     });
 
+    // ENG-1194 code review: a provider-flagged-undeliverable lead (heuristic
+    // status, no syntax/test-domain issue) must still be skipped by default —
+    // this is the overridable case, distinct from the non-overridable one below.
+    it('should skip a provider-flagged-undeliverable address by default', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        listId: 'list-1',
+        userId: 'test-user-id',
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'valid@acmecorp.com' },
+          { leadId: '2', email: 'flagged@acmecorp.com', customFields: { email_validation: { status: 'undeliverable' } } },
+        ],
+        lastEvaluatedKey: undefined,
+      });
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg-1' });
+
+      mockReq.body = {
+        senderEmail: 'me@test.com',
+        senderName: 'Me',
+        subject: 'Hi',
+        htmlContent: '<p>Hello</p>',
+      };
+
+      const handler = findHandler('/lists/:listId/group-email/send', 'post');
+      await handler!(mockReq, mockRes);
+
+      expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
+      const call = (resendService.sendEmail as jest.Mock).mock.calls[0][0];
+      expect(call.to).toBe('valid@acmecorp.com');
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.sent).toBe(1);
+      expect(response.skippedUndeliverable).toBe(1);
+    });
+
+    // ENG-1194 code review: malformed-syntax/test-domain rows must never be
+    // overridable via includeUndeliverable or includeUndeliverableEmails — a
+    // provider rejects them regardless of caller intent, which is exactly the
+    // bug this ticket reports.
+    it('should still skip a malformed/test-domain address even with includeUndeliverable=true (blanket override)', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        listId: 'list-1',
+        userId: 'test-user-id',
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'valid@acmecorp.com' },
+          { leadId: '2', email: 'user@example.com' },
+        ],
+        lastEvaluatedKey: undefined,
+      });
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg-1' });
+
+      mockReq.body = {
+        senderEmail: 'me@test.com',
+        senderName: 'Me',
+        subject: 'Hi',
+        htmlContent: '<p>Hello</p>',
+        includeUndeliverable: true,
+      };
+
+      const handler = findHandler('/lists/:listId/group-email/send', 'post');
+      await handler!(mockReq, mockRes);
+
+      expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
+      const call = (resendService.sendEmail as jest.Mock).mock.calls[0][0];
+      expect(call.to).toBe('valid@acmecorp.com');
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.sent).toBe(1);
+      expect(response.skippedInvalid).toBe(1);
+    });
+
+    it('should still skip a malformed/test-domain address even when whitelisted via includeUndeliverableEmails', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        listId: 'list-1',
+        userId: 'test-user-id',
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'valid@acmecorp.com' },
+          { leadId: '2', email: 'user@example.com' },
+        ],
+        lastEvaluatedKey: undefined,
+      });
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg-1' });
+
+      mockReq.body = {
+        senderEmail: 'me@test.com',
+        senderName: 'Me',
+        subject: 'Hi',
+        htmlContent: '<p>Hello</p>',
+        includeUndeliverableEmails: ['user@example.com'],
+      };
+
+      const handler = findHandler('/lists/:listId/group-email/send', 'post');
+      await handler!(mockReq, mockRes);
+
+      expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
+      const call = (resendService.sendEmail as jest.Mock).mock.calls[0][0];
+      expect(call.to).toBe('valid@acmecorp.com');
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.sent).toBe(1);
+      expect(response.skippedInvalid).toBe(1);
+    });
+
+    // Confirms the overridable path still works: a provider-flagged-undeliverable
+    // (heuristic-only, no syntax/test-domain issue) address CAN be whitelisted.
+    it('should send a provider-flagged-undeliverable address when whitelisted via includeUndeliverableEmails', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        listId: 'list-1',
+        userId: 'test-user-id',
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'flagged@acmecorp.com', customFields: { email_validation: { status: 'undeliverable' } } },
+        ],
+        lastEvaluatedKey: undefined,
+      });
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg-1' });
+
+      mockReq.body = {
+        senderEmail: 'me@test.com',
+        senderName: 'Me',
+        subject: 'Hi',
+        htmlContent: '<p>Hello</p>',
+        includeUndeliverableEmails: ['flagged@acmecorp.com'],
+      };
+
+      const handler = findHandler('/lists/:listId/group-email/send', 'post');
+      await handler!(mockReq, mockRes);
+
+      expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
+      const call = (resendService.sendEmail as jest.Mock).mock.calls[0][0];
+      expect(call.to).toBe('flagged@acmecorp.com');
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.sent).toBe(1);
+      expect(response.skippedUndeliverable).toBe(0);
+    });
+
     it('should emit progress via socket when socketId provided', async () => {
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
         listId: 'list-1',
