@@ -70,6 +70,38 @@ describe('findModelMention', () => {
     });
   });
 
+  describe('a dotted version is not a sentence boundary', () => {
+    // CodeRabbit, PR #2707. Most of the registry carries a dotted version, and
+    // treating "3.7" as two sentences truncated the range handed to the
+    // explanatory-question guard — so the question mark fell outside it and a
+    // plain question was read as a request. Reproduced before fixing:
+    //   "What does it mean to use GPT 4.1?"          -> MATCHED (wrong)
+    //   "What does it mean to use Gemini 3.7 Flash?" -> MATCHED (wrong)
+    //   "What does it mean to use Opus 5?"           -> null (right, no dot)
+    it.each([
+      'What does it mean to use Gemini 3.1 Flash Lite?',
+      'What would it cost to use Claude Opus 4.8?',
+      "don't use Gemini 3.1 Flash Lite",
+      'never use Claude Opus 4.8 for this',
+    ])('stays silent on %p', (text) => {
+      expect(findModelMention(text, index)).toBeNull();
+    });
+
+    it.each([
+      'use Gemini 3.1 Flash Lite',
+      'switch to Claude Opus 4.8',
+      // A real sentence really does end after a dotted version.
+      'That ran on Claude Opus 4.8. Use Opus 5 instead.',
+    ])('still fires on %p', (text) => {
+      expect(findModelMention(text, index)).not.toBeNull();
+    });
+
+    it('treats a spaced "3. 7" as a real break, not a decimal', () => {
+      // The verb is severed from the mention by the break, so no request.
+      expect(findModelMention('use 3. 7 Claude Opus 4.8', index)).toBeNull();
+    });
+  });
+
   describe('negation is scoped to the mention, not the whole message', () => {
     // Found by a real production verification turn on 2026-09-01: the message
     // below named Opus 5 in its own sentence and got silence, because "Do not"

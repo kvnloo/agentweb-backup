@@ -104,6 +104,49 @@ interface Token {
   followsSentenceBreak: boolean;
 }
 
+/**
+ * Is the gap between two tokens a sentence boundary?
+ *
+ * The subtlety is the full stop. Most of the registry carries a dotted version
+ * — "Gemini 3.7 Flash", "GPT 4.1", "Claude Opus 4.8" — and a naive `/[.!?\n]/`
+ * test splits "3.7" into two sentences. That is not cosmetic: it truncated the
+ * sentence range `findModelMention` hands the explanatory-question guard, so
+ * "What does it mean to use Gemini 3.7 Flash?" lost its own question mark and
+ * was read as a REQUEST for that model. Caught by CodeRabbit on PR #2707 and
+ * reproduced before fixing; pinned by tests below.
+ *
+ * A dot flanked by digits with no whitespace is a decimal point. Anything else
+ * — including "3. 7" and the "3.7. Use..." that ends a real sentence — is a
+ * break.
+ */
+function isSentenceBreak(gap: string, previousToken: Token | undefined, nextChar: string): boolean {
+  if (/[!?\n]/.test(gap)) return true;
+  if (!gap.includes('.')) return false;
+  const isDecimalPoint =
+    gap === '.'
+    && !!previousToken
+    && /\d$/.test(previousToken.text)
+    && /^\d/.test(nextChar);
+  return !isDecimalPoint;
+}
+
+/**
+ * Remove the dot from a dotted version ("3.7" -> "37") for guard matching only.
+ *
+ * `EXPLANATORY_QUESTION_PATTERN` (ENG-1565) spans `[^.!]*` between its opening
+ * phrase and the "?", deliberately, so it cannot reach across a sentence. A
+ * version dot is not a sentence, but it stops that scan dead — which is why
+ * "What does it mean to use Gemini 3.1 Flash Lite?" survived the sentence-range
+ * fix and was still read as a request. Fixing it here rather than widening the
+ * shared pattern keeps ENG-1565's detector untouched.
+ *
+ * Used only to answer a yes/no question about the text; never for offsets or
+ * for anything the customer sees.
+ */
+function stripVersionDots(text: string): string {
+  return text.replace(/(\d)\.(?=\d)/g, '$1');
+}
+
 function tokenize(text: string): Token[] {
   const tokens: Token[] = [];
   const re = /[a-z0-9]+/gi;
@@ -114,7 +157,11 @@ function tokenize(text: string): Token[] {
       text: match[0].toLowerCase(),
       start: match.index,
       end: match.index + match[0].length,
-      followsSentenceBreak: /[.!?\n]/.test(text.slice(previousEnd, match.index)),
+      followsSentenceBreak: isSentenceBreak(
+        text.slice(previousEnd, match.index),
+        tokens[tokens.length - 1],
+        match[0],
+      ),
     });
     previousEnd = match.index + match[0].length;
   }
@@ -259,7 +306,7 @@ export function findModelMention(
       const sentence = sentenceBoundsAt(tokens, i, messageContent);
       // Only text leading up to the mention can negate it.
       if (hasNegation(messageContent.slice(sentence.start, tokens[i].start))) continue;
-      if (isExplanatoryQuestion(messageContent.slice(sentence.start, sentence.end))) continue;
+      if (isExplanatoryQuestion(stripVersionDots(messageContent.slice(sentence.start, sentence.end)))) continue;
 
       return {
         modelId,
