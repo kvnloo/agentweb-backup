@@ -124,6 +124,20 @@ describe('hasDuplicateObjectKeys (ENG-1477 security follow-up)', () => {
   it('tracks a fresh key-set per nested object, so the same key name in sibling objects is fine', () => {
     expect(hasDuplicateObjectKeys('{"a":{"id":"1"},"b":{"id":"2"}}')).toBe(false);
   });
+
+  // CodeRabbit review on this PR: the check must compare DECODED key values,
+  // not raw tokenizer spelling, or a unicode-escaped letter lets an attacker
+  // spell a duplicate key differently from the original and dodge detection.
+  it('recognizes a unicode-escaped spelling of an existing key as a duplicate', () => {
+    const raw = '{"title":"Real","content_draft":"x","tit' + '\\u006c' + 'e":"HACKED"}';
+    expect(raw).toContain('\\u006c');
+    expect(hasDuplicateObjectKeys(raw)).toBe(true);
+  });
+
+  it('does not confuse two DIFFERENT keys that merely share letters after decoding', () => {
+    const raw = '{"title":"Real","tit' + '\\u0079' + '":"other"}'; // "tity", not "title"
+    expect(hasDuplicateObjectKeys(raw)).toBe(false);
+  });
 });
 
 describe('parseToolCallArguments — argument injection via repair (ENG-1477 security follow-up)', () => {
@@ -178,6 +192,39 @@ describe('isTruncatedJsonPrefix (ENG-1477 follow-up)', () => {
     // The trailing `]` here is prose inside the string, not real structure —
     // depth never left 0 because of it, so this is NOT a truncation.
     expect(isTruncatedJsonPrefix('{"content_draft":"Use [1,2,3] as the list."}')).toBe(false);
+  });
+
+  // CodeRabbit review on this PR: plain depth-counting (ignoring bracket
+  // TYPE) misses cases that are already definitively invalid rather than
+  // merely incomplete — appending more bytes can never fix them, so telling
+  // the model "retry the same call" is actively wrong guidance.
+  it('does not flag a lone stray closing brace as truncated', () => {
+    // No opener at all — cannot become valid JSON by appending bytes.
+    expect(isTruncatedJsonPrefix('}')).toBe(false);
+  });
+
+  it('does not flag a complete object with extra trailing structure as truncated', () => {
+    // The object closed cleanly at the first `}` — the second `}` is
+    // trailing garbage, not evidence the stream was cut off.
+    expect(isTruncatedJsonPrefix('{"title":"ok"}}')).toBe(false);
+  });
+
+  it('does not flag mismatched bracket types (object opened, array-closed) as truncated', () => {
+    expect(isTruncatedJsonPrefix('{"tags":[1,2}')).toBe(false);
+  });
+
+  it('does not flag a colon with a missing value (nothing before the closing brace) as truncated', () => {
+    expect(isTruncatedJsonPrefix('{"title":}')).toBe(false);
+  });
+
+  it('still flags the real truncation shape: cut off immediately after a colon', () => {
+    // Genuine case: the stream stopped before the value token even started —
+    // there is no terminator character there at all, just end-of-input.
+    expect(isTruncatedJsonPrefix('{"title":')).toBe(true);
+  });
+
+  it('still flags an unclosed nested array as truncated', () => {
+    expect(isTruncatedJsonPrefix('{"tags":["a","b"')).toBe(true);
   });
 });
 
