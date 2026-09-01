@@ -1389,6 +1389,33 @@ describe('AgentModeService - Google Drive methods', () => {
         expect(result.message).not.toMatch(/not found/i);
         expect(result.message).toMatch(/could not determine/i);
         expect(result.message).toMatch(/failed/i);
+        expect(result.message).toMatch(/retry the read/i);
+      });
+
+      // The capped/failed split, pinned on this caller too — the two paths were duplicated
+      // literals before, which is exactly how one gets fixed and the other does not.
+      // See readSingleKnowledgeBaseFile's equivalent for why a capped read is not retryable.
+      it('does not tell the model to retry when the name search ran out of its time budget', async () => {
+        jest.useFakeTimers();
+        try {
+          mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+            if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+              return Promise.resolve({ data: { files: [] } });
+            }
+            jest.advanceTimersByTime(20_000);
+            return Promise.resolve({ data: { files: [], nextPageToken: 'page-2' } });
+          });
+
+          const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+          expect(result.success).toBe(false);
+          expect(result.message).toMatch(/not a confirmed absence/i);
+          expect(result.message).not.toMatch(/retry the read/i);
+          expect(result.message).toMatch(/do not retry this same call/i);
+          expect(result.message).toMatch(/direct google drive link/i);
+        } finally {
+          jest.useRealTimers();
+        }
       });
 
       it('reports ambiguity instead of silently materializing one candidate when the same name exists in two sub-folders', async () => {
@@ -2304,6 +2331,53 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(result.message).not.toMatch(/not found/i);
       expect(result.message).toMatch(/could not determine/i);
       expect(result.message).toMatch(/failed/i);
+      // A request failure IS transient, so "retry" is the right remedy on THIS branch. Pinned
+      // next to the capped test below so the two remedies cannot be collapsed back together.
+      expect(result.message).toMatch(/retry the read/i);
+    });
+
+    /*
+     * The CAPPED branch is not the failed branch, and telling the model to retry it was a
+     * remedy that cannot work.
+     *
+     * `capped` with no `failed` can only mean queryDriveFilesAcrossFolders crossed
+     * DRIVE_LIST_WALK_MAX_MS — a wall-clock bound spent on a folder tree whose size does not
+     * change between attempts, and the SECOND such budget after the folder walk already spent
+     * one. A tree large enough to exhaust it exhausts it again, in the same place, every time.
+     * So "Retry the read." pointed the model at a deterministic non-answer, and each attempt
+     * costs two more 15s budgets out of the turn.
+     *
+     * The time is advanced inside the NAME query specifically, so the folder walk finishes well
+     * inside its own budget: this reproduces capped-without-failed, which is the only shape that
+     * reaches the branch under test.
+     */
+    it('does not tell the model to retry when the name search ran out of its time budget', async () => {
+      jest.useFakeTimers();
+      try {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            return Promise.resolve({ data: { files: [] } });
+          }
+          // The name query returns a page and a cursor, but burns the whole budget doing it —
+          // so the read stops at the bound rather than erroring.
+          jest.advanceTimersByTime(20_000);
+          return Promise.resolve({ data: { files: [], nextPageToken: 'page-2' } });
+        });
+
+        const result = await service.readSingleKnowledgeBaseFile(`gdrive:${ROOT}`, 'notes.txt', USER_ID);
+
+        expect(result.success).toBe(false);
+        // Still not an absence claim — that part was already right.
+        expect(result.message).toMatch(/not a confirmed absence/i);
+        // The defect: a retry instruction on a deterministic, non-transient stop.
+        expect(result.message).not.toMatch(/retry the read/i);
+        expect(result.message).toMatch(/do not retry this same call/i);
+        // And a remedy that can actually change the outcome — a smaller search scope.
+        expect(result.message).toMatch(/direct google drive link/i);
+        expect(result.message).toMatch(/sub-folder/i);
+      } finally {
+        jest.useRealTimers();
+      }
     });
 
     it('reports ambiguity instead of silently reading one candidate when the same name exists in two sub-folders', async () => {

@@ -117,6 +117,53 @@ describe('Meta launch gate (ENG-941)', () => {
       expect(out.blockResult.error).toMatch(/not necessarily absent|not have been reached/i);
       expect(out.blockResult.error).not.toMatch(/may belong to a different campaign/i);
     });
+
+    /*
+     * The two truncation flags answer different questions, and collapsing them
+     * (`adsTruncated || accountWideTruncated`) made the message describe a read that had not
+     * stopped at all.
+     *
+     * The account-wide fallback only runs when the CAMPAIGN-scoped read already came back
+     * without the ad. So when that campaign read was complete and only the fallback truncated,
+     * "the ad list for campaign X was too large to read completely" was false — and it told the
+     * user to narrow to the ad set containing an ad that is not in the campaign, while
+     * suppressing the one accurate sentence: that the ad may belong to a different campaign.
+     */
+    it('names the account-wide read, not the campaign read, when only the fallback truncated', async () => {
+      mockListAds.mockImplementation((_accountId: string, _token: string, campaignId?: string) =>
+        Promise.resolve(
+          campaignId
+            // Campaign-scoped read: COMPLETE, and the ad is genuinely not in it.
+            ? { items: [], truncated: false, pagesFetched: 1 }
+            // Account-wide fallback: stopped at its bound, so where the ad lives is unknown.
+            : { items: [], truncated: true, pagesFetched: 25 },
+        ),
+      );
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t', {}, 'a-missing');
+
+      expect(out.proceed).toBe(false);
+      // The campaign read finished — saying it did not is describing the wrong read.
+      expect(out.blockResult.error).not.toMatch(/ad list for campaign [^.]*was too large/i);
+      // ...and pointing at an ad set inside that campaign is a remedy that cannot work.
+      expect(out.blockResult.error).not.toMatch(/narrow the request to the ad set/i);
+      // The accurate diagnosis must survive rather than be suppressed by the wrong one.
+      expect(out.blockResult.error).toMatch(/may belong to a different campaign/i);
+      // And the read that actually stopped short is named.
+      expect(out.blockResult.error).toMatch(/account-wide search/i);
+    });
+
+    it('keeps the plain not-found message when neither read stopped short', async () => {
+      // Guards the opposite error: both reads complete and the ad is simply elsewhere.
+      mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t', {}, 'a-missing');
+
+      expect(out.proceed).toBe(false);
+      expect(out.blockResult.error).toMatch(/may belong to a different campaign/i);
+      expect(out.blockResult.error).not.toMatch(/too large to read completely/i);
+      expect(out.blockResult.error).not.toMatch(/account-wide search/i);
+    });
   });
 
   it('proceeds and records a pass when every destination is measured', async () => {
