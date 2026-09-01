@@ -172,26 +172,54 @@ export class TruncatedToolCallArgumentsError extends Error {
 
 /**
  * PURE: does `raw` look like a clean-but-incomplete JSON prefix rather than
- * confused/malformed text? Walks the string the same way `repairUnescapedQuotes`
- * does (string/escape state + bracket depth, ignoring brackets seen inside a
- * string) and checks whether we're still inside an open string or an open
- * object/array by end-of-input. A COMPLETE JSON value always returns to depth
- * 0 with `inString` false by the time it ends; ending any other way is strong,
- * low-false-positive evidence the stream stopped mid-generation rather than
- * the model emitting genuinely invalid JSON.
+ * confused/malformed text? A plain bracket-depth counter (ignoring type) is
+ * not enough: a lone stray `}`, or a `{`/`[` closed with the wrong bracket
+ * type, can bring depth back to a "balanced" 0/nonzero reading that has
+ * nothing to do with whether the stream was cut off — neither can ever
+ * become valid JSON by appending more bytes, so classifying either as
+ * "truncated" tells the model to retry an identical call that will fail
+ * again the same way (CodeRabbit review on this PR).
+ *
+ * This instead tracks a stack of the actual container TYPE opened (mirroring
+ * `repairUnescapedQuotes`/`hasDuplicateObjectKeys`), and returns false the
+ * moment a closer shows up with no matching opener of the right type on top
+ * of the stack — that is definitive, immediate evidence of malformed (not
+ * merely incomplete) input, not something that can complete by appending
+ * more bytes. It also rejects a `:` immediately followed (past whitespace)
+ * by a structural terminator (`,` `}` `]`) with no value token in between —
+ * a missing value is a genuine syntax error, not a stream that stopped
+ * before the value started (that case has no terminator there at all; the
+ * text just ends). Whatever remains after ruling those out — still inside an
+ * open string, or inside an object/array whose container was never closed —
+ * is strong, low-false-positive evidence the stream stopped mid-generation
+ * rather than the model emitting genuinely invalid JSON.
  */
 export function isTruncatedJsonPrefix(raw: string): boolean {
   let inString = false;
   let escaped = false;
-  let depth = 0;
+  const stack: JsonContainer[] = [];
+  const n = raw.length;
 
-  for (let i = 0; i < raw.length; i++) {
+  for (let i = 0; i < n; i++) {
     const ch = raw[i];
 
     if (!inString) {
-      if (ch === '"') inString = true;
-      else if (ch === '{' || ch === '[') depth++;
-      else if (ch === '}' || ch === ']') depth--;
+      if (ch === '"') {
+        inString = true;
+      } else if (ch === '{' || ch === '[') {
+        stack.push(ch === '{' ? 'object' : 'array');
+      } else if (ch === '}' || ch === ']') {
+        const wantsObject = ch === '}';
+        const top = stack.pop();
+        if (top === undefined || (wantsObject ? top !== 'object' : top !== 'array')) {
+          return false;
+        }
+      } else if (ch === ':') {
+        const j = nextNonSpaceIndex(raw, i + 1);
+        if (j < n && (raw[j] === ',' || raw[j] === '}' || raw[j] === ']')) {
+          return false;
+        }
+      }
       continue;
     }
 
@@ -204,7 +232,7 @@ export function isTruncatedJsonPrefix(raw: string): boolean {
     }
   }
 
-  return inString || depth !== 0;
+  return inString || stack.length !== 0;
 }
 
 /**
@@ -228,10 +256,49 @@ export function isTruncatedJsonPrefix(raw: string): boolean {
  * heuristics needed here — repair already resolved every ambiguous quote),
  * tracking one key-set per open object, and returns true on the first key
  * seen twice in the same object.
+ *
+ * SECURITY (CodeRabbit review on this PR): comparing/storing the tokenizer
+ * SPELLING of a key — not its decoded JSON value — let an attacker dodge the
+ * duplicate check entirely. A key spelled with a unicode escape for one of
+ * its letters (so the raw text differs from a plain-ASCII spelling of the
+ * same property, e.g. an escaped 'l' inside "title") decodes to the exact
+ * same string once JSON.parse runs — but the old code compared the raw,
+ * still-escaped tokenizer text against the plain spelling and saw no match,
+ * so the duplicate slipped through. `decodeJsonEscape` below performs the
+ * same escape decoding JSON.parse itself does (quote, backslash, slash, and
+ * the b/f/n/r/t/u control escapes) before a string is added to or checked
+ * against a container's key set, so an escaped and unescaped spelling of
+ * the same property name are correctly recognized as the same key.
  */
+function decodeJsonEscape(text: string, backslashIndex: number): { decoded: string; consumed: number } {
+  const ch = text[backslashIndex + 1];
+  switch (ch) {
+    case '"': return { decoded: '"', consumed: 1 };
+    case '\\': return { decoded: '\\', consumed: 1 };
+    case '/': return { decoded: '/', consumed: 1 };
+    case 'b': return { decoded: '\b', consumed: 1 };
+    case 'f': return { decoded: '\f', consumed: 1 };
+    case 'n': return { decoded: '\n', consumed: 1 };
+    case 'r': return { decoded: '\r', consumed: 1 };
+    case 't': return { decoded: '\t', consumed: 1 };
+    case 'u': {
+      const hex = text.slice(backslashIndex + 2, backslashIndex + 6);
+      if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+        return { decoded: String.fromCharCode(parseInt(hex, 16)), consumed: 5 };
+      }
+      // Malformed \u escape — keep it as literal text. Only reachable for
+      // input that will fail JSON.parse anyway; never throw from here.
+      return { decoded: 'u' + hex, consumed: 1 + hex.length };
+    }
+    default:
+      // Not a recognized JSON escape — keep the character as-is rather than
+      // throwing, matching this function's best-effort, never-throw contract.
+      return { decoded: ch ?? '', consumed: ch === undefined ? 0 : 1 };
+  }
+}
+
 export function hasDuplicateObjectKeys(text: string): boolean {
   let inString = false;
-  let escaped = false;
   let stringContent = '';
   const containerStack: JsonContainer[] = [];
   const keySetStack: Set<string>[] = [];
@@ -256,13 +323,10 @@ export function hasDuplicateObjectKeys(text: string): boolean {
       continue;
     }
 
-    if (escaped) {
-      stringContent += ch;
-      escaped = false;
-      continue;
-    }
     if (ch === '\\') {
-      escaped = true;
+      const { decoded, consumed } = decodeJsonEscape(text, i);
+      stringContent += decoded;
+      i += consumed;
       continue;
     }
     if (ch === '"') {
