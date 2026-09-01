@@ -8,6 +8,7 @@ import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy,
 import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
 import { randomUUID } from 'crypto';
 import { recordLlmChargeEvent, LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
+import { buildUsageBlockCopy, type UsageBlockCopy } from '../utils/usageBlockCopy';
 
 export interface TokenUsageStatus {
   allowed: boolean;
@@ -59,6 +60,13 @@ export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'cost
    * `showCostQuota`). This carries that one bit and nothing more.
    */
   hasCostAllowance: boolean;
+  /**
+   * ENG-1344 AC6: the block explanation, composed server-side so the portal
+   * modal and the ENG-1035 MCP 429 cannot describe the same block differently.
+   * Always present — the client decides WHEN to show it (only while blocked),
+   * the server decides WHAT it says.
+   */
+  usageBlock: UsageBlockCopy;
 };
 
 /**
@@ -84,7 +92,11 @@ export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'cost
  */
 export function toCustomerTokenUsage(status: TokenUsageStatus): CustomerTokenUsageStatus {
   const { costUsed: _costUsed, costAllowance, ...customerSafe } = status;
-  return { ...customerSafe, hasCostAllowance: costAllowance != null };
+  return {
+    ...customerSafe,
+    hasCostAllowance: costAllowance != null,
+    usageBlock: buildUsageBlockCopy({ month: status.month }),
+  };
 }
 
 /**
