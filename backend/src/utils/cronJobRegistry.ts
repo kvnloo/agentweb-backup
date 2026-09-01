@@ -1,6 +1,12 @@
 /**
  * Generic in-flight tracker for recurring background jobs (LinkedIn sync,
- * drip worker, meta token refresh, loop attribution, etc.).
+ * drip worker, meta token refresh, loop attribution, etc.) AND, since
+ * ENG-1189, one-off self-calling agent turns with no other drain coverage
+ * (Slack/GTM/email-triggered generateSessionResponse calls, headless
+ * runVerifiedChat callers, etc.) — anything that self-calls mcpFetch back
+ * into this same process and needs the HTTP listener to stay open until it
+ * finishes. The "recurring" framing in the name is historical; track()
+ * itself is job-shape-agnostic, keyed only by the caller-supplied job name.
  *
  * isCronEnabled()/disableCron() (instanceState.ts) stop a job from starting
  * its NEXT run. This registry covers the other half: if a job is already

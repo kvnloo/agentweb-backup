@@ -102,6 +102,7 @@ function ledgerIsIncomplete(
   return total < costUsedMicroUsd * LEDGER_COMPLETENESS_TOLERANCE;
 }
 import { recordUsageTelemetry, USAGE_TELEMETRY_EVENTS } from "./llmUsageTelemetry";
+import { utcDay, resolveCycle } from "../utils/usageCycle";
 
 /** A different target for the SAME driver — an alternative, never an extra win. */
 export interface UsageRecommendationAlternative {
@@ -254,17 +255,6 @@ export interface ResolvedUsageDrivers {
   scheduleDrivers: ScheduleDriver[];
 }
 
-function utcDay(date: Date): string {
-  return date.toISOString().slice(0, 10);
-}
-
-function resolveCycle(today: string): { cycleStartDate: string; cycleResetDate: string } {
-  const [year, month] = today.split("-").map(Number);
-  return {
-    cycleStartDate: `${year}-${String(month).padStart(2, "0")}-01`,
-    cycleResetDate: utcDay(new Date(Date.UTC(year, month, 1))),
-  };
-}
 
 /**
  * Reprice a ledger per DATE under a set of switches, returning the daily totals

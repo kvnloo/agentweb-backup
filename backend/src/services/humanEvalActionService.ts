@@ -28,7 +28,11 @@ async function reviseAgentModeImage(
   if (action?.type !== 'agent_mode_image_revision') return;
 
   const { runVerifiedChat } = await import('../controllers/agentModeController');
-  await runVerifiedChat({
+  const { cronJobRegistry } = await import('../utils/cronJobRegistry');
+  // ENG-1189: this run's tool calls self-call back into this process via
+  // mcpFetch — tracked so a deploy mid-run waits for it instead of
+  // abandoning it against a closed listener.
+  await cronJobRegistry.track('humanEvalVerifiedChat', runVerifiedChat({
     sessionId: action.sessionId,
     userId: action.userId,
     startingMessage:
@@ -42,7 +46,7 @@ async function reviseAgentModeImage(
     keywords: [],
     attachments: [],
     maxAttempts: 5,
-  });
+  }));
 }
 
 async function iterateAndDeployLandingPage(

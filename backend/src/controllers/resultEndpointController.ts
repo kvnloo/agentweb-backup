@@ -4,6 +4,7 @@ import { settingsService } from '../services/settingsService';
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { runVerifiedChat } from './agentModeController';
+import { cronJobRegistry } from '../utils/cronJobRegistry';
 
 export interface WaitingContent {
   type: 'youtube' | 'url' | 'html';
@@ -209,7 +210,11 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
       { functionName: 'send_for_review', minCount: 1 },
     ];
 
-    runVerifiedChat({
+    // ENG-1189: this headless caller's tool calls self-call back into this
+    // process via mcpFetch, same as every other runVerifiedChat caller —
+    // tracked so a deploy mid-run waits for it instead of abandoning it
+    // against a closed listener.
+    cronJobRegistry.track('resultEndpointVerifiedChat', runVerifiedChat({
       sessionId: session.sessionId,
       userId: anonUserId,
       startingMessage,
@@ -230,7 +235,7 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
       console.log(`Result endpoint "${resultName}" session ${session.sessionId} completed: success=${result.success}, attempts=${result.attempts}`);
     }).catch(error => {
       console.error(`Result endpoint "${resultName}" session ${session.sessionId} failed:`, error);
-    });
+    }));
 
   } catch (error) {
     console.error('Error handling result endpoint:', error);
