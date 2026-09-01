@@ -61,6 +61,8 @@ import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
+import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
+import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
@@ -2358,6 +2360,54 @@ export class AgentModeService {
   }
 
   /**
+   * ENG-1205 AC3: the catalog the in-chat model-mention detector matches against.
+   *
+   * Returned rather than reaching into `llmModels` from the util so the detector
+   * stays pure and testable, and so adding a model to the registry extends
+   * mention coverage with no second list to maintain (ENG-1137: never scatter
+   * checks for individual model names).
+   *
+   * Internal-only and Live models are excluded: a user cannot select either, so
+   * naming one is not a request this can honor. Admin-only models ARE included —
+   * a non-admin naming one must be told it is not available to them, which is
+   * precisely the acknowledgement AC3 asks for, and `isModelSelectableBy` below
+   * is what decides which sentence they get.
+   */
+  getModelMentionCatalog(): Array<{ id: string; name?: string; family?: string }> {
+    return Object.keys(this.llmModels)
+      .filter((id) => !this.llmModels[id].internalOnly && !this.llmModels[id].isLive)
+      .map((id) => ({
+        id,
+        name: this.llmModels[id].name,
+        family: this.llmModels[id].family,
+      }));
+  }
+
+  /** Built once per process — `llmModels` is a static registry, not per-request state. */
+  private modelMentionIndex: ModelMentionIndex | null = null;
+
+  getModelMentionIndex(): ModelMentionIndex {
+    if (!this.modelMentionIndex) {
+      this.modelMentionIndex = buildModelMentionIndex(this.getModelMentionCatalog());
+    }
+    return this.modelMentionIndex;
+  }
+
+  /**
+   * Would the model picker accept this id for this user? Mirrors the two gates
+   * `agentModeController.updateSessionLlmModel` applies, in the same order: the
+   * supported-model allow-list, then the non-admin Opus restriction. Kept next
+   * to the registry it reads so the two cannot drift.
+   */
+  isModelSelectableBy(modelId: string, isAdmin: boolean): boolean {
+    const config = this.llmModels[modelId];
+    if (!config || config.internalOnly || config.isLive) return false;
+    if (config.adminOnly && !isAdmin) return false;
+    if (modelId.includes('opus') && !isAdmin) return false;
+    return true;
+  }
+
+  /**
    * Same entitlement/ordering as getSupportedModels, decorated with tier + description
    * for the model-picker UI. Excludes live-voice models (isLive) — they are never
    * selectable through the HTTP generate picker (see callLLM's isLive guard).
@@ -3013,6 +3063,17 @@ export class AgentModeService {
       }
 
       const isAdmin = currentUser?.isAdmin === true;
+
+      // ENG-1205: the correction this turn was admitted under, stamped onto the
+      // turn's assistant messages beside `llm` so a reload can still explain why
+      // the badge disagrees with the picker. The controller wrote this decision
+      // onto the session immediately before dispatch; `resolveTurnModelCorrection`
+      // rejects a slot that does not describe THIS turn, so a resumed or replayed
+      // run degrades to no stamp rather than borrowing a newer turn's model.
+      const turnModelCorrection = resolveTurnModelCorrection(
+        (currentSession as any)?.llmUsagePolicyDecision,
+        llmModel,
+      );
       // Admin tools are available to real admins OR to messages arriving via admin delegated access.
       // iShare sessions always block admin tools even if somehow isDelegatedAccess is set.
       const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
@@ -3854,6 +3915,12 @@ export class AgentModeService {
 
         // Add LLM model to the response message
         responseMessage.llm = llmModel;
+        // ENG-1205: and, when the model that ran is not the one that was asked
+        // for, what was asked for — `llm` alone cannot distinguish "you picked
+        // this" from "you were given this".
+        if (turnModelCorrection) {
+          responseMessage.modelCorrection = turnModelCorrection;
+        }
 
         // Attach token usage from the LLM response to the message
         const responseUsage = response.usage;
@@ -4577,6 +4644,50 @@ export class AgentModeService {
         }
       }
 
+      // ENG-1205 AC3: the NAMED half of the same silence. ENG-1565 (below) fires
+      // on "reassess using a new model"; it deliberately does not fire on a
+      // message that names the model it wants, which is what the founders
+      // session actually contained ("Use Opus 5 model, and make sure you sort
+      // all of the 107 leads...", session d5898ffd, 2026-08-14). That request
+      // and the nine turns after it were answered with nothing.
+      //
+      // Runs BEFORE the generic acknowledgement and suppresses it on a hit: a
+      // message can trip both detectors ("switch to a different model, use Opus
+      // 5"), and two stacked notes saying the same thing is worse than one that
+      // names the model. The specific note is strictly more informative.
+      //
+      // `isAdmin` is the session owner's, already resolved above for the system
+      // prompt — so the entitlement branch of the copy costs no extra read.
+      //
+      // Kill switch: set AGENT_MODEL_MENTION_ACK=false to disable. Absent means ON.
+      let modelAckAppended = false;
+      if (content && !wasCancelled && !mockMode
+          && process.env.AGENT_MODEL_MENTION_ACK !== 'false') {
+        try {
+          const reconciled = reconcileModelMentionAck(
+            content,
+            messageContent,
+            llmModel,
+            this.getModelMentionIndex(),
+            (modelId) => this.isModelSelectableBy(modelId, isAdmin),
+          );
+          if (reconciled !== content) {
+            content = reconciled;
+            modelAckAppended = true;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                break;
+              }
+            }
+          }
+        } catch (modelMentionError) {
+          // Advisory, same reasoning as the reconcilers around it: never block
+          // delivery of a reply the user is waiting on over this note.
+          console.warn('AgentMode: model-mention acknowledgement failed', modelMentionError);
+        }
+      }
+
       // ENG-1565: model resolution reads ONLY the request's llmModel field (the
       // picker) — no code path parses chat text for an intent to switch/reassess
       // models. So a message like "reassess using a new model" is inert by
@@ -4593,7 +4704,7 @@ export class AgentModeService {
       // change the model despite the chat text.
       //
       // Kill switch: set AGENT_MODEL_REASSESS_ACK=false to disable. Absent means ON.
-      if (content && !wasCancelled && !mockMode
+      if (content && !wasCancelled && !mockMode && !modelAckAppended
           && process.env.AGENT_MODEL_REASSESS_ACK !== 'false') {
         try {
           const modelBefore = findLastAssistantModel(sessionHistory as any);
