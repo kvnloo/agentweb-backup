@@ -1665,3 +1665,86 @@ describe('runScheduledChat — conditional skip day', () => {
     );
   });
 });
+
+/**
+ * ENG-1599 review (CodeRabbit) — the publish-press breaker's externalWritesSucceeded
+ * ledger only held allToolCalls (calls made in the CURRENT turn/segment), never
+ * params.priorToolCalls (calls an abandoned, resumed segment already made) — unlike
+ * allActualFunctionCallsForReporting and skipLedgerToolCalls just above, which both
+ * already seed from priorToolCalls for exactly this reason (ENG-657/ENG-844). So a
+ * resumed run whose abandoned portion already published via a qualified consentOnly
+ * route (this ticket's own post_on_connected_account / twitter_manage_post pair)
+ * would not see that write, and would press the resumed segment to publish AGAIN —
+ * the very duplicate this breaker exists to prevent.
+ */
+describe('runVerifiedChat — publish-press breaker sees priorToolCalls on resume (ENG-1599)', () => {
+  const mockSession = {
+    sessionId: 'test-session-resume-1599',
+    userId: 'test-user',
+    title: 'Scheduled: resume test',
+    messages: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
+    mockChatbotDb.updateSessionLlmModel.mockResolvedValue(mockSession);
+    mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+    mockAgentModeService.getScheduledChatsDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+    mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
+    mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
+  });
+
+  const baseParams = {
+    sessionId: 'test-session-resume-1599',
+    userId: 'test-user',
+    startingMessage: 'Post today\'s tweet.',
+    keywords: [] as string[],
+    requiredFunctions: [{ functionName: 'twitter_manage_post', minCount: 1 }],
+    completionGate: true,
+    maxAttempts: 20,
+  };
+
+  it('stops on the FIRST press instead of re-pressing, when the abandoned segment already published', async () => {
+    // The resumed segment's own turn makes no new tool calls at all — it just
+    // narrates. Only priorToolCalls carries the earlier, already-succeeded write.
+    mockWorker.runInWorker.mockResolvedValue({
+      content: 'Resuming — nothing further to do this turn.',
+      toolCalls: [],
+      knowledgeBaseQueries: [], sources: [], responseMessages: [],
+    });
+
+    const result = await runVerifiedChat({
+      ...baseParams,
+      priorToolCalls: [
+        { name: 'post_on_connected_account', arguments: { platform: 'twitter', content: 'Already posted before the abandon.' } },
+      ],
+    });
+
+    // Exactly one turn spent on the resumed segment — proves it did NOT press
+    // again asking the model to call twitter_manage_post.
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+    expect((result as any).publishRequirementMismatch).toBe(true);
+    expect((result as any).publishHeldForApproval).toBeUndefined();
+  });
+
+  it('control: without the prior write, the same shape presses normally (proves the fix, not the setup, explains the stop)', async () => {
+    mockWorker.runInWorker.mockResolvedValue({
+      content: 'Nothing to report.',
+      toolCalls: [],
+      knowledgeBaseQueries: [], sources: [], responseMessages: [],
+    });
+
+    const result = await runVerifiedChat({ ...baseParams, priorToolCalls: [], maxAttempts: 3 });
+
+    // No qualifying write anywhere (prior or current) — a genuine withhold,
+    // pressed to its normal budget, not stopped on attempt 1.
+    expect(mockWorker.runInWorker.mock.calls.length).toBeGreaterThan(1);
+    expect(result.success).toBe(false);
+    expect((result as any).publishRequirementMismatch).toBeUndefined();
+  });
+});

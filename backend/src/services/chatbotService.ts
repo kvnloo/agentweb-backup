@@ -333,6 +333,11 @@ export interface ChatSession {
       instructionCompliance?: number;   // 0-5: explicit instruction followed on first attempt?
       unnecessaryPermissionRequest?: boolean; // asked to confirm a safe (read-only/draft/test) action?
     };
+    // ENG-929: the judge saw a shortened transcript (a very long run exceeded the
+    // scoring context budget). The score is real but formed on partial context —
+    // labelled rather than withheld, since withholding is what silently dropped
+    // the longest sessions from satisfaction reporting.
+    transcriptTruncated?: boolean;
   };
   judgeScores?: Record<string, {  // keyed by judge ID
     score: number;

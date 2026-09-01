@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { toolResultError } from '../utils/toolResultError';
+import { toolResultError, ToolResultPolicyBlockedError } from '../utils/toolResultError';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { isFastTripErrorClass } from './agentMode/core/errorRetryability';
 
@@ -325,9 +325,27 @@ function leadDetailsFailureScope(args: unknown): string {
   return createHash('sha256').update(JSON.stringify([listId, leadId])).digest('hex');
 }
 
+// ENG-1636: scope Meta failures to one (entity, action, target) so a bucket cannot
+// lock the whole tool — six per-ad tracking-preflight refusals froze every read-back
+// and the corrected retry for the rest of the run (Phoenix, session 822c1ed4). Most
+// specific id wins so an AD write and an account-wide LIST never share a bucket.
+// JSON-encode like the lead scope above: ids are caller-controlled strings, so a
+// plain delimiter could make two different targets collide into one scope.
+function metaMarketingFailureScope(args: unknown): string {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const record = args as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+  const entity = str(record.entity_type).toUpperCase();
+  const action = str(record.action).toUpperCase();
+  const target = str(record.ad_id) || str(record.ad_set_id) || str(record.campaign_id) || str(record.account_id);
+  if (!entity && !action && !target) return '';
+  return createHash('sha256').update(JSON.stringify([entity, action, target])).digest('hex');
+}
+
 function failureScope(toolName: string, args: unknown): string {
   if (toolName === 'get_chat_history') return chatHistoryFailureScope(args);
   if (toolName === 'get_lead_details') return leadDetailsFailureScope(args);
+  if (toolName === 'call_meta_marketing_api') return metaMarketingFailureScope(args);
   if (toolName !== 'linkedin_outreach') return '';
   if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
   const record = args as Record<string, unknown>;
@@ -919,9 +937,19 @@ export async function executeAgentToolThroughGateway(
     // failure exactly like the catch path; do NOT clear prior failure counts.
     const structuredFailure = toolResultError(result);
     if (structuredFailure) {
-      if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, input.args, structuredFailure);
+      // ENG-1636: a ToolResultPolicyBlockedError is a gate refusing BY DESIGN
+      // (blocked:true + reason — `by_design` per toolFailureType). The refusal names
+      // its own remedy and invites a corrected call; counting it as a malfunction let
+      // six identical pre-flight refusals trip the breaker and refuse that exact
+      // corrected retry. Deliberate refusals are not failures; nothing is recorded —
+      // and nothing is cleared either, since a refusal is not a success.
+      const deliberateRefusal = structuredFailure instanceof ToolResultPolicyBlockedError;
+      if (!deliberateRefusal && input.runId) {
+        recordToolFailure(input.runId, policyDecision.toolName, input.args, structuredFailure);
+      }
       if (
-        input.budgetScopeId
+        !deliberateRefusal
+        && input.budgetScopeId
         && input.budgetScopeId !== input.runId
         && shouldTrackInSessionScope(policyDecision.toolName, structuredFailure)
       ) {
@@ -1006,6 +1034,13 @@ function classifyToolEffect(toolName: string, args: unknown): AgentToolEffect {
       action === 'ARCHIVE'
     )
       return 'internal_write';
+    return 'read';
+  }
+
+  if (toolName === 'call_attio_api') {
+    const action = stringField(args, 'action').toUpperCase();
+    if (action === 'REMOVE_ENTRIES') return 'destructive';
+    if (action === 'CREATE' || action === 'ADD_ENTRIES') return 'internal_write';
     return 'read';
   }
 

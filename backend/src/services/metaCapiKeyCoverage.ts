@@ -394,7 +394,7 @@ export async function computeCapiKeyCoverageForUser(
             userId,
             acc.accountId,
           );
-          const pixels = await metaService.listPixels(accountId, accessToken);
+          const { pixels } = await metaService.listPixels(accountId, accessToken);
           return (pixels || []).map((p: any) => ({
             pixelId: String(p.id),
             accountId,

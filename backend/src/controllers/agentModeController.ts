@@ -15,9 +15,10 @@ import { workPlanService } from '../services/workPlanService';
 import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
+import { resolveInboundAnswer, resolveTypedTextAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { buildWorkPlanInputRequest, resolveWorkPlanInputAnswer, WorkPlanInputRequestError } from '../services/agentMode/core/workPlanInputRequest';
 import type { WorkPlanTurnDisposition } from '../services/agentMode/core/workPlanTurnDisposition';
+import { priorTurnNeedsWorkPlanDispositionRetry } from '../services/agentMode/core/workPlanTurnDisposition';
 import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
@@ -72,7 +73,11 @@ import {
   stripUnfoundedEntityCounts,
   reconcileFalseDataWriteFailure,
   appendConfirmedDataWriteNotice,
+  reconcileFalseArtifactFailure,
+  appendConfirmedArtifactNotice,
+  collectConfirmedArtifactUrls,
   FalseFailureLedgerEntry,
+  ConfirmedArtifactRef,
 } from '../utils/falseFailureReport';
 import { collectLeadImportTotals, describeLeadImportTotals } from '../utils/leadImportLedger';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -598,6 +603,73 @@ export function detectRunBlockedReason(toolCalls: any[] | undefined | null): str
       && call.result?.searchUnavailable === true,
   );
   return blocked ? LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON : null;
+}
+
+const LINKEDIN_INVITE_CAP_BLOCK_RE =
+  /cannot resend yet|account[ -]level invitation (?:cooldown|cap|limit)|linkedin (?:daily volume limit reached|write actions are being paced)|daily (?:invite|volume).*(?:cap|limit)|(?:pacing|paced).*(?:cap|limit|refus|reach)/i;
+
+type LinkedInInviteSendBlock = {
+  notice: string;
+  successfulInviteSends: number;
+  // ENG-1657 (AC3): the Unipile account the blocked send-invite call targeted, when
+  // the tool arguments carried one. Used only to key the internal oncall alert's
+  // per-account/day dedupe — never surfaced to the customer.
+  accountId?: string;
+};
+
+function linkedInOutreachArgs(call: any): Record<string, any> | null {
+  const args = call?.arguments;
+  if (args && typeof args === 'object') return args;
+  if (typeof args !== 'string') return null;
+  try {
+    const parsed = JSON.parse(args);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function linkedInOutreachAction(call: any): string {
+  const args = linkedInOutreachArgs(call);
+  return args ? String(args.action || '').toLowerCase() : '';
+}
+
+/**
+ * Detect a schedule-wide LinkedIn invitation block from the executed tool ledger.
+ *
+ * A `Cannot resend yet` response and our daily/hourly pacing refusals apply to the
+ * sending account, not just the recipient. Treating an attempted send as a clean
+ * required-function match therefore reports a run as underway while every later
+ * invite is guaranteed to fail (ENG-1132).
+ */
+function detectLinkedInInviteSendBlock(toolCalls: any[] | undefined | null): LinkedInInviteSendBlock | null {
+  if (!Array.isArray(toolCalls)) return null;
+  const inviteCalls = toolCalls.filter(
+    (call: any) => call?.name === 'linkedin_outreach' && linkedInOutreachAction(call) === 'send-invite',
+  );
+  const blockedCall = inviteCalls.find((call: any) => {
+    if (toolCallSucceeded(call)) return false;
+    const detail = [call?.error, call?.result?.error, call?.result?.message]
+      .filter((value) => typeof value === 'string')
+      .join('\n');
+    return LINKEDIN_INVITE_CAP_BLOCK_RE.test(detail);
+  });
+  if (!blockedCall) return null;
+
+  const detail = [blockedCall.error, blockedCall.result?.error, blockedCall.result?.message]
+    .filter((value) => typeof value === 'string')
+    .join(' ');
+  const internalPacing = /daily (?:invite|volume).*(?:cap|limit)|write actions are being paced|pacing|paced/i.test(detail);
+  const reason = internalPacing ? 'our internal pacing cap' : "LinkedIn's account-level invitation cooldown";
+  const blockedArgs = linkedInOutreachArgs(blockedCall);
+  const accountId = blockedArgs && typeof blockedArgs.account_id === 'string' ? blockedArgs.account_id : undefined;
+  return {
+    accountId,
+    notice:
+      `LinkedIn send-invite was blocked by ${reason}. ` +
+      'No further send-invite actions will succeed until it clears; the remaining invitations were not sent.',
+    successfulInviteSends: inviteCalls.filter(toolCallSucceeded).length,
+  };
 }
 
 // ENG-1131 follow-up: minimum real time since the schedule's last observed
@@ -1172,6 +1244,8 @@ interface DiagnosisResult {
   message: string | null;
   /** Publish/deploy calls this run is confirmed to have completed. */
   publishLedger: FalseFailureLedgerEntry[];
+  /** ENG-1224: HTML preview URLs a confirmed create/update_html_file call produced this turn. */
+  artifactUrls: ConfirmedArtifactRef[];
 }
 
 /**
@@ -1212,6 +1286,32 @@ async function loadPublishLedger(
   }
 }
 
+/**
+ * ENG-1224: HTML preview URLs (create_html_file / update_html_file /
+ * create_html_from_template) this turn is confirmed to have produced. Same
+ * retry contract as `loadPublishLedger` — a single transient DynamoDB blip must
+ * not silently drop a link the user is relying on — but an unreadable session
+ * degrades to "nothing to show" rather than UNKNOWN: unlike the publish ledger,
+ * nothing downstream treats an empty result here as license to re-run work.
+ */
+async function loadConfirmedArtifactUrls(
+  sessionId: string,
+  turnStartMs?: number | null,
+): Promise<ConfirmedArtifactRef[]> {
+  if (typeof turnStartMs !== 'number') return [];
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const session = await chatbotDb.getChatSession(sessionId);
+      return collectConfirmedArtifactUrls(session?.messages as any, turnStartMs);
+    } catch (readError) {
+      if (attempt === 3) {
+        console.error(`loadConfirmedArtifactUrls: session ${sessionId} unreadable after 3 attempts:`, readError);
+      }
+    }
+  }
+  return [];
+}
+
 async function getDiagnosticErrorMessage(
   error: unknown,
   sessionId: string,
@@ -1234,6 +1334,12 @@ async function getDiagnosticErrorMessage(
     const importTotals = typeof turnStartMs === 'number'
       ? collectLeadImportTotals(session?.messages as any, turnStartMs)
       : null;
+    // ENG-1224: read straight off the transcript, same reasoning as importTotals —
+    // the in-loop toolCalls[] ledger (with its result.s3_url) does not survive the
+    // throw, but the persisted tool message does.
+    const artifactUrls = typeof turnStartMs === 'number'
+      ? collectConfirmedArtifactUrls(session?.messages as any, turnStartMs)
+      : [];
     const context: DiagnosisContext = {
       errorType: classifyErrorType(error),
       errorMessage: error instanceof Error ? error.message : String(error),
@@ -1269,15 +1375,19 @@ async function getDiagnosticErrorMessage(
       //      Last because both share CORRECTION_MARKER and first-writer wins; a
       //      landed publish is the more expensive thing to have re-run.
       message: message
-        ? reconcileFalseDataWriteFailure(
-            reconcileFalseFailureReport(stripUnfoundedEntityCounts(message, foundedCounts), publishLedger),
-            publishLedger,
+        ? reconcileFalseArtifactFailure(
+            reconcileFalseDataWriteFailure(
+              reconcileFalseFailureReport(stripUnfoundedEntityCounts(message, foundedCounts), publishLedger),
+              publishLedger,
+            ),
+            artifactUrls,
           )
         : null,
       publishLedger,
+      artifactUrls,
     };
   } catch {
-    return { message: null, publishLedger: [] };
+    return { message: null, publishLedger: [], artifactUrls: [] };
   }
 }
 
@@ -2550,13 +2660,34 @@ const AWAITING_CONFIRMATION_PATTERNS: RegExp[] = [
   // "Awaiting/wait for your confirmation/approval/go-ahead/sign-off/response before proceeding"
   /\b(?:await(?:ing)?|wait\s+for)\b[^\n.?!]*\b(?:confirmation|approval|sign-?off|go-?ahead|your\s+(?:go|response|reply|input|approval))\b/i,
   // "confirm to proceed" / "confirm before I continue/generate/build/send/deliver"
-  // (an explicit confirm-gate ahead of the deliverable action, not just "proceed")
-  /\bconfirm\b[^\n.?!]*\b(?:to|before)\b[^\n.?!]*\b(?:proceed|continu|generat|build|start|begin|send|creat|draft|deliver|run\b)/i,
+  // (an explicit confirm-gate ahead of the deliverable action, not just "proceed").
+  // ENG-1256: each bridge is bounded to a handful of WORDS, not an unbounded
+  // run of any character. Excluding only the em dash (an earlier version of
+  // this pattern) fixed the exact live repro string but not the underlying
+  // flaw: "confirm ... before ... <action>" bridging across an ENTIRELY
+  // separate clause is just as wrong when that clause is introduced by a
+  // comma ("... before merge, since #2414 creates ...") or any other
+  // separator — the dash was never the real signal, clause distance was. A
+  // genuine confirm-gate ("confirm before I proceed", "confirm to continue
+  // and I'll generate...") always has its gate verb within a couple of
+  // words; bounding the gap keeps those matching while rejecting a
+  // recommendation that merely mentions "confirm" and a verb from that list
+  // several clauses apart.
+  /\bconfirm\b\s+(?:[^\s.?!\n]+\s+){0,6}\b(?:to|before)\b\s+(?:[^\s.?!\n]+\s+){0,4}\b(?:proceed|continu|generat|build|start|begin|send|creat|draft|deliver|run\b)/i,
   // Numbered/lettered option prompt: "Reply 1 (…) or 2 (…)", "reply with option 2".
   // Opus emitted this exact form ("Reply 1 … or 2 …") instead of "Reply go" (ENG-369).
   /\breply\s+(?:with\s+)?(?:option\s+)?["'“]?\d\b/i,
-  // "please confirm one of these / the following / which option / your choice below"
-  /\bconfirm\b[^\n.?!]*\b(?:one of|which\b|the following|your\s+(?:choice|preference|selection)|these\b|option\b)/i,
+  // "please confirm one of these / the following / your choice below"
+  /\bconfirm\b[^\n.?!—–]*\b(?:one of|the following|your\s+(?:choice|preference|selection)|these\b|option\b)/i,
+  // "confirm which (option/approach) ... you'd like" — split out from the
+  // pattern above and scoped to require "you" in the same clause. ENG-1256:
+  // a bare "confirm ... which" (no "you" anchor) matched a finished report's
+  // "...confirm which of the two pixels the ads are actually configured
+  // against" (live repro) — a third party fact-check, not a question to the
+  // user. Requiring "you" distinguishes an actual human-directed choice
+  // ("confirm which of these you'd like") from prose that merely uses
+  // "which" to refer to something else entirely.
+  /\bconfirm\b[^\n.?!—–]*\bwhich\b[^\n.?!—–]*\byou\b/i,
   // "get/need/require/request your confirmation", "awaiting your confirmation"
   /\b(?:get|need|needs|require[sd]?|request(?:ing)?|await(?:ing)?)\s+(?:your\s+)?confirmation\b/i,
   // "need you to confirm/decide/choose/pick/select …" (asks the human to make the call)
@@ -2604,9 +2735,58 @@ function stripMarkdownEmphasis(content: string): string {
   return content.replace(/[*_`~]+/g, '').replace(/[^\S\n]+/g, ' ');
 }
 
+// ENG-1256: the system prompt (agentModeSystemPrompt.ts) MANDATES that every
+// single message — finished or not — end with "👉 Next Step: [1 recommended
+// action]". That line is a recommendation the model is addressing to whoever
+// acts on it next (often a THIRD PARTY, e.g. "Ask Harsha to confirm…", "Have
+// someone verify…"), not a question the model is asking the user to unblock
+// itself. Its wording is otherwise unconstrained prose, so it can innocently
+// contain words like "confirm" or "approval" and trip a keyword-shaped pattern
+// meant to catch the model halting for a reply (live repro: "confirm which of
+// the two pixels…" matched the "confirm one of/which/these/option" pattern).
+// A genuine mid-run halt asks its actual question in the message BODY, before
+// this trailer (see the ENG-480 scope-clarification tests), so excluding the
+// trailer from detection does not blind it to a real confirmation request.
+//
+// The mandated trailer is required to be the FINAL line of every message, but
+// live transcripts don't reliably preserve a literal newline before it (see
+// the ENG-1256 repro strings below), so this can't anchor on "^|\n". Instead
+// the trailing `(?:(?!👉?\s*next\s*steps?\s*:)[\s\S])*$` clause forbids the
+// matched suffix from containing another "next step(s):" occurrence, which
+// forces the regex engine to land on the LAST occurrence in the string (a
+// standard "match the final instance" technique for a non-global pattern).
+// Without it, a message that quotes/echoes an earlier "👉 Next Step:" line
+// before its real halt question would match at that EARLIER occurrence and
+// strip everything from there to end-of-string — silently deleting the
+// genuine halt question that follows it. The /u flag makes `👉?` optional as
+// a whole code point (👉 is a surrogate pair); without /u, only the trailing
+// low-surrogate code unit is optional and the high surrogate is a mandatory
+// literal, so a trailer without the emoji would fail to strip at all.
+// `steps?` tolerates plural drift ("👉 Next Steps:") — the mandated wording is
+// singular, but a model that pluralizes it would otherwise skip this pattern
+// entirely (verified live: bypasses stripping, so the trailer's prose reaches
+// the confirmation detector completely unstripped).
+//
+// ENG-1256: the label separator accepts a colon OR a dash (em/en/hyphen), not
+// just the mandated literal ":". "👉 Next Step — Ask Harsha to confirm..." is
+// at least as idiomatic an LLM label style as the colon the system prompt
+// specifies, and a colon-only regex left it completely unstripped (proven via
+// the same extracted-regex harness used for the dash/plural gaps above: a
+// short-bridge "confirm ... before ... continu[es]" recommendation inside a
+// "👉 Next Step — ..." trailer matched the confirmation-halt patterns exactly
+// like the colon case is designed NOT to). A bare period or no punctuation at
+// all is deliberately NOT included — those are far weaker signals that a line
+// is the boilerplate label rather than "next step" used as an ordinary noun
+// phrase in prose, and would risk stripping real message content.
+const NEXT_STEP_TRAILER = /👉?\s*next\s*steps?\s*[:\-–—]\s*(?:(?!👉?\s*next\s*steps?\s*[:\-–—])[\s\S])*$/iu;
+
+function stripNextStepTrailer(content: string): string {
+  return content.replace(NEXT_STEP_TRAILER, '');
+}
+
 export function scheduledRunAwaitsConfirmation(content: string): boolean {
   if (!content || typeof content !== 'string') return false;
-  const normalized = stripMarkdownEmphasis(content);
+  const normalized = stripMarkdownEmphasis(stripNextStepTrailer(content));
   return AWAITING_CONFIRMATION_PATTERNS.some((re) => re.test(normalized));
 }
 
@@ -2747,13 +2927,23 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
   if (!content || typeof content !== 'string') return false;
   // Fast path: the regex catches the common forms with zero LLM cost/latency.
   if (scheduledRunAwaitsConfirmation(content)) return true;
+  // ENG-1256: same exclusion as the regex path — the mandated "👉 Next Step:"
+  // trailer is USUALLY a recommendation, not a question to the user. But the
+  // system prompt's own scheduling-suggestion example (agentModeSystemPrompt.ts
+  // ~183-184) shows a genuine user-directed question CAN live entirely inside
+  // that line ("👉 Next Step: Want this to run automatically every week?...").
+  // So when stripping the trailer leaves nothing, any halt in this message can
+  // only be inside the trailer itself — judge the ORIGINAL unstripped content
+  // instead of short-circuiting to "no halt", or that whole class of halt goes
+  // permanently undetected by both the regex and this judge fallback.
+  const judgeableContent = stripNextStepTrailer(content).trim() || content;
   try {
     const llmPromise = agentModeService.callLLM(
       CONFIRMATION_JUDGE_MODEL,
       [
         { role: 'system', content: CONFIRMATION_JUDGE_SYSTEM },
         // The closing of the message is where a halt lives; cap input for cost.
-        { role: 'user', content: content.slice(-2500) },
+        { role: 'user', content: judgeableContent.slice(-2500) },
       ],
       { temperature: 0, max_completion_tokens: 3, taskClass: 'scheduled_background' }
     );
@@ -3378,9 +3568,12 @@ export async function runVerifiedChat(
               'drafts) and produce the final report.'
           : completionGateReason === 'budget'
             ? 'The previous run was cut short because it exhausted its processing-step ' +
-              'budget before it could produce the final deliverable. Using the data ' +
-              'already gathered, produce the final consolidated report now. Surface any ' +
-              'entities you could not fully research as actionable next steps.'
+              'budget before it could produce the final deliverable. Resume the requested ' +
+              'workflow from its first unfinished step and complete all unfinished steps ' +
+              'and entities, using tools as needed. Use the data already gathered, but do ' +
+              'not repeat completed writes or actions. Only after the remaining work is ' +
+              'complete, produce the final consolidated report. Surface any genuinely ' +
+              'blocked entities as actionable next steps.'
           : completionGateReason === 'confirmation'
             ? 'Your previous response paused to ask for confirmation or approval before ' +
               'proceeding, but this is an automated run with no human present to reply. ' +
@@ -3714,13 +3907,27 @@ export async function runVerifiedChat(
       // publish wrote nothing. But a failed publish is not silence either: it
       // means the model DID reach for the tool and the integration is broken, so
       // the attempted-but-unsuccessful names are reported separately.
+      //
+      // ENG-1599 review: kept as full ledger entries (name + arguments), not
+      // bare names — classifyPublishStall's route match needs each call's
+      // action/platform, not just its tool name, or an unrelated call (a
+      // twitter_manage_post REPLY, a post_on_connected_account to a different
+      // platform) could be mistaken for the specific outcome a route documents.
+      //
+      // ENG-1599 review: includes params.priorToolCalls, same as
+      // allActualFunctionCallsForReporting and skipLedgerToolCalls above — a
+      // resumed run's earlier segment can already have made the qualifying
+      // write (e.g. the consentOnly post_on_connected_account call this ticket
+      // is about), and allToolCalls alone only holds calls made AFTER the
+      // resume. Missing that write here would press the resumed segment to
+      // publish again, which is exactly the duplicate this breaker exists to
+      // prevent.
+      const ledgerCallsForThisTurn = [...(params.priorToolCalls ?? []), ...allToolCalls];
       const externalWritesSucceeded = publishIsTheOnlyThingLeft
-        ? allToolCalls
-            .filter((tc: any) => tc && typeof tc.name === 'string' && toolCallSucceeded(tc))
-            .map((tc: any) => tc.name as string)
+        ? ledgerCallsForThisTurn.filter((tc: any) => tc && typeof tc.name === 'string' && toolCallSucceeded(tc))
         : [];
       const publishToolsAttempted = publishIsTheOnlyThingLeft
-        ? allToolCalls
+        ? ledgerCallsForThisTurn
             .filter((tc: any) => tc && typeof tc.name === 'string' && !toolCallSucceeded(tc))
             .map((tc: any) => tc.name as string)
         : [];
@@ -3730,13 +3937,40 @@ export async function runVerifiedChat(
             unmetRequiredFunctions: functionCallMisses,
             externalWritesSucceeded,
             publishToolsAttempted,
+            // ENG-1599 review: the FULL held-to requirement set, not just the
+            // still-unmet subset — a schedule that requires BOTH names of an
+            // equivalence pair separately (e.g. post_on_connected_account AND
+            // twitter_manage_post) wants two distinct actions. Without this, a
+            // succeeded post_on_connected_account call (which already satisfies
+            // ITS OWN requirement, so it drops out of functionCallMisses) would
+            // be misread as "wrote something else" for the still-unmet
+            // twitter_manage_post requirement via the same reverse route, and
+            // stop the run before twitter_manage_post was ever attempted.
+            //
+            // Built fresh from the CURRENT requiredFunctions here, deliberately
+            // NOT the stale requiredFunctionNames const captured before the
+            // retry loop (narrowed by authorization revocation via the
+            // reassignments above) — unlike that const's own use in
+            // countCallsForRequirement, staleness is UNSAFE in this direction.
+            // There, a stale/wider set only ever WITHHOLDS completion credit
+            // more conservatively. Here, suppression means "keep pressing", so
+            // a stale/wider set would suppress a genuine mismatch and press a
+            // requirement whose sibling was since narrowed OUT — risking a
+            // second live publish through the tool that's still required.
+            heldToFunctionNames: new Set(requiredFunctions.map((reqFunc) => reqFunc.functionName)),
           })
         : null;
       if (publishStall) {
         const heldForApproval = publishStall === 'held-for-approval';
         const toolFailing = publishStall === 'publish-tool-failing';
+        const mismatch = publishStall === 'requirement-names-unused-publish-tool';
         console.warn(
-          `AgentMode runVerifiedChat: session ${sessionId} spent its publish-press budget ` +
+          `AgentMode runVerifiedChat: session ${sessionId} ` +
+          (mismatch
+            // ENG-1599: this cause fires as soon as it is detected, not once the
+            // press budget is spent — see classifyPublishStall.
+            ? `already published via a tool its requiredFunctionCalls does not name `
+            : `spent its publish-press budget `) +
           `(${publishPressAttempts}/${MAX_PUBLISH_PRESS_ATTEMPTS} press attempts, ${attempt} attempts overall) ` +
           `with [${functionCallMisses.join(', ')}] still unmet. ` +
           `Ending the run instead of re-pressing to ${maxAttempts} attempts — ` +
@@ -3746,7 +3980,7 @@ export async function runVerifiedChat(
             : toolFailing
             ? `the run DID call [${functionCallMisses.join(', ')}] and every call failed, so the ` +
               `integration is broken and pressing an erroring tool again cannot succeed`
-            : `the run already wrote externally via [${externalWritesSucceeded.join(', ')}], so the ` +
+            : `the run already wrote externally via [${externalWritesSucceeded.map((tc: any) => tc.name).join(', ')}], so the ` +
               `schedule's requiredFunctionCalls names a tool this run does not use and pressing cannot ` +
               `succeed`) +
           ` (ENG-947).`
@@ -5218,6 +5452,59 @@ export async function runScheduledChat(
       }
     }
 
+    // ENG-1132: an account-level invitation throttle makes additional invite
+    // attempts futile. Persist a plain-language completion note in the session
+    // before deriving the result/email so every surface tells the same truth.
+    // A resumed run's final outcome includes its abandoned portion. Use the
+    // same combined ledger here as the requirement verifier below: a prior
+    // blocked invite is still an account-level capacity signal, and a prior
+    // successful call still counts toward the configured minimum.
+    const linkedInOutcomeToolCalls = [...resumePriorToolCalls, ...result.toolCalls];
+    const linkedInInviteSendBlock = detectLinkedInInviteSendBlock(linkedInOutcomeToolCalls);
+    if (linkedInInviteSendBlock && sessionId) {
+      try {
+        await chatbotDb.addMessageToSession(sessionId, {
+          role: 'assistant',
+          content: linkedInInviteSendBlock.notice,
+          timestamp: new Date().toISOString(),
+          metadata: { timestamp: new Date().toISOString() },
+        });
+      } catch (persistError) {
+        console.error('Failed to persist LinkedIn invitation-block notice to session:', persistError);
+      }
+    }
+    // ENG-1657 (ENG-1132 AC3): "we find out before the customer complains" —
+    // a schedule-wide LinkedIn invite block is a fully-blocked outreach run, so it
+    // must page oncall through the SAME mechanism the LinkedIn-disconnect alerts use
+    // (sendAgentModeOncallAlert), not a bespoke channel. Deduped per account/day: a
+    // cooldown/pacing cap that persists across many scheduled fires in one day must
+    // not flood oncall with a near-identical page every fire.
+    if (linkedInInviteSendBlock && !isTest) {
+      const dedupeAccountKey = linkedInInviteSendBlock.accountId || `schedule:${schedule.scheduleId}`;
+      void sendAgentModeOncallAlert({
+        subject: `LinkedIn outreach run fully blocked: ${schedule.scheduleName}`,
+        message:
+          `Scheduled LinkedIn outreach run for schedule "${schedule.scheduleName}" attempted `
+          + `send-invite and was fully blocked. ${linkedInInviteSendBlock.notice}`,
+        sessionId,
+        // No date component: dedupeWindowMs alone enforces the rolling 24h
+        // suppression window, so an alert at 23:59 UTC and the next at 00:01
+        // UTC the following day correctly dedupe instead of bypassing on the
+        // UTC-midnight key rollover (CodeRabbit).
+        dedupeKey: `linkedin_invite_blocked:${dedupeAccountKey}`,
+        dedupeWindowMs: 24 * 60 * 60 * 1000,
+        context: {
+          'Schedule ID': schedule.scheduleId,
+          'Schedule Name': schedule.scheduleName,
+          'User ID': userId,
+          'Account ID': linkedInInviteSendBlock.accountId || 'unknown',
+        },
+      }).catch((err) => console.error('Failed to send oncall alert for blocked LinkedIn invite run:', err));
+    }
+    const scheduledResponse = linkedInInviteSendBlock
+      ? `${result.content}\n\n${linkedInInviteSendBlock.notice}`
+      : result.content;
+
     // Generate a 2-3 word summary and update the session title
     try {
       // ENG-803: ground the title suffix in the tools that actually ran, so a run
@@ -5296,10 +5583,38 @@ export async function runScheduledChat(
       };
     });
 
+    // An account-wide cooldown/pacing refusal is not a successful send. The
+    // verifier historically counted every non-publish call by name, so correct
+    // Schedules contract by tool name rather than action, so successful
+    // non-invite LinkedIn calls count too. Count every successful call from
+    // the combined ledger, rather than treating one such call as enough for
+    // a schedule that requires multiple calls.
+    const requiredLinkedInCalls = functionCallMinCalls.linkedin_outreach || 1;
+    const successfulLinkedInCalls = linkedInOutcomeToolCalls.filter(
+      (call: any) => call?.name === 'linkedin_outreach' && toolCallSucceeded(call),
+    );
+    const linkedInInviteSendRequirementMissed = Boolean(
+      linkedInInviteSendBlock
+      && heldToFunctionNames.includes('linkedin_outreach')
+      && successfulLinkedInCalls.length < requiredLinkedInCalls,
+    );
+    if (linkedInInviteSendRequirementMissed) {
+      finalFunctionCallDetails.linkedin_outreach = {
+        actual: successfulLinkedInCalls.length,
+        required: requiredLinkedInCalls,
+      };
+    }
+    const finalFunctionCallMatches = linkedInInviteSendRequirementMissed
+      ? result.functionCallMatches.filter((name: string) => name !== 'linkedin_outreach')
+      : result.functionCallMatches;
+    const finalFunctionCallMisses = linkedInInviteSendRequirementMissed
+      ? Array.from(new Set([...result.functionCallMisses, 'linkedin_outreach']))
+      : result.functionCallMisses;
+
     // ENG-635: a run that met its requirements but still deferred to an absent human
     // (deferredUnresolved) produced no real deliverable — record it as a failure so it
     // is surfaced (auto-issue + oncall) instead of scored as a clean run.
-    const runDelivered = result.success && !result.deferredUnresolved;
+    const runDelivered = result.success && !result.deferredUnresolved && !linkedInInviteSendRequirementMissed;
 
     // ENG-1131: read off this run's tool ledger before it is trimmed for storage.
     const blockedBy = detectRunBlockedReason(result.toolCalls);
@@ -5315,12 +5630,12 @@ export async function runScheduledChat(
       runId: preGeneratedRunId || require('uuid').v4(),
       status: (runDelivered ? 'success' : 'failure') as 'success' | 'failure',
       passed: runDelivered,
-      actualResponse: result.content,
+      actualResponse: scheduledResponse,
       actualFunctionCalls: actualFunctionCalls,
       keywordMatches: result.keywordMatches,
       keywordMisses: result.keywordMisses,
-      functionCallMatches: result.functionCallMatches,
-      functionCallMisses: result.functionCallMisses,
+      functionCallMatches: finalFunctionCallMatches,
+      functionCallMisses: finalFunctionCallMisses,
       functionCallDetails: finalFunctionCallDetails,
       executionTime: Date.now() - now.getTime(),
       sessionId: sessionId,
@@ -5364,6 +5679,13 @@ export async function runScheduledChat(
       // that is empty, when what they need is to reconnect the account.
       ...(result.publishToolFailing ? { publishToolFailing: true } : {}),
     };
+    const scheduledChatFailureDescription =
+      `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\n` +
+      `Missing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\n` +
+      `Keyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}` +
+      (linkedInInviteSendBlock
+        ? `\n\nBlocked action: send-invite. ${linkedInInviteSendBlock.notice}`
+        : '');
 
     // ENG-1131 follow-up: re-fetch the schedule immediately before deciding on a
     // sourcing-block transition, instead of using `schedule` as loaded at the
@@ -5443,7 +5765,7 @@ export async function runScheduledChat(
     if (!finalResult.passed && !isTest) {
       void fileAutoIssue({
         title: `Scheduled Chat Failed: ${schedule.scheduleName}`,
-        description: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
+        description: scheduledChatFailureDescription,
         source: 'Scheduled chat (validation)',
         extraLabels: ['Scheduled Chat'],
         notionTags: ['Scheduled Chat'],
@@ -5455,9 +5777,13 @@ export async function runScheduledChat(
         }
       })
         .catch(err => console.error('Failed to file scheduled-chat-failure issue:', err))
-        .then(() => sendAgentModeOncallAlert({
+        // A blocked-invite run already paged oncall above via the dedicated
+        // linkedin_invite_blocked alert — sending this generic alert too would
+        // double-page a single blocked run (CodeRabbit). The issue is still
+        // filed unconditionally above so tracking stays intact either way.
+        .then(() => linkedInInviteSendRequirementMissed ? undefined : sendAgentModeOncallAlert({
           subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
-          message: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
+          message: scheduledChatFailureDescription,
           sessionId,
           // One alert per (user, schedule, errorClass) per hour — a flapping
           // schedule cannot flood oncall (ENG-145/146 class). Gated so flag
@@ -6461,7 +6787,17 @@ export async function generateSessionResponse(
   // Check if this is the first user message (excluding system message)
   const userMessages = session.messages?.filter(msg => msg.role === 'user') || [];
   const isFirstMessage = userMessages.length === 0;
+  // ENG-1626: if the immediately-preceding assistant turn failed to reach a
+  // structured workplan disposition (e.g. a decision-card creation that
+  // silently failed even after the in-turn retry), re-enforce the check on
+  // THIS turn too — regardless of what the customer typed — so the retry
+  // happens automatically instead of depending on them asking for it by name
+  // (production case: the customer had to type "Please retry creating the
+  // card" verbatim before anything happened).
+  const lastMessage = session.messages?.[session.messages.length - 1];
+  const priorTurnFailedDisposition = priorTurnNeedsWorkPlanDispositionRetry(lastMessage);
   const enforceWorkPlanDisposition = requireWorkPlanDisposition
+    || priorTurnFailedDisposition
     || (Boolean(session.workPlan) && isFirstMessage);
 
   // If this is the first message, add system message with version info first
@@ -7271,27 +7607,26 @@ export const agentModeController = {
           throw err;
         }
       } else if (session.pendingUserQuestion?.status === 'awaiting') {
-        // ENG-396: the user typed a message instead of clicking the open card. Per the
-        // primitive's model, a selection is ONLY an explicit click — never inferred from
-        // prose. So the open question is abandoned: clear it (the old card freezes as
-        // "not answered" history) so the one-live-question guard lets Emma re-ask with a
-        // FRESH card. The irreversible-write gate still blocks until a real structured
-        // answer lands, so this can't rubber-stamp. Inject a directive so Emma re-asks
-        // THAT SAME question instead of inferring a choice from the prose and advancing.
-        // Optimistic-locked (Greptile P1, "Typed messages bypass answer lock"):
-        // a card-answer submission racing this typed message could already have
-        // persisted a real answer between our read and this write. An
-        // unconditional clear would then erase that just-landed answer (or,
-        // the other way round, this clear could land first and make the valid
-        // answer submission fail with a false "already answered"). Guard the
-        // clear on the question still being exactly this one, still awaiting.
         const abandoned = session.pendingUserQuestion;
-        const cleared = await chatbotDb.updateSessionAskUserQuestion(sessionId, null, {
+        const typedAnswer = resolveTypedTextAnswer(abandoned, userMessage, new Date().toISOString());
+        const nextQuestion = typedAnswer ?? null;
+        // Both typed resolution and clear/re-ask retain the same optimistic lock:
+        // a concurrent card click must never be erased or overwritten.
+        const persisted = await chatbotDb.updateSessionAskUserQuestion(sessionId, nextQuestion, {
           requireStillAwaiting: abandoned.questionId,
         });
-        if (cleared) {
-          session.pendingUserQuestion = undefined;
-          answerAck = buildReaskDirective(abandoned);
+        if (persisted) {
+          session.pendingUserQuestion = typedAnswer;
+          if (typedAnswer?.answer) {
+            answerAck = buildAnswerAcknowledgement(typedAnswer) ?? undefined;
+            answeredQuestionMeta = {
+              questionId: typedAnswer.questionId,
+              optionId: typedAnswer.answer.optionId,
+              delegated: false,
+            };
+          } else {
+            answerAck = buildReaskDirective(abandoned);
+          }
         } else {
           // Lost the race — a concurrent structured answer already resolved
           // this question. Re-read the fresh state so the run proceeds against
@@ -7820,20 +8155,26 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       let publishLedger: FalseFailureLedgerEntry[] = [];
+      let artifactUrls: ConfirmedArtifactRef[] = [];
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
             publishLedger = (await loadPublishLedger(sessionId, turnStartCalledFunctions)) || [];
-            // ENG-1173: same blanket "send it again" advice, same duplicate risk after
-            // a confirmed CRM write. The publish notice wins if both apply.
-            diagnosticContent = appendConfirmedDataWriteNotice(
-              appendConfirmedPublishNotice(
-                'The server restarted while processing your request. Please send your message again.',
+            artifactUrls = await loadConfirmedArtifactUrls(sessionId, turnStartMsForDiagnosis);
+            // ENG-1173/ENG-1224: same blanket "send it again" advice, same duplicate
+            // risk after a confirmed CRM write or lost link after a confirmed HTML
+            // edit. The publish notice wins if more than one applies.
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(
+                  'The server restarted while processing your request. Please send your message again.',
+                  publishLedger,
+                ),
                 publishLedger,
               ),
-              publishLedger,
+              artifactUrls,
             );
           } else {
             const userMessage = req.body?.userMessage || '';
@@ -7842,21 +8183,26 @@ export const agentModeController = {
             );
             diagnosticContent = diagnosis.message;
             publishLedger = diagnosis.publishLedger;
+            artifactUrls = diagnosis.artifactUrls;
           }
         }
 
         const errorAssistantMessage: ChatMessage = {
-          // ENG-971: the fallback carries no outcome at all, just blanket retry
-          // advice — so when the ledger confirms a publish, name it. Applied ONLY to
-          // the fixed string: a diagnosis message has already been judged on its own
-          // prose, and a truthful one must not collect a "Correction" banner.
+          // ENG-971/ENG-1224: the fallback carries no outcome at all, just blanket
+          // retry advice — so when the ledger confirms a publish, data write, or HTML
+          // edit, name it. Applied ONLY to the fixed string: a diagnosis message has
+          // already been judged on its own prose, and a truthful one must not collect
+          // a "Correction" banner.
           role: 'assistant',
-          content: diagnosticContent || appendConfirmedDataWriteNotice(
-            appendConfirmedPublishNotice(
-              'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedArtifactNotice(
+            appendConfirmedDataWriteNotice(
+              appendConfirmedPublishNotice(
+                'I encountered an error processing your request. Please try sending your message again.',
+                publishLedger,
+              ),
               publishLedger,
             ),
-            publishLedger,
+            artifactUrls,
           ),
           timestamp: new Date().toISOString(),
           metadata: {
@@ -8766,38 +9112,47 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       let publishLedger: FalseFailureLedgerEntry[] = [];
+      let artifactUrls: ConfirmedArtifactRef[] = [];
       if (!handledPartialTimeout && shareId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
             publishLedger = (await loadPublishLedger(shareId, turnStartCalledFunctions)) || [];
-            // ENG-1173: see the matching comment on the regular /generate path.
-            diagnosticContent = appendConfirmedDataWriteNotice(
-              appendConfirmedPublishNotice(
-                'The server restarted while processing your request. Please send your message again.',
+            artifactUrls = await loadConfirmedArtifactUrls(shareId, sharedTurnStartMs);
+            // ENG-1173/ENG-1224: see the matching comment on the regular /generate path.
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(
+                  'The server restarted while processing your request. Please send your message again.',
+                  publishLedger,
+                ),
                 publishLedger,
               ),
-              publishLedger,
+              artifactUrls,
             );
           } else {
             const userMessage = req.body?.userMessage || '';
             const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage, turnStartCalledFunctions, sharedTurnStartMs);
             diagnosticContent = diagnosis.message;
             publishLedger = diagnosis.publishLedger;
+            artifactUrls = diagnosis.artifactUrls;
           }
         }
 
         const errorAssistantMessage: ChatMessage = {
-          // ENG-971: see the matching comment in generateResponse — the fixed
-          // fallback gets the ledger's confirmed outcome, model prose does not.
+          // ENG-971/ENG-1224: see the matching comment in generateResponse — the
+          // fixed fallback gets the ledger's confirmed outcome, model prose does not.
           role: 'assistant',
-          content: diagnosticContent || appendConfirmedDataWriteNotice(
-            appendConfirmedPublishNotice(
-              'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedArtifactNotice(
+            appendConfirmedDataWriteNotice(
+              appendConfirmedPublishNotice(
+                'I encountered an error processing your request. Please try sending your message again.',
+                publishLedger,
+              ),
               publishLedger,
             ),
-            publishLedger,
+            artifactUrls,
           ),
           timestamp: new Date().toISOString(),
           metadata: {

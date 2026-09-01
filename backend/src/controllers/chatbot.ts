@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { chatbotDb, generateChatResponse } from '../services/chatbotService';
-import { checkTokenUsage } from '../services/tokenUsageService';
+import { checkTokenUsage, toCustomerTokenUsage } from '../services/tokenUsageService';
 import { userDb } from '../services/db';
 
 // Create a new chat session
@@ -156,7 +156,8 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
       if (!usageStatus.allowed) {
         return res.status(429).json({
           error: 'Monthly token limit reached. Please contact support or upgrade your plan.',
-          tokenUsage: usageStatus,
+          // ENG-1212 AC4 — project before it reaches the customer.
+          tokenUsage: toCustomerTokenUsage(usageStatus),
         });
       }
     }
@@ -228,7 +229,8 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
   if (!usageStatus.allowed) {
     res.status(429).json({
       error: 'Monthly token limit reached. Please contact support or upgrade your plan.',
-      tokenUsage: usageStatus,
+      // ENG-1212 AC4 — project before it reaches the customer.
+      tokenUsage: toCustomerTokenUsage(usageStatus),
     });
     return;
   }
