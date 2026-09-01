@@ -402,7 +402,7 @@ ADDITIONAL REQUIRED DIMENSIONS — include these in the SAME "dimensions" object
 - "unnecessaryPermissionRequest" (true/false): Did the assistant ask the user to confirm or approve a read-only, draft-only, or test/simulation action (e.g. "should I go ahead and run this test?", "want me to draft this for you?") where nothing was spent, nothing was published or sent, and no irreversible action was taken? Set true only when such an unnecessary confirmation prompt actually occurred. Set false otherwise — including when confirmation was correctly requested for a spend change, a publish/send action, or an irreversible action, since that confirmation is NOT unnecessary.
 
 ADDITIONAL SCORING RULE for outputQuality — pushback is not automatically excellent:
-When the user gives an explicit instruction that does NOT involve spending money, publishing, sending, or an otherwise irreversible action, and the assistant responds by arguing, countering, or otherwise not complying instead of doing what was asked — even if the assistant's reasoning is well-articulated — outputQuality for that turn's session may NOT score 5. Score it 3 or lower. A brief, single-sentence note of disagreement ALONGSIDE actually complying (do the thing, then note a concern in one sentence) is not pushback under this rule and is not penalized by it. EXCEPTION: this cap does NOT apply when noncompliance is a valid safety refusal — the instruction itself was harmful, illegal, or privacy-violating (e.g. asking the assistant to expose another user's private data, bypass a security control, or perform something clearly unsafe) and refusing was the correct response. A required safety refusal remains eligible for outputQuality 5.
+When the user gives an explicit instruction that does NOT involve spending money, publishing, sending, or an otherwise irreversible action, and the assistant responds by arguing, countering, or otherwise not complying instead of doing what was asked — even if the assistant's reasoning is well-articulated — outputQuality for that turn's session may NOT score 5. Score it 3 or lower. A brief, single-sentence note of disagreement ALONGSIDE actually complying (do the thing, then note a concern in one sentence) is not pushback under this rule and is not penalized by it. EXCEPTION: this cap does NOT apply when noncompliance is a valid safety refusal — the instruction itself was harmful, illegal, or privacy-violating (e.g. asking the assistant to expose another user's private data, bypass a security control, or perform something clearly unsafe) and refusing was the correct response. A required safety refusal remains eligible for outputQuality 5. This cap also does NOT apply when the assistant declines to make an entire final reply nothing but bare punctuation/JSON-structure debris (see the output-integrity guard rule below) — that is guard-required behavior, not pushback, and remains eligible for outputQuality 5.
 
 Include the new fields in the SAME JSON object as the other fields, e.g.:
 {"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>, "concision": <0-5>, "instructionCompliance": <0-5>, "unnecessaryPermissionRequest": <true|false>}}`;
@@ -532,6 +532,40 @@ ADDITIONAL REQUIRED FIELD — "assertsToolDerivedData":
 
 Include it in the SAME JSON object as the other fields, e.g.:
 {"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "assertsToolDerivedData": <true|false>}`;
+
+/**
+ * ENG-1164: an internal QA "serialization test" session instructed the assistant
+ * to make its ENTIRE final reply nothing but the two characters "}]" — precisely
+ * the shape ENG-1054's punctuation-only output guard (`isUnusableSynthesis`,
+ * synthesisResidue.ts) was shipped to BLOCK, because that exact shape had
+ * previously shipped as mangled, unfinished synthesis in production. The guard
+ * did its job: it discarded the punctuation-only reply and asked the model to
+ * synthesize again, and the retry explained what it had actually done. All
+ * three judges then scored the session 2/2/2 for "failing to adhere to the
+ * strict formatting constraint" — penalizing the assistant for behavior a
+ * shipped guard REQUIRES. dataAccuracy 5 across all three judges confirmed
+ * nothing was fabricated and the underlying tool call succeeded.
+ *
+ * This is a scoring-validity conflict, not an agent defect: the harness's pass
+ * condition (emit exactly "}]") is precisely the string the output-integrity
+ * guard exists to reject, so it can never pass while the guard is active, and
+ * it will recur on every future serialization-test session that asks for the
+ * same thing without this clause.
+ *
+ * APPENDED at call time, same reasoning as the other clauses above: production
+ * carries a live `default-scoring-prompt` AW-Settings override, and a custom
+ * ScoringJudge.systemPrompt (Fangfang Judge, Matt Judge — the two judges that
+ * actually reproduced this) is entirely user-authored, so editing only
+ * DEFAULT_SCORING_SYSTEM_PROMPT's literal text would leave whatever prompt is
+ * ACTUALLY configured blind to it (ENG-392).
+ */
+export const OUTPUT_INTEGRITY_GUARD_CLAUSE = `
+
+IMPORTANT — declining to make an ENTIRE final reply nothing but bare punctuation/JSON-structure debris is correct behavior, not a formatting failure:
+- The assistant runs behind a shipped output-integrity guard that blocks a final reply whose entire content is leftover JSON/punctuation debris (e.g. "}]", "},{", "\"}" with nothing else) — that exact shape has previously shipped as mangled, unfinished synthesis and destroyed a user's whole deliverable, so the guard exists specifically to reject it.
+- If the user's instruction (including an internal QA/serialization test) explicitly asks the assistant to reply with ONLY such punctuation/JSON debris and nothing else, and the assistant instead completed the underlying request (e.g. made the requested tool call) and explained that it could not comply with the literal punctuation-only format, that is CORRECT, guard-required behavior — not a defect.
+- Do NOT lower goalCompletion, outputQuality, or instructionCompliance for declining to emit bare punctuation/JSON debris as an entire reply. Evaluate goalCompletion based on whether the underlying task was actually completed (e.g. the requested data was retrieved, the requested tool ran) — not on literal compliance with an exact-punctuation-only output format.
+- This does NOT cover a genuinely complete, parseable JSON value the user actually asked for (e.g. "{}" for "return an empty object", "[]" for "show me the empty list") — that is a legitimate answer. It only covers a reply that is incomplete/structural debris, or one the instruction demanded be bare punctuation with no other content.`;
 
 /**
  * Read the judge's zero-task verdict, failing OPEN.
@@ -1238,16 +1272,17 @@ export async function scoreSession(
   // Lazy-import to avoid pulling heavy dependencies at module load time
   const { agentModeService } = await import("./agentModeService");
   // Append the zero-task clause, the ENG-1312 verbosity/permission clause, the
-  // ENG-1245 publish-approval-withholding clause, and the ENG-1223
-  // fabrication-grounding clause to whatever prompt is configured — the
-  // stored override, if any, would otherwise mask them entirely
-  // (ENG-392/ENG-830).
+  // ENG-1245 publish-approval-withholding clause, the ENG-1223
+  // fabrication-grounding clause, and the ENG-1164 output-integrity-guard
+  // clause to whatever prompt is configured — the stored override, if any,
+  // would otherwise mask them entirely (ENG-392/ENG-830).
   const systemPrompt =
     (await getDefaultScoringPrompt()) +
     NO_TASK_JUDGMENT_CLAUSE +
     VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
     PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
-    FABRICATION_GROUNDING_CLAUSE;
+    FABRICATION_GROUNDING_CLAUSE +
+    OUTPUT_INTEGRITY_GUARD_CLAUSE;
   // Persisted setting — validate before calling, or a retired id throws
   // `Invalid model` and the session silently goes unscored (ENG-744).
   const model = await resolveScoringModel(await getDefaultScoringModel());
@@ -1344,9 +1379,11 @@ export async function scoreSessionWithJudge(
       // disagree with it about whether a zero-task session is in the cohort
       // (the Matt-5 vs Fangfang-3 split in ENG-830), go blind to the
       // ENG-1312 verbosity/permission dimensions, score a real publish-approval
-      // hold as fabricated (ENG-1245), or credit a fabricated simulation as
+      // hold as fabricated (ENG-1245), credit a fabricated simulation as
       // success (ENG-1223 — this is literally how Fangfang Judge produced this
-      // bug) just because its own prompt predates these rules.
+      // bug), or penalize declining a guard-blocked punctuation-only reply
+      // (ENG-1164 — Fangfang and Matt Judge both did this) just because its
+      // own prompt predates these rules.
       {
         role: "system",
         content:
@@ -1354,7 +1391,8 @@ export async function scoreSessionWithJudge(
           NO_TASK_JUDGMENT_CLAUSE +
           VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
           PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
-          FABRICATION_GROUNDING_CLAUSE,
+          FABRICATION_GROUNDING_CLAUSE +
+          OUTPUT_INTEGRITY_GUARD_CLAUSE,
       },
       { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },
     ],
