@@ -103,16 +103,21 @@ export async function advanceWorkflow(sessionId: string, definition: WorkflowDef
     return { kind: 'step_failed', run: persisted.workflowRun };
   }
 
-  // A declared output execute() failed to return would otherwise checkpoint
-  // as the literal string "undefined" (String(undefined) === 'undefined')
-  // and get threaded into a later step's input as if it were a real entity
-  // ID. Fail loud here instead of trusting execute() honored its contract.
-  const missingOutputs = step.outputs.filter((k) => executeResult[k] === undefined || executeResult[k] === null);
-  if (missingOutputs.length > 0) {
+  // A declared output execute() failed to return a usable value for would
+  // otherwise checkpoint as a fake entity id — either the literal string
+  // "undefined"/"null" (String(undefined) === 'undefined'), or an empty
+  // string / stringified object from some other malformed return — and get
+  // threaded into a later step's input as if it were real. Fail loud here
+  // instead of trusting execute() honored its contract.
+  const invalidOutputs = step.outputs.filter((k) => {
+    const value = executeResult[k];
+    return value === undefined || value === null || value === '' || (typeof value !== 'string' && typeof value !== 'number');
+  });
+  if (invalidOutputs.length > 0) {
     const failedRun = recordStepFailure(
       run,
       step,
-      { error: `execute() did not return required output(s): ${missingOutputs.join(', ')}` },
+      { error: `execute() did not return a valid value for declared output(s): ${invalidOutputs.join(', ')}` },
       at(),
     );
     const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, failedRun, { requireVersion: run.version });
@@ -120,7 +125,23 @@ export async function advanceWorkflow(sessionId: string, definition: WorkflowDef
     return { kind: 'step_failed', run: persisted.workflowRun };
   }
 
-  const verification = await step.verify(executeResult, executionInput);
+  // verify() is step-authored and may do live I/O (a read-back call) — it is
+  // NOT guaranteed to catch its own transport failures. Without this guard, a
+  // thrown verify() skips every checkpoint write entirely: the run stays
+  // 'in_progress' with this step still unattempted, so the NEXT advanceWorkflow
+  // call (an ordinary retry, not even a concurrent one) calls execute() again
+  // and creates a second real entity — the exact duplicate-creation failure
+  // class this engine exists to close. Symmetric with the execute() try/catch
+  // above.
+  let verification: Awaited<ReturnType<typeof step.verify>>;
+  try {
+    verification = await step.verify(executeResult, executionInput);
+  } catch (err: any) {
+    const failedRun = recordStepFailure(run, step, { error: err?.message || 'verify failed' }, at());
+    const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, failedRun, { requireVersion: run.version });
+    if (!persisted?.workflowRun) return { kind: 'conflict', run };
+    return { kind: 'step_failed', run: persisted.workflowRun };
+  }
   if (!verification.verified) {
     const discrepancy = 'mismatches' in verification ? verification.mismatches : { error: verification.error };
     const failedRun = recordStepFailure(run, step, discrepancy, at());
