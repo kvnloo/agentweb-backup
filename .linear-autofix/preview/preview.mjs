@@ -20,9 +20,13 @@ import { config } from '../config.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '../..'); // the agentweb (main) repo root
-const ROUTES = path.join(__dirname, 'routes.json');
-const STATE = path.join(__dirname, 'preview-state.json');
-const LOGS = path.join(__dirname, 'logs');
+// Shared state, not __dirname: preview.mjs runs from whichever worktree invoked it (each bug
+// has its own copy of this file), but proxy.mjs always reads the copy under the main repo root.
+// Using __dirname here would write routes/state into the invoking worktree's own local copy,
+// invisible to the running proxy — the exact 502 this comment is here to prevent.
+const ROUTES = path.join(agentRoot, '.linear-autofix/preview/routes.json');
+const STATE = path.join(agentRoot, '.linear-autofix/preview/preview-state.json');
+const LOGS = path.join(agentRoot, '.linear-autofix/preview/logs');
 
 // Loopback by default: the verify browser + preview run on the same machine, and 127.0.0.1
 // avoids LAN/sandbox firewall issues. Set PREVIEW_IP to the LAN IP to reach it from another
