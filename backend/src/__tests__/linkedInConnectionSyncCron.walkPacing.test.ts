@@ -203,12 +203,17 @@ describe('full walks are paced, and only a completed one counts', () => {
 
 describe('getAllUnipileAccountIds — per-user resilience', () => {
   it('resolves every well-formed user even when another user has a malformed connected_accounts value', async () => {
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
     mockGetSetting.mockResolvedValue(null); // no site-wide accounts — isolate to the per-user path
     mockScanWithFilter.mockResolvedValue([
       { userId: 'user-good-1', connected_accounts: [{ platform: 'unipile', account_id: 'acc-good-1' }] },
       // Malformed: connected_accounts present (passes the `if (!user.connected_accounts) continue`
-      // guard) but not an array, so `for...of` throws for this user specifically.
-      { userId: 'user-bad', connected_accounts: 'not-an-array' },
+      // guard) but not an array. NOT a string — strings are iterable in JS, so
+      // `for...of` walks characters without throwing and would silently pass this
+      // test for the wrong reason (caught in independent review). A plain object
+      // is genuinely non-iterable AND a realistic real-world shape: a single
+      // account object stored unwrapped instead of inside an array.
+      { userId: 'user-bad', connected_accounts: { platform: 'unipile', account_id: 'acc-bad' } },
       { userId: 'user-good-2', connected_accounts: [{ platform: 'unipile', account_id: 'acc-good-2' }] },
     ]);
 
@@ -217,6 +222,13 @@ describe('getAllUnipileAccountIds — per-user resilience', () => {
     expect(ids.sort()).toEqual(['acc-good-1', 'acc-good-2']);
     expect(ownerByAccountId.get('acc-good-1')).toBe('user-good-1');
     expect(ownerByAccountId.get('acc-good-2')).toBe('user-good-2');
+    // Proves the catch branch itself actually ran for user-bad, not just that
+    // the end-to-end ids happen to match by coincidence.
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Skipping malformed connected_accounts for user user-bad'),
+      expect.anything(),
+    );
+    consoleErrorSpy.mockRestore();
   });
 
   it('propagates a genuine scan failure rather than returning a misleadingly-empty result', async () => {
