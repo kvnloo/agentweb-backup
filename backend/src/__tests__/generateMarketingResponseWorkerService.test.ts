@@ -191,6 +191,62 @@ describe('GenerateMarketingResponseWorkerService', () => {
       expect(mockWorker.kill).not.toHaveBeenCalled();
     });
 
+    // ENG-1670: generateMarketingResponse preserves the original provider
+    // error's .status/.code onto the wrapped Error it throws (e.g. 429 from a
+    // rate-limited Gemini call), specifically so agentModeController's
+    // classifyZeroAssistantFailure can tell a transient failure apart from a
+    // real system error. That signal only helps if it survives the worker's
+    // IPC round-trip — prod-verified it previously didn't, so every wrapped
+    // error reaching the controller looked unclassifiable regardless of cause.
+    it('should preserve status and code from a worker error message', async () => {
+      const promise = workerService.runInWorker(mockParams);
+
+      await waitForSend();
+
+      const messageHandler = messageHandlers.get('default');
+      const sendCall = mockWorker.send.mock.calls[0];
+      const requestId = sendCall[0].requestId;
+      messageHandler!({
+        type: 'error',
+        requestId,
+        error: 'I\'m currently experiencing high demand. Please wait a moment and try again.',
+        stack: 'Error stack trace',
+        status: 429,
+        code: 'rate_limit_exceeded'
+      });
+
+      await expect(promise).rejects.toMatchObject({
+        message: 'I\'m currently experiencing high demand. Please wait a moment and try again.',
+        status: 429,
+        code: 'rate_limit_exceeded'
+      });
+    });
+
+    it('should not set status/code on the reconstructed error when the worker omits them', async () => {
+      const promise = workerService.runInWorker(mockParams);
+
+      await waitForSend();
+
+      const messageHandler = messageHandlers.get('default');
+      const sendCall = mockWorker.send.mock.calls[0];
+      const requestId = sendCall[0].requestId;
+      messageHandler!({
+        type: 'error',
+        requestId,
+        error: 'Generic failure',
+        stack: 'Error stack trace'
+      });
+
+      let caught: any;
+      try {
+        await promise;
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught.status).toBeUndefined();
+      expect(caught.code).toBeUndefined();
+    });
+
     it('should handle worker process errors', async () => {
       const promise = workerService.runInWorker(mockParams);
 

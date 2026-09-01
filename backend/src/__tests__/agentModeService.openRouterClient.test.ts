@@ -740,23 +740,51 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
   // provider fallback" — session b32ec8af, 2026-08-26, showed that invariant
   // was wrong: a single 429 that survives OpenRouter's own provider-fallback
   // pool killed an entire session with no retry anywhere in callLLM). callLLM
-  // now retries a fully-exhausted transient failure exactly ONCE, bounded so
-  // it cannot itself compound with OpenRouter's fallback (getOpenRouterClient
-  // still pins maxRetries: 0 above — no SDK-level auto-retry).
-  it('retries a 429 that survives OpenRouter provider fallback exactly once, then gives up', async () => {
+  // retries a fully-exhausted transient failure, bounded so it cannot itself
+  // compound with OpenRouter's fallback (getOpenRouterClient still pins
+  // maxRetries: 0 above — no SDK-level auto-retry).
+  //
+  // ENG-1670: the single retry this test used to pin (2 total attempts) still
+  // wasn't enough — prod sessions on the "LinkedIn Post Factory" schedule hit
+  // a 429 from bursting several tool calls back-to-back and needed the full
+  // 15-60min scheduled-run backoff to recover, because the in-call retry gave
+  // up after one 1.5s wait. Now 3 total attempts with exponential backoff.
+  it('retries a 429 that survives OpenRouter provider fallback up to twice, then gives up', async () => {
     const service = new AgentModeService();
     const error = Object.assign(new Error('rate limited'), { status: 429 });
     const create = jest.fn().mockRejectedValue(error);
     jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
       chat: { completions: { create } },
     } as any);
-    jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+    const sleep = jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
 
     await expect(service.callLLM(
       'gpt-5.5',
       [{ role: 'user', content: 'Hello' }],
       { taskClass: 'interactive_chat' } as any,
     )).rejects.toBe(error);
+
+    expect(create).toHaveBeenCalledTimes(3);
+    expect(sleep).toHaveBeenNthCalledWith(1, 1500);
+    expect(sleep).toHaveBeenNthCalledWith(2, 3000);
+  });
+
+  it('stops retrying as soon as a call succeeds', async () => {
+    const service = new AgentModeService();
+    const error = Object.assign(new Error('rate limited'), { status: 429 });
+    const create = jest.fn()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValueOnce({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+    await service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'interactive_chat' } as any,
+    );
 
     expect(create).toHaveBeenCalledTimes(2);
   });
