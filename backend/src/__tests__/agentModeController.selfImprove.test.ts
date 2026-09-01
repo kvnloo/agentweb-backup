@@ -563,7 +563,11 @@ describe('updateScheduledChat DynamoDB item budget', () => {
   it('refuses to save rather than shed more history than one write can carry', async () => {
     mockScheduleDb.getScheduleById.mockResolvedValue(nearLimitSchedule({
       promptRevisions: [],
-      startingMessage: 'p'.repeat(300000),
+      // Small: this becomes the one revision snapshotted below, and must stay well
+      // under PROMPT_REVISIONS_BUDGET_BYTES so it isn't the thing forcing the
+      // shed — the point of this test is runResults, not a single oversized revision
+      // (that scenario is covered by ENG-1672's own-budget tests above).
+      startingMessage: 'old prompt',
       // Thousands of tiny entries: fitting the item needs far more removals than a
       // single UpdateExpression can name.
       runResults: Array.from({ length: 6000 }, (_, i) => ({ runId: `r${i}` })),
