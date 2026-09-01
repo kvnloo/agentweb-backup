@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { createHash } from 'crypto';
 import { isSuppressedSendResult } from '../utils/nonProdEmailGuard';
 
 import { resendService } from './resendService';
@@ -1969,16 +1970,23 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
   ) {
     const emailListForClaim = Array.isArray(toEmails) ? toEmails : [toEmails];
     // ENG-1297: a scheduled run's automated completion nudge can re-invoke this after
-    // the notification for THIS session + recipient set has already gone out (the
-    // nudge fires because an unrelated requirement is still unmet, not because the
-    // notification failed) — the observed production outcome was a duplicate report
-    // email. Claim atomically BEFORE sending so a repeat call for the same session
-    // and recipients is a no-op instead of a second send; a different recipient set
-    // (or a different session) claims independently, so a session that legitimately
-    // notifies more than one audience is unaffected.
-    const recipientSignature = emailListForClaim.map(e => e.trim().toLowerCase()).sort().join(',');
+    // the notification for THIS session + recipient set + content has already gone
+    // out (the nudge fires because an unrelated requirement is still unmet, not
+    // because the notification failed) — the observed production outcome was a
+    // duplicate report email. Claim atomically BEFORE sending so a repeat call for
+    // the same session, recipients, and content is a no-op instead of a second send.
+    // notify_session is a general-purpose DEFAULT tool available in every session
+    // (not just scheduled nudges), so the claim member folds in a hash of the
+    // subject/content: a different recipient set, a different session, OR genuinely
+    // different content still claims independently, rather than being silently and
+    // permanently suppressed as a "duplicate" of an unrelated earlier notification.
+    // JSON.stringify (not a bare comma-join) keeps the recipient signature
+    // collision-safe against an embedded comma in a single recipient entry.
+    const recipientSignature = JSON.stringify(emailListForClaim.map(e => e.trim().toLowerCase()).sort());
+    const contentSignature = createHash('sha256').update(`${subject || ''} ${content}`).digest('hex').slice(0, 16);
+    const claimMember = `${recipientSignature}:${contentSignature}`;
     const notifyClaimKey = `notify-session:${sessionId}`;
-    const claimed = await settingsService.claimSetMember(notifyClaimKey, recipientSignature);
+    const claimed = await settingsService.claimSetMember(notifyClaimKey, claimMember);
     if (!claimed) {
       console.log(`Session notification to ${emailListForClaim.join(', ')} for session ${sessionId} was already sent — skipping duplicate.`);
       return { sent: false, duplicate: true };
@@ -2081,7 +2089,7 @@ Sent via AgentWeb: ${customerFrontendUrl}
       // otherwise) must be allowed to actually send, not get silently swallowed as
       // "already sent" for a notification that never went out.
       try {
-        await settingsService.releaseSetMember(notifyClaimKey, recipientSignature);
+        await settingsService.releaseSetMember(notifyClaimKey, claimMember);
       } catch (releaseError) {
         console.error(`Failed to release notify-session claim for session ${sessionId}:`, releaseError);
       }
