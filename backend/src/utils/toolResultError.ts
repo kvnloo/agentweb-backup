@@ -86,16 +86,29 @@ export function toolResultError(result: unknown): Error | null {
     );
   };
 
+  // ENG-1300: a handler that catches its own thrown error and re-surfaces it as a
+  // structured { success: false, ... } result (e.g. twitterOutreach's catch-all)
+  // only carries the error MESSAGE by the time it gets here — the numeric HTTP
+  // status the original error threw with (`.code`, e.g. twitter-api-v2's 403) is
+  // gone unless the handler also copies it onto the result object as `code`. When
+  // it does, attach it to the reconstructed Error so classifyToolErrorClass's
+  // status-based branch still fires instead of falling back to the generic
+  // 'Error' class the message text alone cannot match.
+  const withCode = (err: Error): Error => {
+    if (typeof obj.code === 'number') (err as { code?: number }).code = obj.code;
+    return err;
+  };
+
   if (obj.isError === true) {
     const blocked = policyBlock();
     if (blocked) return blocked;
-    return new Error(extractToolResultMessage(obj) || 'Tool returned isError=true');
+    return withCode(new Error(extractToolResultMessage(obj) || 'Tool returned isError=true'));
   }
 
   if (obj.success === false) {
     const blocked = policyBlock();
     if (blocked) return blocked;
-    return new Error(extractToolResultMessage(obj) || 'Tool returned success=false');
+    return withCode(new Error(extractToolResultMessage(obj) || 'Tool returned success=false'));
   }
 
   return null;
