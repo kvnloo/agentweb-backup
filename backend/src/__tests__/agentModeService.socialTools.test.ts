@@ -16,6 +16,13 @@ jest.mock('../services/connectedAccountsDb', () => ({
   getAccountById: jest.fn(),
   getAccountByIdConsistent: jest.fn(),
   isTokenValid: jest.fn(),
+  // ENG-1616 extracted this as the one shared platform allowlist and
+  // postOnConnectedAccount now filters through it (agentModeService.ts). A
+  // jest.mock factory replaces the whole module, so an export missing here
+  // resolves undefined and .includes() throws inside the SUT's try/catch,
+  // silently downgrading every account lookup to 'not found'. Mirrors the
+  // same constant already mocked in scheduledPublishConsentGuard.test.ts.
+  SOCIAL_POSTING_PLATFORMS: ['twitter', 'linkedin', 'instagram', 'youtube'],
 }));
 
 jest.mock('../services/socialPlatformService', () => ({
