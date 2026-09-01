@@ -74,6 +74,50 @@ describe('isUnusableSynthesis', () => {
     expect(isUnusableSynthesis('[Previously called call_meta_marketing_api({"action":"UPDATE"})]')).toBe(true);
   });
 
+  // ENG-1224 Variant B / production session d5898ffd: the model echoed the
+  // loop's own wall-clock budget nudge ("Do not call any more tools. Write
+  // your final answer NOW...") back as its answer instead of following it —
+  // the persisted final message was the literal string below.
+  describe('leaked internal directive (ENG-1224)', () => {
+    it('flags the exact production leak "Do not call any more tools."', () => {
+      expect(isUnusableSynthesis(' Do not call any more tools.')).toBe(true);
+    });
+
+    it('flags other phrasings of the same injected directive', () => {
+      for (const leak of [
+        'Do not call any more tools.',
+        "don't call any more tools",
+        'DO NOT CALL ANY MORE TOOLS.',
+        'Stop all searching/pagination immediately.',
+        '[SYSTEM WARNING] Do not call any more tools. Write your final answer now.',
+      ]) {
+        expect(isUnusableSynthesis(leak)).toBe(true);
+      }
+    });
+
+    it('does NOT flag genuine prose that merely discusses tool-calling policy', () => {
+      for (const real of [
+        'I have finished the task and will not call any more tools unless you ask me to continue.',
+        'As requested, here is a summary of what I found — no further tools were needed.',
+      ]) {
+        expect(isUnusableSynthesis(real)).toBe(false);
+      }
+    });
+
+    // "Stop calling tools" and "No more tool calls" were removed from the guard: no
+    // code path ever injects either phrase, and being anchored + under the residue
+    // length cap they could discard a genuine short answer that happens to open
+    // with similar wording.
+    it('does NOT flag a genuine answer that opens with similar-but-uninjected wording', () => {
+      for (const real of [
+        'Stop calling tools that are not needed — the report below is already complete.',
+        'No more tool calls were necessary; here are the results you asked for.',
+      ]) {
+        expect(isUnusableSynthesis(real)).toBe(false);
+      }
+    });
+  });
+
   // Observed live: driving the synthesis retry into a failure state made the model
   // collapse into a repetition loop and ship 180,180 chars — 30,791 words built
   // from 65 unique tokens — straight into the transcript.

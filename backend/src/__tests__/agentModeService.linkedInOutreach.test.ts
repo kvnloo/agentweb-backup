@@ -512,6 +512,15 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       linkedin: 'https://www.linkedin.com/in/johndoe/',
     };
 
+    beforeEach(() => {
+      // updateArgs supplies a raw provider_id (not profile_url), which now gets
+      // validated via getProfile before getMessagesWithContact is called — see
+      // "rejects with a clear error when provider_id does not resolve to a real
+      // profile" below. Default to a valid profile so these tests exercise the
+      // sync behavior, not the new validation guard.
+      mockGetProfile.mockResolvedValue({ provider_id: 'li-provider-123' });
+    });
+
     it('returns synced: 0 and stamps syncAt when no message history exists', async () => {
       mockGetLeadById.mockResolvedValue(lead);
       mockGetMessagesWithContact.mockResolvedValue([]); // no messages
@@ -610,6 +619,40 @@ describe('AgentModeService - LinkedIn Outreach', () => {
         expect.any(String), // providerId
         'test-account-id',  // account_id from args
       );
+    });
+
+    it('rejects with a clear error when a raw provider_id does not resolve to a real profile, instead of silently reporting synced: 0', async () => {
+      // getMessagesWithContact treats a chat_attendee 404 as "never messaged"
+      // (ENG-1623), which is indistinguishable from a 404 caused by an
+      // invalid/nonexistent provider_id. A raw provider_id (no profile_url) is
+      // not validated by resolveProviderId, so it must be validated here instead.
+      mockGetLeadById.mockResolvedValue(lead);
+      mockGetProfile.mockRejectedValue(
+        Object.assign(new Error('Attendee not found'), {
+          structuredError: { classification: 'NOT_FOUND', message: 'Attendee not found' },
+        })
+      );
+
+      const result = await service.linkedinOutreach('user-1', updateArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Attendee not found');
+      // Must fail before ever reaching the chat lookup, sync, or gate-satisfying write.
+      expect(mockGetMessagesWithContact).not.toHaveBeenCalled();
+      expect(mockUpdateLeadLinkedInSyncAt).not.toHaveBeenCalled();
+    });
+
+    it('does not run the provider_id validation check when a profile_url is supplied (already validated by resolveProviderId)', async () => {
+      const urlArgs = { ...updateArgs, provider_id: undefined, profile_url: 'https://www.linkedin.com/in/johndoe/' };
+      mockGetLeadById.mockResolvedValue(lead);
+      mockResolveProviderId.mockResolvedValue('li-provider-123');
+      mockGetMessagesWithContact.mockResolvedValue([]);
+
+      const result = await service.linkedinOutreach('user-1', urlArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockGetProfile).not.toHaveBeenCalled();
+      expect(mockResolveProviderId).toHaveBeenCalledWith('https://www.linkedin.com/in/johndoe/', true, 'test-account-id');
     });
   });
 
