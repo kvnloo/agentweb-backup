@@ -13074,7 +13074,15 @@ export class AgentModeService {
       };
     } catch (error) {
       console.error('AgentMode: Error sending email to lead:', error);
-      return { success: false, message: 'Failed to send email', error: error instanceof Error ? error.message : 'Unknown error' };
+      const { emailProviderErrorStatus } = await import('./emailProviderService');
+      return {
+        success: false,
+        message: 'Failed to send email',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: Gmail/Outlook throw fully-typed EmailProviderError
+        // subclasses with no HTTP status of their own — mapped by name.
+        code: emailProviderErrorStatus(error)
+      };
     }
   }
 
@@ -13239,17 +13247,24 @@ export class AgentModeService {
         // configured"). Nearly all are resolved by reconnecting in Settings.
         const raw = error instanceof Error ? error.message : String(error);
         const needsReconnect = senderProvider !== 'resend' && /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
+        // ENG-1300: Gmail/Outlook throw fully-typed EmailProviderError subclasses
+        // with no HTTP status of their own — mapped by name. undefined for Resend
+        // and any other error shape, which is fine: the fields below are additive.
+        const { emailProviderErrorStatus } = await import('./emailProviderService');
+        const code = emailProviderErrorStatus(error);
         if (needsReconnect) {
           return {
             success: false,
             message: `${label} sender needs reconnecting`,
             error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
+            code,
           };
         }
         return {
           success: false,
           message: `${label} send failed`,
           error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
+          code,
         };
       }
 
@@ -13263,7 +13278,13 @@ export class AgentModeService {
       };
     } catch (error) {
       console.error('AgentMode: Error sending email from configured sender:', error);
-      return { success: false, message: 'Failed to send email', error: error instanceof Error ? error.message : 'Unknown error' };
+      const { emailProviderErrorStatus } = await import('./emailProviderService');
+      return {
+        success: false,
+        message: 'Failed to send email',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        code: emailProviderErrorStatus(error)
+      };
     }
   }
 
@@ -22331,6 +22352,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const queryLower = query.toLowerCase();
       const results: Array<{ content: string; source: string }> = [];
       let foreplayResultCount = 0;
+      // ENG-1300: swipefile/board-list failures below are caught and swallowed
+      // so a bad Foreplay board never sinks the whole search — but that meant an
+      // outright auth/rate-limit failure on EVERY source silently reported as
+      // "no ads found" (success:true), exactly the "run looks successful while
+      // operating on partial input" pattern ENG-1300 exists to catch. Track the
+      // top-level failures (not the deliberately-tolerated per-board ones) and
+      // only surface them as a real failure when there are zero results to show
+      // for it — a genuine empty match must still report success.
+      let topLevelError: any = null;
 
       // Search swipefile ads
       try {
@@ -22352,6 +22382,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       } catch (swipeErr) {
         console.log('AgentMode: Error searching Foreplay swipefile:', swipeErr);
+        topLevelError = swipeErr;
       }
 
       // Search board ads
@@ -22377,11 +22408,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               }
             }
           } catch (boardErr) {
+            // Deliberately tolerated — one bad board must not sink every other
+            // board's results, so this one is never promoted to topLevelError.
             console.log(`AgentMode: Error searching Foreplay board ${board.name}:`, boardErr);
           }
         }
       } catch (boardsErr) {
         console.log('AgentMode: Error listing Foreplay boards for search:', boardsErr);
+        topLevelError = topLevelError || boardsErr;
+      }
+
+      if (results.length === 0 && topLevelError) {
+        return {
+          success: false,
+          message: `Failed to search Foreplay ads: ${topLevelError?.message || 'Unknown error'}`,
+          error: topLevelError?.message || 'Unknown error',
+          code: topLevelError?.response?.status,
+          results: [],
+          totalResults: 0
+        };
       }
 
       if (results.length === 0) {
@@ -22406,7 +22451,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to search Foreplay ads. Please try again.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: plain axios error — Foreplay has no known business-code field.
+        code: (error as any)?.response?.status
       };
     }
   }
@@ -22494,7 +22541,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to search Foreplay discovery. Please try again.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        code: (error as any)?.response?.status
       };
     }
   }
@@ -24968,7 +25016,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       console.error('AgentMode: Error reading Foreplay ad:', error);
       return {
         success: false,
-        message: `Failed to read Foreplay ad "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read Foreplay ad "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code: (error as any)?.response?.status
       };
     }
   }
@@ -25038,6 +25087,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         toolName,
         resultSource,
         error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: googleapis' customsearch client throws a GaxiosError, whose
+        // .code is genuinely the numeric HTTP status (unlike Meta's business-code
+        // .code) — same convention already established for Drive/Calendar.
+        code: (error as any)?.code || (error as any)?.response?.status,
       };
     }
   }
@@ -27597,7 +27650,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        uploadErr.status = uploadResult.statusCode;
+        throw uploadErr;
       }
 
       const htmlUrl = uploadResult.url;
@@ -27626,7 +27681,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to create blog article',
-        error: error.message
+        error: error.message,
+        // ENG-1300: real HTTP status from the S3 upload, when the failure came
+        // from there (uploadFileToS3 exposes AWS SDK v2's numeric statusCode —
+        // never .code, a string error name on that SDK).
+        code: error?.status
       };
     }
   }
@@ -28486,7 +28545,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        uploadErr.status = uploadResult.statusCode;
+        throw uploadErr;
       }
 
       const htmlUrl = uploadResult.url;
@@ -28505,7 +28566,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to create social media posts',
-        error: error.message
+        error: error.message,
+        // ENG-1300: this function never actually calls any per-platform social
+        // API — it's a local markdown-to-HTML preview generator, and the only
+        // external call is the S3 upload. Real HTTP status from there, when
+        // that's what failed (uploadFileToS3's numeric statusCode).
+        code: error?.status
       };
     }
   }
@@ -29720,7 +29786,9 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         const uploadableHtml = await this.inlinePrivateS3Images(contentDraft, documentType, userId);
         const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
         if (!uploadResult.success || !uploadResult.url) {
-          throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+          const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+          uploadErr.status = uploadResult.statusCode;
+          throw uploadErr;
         }
         return {
           success: true,
@@ -29955,7 +30023,9 @@ Please generate a complete, professional HTML document that properly formats and
       const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
 
       if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        uploadErr.status = uploadResult.statusCode;
+        throw uploadErr;
       }
 
       const s3Url = uploadResult.url;
@@ -29974,7 +30044,9 @@ Please generate a complete, professional HTML document that properly formats and
       return {
         success: false,
         message: 'Failed to create HTML file',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: real HTTP status from the S3 upload, when that's what failed.
+        code: (error as any)?.status
       };
     }
   }
