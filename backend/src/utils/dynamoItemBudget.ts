@@ -36,6 +36,16 @@ export const SCHEDULE_ITEM_BUDGET_BYTES = 380 * 1024;
  * must not be able to wedge itself out of being editable just by running its normal
  * daily cycle. Deliberately well under half of SCHEDULE_ITEM_BUDGET_BYTES so the
  * rest of the item (current prompt, run history) keeps real headroom.
+ *
+ * Sign-off (code review, ENG-1672): this trims revision history proactively —
+ * on ANY edit where promptRevisions alone crosses this budget, even for a
+ * schedule whose total item size is nowhere near SCHEDULE_ITEM_BUDGET_BYTES or
+ * DYNAMO_MAX_ITEM_BYTES. That is an intentional behavior change from the
+ * pre-ENG-1672 code (which only trimmed once the WHOLE item crossed budget),
+ * confirmed here rather than left implicit: it is exactly what the ticket
+ * asked for (aggressive-enough trimming that a self-improving schedule cannot
+ * wedge itself out of being editable), traded deliberately against holding
+ * more revision-undo history for schedules that would otherwise have kept it.
  */
 export const PROMPT_REVISIONS_BUDGET_BYTES = 150 * 1024;
 
