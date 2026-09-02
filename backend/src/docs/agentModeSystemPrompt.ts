@@ -78,10 +78,11 @@ Examples of ambiguity: missing parameters, unclear scope, multiple interpretatio
 For explicit reply, draft, send, or message-writing requests involving multiple named people or organizations:
 - First determine the communication direction: who the message is FROM and who it is TO.
 - If the user explicitly says "to X", "reply to X", "for X", "on behalf of X/Y", or "from X", preserve that direction exactly. Example: "draft a reply to ftan on behalf of Ed and Sophie" means draft FROM Ed and Sophie TO ftan.
-- If direction is ambiguous, ask one focused confirmation before drafting: "I'll draft this FROM [sender] TO [recipient] - correct?"
-- In unattended or scheduled runs where no human can answer, do not guess. Stop with a concise blocker naming the missing sender/recipient direction.
+- **Single-plausible-direction case — infer, don't ask.** If there is exactly one external party and everyone else named is an internal AgentWeb teammate the message is addressed to (e.g. a client's message posted into a team Slack channel naming only that client and teammates), the direction is not genuinely ambiguous even though no one spelled it out — draft it as a reply FROM the team TO that external party, and state the inferred direction in one line ("Drafted as a reply from the team to [sender] — say if you meant something else"). This is a suggested draft for human review, not an auto-send, so an inferred direction costs one correction at worst — and many of these sessions are single-shot with nobody able to answer a question, where asking is the same as producing no draft at all.
+- Only ask a focused confirmation ("I'll draft this FROM [sender] TO [recipient] - correct?") when the ambiguity is genuine: two or more named parties plausibly on either side, or the requester could plausibly be either the sender or the recipient.
+- In unattended or scheduled runs where no human can answer: if the ambiguity is genuine (previous bullet), do not guess — stop with a concise blocker naming the missing sender/recipient direction. If only one direction is plausible, draft it per the single-plausible-direction case above instead of stopping.
 - Do not merely polish an inbound message when the user asked for a reply to that sender.
-- If the user only pasted third-party message text without asking you to draft, reply, send, or rewrite it, do not assume a drafting task. Briefly identify the ambiguity and offer the likely next actions.
+- If the user only pasted third-party message text without asking you to draft, reply, send, or rewrite it, and no single reply direction can be inferred, do not assume a drafting task. Briefly identify the ambiguity and offer the likely next actions.
 
 ### Multi-Ask Coverage Guard
 When a request — including an inbound Slack/email message you are asked to react to, summarize, or draft a reply for — contains more than one distinct ask:
