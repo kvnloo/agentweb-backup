@@ -101,14 +101,14 @@ describe('emailService.sendSessionNotificationEmail', () => {
   // ENG-1297: a post-completion scheduler nudge (or any other caller) resending a
   // notification for a session that already sent it must not produce a second email.
   describe('duplicate-send guard (ENG-1297)', () => {
-    it('claims an idempotency key scoped to the session, recipients, and content before sending', async () => {
+    it('claims an idempotency key scoped to the session and recipients before sending', async () => {
       jest.spyOn(emailService, 'sendEmailStrict').mockResolvedValue({ messageId: 'msg-1' });
 
       await emailService.sendSessionNotificationEmail(['B@Example.com', 'a@example.com'], 'session-666', 'Report');
 
       expect(settingsService.claimSetMember).toHaveBeenCalledWith(
         'notify-session:session-666',
-        expect.stringContaining(JSON.stringify(['a@example.com', 'b@example.com']))
+        JSON.stringify(['a@example.com', 'b@example.com'])
       );
     });
 
@@ -126,11 +126,37 @@ describe('emailService.sendSessionNotificationEmail', () => {
       expect(embeddedCommaMember).not.toBe(splitRecipientsMember);
     });
 
-    it('claims independently for different content, so a legitimate second notification is not permanently suppressed', async () => {
+    // A prior version of this guard folded a hash of subject+content into the claim
+    // member specifically so a same-session, same-recipients call with DIFFERENT
+    // content would claim independently. Reverted: re-derived against the actual
+    // production incident (session 0050a0b4-…), the scheduler's nudge caused the
+    // same run to regenerate an "updated" report and re-notify the same recipient
+    // with different content both times — a content-aware key does not suppress
+    // that duplicate, so it does not fix the bug it was added for. The guard is
+    // deliberately coarser: same session + same recipients collide regardless of
+    // content, which is what actually stops the proven regression.
+    it('collides on content: a repeat call to the same session+recipients is suppressed even with different content', async () => {
+      (settingsService.claimSetMember as jest.Mock)
+        .mockResolvedValueOnce(true)
+        .mockResolvedValueOnce(false);
+      const spy = jest.spyOn(emailService, 'sendEmailStrict').mockResolvedValue({ messageId: 'msg-1' });
+
+      const first = await emailService.sendSessionNotificationEmail(['r@example.com'], 'session-content-1', 'First report body');
+      const second = await emailService.sendSessionNotificationEmail(['r@example.com'], 'session-content-1', 'Second, different report body');
+
+      const [, firstMember] = (settingsService.claimSetMember as jest.Mock).mock.calls[0];
+      const [, secondMember] = (settingsService.claimSetMember as jest.Mock).mock.calls[1];
+      expect(firstMember).toBe(secondMember);
+      expect(first).toEqual({ sent: true, duplicate: false });
+      expect(second).toEqual({ sent: false, duplicate: true });
+      expect(spy).toHaveBeenCalledTimes(1);
+    });
+
+    it('claims independently for a genuinely different recipient set in the same session', async () => {
       jest.spyOn(emailService, 'sendEmailStrict').mockResolvedValue({ messageId: 'msg-1' });
 
-      await emailService.sendSessionNotificationEmail(['r@example.com'], 'session-content-1', 'First report body');
-      await emailService.sendSessionNotificationEmail(['r@example.com'], 'session-content-2', 'Second, different report body');
+      await emailService.sendSessionNotificationEmail(['r1@example.com'], 'session-recipients-1', 'Report');
+      await emailService.sendSessionNotificationEmail(['r2@example.com'], 'session-recipients-1', 'Report');
 
       const [, firstMember] = (settingsService.claimSetMember as jest.Mock).mock.calls[0];
       const [, secondMember] = (settingsService.claimSetMember as jest.Mock).mock.calls[1];
