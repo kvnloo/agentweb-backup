@@ -118,6 +118,22 @@ describe('a refusal that forbids substitution is never handed a "use a different
   });
 });
 
+describe('an incomplete read is never told the target was not found', () => {
+  it('read_incomplete is retryable and forbids reporting absence', () => {
+    const line = retryabilityLine('read_incomplete');
+    expect(line).toContain('Retryable: yes');
+    expect(line.toLowerCase()).toContain('not evidence that anything is absent');
+    expect(line.toLowerCase()).not.toContain('was not found');
+  });
+
+  it('read_bounded is NOT retryable, and still forbids reporting absence', () => {
+    const line = retryabilityLine('read_bounded');
+    expect(line).toContain('Retryable: no');
+    expect(line.toLowerCase()).toContain('narrow the scope');
+    expect(line.toLowerCase()).toContain('never report an item as missing');
+  });
+});
+
 describe('appendRetryabilityGuidance', () => {
   it('appends the verdict line on its own line after the formatted error', () => {
     const out = appendRetryabilityGuidance('⚠️ Tool Error: send_email\nReason: Unauthorized', 'auth');

@@ -37,6 +37,13 @@ export const RETRYABLE_ERROR_CLASSES: ReadonlySet<string> = new Set([
   'timeout',
   'network',
   'upstream_5xx',
+  /*
+   * Retryable because the common causes (a throttle, a transient page failure) clear on their
+   * own, and because the alternative verdict is worse: a "do NOT retry" on a read that was
+   * merely rate-limited leaves the model with no way to finish and every incentive to report
+   * the thing it was looking for as missing. The next step below tells it which sub-case it is.
+   */
+  'read_incomplete',
   // A tool call's arguments were a clean-but-incomplete JSON prefix (the
   // stream got cut off, not a bad-args mistake) — retrying the identical
   // call can plausibly produce a complete response next time (ENG-1477
@@ -84,6 +91,8 @@ const NEXT_STEP_BY_CLASS: Record<string, string> = {
    * is no alternative tool that produces this tool's result, and saying "use a different tool"
    * here is what turns a refusal into a fabricated answer (ENG-1625).
    */
+  read_bounded: 'the read stopped at a fixed scope or time bound and will stop in the same place every time, so retrying the identical call cannot help — and it is NOT evidence that anything is absent; never report an item as missing based on it. Narrow the scope instead: a specific sub-folder, campaign or ad set, or ask the user for a direct link.',
+  read_incomplete: 'the read did not finish, so it is NOT evidence that anything is absent — never report an item as missing based on this result. If it was throttled or failed transiently, wait briefly and retry ONCE; if it stopped at a scope or budget bound, narrow the scope (a specific folder, campaign or ad set, or ask the user for a direct link) rather than repeating the identical call.',
   subscription_blocked: 'the required skill is not included in the user\'s subscription. Do NOT retry it and do NOT substitute another tool — tell the user plainly that this capability is not on their plan.',
   invalid_output: 'the tool ran but produced no usable output. Do NOT repeat the identical call — change the arguments/approach or use a different tool.',
   policy_blocked: 'the tool gateway policy blocked this call. Do NOT retry it — follow the policy guidance or tell the user what is blocked.',

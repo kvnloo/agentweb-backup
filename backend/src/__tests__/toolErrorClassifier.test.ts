@@ -174,6 +174,48 @@ describe('classifyToolErrorClass', () => {
     ))).toBe('subscription_blocked');
   });
 
+  /*
+   * The verdict appended after a refusal must not assert what the refusal spends three
+   * sentences denying.
+   *
+   * Every one of these messages exists to stop the model concluding absence. Unclassified they
+   * fell to `not_found` — whose next step is literally "the target was not found" — or, after
+   * main widened the invalid_args regex with `is too large`, to "fix the arguments" for a
+   * filename that was never wrong. The verdict is appended AFTER the message, so it is the last
+   * thing the model reads: ENG-1584 rebuilt in the guidance channel.
+   */
+  it('classifies an incomplete read as read_incomplete, never as not_found', () => {
+    expect(classifyToolErrorClass(err(
+      'File "ad.png" was not found, but Google Drive rate-limited the scan of folder "X". Wait a minute and try again. Do NOT report the file as absent.',
+    ))).toBe('read_incomplete');
+    expect(classifyToolErrorClass(err(
+      'File "a.png" not found in folder "X" - but the folder scan did not cover the whole tree, so this is not a confirmed absence. Retry.',
+    ))).toBe('read_incomplete');
+    expect(classifyToolErrorClass(err(
+      'the file search itself failed (rate limited). This is a FAILED read, not a confirmed absence. Retry the read.',
+    ))).toBe('read_incomplete');
+    expect(classifyToolErrorClass(err(
+      'Google Drive is rate-limiting this account right now - a temporary quota answer. Wait a minute and retry.',
+    ))).toBe('read_incomplete');
+  });
+
+  it('separates a DETERMINISTIC bound, which must not be retried, from a transient one', () => {
+    // The capped-search message says "Do NOT retry this same call ... will stop in the same
+    // place every time". A Retryable: yes beneath that is the same contradiction one level down.
+    expect(classifyToolErrorClass(err(
+      'This is an INCOMPLETE read, not a confirmed absence: do not report the file as missing. '
+      + 'Do NOT retry this same call - a tree this large will stop in the same place every time.',
+    ))).toBe('read_bounded');
+  });
+
+  it('main\'s "is too large" invalid_args rule no longer swallows a Drive capped read', () => {
+    // ENG-1672 widened invalid_args with `is too large`; the Drive capped message used to end
+    // "this folder is too large to search within the read budget" and met it at auto-merge.
+    expect(classifyToolErrorClass(err(
+      'tell the user plainly that this folder exceeded the read budget for a single search',
+    ))).not.toBe('invalid_args');
+  });
+
   it('classifies bad skill ids as invalid_args, not as a plan problem', () => {
     // The model's fault, not the subscription's — the remedy is different.
     expect(classifyToolErrorClass(err('No valid skills found for the provided IDs.'))).toBe('invalid_args');

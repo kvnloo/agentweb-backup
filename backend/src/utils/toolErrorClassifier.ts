@@ -13,7 +13,7 @@
  *   timeout | auth | rate_limit | quota_exceeded | invalid_args | not_found |
  *   network | upstream_5xx | policy_blocked | repeated_failure |
  *   tool_unavailable | upstream_rejected | empty_result | invalid_output |
- *   subscription_blocked | truncated_response
+ *   subscription_blocked | truncated_response | read_incomplete | read_bounded
  *
  * The three trailing classes were added 2026-06-14 after a 7-day production
  * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
@@ -112,6 +112,33 @@ function classFromMessage(message: string): string | null {
    * a fabricated result (ENG-1625: a "UTM Tagging Audit Summary — PASS, 6/6 tagged" produced by
    * a tool that never ran). Both strings below are ours, emitted by installSkills.
    */
+  /*
+   * A read that did not finish is NOT evidence of absence — and until this branch existed, the
+   * classifier said the opposite of the message it was appended to.
+   *
+   * These messages are ours, and every one of them exists to REFUSE an absence conclusion:
+   * "Do NOT report the file as absent", "this is not a confirmed absence", "this is a FAILED
+   * read". Unclassified, they fell to `not_found` (whose next step is "the target was not
+   * found") or, once main widened the `invalid_args` regex with `is too large`, to "fix the
+   * arguments" for a filename that was never wrong. The verdict is appended AFTER the warning,
+   * so it is the last thing the model reads — ENG-1584 reintroduced through the one channel
+   * this PR had not checked.
+   *
+   * Checked ahead of not_found and invalid_args for that reason.
+   */
+  if (/do not report the file as absent|not a confirmed absence|this is a failed read|rate-limiting this account|rate-limited the scan/.test(m)) {
+    /*
+     * Two sub-cases, and they need OPPOSITE verdicts.
+     *
+     * A wall-clock/scope bound is deterministic — the message itself says "Do NOT retry this
+     * same call ... a tree this large will stop in the same place every time" — so a
+     * `Retryable: yes` beneath it is the same contradiction one level down. A throttle or a
+     * transient page failure clears on its own and must stay retryable.
+     */
+    if (/do not retry this same call|stop in the same place every time/.test(m)) return 'read_bounded';
+    return 'read_incomplete';
+  }
+
   if (/not available with your current subscription|capability is not on their plan/.test(m)) return 'subscription_blocked';
   // Bad skill ids from the model — an argument problem, not a plan problem.
   if (/no valid skills found/.test(m)) return 'invalid_args';
