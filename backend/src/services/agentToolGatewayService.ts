@@ -370,6 +370,12 @@ function metaMarketingFailureScope(args: unknown): string {
 // for both even though neither one touched a budget. Most-specific resource name
 // wins so a write against one entity and a read/list against another never share
 // a bucket; JSON-encode like the scopes above so no id can forge a collision.
+// campaign_resource_name is checked before budget_resource_name: CAMPAIGN UPDATE
+// can optionally carry budget_resource_name to reassign a campaign onto a shared
+// budget (emma/tools.ts's CAMPAIGN action matrix), so two DIFFERENT campaigns
+// reassigned to the SAME shared budget must not collide into one scope just
+// because they share that value — campaign_resource_name is the actual identity
+// of what's being updated there, budget_resource_name is a payload field on it.
 function googleAdsFailureScope(args: unknown): string {
   if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
   const record = args as Record<string, unknown>;
@@ -377,8 +383,8 @@ function googleAdsFailureScope(args: unknown): string {
   const entity = str(record.entity_type).toUpperCase();
   const action = str(record.action).toUpperCase();
   const target =
-    str(record.budget_resource_name) ||
     str(record.campaign_resource_name) ||
+    str(record.budget_resource_name) ||
     str(record.ad_group_resource_name) ||
     str(record.criterion_resource_name) ||
     str(record.ad_resource_name) ||
@@ -575,7 +581,17 @@ function countToolFailures(runId: string, toolName: string): number {
 function reserveRunBudgetSlot(runId: string, toolName: string): void {
   if (toolName !== 'call_google_ads_api') return;
   const key = `${runId}\0${toolName}`;
+  const isNewKey = !pendingRunBudgetReservations.has(key);
   pendingRunBudgetReservations.set(key, (pendingRunBudgetReservations.get(key) ?? 0) + 1);
+  // Same defensive LRU bound as runFailureCounts (MAX_TRACKED_RUNS) — a reservation
+  // is normally released the instant its own execute() settles, so this map should
+  // stay near-empty, but an execute() that never resolves (no timeout wrapper found
+  // around it in toolDispatch.ts's runOne) would otherwise leave a permanent phantom
+  // entry with no other cleanup path.
+  if (isNewKey && pendingRunBudgetReservations.size > MAX_TRACKED_RUNS) {
+    const oldest = pendingRunBudgetReservations.keys().next().value;
+    if (oldest !== undefined) pendingRunBudgetReservations.delete(oldest);
+  }
 }
 
 function releaseRunBudgetSlot(runId: string, toolName: string): void {
