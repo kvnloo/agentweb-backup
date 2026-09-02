@@ -156,8 +156,13 @@ export async function executeCrossAccountLeadAdd(args: any, context: any): Promi
 
   if (dryRun) {
     recordAdminAudit({ ...auditBase, outcome: 'planned' });
-    const preview = await previewLeadAdd(scope.target.userId, listId, leadPayload);
-    return jsonResult({ dryRun: true, ...preview });
+    try {
+      const preview = await previewLeadAdd(scope.target.userId, listId, leadPayload);
+      return jsonResult({ dryRun: true, ...preview });
+    } catch (error: any) {
+      recordAdminAudit({ ...auditBase, outcome: 'failed', error: error?.message });
+      throw error;
+    }
   }
 
   if (!isCrossAccountAddEnabled()) {

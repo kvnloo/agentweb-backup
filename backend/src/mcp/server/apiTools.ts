@@ -1011,7 +1011,13 @@ mcpToolRegistry.register({
       case 'add': {
         const leadPayload = normalizeAddLeadPayload(args.leads);
         if (resolveDryRunFlag(args.dry_run)) {
-          const actingUserId = context?.agentUserId || context?.userId;
+          // Must match httpClient.ts's own acting-identity resolution
+          // (`context.userId || context.agentUserId`) exactly — otherwise an
+          // internal service-to-service caller (userId deliberately distinct
+          // from agentUserId, see mcpServerCore.ts) gets a preview checked
+          // against a different identity than the one that actually performs
+          // the real write a moment later.
+          const actingUserId = c.userId || c.agentUserId;
           const preview = await previewLeadAdd(actingUserId, listId, leadPayload);
           return jsonResult({ dryRun: true, ...preview });
         }
