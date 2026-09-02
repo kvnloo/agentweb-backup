@@ -85,7 +85,20 @@ export const fetchWithRetry = async (url: string, retries: number = 3, delayMs: 
  */
 export const fetchWithRetryAndPaging = async (url: string): Promise<any> => {
   const response = await fetchWithRetry(url);
-  const data = await response.json();
+  let data: any;
+  try {
+    data = await response.json();
+  } catch (parseErr) {
+    // ENG-1300: a non-2xx response is sometimes a gateway/proxy error page or
+    // other non-JSON body rather than Meta's usual { error: {...} } shape —
+    // .json() throws in that case, and without this the real HTTP status is
+    // lost entirely (the SyntaxError carries none of its own).
+    const err: any = new Error(
+      parseErr instanceof Error ? `Meta API returned a non-JSON response: ${parseErr.message}` : 'Meta API returned a non-JSON response'
+    );
+    err.status = response.status;
+    throw err;
+  }
 
   // ENG-1300: this helper returns the parsed body even on a non-2xx response
   // (existing callers — routes/meta.ts, clientHealthService.ts — already build
