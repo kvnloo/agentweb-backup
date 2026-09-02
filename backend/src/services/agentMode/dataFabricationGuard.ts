@@ -32,18 +32,23 @@ function isNonEmptyString(v: unknown): v is string {
 
 /**
  * Dashboard/table/metrics-shaped UI language that invites the model to invent
- * values. Bare "metrics" and "chart" are intentionally unqualified — both are
- * low-ambiguity signals in an image-generation prompt (unlike "table", which is
- * also ordinary furniture, so it stays qualified to avoid flagging something like
- * "a laptop on a kitchen table"). This must cover the exact categories the tool
- * description warns about — "a table, chart, or list of metrics" — a fresh
- * independent review of this PR (round 3) found the original regex missed bare
- * "chart", bare "table"/"metrics" phrasing, and percent-complete phrasing that
- * doesn't say "progress bar" verbatim (e.g. "45% complete", "a completion
- * percentage"), which are exactly the categories the guidance itself names.
+ * values. Bare "metrics"/"chart"/"spreadsheet" are intentionally unqualified — all
+ * three are low-ambiguity signals in an image-generation prompt (unlike "table",
+ * which is also ordinary furniture, so it stays qualified to avoid flagging
+ * something like "a laptop on a kitchen table"). This must cover the exact
+ * categories the tool description warns about — "a table, chart, or list of
+ * metrics" — a fresh independent review of this PR (round 3) found the original
+ * regex missed bare "chart", bare "table"/"metrics" phrasing, and percent-complete
+ * phrasing that doesn't say "progress bar" verbatim (e.g. "45% complete", "a
+ * completion percentage"). Live-replaying the EXACT original bug-reporting prompt
+ * post-merge (round 4 — the real customer brief for a "budget-review spreadsheet"
+ * image, verbatim) found one more: "spreadsheet" itself was never covered, so the
+ * literal scenario that reported ENG-1027 still slipped past the backstop even
+ * after all of the above — the fabricated-numbers failure reproduced live in
+ * production with no warning, because the prompt said "spreadsheet", not "table".
  */
 const DATA_SHAPE_RE =
-  /\b(dashboard|status\s+tracker|chart|metrics?|kpi|stat(?:s|istic)?\s*(?:card|panel|preview|block)|progress\s+(?:bar|preview|ring|indicator|wheel)|completion\s+percentage|percent(?:age)?\s+complete|%\s*complete\b|data[- ]?table|table\s+(?:of|showing|listing|comparing|with)|infographic|scorecard|analytics\s+(?:card|panel|dashboard)|comparison\s+table)\b/i;
+  /\b(dashboard|status\s+tracker|chart|spreadsheet|metrics?|kpi|stat(?:s|istic)?\s*(?:card|panel|preview|block)|progress\s+(?:bar|preview|ring|indicator|wheel)|completion\s+percentage|percent(?:age)?\s+complete|%\s*complete\b|data[- ]?table|table\s+(?:of|showing|listing|comparing|with)|infographic|scorecard|analytics\s+(?:card|panel|dashboard)|comparison\s+table)\b/i;
 
 /**
  * Does this generate_image prompt describe a dashboard/table/metrics-shaped layout

@@ -20,6 +20,7 @@ import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService
 import { ctx, jsonResult } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
+import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
 
 const CLIENT_ID_SCHEMA_PROPERTY = {
   type: 'string' as const,
@@ -951,21 +952,25 @@ mcpToolRegistry.register({
   name: 'manage_leads',
   definition: {
     name: 'manage_leads',
-    description: 'Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list". Admin-only: pass client_id to read a specific client\'s list ("list"/"get" actions only) instead of the caller\'s own. Not supported for "add"/"update"/"delete" — cross-account mutation is pending a separate authorization review (ENG-1557).',
+    description: 'Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list". Admin-only: pass client_id to act on a specific client\'s list instead of the caller\'s own — supported for "list", "get", and "add" (ENG-1557 v1: admin creates one lead on a customer\'s behalf, behind a feature flag; pass dry_run:true to preview first without writing anything). Still rejected for "update"/"delete" — those need a broader authorization review.',
     inputSchema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['list', 'add', 'get', 'update', 'delete'], description: 'Action to perform' },
         list_id: { type: 'string', description: 'The lead list ID' },
         lead_id: { type: 'string', description: 'Lead ID (for get/update)' },
-        leads: { type: 'array', description: 'Array of lead objects to add (for add action)' },
+        leads: { type: 'array', description: 'Exactly one lead object to add, wrapped in an array (for add action)' },
         lead_ids: { type: 'array', items: { type: 'string' }, description: 'Lead IDs to delete (for delete action)' },
         updates: { type: 'object', description: 'Fields to update (for update action)' },
         limit: { type: 'number', description: 'Max leads to return (list action)' },
         last_key: { type: 'string', description: 'Pagination key (list action)' },
         client_id: {
           type: 'string',
-          description: "Admin-only, read actions only ('list'/'get'). Scope to a specific client's list instead of the caller's own — accepts the client's email or userId. Rejected for 'add'/'update'/'delete' (ENG-1557: cross-account writes need a separate authorization review).",
+          description: "Admin-only. Scope to a specific client's list instead of the caller's own — accepts the client's email or userId. Supported for 'list', 'get', and 'add'. For 'add', the real write additionally requires the MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED flag; dry_run:true always works regardless of the flag. Still rejected for 'update'/'delete' (broader authorization review pending).",
+        },
+        dry_run: {
+          type: 'boolean',
+          description: '"add" action only. When true, preview what would be created (list resolution, permission check, duplicate-email check) without creating anything. Advisory, not exhaustive — some real-write validations (e.g. selectedSenderId) aren\'t replicated, so a preview success doesn\'t guarantee the real write will succeed. Works regardless of client_id or the cross-account-add feature flag. Must be a real boolean if provided.',
         },
       },
       required: ['action', 'list_id']
@@ -973,26 +978,27 @@ mcpToolRegistry.register({
   },
   /**
    * CRUD dispatch for a lead list's leads. `args.client_id` (admin-only) scopes
-   * `list`/`get` to a specific client's list; `add`/`update`/`delete` reject it
-   * outright (ENG-1557: cross-account writes are pending authorization review).
+   * `list`/`get`/`add` to a specific client's list; `update`/`delete` reject it
+   * outright (ENG-1557: broader cross-account mutation is still pending
+   * authorization review — `add` graduated out under ENG-1557 v1, scoped
+   * narrowly and feature-flagged, see manageLeadsCrossAccountAdd.ts).
    */
   execute: async (args: any, context: any) => {
     const listId = args.list_id;
-    const isWriteAction = args.action === 'add' || args.action === 'update' || args.action === 'delete';
-    // CodeRabbit (PR #2651): reject ANY present client_id on a write action,
-    // not just non-empty strings — a number/object/boolean is still "provided,"
-    // and the earlier string-only check let those silently fall through to a
-    // caller-scoped write instead of being rejected loudly.
     const hasClientId = args.client_id !== undefined && args.client_id !== null;
-    if (isWriteAction && hasClientId) {
-      // ENG-1557: cross-account mutation via client_id needs its own authorization
-      // contract (staff roles, attribution, audit) before it ships — reads
-      // (list/get) don't carry that risk and are unaffected. Fail loud rather
-      // than silently writing to the caller's own list instead of the client's.
+    // Only update/delete remain blanket-rejected — add graduated out under
+    // ENG-1557 v1. Still reject ANY present client_id (not just non-empty
+    // strings — CodeRabbit, PR #2651) rather than silently falling through.
+    const isRejectedWrite = (args.action === 'update' || args.action === 'delete') && hasClientId;
+    if (isRejectedWrite) {
       throw new Error(
-        `client_id is not supported for manage_leads action "${args.action}" — cross-account writes are pending ENG-1557's authorization review. Only "list" and "get" support client_id today.`
+        `client_id is not supported for manage_leads action "${args.action}" — cross-account writes for this action are pending a broader ENG-1557 authorization review. Only "list", "get", and "add" support client_id today.`
       );
     }
+    if (args.action === 'add' && hasClientId) {
+      return executeCrossAccountLeadAdd(args, context);
+    }
+    const isWriteAction = args.action === 'add' || args.action === 'update' || args.action === 'delete';
     const c = isWriteAction ? ctx(context) : await resolveClientScopedContext(context, args.client_id, 'manage_leads');
     switch (args.action) {
       case 'list': {
@@ -1003,7 +1009,19 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'add': {
-        const data = await mcpFetch({ method: 'POST', path: `/api/crm/lists/${listId}/leads`, context: c, body: { leads: args.leads } });
+        const leadPayload = normalizeAddLeadPayload(args.leads);
+        if (resolveDryRunFlag(args.dry_run)) {
+          // Must match httpClient.ts's own acting-identity resolution
+          // (`context.userId || context.agentUserId`) exactly — otherwise an
+          // internal service-to-service caller (userId deliberately distinct
+          // from agentUserId, see mcpServerCore.ts) gets a preview checked
+          // against a different identity than the one that actually performs
+          // the real write a moment later.
+          const actingUserId = c.userId || c.agentUserId;
+          const preview = await previewLeadAdd(actingUserId, listId, leadPayload);
+          return jsonResult({ dryRun: true, ...preview });
+        }
+        const data = await mcpFetch({ method: 'POST', path: `/api/crm/lists/${listId}/leads`, context: c, body: leadPayload });
         return jsonResult(data);
       }
       case 'get': {

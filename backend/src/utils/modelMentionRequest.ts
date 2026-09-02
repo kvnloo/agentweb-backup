@@ -104,6 +104,49 @@ interface Token {
   followsSentenceBreak: boolean;
 }
 
+/**
+ * Is the gap between two tokens a sentence boundary?
+ *
+ * The subtlety is the full stop. Most of the registry carries a dotted version
+ * — "Gemini 3.7 Flash", "GPT 4.1", "Claude Opus 4.8" — and a naive `/[.!?\n]/`
+ * test splits "3.7" into two sentences. That is not cosmetic: it truncated the
+ * sentence range `findModelMention` hands the explanatory-question guard, so
+ * "What does it mean to use Gemini 3.7 Flash?" lost its own question mark and
+ * was read as a REQUEST for that model. Caught by CodeRabbit on PR #2707 and
+ * reproduced before fixing; pinned by tests below.
+ *
+ * A dot flanked by digits with no whitespace is a decimal point. Anything else
+ * — including "3. 7" and the "3.7. Use..." that ends a real sentence — is a
+ * break.
+ */
+function isSentenceBreak(gap: string, previousToken: Token | undefined, nextChar: string): boolean {
+  if (/[!?\n]/.test(gap)) return true;
+  if (!gap.includes('.')) return false;
+  const isDecimalPoint =
+    gap === '.'
+    && !!previousToken
+    && /\d$/.test(previousToken.text)
+    && /^\d/.test(nextChar);
+  return !isDecimalPoint;
+}
+
+/**
+ * Remove the dot from a dotted version ("3.7" -> "37") for guard matching only.
+ *
+ * `EXPLANATORY_QUESTION_PATTERN` (ENG-1565) spans `[^.!]*` between its opening
+ * phrase and the "?", deliberately, so it cannot reach across a sentence. A
+ * version dot is not a sentence, but it stops that scan dead — which is why
+ * "What does it mean to use Gemini 3.1 Flash Lite?" survived the sentence-range
+ * fix and was still read as a request. Fixing it here rather than widening the
+ * shared pattern keeps ENG-1565's detector untouched.
+ *
+ * Used only to answer a yes/no question about the text; never for offsets or
+ * for anything the customer sees.
+ */
+function stripVersionDots(text: string): string {
+  return text.replace(/(\d)\.(?=\d)/g, '$1');
+}
+
 function tokenize(text: string): Token[] {
   const tokens: Token[] = [];
   const re = /[a-z0-9]+/gi;
@@ -114,7 +157,11 @@ function tokenize(text: string): Token[] {
       text: match[0].toLowerCase(),
       start: match.index,
       end: match.index + match[0].length,
-      followsSentenceBreak: /[.!?\n]/.test(text.slice(previousEnd, match.index)),
+      followsSentenceBreak: isSentenceBreak(
+        text.slice(previousEnd, match.index),
+        tokens[tokens.length - 1],
+        match[0],
+      ),
     });
     previousEnd = match.index + match[0].length;
   }
@@ -197,13 +244,57 @@ function matchLengthAt(tokens: Token[], index: number, key: string): number {
  * not a request), then a longest-match scan for a registered model name led by a
  * request verb.
  */
+/** Char range of the sentence containing `index`, using the same breaks as the verb scan. */
+function sentenceBoundsAt(
+  tokens: Token[],
+  index: number,
+  messageContent: string,
+): { start: number; end: number } {
+  let first = index;
+  while (first > 0 && !tokens[first].followsSentenceBreak) first--;
+  let afterLast = index + 1;
+  while (afterLast < tokens.length && !tokens[afterLast].followsSentenceBreak) afterLast++;
+  return {
+    start: tokens[first].start,
+    // Up to the next sentence's first token (or end of string) so the sentence's
+    // own terminating "?" is inside the range — `isExplanatoryQuestion` needs it.
+    end: afterLast < tokens.length ? tokens[afterLast].start : messageContent.length,
+  };
+}
+
+/**
+ * The model this message asks to be used, or null.
+ *
+ * ## Why the guards are scoped, and not applied to the whole message
+ *
+ * ENG-1565 tests its guards against the entire message, which is right for its
+ * detector: its trigger is the bare word "model", so any nearby negation is
+ * plausibly about the model. Inheriting that unchanged was a mistake here, and
+ * it cost a production verification turn to find. The message
+ *
+ *     "Use Opus 5 model and reply with just the word OK. Do not call any tools."
+ *
+ * names a model unambiguously, in its own sentence — and got silence, because
+ * "Do not" appeared in a LATER, unrelated sentence. Worse are the ones a real
+ * customer would send:
+ *
+ *     "Use Opus 5 and don't use tables"
+ *     "Switch to Opus 5, no need to summarise first"
+ *     "Use Opus 5 — I can't get good output from Flash"
+ *
+ * The last is the ENG-1200 complaint almost verbatim, and a whole-message guard
+ * answers it with exactly the silence this ticket exists to remove.
+ *
+ * So a negation only suppresses a mention when it could actually be negating it:
+ * in the SAME sentence, and BEFORE it. "Don't use Opus 5" still stays silent;
+ * "use Opus 5, don't use tables" no longer does. The explanatory-question guard
+ * is scoped to the mention's sentence for the same reason.
+ */
 export function findModelMention(
   messageContent: string | null | undefined,
   index: ModelMentionIndex,
 ): ModelMention | null {
   if (!messageContent || typeof messageContent !== 'string') return null;
-  if (hasNegation(messageContent)) return null;
-  if (isExplanatoryQuestion(messageContent)) return null;
 
   const tokens = tokenize(messageContent);
   for (let i = 0; i < tokens.length; i++) {
@@ -211,6 +302,12 @@ export function findModelMention(
       const length = matchLengthAt(tokens, i, key);
       if (!length) continue;
       if (!hasLeadingRequestVerb(tokens, i)) continue;
+
+      const sentence = sentenceBoundsAt(tokens, i, messageContent);
+      // Only text leading up to the mention can negate it.
+      if (hasNegation(messageContent.slice(sentence.start, tokens[i].start))) continue;
+      if (isExplanatoryQuestion(stripVersionDots(messageContent.slice(sentence.start, sentence.end)))) continue;
+
       return {
         modelId,
         matchedText: messageContent.slice(tokens[i].start, tokens[i + length - 1].end),

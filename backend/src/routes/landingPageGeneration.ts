@@ -749,7 +749,10 @@ router.post("/generated/:id/iterate", rateLimiter, async (req, res: Response) =>
     const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
 
-    const result = await iterateLandingPage(auth.page.id, auth.page.userId, message);
+    // ENG-694 AC5: pass the acting member alongside the owner. `auth.page.userId`
+    // stays the billing subject; `userId` is whoever actually asked for the edit,
+    // and authorizeLandingPageAccess has already proven they may.
+    const result = await iterateLandingPage(auth.page.id, auth.page.userId, message, userId);
     void emitLanderLifecycle("iterated", { pageId: auth.page.id, userId, channel: landerChannelFromRequest(req), mode: "incremental" });
     res.json(result);
   } catch (error: any) {
