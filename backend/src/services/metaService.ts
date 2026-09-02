@@ -140,6 +140,7 @@ export const META_LIST_MAX_PAGES = 25;
  */
 export const META_LIST_MAX_MS = 45_000;
 
+
 /**
  * Ceiling on how long ONE Graph read may block this request.
  *
@@ -162,6 +163,12 @@ export const META_LIST_MAX_MS = 45_000;
  * wait that was previously unbounded anyway. So this is a backstop against a hang, not a latency
  * target. One slow page fits inside META_LIST_MAX_MS; a second cannot, so the loop then stops and
  * reports `truncated` rather than grinding on.
+ *
+ * ⚠ That last sentence holds for the 45s default and NOT for the launch path, which passes
+ * `maxMs: META_LAUNCH_READ_MAX_MS` (240s) — there roughly eight slow pages fit. Deliberate: a
+ * truncated read refuses a launch rather than degrading an answer, so stopping early is the
+ * expensive outcome. Worst case is the 240s loop plus one in-flight 30s page, ~270s, against
+ * nginx `proxy_read_timeout` and the ALB `IdleTimeout` of 600s — checked, with headroom.
  */
 export const META_READ_CALL_TIMEOUT_MS = 30_000;
 
@@ -2041,7 +2048,9 @@ export class MetaService {
 
   private async drainCursor(
     cursor: any,
-    maxPages: number
+    maxPages: number,
+    /** Wall-clock budget for this walk. Defaults to the ordinary read ceiling. */
+    maxMs: number = META_LIST_MAX_MS,
   ): Promise<{ items: any[]; truncated: boolean; pagesFetched: number }> {
     /*
      * Normalise the bound before it is used as one. `maxPages` arrives from a caller-supplied
@@ -2063,11 +2072,14 @@ export class MetaService {
     const canPage = typeof cursor?.hasNext === 'function' && typeof cursor?.next === 'function';
     if (!canPage) return { items, truncated: false, pagesFetched };
 
-    const deadline = Date.now() + META_LIST_MAX_MS;
+    // Same normalisation discipline as `pageLimit` above: a caller-supplied budget that is not a
+    // positive safe integer must not quietly become an unbounded walk.
+    const budgetMs = Number.isSafeInteger(maxMs) && maxMs > 0 ? maxMs : META_LIST_MAX_MS;
+    const deadline = Date.now() + budgetMs;
 
     while (cursor.hasNext()) {
       if (Date.now() >= deadline) {
-        this.log(`Stopped paginating at the ${META_LIST_MAX_MS}ms wall-clock bound`, {
+        this.log(`Stopped paginating at the ${budgetMs}ms wall-clock bound`, {
           pagesFetched,
           itemsSoFar: items.length,
         });
@@ -2273,7 +2285,21 @@ export class MetaService {
     // Both sides must be known. An empty selected account cannot be compared against anything,
     // so treating it as "no mismatch" would pass every node the token can reach.
     if (!selected) {
-      refuse(`no selected account resolved for ${nodeLabel} ${nodeId}`);
+      /*
+       * OUR failure, not the user's, and it must not read like theirs.
+       *
+       * This fires when no ad account could be resolved for the request — a credential or
+       * wiring problem on our side. The shared remedy ("it belongs to a different ad account,
+       * select that one") accuses the user of pointing at someone else's node, which is a
+       * confusing, unactionable thing to read about your own campaign. It is the same mistake
+       * that shipped as "in ad account (undefined)" earlier in this work.
+       */
+      refuse(
+        `no selected account resolved for ${nodeLabel} ${nodeId}`,
+        `No ad account could be determined for this request, so ownership could not be checked. ` +
+        `This is a connection problem, not a permissions one — reconnect Meta in Settings, or ` +
+        `name the ad account explicitly, then try again.`,
+      );
     }
     if (owner !== selected) {
       refuse(`${nodeLabel} ${nodeId} owned by ${owner}, selected ${selected}`);
@@ -2436,7 +2462,7 @@ export class MetaService {
     adAccountId: string,
     accessToken: string,
     campaignId?: string,
-    options: { maxPages?: number } = {},
+    options: { maxPages?: number; maxMs?: number } = {},
   ): Promise<{
     items: Array<{ adId: string; campaignId: string; destinationUrls: string[]; urlTags?: string }>;
     truncated: boolean;
@@ -2465,7 +2491,8 @@ export class MetaService {
       const cursor = await MetaService.withReadDeadline(async () => account.getAds(fields, params), 'UTM audit ad list');
       const { items: pages, truncated, pagesFetched } = await this.drainCursor(
         cursor,
-        options.maxPages ?? META_LIST_MAX_PAGES
+        options.maxPages ?? META_LIST_MAX_PAGES,
+        options.maxMs,
       );
       const items = pages.map((a: any) => {
         const data = a._data ?? a;
