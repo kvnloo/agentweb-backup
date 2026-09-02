@@ -2351,6 +2351,29 @@ export class AgentModeService {
     // Net result: Meta/Llama has ZERO entrants after this cleanup. OpenRouter's
     // catalog has no meta-llama/llama-5* listed as of this snapshot (checked
     // live) — this is a real, currently-unfillable gap, not an oversight.
+    // ENG-199/ENG-1685: Claude Fable 5.1 (Anthropic, released 2026-09-01) —
+    // routed through OpenRouter, same convention as every other OpenRouter
+    // entry in this block (id = openrouter/<upstream-provider>/<upstream-model>,
+    // one registry line, no new routing code). This is ENG-199's actual wire-in:
+    // llmPricing.ts had a Fable 5 pricing stub staged since ENG-200 for exactly
+    // this moment, but Fable 5 itself was NEVER added to this llmModels
+    // registry — so there is no existing Fable entry to compare against yet.
+    // Going straight to 5.1 (the current model; Fable 5 is already superseded
+    // as of 2026-09-01) rather than also backfilling the now-superseded 5.
+    // Live AA Intelligence Index score (66, max-effort w/ fallback) confirmed
+    // 2026-09-01 — currently the #1 model on the independent leaderboard, 3pts
+    // above Claude Opus 5 (63). qualityScore/costScore below plug into the
+    // EXISTING dominance rule (getSupportedModelsWithMetadata) automatically —
+    // no dominance action needed today since there's no sibling family member,
+    // but the very next same-family add (e.g. a future Fable 5.2) will
+    // auto-flag whichever one loses on both cost and quality, same as every
+    // other family in this registry.
+    // supportsVision/supportsTemperature per OpenRouter's live model page
+    // (architecture.modality includes image+file input; reasoning-capable).
+    // ENG-199's cost-control blocker (ENG-200) is closed — org/per-user LLM
+    // cost caps already exist and apply automatically to every model priced
+    // in llmPricing.ts, this one included.
+    'openrouter/anthropic/claude-fable-5.1': { name: 'Claude Fable 5.1', family: 'claude-fable', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s top-ranked model for coding & agentic work', client: null, supportsTemperature: false, supportsVision: true, qualityScore: 66, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, max effort w/ fallback, snapshot 2026-09-01' },
     'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // 2026-08-19: qualityScore corrected 52 -> 40. The 52 belonged to a
