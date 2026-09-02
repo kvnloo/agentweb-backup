@@ -127,8 +127,8 @@ export function isPublishOnlyUnmet(unmetRequiredFunctions: string[]): boolean {
  * publish-shaped), so `shouldStopPressingForPublish`/`classifyPublishStall`
  * never engage and the run presses to the full `maxAttempts` (20) every day —
  * the exact ENG-947 loop, reproduced by a co-required tool ENG-947 didn't
- * anticipate. Confirmed live: schedule 34154af9 pressed 19 identical times
- * (68 messages, $8.07) on 2026-08-12, three days AFTER ENG-947 shipped.
+ * anticipate. Confirmed live: a production schedule pressed 19 identical
+ * times (68 messages, $8.07), three days AFTER ENG-947 shipped.
  *
  * This helper only answers "is a publish call among what's unmet" — it is
  * deliberately NOT sufficient on its own to stop pressing (a co-required

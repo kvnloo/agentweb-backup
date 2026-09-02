@@ -415,17 +415,16 @@ describe('hasUnmetPublishRequirement (ENG-930)', () => {
 });
 
 /**
- * ENG-930: the reported schedules (34154af9 "Kevin — X Evening Post", e7ed196d
- * "Kevin — X Morning Post") both carry `requiredFunctionCalls:
+ * ENG-930: the reported production schedules both carry `requiredFunctionCalls:
  * ['post_on_connected_account', 'generate_image']`. A run that holds the
  * publish never calls generate_image either — there is no point rendering an
  * image for a post that will not go out — so the unmet set is always the pair,
  * never purely publish-shaped, and `isPublishOnlyUnmet` never returns true.
  * That silently disabled BOTH ENG-947's press budget and (via
  * runVerifiedChat's `publishIsTheOnlyThingLeft` gate) the entry point for this
- * whole module. Confirmed live: session 0ef2078d-17c5-4d2e-bb9c-9b61d7664b75
- * (2026-08-12, three days after ENG-947 shipped) still pressed 19 identical
- * times, 68 messages, $8.07 — the exact pre-ENG-947 severity.
+ * whole module. Confirmed live: a production session, three days after
+ * ENG-947 shipped, still pressed 19 identical times, 68 messages, $8.07 —
+ * the exact pre-ENG-947 severity.
  *
  * `explicitlyWithheld` is the fix: a caller that has independently verified
  * (via agentModeController.withholdIsGenuine — NOT just model prose) that the

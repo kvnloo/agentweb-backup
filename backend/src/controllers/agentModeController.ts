@@ -4149,9 +4149,9 @@ export async function runVerifiedChat(
       // it (e.g. ['post_on_connected_account', 'generate_image']) — a run that
       // holds the publish has no reason to spend a generation call on an image for
       // content that will never post, so that prep call stays unmet forever and the
-      // set is never PURELY publish-shaped. Confirmed live: schedule 34154af9
-      // pressed 19 identical times (68 messages, $8.07) on 2026-08-12, three days
-      // AFTER ENG-947 shipped, because of exactly this. `withholdIsGenuine` is the
+      // set is never PURELY publish-shaped. Confirmed live: a production schedule
+      // pressed 19 identical times (68 messages, $8.07), three days after ENG-947
+      // shipped, because of exactly this. `withholdIsGenuine` is the
       // SAME verified (not just model-claimed) signal ENG-803's completion gate
       // already trusts below (classifyScheduledContinuationAsync) — reused here so
       // a schedule that pairs a publish call with a prep call gets the identical

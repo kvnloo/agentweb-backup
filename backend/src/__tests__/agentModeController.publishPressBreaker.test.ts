@@ -396,9 +396,8 @@ describe('runScheduledChat — publish-press circuit breaker (ENG-947)', () => {
 });
 
 /**
- * ENG-930 — the ticket's own reported schedules (34154af9 "Kevin — X Evening
- * Post", e7ed196d "Kevin — X Morning Post") both require
- * `['post_on_connected_account', 'generate_image']`. A run that holds the
+ * ENG-930 — the ticket's own reported production X-posting schedules both
+ * require `['post_on_connected_account', 'generate_image']`. A run that holds the
  * publish never generates an image for content that will not post either, so
  * `generate_image` stays unmet forever too and `isPublishOnlyUnmet` never
  * fires — see "leaves a MIXED requirement set on the full retry budget" above,
