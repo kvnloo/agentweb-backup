@@ -12,7 +12,8 @@
  * breaking change for historical queries:
  *   timeout | auth | rate_limit | quota_exceeded | invalid_args | not_found |
  *   network | upstream_5xx | policy_blocked | repeated_failure |
- *   tool_unavailable | upstream_rejected | empty_result | invalid_output
+ *   tool_unavailable | upstream_rejected | empty_result | invalid_output |
+ *   truncated_response
  *
  * The three trailing classes were added 2026-06-14 after a 7-day production
  * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
@@ -56,6 +57,11 @@ const GATEWAY_NAME_CLASSES: Record<string, string> = {
   // Typed X credit-exhaustion (ENG-664) — classify by name so a 402 clusters as
   // a billing stop even when it crosses a module/mock boundary.
   XCreditsExhaustedError: 'payment_required',
+  // A tool call's arguments were a clean-but-incomplete JSON prefix — the
+  // stream was cut off mid-generation, not a formatting mistake (ENG-1477
+  // follow-up; see repairToolCallArguments.ts). Distinct from invalid_args so
+  // the model gets retry guidance instead of "fix your arguments first".
+  TruncatedToolCallArgumentsError: 'truncated_response',
 };
 
 function classFromStatus(status: number): string | null {
@@ -100,7 +106,22 @@ function classFromMessage(message: string): string | null {
 
   // Bad arguments the model emitted — schema-validation rejections (the
   // contract layer rejects before execution) plus classic validation phrasing.
-  if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short/.test(m)) return 'invalid_args';
+  //
+  // `is too large` (ENG-1672) is deliberately global, not scoped to the schedule
+  // size-block message it was added for — it requires the literal word "is"
+  // before "too large" (verified: "Video file too large…"/"Content too
+  // large…"/"Image too large…" do NOT match this, only messages phrased as
+  // "X is too large" do), but for the ones that do match — an oversized
+  // perform_data_analysis instruction, a too-large cookie header, Gmail's
+  // HTML-body limit — this now classifies messages that previously fell
+  // through unclassified to the generic legacy-name fallback below. The one
+  // exception is a named custom error whose message happens to say "is too
+  // large" AND which previously relied on keeping its own distinct name via
+  // that same fallback (gmailService.ts's GmailBodyTooLargeError) — this now
+  // reclassifies it to invalid_args too. Accepted: a genuinely oversized input
+  // isn't retryable either way, and consistent classification across the app
+  // outweighs one error keeping a bespoke class name.
+  if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short|too large to save|is too large/.test(m)) return 'invalid_args';
 
   if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials|not authorized|do not have permission|permission to|no secrets configured|not a member of channel|account connected|account not configured|not configured to access/.test(m)) return 'auth';
   if (/enotfound|econnrefused|econnreset|eai_again|socket hang up|network error|fetch failed/.test(m)) return 'network';
@@ -141,6 +162,18 @@ export function classifyToolErrorClass(error: unknown): string {
     const byName = GATEWAY_NAME_CLASSES[error.name]
       ?? GATEWAY_NAME_CLASSES[error.constructor?.name ?? ''];
     if (byName) return byName;
+
+    // AWS SDK v2 (DynamoDB et al.) puts the exception name in the STRING
+    // `.code` property (ENG-1626, CodeRabbit) — checked BEFORE the numeric
+    // status below, not after: these errors also carry a numeric
+    // `.statusCode` of 400, and classFromStatus(400) returns 'invalid_args'
+    // before this string check would otherwise ever run, silently discarding
+    // the real classification and disabling retry during throttling.
+    const stringCodeProp = (error as { code?: unknown }).code;
+    if (typeof stringCodeProp === 'string'
+      && (stringCodeProp === 'ThrottlingException' || stringCodeProp === 'ProvisionedThroughputExceededException')) {
+      return 'rate_limit';
+    }
 
     let statusProp = (error as { status?: unknown }).status
       ?? (error as { statusCode?: unknown }).statusCode;

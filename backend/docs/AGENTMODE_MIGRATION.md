@@ -231,3 +231,10 @@ snapshot job adds one without touching the chat path.
   Monolith 24,213 → **23,895 (−318 net — first net-negative slice)**; core prod 279 → 801. Seams 2/6.
   Left inline: counter-flush DB calls, onProgress events, anti-loop detection (loop-state, later seams).
   **Outcome: GREEN.** Branch `swarm/agentmode-core-dispatch` → PR vs `harsha/swarm` (not merged).
+
+- **2026-08-29 · Consent correctness (ENG-1643)** — corrected the controller's typed-past-card
+  path without touching model selection, prompts, tool dispatch, or the core loop. A pure resolver
+  accepts one exact option id/label match, or a bare affirmative on exactly one affirmative
+  approval option; ambiguous and multi-choice bare affirmation retain clear-and-re-ask. The
+  existing optimistic write guard and human-answer invariants remain the authority. This is a
+  bounded user-visible reliability correction, not a behavior-preserving extraction.

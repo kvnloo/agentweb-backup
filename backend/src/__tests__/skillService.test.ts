@@ -50,7 +50,12 @@ describe('SkillService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     jest.spyOn(Date.prototype, 'toISOString').mockReturnValue(mockTimestamp);
-    
+    // ENG-1222: getPublishedSkills() now caches on the singleton instance
+    // (real wall-clock TTL, not mocked here) — without resetting it, a later
+    // test would silently see an earlier test's cached result instead of
+    // exercising the mock it just set up.
+    (skillService as any).publishedSkillsCache = null;
+
     // Reset defaults
     mockPromise.mockResolvedValue({});
     mockPut.mockReturnValue({ promise: mockPromise });
@@ -205,6 +210,65 @@ describe('SkillService', () => {
     it('excludes a pending-review skill whose stale publication flag is true', async () => {
       mockPromise.mockResolvedValueOnce({ Items: [{ skillId: 'pending', name: 'Pending', description: 'Desc', toolNames: [], isPublished: true, visibility: 'pending_review', createdAt: mockTimestamp, updatedAt: mockTimestamp }] });
       expect(await skillService.getPublishedSkills()).toEqual([]);
+    });
+
+    // ENG-1222: this is a full-table scan called on every turn of every
+    // skill-having chat session — caching it is what keeps that off the hot path.
+    it('serves a second call within the TTL from cache, without scanning again', async () => {
+      mockPromise.mockResolvedValueOnce({ Items: [{ skillId: 'skill-1', name: 'Skill 1', description: '', toolNames: [], isPublished: true, createdAt: mockTimestamp, updatedAt: mockTimestamp }] });
+
+      const first = await skillService.getPublishedSkills();
+      const second = await skillService.getPublishedSkills();
+
+      expect(mockScan).toHaveBeenCalledTimes(1);
+      expect(second).toEqual(first);
+    });
+
+    it('re-scans once the cache is invalidated by a skill mutation', async () => {
+      mockPromise.mockResolvedValueOnce({ Items: [{ skillId: 'skill-1', name: 'Skill 1', description: '', toolNames: [], isPublished: true, createdAt: mockTimestamp, updatedAt: mockTimestamp }] });
+      await skillService.getPublishedSkills();
+      expect(mockScan).toHaveBeenCalledTimes(1);
+
+      mockPromise.mockResolvedValueOnce({}); // updateSkill's own put
+      await skillService.updateSkill({ skillId: 'skill-1', name: 'Skill 1', description: '', toolNames: [], isPublished: true, createdAt: mockTimestamp, updatedAt: mockTimestamp });
+
+      mockPromise.mockResolvedValueOnce({ Items: [] });
+      await skillService.getPublishedSkills();
+      expect(mockScan).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not cache a failed lookup — retries the scan on the next call', async () => {
+      mockPromise.mockRejectedValueOnce(new Error('transient DynamoDB error'));
+      await expect(skillService.getPublishedSkills()).rejects.toThrow('transient DynamoDB error');
+
+      mockPromise.mockResolvedValueOnce({ Items: [] });
+      await skillService.getPublishedSkills();
+      expect(mockScan).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not let a scan already in flight repopulate the cache after a concurrent invalidation', async () => {
+      // CodeRabbit (ENG-1222 review): a scan started before a mutation, but
+      // finishing after it invalidates the cache, would otherwise overwrite the
+      // null with its own now-stale result — silently reviving pre-edit data.
+      let resolveScan: (value: any) => void;
+      const deferredScan = new Promise((resolve) => { resolveScan = resolve; });
+      mockPromise.mockReturnValueOnce(deferredScan); // consumed by getPublishedSkills' scan call
+
+      const firstCall = skillService.getPublishedSkills(); // scan in flight, not yet resolved
+
+      // A concurrent mutation invalidates the cache while the scan above is still pending.
+      mockPromise.mockResolvedValueOnce({}); // updateSkill's own put
+      await skillService.updateSkill({ skillId: 'skill-1', name: 'Skill 1', description: '', toolNames: [], isPublished: true, createdAt: mockTimestamp, updatedAt: mockTimestamp });
+
+      // Now let the stale scan resolve, after the invalidation already happened.
+      resolveScan!({ Items: [{ skillId: 'skill-1', name: 'Skill 1', description: '', toolNames: [], isPublished: true, createdAt: mockTimestamp, updatedAt: mockTimestamp }] });
+      await firstCall;
+
+      expect((skillService as any).publishedSkillsCache).toBeNull();
+
+      mockPromise.mockResolvedValueOnce({ Items: [] });
+      await skillService.getPublishedSkills();
+      expect(mockScan).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -541,6 +605,46 @@ describe('SkillService', () => {
       const result = await skillService.syncSkill('non-existent', 'prod-to-dev');
       expect(result).toBeNull();
       expect(mockPut).not.toHaveBeenCalled();
+    });
+
+    // ENG-1222 (CodeRabbit): syncSkill writes directly via dynamodb.put and,
+    // unlike createSkill/updateSkill/deleteSkill, was not invalidating the
+    // published-skills cache — a synced skill's stale toolNames/prompt could
+    // be served for up to the TTL after the sync. Only a write to THIS
+    // environment's own table (this.tableName) can invalidate anything this
+    // cache reads.
+    it('invalidates the published-skills cache when the sync targets this environment\'s own table', async () => {
+      mockPromise.mockResolvedValueOnce({ Items: [mockSkill] });
+      await skillService.getPublishedSkills();
+      expect(mockScan).toHaveBeenCalledTimes(1);
+
+      mockPromise
+        .mockResolvedValueOnce({ Item: mockSkill })
+        .mockResolvedValueOnce({});
+      // dev-to-prod writes to 'AW-Skills', which is this.tableName outside
+      // NODE_ENV=development (the environment these tests run in).
+      await skillService.syncSkill('skill-1', 'dev-to-prod');
+
+      mockPromise.mockResolvedValueOnce({ Items: [] });
+      await skillService.getPublishedSkills();
+      expect(mockScan).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not invalidate the cache when the sync targets the other environment\'s table', async () => {
+      mockPromise.mockResolvedValueOnce({ Items: [mockSkill] });
+      await skillService.getPublishedSkills();
+      expect(mockScan).toHaveBeenCalledTimes(1);
+
+      mockPromise
+        .mockResolvedValueOnce({ Item: mockSkill })
+        .mockResolvedValueOnce({});
+      // prod-to-dev writes to 'Dev-AW-Skills' — not this.tableName here, so
+      // nothing this cache reads was actually changed.
+      await skillService.syncSkill('skill-1', 'prod-to-dev');
+
+      const cached = await skillService.getPublishedSkills();
+      expect(mockScan).toHaveBeenCalledTimes(1);
+      expect(cached).toHaveLength(1);
     });
 
     it('should convert DynamoDB Set toolNames when writing to target', async () => {

@@ -1,0 +1,35 @@
+import { emmaToolRegistry } from '../emma/registry';
+
+// Detection is fail-SAFE: rather than enumerate write verbs (an allowlist that
+// leaks — `email`, `add_*`, `assign_*`, `manage_*`, `freeze_*` all slipped past an
+// earlier verb list), we allowlist READ/CONTEXT tools and treat EVERYTHING ELSE as
+// a side effect. A new or unrecognized tool therefore counts as a write until
+// proven read-only, so no write can be silently concealed.
+// Reads are named verb-FIRST (get_*, read_*, list_*, describe_*, analyze_*), so
+// anchor to the leading token — otherwise a write like `add_leads_to_list` or
+// `create_lead_list` would be mistaken for a read because it merely CONTAINS a read
+// word. Irregular read names that don't lead with a read verb are listed exactly.
+// perform_data_analysis belongs here too (ENG-1276): it runs code on caller-supplied
+// data with no external side effects — the same as analyze_*/read_* — but its name
+// doesn't lead with a recognized verb, so without this it was misclassified as a
+// write and vetoed a legitimate skip whose FIRST step is calling it to compute
+// today's weekday (real prod session 17834849…, 2026-08-16).
+const READ_ONLY_TOOL = /^(?:get|read|list|fetch|search|describe|analy[sz]e|ask|audit|lookup|view|show|load|query|count|retrieve|summari[sz]e|inspect)(?:_|$)/i;
+const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_search', 'perform_data_analysis']);
+// ENG-1276 follow-up: the exact-name allowlist above is reactive — it only grows
+// once a new read-only tool's odd name has ALREADY broken a real schedule
+// (perform_data_analysis was one such case). perform_deep_research is a live,
+// still-unpatched analog: same "no external side effects" shape, same
+// non-read-verb name, just not yet observed breaking a run. Rather than wait for
+// that, the tool's OWN registration can declare `readOnly: true` (see
+// McpToolHandler in mcp/server/registry.ts) when EVERY possible call is
+// side-effect-free, and this consults it. Checked last, after the free name
+// checks — cheaper and requires no registry state for the common case.
+export function isReadOnlyToolName(name: string): boolean {
+  if (READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name)) return true;
+  return emmaToolRegistry.getTool(name)?.readOnly === true;
+}
+export function isWriteToolCall(toolCall: any): boolean {
+  const name = typeof toolCall?.name === 'string' ? toolCall.name : '';
+  return name.length > 0 && !isReadOnlyToolName(name);
+}

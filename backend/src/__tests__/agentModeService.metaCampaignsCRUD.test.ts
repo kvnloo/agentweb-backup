@@ -28,6 +28,9 @@ jest.mock('../utils/secretsManager', () => ({
 import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { userDb } from '../services/db';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 describe('AgentModeService - Meta Campaign CRUD', () => {
   let agentModeService: AgentModeService;
@@ -61,14 +64,22 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
       ];
 
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-      (metaService.listCampaigns as jest.Mock).mockResolvedValue(mockCampaigns);
+      (metaService.listCampaigns as jest.Mock).mockResolvedValue({
+        campaigns: mockCampaigns,
+        truncated: false,
+        pagesFetched: 1,
+      });
 
       const result = await agentModeService.listMetaAdsCampaignsNew('user123');
 
       expect(result.success).toBe(true);
-      expect(result.message).toBe('Found 2 campaign(s)');
+      // ENG-1625: bare "Found N campaign(s)" was the ENG-1476/ENG-1584 sentence shape —
+      // the message now names scope and completeness explicitly.
+      expect(result.message).toBe('Found 2 campaign(s) in this ad account (complete list).');
       expect(result.campaigns).toEqual(mockCampaigns);
       expect(result.totalCount).toBe(2);
+      expect(result.complete).toBe(true);
+      expect(result.hasMore).toBe(false);
       expect(metaService.listCampaigns).toHaveBeenCalledWith('123456789', 'mock-access-token');
     });
 
@@ -90,6 +101,42 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
       // Diagnostics (Meta code / fbtrace_id / classification) survive to telemetry,
       // matching the sibling createMetaAdsCampaign path — not dropped as a bare string.
       expect(result.details).toEqual(metaErr.structuredError);
+    });
+
+    // ENG-1300: the exact misclassification trap this fix exists to avoid. Meta's
+    // own business error codes (structuredError.code, e.g. "404" as a Meta-internal
+    // code, NOT the HTTP status "Not Found") coincidentally overlap the 100-599 HTTP
+    // range. `code` on the result must come from error.status / error.response.status
+    // ONLY — never from structuredError.code — or a coincidental business code would
+    // silently masquerade as a transport status.
+    it('ENG-1300: a Meta business error code (structuredError.code) is never misread as the HTTP status', async () => {
+      // Deliberately a message with NO independent classifyToolErrorClass message-text
+      // match (unlike e.g. "Object does not exist" -> classFromMessage's 'not found'
+      // pattern) — this test isolates the numeric-code path specifically, so a
+      // leaked business code is the ONLY way this could classify as 'not_found'.
+      const metaErr: any = new Error('Unexpected Meta response');
+      metaErr.structuredError = {
+        message: metaErr.message,
+        code: 404, // Meta business code — coincidentally in the HTTP range, but NOT an HTTP status here.
+        classification: 'UNKNOWN_ERROR',
+      };
+      // Deliberately no `.status` / `.response.status` — this error carries no real
+      // transport status at all.
+
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaErr);
+
+      const result = await agentModeService.listMetaAdsCampaignsNew('user123');
+
+      expect(result.success).toBe(false);
+      // No real HTTP status was ever present, so `code` must stay unset — not
+      // silently backfilled from the business code.
+      expect(result.code).toBeUndefined();
+      const classified = toolResultError(result);
+      // Had the business code leaked through as `code`, classFromStatus(404) would
+      // have forced 'not_found'. With no numeric status and no message-text match,
+      // classification falls back to the generic legacy-name class instead.
+      expect(classifyToolErrorClass(classified)).not.toBe('not_found');
     });
   });
 
@@ -172,6 +219,30 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
       expect(result.success).toBe(false);
       expect(result.message).toBe('Invalid parameters');
       expect(result.error).toBe('Invalid parameters');
+    });
+
+    // ENG-1300: metaService.createCampaign's errors are FacebookRequestError
+    // instances (SDK-shaped) — metaService.handleError rethrows the SDK error
+    // unchanged (only attaching structuredError), so its own `.status` is the
+    // real HTTP status. Prove it survives to `code` and classifies end-to-end,
+    // distinct from a Meta business error code.
+    it('ENG-1300: a 403 (error.status, SDK-shaped) classifies as auth/config end-to-end', async () => {
+      const sdkError: any = new Error('Insufficient permission to perform this action');
+      sdkError.status = 403;
+      sdkError.structuredError = { code: 200, classification: 'PERMISSION_ERROR' };
+
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (metaService.createCampaign as jest.Mock).mockRejectedValue(sdkError);
+
+      const result = await agentModeService.createMetaAdsCampaign('user123', {
+        name: 'Test Campaign', objective: 'OUTCOME_TRAFFIC',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(403);
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
     });
   });
 

@@ -1,4 +1,5 @@
 import AWS from "aws-sdk";
+import { assertMemoryContentWithinLimit } from '../utils/memoryContentLimit';
 import dotenv from "dotenv";
 import path from "path";
 import { S3 } from "aws-sdk";
@@ -152,13 +153,14 @@ export interface User {
   displayName?: string;
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
-  emailDomain?: string; // Email sender domain
-  resendDomainId?: string; // Resend domain ID for domain verification
+  emailDomain?: string; // @deprecated legacy single sending domain — kept for the task/subscriber-notification fallback sender (emailService.ts, dripSequenceWorker.ts legacyDefaultSender); CRM sending domains live in emailDomains[] (ENG-265)
+  resendDomainId?: string; // @deprecated Resend domain ID paired with the legacy emailDomain above
+  emailDomains?: Array<{ id: string; domain: string; status: string; addedAt: string }>; // Multiple verified Resend sending domains (ENG-265). id = Resend domain id.
+  emailDomainList?: string[]; // Denormalized domain names from emailDomains[], kept in sync on every write — lets getUsersByEmailDomain's Scan filter with contains() instead of pulling every row into app memory.
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels. Kept for backward-compat reads.
   slackChannels?: string[]; // Slack channels configured for this user (agent tools are restricted to these)
-  slackSuggestedRepliesDisabled?: boolean; // When true, suppress Slack suggested-reply (slack-triggered) sessions/emails for this user. Absent/false = enabled (default).
   slackShipNotifyDisabled?: boolean; // When true, suppress the Slack ping when an item this user reported ships (shipNotifyService). Absent/false = enabled (default).
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   landerUtmDefault?: import("../utils/landerUtm").UtmConfig; // Customer-level UTM default for generated landers (ENG-724); read/write only via landerUtmStore
@@ -1245,7 +1247,9 @@ export class UserDB {
       do {
         const params: AWS.DynamoDB.DocumentClient.ScanInput = {
           TableName: this.tableName,
-          FilterExpression: 'emailDomain = :emailDomain AND NOT begins_with(userId, :tombstone)',
+          // ENG-265: also matches a domain registered as one of several entries in emailDomains[]
+          // via the denormalized emailDomainList — see the field comment on User.emailDomainList.
+          FilterExpression: '(emailDomain = :emailDomain OR contains(emailDomainList, :emailDomain)) AND NOT begins_with(userId, :tombstone)',
           ExpressionAttributeValues: {
             ':emailDomain': normalizedDomain,
             ':tombstone': 'deleted_',
@@ -5565,8 +5569,46 @@ export const crmDb = {
    *
    * Stored as: externalCrmSyncConfigs: { hubspot: {...}, attio: {...} }
    *
-   * Uses if_not_exists so the parent map is initialised automatically if absent.
    * Pass config=null to REMOVE the provider key without touching the other provider.
+   *
+   * CodeRabbit findings (ENG-1380), all now fixed:
+   *
+   * 1. This used to replace externalCrmSyncConfigs.<provider> — or, for a
+   *    provider's first-ever save, the WHOLE externalCrmSyncConfigs map,
+   *    including every other already-connected provider — wholesale (read,
+   *    merge in JS, write the whole thing back). A concurrent
+   *    updateLeadListCrmSyncStatus nested-path write for ANY provider
+   *    landing between the read and the write here would be silently
+   *    clobbered by this call's stale snapshot. Fixed by writing via
+   *    targeted paths whenever possible, scoped as narrowly as each case
+   *    allows (see the three cases below), instead of ever doing an
+   *    unconditional wholesale replace of externalCrmSyncConfigs.
+   *
+   * 2. The targeted per-field write used the field's own name as its
+   *    ExpressionAttributeNames alias (`#${field}`). Every real
+   *    ExternalCrmSyncConfig carries a `provider` field — iterating over it
+   *    silently overwrote the OTHER `#provider` alias already bound above to
+   *    the provider VALUE ('attio'/'hubspot'), corrupting every
+   *    #ecs.#provider.* path in the same expression. Fixed by using
+   *    collision-proof indexed aliases (#f0/:v0, #f1/:v1, ...) for the
+   *    per-field loop instead of the field's own name.
+   *
+   * 3. The per-field write was reached whenever externalCrmSyncConfigs
+   *    existed as an attribute at all — even when THIS provider's own key
+   *    didn't exist within it yet (e.g. Attio connecting for the first time
+   *    on a list that already has HubSpot). DynamoDB can only create the
+   *    LAST segment of a path in one SET: `#ecs.#provider.#f0` requires
+   *    `#ecs.#provider` to already exist as a map, or DynamoDB rejects the
+   *    whole write with ValidationException — it won't create both the
+   *    provider map AND a field inside it in one operation. Fixed by
+   *    splitting into three cases: (a) externalCrmSyncConfigs doesn't exist
+   *    at all — bootstrap it with a conditional write; (b) it exists but
+   *    this provider's key doesn't — a single one-level-deep
+   *    `SET #ecs.#provider = :configObj` (safe unconditionally: nothing can
+   *    legitimately be racing a provider key that doesn't exist yet, since
+   *    updateLeadListCrmSyncStatus itself requires the key to already
+   *    exist); (c) this provider's key already exists — the targeted
+   *    per-field write, unchanged.
    */
   async setLeadListCrmSyncConfig(
     listId: string,
@@ -5574,37 +5616,8 @@ export const crmDb = {
     config: Record<string, any> | null
   ): Promise<void> {
     try {
-      let params: any;
-
-      if (config !== null) {
-        // Read the current map, merge the provider key in JS, write the whole map back.
-        // This avoids the DynamoDB limitation where SET map.key fails when the parent
-        // map doesn't yet exist on the item (if_not_exists + nested path evaluated
-        // simultaneously against the original item state, not sequentially).
-        const current = await dynamodb.get({
-          TableName: `${TABLE_PREFIX}AW-LeadLists`,
-          Key: { listId },
-          ProjectionExpression: '#ecs',
-          ExpressionAttributeNames: { '#ecs': 'externalCrmSyncConfigs' },
-        }).promise();
-        const existingMap = (current.Item?.externalCrmSyncConfigs as Record<string, any>) ?? {};
-        const mergedMap = { ...existingMap, [provider]: config };
-
-        params = {
-          TableName: `${TABLE_PREFIX}AW-LeadLists`,
-          Key: { listId },
-          UpdateExpression: 'SET #ecs = :mergedMap, #updatedAt = :now',
-          ExpressionAttributeNames: {
-            '#ecs': 'externalCrmSyncConfigs',
-            '#updatedAt': 'updatedAt',
-          },
-          ExpressionAttributeValues: {
-            ':mergedMap': mergedMap,
-            ':now': new Date().toISOString(),
-          },
-        };
-      } else {
-        params = {
+      if (config === null) {
+        await dynamodb.update({
           TableName: `${TABLE_PREFIX}AW-LeadLists`,
           Key: { listId },
           UpdateExpression: 'REMOVE #ecs.#provider SET #updatedAt = :now',
@@ -5616,15 +5629,174 @@ export const crmDb = {
           ExpressionAttributeValues: {
             ':now': new Date().toISOString(),
           },
-        };
+        }).promise();
+        return;
       }
 
-      await dynamodb.update(params).promise();
+      const readEcs = async (): Promise<Record<string, any> | undefined> => {
+        const current = await dynamodb.get({
+          TableName: `${TABLE_PREFIX}AW-LeadLists`,
+          Key: { listId },
+          ProjectionExpression: '#ecs',
+          ExpressionAttributeNames: { '#ecs': 'externalCrmSyncConfigs' },
+        }).promise();
+        return current.Item?.externalCrmSyncConfigs;
+      };
+
+      let existingMap = await readEcs();
+
+      if (existingMap === undefined) {
+        try {
+          await dynamodb.update({
+            TableName: `${TABLE_PREFIX}AW-LeadLists`,
+            Key: { listId },
+            UpdateExpression: 'SET #ecs = :singleProviderMap, #updatedAt = :now',
+            ConditionExpression: 'attribute_not_exists(#ecs)',
+            ExpressionAttributeNames: { '#ecs': 'externalCrmSyncConfigs', '#updatedAt': 'updatedAt' },
+            ExpressionAttributeValues: {
+              ':singleProviderMap': { [provider]: config },
+              ':now': new Date().toISOString(),
+            },
+          }).promise();
+          return;
+        } catch (condError: any) {
+          if (condError?.code !== 'ConditionalCheckFailedException') throw condError;
+          // Someone else's concurrent first-ever-connection save for this
+          // list won the race — re-read rather than assume, since we don't
+          // know whether they created THIS provider or a different one.
+          existingMap = (await readEcs()) ?? {};
+        }
+      }
+
+      if (existingMap[provider] === undefined) {
+        // externalCrmSyncConfigs exists (has at least one other provider, or
+        // is an empty {} left behind by removing the last one), but this
+        // provider's own key doesn't. A single one-level-deep SET creates
+        // the whole provider map in one operation — valid because #ecs
+        // already exists — rather than the per-field write below, which
+        // would need DynamoDB to create #ecs.#provider AND a field inside it
+        // simultaneously (not supported; see finding 3 above).
+        await dynamodb.update({
+          TableName: `${TABLE_PREFIX}AW-LeadLists`,
+          Key: { listId },
+          UpdateExpression: 'SET #ecs.#provider = :configObj, #updatedAt = :now',
+          ExpressionAttributeNames: { '#ecs': 'externalCrmSyncConfigs', '#provider': provider, '#updatedAt': 'updatedAt' },
+          ExpressionAttributeValues: { ':configObj': config, ':now': new Date().toISOString() },
+        }).promise();
+        return;
+      }
+
+      const setExpressions: string[] = [];
+      const removeExpressions: string[] = [];
+      const names: Record<string, string> = { '#ecs': 'externalCrmSyncConfigs', '#provider': provider, '#updatedAt': 'updatedAt' };
+      const values: Record<string, any> = { ':now': new Date().toISOString() };
+
+      Object.entries(config).forEach(([field, value], i) => {
+        const nameAlias = `#f${i}`;
+        names[nameAlias] = field;
+        if (value === undefined) {
+          // Matches the old wholesale-replace semantics: a field absent
+          // (or explicitly undefined) from `config` never persisted, since
+          // the whole provider sub-object used to be replaced by `config`
+          // as marshalled — undefined-valued keys are dropped on write.
+          removeExpressions.push(`#ecs.#provider.${nameAlias}`);
+        } else {
+          const valueAlias = `:v${i}`;
+          values[valueAlias] = value;
+          setExpressions.push(`#ecs.#provider.${nameAlias} = ${valueAlias}`);
+        }
+      });
+      setExpressions.push('#updatedAt = :now');
+
+      const updateExpressionParts: string[] = [];
+      if (setExpressions.length > 0) updateExpressionParts.push(`SET ${setExpressions.join(', ')}`);
+      if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(', ')}`);
+
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        UpdateExpression: updateExpressionParts.join(' '),
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+      }).promise();
     } catch (error: any) {
       // If removing a nested key from a map that doesn't exist yet, DynamoDB throws
       // ValidationException. Treat it as a no-op — the config is already absent.
       if (config === null && error?.code === 'ValidationException') return;
       handleDynamoDbError(error, 'setLeadListCrmSyncConfig');
+      throw error;
+    }
+  },
+
+  /**
+   * Surgically updates only the sync-status fields of a CRM sync config,
+   * without reading and rewriting the rest of that provider's config entry
+   * (unlike setLeadListCrmSyncConfig's read-modify-write). Used by
+   * ExternalCrmSyncService.updateSyncTimestamp — a genuinely atomic
+   * DynamoDB nested-attribute UpdateExpression, so a concurrent PUT /config
+   * save (field mapping changes, webhookEnabled toggle, etc.) can never be
+   * clobbered by a status update racing it, regardless of timing. Safe to
+   * call as a targeted nested SET/REMOVE here specifically because the
+   * parent `externalCrmSyncConfigs.<provider>` map is guaranteed to already
+   * exist (this is only ever called after a successful getConfig lookup) —
+   * setLeadListCrmSyncConfig's read-modify-write exists to handle the
+   * different case of that parent map not yet existing.
+   */
+  async updateLeadListCrmSyncStatus(
+    listId: string,
+    provider: string,
+    fields: {
+      lastPushSyncAt?: string;
+      lastPullSyncAt?: string;
+      lastSyncStatus: 'success' | 'error';
+      // undefined = leave whatever's already stored untouched; null = remove
+      lastSyncError?: string | null;
+      lastSyncErrorCategory?: string | null;
+      lastSyncErrorCount?: number | null;
+    }
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    const setExpressions: string[] = [];
+    const removeExpressions: string[] = [];
+    const names: Record<string, string> = { '#ecs': 'externalCrmSyncConfigs', '#provider': provider, '#updatedAt': 'updatedAt' };
+    const values: Record<string, any> = { ':now': now };
+
+    const addSet = (field: string, value: any) => {
+      names[`#${field}`] = field;
+      values[`:${field}`] = value;
+      setExpressions.push(`#ecs.#provider.#${field} = :${field}`);
+    };
+    const addRemove = (field: string) => {
+      names[`#${field}`] = field;
+      removeExpressions.push(`#ecs.#provider.#${field}`);
+    };
+
+    if (fields.lastPushSyncAt !== undefined) addSet('lastPushSyncAt', fields.lastPushSyncAt);
+    if (fields.lastPullSyncAt !== undefined) addSet('lastPullSyncAt', fields.lastPullSyncAt);
+    addSet('lastSyncStatus', fields.lastSyncStatus);
+    addSet('updatedAt', now); // nested per-provider updatedAt, mirrors setLeadListCrmSyncConfig
+    setExpressions.push('#updatedAt = :now'); // top-level list updatedAt, same as setLeadListCrmSyncConfig
+
+    for (const key of ['lastSyncError', 'lastSyncErrorCategory', 'lastSyncErrorCount'] as const) {
+      const value = fields[key];
+      if (value === null) addRemove(key);
+      else if (value !== undefined) addSet(key, value);
+    }
+
+    const updateExpressionParts: string[] = [];
+    if (setExpressions.length > 0) updateExpressionParts.push(`SET ${setExpressions.join(', ')}`);
+    if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(', ')}`);
+
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: { listId },
+        UpdateExpression: updateExpressionParts.join(' '),
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+      }).promise();
+    } catch (error: any) {
+      handleDynamoDbError(error, 'updateLeadListCrmSyncStatus');
       throw error;
     }
   },
@@ -6164,7 +6336,7 @@ export const crmDb = {
 
       // Extract field names from lead data
       const fieldNames: string[] = [];
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'companyLinkedin', 'status', 'dealValue', 'dealCurrency'];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'companyLinkedin', 'status', 'dealValue', 'dealCurrency', 'utmSource', 'utmMedium'];
       standardFields.forEach(field => {
         if (leadData[field as keyof typeof leadData] && String(leadData[field as keyof typeof leadData]).trim()) {
           fieldNames.push(field);
@@ -6393,6 +6565,64 @@ export const crmDb = {
       handleDynamoDbError(error, "getLeadById");
       throw error;
     }
+  },
+
+  // ENG-969 follow-up: leadId is minted once, globally (Date.now() + a random
+  // suffix — see createLead), never re-derived per list, so it never legitimately
+  // collides across two lists. Production session 6082779b-f9f1-4e38-a8eb-34abbc3da419
+  // showed an agent pair a valid lead_id with a stale list_id from an earlier step
+  // in the same run — a not-found on the requested list is as likely to mean "wrong
+  // list_id" as "no such lead". `candidateListIds` should already be access-scoped
+  // (e.g. via getLeadListsForUser) since any match here is returned as-is, with no
+  // further access check. Capped at 200 lists (8 BatchGetItem round trips) so a
+  // pathological org with hundreds of lists can't turn a single not-found into an
+  // unbounded scan.
+  async getLeadByIdAcrossLists(candidateListIds: string[], leadId: string) {
+    if (candidateListIds.length === 0) return null;
+    const MAX_CANDIDATE_LISTS = 200;
+    const BATCH_SIZE = 25;
+    // BatchGetItem can partially succeed and return the requested key in
+    // UnprocessedKeys (capacity limits, internal retries) — AWS's own docs
+    // require retrying those, with backoff, or a genuinely-existing lead can
+    // read as "not found" here. Bounded so contention degrades gracefully
+    // instead of retrying forever.
+    const MAX_UNPROCESSED_RETRIES = 3;
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const listIds = candidateListIds.slice(0, MAX_CANDIDATE_LISTS);
+
+    for (let i = 0; i < listIds.length; i += BATCH_SIZE) {
+      let keys: Array<{ listId: string; leadId: string }> = listIds
+        .slice(i, i + BATCH_SIZE)
+        .map(listId => ({ listId, leadId }));
+      let unprocessedAttempt = 0;
+
+      while (keys.length > 0) {
+        const params = {
+          RequestItems: {
+            [tableName]: { Keys: keys },
+          },
+        };
+        try {
+          const result = await dynamodb.batchGet(params).promise();
+          const items = (result.Responses?.[tableName] as any[]) || [];
+          if (items.length > 0) return items[0];
+
+          const unprocessed = result.UnprocessedKeys?.[tableName]?.Keys as
+            | Array<{ listId: string; leadId: string }>
+            | undefined;
+          if (!unprocessed || unprocessed.length === 0) break; // batch genuinely done, no match
+
+          unprocessedAttempt += 1;
+          if (unprocessedAttempt > MAX_UNPROCESSED_RETRIES) break; // give up on this batch's remainder
+          await new Promise(resolve => setTimeout(resolve, 50 * 2 ** (unprocessedAttempt - 1)));
+          keys = unprocessed;
+        } catch (error) {
+          handleDynamoDbError(error, "getLeadByIdAcrossLists");
+          throw error;
+        }
+      }
+    }
+    return null;
   },
 
   /**
@@ -6844,6 +7074,60 @@ export const crmDb = {
     }
   },
 
+  async getLeadByAttioRecordId(listId: string, recordId: string) {
+    // DynamoDB applies FilterExpression after the page read, not before, so a
+    // single query only sees the first ~1MB page — a match on a later page
+    // would be reported absent. Mirrors findLeadByLinkedinInList's bounded
+    // pagination for the same reason.
+    const MAX_PAGES = 20;
+    try {
+      let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+      let pages = 0;
+      do {
+        const result = await dynamodb.query({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          KeyConditionExpression: 'listId = :listId',
+          FilterExpression: 'syncMetadata.attio_record_id = :recordId',
+          ExpressionAttributeValues: { ':listId': listId, ':recordId': recordId },
+          ExclusiveStartKey: lastEvaluatedKey,
+        }).promise();
+        const hit = result.Items?.[0];
+        if (hit) return hit;
+        lastEvaluatedKey = result.LastEvaluatedKey;
+        pages++;
+      } while (lastEvaluatedKey && pages < MAX_PAGES);
+      return null;
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadByAttioRecordId");
+      throw error;
+    }
+  },
+
+  async getLeadByAttioListEntryId(listId: string, entryId: string) {
+    const MAX_PAGES = 20;
+    try {
+      let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+      let pages = 0;
+      do {
+        const result = await dynamodb.query({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          KeyConditionExpression: 'listId = :listId',
+          FilterExpression: 'syncMetadata.attio_list_entry_id = :entryId',
+          ExpressionAttributeValues: { ':listId': listId, ':entryId': entryId },
+          ExclusiveStartKey: lastEvaluatedKey,
+        }).promise();
+        const hit = result.Items?.[0];
+        if (hit) return hit;
+        lastEvaluatedKey = result.LastEvaluatedKey;
+        pages++;
+      } while (lastEvaluatedKey && pages < MAX_PAGES);
+      return null;
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadByAttioListEntryId");
+      throw error;
+    }
+  },
+
   async updateLead(listId: string, leadId: string, updates: {
     email?: string;
     firstName?: string;
@@ -6920,6 +7204,8 @@ export const crmDb = {
     enrichmentMetadata?: Record<string, any>;
     /** ISO timestamp set when a LinkedIn connection invite is manually sent from the CRM. */
     linkedInInviteSentAt?: string | null;
+    /** ISO timestamp set when this account accepted an INBOUND LinkedIn invite from this lead — distinct from linkedInInviteSentAt (an outbound send), since the two are opposite real-world events. */
+    linkedInInviteAcceptedAt?: string | null;
     /** ENG-1026: pre-send identity cross-check stamp (ISO date + verified canonical URL). */
     linkedinIdentityVerifiedAt?: string | null;
     linkedinIdentityVerifiedUrl?: string | null;
@@ -7116,6 +7402,15 @@ export const crmDb = {
         } else {
           setExpressions.push('linkedInInviteSentAt = :linkedInInviteSentAt');
           expressionAttributeValues[':linkedInInviteSentAt'] = updates.linkedInInviteSentAt;
+        }
+      }
+
+      if (updates.linkedInInviteAcceptedAt !== undefined) {
+        if (updates.linkedInInviteAcceptedAt === null) {
+          removeExpressions.push('linkedInInviteAcceptedAt');
+        } else {
+          setExpressions.push('linkedInInviteAcceptedAt = :linkedInInviteAcceptedAt');
+          expressionAttributeValues[':linkedInInviteAcceptedAt'] = updates.linkedInInviteAcceptedAt;
         }
       }
 
@@ -9754,9 +10049,7 @@ export const accountMemoryDb = {
     // valid becomes invalid. Worst-case stored size roughly doubles (2,000
     // astral chars ≈ 8 KB UTF-8) — negligible against DynamoDB's 400 KB limit.
     // The other three memory guards below/above match this unit deliberately.
-    if (Array.from(content).length > 2000) {
-      throw new Error('Content must be 2000 characters or less');
-    }
+    assertMemoryContentWithinLimit(content);
 
     const { ulid } = await import('ulid');
     const now = new Date().toISOString();
@@ -9857,9 +10150,7 @@ export const accountMemoryDb = {
     }
     // Code points, not UTF-16 code units — same unit as the declared
     // `maxLength: 2000` and the addMemory guard (ENG-821).
-    if (updates.content !== undefined && Array.from(updates.content).length > 2000) {
-      throw new Error('Content must be 2000 characters or less');
-    }
+    if (updates.content !== undefined) assertMemoryContentWithinLimit(updates.content);
 
     const expressions: string[] = ['#updatedAt = :updatedAt'];
     const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
@@ -9923,9 +10214,7 @@ export const orgMemoryDb = {
     }
     // Code points, not UTF-16 code units — same unit as the declared
     // `maxLength: 2000` and the addMemory guard (ENG-821).
-    if (Array.from(content).length > 2000) {
-      throw new Error('Content must be 2000 characters or less');
-    }
+    assertMemoryContentWithinLimit(content);
 
     const { ulid } = await import('ulid');
     const now = new Date().toISOString();
@@ -10025,9 +10314,7 @@ export const orgMemoryDb = {
     }
     // Code points, not UTF-16 code units — same unit as the declared
     // `maxLength: 2000` and the addMemory guard (ENG-821).
-    if (updates.content !== undefined && Array.from(updates.content).length > 2000) {
-      throw new Error('Content must be 2000 characters or less');
-    }
+    if (updates.content !== undefined) assertMemoryContentWithinLimit(updates.content);
 
     const expressions: string[] = ['#updatedAt = :updatedAt'];
     const names: Record<string, string> = { '#updatedAt': 'updatedAt' };

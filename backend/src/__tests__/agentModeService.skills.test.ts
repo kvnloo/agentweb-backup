@@ -314,6 +314,53 @@ describe('AgentModeService - Skills', () => {
       expect(result.message).toContain('not available with your current subscription');
       expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
     });
+
+    it('installs __other_skills__ when only an unpublished org-shared skill claims the remaining tools (ENG-1237 production repro)', async () => {
+      // Mirrors the harsha@agentweb.pro session: getSkillsAvailableToUser mixes a
+      // published skill in with an unpublished org-shared draft skill (included for
+      // install purposes only). Before the fix, the draft skill's toolNames silently
+      // counted as "associated", leaving no unassociated tools, so __other_skills__
+      // never appeared in getSkillsForDisplay and install_skills(['__other_skills__'])
+      // rejected with "not available with your current subscription".
+      const orgId = 'org-1';
+      const userId = 'harsha-user-id';
+      const publishedSkill = {
+        skillId: 'crm-skill', name: 'CRM & Lead Management', description: 'CRM tools',
+        toolNames: ['search_leads'], isPublished: true,
+      };
+      const unpublishedOrgSkill = {
+        skillId: 'draft-landing-pages', name: 'Landing Pages (draft)', description: 'Landing page tools',
+        toolNames: ['list_landing_pages'], isPublished: false, ownerId: 'other-owner', orgId, visibility: 'private',
+      };
+
+      const mockTools = [
+        { name: 'search_leads', definition: { function: { description: 'search leads' } } },
+        { name: 'list_landing_pages', definition: { function: { description: 'list landing pages' } } },
+      ];
+
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([publishedSkill, unpublishedOrgSkill]);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      const mockDb = require('../services/db');
+      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId, orgId, orgRole: 'member' }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({
+        orgId, ownerUserId: 'other-owner',
+        shareSettings: { skills: { enabled: true, editors: [] } },
+      }) };
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+
+      const result = await agentModeService.installSkills(
+        ['__other_skills__'],
+        userId,
+        'session-0e73690d'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.installedSkills).toContain('other_skills');
+      expect(chatbotDb.addAssociatedSkills).toHaveBeenCalledWith('session-0e73690d', ['__other_skills__']);
+    });
   });
 
   describe('buildSkillContext', () => {
@@ -425,6 +472,27 @@ describe('AgentModeService - Skills', () => {
       expect(result).toHaveLength(1);
       expect(result[0].name).toBe('orphan_tool');
       expect(result[0].description).toBe('orphan desc');
+    });
+
+    it('should NOT treat a tool as associated when only an unpublished (private/org-shared) skill claims it (ENG-1237)', () => {
+      // loadAuthorizedSkillCatalog's org-sharing bypass mixes unpublished private/
+      // org skills into the same list passed here — a draft skill nobody published
+      // must not be able to silently steal a tool out of __other_skills__ for the
+      // whole org.
+      const publishedSkills = [
+        { skillId: 's1', name: 'S1', toolNames: ['tool1'], isPublished: true },
+        { skillId: 'draft1', name: 'Draft Skill', toolNames: ['tool1', 'orphan_tool'], isPublished: false }
+      ];
+      const mockTools = [
+        { name: 'tool1', definition: { function: { description: 'desc1' } } },
+        { name: 'orphan_tool', definition: { function: { description: 'orphan desc' } } }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).getUnassociatedTools(publishedSkills);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe('orphan_tool');
     });
 
     it('should exclude infrastructure tools', () => {
@@ -1299,6 +1367,45 @@ describe('AgentModeService - Skills', () => {
       expect(otherSkill).toBeDefined();
       expect(otherSkill!.name).toBe('Other Skills');
       expect(otherSkill!.toolNames).toContain('orphan_tool');
+    });
+
+    it('does not double-list a tool under Other Skills when an unpublished skill\'s own card already shows it (ENG-1237 follow-up)', async () => {
+      // The ENG-1237 fix correctly stops an unpublished skill from removing its
+      // tools from the installable __other_skills__ pool — but that skill's own
+      // card in this same response already lists those toolNames. This is a
+      // display-only dedup: `draft_tool` must still count toward whether
+      // __other_skills__ appears at all and must still be installable through it,
+      // it just shouldn't be repeated in the rendered toolNames list.
+      const unpublishedOrgSkill = {
+        skillId: 'draft-skill', name: 'Draft Skill', description: 'd',
+        toolNames: ['draft_tool'], isPublished: false, ownerId: 'owner-1', orgId: 'org-1', visibility: 'private',
+      };
+      const mockDb = require('../services/db');
+      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'member-1', orgId: 'org-1', orgRole: 'member' }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({
+        orgId: 'org-1', ownerUserId: 'owner-1',
+        shareSettings: { skills: { enabled: true, editors: [] } },
+      }) };
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([unpublishedOrgSkill]);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+
+      const mockToolRegistry = (agentModeService as any).toolRegistry;
+      mockToolRegistry.getAllTools.mockReturnValue([
+        { name: 'draft_tool', definition: { function: { description: 'Claimed by the draft skill' } } },
+        { name: 'orphan_tool', definition: { function: { description: 'Claimed by nothing' } } },
+      ]);
+
+      const result = await agentModeService.getSkillsForDisplay([], 'member-1');
+
+      const draftCard = result.find(s => s.skillId === 'draft-skill');
+      const otherSkill = result.find(s => s.skillId === '__other_skills__');
+      expect(draftCard!.toolNames).toContain('draft_tool');
+      // Still installable/present because the real pool is non-empty (ENG-1237 behavior).
+      expect(otherSkill).toBeDefined();
+      expect(otherSkill!.toolNames).toContain('orphan_tool');
+      // But not repeated — it's already shown on the draft skill's own card.
+      expect(otherSkill!.toolNames).not.toContain('draft_tool');
     });
   });
 });

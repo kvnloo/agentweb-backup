@@ -45,6 +45,10 @@ interface AccountSummary {
   accountType: string;
   postCount: number;
   error?: string;
+  // ENG-1300: the real HTTP status behind `error`, when the adapter attached
+  // one (e.g. LinkedInAdapter's rethrowWithCode) — lets callers classify a
+  // 401/403 as auth/config instead of a generic bug.
+  code?: number;
 }
 
 interface GetPostsResult {
@@ -180,6 +184,7 @@ export async function getPostsForUser(
         accountType,
         postCount: 0,
         error: error?.message || 'Failed to load posts',
+        code: error?.code,
       });
     }
   }

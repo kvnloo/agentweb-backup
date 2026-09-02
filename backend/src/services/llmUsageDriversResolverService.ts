@@ -50,6 +50,36 @@ import { computeUsageRunway, TRAILING_WINDOW_DAYS } from "./llmUsageForecastServ
 const LEDGER_COMPLETENESS_TOLERANCE = 0.95;
 
 /**
+ * ENG-1563 — how large an AA Intelligence Index `qualityScore` gap (0-100
+ * scale) must be before a candidate model is called `benchmark_lower`
+ * instead of `benchmark_comparable`.
+ *
+ * The issue did not hand down an exact number, so this is a judgment call,
+ * documented rather than left as a magic number buried in `qualityFor`.
+ * Reasoning, from the real scores already in `agentModeService`'s registry
+ * (`llmModels`, AA Index v4.1.1, snapshot 2026-08-19):
+ *
+ *   - Same-generation / minor-version deltas cluster small: GPT-5.4 -> 5.5 is
+ *     3 points, Gemini 3.5 Flash -> 3.7 Flash is 4 points. These read as "the
+ *     same tier of model, slightly refreshed."
+ *   - Cross-tier / cross-generation deltas start meaningfully larger: Claude
+ *     Opus 5 -> Sonnet 5 is 8 points, Sonnet 4.5 -> 4.6 is 11 points. These
+ *     read as genuinely different capability, not noise.
+ *
+ * 5 sits between those two clusters: it comfortably covers the observed
+ * same-tier refreshes (3-4 pts) as "comparable" while still calling an
+ * 8+ point cross-tier gap "lower". Given ENG-1200 (a founder account silently
+ * defaulted to an inferior model with false confidence), the bias here is
+ * deliberately toward the SMALLER threshold — erring toward `benchmark_lower`
+ * more readily than toward `benchmark_comparable` — because a false
+ * "comparable" is the exact failure mode this system exists to prevent, while
+ * an over-cautious "lower" is merely conservative, not misleading.
+ *
+ * Revisit if the AA Index's own scale or methodology changes materially.
+ */
+export const BENCHMARK_COMPARABLE_MAX_DELTA = 5;
+
+/**
  * Is this ledger a complete picture of what was billed to the subject?
  *
  * Raised by Greptile on PR #2407: the driver resolver "consumes that incomplete
@@ -72,6 +102,7 @@ function ledgerIsIncomplete(
   return total < costUsedMicroUsd * LEDGER_COMPLETENESS_TOLERANCE;
 }
 import { recordUsageTelemetry, USAGE_TELEMETRY_EVENTS } from "./llmUsageTelemetry";
+import { utcDay, resolveCycle } from "../utils/usageCycle";
 
 /** A different target for the SAME driver — an alternative, never an extra win. */
 export interface UsageRecommendationAlternative {
@@ -91,17 +122,39 @@ export interface UsageRecommendationAlternative {
 export type RecommendationConfidence = "insufficient_data" | "low" | "medium" | "high";
 
 /**
- * What we know about the cheaper model doing the same job (ENG-1217 AC5).
+ * What we know about the cheaper model doing the same job (ENG-1217 AC5,
+ * grounded in a real signal by ENG-1563).
  *
- * `status` is a closed set with one member today, and that is the point. AC5
- * forbids representing a cheaper model as equivalent in quality without
- * task-specific evaluation evidence, and no eval harness exists yet (open
- * question `OQ:okareo`). Modelling it as a field rather than omitting it forces
- * the UI to render "quality: unknown" instead of silently implying parity, and
- * gives the eventual harness a slot to fill rather than a schema change.
+ * AC5 forbids representing a cheaper model as equivalent in quality WITHOUT
+ * task-specific evaluation evidence. It does not forbid citing a general
+ * benchmark signal, as long as it is labeled honestly as exactly that — so
+ * `status` carries its own `source`, and the two are never allowed to read as
+ * the same kind of claim:
+ *
+ * - `benchmark_comparable` / `benchmark_lower` (`source: "artificial_analysis"`)
+ *   — derived from the AA Intelligence Index `qualityScore` every model
+ *   already carries (see `agentModeService.getSupportedModelsWithMetadata`,
+ *   the same source powering the picker's meters and the dominance filter).
+ *   The copy always names the benchmark and disclaims task-specific
+ *   verification (ENG-1200: a confident-looking number nobody can trace to
+ *   "was this tested for you" is the exact incident this system exists to
+ *   prevent).
+ * - `unknown` (`source: "none"`) — the true no-data case: AA has not scored
+ *   one or both sides of the pair. This is still the ONLY status this file
+ *   is entitled to emit for a pair with no AA data, and it stays that way.
+ * - `task_verified` (`source: "task_eval"`) — TYPE SLOT RESERVED for a future
+ *   Okareo-backed eval harness (open question `OQ:okareo`). Nothing in this
+ *   file sets it; see the follow-up issue linked from ENG-1563.
+ *
+ * HARD INVARIANT: an AA-derived value and a task-eval-derived value are never
+ * blended into one number or one status — each tier renders its own explicit
+ * provenance via `source`, always. Do not add a numeric field here that both
+ * branches could feed; if that instinct ever comes up, stop and re-read this
+ * comment.
  */
 export interface RecommendationQuality {
-  status: "unknown";
+  status: "unknown" | "benchmark_comparable" | "benchmark_lower" | "task_verified";
+  source: "none" | "artificial_analysis" | "task_eval";
   reason: string;
 }
 
@@ -202,17 +255,6 @@ export interface ResolvedUsageDrivers {
   scheduleDrivers: ScheduleDriver[];
 }
 
-function utcDay(date: Date): string {
-  return date.toISOString().slice(0, 10);
-}
-
-function resolveCycle(today: string): { cycleStartDate: string; cycleResetDate: string } {
-  const [year, month] = today.split("-").map(Number);
-  return {
-    cycleStartDate: `${year}-${String(month).padStart(2, "0")}-01`,
-    cycleResetDate: utcDay(new Date(Date.UTC(year, month, 1))),
-  };
-}
 
 /**
  * Reprice a ledger per DATE under a set of switches, returning the daily totals
@@ -537,15 +579,63 @@ export async function resolveUsageDrivers(
     return RANK[own] <= RANK[forecastCap] ? own : forecastCap;
   };
 
+  // ENG-1563: same source of truth the model picker's meters and the
+  // cost/quality dominance filter already read — never a second hand-rolled
+  // path to the AA Index data. `true` so the lookup covers the full
+  // registry (admin-only + legacy models a historical `fromModel` may be),
+  // since this is a metadata READ, not an entitlement decision — entitlement
+  // for `toModel` is already enforced above via `catalog`.
+  const qualityScoreById = new Map<string, number>(
+    (typeof agentModeService.getSupportedModelsWithMetadata === "function"
+      ? (await agentModeService.getSupportedModelsWithMetadata(true)) ?? []
+      : []
+    )
+      .filter((m): m is typeof m & { qualityScore: number } => typeof m.qualityScore === "number")
+      .map((m) => [m.id, m.qualityScore]),
+  );
+
   /**
-   * AC5. One value, deliberately: we have no task-specific evaluation evidence
-   * for any of these targets, so `unknown` is the only claim we are entitled to
-   * make. The wording avoids "similar"/"equivalent" for the same reason.
+   * ENG-1563 — derive one recommendation's `RecommendationQuality` from the AA
+   * `qualityScore` delta between `fromModel` and `toModel`.
+   *
+   * Falls back to `{ status: "unknown", source: "none" }` (AC3) whenever
+   * either side is missing from `qualityScoreById` — that is the only honest
+   * answer when AA has no benchmark for one or both models. Otherwise
+   * resolves to `benchmark_comparable` or `benchmark_lower` (AC1/AC2) per
+   * `BENCHMARK_COMPARABLE_MAX_DELTA`, never `task_verified` (AC5 — that
+   * status is reserved for a future task-eval harness, out of scope here).
    */
-  const UNKNOWN_QUALITY: RecommendationQuality = {
-    status: "unknown",
-    reason:
-      "No task-specific evaluation evidence exists for this model on your work, so its output quality is unknown.",
+  const qualityFor = (fromModel: string, toModel: string): RecommendationQuality => {
+    const fromScore = qualityScoreById.get(fromModel);
+    const toScore = qualityScoreById.get(toModel);
+    if (typeof fromScore !== "number" || typeof toScore !== "number") {
+      // AC5's true no-data case: neither this file nor the copy is entitled to
+      // make any claim, benchmark or otherwise.
+      return {
+        status: "unknown",
+        source: "none",
+        reason:
+          "No task-specific evaluation evidence exists for this model on your work, so its output quality is unknown.",
+      };
+    }
+    // Positive => toModel scores lower than fromModel. A tie or a HIGHER
+    // toModel score is "comparable" too — there is no third "better" status,
+    // and a higher-scoring target was never the case AC5 was worried about.
+    const delta = fromScore - toScore;
+    if (delta <= BENCHMARK_COMPARABLE_MAX_DELTA) {
+      return {
+        status: "benchmark_comparable",
+        source: "artificial_analysis",
+        reason:
+          "Generally rated similar on independent benchmarks — not yet tested on your specific work.",
+      };
+    }
+    return {
+      status: "benchmark_lower",
+      source: "artificial_analysis",
+      reason:
+        "Generally rated lower on independent benchmarks — not yet tested on your specific work.",
+    };
   };
 
   const recommendations: UsageRecommendation[] = [];
@@ -597,7 +687,7 @@ export async function resolveUsageDrivers(
         completeDaysObserved: baseline.completeDaysElapsed,
         confidence:
           estimatedDaysRecovered === null ? "insufficient_data" : confidenceFor(driver.callCount),
-        quality: UNKNOWN_QUALITY,
+        quality: qualityFor(driver.key, candidate),
         isEstimate: true,
         requiresConfirmation: true,
         basis: est.basis,

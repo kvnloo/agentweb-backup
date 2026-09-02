@@ -7,6 +7,7 @@ import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
+import { mintDelegateToken } from "../services/delegateAccessToken";
 import { linkedInOutreachService } from "../services/linkedInOutreachService";
 import { deleteAccountById, createAccount } from "../services/connectedAccountsDb";
 import { waitlistDb } from "../services/waitlistDb";
@@ -192,7 +193,6 @@ const ADMIN_USER_LIST_FIELDS = [
   "fromName",
   "slackChannel",
   "slackChannels",
-  "slackSuggestedRepliesDisabled",
   "seoDomains",
   "googleAnalyticsPropertyId",
   "googleAnalyticsProperties",
@@ -1365,29 +1365,6 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
   }
 });
 
-// Toggle Slack suggested-reply (slack-triggered) monitoring for a user.
-// Body: { enabled: boolean } — true = suggestions on (default), false = suppress.
-// Persisted as the inverse `slackSuggestedRepliesDisabled` flag so absent = enabled.
-router.put("/users/:userId/slack-suggested-replies", async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { enabled } = req.body;
-
-    const user = await userDb.getUserById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    const updatedUser = await userDb.updateUser(userId, {
-      slackSuggestedRepliesDisabled: !enabled,
-    });
-    res.json(updatedUser);
-  } catch (error) {
-    console.error("Error updating slack suggested replies setting:", error);
-    res.status(500).json({ message: "Error updating slack suggested replies setting" });
-  }
-});
-
 // Get user secret names (keys only, not values)
 router.get("/users/:userId/secrets", async (req, res) => {
   try {
@@ -1565,6 +1542,8 @@ router.get("/google-drive-folders", async (req, res) => {
       fields: "files(id, name)",
       orderBy: "name",
       pageSize: 100,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
     });
 
     const folders = (response.data.files || []).map((f) => ({
@@ -1898,25 +1877,13 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
     // from the TARGET user and compared on every request by the auth middleware —
     // bumping either one rejects this token immediately. Without them the only
     // limit on a leaked support token was its expiry.
-    const delegatePayload = {
-      userId: targetUser.userId, // This will be the active user in the token
-      email: targetUser.email,
-      roles: targetUser.roles,
-      isAdmin: false, // Target user permissions
-      dte: targetUser.delegateTokenEpoch ?? 0,
-      sv: targetUser.sessionVersion ?? 0,
-      delegateAccess: {
-        adminUserId: adminReq.user.userId,
-        adminEmail: adminReq.user.email,
-        targetUserId: targetUser.userId,
-        targetEmail: targetUser.email
-      }
-    };
-
-    const delegateToken = jwt.sign(
-      delegatePayload,
-      getJwtSecret(),
-      { expiresIn: DELEGATE_TOKEN_TTL }
+    //
+    // ENG-1596: minting extracted to delegateAccessToken.ts so the MCP tool layer
+    // (apiTools.ts) can mint the same shape of token internally, per tool call.
+    const delegateToken = mintDelegateToken(
+      { userId: adminReq.user.userId, email: adminReq.user.email },
+      targetUser,
+      DELEGATE_TOKEN_TTL,
     );
 
     // Return the delegate token and customer portal URL
@@ -3311,6 +3278,13 @@ router.get("/chat-sessions", async (req, res) => {
     );
 
     // Sync mode: batch-score sessions that need it (default + all judges)
+    let scoringSummary: {
+      scored: number;
+      skipped: number;
+      failed: number;
+      notAttempted: number;
+      timedOut: boolean;
+    } | undefined;
     // ENG-1332: coverage metadata travels with the response so a caller (e.g.
     // the Daily Satisfaction Score Report) can state its own denominator
     // honestly instead of inferring one from sessions.length.
@@ -3385,6 +3359,31 @@ router.get("/chat-sessions", async (req, res) => {
         );
       }
 
+      // ENG-929: attach each session's scoring verdict. sync=true promises to
+      // score whatever is unscored, but a scorer that failed and a session that
+      // is legitimately unscorable both used to come back as
+      // `satisfactionScore: null` — so the Daily Satisfaction Score Report
+      // silently under-sampled (four completed, expensive sessions, including
+      // the most expensive in the window, were simply missing). Reporting the
+      // outcome per session makes "we could not score this" visible.
+      const byId = new Map(sessionsWithMessages.map((s: any) => [s.sessionId, s]));
+      for (const outcome of backfill.outcomes) {
+        const session = byId.get(outcome.sessionId) as any;
+        if (!session) continue;
+        session.scoringOutcome = {
+          status: outcome.status,
+          ...(outcome.reason ? { reason: outcome.reason } : {}),
+          ...(outcome.judgeErrors ? { judgeErrors: outcome.judgeErrors } : {}),
+        };
+      }
+      scoringSummary = {
+        scored: backfill.outcomes.filter((o) => o.status === "scored").length,
+        skipped: backfill.outcomes.filter((o) => o.status === "skipped").length,
+        failed: backfill.outcomes.filter((o) => o.status === "failed").length,
+        notAttempted: backfill.outcomes.filter((o) => o.status === "not-attempted").length,
+        timedOut: backfill.timedOut,
+      };
+
       const newlyScored = inRangeSessions.filter(
         (session: any) =>
           session.satisfactionScore?.evaluatedAt && !alreadyScoredIds.has(session.sessionId)
@@ -3427,6 +3426,7 @@ router.get("/chat-sessions", async (req, res) => {
     res.json({
       sessions: nonEmptySessions,
       nextCursor,
+      ...(scoringSummary ? { scoringSummary } : {}),
       ...(scoringCoverage ? { scoringCoverage } : {}),
     });
   } catch (error) {
@@ -4727,7 +4727,11 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-ses
     const planUserId = plan.userId;
     const { generateSessionResponse } = await import('../controllers/agentModeController');
     const { io } = await import('../server');
-    generateSessionResponse(session.sessionId, initialMessage, planUserId, modelToUse, workItemAttachments.length > 0 ? workItemAttachments : undefined)
+    const { cronJobRegistry } = await import('../utils/cronJobRegistry');
+    // ENG-1189: this turn's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener.
+    cronJobRegistry.track('gtmPlanAdminAgentTurn', generateSessionResponse(session.sessionId, initialMessage, planUserId, modelToUse, workItemAttachments.length > 0 ? workItemAttachments : undefined))
       .then(() => {
         console.log(`GTM work item session ${session.sessionId}: AI response generated (admin)`);
         io.to(`user:${planUserId}`).emit("gtm-session-ready", {
@@ -5553,7 +5557,7 @@ router.delete("/result-endpoints/:name", async (req, res) => {
 // Score chat sessions for satisfaction
 router.post("/chat-sessions/score", async (req, res) => {
   try {
-    const { sessionIds } = req.body;
+    const { sessionIds, force } = req.body;
 
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
       return res.status(400).json({ message: "sessionIds must be a non-empty array" });
@@ -5566,7 +5570,11 @@ router.post("/chat-sessions/score", async (req, res) => {
       sessionIds.map(async (sessionId: string) => {
         const session = await chatbotDb.getChatSession(sessionId);
         if (!session) return { sessionId, score: null };
-        const score = await scoreSessionIfNeeded(session);
+        // ENG-1296: force bypasses the "already scored, up-to-date" skip — the
+        // explicit escape hatch for re-running a specific session through the
+        // current scoring rules after a rubric/prompt change. Default false
+        // preserves the normal cheap-skip behavior for routine sync/backfill.
+        const score = await scoreSessionIfNeeded(session, { force: force === true });
         return { sessionId, score };
       })
     );
@@ -5623,7 +5631,7 @@ router.put("/chat-sessions/:sessionId/score", async (req, res) => {
 // Score sessions with a custom judge
 router.post("/chat-sessions/judge-score", async (req, res) => {
   try {
-    const { sessionIds, judgeId } = req.body;
+    const { sessionIds, judgeId, force } = req.body;
 
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
       return res.status(400).json({ message: "sessionIds must be a non-empty array" });
@@ -5657,7 +5665,9 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
       sessionIds.map(async (sessionId: string) => {
         const session = await chatbotDb.getChatSession(sessionId);
         if (!session) return { sessionId, score: null };
-        const score = await scoreSessionWithJudgeIfNeeded(session, judge);
+        // ENG-1296: force bypasses the "already scored, up-to-date" skip — see
+        // the matching comment on POST /chat-sessions/score above.
+        const score = await scoreSessionWithJudgeIfNeeded(session, judge, { force: force === true });
         return { sessionId, score };
       })
     );

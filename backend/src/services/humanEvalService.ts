@@ -438,6 +438,27 @@ export class HumanEvalService {
     await this.appendFeedback(candidate, feedback);
     await this.addFeedbackToSession(candidate, feedback);
     await this.learning.recordFeedback(candidate, feedback);
+
+    // ENG-1687: acknowledge receipt in-thread immediately. Feedback was
+    // previously recorded (and, for the 3 known action types, silently acted
+    // on) with zero reply — a reviewer who posts feedback with no visible
+    // confirmation has no way to tell "recorded, working on it" from "the
+    // bot never saw this." Every reply gets an ack; only candidates with a
+    // known runnable action additionally get an auto-action note.
+    const ackLines = [
+      `:inbox_tray: Got it, <@${input.slackUserId}> — feedback recorded on candidate \`${candidate.candidateId}\`.`,
+    ];
+    if (candidate.action) {
+      ackLines.push('Running the auto-action now; the revised result will post back to this thread when ready.');
+    } else {
+      ackLines.push('No automatic re-run is wired for this review type yet — this will be actioned manually.');
+    }
+    void this.slack
+      .postSlackMessage(input.channel, ackLines.join('\n'), input.threadTs)
+      .catch((err: any) => {
+        console.warn('[human-eval] failed to post Slack ack reply:', err?.message || err);
+      });
+
     void this.actions.run(candidate, feedback).catch((err: any) => {
       console.warn('[human-eval] failed to run feedback action:', err?.message || err);
     });

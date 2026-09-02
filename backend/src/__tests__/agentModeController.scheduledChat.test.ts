@@ -801,14 +801,23 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       const result = await runScheduledChat(scheduleWithSearchWeb, mockUserId, true);
 
-      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
+      // ENG-1297: you_search_web is read-only, so once it's the ONLY unmet
+      // requirement the read-only press circuit breaker stops the run after its
+      // (small) press budget instead of grinding to maxAttempts (20) — the run
+      // still correctly recognizes legacy_news_search does NOT satisfy
+      // you_search_web (functionCallMatches/functionCallMisses below are
+      // unchanged), it just no longer pays for 18 more identical presses to
+      // reach that same conclusion, and ends as a successful, waived run rather
+      // than a hard failure.
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(2);
       expect(result).toEqual(
         expect.objectContaining({
-          status: 'failure',
-          passed: false,
-          attempt: 20,
+          status: 'success',
+          passed: true,
+          attempt: 2,
           functionCallMatches: [],
           functionCallMisses: ['you_search_web'],
+          readOnlyRequirementWaived: true,
         })
       );
     });
@@ -3945,7 +3954,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
     });
 
-    it('should render a cost-based block message when the cost cap is the cause and tokens are unlimited', async () => {
+    it('should render a percentage-only block message when the cost cap is the cause — never the raw dollar spend (ENG-1566)', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
         warning: false,
@@ -3972,9 +3981,47 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       const result = await runScheduledChat(scheduleWithEmails, mockUserId, true);
 
       expect(mockEmailService.sendScheduledChatTokenLimitEmail).toHaveBeenCalled();
-      expect(result.actualResponse).toContain('Monthly cost limit reached');
-      expect(result.actualResponse).toContain('$42.50 / $40.00 spent this month');
+      expect(result.actualResponse).toContain('monthly usage limit');
+      expect(result.actualResponse).toContain('106% used');
+      // ENG-1566: the raw dollar spend/allowance and the "cost" vs "token" dimension
+      // name must never reach the customer — only a percentage of "monthly usage".
+      expect(result.actualResponse).not.toContain('$');
+      expect(result.actualResponse).not.toContain('cost limit');
       expect(result.actualResponse).not.toContain('tokens used');
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('should render a percentage-only block message when the token cap is the cause — never the raw token count (ENG-1566)', async () => {
+      mockedCheckTokenUsage.mockResolvedValueOnce({
+        allowed: false,
+        warning: false,
+        used: 1050000,
+        allowance: 1000000,
+        percentUsed: 105,
+        effectiveAllowance: 1000000,
+        bonus: 0,
+        month: '2026-04',
+        costUsed: 0,
+        costAllowance: null,
+        costPercentUsed: 0,
+        costEnforced: false,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
+      });
+
+      const scheduleWithEmails = {
+        ...baseSchedule,
+        requiredFunctionCalls: [],
+        emailNotifications: ['owner@example.com'],
+      };
+
+      const result = await runScheduledChat(scheduleWithEmails, mockUserId, true);
+
+      expect(result.actualResponse).toContain('monthly usage limit');
+      expect(result.actualResponse).toContain('105% used');
+      expect(result.actualResponse).not.toContain('$');
+      expect(result.actualResponse).not.toContain('token limit');
+      expect(result.actualResponse).not.toContain('1,050,000');
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
     });
 

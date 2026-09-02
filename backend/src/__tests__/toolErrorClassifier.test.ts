@@ -64,6 +64,66 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('Validation failed: url is required'))).toBe('invalid_args');
   });
 
+  // ENG-1672: a schedule write blocked by DynamoDB's 400KB item ceiling
+  // ("Scheduled chat is too large to save...") fell through every pattern here
+  // (only "too long"/"too short" matched) and landed on the generic legacy
+  // "Error" class, indistinguishable from a random unclassified failure. It is a
+  // client-fixable, non-retryable condition like any other "too long" rejection.
+  // A projected size (e.g. "391KB") does not reliably start with a 4 or 5, so
+  // the explicit "too large to save"/"is too large" pattern below must not
+  // depend on incidental "400KB"-shaped digits elsewhere in the message —
+  // these two fixtures omit "400KB" entirely to prove that.
+  it('classifies an item-size-blocked schedule write as invalid_args, independent of incidental status-shaped digits', () => {
+    expect(classifyToolErrorClass(err(
+      'Scheduled chat is too large to save (about 391KB against the per-item limit) '
+      + 'even after dropping saved history. The starting message is 10240 characters — shorten it and try again.'
+    ))).toBe('invalid_args');
+    expect(classifyToolErrorClass(err(
+      'API error (400): Scheduled chat is too large to save — it exceeds the per-item limit.'
+    ))).toBe('invalid_args');
+  });
+
+  // The three real messages agentModeController.ts actually throws (via
+  // mcpFetch's `API error (${status}): ${message}` wrapping) all hard-code the
+  // literal "DynamoDB's 400KB per-item limit" — so today they already classify
+  // correctly via the earlier embedded-status-code match (classFromStatus(400))
+  // before ever reaching the pattern above. Asserted here so a future change to
+  // either branch can't silently break the real, verbatim production shape —
+  // the fixtures above stay as the regression proof for message shapes (or
+  // future callers) that don't happen to repeat "400KB".
+  it('classifies the real manage_scheduled_chat size-block messages as invalid_args', () => {
+    expect(classifyToolErrorClass(err(
+      "API error (400): Scheduled chat is too large to save (about 391KB against DynamoDB's 400KB per-item "
+      + 'limit) even after dropping saved history. The starting message is 10240 characters — shorten it and try again.'
+    ))).toBe('invalid_args');
+    expect(classifyToolErrorClass(err(
+      "API error (400): Scheduled chat is too large to save — fitting it under DynamoDB's 400KB per-item limit "
+      + "would mean dropping 3 saved runs from this schedule's history at once. The starting message is 10240 "
+      + 'characters — shorten it and try again.'
+    ))).toBe('invalid_args');
+    expect(classifyToolErrorClass(err(
+      "API error (400): Scheduled chat is too large to save — it exceeds DynamoDB's 400KB per-item limit. "
+      + 'Shorten the starting message and try again.'
+    ))).toBe('invalid_args');
+  });
+
+  // ENG-1672 (code review follow-up): the global `is too large` pattern this
+  // added is a deliberate trade-off, not an oversight — it now also classifies
+  // pre-existing "too large" messages elsewhere in the app that previously fell
+  // through unclassified to the legacy name fallback, including a named error
+  // (gmailService.ts's GmailBodyTooLargeError) that used to keep its own
+  // distinct class via that same fallback. Locked in here so a future change to
+  // either the regex or this error's name can't silently flip this back without
+  // a test noticing.
+  it('reclassifies GmailBodyTooLargeError to invalid_args (accepted trade-off, was previously its own distinct class)', () => {
+    expect(classifyToolErrorClass(err(
+      'Email body is too large (HTML content exceeds 50KB). '
+      + 'Ask the user to open the email directly in Gmail, or specify which part they want — '
+      + 'e.g. "just the subject and sender" or "first paragraph only".',
+      'GmailBodyTooLargeError'
+    ))).toBe('invalid_args');
+  });
+
   it('classifies not-found and network failures', () => {
     expect(classifyToolErrorClass(err('Request failed with status code 404'))).toBe('not_found');
     expect(classifyToolErrorClass(err('getaddrinfo ENOTFOUND api.example.com'))).toBe('network');
@@ -86,6 +146,10 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('blocked', 'AgentToolPolicyBlockedError'))).toBe('policy_blocked');
     expect(classifyToolErrorClass(err('failed 3 times', 'AgentToolRepeatedFailureError'))).toBe('repeated_failure');
     expect(classifyToolErrorClass(err('bad args', 'AgentToolContractValidationError'))).toBe('invalid_args');
+  });
+
+  it('classifies a truncated tool-call-arguments error as truncated_response, distinct from invalid_args (ENG-1477)', () => {
+    expect(classifyToolErrorClass(err('cut off mid-object', 'TruncatedToolCallArgumentsError'))).toBe('truncated_response');
   });
 
   it('uses numeric status properties when the message is unhelpful', () => {
@@ -190,5 +254,27 @@ describe('payment_required — X credit exhaustion (402)', () => {
   it('does not misclassify a 403 as payment_required', () => {
     const err = Object.assign(new Error('Request failed with code 403'), { code: 403 });
     expect(classifyToolErrorClass(err)).toBe('auth');
+  });
+});
+
+// ENG-1626 (CodeRabbit): DynamoDB throttling from the AWS SDK v2 carries the
+// exception name as a STRING .code (not .status/.statusCode), and typically
+// ALSO carries a numeric statusCode of 400 -- classFromStatus(400) returns
+// 'invalid_args', so the string-code check must run before the numeric
+// status check or it never gets a chance to fire.
+describe('rate_limit — AWS SDK v2 DynamoDB throttling (ENG-1626)', () => {
+  it('classifies ThrottlingException as rate_limit even with statusCode 400', () => {
+    const err = Object.assign(new Error('Throttling'), { code: 'ThrottlingException', statusCode: 400 });
+    expect(classifyToolErrorClass(err)).toBe('rate_limit');
+  });
+
+  it('classifies ProvisionedThroughputExceededException as rate_limit even with statusCode 400', () => {
+    const err = Object.assign(new Error('Rate exceeded'), { code: 'ProvisionedThroughputExceededException', statusCode: 400 });
+    expect(classifyToolErrorClass(err)).toBe('rate_limit');
+  });
+
+  it('classifies ThrottlingException as rate_limit with no statusCode at all', () => {
+    const err = Object.assign(new Error('Throttling'), { code: 'ThrottlingException' });
+    expect(classifyToolErrorClass(err)).toBe('rate_limit');
   });
 });

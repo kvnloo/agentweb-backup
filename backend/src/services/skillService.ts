@@ -63,9 +63,30 @@ export interface Skill {
 
 export class SkillService {
   private tableName: string;
+  // ENG-1222: getPublishedSkills() is a full-table scan, called on every turn
+  // of every skill-having chat session (both agent-mode and chatbotService.ts)
+  // to resolve the __other_skills__ virtual skill and the "available skills"
+  // message — none of which needs sub-minute freshness. A short TTL cache
+  // removes that scan from the hot path; publish/edit/delete below explicitly
+  // invalidate it so an admin's change is visible on their very next request
+  // rather than waiting out the TTL.
+  private publishedSkillsCache: { data: Skill[]; expiresAt: number } | null = null;
+  private static readonly PUBLISHED_SKILLS_CACHE_TTL_MS = 30_000;
+  // CodeRabbit (ENG-1222 review): a scan in flight when create/update/delete
+  // invalidates the cache would otherwise finish afterward and unconditionally
+  // overwrite the null with its own now-stale result, silently reviving data
+  // from before the edit until the TTL expires. Bump this on every invalidation
+  // and only let a scan publish its result if the generation it started under
+  // is still current.
+  private publishedSkillsCacheGeneration = 0;
 
   constructor() {
     this.tableName = `${TABLE_PREFIX}AW-Skills`;
+  }
+
+  private invalidatePublishedSkillsCache(): void {
+    this.publishedSkillsCache = null;
+    this.publishedSkillsCacheGeneration++;
   }
 
   private normalizeSkill(item: any): Skill {
@@ -127,6 +148,7 @@ export class SkillService {
 
     try {
       await dynamodb.put(params).promise();
+      this.invalidatePublishedSkillsCache();
       return skill;
     } catch (error) {
       console.error("Error creating skill:", error);
@@ -169,6 +191,11 @@ export class SkillService {
   }
 
   async getPublishedSkills(): Promise<Skill[]> {
+    if (this.publishedSkillsCache && this.publishedSkillsCache.expiresAt > Date.now()) {
+      return this.publishedSkillsCache.data;
+    }
+
+    const generationAtScanStart = this.publishedSkillsCacheGeneration;
     const params = {
       TableName: this.tableName,
       FilterExpression: "isPublished = :isPublished",
@@ -179,8 +206,15 @@ export class SkillService {
 
     try {
       const items = await paginatedScan(dynamodb, params);
-      return ((items.map(item => this.normalizeSkill(item)) as Skill[]) || [])
+      const result = ((items.map(item => this.normalizeSkill(item)) as Skill[]) || [])
         .filter(skill => skill.visibility !== 'pending_review');
+      // Only publish this scan's result if nothing invalidated the cache while
+      // it was in flight — otherwise a deferred scan would resurrect stale data
+      // right after a create/update/delete/sync explicitly cleared it.
+      if (this.publishedSkillsCacheGeneration === generationAtScanStart) {
+        this.publishedSkillsCache = { data: result, expiresAt: Date.now() + SkillService.PUBLISHED_SKILLS_CACHE_TTL_MS };
+      }
+      return result;
     } catch (error) {
       if ((error as any).code === 'ResourceNotFoundException') {
         return [];
@@ -284,6 +318,7 @@ export class SkillService {
 
     try {
       await dynamodb.put(params).promise();
+      this.invalidatePublishedSkillsCache();
       return updatedAt;
     } catch (error) {
       console.error(`Error updating skill ${skill.skillId}:`, error);
@@ -320,6 +355,13 @@ export class SkillService {
         TableName: targetTable,
         Item: skillItem,
       }).promise();
+
+      // ENG-1222: only invalidate when the sync wrote to THIS environment's own
+      // table (this.tableName) — getPublishedSkills only ever reads that one, so
+      // a sync writing to the other environment's table has nothing to invalidate.
+      if (targetTable === this.tableName) {
+        this.invalidatePublishedSkillsCache();
+      }
 
       return skill;
     } catch (error) {
@@ -513,6 +555,7 @@ export class SkillService {
 
     try {
       await dynamodb.delete(params).promise();
+      this.invalidatePublishedSkillsCache();
     } catch (error) {
       console.error(`Error deleting skill ${skillId}:`, error);
       throw error;

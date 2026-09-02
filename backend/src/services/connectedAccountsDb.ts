@@ -1,12 +1,24 @@
 import { isDeepStrictEqual } from 'node:util';
 import { userDb, User } from './db';
 import { invalidateCachedPixels } from './metaPixelsCache';
+import type { DailyVolumeState } from './linkedInWritePacer';
 
 // ============================================
 // Type Definitions
 // ============================================
 
 export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly';
+
+/**
+ * ENG-1616 — the subset of `PlatformType` that `postOnConnectedAccount` treats as
+ * social-posting-capable. Single source of truth for that allowlist: it used to be
+ * duplicated between `agentModeService.postOnConnectedAccount` and the scheduled
+ * publish consent guard's `resolveAccountPlatform`, both narrowing an account_id
+ * lookup to these platforms before matching — a drift between the two copies would
+ * silently break account resolution for the missing platform on one side, with no
+ * test or runtime signal to catch it.
+ */
+export const SOCIAL_POSTING_PLATFORMS: readonly PlatformType[] = ['twitter', 'linkedin', 'instagram', 'youtube'];
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -64,6 +76,23 @@ export interface LinkedInOutreachConfig {
   // Premium LinkedIn accounts allow 300-char invitation notes (free accounts: 200).
   // User-set in Settings → Connected accounts. Absent/false = free tier.
   is_premium?: boolean;
+  /**
+   * Self-reported daily LinkedIn connection-request ceiling (linkedInWritePacer.ts).
+   * Set directly by the user in Settings, or by Emma via the linkedin_outreach
+   * `set-daily-invite-cap` action after asking whether the account has LinkedIn
+   * Premium. Deliberately NOT auto-detected — see the pacer's module doc comment.
+   * Unset defaults to the conservative free-tier number; the pacer clamps any
+   * value to its own absolute system-wide ceiling regardless of what's stored here.
+   */
+  daily_invite_cap?: number;
+  /**
+   * Durable daily-volume counters (linkedInWritePacer.ts). Persisted here —
+   * not in process memory — specifically so a backend restart (which happens
+   * on every merge to `main`) can't reset an account's daily send count to
+   * zero mid-day. Written by the pacer's caller, never read/written directly
+   * anywhere else.
+   */
+  daily_volume?: DailyVolumeState;
   /**
    * Persisted session health (ENG-1197).
    *
@@ -272,12 +301,35 @@ export interface AttioConfig extends BaseOAuthConfig {
   account_type: 'oauth';
   workspace_id: string;
   workspace_name: string;
+  // Set after a real-time webhook subscription is registered against this
+  // workspace (POST /v2/webhooks — Attio's model is per-workspace, unlike
+  // HubSpot's single app-wide subscription list). `webhook_signing_key` is
+  // the secret Attio returns at creation time — it's shown only once and
+  // must be persisted immediately for HMAC verification of inbound events.
+  webhook_id?: string;
+  webhook_signing_key?: string;
+  // Set when webhook registration fails with 403 (missing webhook:read-write
+  // scope on this token — e.g. connected before the scope was added to the
+  // app). Cleared on reconnect, same pattern as TwitterXConfig/CalendlyConfig.
+  needs_reconnect?: boolean;
 }
 
 export interface GoogleAdsConfig extends BaseOAuthConfig {
   account_type: 'google_ads';
   customer_id: string;
   currency: string;
+  /**
+   * ENG-1362. Google's `test_account` flag, captured at connect time.
+   *
+   * `true` is Google's guarantee that the account cannot serve ads and cannot spend.
+   * `false` means real money. **Absent** means the account was connected before this was
+   * recorded — which must be read as billable, never as safe, and is resolved live by
+   * `googleAdsService.isTestAccount`.
+   *
+   * Stored because the account NAME carries no such guarantee: a real, billable, ENABLED
+   * account descriptively named "Test" is exactly the case this field disambiguates.
+   */
+  test_account?: boolean;
   /**
    * The manager (MCC) account id to send as `login-customer-id` on every Google Ads
    * API call for this account. Set when the account is a leaf reached through a manager
@@ -699,6 +751,8 @@ export type AccountConfigMutation =
   | ((freshConfig: Record<string, any>) => {
       updates: Record<string, any>;
       unset?: string[];
+      /** Return without writing when the fresh state declines the mutation. */
+      skip?: boolean;
     });
 
 export const updateAccountConfig = async (
@@ -738,9 +792,11 @@ export const updateAccountConfig = async (
     const existingAccount = accounts[accountIndex];
 
     const isDerived = typeof configUpdates === 'function';
-    const { updates, unset } = isDerived
+    const mutation = isDerived
       ? configUpdates(existingAccount.config || {})
       : { updates: configUpdates, unset: options?.unset };
+    if (mutation.skip) return;
+    const { updates, unset } = mutation;
 
     const mergedConfig: Record<string, any> = {
       ...existingAccount.config,
@@ -988,6 +1044,50 @@ export const getAccountsByCalendlyUserUri = async (
     return matches;
   } catch (error) {
     console.error('Error resolving Calendly user_uri to accounts:', error);
+    return [];
+  }
+};
+
+/**
+ * Find the user (and the specific connected account) that owns a given Attio
+ * workspace_id. Used by the incoming Attio webhook to resolve which tenant(s)
+ * a delivery belongs to.
+ *
+ * Returns every match, not a single best-guess userId, following the same
+ * ENG-994 lesson `getAccountsByCalendlyUserUri` already documents above:
+ * two tenants could in principle connect the same underlying Attio workspace
+ * independently, each with their own webhook subscription and signing key —
+ * a single-match resolver would silently drop one tenant's deliveries on a
+ * collision. The caller verifies each candidate's own webhook_signing_key
+ * against the delivery's signature rather than committing to a guess.
+ */
+export const getAccountsByAttioWorkspaceId = async (
+  workspaceId: string
+): Promise<Array<{ userId: string; account: ConnectedAccountConfig }>> => {
+  try {
+    const { userDb } = await import('./db');
+    // Deliberately scanWithFilter, not getAllUsers(): this runs on every
+    // incoming Attio webhook, unauthenticated until a candidate's signing key
+    // verifies below — getAllUsers() additionally starts three count queries
+    // (tasks/workflows/chat sessions) per user for admin-dashboard display,
+    // irrelevant here and multiplying the cost of every delivery. A full
+    // table scan is still unavoidable without a dedicated workspace-to-account
+    // index (a schema change, gated separately), but skipping the per-user
+    // fan-out removes the dominant, easily-avoidable cost.
+    const users = await userDb.scanWithFilter('attribute_exists(connected_accounts)', {});
+    const matches: Array<{ userId: string; account: ConnectedAccountConfig }> = [];
+
+    for (const user of users) {
+      const accounts = normalizeAccounts((user as User).connected_accounts);
+      for (const account of accounts) {
+        if (account.platform === 'attio' && (account.config as AttioConfig).workspace_id === workspaceId) {
+          matches.push({ userId: user.userId, account });
+        }
+      }
+    }
+    return matches;
+  } catch (error) {
+    console.error('Error resolving Attio workspace_id to accounts:', error);
     return [];
   }
 };

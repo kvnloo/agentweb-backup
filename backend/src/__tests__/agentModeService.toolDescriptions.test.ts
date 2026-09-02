@@ -208,6 +208,18 @@ describe('AgentModeService - Tool Descriptions', () => {
       expect(systemPrompt).toContain('"I\'ll draft this FROM [sender] TO [recipient] - correct?"');
     });
 
+    it('should infer a single plausible reply direction instead of asking when only one external party is named', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('Single-plausible-direction case — infer, don\'t ask');
+      expect(systemPrompt).toContain('draft it as a reply FROM the team TO that external party');
+      expect(systemPrompt).toContain('asking is the same as producing no draft at all');
+    });
+
+    it('should only block unattended runs on genuine multi-party ambiguity, not a single inferable direction', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('If only one direction is plausible, draft it per the single-plausible-direction case above instead of stopping');
+    });
+
     it('should not polish inbound text when the user asked for a reply', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
       expect(systemPrompt).toContain('Do not merely polish an inbound message when the user asked for a reply');
@@ -217,6 +229,35 @@ describe('AgentModeService - Tool Descriptions', () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
       expect(systemPrompt).toContain('only pasted third-party message text');
       expect(systemPrompt).toContain('do not assume a drafting task');
+    });
+
+    it('should include the multi-ask coverage guard', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('Multi-Ask Coverage Guard');
+      expect(systemPrompt).toContain('enumerate every ask before acting');
+    });
+
+    it('should treat a requested draft as the primary deliverable over a related tool action', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('that draft IS the primary deliverable');
+      expect(systemPrompt).toContain('do not substitute one for the other, do both');
+    });
+
+    it('should require verifying with tools before the draft describes a technical ask\'s outcome', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('call that tool — or its read/list equivalent — BEFORE writing the draft');
+    });
+
+    it('should bind drafted content to Truthful Reporting, not just the assistant\'s own narration', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('Truthful Reporting applies to drafted content, not just your own narration');
+      expect(systemPrompt).toContain('you must have the tool result behind that claim in THIS session');
+      expect(systemPrompt).toContain('A confident-sounding draft that asserts a false completion is worse than no draft');
+    });
+
+    it('should require a per-ask status line and forbid silently dropping an ask', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('Never silently drop an ask');
     });
   });
 

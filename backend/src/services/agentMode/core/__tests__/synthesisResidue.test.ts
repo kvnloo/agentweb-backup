@@ -10,6 +10,9 @@ import {
   isUnusableSynthesis,
   buildExecutedActionsFallback,
   buildExecutedActionsFooter,
+  detectFalseCompletionClaim,
+  buildFalseClaimCorrectionFooter,
+  extractProducedAssetCount,
 } from '../synthesisResidue';
 import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from '../termination';
 import { buildTurnTimeBudgetNudge, type TurnTimeBudgetState } from '../../../../utils/turnTimeBudget';
@@ -69,6 +72,50 @@ describe('isUnusableSynthesis', () => {
 
   it('flags a reply that opens with the degraded tool-call marker', () => {
     expect(isUnusableSynthesis('[Previously called call_meta_marketing_api({"action":"UPDATE"})]')).toBe(true);
+  });
+
+  // ENG-1224 Variant B / production session d5898ffd: the model echoed the
+  // loop's own wall-clock budget nudge ("Do not call any more tools. Write
+  // your final answer NOW...") back as its answer instead of following it —
+  // the persisted final message was the literal string below.
+  describe('leaked internal directive (ENG-1224)', () => {
+    it('flags the exact production leak "Do not call any more tools."', () => {
+      expect(isUnusableSynthesis(' Do not call any more tools.')).toBe(true);
+    });
+
+    it('flags other phrasings of the same injected directive', () => {
+      for (const leak of [
+        'Do not call any more tools.',
+        "don't call any more tools",
+        'DO NOT CALL ANY MORE TOOLS.',
+        'Stop all searching/pagination immediately.',
+        '[SYSTEM WARNING] Do not call any more tools. Write your final answer now.',
+      ]) {
+        expect(isUnusableSynthesis(leak)).toBe(true);
+      }
+    });
+
+    it('does NOT flag genuine prose that merely discusses tool-calling policy', () => {
+      for (const real of [
+        'I have finished the task and will not call any more tools unless you ask me to continue.',
+        'As requested, here is a summary of what I found — no further tools were needed.',
+      ]) {
+        expect(isUnusableSynthesis(real)).toBe(false);
+      }
+    });
+
+    // "Stop calling tools" and "No more tool calls" were removed from the guard: no
+    // code path ever injects either phrase, and being anchored + under the residue
+    // length cap they could discard a genuine short answer that happens to open
+    // with similar wording.
+    it('does NOT flag a genuine answer that opens with similar-but-uninjected wording', () => {
+      for (const real of [
+        'Stop calling tools that are not needed — the report below is already complete.',
+        'No more tool calls were necessary; here are the results you asked for.',
+      ]) {
+        expect(isUnusableSynthesis(real)).toBe(false);
+      }
+    });
   });
 
   // Observed live: driving the synthesis retry into a failure state made the model
@@ -312,5 +359,425 @@ describe('buildExecutedActionsFooter', () => {
     expect(footer).toContain('save_file');
     expect(footer).toContain('1 succeeded');
     expect(footer).toContain('https://s3.example.com/xCures-Master-Banners-V2.html');
+  });
+});
+
+// ENG-1331: a work-plan session generated and screenshot-exported 4 of 12 requested
+// display-ad sizes, then closed with "all 12 sizes have been rendered, QA'd, and
+// saved" — fluent, well-formed prose, not residue. The ENG-1054 guard above only
+// catches junk-shaped output (`isUnusableSynthesis`), so a plausible false claim
+// like this sailed straight through it. `detectFalseCompletionClaim` is the
+// independent truth check: it never judges whether text "looks like" an answer, it
+// parses any "all N <asset noun>" / "N of N" / "N/N" completion claim out of the
+// content and compares it against the ledger's actual successful asset-producing
+// tool calls.
+describe('detectFalseCompletionClaim', () => {
+  const fourScreenshots = Array.from({ length: 4 }, (_, i) => ({
+    name: 'playwright_browser_take_screenshot',
+    result: { success: true, screenshotUrl: `https://s3.example.com/${i + 1}.png` },
+  }));
+
+  it('flags an "all N <asset noun>" claim the ledger cannot back up', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved for Variant 4.",
+      fourScreenshots,
+    );
+    expect(claim).toEqual({ claimed: 12, actual: 4 });
+  });
+
+  it('flags an "N of N" claim', () => {
+    expect(detectFalseCompletionClaim('Delivered 12 of 12 banners.', [])).toEqual({ claimed: 12, actual: 0 });
+  });
+
+  it('flags an "N/N" claim', () => {
+    expect(detectFalseCompletionClaim('12/12 images generated.', [])).toEqual({ claimed: 12, actual: 0 });
+  });
+
+  it('does NOT flag when the ledger backs the claim up exactly', () => {
+    expect(detectFalseCompletionClaim('All 4 sizes rendered.', fourScreenshots)).toBeNull();
+  });
+
+  it('does NOT flag when the ledger over-delivers relative to the claim', () => {
+    const claim = detectFalseCompletionClaim('All 4 sizes rendered.', [
+      ...fourScreenshots,
+      { name: 'playwright_browser_take_screenshot', result: { success: true, screenshotUrl: 'https://s3.example.com/5.png' } },
+    ]);
+    expect(claim).toBeNull();
+  });
+
+  it('does NOT flag text with no completion claim at all', () => {
+    expect(detectFalseCompletionClaim('Here are the assets you requested.', [])).toBeNull();
+  });
+
+  it('does NOT flag an unrelated "all N" claim with no asset noun nearby', () => {
+    expect(detectFalseCompletionClaim('I reviewed all 12 line items in the report.', [])).toBeNull();
+  });
+
+  // Live repro: N_OF_N_PATTERN/N_SLASH_N_PATTERN had no noun-proximity requirement,
+  // unlike ALL_N_NOUN_PATTERN above, so an unrelated same-number ratio was misread
+  // as an asset-completion claim.
+  it('does NOT flag an unrelated "N of N" claim with no asset noun nearby', () => {
+    expect(detectFalseCompletionClaim('I reviewed 10 of 10 pages in the brief.', [])).toBeNull();
+  });
+
+  it('does NOT flag an unrelated "N/N" claim with no asset noun nearby', () => {
+    expect(detectFalseCompletionClaim('That covers 3/3 of the brief.', [])).toBeNull();
+  });
+
+  it('does NOT flag a claim the model already qualifies as partial', () => {
+    expect(detectFalseCompletionClaim('I rendered 4 of the 12 requested sizes.', [])).toBeNull();
+  });
+
+  it('does NOT flag empty content', () => {
+    expect(detectFalseCompletionClaim('', [])).toBeNull();
+  });
+
+  it('counts a failed or deferred asset call as NOT produced', () => {
+    const claim = detectFalseCompletionClaim('All 2 images generated.', [
+      { name: 'generate_image', result: { success: true, imageUrl: 'https://s3.example.com/a.png' } },
+      { name: 'generate_image', error: 'boom' },
+      { name: 'generate_image', result: { deferred: true } },
+    ]);
+    expect(claim).toEqual({ claimed: 2, actual: 1 });
+  });
+
+  // ENG-1331 manager follow-up / ENG-1188 anti-pattern: toolCalls is the WHOLE
+  // TURN's ledger, which in an AUTOCOMPLETE work-plan session can span multiple
+  // steps/variants closed via set_work_plan_status inside the same turn. Without
+  // scoping to "since the last step boundary", an earlier variant's successful
+  // assets would mask a later variant's shortfall — the exact bug the guard exists
+  // to catch.
+  it('does NOT let an earlier step/variant\'s assets mask a later step\'s shortfall', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved for Variant 4.",
+      [
+        // Variant 1-3: 40 successful renders, closed out via set_work_plan_status.
+        ...Array.from({ length: 40 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/earlier-${i + 1}.png` },
+        })),
+        { name: 'set_work_plan_status', result: { success: true } },
+        // Variant 4: only 4 of the claimed 12 actually rendered.
+        ...fourScreenshots,
+      ],
+    );
+    expect(claim).toEqual({ claimed: 12, actual: 4 });
+  });
+
+  it('still counts the whole ledger when no step boundary is present', () => {
+    expect(
+      detectFalseCompletionClaim('All 4 sizes have been rendered, QA\'d, and saved.', fourScreenshots),
+    ).toBeNull();
+  });
+
+  it('does NOT treat a FAILED set_work_plan_status call as a step boundary', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved for Variant 4.",
+      [
+        ...Array.from({ length: 40 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/earlier-${i + 1}.png` },
+        })),
+        { name: 'set_work_plan_status', error: 'validation failed: insufficient assets' },
+        ...fourScreenshots,
+      ],
+    );
+    // The failed call never closed the step, so the earlier 40 are still "this
+    // step's" work and legitimately back the claim.
+    expect(claim).toBeNull();
+  });
+
+  // CodeRabbit (ENG-1331 follow-up, second pass): a set_work_plan_status call the
+  // dispatcher collapsed as a same-turn duplicate (duplicateOf set) never actually
+  // ran — the call it points at is the real boundary and is its own ledger entry.
+  // Treating the duplicate itself as a successful boundary too could point
+  // sinceLastStepBoundary at an entry that only looks like the true last boundary
+  // in array order. Mirrors tallyExecutedActions' existing duplicateOf exclusion.
+  it('does NOT treat a duplicate-collapsed set_work_plan_status call as a step boundary', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved for Variant 4.",
+      [
+        ...Array.from({ length: 40 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/earlier-${i + 1}.png` },
+        })),
+        { name: 'set_work_plan_status', result: { success: true } },
+        ...fourScreenshots,
+        // The model re-emits an identical set_work_plan_status later in the same
+        // turn; the dispatcher collapses it as a duplicate of the real call above.
+        { name: 'set_work_plan_status', duplicateOf: 'call-id-of-the-real-close', result: { success: true } },
+      ],
+    );
+    // In THIS shape the buggy and fixed code happen to agree (both land on
+    // "since the real close, before the trailing duplicate") — kept as a basic
+    // sanity check, but the test below is the one that actually distinguishes
+    // correct from buggy: it fails without the fix and passes with it.
+    expect(claim).toEqual({ claimed: 12, actual: 4 });
+  });
+
+  // The scenario that actually distinguishes correct behavior from the bug: a
+  // step genuinely finishes and closes itself, and the model then re-emits an
+  // identical close as the LAST thing in the turn (collapsed as a duplicate).
+  // Naively checking "is the boundary the literal last array element" says NO
+  // here (the duplicate follows it) and wrongly falls back to the
+  // not-yet-closed-step rule — slicing to just the duplicate call itself, actual
+  // = 0, falsely flagging a truthful "all 12 done". The fix must recognize that
+  // nothing MEANINGFUL (non-duplicate) follows the real close.
+  it('treats a step as self-closing even when a duplicate close trails the real one', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved.",
+      [
+        ...Array.from({ length: 12 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/${i + 1}.png` },
+        })),
+        { name: 'set_work_plan_status', result: { success: true } },
+        { name: 'set_work_plan_status', duplicateOf: 'call-id-of-the-real-close', result: { success: true } },
+      ],
+    );
+    expect(claim).toBeNull(); // truthful — must NOT be flagged
+  });
+
+  // CodeRabbit (ENG-1331 follow-up), confirmed live against production: when a
+  // step's OWN assets are immediately followed by its OWN successful
+  // set_work_plan_status close (the normal shape in an AUTOCOMPLETE turn — the
+  // step finishes and closes itself before the closing synthesis is written),
+  // the OLD "since the last successful boundary" rule sliced to nothing (the
+  // boundary was the last ledger entry), so a step that genuinely produced all
+  // 12 assets and validly closed itself read as actual=0 — a false
+  // UNDER-claim slapped onto a truthful message. This is the opposite failure
+  // from the masking case above, on the same mechanism.
+  it('counts a step\'s own assets when its own successful close is the last ledger entry', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved.",
+      [
+        ...Array.from({ length: 12 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/${i + 1}.png` },
+        })),
+        { name: 'set_work_plan_status', result: { success: true } },
+      ],
+    );
+    expect(claim).toBeNull(); // truthful — must NOT be flagged
+  });
+
+  it('still catches a shortfall when the step closes itself anyway (self-close does not launder a false claim)', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved.",
+      [...fourScreenshots, { name: 'set_work_plan_status', result: { success: true } }],
+    );
+    expect(claim).toEqual({ claimed: 12, actual: 4 });
+  });
+
+  it('excludes an EARLIER step\'s assets even when the current step self-closes with nothing after it', () => {
+    // Two self-closing steps in sequence: step 1 (40 assets, closes itself),
+    // step 2 (4 assets, closes itself) — the claim is about step 2 only.
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved for Variant 4.",
+      [
+        ...Array.from({ length: 40 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/earlier-${i + 1}.png` },
+        })),
+        { name: 'set_work_plan_status', result: { success: true } },
+        ...fourScreenshots,
+        { name: 'set_work_plan_status', result: { success: true } },
+      ],
+    );
+    expect(claim).toEqual({ claimed: 12, actual: 4 });
+  });
+
+  it('takes the largest claim when multiple numeric completion claims appear', () => {
+    const claim = detectFalseCompletionClaim(
+      'All 4 sizes for the first variant and all 12 sizes for the second variant were rendered.',
+      [{ name: 'playwright_browser_take_screenshot', result: { success: true } }],
+    );
+    expect(claim).toEqual({ claimed: 12, actual: 1 });
+  });
+});
+
+describe('buildFalseClaimCorrectionFooter', () => {
+  it('states both the claimed and actual counts, and the ledger backing them', () => {
+    const footer = buildFalseClaimCorrectionFooter(
+      { claimed: 12, actual: 4 },
+      fourScreenshotsForFooterTest(),
+    );
+    expect(footer).toContain('12');
+    expect(footer).toContain('4');
+    expect(footer).toContain('playwright_browser_take_screenshot');
+    expect(footer).toContain('https://s3.example.com/1.png');
+  });
+
+  // ENG-1331 manager follow-up: the footer must be scoped the same way the claim
+  // detection was, or the "only 4 of 12" correction would sit next to a ledger
+  // listing 44 successes from an earlier, already-closed step/variant.
+  it('scopes its ledger to since the last step boundary, excluding an earlier step\'s assets', () => {
+    const footer = buildFalseClaimCorrectionFooter(
+      { claimed: 12, actual: 4 },
+      [
+        { name: 'save_file', result: { success: true, file_url: 'https://s3.example.com/earlier-step.html' } },
+        { name: 'set_work_plan_status', result: { success: true } },
+        ...fourScreenshotsForFooterTest(),
+      ],
+    );
+    expect(footer).not.toContain('earlier-step.html');
+    expect(footer).toContain('playwright_browser_take_screenshot');
+  });
+
+  it('handles an empty ledger without throwing', () => {
+    const footer = buildFalseClaimCorrectionFooter({ claimed: 12, actual: 0 }, []);
+    expect(typeof footer).toBe('string');
+    expect(footer).toContain('12');
+    expect(footer).toContain('0');
+  });
+});
+
+function fourScreenshotsForFooterTest() {
+  return Array.from({ length: 4 }, (_, i) => ({
+    name: 'playwright_browser_take_screenshot',
+    result: { success: true, screenshotUrl: `https://s3.example.com/${i + 1}.png` },
+  }));
+}
+
+// ENG-1331: the work-plan step completion gate's own asset counter
+// (extractGeneratedImageFilenames) only recognizes generate_image's marker, so a
+// Playwright-screenshot-rendered step could never satisfy expectedAssetCount even
+// when it was set. extractProducedAssetCount reads the same persisted
+// session.messages toolCalls ledger for every ASSET_PRODUCING_TOOL_NAMES tool.
+describe('extractProducedAssetCount', () => {
+  function assistantMessage(toolCalls: any[], timestamp?: string) {
+    return { role: 'assistant', timestamp, metadata: { timestamp, toolCalls } };
+  }
+
+  it('counts successful playwright_browser_take_screenshot calls — the production gap', () => {
+    const messages = [
+      assistantMessage([
+        { name: 'create_html_file', result: { success: true, s3_url: 'https://s3.example.com/template.html' } },
+        ...fourScreenshotsForFooterTest(),
+      ]),
+    ];
+    // Max across tool types, not a sum — see the dedicated "does not pad" test below
+    // for why. 1 create_html_file + 4 screenshots -> 4, not 5.
+    expect(extractProducedAssetCount(messages)).toBe(4);
+  });
+
+  // A step like "Render the Full Size Matrix" legitimately calls BOTH
+  // create_html_file (a few reusable templates) and playwright_browser_take_
+  // screenshot (one per requested size) — real work, not padding. But they are not
+  // interchangeable units of the step's deliverable: summing them would let, e.g.,
+  // 5 create_html_file calls + 7 screenshots satisfy expectedAssetCount=12 while
+  // only 7 of the 12 requested sizes were actually rendered — the exact class of
+  // false-completion bug this module exists to catch, just introduced by its own
+  // counting instead of the model's prose.
+  it('does not let one tool type pad another\'s count toward the total', () => {
+    const messages = [
+      assistantMessage([
+        ...Array.from({ length: 5 }, (_, i) => ({
+          name: 'create_html_file',
+          result: { success: true, s3_url: `https://s3.example.com/template-${i}.html` },
+        })),
+        ...Array.from({ length: 7 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/${i}.png` },
+        })),
+      ]),
+    ];
+    // NOT 12 (5 + 7) — only 7 of the primary per-size deliverable actually happened.
+    expect(extractProducedAssetCount(messages)).toBe(7);
+  });
+
+  it('counts generate_image successes too', () => {
+    const messages = [
+      assistantMessage([
+        { name: 'generate_image', result: { success: true, imageUrl: 'https://s3.example.com/hero.png' } },
+      ]),
+    ];
+    expect(extractProducedAssetCount(messages)).toBe(1);
+  });
+
+  it('ignores non-asset-producing tools', () => {
+    const messages = [
+      assistantMessage([
+        { name: 'search_user_assets', result: { success: true, results: [] } },
+        { name: 'set_work_plan_status', result: { success: true } },
+      ]),
+    ];
+    expect(extractProducedAssetCount(messages)).toBe(0);
+  });
+
+  it('ignores errored, deferred, and reported-failure calls', () => {
+    const messages = [
+      assistantMessage([
+        { name: 'playwright_browser_take_screenshot', error: 'timeout' },
+        { name: 'playwright_browser_take_screenshot', result: { deferred: true } },
+        { name: 'playwright_browser_take_screenshot', result: { success: false } },
+      ]),
+    ];
+    expect(extractProducedAssetCount(messages)).toBe(0);
+  });
+
+  it('ignores non-assistant messages', () => {
+    const messages = [
+      { role: 'user', metadata: { toolCalls: fourScreenshotsForFooterTest() } },
+      { role: 'system', metadata: { toolCalls: fourScreenshotsForFooterTest() } },
+    ];
+    expect(extractProducedAssetCount(messages as any)).toBe(0);
+  });
+
+  it('excludes calls before sinceIso — an earlier step\'s assets do not satisfy a later step', () => {
+    const messages = [
+      assistantMessage(fourScreenshotsForFooterTest(), '2026-08-18T09:12:00.000Z'),
+      assistantMessage(fourScreenshotsForFooterTest(), '2026-08-18T09:20:00.000Z'),
+    ];
+    expect(extractProducedAssetCount(messages, '2026-08-18T09:15:00.000Z')).toBe(4);
+  });
+
+  it('returns 0 for missing or empty message history', () => {
+    expect(extractProducedAssetCount(undefined)).toBe(0);
+    expect(extractProducedAssetCount([])).toBe(0);
+  });
+
+  // ENG-1331 (post-launch hardening): a step author can name exactly which tool(s)
+  // count, removing the max-vs-sum ambiguity entirely instead of relying on a
+  // heuristic. When named, those tools are SUMMED (the author has already resolved
+  // any padding risk by choosing what to name) — unlike the max-based default.
+  describe('with an explicit tools allowlist', () => {
+    it('sums only the named tool, ignoring a co-occurring unrelated asset-producing tool', () => {
+      const messages = [
+        assistantMessage([
+          { name: 'create_html_file', result: { success: true, s3_url: 'https://s3.example.com/t1.html' } },
+          { name: 'create_html_file', result: { success: true, s3_url: 'https://s3.example.com/t2.html' } },
+          ...fourScreenshotsForFooterTest(),
+        ]),
+      ];
+      expect(extractProducedAssetCount(messages, undefined, ['playwright_browser_take_screenshot'])).toBe(4);
+    });
+
+    it('sums across multiple named tools when the author declares more than one', () => {
+      const messages = [
+        assistantMessage([
+          { name: 'generate_image', result: { success: true, imageUrl: 'https://s3.example.com/a.png' } },
+          { name: 'generate_video', result: { success: true, videoUrl: 'https://s3.example.com/b.mp4' } },
+        ]),
+      ];
+      expect(extractProducedAssetCount(messages, undefined, ['generate_image', 'generate_video'])).toBe(2);
+    });
+
+    it('ignores a tool call whose name is not in the allowlist even if it is asset-producing', () => {
+      const messages = [assistantMessage([
+        { name: 'save_file', result: { success: true, file_url: 'https://s3.example.com/report.pdf' } },
+      ])];
+      expect(extractProducedAssetCount(messages, undefined, ['playwright_browser_take_screenshot'])).toBe(0);
+    });
+
+    it('treats an empty tools array the same as omitting it (falls back to max)', () => {
+      const messages = [
+        assistantMessage([
+          { name: 'create_html_file', result: { success: true, s3_url: 'https://s3.example.com/t1.html' } },
+          ...fourScreenshotsForFooterTest(),
+        ]),
+      ];
+      expect(extractProducedAssetCount(messages, undefined, [])).toBe(4); // max(1, 4), not sum
+    });
   });
 });

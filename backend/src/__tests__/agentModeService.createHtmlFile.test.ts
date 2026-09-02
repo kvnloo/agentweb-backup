@@ -242,6 +242,33 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(result.error).toContain('S3 upload failed');
     });
 
+    // ENG-1300: uploadFileToS3 now exposes AWS SDK v2's numeric statusCode;
+    // prove it survives the nested rethrow to createHtmlFile's own catch.
+    it('ENG-1300: a coded S3 upload failure classifies as auth/config end-to-end', async () => {
+      mockUploadFileToS3.mockResolvedValue({
+        success: false,
+        error: 'Access Denied',
+        statusCode: 403,
+      });
+
+      const result = await (agentModeService as any).createHtmlFile(
+        'Test Title',
+        'Test content',
+        '',
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(403);
+      const { toolResultError } = await import('../utils/toolResultError');
+      const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+      const { classifyToolFailureType } = await import('../utils/toolFailureType');
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    });
+
     // ENG-873: a render failure must no longer discard the draft. The draft is
     // rendered deterministically instead, so the deliverable still exists.
     it('degrades to a deterministic render when the LLM generation errors', async () => {
@@ -699,8 +726,8 @@ describe('AgentModeService - createHtmlFile', () => {
       );
     });
 
-    it('should truncate long titles in filename', async () => {
-      const longTitle = 'A'.repeat(100);
+    it('caps very long titles at 150 chars, still bounded (ENG-1686: was 50, too aggressive)', async () => {
+      const longTitle = 'A'.repeat(300);
       const result = await (agentModeService as any).createHtmlFile(
         longTitle,
         'Test content',
@@ -709,9 +736,11 @@ describe('AgentModeService - createHtmlFile', () => {
         'session123'
       );
 
-      // Filename should be truncated to 50 characters (plus extension)
-      expect(result.filename.length).toBeLessThan(100);
-      expect(result.filename).toMatch(/^html_\d+_A{1,50}\.html$/);
+      // Filename should be truncated to 150 sanitized chars (plus prefix/extension).
+      // ENG-1686 raised this from 50 -- the old cap cut real report titles
+      // mid-word (Kraftersland: "...Weekly_Performance_Report" -> "...Repor").
+      expect(result.filename.length).toBeLessThan(200);
+      expect(result.filename).toMatch(/^html_\d+_A{1,150}\.html$/);
     });
 
     it('should default to document mode and report an HTML file', async () => {

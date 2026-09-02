@@ -492,7 +492,7 @@ emmaToolRegistry.register({
     description: `LinkedIn outreach tool via a connected Unipile account. To find the account_id, call list_connected_accounts(platform='unipile') tool.
 
 Actions:
-- search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person. OUT-OF-NETWORK RESULTS: LinkedIn anonymizes hits outside the connected account's network — they come back with no public_identifier/public_profile_url and a placeholder name ("LinkedIn Member", "LinkedIn User", or its localized equivalent). Those are not people you can contact or dedup: never write them to the CRM (via add_leads_to_list or otherwise) and never present them to the user as found leads. Skip them, or use import_leads_from_search, which drops them for you and reports the count as anonymizedSkipped.
+- search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school, company_size_min/company_size_max. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person. COMPANY SIZE: there is no native LinkedIn/Unipile filter for a person's employer headcount, so company_size_min/max is a post-filter applied after the search — it can meaningfully shrink the result count (candidates whose employer size can't be verified are excluded, not guessed at), and the response may report companySizeFiltered with a count and a message when this happens. Only pass it when the user actually asked for a size constraint (e.g. "at startups", "at large companies") — it costs extra lookups per search. OUT-OF-NETWORK RESULTS: LinkedIn anonymizes hits outside the connected account's network — they come back with no public_identifier/public_profile_url and a placeholder name ("LinkedIn Member", "LinkedIn User", or its localized equivalent). Those are not people you can contact or dedup: never write them to the CRM (via add_leads_to_list or otherwise) and never present them to the user as found leads. Skip them, or use import_leads_from_search, which drops them for you and reports the count as anonymizedSkipped.
 - get-profile: Get detailed profile info (headline, About, location, network_distance, is_open_profile, etc.) for a LinkedIn user by profile_url or provider_id. This reads the LIVE profile from the connected/platform-wide Unipile account — it is the ONLY authoritative source for a person's current headline/About. NEVER take a headline, About, or other profile-identity field from a you_search_web snippet or a page-source scrape: search caches lag LinkedIn edits by many months and will report a stale headline as if current. When you specifically need the CURRENT profile — a founder/profile readiness audit, or a "what is my headline right now?" question — pass force_refresh=true to bypass the profile cache and read live. If no LinkedIn account can be resolved, get-profile fails with an explicit connect-LinkedIn error; surface that and prompt the user to connect LinkedIn rather than substituting search-snippet text.
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
@@ -502,9 +502,10 @@ Actions:
 - send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
 - cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
-- accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations.
+- accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations. CRM ATTRIBUTION IS OPT-IN, ON YOU: accepting an inbound request does NOT automatically make someone a lead — unlike sending an invite (always a deliberate targeting choice), an inbound accept could be a genuine prospect or an unrelated personal connection, and nothing gets logged unless you decide it belongs somewhere. If — and only if — this person is actually relevant to a specific CRM campaign, pass list_id for that list; the connection's identity is looked up automatically from LinkedIn's own record of this invitation (not from anything else you pass), so list_id is the only extra thing needed. Omit list_id for a connection that isn't a lead — the accept still succeeds, nothing gets mirrored, no false attribution. If you judge someone a good potential lead but have no specific list to attach them to (the task didn't name one), do NOT let that pass silently — call it out explicitly in your final report (e.g. "N accepted connections look like good fits for X but I had no target list — let me know where to add them") so it's visible and actionable, not just accepted-and-forgotten.
 - update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
 - search-parameters: Resolve a free-text query (company name, location, industry, school, service) to LinkedIn entity IDs via Unipile's parameter search. Required: type (one of COMPANY, LOCATION, INDUSTRY, SCHOOL, SERVICE) and keywords. Optional limit. Returns ranked candidates with id/title/subtitle plus fromCache and source metadata. Use the returned id with the matching *_id field on search-people for precise structured filtering.
+- set-daily-invite-cap: Set this account's daily LinkedIn connection-request limit. Requires daily_invite_cap (a number, up to the system-wide maximum — a higher value you pass is clamped automatically, so 30 always works as "the Premium number" without needing to know the exact ceiling). SELF-REPORTED, NEVER DETECTED: call this ONLY after asking the user directly, in THIS conversation, whether their connected LinkedIn account has Premium — never guess, never infer it from anything else about the account. If they say yes, call this with daily_invite_cap=30 (or their stated preference, if lower); if no, call it with daily_invite_cap=10. Before running any LinkedIn outreach for an account you haven't confirmed this for, ask first — a live/interactive turn is the only place you CAN ask, since an unattended/scheduled run has no one to answer. If a scheduled run reaches this point with the cap still unconfirmed, do NOT call this action from that run — proceed at whatever cap is already configured (defaults to the conservative 10 until someone answers) and say so plainly in the completion ledger, rather than guessing Premium.
 
 SHARED-ACCOUNT FALLBACK: search-people, get-profile, get-company, and search-parameters still work even when the user has no connected LinkedIn account (or it's disconnected) — they silently borrow a platform-wide shared account so discovery doesn't stall. When that happens the response carries usedSharedAccount:true and sharedAccountId. Treat this as a real signal, not a footnote: network_distance and any "already connected/pending" status are relative to the SHARED account's network, not the user's, so they are omitted from the response entirely — do not claim or infer a connection degree from a shared-account result. Proactively tell the user their LinkedIn account appears disconnected (discovery still worked, but outreach — send-invite/send-message/etc. — will fail) rather than silently continuing as if everything is normal.
 
@@ -518,20 +519,24 @@ For target person identification (send-invite, send-message, get-profile, update
       properties: {
         action: {
           type: 'string',
-          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'send-inmail', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history', 'search-parameters'],
+          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'send-inmail', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history', 'search-parameters', 'set-daily-invite-cap'],
           description: 'The outreach action to perform.'
         },
         account_id: {
           type: 'string',
           description: 'The Unipile account ID for the LinkedIn connection. Optional for search-people and get-profile — the system will automatically use a platform-wide account if the user has no personal account connected. For write actions (send-invite, send-message), must be the user\'s own account. Obtain via list_connected_accounts(platform=\'unipile\') tool.'
         },
+        daily_invite_cap: {
+          type: 'number',
+          description: 'For set-daily-invite-cap only: the account\'s daily connection-request limit, self-reported by the user (30 if they have LinkedIn Premium, 10 if not — ask, never guess). Values above the system-wide maximum are clamped automatically.'
+        },
         profile_url: {
           type: 'string',
-          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). For send-invite, send-message, update-conversation-history. Provide this OR provider_id.'
+          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). For send-invite, send-message, update-conversation-history. Provide this OR provider_id. (Not used by accept-invitation — that action resolves the invitee\'s identity itself from the invitation record.)'
         },
         provider_id: {
           type: 'string',
-          description: 'The Unipile provider_id for the target LinkedIn user. For send-invite, send-message, get-profile, update-conversation-history. Provide this OR profile_url.'
+          description: 'The Unipile provider_id for the target LinkedIn user. For send-invite, send-message, get-profile, update-conversation-history. Provide this OR profile_url. (Not used by accept-invitation — that action resolves the invitee\'s identity itself from the invitation record.)'
         },
         message: {
           type: 'string',
@@ -548,19 +553,19 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         list_id: {
           type: 'string',
-          description: 'CRM lead list ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate. For send-invite: pass the list you are running outreach for so the invite is mirrored back into that CRM list (ENG-787 attribution).'
+          description: 'CRM lead list ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate. For send-invite: pass the list you are running outreach for so the invite is mirrored back into that CRM list. For accept-invitation: pass the list this contact belongs to so the newly-accepted connection is mirrored in as a lead — otherwise it stays LinkedIn-only and won\'t be findable by CRM search later.'
         },
         lead_id: {
           type: 'string',
-          description: 'CRM lead ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate. Optional for send-invite — pass it when you already know the CRM lead so the invite is attributed to it directly.'
+          description: 'CRM lead ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate. Optional for send-invite and accept-invitation — pass it when you already know the CRM lead so the invite/accept is attributed to it directly (still verified server-side against the invitee\'s actual LinkedIn URL before being trusted).'
         },
         first_name: {
           type: 'string',
-          description: 'The target person\'s first name. Pass with send-invite (alongside list_id) so a lead created for CRM attribution carries their name.'
+          description: 'The target person\'s first name. Pass with send-invite (alongside list_id) so a lead created for CRM attribution carries their name. Not used by accept-invitation — that action derives the name itself from the invitation record.'
         },
         last_name: {
           type: 'string',
-          description: 'The target person\'s last name. Pass with send-invite (alongside list_id) so a lead created for CRM attribution carries their name.'
+          description: 'The target person\'s last name. Pass with send-invite (alongside list_id) so a lead created for CRM attribution carries their name. Not used by accept-invitation — that action derives the name itself from the invitation record.'
         },
         keywords: {
           type: 'string',
@@ -572,15 +577,23 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         title: {
           type: 'string',
-          description: 'For search-people: job title FILTER (e.g. "CTO"). For send-invite: the invitee\'s ACTUAL job title, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite; omit it if you do not know the person\'s real title.'
+          description: 'For search-people: job title FILTER (e.g. "CTO"). For send-invite: the invitee\'s ACTUAL job title, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite; omit it if you do not know the person\'s real title. Not used by accept-invitation.'
         },
         company: {
           type: 'string',
-          description: 'For search-people: company name FILTER — free text, auto-resolved to a LinkedIn company id if no company_id is provided. For send-invite: the invitee\'s ACTUAL employer, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite; omit it if you do not know the person\'s real employer.'
+          description: 'For search-people: company name FILTER — free text, auto-resolved to a LinkedIn company id if no company_id is provided. For send-invite: the invitee\'s ACTUAL employer, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite; omit it if you do not know the person\'s real employer. Not used by accept-invitation.'
         },
         company_id: {
           type: 'string',
           description: 'LinkedIn company identifier/slug. Used for get-company. Optional pre-resolved LinkedIn company entity ID for search-people — when provided, skips the resolver.'
+        },
+        company_size_min: {
+          type: 'number',
+          description: 'For search-people: minimum employee headcount for each candidate\'s CURRENT employer. Unipile has no native headcount filter for people search, so this is applied as a post-filter — a candidate whose employer size can\'t be verified is excluded rather than let through unchecked, so result counts can shrink noticeably. Rough guide: startup ~1-200, mid-market ~201-1000, enterprise ~1000+. Only pass this when the user explicitly cares about company size — it adds extra lookups per search.'
+        },
+        company_size_max: {
+          type: 'number',
+          description: 'For search-people: maximum employee headcount for each candidate\'s CURRENT employer. Combine with company_size_min for a range (e.g. min omitted, max 200, for "startups"). See company_size_min for how unverifiable employers are handled.'
         },
         location: {
           type: 'string',
@@ -905,6 +918,10 @@ LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid deliv
     2. Show the user that resolved target verbatim (campaign name + ID, ad set name + ID, ad name, and any
        content/budget/status changes) and get EXPLICIT approval before proceeding.
     3. Only after the user approves, re-call with the SAME arguments plus params.confirm=true to execute.
+    4. When one user directive covers multiple gated writes with no data dependency between them (for example,
+       status changes across AD, AD_SET, and CAMPAIGN), emit ALL of those calls in ONE message so they confirm
+       as a single round. Split only on a real data dependency, such as creating a creative before an ad can
+       reference its creative_id.
   If the user's request could map to MORE THAN ONE campaign, ad set, or asset, do NOT guess — list the
   candidates and ask the user to disambiguate BEFORE calling. Never publish an ad into a campaign/ad set the
   user did not explicitly name, and never regenerate/edit an asset set without confirming which assets.
@@ -936,9 +953,26 @@ ACTION MATRIX (entity_type → supported actions):
   DATASET       → LIST, GET_MATCH_QUALITY
 
 AD_CREATIVE GET — read ONE creative back by id (params.creative_id), including asset_feed_spec.
-  LIST is account-wide, capped, and omits asset_feed_spec, so it cannot tell you what a specific
-  creative actually contains. Use GET to verify a creative you just built or swapped onto an ad, and
-  to read a placement-customized creative (1:1 Feed + 9:16 Story/Reels) faithfully before cloning it.
+  LIST omits asset_feed_spec, so it cannot tell you what a specific creative actually contains.
+  Use GET to verify a creative you just built or swapped onto an ad, and to read a
+  placement-customized creative (1:1 Feed + 9:16 Story/Reels) faithfully before cloning it.
+
+SCOPING AND COMPLETENESS ON EVERY LIST — read this before reporting that something is absent.
+  ALWAYS pass campaign_id (or ad_set_id) when you care about one campaign or ad set. AD LIST
+  accepts both and scopes the read to that node. AD_CREATIVE LIST accepts ad_set_id only —
+  Meta has no campaign→creatives edge, so for campaign-scoped creatives use AD LIST with
+  campaign_id, which returns creative{...} inline on every ad.
+
+  Every LIST result carries "complete" and "hasMore" fields. A list is only the whole set when
+  complete is true, and the message says "(complete list)". When hasMore is true the read
+  stopped at a page bound and the set is PARTIAL.
+
+  ⚠ NEVER conclude that an ad, creative, campaign or ad set does not exist from a list where
+  complete is not true. An unscoped account-wide list is the weakest possible evidence of
+  absence. To check whether one specific thing exists, scope the list to its parent
+  (campaign_id / ad_set_id) or read the object directly by id — do not search a broad list and
+  report a miss. Reporting "not found" off a partial list has already told a customer that an
+  ad they were protecting did not exist, when it existed and we had paused it ourselves.
 
 READING CONFIG (LIST) — read what a campaign/ad set is actually set to optimize for (use to verify after a CREATE/UPDATE):
   AD_SET LIST returns optimization_goal, billing_event, destination_type, promoted_object (pixel_id + custom_event_type), bid_strategy, and budgets per ad set. Pass ad_set_id to read a single ad set; pass campaign_id to scope to one campaign's ad sets.
@@ -1098,11 +1132,11 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         campaign_id: {
           type: "string",
-          description: "Campaign ID. Required for: CAMPAIGN UPDATE/DELETE, AD_SET CREATE, AD_SET LIST (optional filter)."
+          description: "Campaign ID. Required for: CAMPAIGN UPDATE/DELETE, AD_SET CREATE, AD_SET LIST (optional filter), AD LIST (optional filter — scopes the read to that campaign; strongly preferred over listing the whole account)."
         },
         ad_set_id: {
           type: "string",
-          description: "Ad Set ID. Required for: AD_SET UPDATE/DELETE, AD CREATE, AD LIST (optional filter)."
+          description: "Ad Set ID. Required for: AD_SET UPDATE/DELETE, AD CREATE, AD LIST (optional filter), AD_CREATIVE LIST (optional filter). Scopes the read to that ad set; takes precedence over campaign_id when both are given."
         },
         ad_id: {
           type: "string",
@@ -4288,7 +4322,15 @@ emmaToolRegistry.register({
   name: 'list_connected_accounts',
   definition: {
     name: 'list_connected_accounts',
-    description: 'Returns list of social media accounts connected by the user. PLATFORM MAPPING: use platform="linkedin" for standard LinkedIn posting accounts; use platform="unipile" for LinkedIn Outreach accounts (sending connection invites and direct messages via the linkedin_outreach tool).',
+    description: `Returns list of social media accounts connected by the user. PLATFORM MAPPING: use platform="linkedin" for standard LinkedIn posting accounts; use platform="unipile" for LinkedIn Outreach accounts (sending connection invites and direct messages via the linkedin_outreach tool).
+
+GOOGLE ADS SPEND RISK (ENG-1362). Each google_ads account reports two extra fields:
+  test_account: true  = Google guarantees this account CANNOT serve ads and CANNOT spend.
+  test_account: false = a real, billable account.
+  test_account: null  = never recorded and could not be checked right now. Treat as billable.
+  can_spend           = states it directly; false ONLY when test_account is true.
+NEVER infer any of this from account_name. A fully billable account can be named "Test", and accounts like that do exist. The name is not a safety property and never was.
+If asked to try something in "the test account", choose by test_account. If none of them is a real test account, say so and confirm before touching one that can spend.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -4857,7 +4899,7 @@ emmaToolRegistry.register({
   name: 'generate_image',
   definition: {
     name: 'generate_image',
-    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.\n\nMULTIPLE VARIANTS: When the user asks for several INDEPENDENT variants of the same brief (e.g. "generate 3 variants"), emit ALL the generate_image calls together in a SINGLE turn — one tool call per variant. They run in parallel (bounded), so N variants finish in roughly the time of one instead of N× and stay within the turn\'s time limit; generating them one-by-one across separate turns is slow and can time out. Only chain image calls sequentially when a later image genuinely DEPENDS on an earlier one (e.g. editing a just-generated image).\n\nLOGO COMPOSITING BEST PRACTICES (tested and confirmed):\n- When the user wants an image with their logo, ALWAYS use the logo_image parameter with the logo URL from their brand guidelines (read_brand_guidelines tool). Do NOT describe the logo in the prompt — pass the actual PNG URL.\n- For logo compositing, prefer gemini-3.1-flash-image or gemini-3-pro-image-preview. Both successfully composite PNG logos with high fidelity. gemini-3.1-flash-image renders the logo largest and most prominently. These models also produce 4096×4096 output.\n- gpt-image-2 also supports logo compositing via logo_image and works correctly, preserving the logo faithfully at 1024×1024 (may add unrequested design elements around it).\n- gpt-image-1 is NOT reliable for logo compositing — it rewrites the logo (e.g. replaces the actual text in the logo with the company name from the prompt). Avoid gpt-image-1 when logo fidelity matters.\n- NEVER tell the user that AI image generation cannot composite a real logo — gemini-3-pro-image-preview, gemini-3.1-flash-image, and gpt-image-2 all handle it correctly when logo_image is provided.\n- NEVER switch the output format from image to HTML without explicit user approval.\n- Brand guideline PNG logos from the attachments array composite cleanly — use them directly.\n\nTRANSPARENT BACKGROUNDS — DO NOT use generate_image to "redraw the logo on a transparent background". This model redraws the mark and can drift its icon/letters/colors, and it CANNOT guarantee a true alpha channel. To make an existing logo\'s background transparent, use the remove_image_background tool (it operates on the original pixels and outputs genuine alpha). If the user already has a transparent PNG of the logo, use that directly. Only fall back to generation if no source logo exists at all.',
+    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.\n\nMULTIPLE VARIANTS: When the user asks for several INDEPENDENT variants of the same brief (e.g. "generate 3 variants"), emit ALL the generate_image calls together in a SINGLE turn — one tool call per variant. They run in parallel (bounded), so N variants finish in roughly the time of one instead of N× and stay within the turn\'s time limit; generating them one-by-one across separate turns is slow and can time out. Only chain image calls sequentially when a later image genuinely DEPENDS on an earlier one (e.g. editing a just-generated image).\n\nLOGO COMPOSITING BEST PRACTICES (tested and confirmed):\n- When the user wants an image with their logo, ALWAYS use the logo_image parameter with the logo URL from their brand guidelines (read_brand_guidelines tool). Do NOT describe the logo in the prompt — pass the actual PNG URL.\n- For logo compositing, prefer gemini-3.1-flash-image or gemini-3-pro-image-preview. Both successfully composite PNG logos with high fidelity. gemini-3.1-flash-image renders the logo largest and most prominently. These models also produce 4096×4096 output.\n- gpt-image-2 also supports logo compositing via logo_image and works correctly, preserving the logo faithfully at 1024×1024 (may add unrequested design elements around it).\n- gpt-image-1 is NOT reliable for logo compositing — it rewrites the logo (e.g. replaces the actual text in the logo with the company name from the prompt). Avoid gpt-image-1 when logo fidelity matters.\n- NEVER tell the user that AI image generation cannot composite a real logo — gemini-3-pro-image-preview, gemini-3.1-flash-image, and gpt-image-2 all handle it correctly when logo_image is provided.\n- NEVER switch the output format from image to HTML without explicit user approval.\n- Brand guideline PNG logos from the attachments array composite cleanly — use them directly.\n\nTRANSPARENT BACKGROUNDS — DO NOT use generate_image to "redraw the logo on a transparent background". This model redraws the mark and can drift its icon/letters/colors, and it CANNOT guarantee a true alpha channel. To make an existing logo\'s background transparent, use the remove_image_background tool (it operates on the original pixels and outputs genuine alpha). If the user already has a transparent PNG of the logo, use that directly. Only fall back to generation if no source logo exists at all.\n\nTEXT & DATA RELIABILITY (known model limitation — brief around it, do NOT retry expecting a better roll):\n- Image models cannot reliably render small exact text — specific IDs/codes, short spelled-out strings, or any string that must match character-for-character (e.g. "campaign 120214893"). At small sizes the model commonly repeats a garbled or truncated approximation of the string in every occurrence instead of the real value. Do NOT ask for an exact short identifier to appear (especially more than once) and do NOT retry the same prompt hoping the string comes out right next time — it won\'t reliably. Instead brief around it: use a generic/illustrative label ("Campaign A"), keep any exact identifier out of the image and reference it in the surrounding chat text instead, or enlarge it to be the sole hero text of the image rather than one of several small repeated labels.\n- When a prompt asks for a data-shaped layout (a table, chart, or list of metrics), the model tends to invent plausible-looking numbers/data for cells it doesn\'t actually have values for, rather than leaving them blank. NEVER ask generate_image to fill in real metrics or figures you don\'t already have from a tool result — either pass the exact real values in the prompt, or explicitly instruct the prompt to leave those cells blank or empty. Never present the resulting image\'s invented numbers to the user as real data.\n- This also applies when the USER never asked for real data at all. A prompt that merely describes dashboard-like UI elements (a "metrics preview" panel, KPI cards, a progress/stat block, a completion/progress-bar PERCENTAGE) without specifying values will still get invented numbers filled in — the model treats an unstated metric as one it should make up, not one to leave blank. Whenever your own generate_image prompt includes any such element, explicitly state placeholder values ("--", empty, or a generic status word) for it, exactly as you would for an explicit data-table request. Do not assume omitting a value is enough to keep it blank — and do NOT write a specific-looking number into the prompt yourself as a design flourish (e.g. "progress bar at 75%") unless it came from a real tool result. A plausible percentage you invented while writing the prompt is exactly the fabricated data this rule exists to prevent, even though nothing about generating it looks broken.\n- A data-shaped prompt is automatically re-checked against the actual generated image unless you set metrics_verified=true — only do that when every value in the prompt is genuinely sourced from a real tool result this turn, since it skips the check.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4904,6 +4946,10 @@ emmaToolRegistry.register({
           type: 'string',
           enum: ['ad', 'organic_post'],
           description: "REQUIRED use-case declaration for the human eval queue: 'ad' when the image is a paid ad creative (Meta/Google/LinkedIn ads, retargeting creatives), 'organic_post' when it is organic social/content imagery (feed posts, blog headers, non-paid content). Reviewer feedback differs entirely between the two, so declare it from the request's context — never guess randomly; if the user's intent is genuinely unclear, ask them which use case the image is for before generating."
+        },
+        metrics_verified: {
+          type: 'boolean',
+          description: "Set true ONLY when your prompt describes a dashboard/table/metrics-shaped layout AND every number/percentage/dollar figure in it came directly from a real tool result earlier in this conversation (e.g. get_meta_ads_metrics, call_meta_marketing_api). Leave false or omit for any illustrative, placeholder, or self-written figure — including a plausible-looking value you wrote yourself with no real source (e.g. a progress-bar percentage). Omitting this on a data-shaped prompt triggers an automatic post-generation reliability check; setting it true when the values are genuinely real skips that check instead of risking a false 'unverified' caution on accurate data."
         }
       },
       required: ['prompt', 'filename', 'category']
@@ -4927,7 +4973,8 @@ emmaToolRegistry.register({
       args.imageModel,
       args.logo_image,
       args.confirm,
-      args.category
+      args.category,
+      args.metrics_verified
     );
   }
 });
@@ -5364,7 +5411,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains);
+    return await agentModeService.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains, context?.userId);
   }
 });
 
@@ -5395,7 +5442,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchNews(args.query, args.max_results || 10, args.freshness);
+    return await agentModeService.youSearchNews(args.query, args.max_results || 10, args.freshness, context?.userId);
   }
 });
 
@@ -5421,7 +5468,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.googleSearchWeb(args.query, args.max_results || 10);
+    return await agentModeService.googleSearchWeb(args.query, args.max_results || 10, context?.userId);
   }
 });
 
@@ -5533,7 +5580,7 @@ emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
-    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp doc entries start with "clickup:" and include a docId field — use docId as parent_doc_id in write_clickup_doc to nest content inside that doc. ClickUp folder entries start with "clickup-folder:" (these are task-hierarchy folders, for reference only — not writable doc parents). Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date. NOTE: the Google Drive entries here are READ-ONLY shared folders — CREATING or EDITING Google Docs/Sheets is a SEPARATE capability; discover and install the skill that provides Google Docs/Sheets create/edit tools via list_available_skills.',
+    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp doc entries start with "clickup:" and include a docId field — use docId as parent_doc_id in write_clickup_doc to nest content inside that doc. ClickUp folder entries start with "clickup-folder:" (these are task-hierarchy folders, for reference only — not writable doc parents). Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date. NOTE: the Google Drive entries here are READ-ONLY shared folders — CREATING or EDITING Google Docs/Sheets is a SEPARATE capability; discover and install the skill that provides Google Docs/Sheets create/edit tools via list_available_skills. For an IMAGE or VIDEO file found here that you need to actually USE (e.g. as ad creative), do NOT use read_knowledge_base_files — use materialize_knowledge_base_asset instead.',
     inputSchema: {
       type: "object",
       properties: {
@@ -5577,7 +5624,7 @@ emmaToolRegistry.register({
   name: "read_knowledge_base_files",
   definition: {
     name: "read_knowledge_base_files",
-    description: 'Read one or more knowledge base files. Each entry requires a knowledge base identifier (kb_identifier) and a file name (file_name). For Google Drive shared folders, use the identifier from list_knowledge_base_files (e.g., "gdrive:FOLDER_ID") and the file name. For ClickUp docs, use the identifier (e.g., "clickup:WORKSPACE_ID") and the doc name. Public knowledge base files can be accessed by any user, while private files require ownership. Returns the content for each requested file.',
+    description: 'Read one or more knowledge base files. Each entry requires a knowledge base identifier (kb_identifier) and a file name (file_name). For Google Drive shared folders, use the identifier from list_knowledge_base_files (e.g., "gdrive:FOLDER_ID") and the file name. For ClickUp docs, use the identifier (e.g., "clickup:WORKSPACE_ID") and the doc name. Public knowledge base files can be accessed by any user, while private files require ownership. Returns the content for each requested file. WARNING: for an image or video file this returns raw bytes as a base64 string, capped and silently truncated at 1,000,000 characters — truncated base64 does not decode, so any real image/video will come back corrupted. Never use this tool for image/video files you intend to actually use (e.g. as ad creative) — use materialize_knowledge_base_asset instead, which returns a real hosted URL. Only use this tool for images/video if you genuinely just need to inspect/describe them and corruption from truncation is acceptable.',
     inputSchema: {
       type: "object",
       properties: {
@@ -5605,6 +5652,31 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.readKnowledgeBaseFiles(args.files, context?.userId);
+  }
+});
+
+emmaToolRegistry.register({
+  name: "materialize_knowledge_base_asset",
+  definition: {
+    name: "materialize_knowledge_base_asset",
+    description: 'Turn an IMAGE or VIDEO file from a connected Google Drive knowledge base folder into a real, hosted asset with a usable URL — e.g. to pass as image_url to AD_CREATIVE CREATE, or to a video upload tool. read_knowledge_base_files is for TEXT/DOCUMENT content only (Docs, Sheets, PDFs, etc.) — for images/videos it returns raw bytes as base64 text capped at 1,000,000 characters, which silently truncates and corrupts anything but a tiny file, and nothing downstream can consume that base64 anyway. Use THIS tool whenever you need to actually USE a Drive-sourced image or video, not just inspect it. Get kb_identifier and file_name from list_knowledge_base_files. Currently only supports Google Drive sources (kb_identifier starting with "gdrive:").',
+    inputSchema: {
+      type: "object",
+      properties: {
+        kb_identifier: {
+          type: 'string',
+          description: 'Google Drive knowledge base identifier, e.g. "gdrive:FOLDER_ID" — from list_knowledge_base_files'
+        },
+        file_name: {
+          type: 'string',
+          description: 'Exact file name of the image/video inside that folder, from list_knowledge_base_files'
+        }
+      },
+      required: ["kb_identifier", "file_name"]
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.materializeKnowledgeBaseAsset(args.kb_identifier, args.file_name, context?.userId);
   }
 });
 
@@ -5956,7 +6028,14 @@ emmaToolRegistry.register({
         format_requirements: { type: "string", description: "Optional additional formatting instructions (e.g. 'use dark theme', 'include charts', 'brand color #1a73e8', 'add a CTA button to book a demo')." },
         document_type: { type: "string", enum: ["document", "email"], description: "Optional. Use 'email' for a one-off newsletter/marketing email so the HTML is email-client-safe (table-based layout, inline CSS, 600px container, no JS). Use 'document' (default) for reports, summaries, audits, and other web-style documents." }
       },
-      required: ["title", "content_draft"]
+      required: ["title", "content_draft"],
+      // ENG-1477: reject any argument outside the four named above. The
+      // handler below only ever reads args.title/content_draft/
+      // format_requirements/document_type by name, so an extra key is
+      // already inert — this makes that safety a schema-enforced guarantee
+      // (agentToolGatewayService.ts's validator) rather than an incidental
+      // property of how execute() happens to be written.
+      additionalProperties: false
     }
   },
   execute: async (args: any, context?: any) => {
@@ -6033,7 +6112,12 @@ emmaToolRegistry.register({
           description: 'REQUIRED: The complete content of the file to save as a string. You must provide the full file content - this tool cannot retrieve content from previous operations.'
         }
       },
-      required: ["file_name", "file_content"]
+      required: ["file_name", "file_content"],
+      // ENG-1477: same reasoning as create_html_file above — the handler
+      // only reads file_name/file_content by name, so reject anything else
+      // at the schema level instead of relying on it being harmlessly
+      // ignored.
+      additionalProperties: false
     }
   },
   execute: async (args: any, context?: any) => {
@@ -6521,7 +6605,7 @@ emmaToolRegistry.register({
         content: {
           type: 'string',
           maxLength: 2000,
-          description: 'The fact to remember (max 2000 chars). Be specific and actionable.'
+          description: 'The fact to remember. Be specific and actionable. HARD LIMIT 2000 characters — content over it is REJECTED, not truncated. If you have more to record, split it into several save_memory calls of at most 2000 characters each rather than re-sending the same oversized text, which fails identically every time (ENG-908).'
         },
         category: {
           type: 'string',
@@ -6599,7 +6683,7 @@ emmaToolRegistry.register({
         content: {
           type: 'string',
           maxLength: 2000,
-          description: 'The org-wide fact to remember (max 2000 chars). Be specific and actionable.'
+          description: 'The org-wide fact to remember. Be specific and actionable. HARD LIMIT 2000 characters — content over it is REJECTED, not truncated. If you have more to record, split it into several save_org_memory calls of at most 2000 characters each rather than re-sending the same oversized text, which fails identically every time (ENG-831).'
         },
         category: {
           type: 'string',
@@ -7199,13 +7283,48 @@ const adminToolNames = [
   'get_landing_page_effective_view',
 ];
 
+// ENG-1596 added an admin-only `client_id` param to these tools' mcpToolRegistry
+// definitions (external MCP admin surface), so an admin's own MCP session can
+// scope the call to a specific client. That param must NOT leak into the
+// in-app bridge below: every logged-in customer (not just admins) gets these
+// as self-serve tools, and `resolveClientScopedContext` treats client_id as
+// admin-only regardless — so a non-admin customer could never use it, it would
+// just be confusing schema noise (exactly the "asked me for my email instead
+// of reporting my own account" bug this bridge already guards against, see
+// mcpGetAccountStatusExposure.test.ts). Same `execute`, self-only schema.
+const SELF_ONLY_BRIDGE_DEFINITIONS: Record<string, { description: string; inputSchema: any }> = {
+  get_account_status: {
+    description: "Get the current user's account status, subscription plan, and usage.",
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  list_scheduled_chats: {
+    description: 'List all scheduled chats for the authenticated user.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+};
+
 for (const toolName of bridgedToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);
   if (handler) {
+    const selfOnly = SELF_ONLY_BRIDGE_DEFINITIONS[toolName];
+    /**
+     * Bridged execute for this tool. For a self-only entry, strips
+     * `client_id` unconditionally before delegating — CodeRabbit (PR #2651):
+     * the schema swap above keeps `client_id` out of what the model is TOLD
+     * about, but the underlying execute is the same function the admin
+     * external-MCP surface uses, and would still honor one that slipped
+     * through anyway (a hallucinated arg, or an admin's own in-app chat).
+     * The in-app bridge stays self-scoped, full stop, for every caller.
+     */
+    const execute = selfOnly
+      ? (args: any, context: any) => handler.execute({ ...args, client_id: undefined }, context)
+      : handler.execute;
     emmaToolRegistry.register({
       name: handler.name,
-      definition: handler.definition,
-      execute: handler.execute,
+      definition: selfOnly
+        ? { ...handler.definition, description: selfOnly.description, inputSchema: selfOnly.inputSchema }
+        : handler.definition,
+      execute,
     });
   } else {
     console.warn(`[emma/tools] Failed to bridge tool "${toolName}" — not found in mcpToolRegistry`);
@@ -8603,6 +8722,8 @@ Use this when the user wants to:
 
 Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend (via the search-parameter resolver), giving precise structured filtering. Pass keywords ONLY for free-text broad search — when you have structured filters, the backend handles Unipile's keyword requirement transparently.
 
+company_size_min/company_size_max filter by each lead's resolved current-employer headcount (e.g. "startup PMs" ≈ max 200). There is no native LinkedIn/Unipile headcount filter for people search, so this is a post-filter applied after every other company-resolution step (work_experience, title-parsing, LLM fallback, profile fallback) — a lead whose employer size can't be verified is excluded, not guessed at, so imported counts can shrink noticeably. Only pass this when the user explicitly asked for a size constraint; it costs extra lookups per page.
+
 For more than ~30 results from a single query, use the cursor returned in the response to paginate through subsequent pages.
 
 When you make multiple sequential import calls, trust the "list_total_after_import" field on each response for the actual list size — do NOT sum the per-call "imported" values across calls, because the same lead can match multiple queries and is correctly deduplicated by the backend. Summing produces an inflated count.
@@ -8614,6 +8735,8 @@ Response keys:
 - list_total_after_import — actual post-import list size (trust this for cumulative counts)
 - cursor — pagination cursor for the next page of the same query (null when no more results)
 - anonymizedSkipped — count of out-of-network placeholder results ("LinkedIn Member", "LinkedIn User" and their localized equivalents) that were discarded before writing (they carry no usable name, email or profile URL, so they are not importable). A high value means the search reached beyond the connected account's network.
+- companySizeFiltered — count of leads dropped by company_size_min/max (out of range, or an unverifiable employer). Always present; 0 when the filter wasn't used or excluded nothing.
+- earlyExitOnSizeFilter — present (true) only when company_size_min/max was given AND 3 consecutive pages were excluded entirely by it. The search stopped BEFORE exhausting to avoid burning through many pages on a range that's proving unproductive for this market — call again with the returned cursor to keep looking, or widen the range.
 - importedLeads — summaries (firstName, lastName, linkedin, title, company) of up to the first 5 leads ACTUALLY WRITTEN by this call. It never includes results that were deduplicated into an existing lead, trimmed to honour the requested limit, or discarded as anonymized — report only from this array, and never describe a search result as imported unless it appears here.
 - autoEnrichJobId — present only when auto_enrich=true AND at least 1 new lead was imported AND the background job was successfully queued`,
     inputSchema: {
@@ -8638,6 +8761,14 @@ Response keys:
         company_id: {
           type: 'string',
           description: 'Optional pre-resolved LinkedIn company entity ID — when provided, skips the resolver.'
+        },
+        company_size_min: {
+          type: 'number',
+          description: 'Minimum employee headcount for each lead\'s resolved current employer. See the tool description for how this post-filter works and what it costs.'
+        },
+        company_size_max: {
+          type: 'number',
+          description: 'Maximum employee headcount for each lead\'s resolved current employer. Combine with company_size_min for a range (e.g. max 200 for "startups").'
         },
         location: {
           type: 'string',
@@ -8693,6 +8824,8 @@ Response keys:
       title: args.title,
       company: args.company,
       company_id: args.company_id,
+      company_size_min: args.company_size_min,
+      company_size_max: args.company_size_max,
       location: args.location,
       location_id: args.location_id,
       industry: args.industry,
@@ -8722,14 +8855,14 @@ ACTION MATRIX:
     order_id should be the SAME eventId the browser sent as transaction_id — Google dedupes the pair, which is what stops one lead counting twice across the two channels.
     A conversion_value REQUIRES a currency_code; without one Google assumes the account currency and misstates revenue.
     validate_only=true asks Google to check the payload and write nothing. Use it to rehearse a batch before committing it.
-  CONVERSION_ACTION → LIST, CREATE (name, category, counting_type; status?, primary_for_goal?, click_through_lookback_window_days?), UPDATE (conversion_action_resource_name; any of name/status/category/counting_type/primary_for_goal/click_through_lookback_window_days), REMOVE (conversion_action_resource_name, confirm_conversion_action_removal)
+  CONVERSION_ACTION → LIST, CREATE (name, category, counting_type; status?, primary_for_goal?, click_through_lookback_window_days?), UPDATE (conversion_action_resource_name; any of name/status/category/counting_type/primary_for_goal/click_through_lookback_window_days), REMOVE (conversion_action_resource_name, confirm_conversion_action_removal, conversion_action_removal_token)
     A CONVERSION_ACTION has NO PAUSED status — that is a campaign status and is rejected. It is always created ENABLED (omit status and it defaults there); Google deny-lists every other value on create.
     HIDDEN cannot be set through the API at all — Google assigns it, and sending it is rejected on both create and update. Do not suggest it.
-    To stop an action recording, use CONVERSION_ACTION REMOVE with confirm_conversion_action_removal=true. That is permanent and cannot be re-enabled, so confirm with the user first — but conversions already recorded stay in reporting, so it is not data loss.
+    To stop an action recording, use CONVERSION_ACTION REMOVE with confirm_conversion_action_removal=true. That is permanent and cannot be re-enabled, so it HALTS for a real user approval: the first call returns a disclosure plus conversion_action_removal_token, and only a replay carrying that token removes anything. You cannot approve this yourself by setting the flag. Conversions already recorded stay in reporting, so it is not data loss.
               counting_type is REQUIRED and never inferred: ONE_PER_CLICK counts one conversion per ad click (lead forms, sign-ups); MANY_PER_CLICK counts every conversion (purchases). Choosing wrong inflates reported conversions and silently misdirects smart bidding — nothing errors, so ASK the user rather than guessing.
               CREATE returns tag = {conversionId, conversionLabel, sendTo}, read back from the action's own tag snippets. That AW-<id>/<label> pair is what goes on the page — a resource name cannot be installed. If Google has not generated snippets yet, tag is null and tagUnavailable explains it; re-run LIST shortly to get it.
               CREATE and UPDATE both read the action back and return drift (fields Google stored differently from what was requested) plus driftWarning. Relay drift to the user — do not assume the write took.
-              REMOVE (conversion_action_resource_name; requires confirm_conversion_action_removal=true) stops the action recording permanently. Ask the user before setting the flag.
+              REMOVE (conversion_action_resource_name; requires confirm_conversion_action_removal=true AND a matching conversion_action_removal_token from the disclosure halt) stops the action recording permanently. The flag alone does nothing — a token minted for a DIFFERENT conversion action is refused too, so never reuse one.
   CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
               Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
@@ -8774,7 +8907,7 @@ ACTION MATRIX:
         action: { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         name: { type: 'string' },
         type: { type: 'string', description: 'Campaign type (SEARCH|DISPLAY|PERFORMANCE_MAX), ad group type (SEARCH_STANDARD|DISPLAY_STANDARD), or ad type for AD CREATE (RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD).' },
-        budget_resource_name: { type: 'string', description: 'From BUDGET CREATE. Required for CAMPAIGN CREATE.' },
+        budget_resource_name: { type: 'string', description: 'From BUDGET LIST or BUDGET CREATE. Required for CAMPAIGN CREATE, BUDGET UPDATE (with amount_micros), and BUDGET REMOVE.' },
         amount_micros: { type: 'number', description: 'Budget in micros. $10/day = 10000000.' },
         explicitly_shared: { type: 'boolean', description: 'Whether the budget is explicitly shared across campaigns. Optional for BUDGET CREATE.' },
         bidding_strategy: { type: 'string', enum: ['MAXIMIZE_CONVERSIONS', 'TARGET_CPA', 'TARGET_ROAS', 'MAXIMIZE_CONVERSION_VALUE', 'TARGET_IMPRESSION_SHARE', 'TARGET_SPEND', 'MANUAL_CPC'], description: 'A standard (embedded) bidding strategy. TARGET_SPEND = Maximize Clicks (optionally capped by cpc_bid_ceiling_micros). Mutually exclusive with bidding_strategy_resource_name.' },
@@ -8786,7 +8919,8 @@ ACTION MATRIX:
         counting_type: { type: 'string', enum: ['ONE_PER_CLICK', 'MANY_PER_CLICK'], description: 'CONVERSION_ACTION CREATE (required) / UPDATE. ONE_PER_CLICK counts one conversion per ad click (lead forms, sign-ups); MANY_PER_CLICK counts every conversion (purchases). NEVER guess — choosing wrong inflates reported conversions and silently misdirects smart bidding. Ask the user.' },
         primary_for_goal: { type: 'boolean', description: 'CONVERSION_ACTION CREATE/UPDATE: whether this action is a primary goal (counts toward the Conversions column and drives smart bidding).' },
         click_through_lookback_window_days: { type: 'number', description: 'CONVERSION_ACTION CREATE/UPDATE: how many days after an ad click a conversion still attributes to it.' },
-        confirm_conversion_action_removal: { type: 'boolean', description: 'Required true for CONVERSION_ACTION REMOVE. Removal is permanent — the action stops recording and cannot be re-enabled — so confirm with the user first. Conversions already recorded stay in reporting.' },
+        confirm_conversion_action_removal: { type: 'boolean', description: 'Required true for CONVERSION_ACTION REMOVE. NOT sufficient on its own: setting it returns a disclosure and a conversion_action_removal_token, and the removal only happens when you replay the same call carrying that token. Removal is permanent and cannot be re-enabled. Conversions already recorded stay in reporting.' },
+        conversion_action_removal_token: { type: 'string', description: 'CONVERSION_ACTION REMOVE only: replay the token returned by the disclosure halt, verbatim, after the USER has approved. Bound to that exact conversion action — a token for a different one is refused. Never mint, guess or reuse it.' },
         gclid: { type: 'string', description: 'OFFLINE_CONVERSION UPLOAD: the click id captured at first touch and stored on the lead. Without it there is no click to attribute the conversion to.' },
         conversion_at: { type: 'string', description: 'OFFLINE_CONVERSION UPLOAD: ISO 8601 timestamp of when the conversion HAPPENED, not when it was noticed. Future dates are rejected.' },
         conversion_value: { type: 'number', description: 'OFFLINE_CONVERSION UPLOAD: the conversion value. Requires currency_code.' },
@@ -8795,7 +8929,7 @@ ACTION MATRIX:
         time_zone: { type: 'string', description: 'OFFLINE_CONVERSION UPLOAD: override the account time zone (IANA). Normally omit — it is read from the account.' },
         validate_only: { type: 'boolean', description: 'OFFLINE_CONVERSION UPLOAD: ask Google to validate the payload and write NOTHING. Use to rehearse before committing.' },
         conversion_action_resource_name: { type: 'string', description: 'Required for CONVERSION_ACTION UPDATE. From CONVERSION_ACTION LIST or CREATE.' },
-        campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE/ADD_PROXIMITY and AD_GROUP LIST.' },
+        campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE/ADD_PROXIMITY, AD_GROUP LIST, and (as an alternative to ad_group_resource_name) KEYWORD ADD_NEGATIVE.' },
         radius: { type: 'number', description: 'Proximity radius for CAMPAIGN ADD_PROXIMITY, in radius_units (default MILES).' },
         radius_units: { type: 'string', enum: ['MILES', 'KILOMETERS'], description: 'Unit for radius on CAMPAIGN ADD_PROXIMITY. Defaults to MILES.' },
         address: {
@@ -8811,12 +8945,12 @@ ACTION MATRIX:
           },
         },
         final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },
-        ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD/ADD_NEGATIVE/REMOVE, AD LIST/CREATE, AD_GROUP UPDATE.' },
+        ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD, AD LIST/CREATE, AD_GROUP UPDATE. For KEYWORD ADD_NEGATIVE, required only as an alternative to campaign_resource_name (either one works). Not used by KEYWORD REMOVE, which identifies the keyword via criterion_resource_name alone.' },
         ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE/RETAG_UTM. Obtain from AD LIST.' },
         asset_group_resource_name: { type: 'string', description: 'Asset group resource name. Required for ASSET_GROUP RETAG_UTM. Obtain from audit_ad_utm_coverage or a GAQL read on asset_group.' },
         brand_business_name: { type: 'string', description: 'Business name for PMax brand guidelines. Required for PERFORMANCE_MAX CAMPAIGN CREATE when brand guidelines are enforced.' },
         brand_logo_asset_resource_name: { type: 'string', description: 'Logo image asset resource name for PMax brand guidelines. Upload via ASSET UPLOAD first.' },
-        criterion_resource_name: { type: 'string', description: 'Criterion resource name. Required for KEYWORD REMOVE (ad group criterion, from KEYWORD LIST) and CAMPAIGN REMOVE_PROXIMITY (campaign criterion, from a raw GAQL query on campaign_criterion).' },
+        criterion_resource_name: { type: 'string', description: 'Criterion resource name. Required for KEYWORD UPDATE and KEYWORD REMOVE (ad group criterion, from KEYWORD LIST) and CAMPAIGN REMOVE_PROXIMITY (campaign criterion, from a raw GAQL query on campaign_criterion).' },
         placement_urls: { type: 'array', items: { type: 'string' }, description: 'Placement domains or HTTP(S) URLs to add as negative campaign criteria. For CAMPAIGN_CRITERION ADD.' },
         mobile_app_category_resource_names: { type: 'array', items: { type: 'string' }, description: 'Canonical mobileAppCategoryConstants/<id> resource names to add as negative campaign criteria. For CAMPAIGN_CRITERION ADD.' },
         assets: { type: 'array', items: { type: 'object', properties: { fieldType: { type: 'string', enum: ['BUSINESS_NAME', 'LOGO', 'SQUARE_MARKETING_IMAGE', 'MARKETING_IMAGE', 'HEADLINE', 'DESCRIPTION'] }, assetResourceName: { type: 'string' }, text: { type: 'string' } }, required: ['fieldType'] }, description: 'Assets to attach for CAMPAIGN_ASSET ATTACH. Use text for BUSINESS_NAME, assetResourceName for image/logo types.' },
@@ -9039,6 +9173,53 @@ TYPICAL WORKFLOW:
     const userId = context?.userId;
     if (!userId) return { success: false, error: 'Authentication required: no user context.' };
     return agentModeService.handleHubspotApi(userId, args);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'call_attio_api',
+  definition: {
+    name: 'call_attio_api',
+    description: `Read Attio lead counts and manage Attio lists, for CPL/attribution
+reporting and list-membership workflows.
+
+Attio has no equivalent of HubSpot's marketing-asset concepts (campaigns,
+emails, landing pages, workflows, social broadcasts) — this tool covers only
+lists and list entries, mirroring call_hubspot_api's CONTACT_LIST actions.
+
+ENTITY_TYPE + ACTION MATRIX:
+
+  LIST_ENTRIES → COUNT (list_id) | ADD_ENTRIES (list_id, record_ids) | REMOVE_ENTRIES (list_id, record_ids)
+               Entry-level actions scoped to one already-identified list.
+               COUNT returns the number of entries (e.g. for CPL = spend / count).
+               ADD_ENTRIES adds Attio Person record ids to the list.
+               REMOVE_ENTRIES removes Person record ids from the list (looks up
+               each person's entry in the list and deletes it).
+
+  LISTS → LIST | GET (list_id) | CREATE (name, object_type?)
+               Whole-list actions. LIST enumerates every list in the workspace.
+               CREATE makes a new list (object_type: 'people' or 'companies',
+               defaults to 'people'). There is no DELETE action — Attio's API
+               has no delete-list endpoint; a list can only be removed through
+               Attio's own UI.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        entity_type: { type: 'string', enum: ['LIST_ENTRIES', 'LISTS'], description: 'Attio resource to operate on.' },
+        action:      { type: 'string', enum: ['COUNT', 'ADD_ENTRIES', 'REMOVE_ENTRIES', 'LIST', 'GET', 'CREATE'], description: 'Action to perform. See ACTION MATRIX.' },
+        list_id:     { type: 'string', description: 'Required for LIST_ENTRIES COUNT/ADD_ENTRIES/REMOVE_ENTRIES and LISTS GET. For LIST_ENTRIES actions, pass the AgentWeb lead list\'s id (e.g. from get_lead_lists/get_lead_details) — it is automatically resolved to that list\'s connected Attio deal-list id; a raw Attio list id also works. For LISTS actions, always a raw Attio list id (e.g. from LISTS LIST) — never an AgentWeb list id.' },
+        record_ids:  { type: 'array', items: { type: 'string' }, maxItems: 100, description: 'Attio record ids (Person or Company, matching the target list). Required for LIST_ENTRIES ADD_ENTRIES/REMOVE_ENTRIES. Max 100 per call.' },
+        name:        { type: 'string', description: 'List display name. Required for LISTS CREATE.' },
+        object_type: { type: 'string', enum: ['people', 'companies'], description: 'What kind of records the new list holds. LISTS CREATE only. Defaults to "people".' },
+        account_id:  { type: 'string', description: 'Attio account ID. Required when the user has multiple Attio accounts connected — the error message will list them; ask the user which to use.' },
+      },
+      required: ['entity_type', 'action'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId;
+    if (!userId) return { success: false, error: 'Authentication required: no user context.' };
+    return agentModeService.handleAttioApi(userId, args);
   },
 });
 

@@ -86,16 +86,53 @@ export function toolResultError(result: unknown): Error | null {
     );
   };
 
+  // ENG-1300: a handler that catches its own thrown error and re-surfaces it as a
+  // structured { success: false, ... } result (e.g. twitterOutreach's catch-all)
+  // only carries the error MESSAGE by the time it gets here — the numeric HTTP
+  // status the original error threw with (`.code`, e.g. twitter-api-v2's 403) is
+  // gone unless the handler also copies it onto the result object. When it does,
+  // attach it to the reconstructed Error so classifyToolErrorClass's status-based
+  // branch still fires instead of falling back to the generic 'Error' class the
+  // message text alone cannot match.
+  //
+  // Two field names are read because two conventions already exist in the
+  // codebase: `code` (twitterOutreach/twitterManagePost, mirroring twitter-api-v2's
+  // own ApiResponseError.code) and `status` (handleHubspotApi/handleAttioApi,
+  // mirroring axios's error.response.status). Both are guarded to the HTTP range
+  // (100-599) — same guard classifyToolErrorClass already applies to `.code` —
+  // because this field is caller-supplied and not itself proof the number is an
+  // HTTP status: a handler that naively forwards a vendor BUSINESS error code
+  // (e.g. Meta Graph's `error.code`, which is not an HTTP status and can still
+  // land in 100-599 by coincidence) would misclassify through this same path.
+  // The guard cannot fully prevent that — it only rejects obvious garbage — so
+  // each call site is still responsible for extracting the correct field.
+  const isHttpRange = (n: unknown): n is number => typeof n === 'number' && n >= 100 && n <= 599;
+  const withCode = (err: Error): Error => {
+    // statusCode checked first: a field named exactly that (the AWS SDK v2
+    // convention — S3 upload failures thread it through as `code` today, but
+    // a future caller could pass it through verbatim under its own name) is
+    // an unambiguous signal that the number is a transport status, unlike
+    // `code`, which is overloaded with vendor business codes elsewhere in
+    // this codebase (Meta, Google Ads) — preferring it when present is
+    // defense-in-depth against exactly that collision.
+    const code = isHttpRange(obj.statusCode) ? obj.statusCode
+      : isHttpRange(obj.code) ? obj.code
+      : isHttpRange(obj.status) ? obj.status
+      : undefined;
+    if (code !== undefined) (err as { code?: number }).code = code;
+    return err;
+  };
+
   if (obj.isError === true) {
     const blocked = policyBlock();
     if (blocked) return blocked;
-    return new Error(extractToolResultMessage(obj) || 'Tool returned isError=true');
+    return withCode(new Error(extractToolResultMessage(obj) || 'Tool returned isError=true'));
   }
 
   if (obj.success === false) {
     const blocked = policyBlock();
     if (blocked) return blocked;
-    return new Error(extractToolResultMessage(obj) || 'Tool returned success=false');
+    return withCode(new Error(extractToolResultMessage(obj) || 'Tool returned success=false'));
   }
 
   return null;

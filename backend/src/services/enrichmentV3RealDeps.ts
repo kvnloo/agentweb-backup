@@ -390,6 +390,7 @@ async function fetchWebForGroupReal(
   lead: LeadRecord,
   groupName: string,
   listId?: string,
+  userId?: string,
 ): Promise<{ webContext: string } | null> {
   const groupCfg = FIELD_GROUPS[groupName];
   if (!groupCfg) return null;
@@ -424,7 +425,7 @@ async function fetchWebForGroupReal(
   // 3. Google CSE — for company_technographic also run a job-postings query
   let webResults: any[] = [];
   try {
-    const search = await agentModeService.youSearchWeb(query, 10);
+    const search = await agentModeService.youSearchWeb(query, 10, undefined, undefined, userId, 'crm_enrichment');
     if (search?.success && Array.isArray(search.results)) {
       webResults = search.results;
     }
@@ -439,7 +440,7 @@ async function fetchWebForGroupReal(
       lead,
     );
     try {
-      const jobsSearch = await agentModeService.youSearchWeb(jobsQuery, 5);
+      const jobsSearch = await agentModeService.youSearchWeb(jobsQuery, 5, undefined, undefined, userId, 'crm_enrichment');
       if (jobsSearch?.success && Array.isArray(jobsSearch.results)) {
         const existingUrls = new Set(webResults.map((r: any) => r.url || r.link).filter(Boolean));
         for (const r of jobsSearch.results) {
@@ -1262,7 +1263,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       },
 
       extractFieldsViaLLM: (input) => extractFieldsViaLLMReal(input, userId),
-      fetchWebForGroup: fetchWebForGroupReal,
+      fetchWebForGroup: (lead, groupName, listId) => fetchWebForGroupReal(lead, groupName, listId, userId),
 
       // Tier 3.5b: person enrichment via Unipile.
       // Case A: lead.linkedin present → getProfile → extract name/title directly.
@@ -1531,7 +1532,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       const query = `${domain} ${queryParts.join(' ')}`;
       let webContext = '';
       try {
-        const search = await agentModeService.youSearchWeb(query, 5);
+        const search = await agentModeService.youSearchWeb(query, 5, undefined, undefined, userId, 'crm_enrichment');
         if (search?.success && Array.isArray(search.results)) {
           webContext = JSON.stringify(search.results.slice(0, 5), null, 2);
         }

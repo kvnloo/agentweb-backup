@@ -115,19 +115,23 @@ router.post('/generate', authenticateToken, async (req: Request, res: Response) 
       'report_generation',
     );
     const { runVerifiedChat } = await import('../controllers/agentModeController');
+    const { cronJobRegistry } = await import('../utils/cronJobRegistry');
 
     const startingMessage = buildStartingMessage(images, reportType, customInstruction);
 
     console.log(`ImageReports: running agent for session ${session.sessionId}, ${images.length} images`);
 
-    const result = await runVerifiedChat({
+    // ENG-1189: this run's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener.
+    const result = await cronJobRegistry.track('imageReportsVerifiedChat', runVerifiedChat({
       sessionId: session.sessionId,
       userId,
       startingMessage,
       requiredFunctions: [{ functionName: 'create_html_file', minCount: 1 }],
       keywords: [],
       maxAttempts: 5,
-    });
+    }));
 
     // Set title after agent completes — agent auto-titles the session during the run
     await chatbotDb.updateSessionTitle(session.sessionId, reportTitle);
