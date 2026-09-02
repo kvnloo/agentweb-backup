@@ -658,6 +658,23 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
         expect(result.message).toBe('Invalid search type');
       });
 
+      // ENG-1300: searchAdTargeting was found outside the original audit (its name
+      // has no "Meta" in it) — same SDK-shaped-error rule applies.
+      it('ENG-1300: a 403 (error.status) classifies as auth/config end-to-end', async () => {
+        const sdkError: any = new Error('Insufficient permission for targeting search');
+        sdkError.status = 403;
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.searchTargeting as jest.Mock).mockRejectedValue(sdkError);
+
+        const result = await agentModeService.searchAdTargeting('user123', '123456789', 'test', 'adinterest');
+
+        expect(result.success).toBe(false);
+        expect(result.code).toBe(403);
+        const classified = toolResultError(result);
+        expect(classifyToolErrorClass(classified)).toBe('auth');
+        expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+      });
+
       it('should use specified account_id when provided', async () => {
         const multiAccountUser = {
           id: 'user123',
