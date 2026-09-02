@@ -27,6 +27,31 @@ import {
 } from './apolloQuota';
 import { crmDb } from './db';
 import { getApolloApiKey, getApolloWebhookSecret } from '../utils/secretsManager';
+import { recordVendorUsage } from './usageRecorderService';
+import { computeAllocatedCost } from '../utils/vendorRateCard';
+
+// ─── Vendor $ ledger mirroring (ENG-696) ───────────────────────────────────
+//
+// Distinct from the DynamoDB quota tracker below (call-count only, no $).
+// Each HTTP wrapper method mirrors ITS successful call into the SAME ledger
+// recordUsage/recordVendorUsage writes to, at the exact point the call
+// reaches api.apollo.io. A call with no resolvable userId still records,
+// attributed to the platform (recordVendorUsage defaults userId to "system").
+// Tier-3 (runWaterfall) findEmail calls are recorded under `full_enrichment`
+// — a materially higher-cost broker chain — rather than `email_reveal`, so a
+// future rate can price the two differently (AC5).
+function recordApolloLedger(rateKey: string, unit: string, userId: string | undefined): void {
+  void recordVendorUsage({
+    userId,
+    provider: 'apollo',
+    operation: rateKey,
+    feature: 'crm_enrichment',
+    unit,
+    quantity: 1,
+    costSource: 'allocated',
+    costUsd: computeAllocatedCost('apollo', rateKey, 1),
+  });
+}
 
 const APOLLO_BASE_URL = 'https://api.apollo.io/api/v1';
 const TABLE_PREFIX = process.env.NODE_ENV === 'production' ? '' : 'Dev-';
@@ -76,18 +101,23 @@ function buildHttpClient(apiKey: string): ApolloHttpClient {
         if (input.organizationName) body.organization_name = input.organizationName;
         if (input.domain) body.domain = input.domain;
         const r = await client.post('/people/match', body);
+        recordApolloLedger('person_match', 'match', input.userId);
         return r.data;
       } catch (err: any) {
         const status = err?.response?.status;
         // 404 / 422 → translate to a "person not found" envelope so the
         // service's negative-classifier routes it into the 7d not-found bucket
         // instead of the 1h error bucket. Without this we'd re-hit Apollo
-        // every hour for known-not-found leads.
-        if (status === 404 || status === 422) return { person: null };
+        // every hour for known-not-found leads. Still a billed vendor call.
+        if (status === 404 || status === 422) {
+          recordApolloLedger('person_match', 'match', input.userId);
+          return { person: null };
+        }
         throw err;
       }
     },
     async findEmail(input) {
+      let body: any = {};
       try {
         // Two modes:
         //   default: basic /people/match (1 credit, sync, first-party data only)
@@ -103,7 +133,7 @@ function buildHttpClient(apiKey: string): ApolloHttpClient {
         // is available. The service layer enforces mutual exclusion so we
         // never send both — sending a company-name string as `domain` would
         // corrupt match heuristics and pollute the cache for 60-90 days.
-        const body: any = {
+        body = {
           first_name: input.firstName,
           last_name: input.lastName,
         };
@@ -123,20 +153,40 @@ function buildHttpClient(apiKey: string): ApolloHttpClient {
           }
         }
         const r = await client.post('/people/match', body);
+        // ENG-696: distinguish the (higher-cost) broker waterfall reveal from
+        // a basic match/find — only recorded as `full_enrichment` when the
+        // waterfall flag actually made it onto the request body (a webhook
+        // fallback above silently downgrades to a basic match, AC5).
+        recordApolloLedger(
+          body.run_waterfall_email ? 'full_enrichment' : 'email_reveal',
+          body.run_waterfall_email ? 'enrichment' : 'reveal',
+          input.userId,
+        );
         return r.data;
       } catch (err: any) {
         const status = err?.response?.status;
-        if (status === 404 || status === 422) return { person: null };
+        if (status === 404 || status === 422) {
+          recordApolloLedger(
+            body.run_waterfall_email ? 'full_enrichment' : 'email_reveal',
+            body.run_waterfall_email ? 'enrichment' : 'reveal',
+            input.userId,
+          );
+          return { person: null };
+        }
         throw err;
       }
     },
-    async enrichOrg(domain) {
+    async enrichOrg(domain, userId) {
       try {
         const r = await client.get('/organizations/enrich', { params: { domain } });
+        recordApolloLedger('org_enrichment', 'enrichment', userId);
         return r.data;
       } catch (err: any) {
         const status = err?.response?.status;
-        if (status === 404) return { organization: null };
+        if (status === 404) {
+          recordApolloLedger('org_enrichment', 'enrichment', userId);
+          return { organization: null };
+        }
         throw err;
       }
     },

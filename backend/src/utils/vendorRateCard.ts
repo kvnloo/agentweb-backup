@@ -59,11 +59,31 @@ const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
     email_reveal: { recordingUnit: "reveal", usdPerUnit: 0.0495 },
     phone_reveal: { recordingUnit: "reveal", usdPerUnit: 0.395 },
     full_enrichment: { recordingUnit: "enrichment", usdPerUnit: 0.445 },
+    // ENG-696: basic /people/match with no email/phone reveal — Apollo's
+    // cheapest person-match credit tier (same class as org enrichment below).
+    person_match: { recordingUnit: "match", usdPerUnit: 0.0495 },
+    // ENG-696 PLACEHOLDER — no confirmed Apollo org-enrichment ($/call) pricing
+    // signal exists anywhere in this codebase or its docs at the time this was
+    // added (2026-09-02). Set equal to email_reveal as a conservative
+    // same-tier estimate (org enrichment is a single /organizations/enrich
+    // call, same credit class as a basic /people/match) so a missing rate is
+    // never silently $0 — Harsha must confirm the real Apollo org-enrichment
+    // credit cost and correct this value.
+    org_enrichment: { recordingUnit: "enrichment", usdPerUnit: 0.0495 },
   },
   "enrich.so": {
     email_lookup: { recordingUnit: "lookup", usdPerUnit: 0.005 },
     phone_finder: { recordingUnit: "lookup", usdPerUnit: 0.25 },
     email_validation: { recordingUnit: "validation", usdPerUnit: 0.0005 },
+    // ENG-696 PLACEHOLDER — no confirmed per-call $ figure exists for
+    // enrich.so's reverse (lookup-by-email) endpoint anywhere in this
+    // codebase or its docs. The endpoint's daily cap (50/day route-level,
+    // vs 1000/day for find/validate — see enrichSoQuota.ts
+    // DEFAULT_LOOKUP_BY_EMAIL_DAILY_LIMIT) strongly implies a materially
+    // higher unit cost than email_lookup, so this is set at 10x email_lookup
+    // as a directional placeholder, NOT a sourced rate — Harsha must confirm
+    // the real reverse-lookup credit cost and correct this value.
+    reverse_lookup: { recordingUnit: "lookup", usdPerUnit: 0.05 },
   },
   "2captcha": {
     solve: { recordingUnit: "solve", usdPerUnit: 0.00725 },

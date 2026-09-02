@@ -74,7 +74,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
         if (lastName) input.lastName = lastName;
         if (domain) input.domain = domain;
         else if (company) input.organizationName = company;
-        const result = await apollo.matchPerson(input);
+        const result = await apollo.matchPerson(input, { userId });
         const p = result?.match?.person;
         if (!p) return null;
         const org = result?.match?.organization;
@@ -146,7 +146,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
     enrichSoReverseLookup: async ({ email }) => {
       try {
         const enrichSo = getEnrichSoService();
-        const result = await enrichSo.reverseLookup(email);
+        const result = await enrichSo.reverseLookup(email, { userId });
         if (!result?.found) return null;
         return {
           firstName: result.firstName,
@@ -164,7 +164,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
       if (CrmEnrichmentService.isPersonalEmailDomain(`x@${domain}`)) return null;
       try {
         const enrichSo = getEnrichSoService();
-        const result = await enrichSo.findEmail({ firstName, lastName, domain });
+        const result = await enrichSo.findEmail({ firstName, lastName, domain }, { userId });
         if (!result?.found || !result.email) return null;
         return { email: result.email };
       } catch (err) {
@@ -1207,7 +1207,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         }
         console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] matchOrg domain=${domain}`);
         try {
-          const result = await getApolloService().matchOrg(domain);
+          const result = await getApolloService().matchOrg(domain, { userId });
           if (!result?.organization) {
             console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] MISS no organization`);
             return null;
@@ -1244,7 +1244,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
             ? { email: lead.email, firstName: lead.firstName ?? undefined, lastName: lead.lastName ?? undefined }
             : { firstName: lead.firstName ?? undefined, lastName: lead.lastName ?? undefined, domain: domain! };
           console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:person] matchPerson input=${JSON.stringify(apolloInput)}`);
-          const result = await getApolloService().matchPerson(apolloInput);
+          const result = await getApolloService().matchPerson(apolloInput, { userId });
           if (!result?.match?.person) {
             console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:person] MISS no person`);
             return null;
