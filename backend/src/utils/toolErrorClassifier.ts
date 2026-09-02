@@ -106,6 +106,18 @@ function classFromMessage(message: string): string | null {
 
   // Bad arguments the model emitted — schema-validation rejections (the
   // contract layer rejects before execution) plus classic validation phrasing.
+  //
+  // `is too large` (ENG-1672) is deliberately global, not scoped to the schedule
+  // size-block message it was added for — before this line, EVERY "too large"
+  // message anywhere in the app (video/content/image size limits, an oversized
+  // perform_data_analysis instruction, Gmail's HTML-body limit, …) fell through
+  // unclassified to the generic legacy-name fallback below. The one exception is
+  // a named custom error whose message happens to say "too large" AND which
+  // previously relied on keeping its own distinct name via that same fallback
+  // (e.g. gmailService.ts's GmailBodyTooLargeError) — this now reclassifies it
+  // to invalid_args too. Accepted: a genuinely oversized input isn't retryable
+  // either way, and consistent classification across the app outweighs one
+  // error keeping a bespoke class name.
   if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short|too large to save|is too large/.test(m)) return 'invalid_args';
 
   if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials|not authorized|do not have permission|permission to|no secrets configured|not a member of channel|account connected|account not configured|not configured to access/.test(m)) return 'auth';
