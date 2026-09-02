@@ -119,12 +119,6 @@ const VENDOR_ALLOWLIST: AllowlistEntry[] = [
     issue: 'ENG-698',
     reason: 'Editor-token and rendered-image fetch calls are unmetered.',
   },
-  {
-    path: 'services/remotionService.ts',
-    vendor: 'Remotion Lambda',
-    issue: 'ENG-699',
-    reason: 'renderMediaOnLambda submissions are unmetered.',
-  },
 ];
 
 // ─── Pure scanning logic (unit-tested against fixtures below) ────────────────
@@ -380,7 +374,6 @@ describe('Vendor metering coverage guard (ENG-701, real repo)', () => {
       '2captcha (emma/solveRecaptchaTool.ts) — ENG-698',
       'ElevenLabs (services/voiceoverService.ts) — ENG-698',
       'Placid (controllers/tasks.ts) — ENG-698',
-      'Remotion Lambda (services/remotionService.ts) — ENG-699',
       'v0 (Vercel) (services/v0Service.ts) — ENG-694',
     ]);
   });
