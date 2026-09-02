@@ -40,7 +40,15 @@ import AgentRunsInspector from './pages/AgentRunsInspector';
 import PromptTemplates from './pages/PromptTemplates';
 import Api from './pages/Api';
 import Marketing from './pages/marketing';
-import PartnerJobOverview from './pages/PartnerJobOverview';
+import { useEffect } from 'react';
+
+const RedirectToTasks = () => {
+  useEffect(() => {
+    window.location.href = '/tasks';
+  }, []);
+
+  return null;
+};
 
 export default function App() {
   return (
@@ -53,14 +61,7 @@ export default function App() {
               <Box sx={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
                 <Routes>
                   <Route path="/" element={<Layout />}>
-                    <Route
-                      index
-                      element={
-                        <PartnerRoute>
-                          <PartnerJobOverview />
-                        </PartnerRoute>
-                      }
-                    />
+                    <Route index element={<RedirectToTasks />} />
                     <Route path="login" element={<Login />} />
                     <Route path="register" element={<Register />} />
                     <Route path="oauth-callback" element={<OAuthCallback />} />
