@@ -5742,7 +5742,19 @@ export async function deleteEnvVar(
 export async function iterateLandingPage(
   id: string,
   userId: string,
-  message: string
+  message: string,
+  /**
+   * ENG-694 AC5: the org member who triggered this, when that is not the page
+   * owner. The route authorizes with `authorizeLandingPageAccess(id, actor,
+   * "edit")` and then passes `auth.page.userId` — the OWNER — as `userId`, so
+   * the actor's identity was being discarded before this function saw it.
+   *
+   * It has to arrive as its own argument. `getLandingPage(id, userId)` returns
+   * null unless `item.userId === userId`, so deriving the actor from the record
+   * here can only ever reproduce the owner (CodeRabbit, #2721). Optional so
+   * every existing caller keeps today's behaviour: absent means actor = owner.
+   */
+  actingUserId?: string
 ): Promise<GeneratedLandingPage> {
   const record = await getLandingPage(id, userId);
   if (!record) {
@@ -5761,12 +5773,12 @@ export async function iterateLandingPage(
   const chatId = record.v0ChatId!;
   const deadline = Date.now() + V0_GENERATION_BUDGET_MS;
 
-  // ENG-694 AC5: the member who acted and the account that is accountable are not
-  // always the same person. `record.userId` owns the page and carries the spend;
-  // `userId` is whoever triggered this call. `onBehalfOf` is set only when they
-  // differ, so the common case stays a plain single-subject row.
-  const iterateActorUserId = userId;
+  // ENG-694 AC5. `userId` is the page owner (the route passes auth.page.userId)
+  // and carries the spend; `actingUserId` is the member who triggered it, when
+  // the route supplies one. They are equal on every self-service call, so
+  // `onBehalfOf` stays absent unless a delegated edit genuinely happened.
   const iterateOwnerUserId = record.userId || userId;
+  const iterateActorUserId = actingUserId || iterateOwnerUserId;
 
   try {
     const v0 = await getV0Client();

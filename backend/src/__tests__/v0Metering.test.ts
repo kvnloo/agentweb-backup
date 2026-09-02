@@ -150,3 +150,45 @@ describe('coverage is derived, not a hardcoded list (ENG-701)', () => {
     expect(wrapped.length).toBe(calls.length);
   });
 });
+
+describe('AC5 — delegated iteration is genuinely reachable (CodeRabbit, #2721)', () => {
+  /**
+   * The first implementation derived the actor from the loaded record. It could
+   * never differ from the owner: `getLandingPage(id, userId)` returns null unless
+   * `item.userId === userId`, so the onBehalfOf branch was unreachable and AC5
+   * was a no-op that read as satisfied.
+   *
+   * The actor has to arrive from the route, which is the only place that still
+   * knows it — `authorizeLandingPageAccess(id, actor, "edit")` proves permission,
+   * and then the call passed `auth.page.userId` (the OWNER), discarding the actor.
+   */
+  const fs = require('fs');
+
+  it('the route hands the acting member through as its own argument', () => {
+    const route = fs.readFileSync('src/routes/landingPageGeneration.ts', 'utf8');
+    expect(route).toMatch(
+      /iterateLandingPage\(\s*auth\.page\.id,\s*auth\.page\.userId,\s*message,\s*userId\s*\)/
+    );
+  });
+
+  it('the service takes it as a parameter, not from the record', () => {
+    const svc = fs.readFileSync('src/services/v0Service.ts', 'utf8');
+    expect(svc).toMatch(/actingUserId\?:\s*string/);
+    // The owner still comes from the record; only the ACTOR is injected.
+    expect(svc).toContain('const iterateActorUserId = actingUserId || iterateOwnerUserId;');
+    // The ownership check that made the old derivation impossible must remain —
+    // CodeRabbit was explicit that it must not be removed to make this reachable.
+    expect(svc).toContain('if (!item || item.userId !== userId) {');
+  });
+
+  it('a delegated edit names both parties; a self-service edit names one', () => {
+    mockRecordVendorUsage.mockReset();
+    recordV0Call({ userId: 'member-9', billingUserId: 'owner-1', onBehalfOf: 'member-9', operation: 'iterate_message' });
+    expect(mockRecordVendorUsage.mock.calls[0][0]).toMatchObject({
+      userId: 'member-9', billingUserId: 'owner-1', onBehalfOf: 'member-9',
+    });
+    mockRecordVendorUsage.mockReset();
+    recordV0Call({ userId: 'owner-1', billingUserId: 'owner-1', operation: 'iterate_message' });
+    expect(mockRecordVendorUsage.mock.calls[0][0]).not.toHaveProperty('onBehalfOf');
+  });
+});
