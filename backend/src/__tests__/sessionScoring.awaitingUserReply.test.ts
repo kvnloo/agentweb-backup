@@ -26,11 +26,13 @@
 import {
   scoreSession,
   scoreSessionWithJudge,
+  scoreSessionWithJudgeIfNeeded,
+  attemptSessionScore,
   DEFAULT_SCORING_SYSTEM_PROMPT,
   AWAITING_USER_REPLY_CLAUSE,
   ScoringJudge,
 } from '../services/sessionScoringService';
-import { ChatMessage } from '../services/chatbotService';
+import { ChatMessage, ChatSession } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 
 jest.mock('../services/agentModeService', () => ({
@@ -244,5 +246,141 @@ describe('SessionScoring - awaiting user reply (ENG-1296)', () => {
 
     expect(result.score).toBe(5);
     expect(result.dimensions?.goalCompletion).toBe(5);
+  });
+});
+
+/**
+ * ENG-1296 follow-up: neither AWAITING_USER_REPLY_CLAUSE nor
+ * applyAwaitingReplyGuard can EVER touch a session that was already fully
+ * scored before this fix shipped — attemptSessionScore/
+ * scoreSessionWithJudgeIfNeeded skip re-invoking the LLM whenever
+ * evaluatedMessageIndex >= messageCount, and a stalled clarifying-question
+ * session (like cf363dcb and 28a2d125) never grows past the message count it
+ * was scored at, so it stays "up to date" and skipped forever. Verified live
+ * against the real production sessions on the ENG-1296 preview: re-copying
+ * them into dev and calling the sync/judge-score endpoints returned a
+ * verbatim `null` — the stored goalCompletion:3 never moved. `force` is the
+ * fix: an explicit opt-in that bypasses ONLY the already-scored skip (every
+ * other skip reason — admin-override, in-flight, no-task-session, etc. —
+ * still applies), so an admin can deliberately re-run a specific session
+ * through the current rules after a rubric/prompt change.
+ */
+describe('SessionScoring - force re-score bypasses the already-scored skip (ENG-1296)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  const stalledSession: ChatSession = {
+    sessionId: 'cf363dcb-fb57-43d7-bc12-74d9d61fa743',
+    userId: 'test-user',
+    messages: ambiguousFragmentMessages,
+    createdAt: '2026-08-16T21:19:04.514Z',
+    updatedAt: '2026-08-16T21:19:10.000Z',
+    messageCount: ambiguousFragmentMessages.length,
+  };
+
+  it('scoreSessionWithJudgeIfNeeded: skips (no LLM call) once a judge score is already up to date', async () => {
+    const alreadyScored: ChatSession = {
+      ...stalledSession,
+      judgeScores: {
+        [judge.id]: {
+          score: 3,
+          reason: 'The conversation ended before the goal could be fully achieved.',
+          evaluatedAt: '2026-08-17T02:12:50.309Z',
+          evaluatedMessageIndex: stalledSession.messageCount!,
+          judgeName: judge.name,
+          dimensions: { goalCompletion: 3, dataAccuracy: 5, outputQuality: 5 },
+        },
+      },
+    };
+
+    const result = await scoreSessionWithJudgeIfNeeded(alreadyScored, judge);
+
+    expect(result).toBeNull();
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('scoreSessionWithJudgeIfNeeded: force:true re-invokes the LLM and lets the fixed rubric correct the stale score', async () => {
+    const alreadyScored: ChatSession = {
+      ...stalledSession,
+      judgeScores: {
+        [judge.id]: {
+          score: 3,
+          reason: 'The conversation ended before the goal could be fully achieved.',
+          evaluatedAt: '2026-08-17T02:12:50.309Z',
+          evaluatedMessageIndex: stalledSession.messageCount!,
+          judgeName: judge.name,
+          dimensions: { goalCompletion: 3, dataAccuracy: 5, outputQuality: 5 },
+        },
+      },
+    };
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(5, { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 }, 'Fully completed the request.')
+    );
+
+    const result = await scoreSessionWithJudgeIfNeeded(alreadyScored, judge, { force: true });
+
+    expect(mockCallLLM).toHaveBeenCalled();
+    expect(result?.dimensions?.goalCompletion).toBe(5);
+  });
+
+  it('attemptSessionScore: skips (no LLM call) once satisfactionScore is already up to date', async () => {
+    const alreadyScored: ChatSession = {
+      ...stalledSession,
+      satisfactionScore: {
+        score: 5,
+        reason: 'Handled correctly.',
+        evaluatedAt: '2026-08-17T02:12:46.359Z',
+        evaluatedMessageIndex: stalledSession.messageCount!,
+        dimensions: { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 },
+      },
+    };
+
+    const result = await attemptSessionScore(alreadyScored);
+
+    expect(result.score).toBeNull();
+    expect(result.skipReason).toBe('already-scored');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('attemptSessionScore: force:true bypasses the already-scored skip and re-invokes the LLM', async () => {
+    const alreadyScored: ChatSession = {
+      ...stalledSession,
+      satisfactionScore: {
+        score: 5,
+        reason: 'Handled correctly.',
+        evaluatedAt: '2026-08-17T02:12:46.359Z',
+        evaluatedMessageIndex: stalledSession.messageCount!,
+        dimensions: { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 },
+      },
+    };
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(5, { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 }, 'Fully completed the request.')
+    );
+
+    const result = await attemptSessionScore(alreadyScored, { force: true });
+
+    expect(mockCallLLM).toHaveBeenCalled();
+    expect(result.score).not.toBeNull();
+    expect(result.skipReason).toBeUndefined();
+  });
+
+  it('force:true does NOT bypass admin-override — an admin-set score is never silently re-scored', async () => {
+    const overridden: ChatSession = {
+      ...stalledSession,
+      satisfactionScore: {
+        score: 2,
+        reason: 'Admin override',
+        evaluatedAt: '2026-08-17T02:12:46.359Z',
+        evaluatedMessageIndex: stalledSession.messageCount!,
+        adminOverride: true,
+      },
+    };
+
+    const result = await attemptSessionScore(overridden, { force: true });
+
+    expect(result.score).toBeNull();
+    expect(result.skipReason).toBe('admin-override');
+    expect(mockCallLLM).not.toHaveBeenCalled();
   });
 });
