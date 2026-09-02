@@ -11146,14 +11146,28 @@ export const agentModeController = {
           ? trimListToItemBudget({}, listKey, list, ownBudgetBytes)
           : trimListToItemBudget(projectedItem, listKey, list);
         // Never let a trim erase the newest entry outright — including the one this
-        // very edit just created — even when it alone exceeds the budget; a genuinely
-        // oversized write is still caught by the whole-item check below.
-        const kept = trimmed.length > 0 ? trimmed : list.slice(-1);
+        // very edit just created — even when it alone exceeds the byte budget; a
+        // genuinely oversized write is still caught by the whole-item check below.
+        const usedFallback = trimmed.length === 0;
+        const kept = usedFallback ? list.slice(-1) : trimmed;
         const dropped = list.length - kept.length;
-        if (dropped === 0) return;
-        console.warn(
-          `AgentMode: schedule ${scheduleId} is over the DynamoDB item budget — dropped the ${dropped} oldest of ${list.length} ${listKey} entries to fit`
-        );
+        if (dropped === 0 && !usedFallback) return;
+        // `usedFallback` always logs, even when `dropped === 0` — that happens when
+        // there was nothing else in `list` to drop in the first place (the single
+        // newest entry alone already exceeds the byte budget). Staying silent just
+        // because nothing existed yet to trim away would defeat the whole point of
+        // this budget: flagging a schedule already sitting at that edge.
+        if (usedFallback) {
+          console.warn(
+            dropped > 0
+              ? `AgentMode: schedule ${scheduleId} kept only the newest ${listKey} entry — it alone still exceeds the byte budget after dropping ${dropped} older entries`
+              : `AgentMode: schedule ${scheduleId} kept the newest ${listKey} entry even though it alone exceeds the byte budget — no older entries existed to drop`
+          );
+        } else {
+          console.warn(
+            `AgentMode: schedule ${scheduleId} is over the DynamoDB item budget — dropped the ${dropped} oldest of ${list.length} ${listKey} entries to fit`
+          );
+        }
         if (listKey === 'runResults') {
           // Never write run history back from the read above: a run finishing while
           // this edit is in flight appends to the tail, and a full-list write derived

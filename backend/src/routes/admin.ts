@@ -5557,7 +5557,7 @@ router.delete("/result-endpoints/:name", async (req, res) => {
 // Score chat sessions for satisfaction
 router.post("/chat-sessions/score", async (req, res) => {
   try {
-    const { sessionIds } = req.body;
+    const { sessionIds, force } = req.body;
 
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
       return res.status(400).json({ message: "sessionIds must be a non-empty array" });
@@ -5570,7 +5570,11 @@ router.post("/chat-sessions/score", async (req, res) => {
       sessionIds.map(async (sessionId: string) => {
         const session = await chatbotDb.getChatSession(sessionId);
         if (!session) return { sessionId, score: null };
-        const score = await scoreSessionIfNeeded(session);
+        // ENG-1296: force bypasses the "already scored, up-to-date" skip — the
+        // explicit escape hatch for re-running a specific session through the
+        // current scoring rules after a rubric/prompt change. Default false
+        // preserves the normal cheap-skip behavior for routine sync/backfill.
+        const score = await scoreSessionIfNeeded(session, { force: force === true });
         return { sessionId, score };
       })
     );
@@ -5627,7 +5631,7 @@ router.put("/chat-sessions/:sessionId/score", async (req, res) => {
 // Score sessions with a custom judge
 router.post("/chat-sessions/judge-score", async (req, res) => {
   try {
-    const { sessionIds, judgeId } = req.body;
+    const { sessionIds, judgeId, force } = req.body;
 
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
       return res.status(400).json({ message: "sessionIds must be a non-empty array" });
@@ -5661,7 +5665,9 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
       sessionIds.map(async (sessionId: string) => {
         const session = await chatbotDb.getChatSession(sessionId);
         if (!session) return { sessionId, score: null };
-        const score = await scoreSessionWithJudgeIfNeeded(session, judge);
+        // ENG-1296: force bypasses the "already scored, up-to-date" skip — see
+        // the matching comment on POST /chat-sessions/score above.
+        const score = await scoreSessionWithJudgeIfNeeded(session, judge, { force: force === true });
         return { sessionId, score };
       })
     );
