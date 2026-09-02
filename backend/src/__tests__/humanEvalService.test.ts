@@ -458,6 +458,92 @@ describe('HumanEvalService', () => {
     );
   });
 
+  // ENG-1687: Harsha replied to a design-review candidate posted directly via
+  // the Slack API (bypassing createCandidate) and got zero acknowledgment —
+  // silence was indistinguishable from "the bot never saw this." Every
+  // handled reply must now post a visible ack back into the same thread.
+  it('posts a Slack ack reply in-thread when feedback is received', async () => {
+    const { service, slack } = makeHarness();
+
+    const candidate = await service.createCandidate({
+      reviewType: 'landing_page',
+      outputSummary: 'Design review candidate with no runnable auto-action.',
+      artifactUrl: 'https://example.com/design-review',
+      sessionId: 'session-3',
+      userId: 'user-3',
+      // No `action` — this candidate has no wired auto-rerun (e.g. a design
+      // review, not one of the 3 known action types).
+    });
+
+    slack.postSlackMessage.mockClear();
+
+    const handled = await service.handleSlackThreadReply({
+      channel: candidate.slackChannel,
+      threadTs: candidate.slackMessageTs,
+      messageTs: '1780000002.000001',
+      slackUserId: 'U_HARSHA',
+      text: 'Looks good, but make it a modal on login instead.',
+    });
+
+    expect(handled).toBe(true);
+    // Allow the fire-and-forget ack post to flush.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      candidate.slackChannel,
+      expect.stringContaining('Got it'),
+      candidate.slackMessageTs,
+    );
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      candidate.slackChannel,
+      expect.stringContaining('U_HARSHA'),
+      candidate.slackMessageTs,
+    );
+    // No auto-action wired for this candidate — the ack should say so rather
+    // than falsely promising a re-run.
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      candidate.slackChannel,
+      expect.stringContaining('No automatic re-run is wired'),
+      candidate.slackMessageTs,
+    );
+  });
+
+  it('ack reply promises a re-run when the candidate has a known auto-action', async () => {
+    const { service, slack } = makeHarness();
+
+    const candidate = await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Generated ad creative for eval.',
+      artifactUrl: 'https://example.com/creative.png',
+      sessionId: 'session-4',
+      userId: 'user-4',
+      action: {
+        type: 'agent_mode_image_revision',
+        sessionId: 'session-4',
+        userId: 'user-4',
+        artifactUrl: 'https://example.com/creative.png',
+        filename: 'creative.png',
+      },
+    });
+
+    slack.postSlackMessage.mockClear();
+
+    await service.handleSlackThreadReply({
+      channel: candidate.slackChannel,
+      threadTs: candidate.slackMessageTs,
+      messageTs: '1780000003.000001',
+      slackUserId: 'U_FANGFANG',
+      text: 'Too dark, brighten the background.',
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      candidate.slackChannel,
+      expect.stringContaining('Running the auto-action now'),
+      candidate.slackMessageTs,
+    );
+  });
+
   it('stores a normalized category and surfaces a bold Ad tag in the Slack post', async () => {
     const { service, slack, items } = makeHarness();
 
