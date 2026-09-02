@@ -489,9 +489,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       it('does NOT mark the non-preview, non-dominated Gemini models legacy', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
-        // gemini-3.5-flash is deliberately excluded here — it's now correctly
-        // legacy, dominated band-for-band by gemini-3.7-flash (see above).
-        for (const id of ['gemini-3.1-flash-lite', 'gemini-3.7-flash']) {
+        // gemini-3.5-flash and gemini-3.7-flash are deliberately excluded here
+        // — 3.5 is legacy (dominated by 3.7), and 3.7 is now ALSO legacy
+        // (same `gemini-flash` family, same 'cheap' tier, but Gemini 3.8
+        // Flash beats it on quality: 59 vs 56 — see below).
+        for (const id of ['gemini-3.1-flash-lite']) {
           expect(models.find((m) => m.id === id)!.legacy).toBeUndefined();
         }
       });
@@ -541,10 +543,23 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(flash35.legacy).toBe(true);
       });
 
-      it('Gemini 3.7 Flash itself is never auto-flagged legacy — it is the dominator, not the dominated', async () => {
+      // Gemini 3.8 Flash (added 2026-09-02): same `gemini-flash` family, same
+      // 'cheap' tier as 3.7, higher quality (59 vs 56) — dominance flips 3.7
+      // from "the dominator" to "the dominated", same class of transition
+      // 3.5 Flash went through when 3.7 landed (see above).
+      it('flags Gemini 3.7 Flash as legacy — Gemini 3.8 Flash beats it on quality in the same tier', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         const flash37 = models.find((m) => m.id === 'gemini-3.7-flash')!;
-        expect(flash37.legacy).toBeUndefined();
+        const flash38 = models.find((m) => m.id === 'gemini-3.8-flash')!;
+        expect(flash38.qualityScore).toBeGreaterThan(flash37.qualityScore!);
+        expect(flash38.tier).toBe(flash37.tier);
+        expect(flash37.legacy).toBe(true);
+      });
+
+      it('Gemini 3.8 Flash itself is never auto-flagged legacy — it is the dominator, not the dominated', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const flash38 = models.find((m) => m.id === 'gemini-3.8-flash')!;
+        expect(flash38.legacy).toBeUndefined();
       });
 
       // Gemini 3.1 Flash Lite is a distinct "lightest/fastest" positioning
