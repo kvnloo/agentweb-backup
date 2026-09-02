@@ -102,18 +102,6 @@ const VENDOR_ALLOWLIST: AllowlistEntry[] = [
     reason: '9 billable v0.chats.create/sendMessage sites; none record usage yet.',
   },
   {
-    path: 'search/youSearchProvider.ts',
-    vendor: 'You.com search',
-    issue: 'ENG-695',
-    reason: 'ydc-index.io queries are unmetered; the owning user is discarded at the seam.',
-  },
-  {
-    path: 'search/googleSearchProvider.ts',
-    vendor: 'Google Custom Search',
-    issue: 'ENG-695',
-    reason: 'Same search seam as You.com — billed customsearch.cse.list calls are unmetered.',
-  },
-  {
     path: 'services/apolloServiceFactory.ts',
     vendor: 'Apollo',
     issue: 'ENG-696',
@@ -404,10 +392,8 @@ describe('Vendor metering coverage guard (ENG-701, real repo)', () => {
       '2captcha (emma/solveRecaptchaTool.ts) — ENG-698',
       'Apollo (services/apolloServiceFactory.ts) — ENG-696',
       'ElevenLabs (services/voiceoverService.ts) — ENG-698',
-      'Google Custom Search (search/googleSearchProvider.ts) — ENG-695',
       'Placid (controllers/tasks.ts) — ENG-698',
       'Remotion Lambda (services/remotionService.ts) — ENG-699',
-      'You.com search (search/youSearchProvider.ts) — ENG-695',
       'enrich.so (services/enrichSoServiceFactory.ts) — ENG-696',
       'v0 (Vercel) (services/v0Service.ts) — ENG-694',
     ]);
