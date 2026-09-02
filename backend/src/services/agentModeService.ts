@@ -2693,6 +2693,17 @@ export class AgentModeService {
     }
 
     params.provider = { allow_fallbacks: true, require_parameters: true };
+    if (upstreamModel.startsWith('google/gemini-')) {
+      // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
+      // a legacy Standard API key hitting Google's Sept 2026 Standard-key
+      // cutoff; OpenRouter's own health check showed the "Google" BYOK slot
+      // at 63-85% uptime over 30min vs 99.9%+ on the pooled "Google AI
+      // Studio" slot, and default routing lands on the degraded one. Skip it
+      // until ENG-753 rotates the key to an Auth key and the BYOK slot's
+      // uptime recovers — remove this then, since it forfeits the BYOK cost
+      // discount in exchange for reliability.
+      params.provider.ignore = ['Google'];
+    }
     // OpenRouter reports its own billed amount as zero for BYOK requests even
     // though the upstream provider still bills the inference. Request the
     // routing flag so metering can distinguish BYOK from a genuinely free call.
