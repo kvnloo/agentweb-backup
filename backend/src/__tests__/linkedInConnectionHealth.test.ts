@@ -14,6 +14,7 @@ import {
   DISCONNECT_REMINDER_MS,
   VERIFY_STAMP_INTERVAL_MS,
 } from '../services/linkedInConnectionHealth';
+import { PROMPT_REVISIONS_BUDGET_BYTES, estimateDynamoItemBytes } from '../utils/dynamoItemBudget';
 
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
@@ -875,6 +876,37 @@ describe('repointStaleAccountReferences (ENG-1366)', () => {
     const [, updates] = scheduleDb.updateSchedule.mock.calls[0];
     expect(updates.promptRevisions).toHaveLength(1);
     expect(updates.promptRevisions[0].startingMessage).toBe(originalMessage);
+  });
+
+  // ENG-1672: the ordinary partial-trim case — several old revisions dropped so
+  // the total fits the budget, the newest (including the one this repoint just
+  // created) survives untouched. The other two ENG-1672 tests above/below only
+  // cover the edges (a single oversized entry, and a rejection past this trim);
+  // this covers the common in-between case.
+  it('drops the oldest revisions to fit the byte budget, leaving the newest (including this repoint) untouched', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    const existingRevisions = Array.from({ length: 4 }, (_, i) => ({
+      startingMessage: 'p'.repeat(45000),
+      updatedAt: `2026-01-0${i + 1}T00:00:00.000Z`,
+    }));
+    const originalMessage = `use ${ACCOUNT_ID}`;
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: originalMessage, promptRevisions: existingRevisions },
+    ]);
+    scheduleDb.updateSchedule.mockResolvedValue(undefined);
+
+    const repointed = await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(repointed).toBe(1);
+    const [, updates] = scheduleDb.updateSchedule.mock.calls[0];
+    expect(updates.promptRevisions.length).toBeLessThan(existingRevisions.length + 1);
+    const revisionBytes = estimateDynamoItemBytes({ promptRevisions: updates.promptRevisions });
+    expect(revisionBytes).toBeLessThanOrEqual(PROMPT_REVISIONS_BUDGET_BYTES);
+    // The newest entry — the pre-repoint text this rewrite just snapshotted — always survives.
+    expect(updates.promptRevisions[updates.promptRevisions.length - 1]).toMatchObject({ startingMessage: originalMessage });
   });
 
   // ENG-1672: an item-size rejection is a property of the ONE schedule that hit
