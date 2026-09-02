@@ -439,7 +439,12 @@ export const config = {
       enabled: true,
       cadenceMs: 4 * 60 * 1000,        // recheck a waiting task every ~4 min
       maxMs: 24 * 60 * 60 * 1000,      // safety cap: auto-stop (and notify) a watch after 24h
-      minMemMB: 3000,                  // skip a tick entirely if available RAM is below this (never add to OOM pressure)
+      minMemMB: 6000,                  // skip a tick if available RAM is below this. Reserves headroom for a
+                                       // worst-case tsc/jest (~4GB) + margin, so a woken turn's build can't OOM
+                                       // the shared cgroup and take down every in-flight turn. Raised from 3000
+                                       // after systemd-oomd killed the whole chat unit (324 procs) on 2026-08-31.
+      maxConcurrentTurns: 4,           // never wake a watch while >= this many turns are already active — a hard
+                                       // cap on auto-spawned concurrency so N turns + a build can't stack past it.
       tickMs: 60 * 1000,               // how often the server scans state for a due watch (fires at most one/tick)
     },
     // Pinned to the system prompt (compaction-proof) on every full turn — teaches the agent HOW to wait.

@@ -2374,9 +2374,13 @@ function fireWatchTurn(identifier, watch) {
   const found = findEntry(identifier);
   if (!found) return;
   if (activeTurns.has(identifier)) return;                 // a turn is already running for this issue
+  if (activeTurns.size >= (CHAT.watch?.maxConcurrentTurns ?? 4)) return; // global concurrency cap (one shared memory-capped cgroup)
   if (capabilityOf(found.entry).level !== 'full') return;  // a watch that can't act (no push) is pointless
-  const lockPath = acquireFixLock(identifier);
-  if (!lockPath) return;                                   // another process (pipeline/gc) holds the lock
+  const lk = acquireFixLock(identifier);
+  // A held lock is normal (the pipeline is mid-run) and stays silent; a lock we could not WRITE means the
+  // box is broken, and a silent return there is how a full disk stayed invisible until a human noticed.
+  if (!lk.path) { if (lk.reason !== 'held') log(`watch: cannot wake ${identifier} — ${lockUnavailableMessage(lk.reason, '')}`); return; }
+  const lockPath = lk.path;
   const turnId = `t${Date.now()}-${++turnSeq}`;
   activeTurns.set(identifier, { child: null, cap: 'full', turnId, startedAt: new Date().toISOString(), lockPath });
   log(`watch: waking ${identifier} — ${watch.goal}`);
@@ -2388,6 +2392,8 @@ function watchTick() {
   const minMemMB = cfg.minMemMB ?? 3000;
   const memMB = availMemMB();
   if (memMB != null && memMB < minMemMB) { log(`watch: low memory (${memMB}MB < ${minMemMB}) — deferring tick`); return; }
+  const maxTurns = cfg.maxConcurrentTurns ?? 4;
+  if (activeTurns.size >= maxTurns) { log(`watch: ${activeTurns.size} turns active (>= ${maxTurns}) — deferring tick`); return; }
   const now = Date.now();
   let state; try { state = loadState(); } catch { return; }
   for (const entry of Object.values(state)) {
