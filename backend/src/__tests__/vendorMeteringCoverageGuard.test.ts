@@ -102,18 +102,6 @@ const VENDOR_ALLOWLIST: AllowlistEntry[] = [
     reason: '9 billable v0.chats.create/sendMessage sites; none record usage yet.',
   },
   {
-    path: 'services/apolloServiceFactory.ts',
-    vendor: 'Apollo',
-    issue: 'ENG-696',
-    reason: 'apolloService.ts only tracks a call-count quota; no $ ledger entry is written.',
-  },
-  {
-    path: 'services/enrichSoServiceFactory.ts',
-    vendor: 'enrich.so',
-    issue: 'ENG-696',
-    reason: 'Structural twin of Apollo — call-count quota only, no $ ledger entry.',
-  },
-  {
     path: 'services/voiceoverService.ts',
     vendor: 'ElevenLabs',
     issue: 'ENG-698',
@@ -390,11 +378,9 @@ describe('Vendor metering coverage guard (ENG-701, real repo)', () => {
     // staleness test above then requires removing the entry for.
     expect(VENDOR_ALLOWLIST.map((e) => `${e.vendor} (${e.path}) — ${e.issue}`).sort()).toEqual([
       '2captcha (emma/solveRecaptchaTool.ts) — ENG-698',
-      'Apollo (services/apolloServiceFactory.ts) — ENG-696',
       'ElevenLabs (services/voiceoverService.ts) — ENG-698',
       'Placid (controllers/tasks.ts) — ENG-698',
       'Remotion Lambda (services/remotionService.ts) — ENG-699',
-      'enrich.so (services/enrichSoServiceFactory.ts) — ENG-696',
       'v0 (Vercel) (services/v0Service.ts) — ENG-694',
     ]);
   });
