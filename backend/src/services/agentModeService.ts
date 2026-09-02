@@ -23326,9 +23326,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error) {
       console.error('AgentMode: Error reading Google Drive file:', error);
+      // ENG-1300: carry the real numeric HTTP status through so a clean
+      // 401/403/404 classifies as auth/not_found instead of the generic
+      // Error/bug fallback once toolResultError rebuilds an Error from the
+      // message alone.
+      const code = (error as any)?.code || (error as any)?.status;
       return {
         success: false,
-        message: `Failed to read Google Drive file "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read Google Drive file "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code,
       };
     }
   }
@@ -23729,18 +23735,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const saDrive = await this.getGoogleDriveClient();
           return await readWithDrive(saDrive);
         } catch (saErr: any) {
-          const is404 = saErr?.code === 404 || saErr?.status === 404;
+          // ENG-1300: carry the real numeric HTTP status through so a clean
+          // 401/403/404 classifies as auth/not_found instead of the generic
+          // Error/bug fallback once toolResultError rebuilds an Error from the
+          // message alone.
+          const code = saErr?.code || saErr?.status;
+          const is404 = code === 404;
           const msg = is404
             ? `File not found or not accessible. Share the file with the service account, or connect Google Drive in Settings for files you own.`
             : `Failed to read file: ${saErr instanceof Error ? saErr.message : 'Unknown error'}`;
-          return { success: false, message: msg };
+          return { success: false, message: msg, code };
         }
       }
-      const is404 = oauthErr?.code === 404 || oauthErr?.status === 404;
+      const code = oauthErr?.code || oauthErr?.status;
+      const is404 = code === 404;
       const msg = is404
         ? `File not found or you don't have access (fileId: ${fileId}).`
         : `Failed to read file: ${oauthErr instanceof Error ? oauthErr.message : 'Unknown error'}`;
-      return { success: false, message: msg };
+      return { success: false, message: msg, code };
     }
   }
 
@@ -23821,14 +23833,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         files: formatted,
       };
     } catch (err: any) {
+      // ENG-1300: `code` (GaxiosError — the real numeric HTTP status) is already
+      // computed for the branches below; carry it onto the result too, or a
+      // clean 401/403/404 still classifies as the generic Error/bug fallback
+      // once toolResultError reconstructs an Error from the message alone.
       const code = err?.code || err?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Google Drive access denied. Your Google Drive connection may have expired — reconnect in Settings → Connected Accounts.' };
+        return { success: false, message: 'Google Drive access denied. Your Google Drive connection may have expired — reconnect in Settings → Connected Accounts.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Folder not found. Check the URL or ID and try again.' };
+        return { success: false, message: 'Folder not found. Check the URL or ID and try again.', code };
       }
-      return { success: false, message: err?.message || 'Failed to list folder contents' };
+      return { success: false, message: err?.message || 'Failed to list folder contents', code };
     }
   }
 
@@ -23848,14 +23864,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return { success: true, folder_id: folderId, folder_url: folderUrl, name: resp.data.name };
     } catch (err: any) {
+      // ENG-1300: see listGoogleDriveFolder's catch above for why `code` rides
+      // along on the result.
       const code = err?.code || err?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot create folder in that location — Emma does not have access to the specified parent folder.' };
+        return { success: false, message: 'Cannot create folder in that location — Emma does not have access to the specified parent folder.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Parent folder not found. Check the folder ID and try again.' };
+        return { success: false, message: 'Parent folder not found. Check the folder ID and try again.', code };
       }
-      return { success: false, message: err?.message || 'Failed to create Google Drive folder' };
+      return { success: false, message: err?.message || 'Failed to create Google Drive folder', code };
     }
   }
 
@@ -23898,11 +23916,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return { success: true, message: `Found ${results.length} item(s) matching "${query}".`, results };
     } catch (err: any) {
+      // ENG-1300: see listGoogleDriveFolder's catch above for why `code` rides
+      // along on the result.
       const code = err?.code || err?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Google Drive access denied. Ensure Drive is connected in Settings → Connected Accounts.' };
+        return { success: false, message: 'Google Drive access denied. Ensure Drive is connected in Settings → Connected Accounts.', code };
       }
-      return { success: false, message: err?.message || 'Failed to search Google Drive' };
+      return { success: false, message: err?.message || 'Failed to search Google Drive', code };
     }
   }
 
@@ -24637,14 +24657,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error creating Google Doc:', error);
+      // ENG-1300: carry `code` through so a clean 401/403/404 classifies as
+      // auth/not_found instead of the generic Error/bug fallback.
       const code = error?.code || error?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot create Doc in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
+        return { success: false, message: 'Cannot create Doc in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.' };
+        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.', code };
       }
-      return { success: false, message: `Failed to create Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to create Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -24672,14 +24694,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error updating Google Doc:', error);
+      // ENG-1300: carry `code` through so a clean 401/403/404 classifies as
+      // auth/not_found instead of the generic Error/bug fallback.
       const code = error?.code || error?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot update this Google Doc — you may not have edit access to it, or it may have been deleted.' };
+        return { success: false, message: 'Cannot update this Google Doc — you may not have edit access to it, or it may have been deleted.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Google Doc not found. Check the URL or ID and try again.' };
+        return { success: false, message: 'Google Doc not found. Check the URL or ID and try again.', code };
       }
-      return { success: false, message: `Failed to update Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to update Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -24738,14 +24762,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         try { await drive.files.delete({ fileId: sheetId }); } catch {}
       }
       console.error('AgentMode: Error creating Google Sheet:', error);
+      // ENG-1300: carry `code` through so a clean 401/403/404 classifies as
+      // auth/not_found instead of the generic Error/bug fallback.
       const code = error?.code || error?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot create Sheet in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
+        return { success: false, message: 'Cannot create Sheet in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.' };
+        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.', code };
       }
-      return { success: false, message: `Failed to create Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to create Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -24774,14 +24800,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error updating Google Sheet:', error);
+      // ENG-1300: carry `code` through so a clean 401/403/404 classifies as
+      // auth/not_found instead of the generic Error/bug fallback.
       const code = error?.code || error?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot update this Google Sheet — it was not created by Emma. Emma can only edit Sheets she created.' };
+        return { success: false, message: 'Cannot update this Google Sheet — it was not created by Emma. Emma can only edit Sheets she created.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Google Sheet not found. Check the URL or ID and try again.' };
+        return { success: false, message: 'Google Sheet not found. Check the URL or ID and try again.', code };
       }
-      return { success: false, message: `Failed to update Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to update Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
