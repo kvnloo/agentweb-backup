@@ -69,16 +69,41 @@ describe('classifyToolErrorClass', () => {
   // (only "too long"/"too short" matched) and landed on the generic legacy
   // "Error" class, indistinguishable from a random unclassified failure. It is a
   // client-fixable, non-retryable condition like any other "too long" rejection.
-  // The projected size (e.g. "391KB") does not reliably start with a 4 or 5, so
-  // this must not depend on the incidental "400KB" status-code-shaped digits
-  // elsewhere in the message.
-  it('classifies an item-size-blocked schedule write as invalid_args', () => {
+  // A projected size (e.g. "391KB") does not reliably start with a 4 or 5, so
+  // the explicit "too large to save"/"is too large" pattern below must not
+  // depend on incidental "400KB"-shaped digits elsewhere in the message —
+  // these two fixtures omit "400KB" entirely to prove that.
+  it('classifies an item-size-blocked schedule write as invalid_args, independent of incidental status-shaped digits', () => {
     expect(classifyToolErrorClass(err(
       'Scheduled chat is too large to save (about 391KB against the per-item limit) '
       + 'even after dropping saved history. The starting message is 10240 characters — shorten it and try again.'
     ))).toBe('invalid_args');
     expect(classifyToolErrorClass(err(
       'API error (400): Scheduled chat is too large to save — it exceeds the per-item limit.'
+    ))).toBe('invalid_args');
+  });
+
+  // The three real messages agentModeController.ts actually throws (via
+  // mcpFetch's `API error (${status}): ${message}` wrapping) all hard-code the
+  // literal "DynamoDB's 400KB per-item limit" — so today they already classify
+  // correctly via the earlier embedded-status-code match (classFromStatus(400))
+  // before ever reaching the pattern above. Asserted here so a future change to
+  // either branch can't silently break the real, verbatim production shape —
+  // the fixtures above stay as the regression proof for message shapes (or
+  // future callers) that don't happen to repeat "400KB".
+  it('classifies the real manage_scheduled_chat size-block messages as invalid_args', () => {
+    expect(classifyToolErrorClass(err(
+      "API error (400): Scheduled chat is too large to save (about 391KB against DynamoDB's 400KB per-item "
+      + 'limit) even after dropping saved history. The starting message is 10240 characters — shorten it and try again.'
+    ))).toBe('invalid_args');
+    expect(classifyToolErrorClass(err(
+      "API error (400): Scheduled chat is too large to save — fitting it under DynamoDB's 400KB per-item limit "
+      + "would mean dropping 3 saved runs from this schedule's history at once. The starting message is 10240 "
+      + 'characters — shorten it and try again.'
+    ))).toBe('invalid_args');
+    expect(classifyToolErrorClass(err(
+      "API error (400): Scheduled chat is too large to save — it exceeds DynamoDB's 400KB per-item limit. "
+      + 'Shorten the starting message and try again.'
     ))).toBe('invalid_args');
   });
 
