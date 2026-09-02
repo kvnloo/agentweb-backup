@@ -241,8 +241,13 @@ const EXPENSIVE_MEDIA_TOOLS = new Set([
 
 const runFailureCounts = new Map<string, Map<string, number>>();
 
+// ENG-1668 follow-up: in-flight reservations for the run-scoped aggregate budget
+// below, keyed by `${runId}\0${toolName}`. See findTrippedRunBudget/reserveRunBudgetSlot.
+const pendingRunBudgetReservations = new Map<string, number>();
+
 export function _resetAgentToolFailureBreaker(): void {
   runFailureCounts.clear();
+  pendingRunBudgetReservations.clear();
 }
 
 function errorHead(error: unknown): string {
@@ -556,14 +561,40 @@ function countToolFailures(runId: string, toolName: string): number {
   return total;
 }
 
+// ENG-1668 follow-up: countToolFailures only reflects CONFIRMED failures — recorded
+// after execute() resolves. Concurrent same-run tool calls (Promise.all — the exact
+// shape of the production incident, 4 call_google_ads_api calls dispatched in one
+// turn) all run their check synchronously before any sibling's execute() settles, so
+// every one of them sees the SAME stale confirmed count and none accounts for the
+// others. Track in-flight attempts — reserved the instant a call passes every check
+// and commits to executing, released once its outcome is known either way — and fold
+// them into the threshold. This closes the race without predicting outcomes: a
+// reservation only ever nudges a SIBLING call in the same synchronous burst; it's
+// never held past its own call resolving, and a call that succeeds never converts its
+// reservation into a permanent failure.
+function reserveRunBudgetSlot(runId: string, toolName: string): void {
+  if (toolName !== 'call_google_ads_api') return;
+  const key = `${runId}\0${toolName}`;
+  pendingRunBudgetReservations.set(key, (pendingRunBudgetReservations.get(key) ?? 0) + 1);
+}
+
+function releaseRunBudgetSlot(runId: string, toolName: string): void {
+  if (toolName !== 'call_google_ads_api') return;
+  const key = `${runId}\0${toolName}`;
+  const current = pendingRunBudgetReservations.get(key) ?? 0;
+  if (current <= 1) pendingRunBudgetReservations.delete(key);
+  else pendingRunBudgetReservations.set(key, current - 1);
+}
+
 // ENG-1668 follow-up: a run-scoped backstop, separate from aggregateFailureBudget
 // above — that one is keyed by budgetScopeId (session-wide, for tools whose failures
 // are deliberately tracked cross-run), this one by runId directly, using the SAME
-// per-run counts every per-scope breaker check already writes via recordToolFailure.
-// No new recording path needed.
+// per-run counts every per-scope breaker check already writes via recordToolFailure,
+// plus any in-flight reservation (see above) for concurrency safety.
 function findTrippedRunBudget(runId: string, toolName: string): { count: number; budget: number } | null {
   if (toolName !== 'call_google_ads_api') return null;
-  const count = countToolFailures(runId, toolName);
+  const pending = pendingRunBudgetReservations.get(`${runId}\0${toolName}`) ?? 0;
+  const count = countToolFailures(runId, toolName) + pending;
   return count >= GOOGLE_ADS_RUN_FAILURE_BUDGET ? { count, budget: GOOGLE_ADS_RUN_FAILURE_BUDGET } : null;
 }
 
@@ -1041,6 +1072,13 @@ export async function executeAgentToolThroughGateway(
     }
   }
 
+  // ENG-1668 follow-up: reserve this attempt against the run-scoped aggregate
+  // BEFORE awaiting execute(), so a sibling call dispatched concurrently in the
+  // same batch sees this attempt when it runs its own findTrippedRunBudget check
+  // above — closing the check-then-act race under concurrent same-run tool calls.
+  // Always released in `finally` below, regardless of outcome.
+  if (input.runId) reserveRunBudgetSlot(input.runId, policyDecision.toolName);
+
   try {
     const result = await input.execute();
     // A resolved result can still encode a failure ({ success: false } /
@@ -1112,6 +1150,8 @@ export async function executeAgentToolThroughGateway(
       policyDecision,
       durationMs: Math.max(0, now() - startedAt),
     };
+  } finally {
+    if (input.runId) releaseRunBudgetSlot(input.runId, policyDecision.toolName);
   }
 }
 
