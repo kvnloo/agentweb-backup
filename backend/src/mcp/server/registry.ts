@@ -3,6 +3,20 @@ import { refuseUnauthorizedScheduledPublish, attachPublishRevalidation } from '.
 
 export interface McpToolHandler {
   name: string;
+  /**
+   * `definition.inputSchema.properties` names are load-bearing beyond this tool's
+   * own handler: `validateAndRepairToolArgs` (agentToolGatewayService.ts, ENG-1668)
+   * silently hoists fields out of a stray wrapper object the model might invent
+   * (e.g. `params: { your_field: ... }`) whenever the wrapper key is a generic name
+   * like `params`/`args`/`data`/`config` (see LIKELY_WRAPPER_KEY_NAMES there) AND the
+   * nested key matches one of YOUR schema's property names that's still empty. This
+   * runs for every tool, not just the one it was built for — if your schema reuses a
+   * very common field name, a stray wrapper on an unrelated tool call could in
+   * principle land a value in your field. It never overwrites a value you already
+   * set, and only fires for those generic wrapper-like key names, but if that ever
+   * matters for your tool, read agentToolGatewayService.ts's validateAndRepairToolArgs
+   * before assuming a nested-looking argument was ignored.
+   */
   definition: any;
   execute: (args: any, context?: any) => Promise<any>;
   /**

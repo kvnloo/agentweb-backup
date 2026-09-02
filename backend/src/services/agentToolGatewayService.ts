@@ -230,7 +230,16 @@ const CHAT_HISTORY_FAILURE_BUDGET = 6;
 // about. Threshold well above the worst real session on record (8 failures, all pre-
 // dating the hoist fix that now prevents most of them outright) and well below the
 // theoretical worst-case drift, so only a genuine multi-vector spiral trips it.
-const GOOGLE_ADS_RUN_FAILURE_BUDGET = 10;
+// Env-overridable (not just a hardcoded guess): there's no real production traffic
+// yet to tune this against, so ops can adjust it from observed telemetry without a
+// deploy once there is.
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+const GOOGLE_ADS_RUN_FAILURE_BUDGET = readPositiveIntEnv('GOOGLE_ADS_RUN_FAILURE_BUDGET', 10);
 const MAX_TRACKED_RUNS = 500;
 const ERROR_KEY_LENGTH = 80;
 
@@ -694,6 +703,23 @@ const READ_PREFIXES = [
   'search_',
 ];
 
+// ENG-1668 follow-up: the nested-wrapper hoist below is generic across EVERY tool
+// in the registry, not just call_google_ads_api — a wide blast radius for a fix
+// aimed at one specific mistake. Restrict it to keys that actually look like an
+// invented catch-all wrapper (the real mistake pattern: the model reaches for a
+// generic word for "the real arguments", e.g. `params`), rather than firing on ANY
+// undeclared object-valued key. This is the difference between "any future tool
+// whose schema happens to reuse a property name inside some unrelated stray
+// object could theoretically get silently reinterpreted" and "only these ~15 known
+// generic names can ever trigger a hoist" — a tool author adding a new tool does
+// not need to know this mechanism exists to be safe from it, because their own
+// schema's real field names are never treated as wrapper candidates.
+const LIKELY_WRAPPER_KEY_NAMES = new Set([
+  'params', 'param', 'args', 'arguments', 'data', 'payload',
+  'fields', 'field', 'filters', 'filter', 'options', 'config',
+  'input', 'body', 'values', 'updates', 'attributes', 'properties',
+]);
+
 const DEFAULT_ARG_ALIASES: Record<string, string[]> = {
   content_draft: [
     'html_content',
@@ -821,13 +847,19 @@ export function validateAndRepairToolArgs(
     // AND misnamed (e.g. `params: { criterion: ... }` instead of
     // criterion_resource_name) is still caught rather than silently dropped.
     // Only fills empty slots — never overwrites a value already present at the
-    // top level — and only applies to a wrapper key that isn't itself a
-    // declared property, so a genuinely nested schema field (e.g. this same
-    // tool's `address` object for CAMPAIGN ADD_PROXIMITY) is left untouched.
-    // Hoists apply one at a time so a second nested key can't clobber the
-    // first's target once it's filled.
+    // top level — only applies to a wrapper key that isn't itself a declared
+    // property, so a genuinely nested schema field (e.g. this same tool's
+    // `address` object for CAMPAIGN ADD_PROXIMITY) is left untouched — and (ENG-1668
+    // follow-up) only fires for keys that look like an invented wrapper
+    // (LIKELY_WRAPPER_KEY_NAMES above), not any arbitrary undeclared object-valued
+    // key, to keep this tool-agnostic mechanism's blast radius narrow. Hoists apply
+    // one at a time so a second nested key can't clobber the first's target once
+    // it's filled.
     const wrapperValue = repairedArgs[key];
-    if (wrapperValue && typeof wrapperValue === 'object' && !Array.isArray(wrapperValue)) {
+    if (
+      LIKELY_WRAPPER_KEY_NAMES.has(key.toLowerCase())
+      && wrapperValue && typeof wrapperValue === 'object' && !Array.isArray(wrapperValue)
+    ) {
       const nested = wrapperValue as Record<string, unknown>;
       let hoistedAny = false;
       for (const nestedKey of Object.keys(nested)) {
@@ -977,7 +1009,19 @@ export function summarizeAgentToolPolicyFlags(
   const entries = decisions
     .filter((decision): decision is AgentToolPolicyDecision => Boolean(decision))
     .flatMap((decision) =>
-      decision.flags.map((flag) => `${decision.toolName}:${flag.code}:${flag.severity}`)
+      decision.flags.map((flag) => {
+        const base = `${decision.toolName}:${flag.code}:${flag.severity}`;
+        // ENG-1668 follow-up: args_repaired is the one flag whose message carries
+        // per-call detail (toolDispatch.ts embeds validateAndRepairToolArgs's
+        // `repairs` list, e.g. "params.criterion_resource_name->criterion_resource_name")
+        // rather than a fixed template. Without it, this telemetry line shows only
+        // a bare repair COUNT (see argsRepairedCount in agentModeService.ts) —
+        // diagnosing an unexpected repair meant re-deriving it from raw args in a
+        // session dump. Every other flag code's message is a static per-tool
+        // template that adds nothing beyond the code itself, so they're
+        // intentionally left out to avoid bloating every tool call's telemetry line.
+        return flag.code === 'args_repaired' ? `${base}(${flag.message})` : base;
+      })
     );
 
   return entries.length > 0 ? entries.join(',') : undefined;
