@@ -43,7 +43,35 @@ export function normalizeAddLeadPayload(leads: unknown): Record<string, unknown>
       `manage_leads action "add" creates exactly one lead per call; received ${Array.isArray(leads) ? leads.length : typeof leads}.`
     );
   }
-  return leads[0] as Record<string, unknown>;
+  const lead = leads[0];
+  // A non-object entry (null, a string, a number, another array) would
+  // otherwise reach mcpFetch as-is: `null`/`undefined` are falsy, so
+  // httpClient's `if (body && method !== 'GET')` check skips sending a body
+  // at all — silently creating an EMPTY lead on a real write instead of
+  // erroring. Fail loud here instead.
+  if (typeof lead !== 'object' || lead === null || Array.isArray(lead)) {
+    throw new Error(
+      `manage_leads action "add" requires the single lead to be an object with fields (e.g. { email, firstName, ... }); received ${lead === null ? 'null' : Array.isArray(lead) ? 'an array' : typeof lead}.`
+    );
+  }
+  return lead as Record<string, unknown>;
+}
+
+/**
+ * `dry_run` is this tool's advertised safety valve for the cross-account
+ * write path — it must fail loud on anything that isn't a real boolean
+ * rather than silently coercing (e.g. a caller-side typo like
+ * `dry_run: "true"` must not fall through to `false` and reach a real write
+ * once the flag is on).
+ */
+export function resolveDryRunFlag(dryRun: unknown): boolean {
+  if (dryRun === undefined || dryRun === null) {
+    return false;
+  }
+  if (typeof dryRun !== 'boolean') {
+    throw new Error(`dry_run must be a boolean if provided; received ${typeof dryRun}.`);
+  }
+  return dryRun;
 }
 
 /**
@@ -55,7 +83,13 @@ export function normalizeAddLeadPayload(leads: unknown): Record<string, unknown>
  *
  * Known tradeoff: check ORDER is duplicated between that route and this
  * function. If the route's own checks are ever reordered or extended, this
- * preview won't automatically follow — update both together.
+ * preview won't automatically follow — update both together. Confirmed gap
+ * as of this writing: the route also validates `selectedSenderId` against
+ * the caller's configured senders (`crm.ts`'s local `normalizeSenderId`/
+ * `getCrmSenderIds`, not exported) and lets `crmDb.createLead` run further
+ * sanitization — neither is replicated here, so `dry_run:true` can report
+ * `wouldSucceed: true` for a payload the real write later 400s on. Preview
+ * is advisory, not a guarantee.
  */
 export async function previewLeadAdd(
   actingUserId: string,
@@ -106,7 +140,7 @@ export async function executeCrossAccountLeadAdd(args: any, context: any): Promi
   const scope = c.resolvedScope!; // always populated here — client_id is guaranteed present by the caller in apiTools.ts
 
   const leadPayload = normalizeAddLeadPayload(args.leads);
-  const dryRun = args.dry_run === true;
+  const dryRun = resolveDryRunFlag(args.dry_run);
 
   const auditBase = {
     actorUserId: scope.caller.userId,

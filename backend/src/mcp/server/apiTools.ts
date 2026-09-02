@@ -20,7 +20,7 @@ import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService
 import { ctx, jsonResult } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
-import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd } from './manageLeadsCrossAccountAdd';
+import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
 
 const CLIENT_ID_SCHEMA_PROPERTY = {
   type: 'string' as const,
@@ -970,7 +970,7 @@ mcpToolRegistry.register({
         },
         dry_run: {
           type: 'boolean',
-          description: '"add" action only. When true, preview what would be created (list resolution, permission check, duplicate-email check) without creating anything. Works regardless of client_id or the cross-account-add feature flag.',
+          description: '"add" action only. When true, preview what would be created (list resolution, permission check, duplicate-email check) without creating anything. Advisory, not exhaustive — some real-write validations (e.g. selectedSenderId) aren\'t replicated, so a preview success doesn\'t guarantee the real write will succeed. Works regardless of client_id or the cross-account-add feature flag. Must be a real boolean if provided.',
         },
       },
       required: ['action', 'list_id']
@@ -1010,7 +1010,7 @@ mcpToolRegistry.register({
       }
       case 'add': {
         const leadPayload = normalizeAddLeadPayload(args.leads);
-        if (args.dry_run === true) {
+        if (resolveDryRunFlag(args.dry_run)) {
           const actingUserId = context?.agentUserId || context?.userId;
           const preview = await previewLeadAdd(actingUserId, listId, leadPayload);
           return jsonResult({ dryRun: true, ...preview });
