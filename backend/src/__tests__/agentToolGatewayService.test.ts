@@ -107,6 +107,30 @@ describe('agentToolGatewayService', () => {
     expect(summarizeAgentToolPolicyModes(decisions)).toContain('google_search_web:read:low:observe');
   });
 
+  // ENG-1668 follow-up: an args_repaired flag's message carries the actual
+  // field-level repair detail (which key was hoisted/renamed) — without surfacing
+  // it here, telemetry only ever showed a bare repair COUNT, and diagnosing an
+  // unexpected repair meant re-deriving it from raw args in a session dump.
+  it('includes per-call detail for an args_repaired flag, but not for other flag codes', () => {
+    const decision = evaluateAgentToolPolicy({ toolName: 'call_google_ads_api', args: { action: 'UPDATE' } });
+    decision.flags.push({
+      code: 'args_repaired',
+      severity: 'info',
+      message: 'Tool arguments were repaired before execution: params.criterion_resource_name->criterion_resource_name',
+    });
+
+    const summary = summarizeAgentToolPolicyFlags([decision]);
+
+    expect(summary).toContain(
+      'call_google_ads_api:args_repaired:info(Tool arguments were repaired before execution: params.criterion_resource_name->criterion_resource_name)'
+    );
+    // Every other flag on this decision keeps the compact form (no parenthesized
+    // detail) since their messages are static per-tool templates, not per-call data.
+    const otherEntries = summary!.split(',').filter((entry) => !entry.includes(':args_repaired:'));
+    expect(otherEntries.length).toBeGreaterThan(0);
+    otherEntries.forEach((entry) => expect(entry).not.toMatch(/\(/));
+  });
+
   it('executes allowed tools and returns the exact result object', async () => {
     const result = { ok: true, nested: { id: 'same-reference' } };
     let now = 100;
@@ -3243,6 +3267,24 @@ describe('ENG-1668 — hoists a stray nested wrapper object before validation', 
     expect(result.status).toBe('invalid');
   });
 
+  // ENG-1668 follow-up: restrict the hoist to keys that look like an invented
+  // wrapper (LIKELY_WRAPPER_KEY_NAMES) — a tool's own, unrelated field name should
+  // never be treated as a wrapper candidate just because it happens to hold an
+  // object whose keys collide with another property.
+  it('does not hoist from a wrapper key that is not a recognized wrapper name', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        action: 'UPDATE', customer_id: '5092566541', entity_type: 'KEYWORD',
+        metadata: { criterion_resource_name: 'customers/5092566541/adGroupCriteria/x' },
+      },
+      inputSchema: googleAdsSchema,
+    });
+
+    expect((result.args as Record<string, unknown>).criterion_resource_name).toBeUndefined();
+    expect(result.repairs).toEqual([]);
+  });
+
   // ENG-1668 follow-up: the compound mistake — nested AND misnamed at once —
   // is caught by running the SAME alias resolution used on top-level keys
   // against the wrapper's nested keys too, not just an exact property-name match.
@@ -3285,5 +3327,74 @@ describe('ENG-1668 — hoists a stray nested wrapper object before validation', 
     expect(result.status).toBe('repaired');
     expect((result.args as Record<string, unknown>).query).toBe('agentweb');
     expect(result.repairs).toEqual(['filters.search_query->query']);
+  });
+});
+
+// ENG-1668 follow-up: GOOGLE_ADS_RUN_FAILURE_BUDGET is read at module load time
+// (readPositiveIntEnv), so exercising a custom value means loading a fresh module
+// instance with the env var already set — jest.isolateModules + require gives a
+// module registry sandbox with its own fresh runFailureCounts/pendingRunBudget-
+// Reservations state, mirroring attioService.retry.test.ts's pattern for the same
+// kind of module-load-time configuration.
+describe('ENG-1668 follow-up — GOOGLE_ADS_RUN_FAILURE_BUDGET is env-overridable', () => {
+  const ORIGINAL_ENV = process.env.GOOGLE_ADS_RUN_FAILURE_BUDGET;
+
+  afterEach(() => {
+    if (ORIGINAL_ENV === undefined) delete process.env.GOOGLE_ADS_RUN_FAILURE_BUDGET;
+    else process.env.GOOGLE_ADS_RUN_FAILURE_BUDGET = ORIGINAL_ENV;
+  });
+
+  function loadIsolated(envValue: string) {
+    let isolated: typeof import('../services/agentToolGatewayService');
+    jest.isolateModules(() => {
+      process.env.GOOGLE_ADS_RUN_FAILURE_BUDGET = envValue;
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      isolated = require('../services/agentToolGatewayService');
+    });
+    return isolated!;
+  }
+
+  const failingCall = (i: number) => ({
+    action: 'UPDATE', customer_id: '1', entity_type: `ENTITY_${i}`, campaign_resource_name: `customers/1/campaigns/${i}`,
+  });
+
+  it('honors a custom budget from the environment', async () => {
+    const isolated = loadIsolated('2');
+    const runId = 'run-1668-env-budget-custom';
+    for (let i = 0; i < 2; i += 1) {
+      await isolated.executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args: failingCall(i), runId,
+        execute: () => Promise.reject(new Error(`some field is required for ENTITY_${i} UPDATE`)),
+      });
+    }
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const outcome = await isolated.executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: failingCall(99), runId, execute,
+    });
+    expect(outcome.status).toBe('error');
+    if (outcome.status === 'error') expect(outcome.error).toBeInstanceOf(isolated.AgentToolBudgetExceededError);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the default (10) when the env var is invalid', async () => {
+    const isolated = loadIsolated('not-a-number');
+    const runId = 'run-1668-env-budget-invalid';
+    for (let i = 0; i < 9; i += 1) {
+      await isolated.executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args: failingCall(i), runId,
+        execute: () => Promise.reject(new Error(`some field is required for ENTITY_${i} UPDATE`)),
+      });
+    }
+    // Still under the default budget of 10 after 9 failures — an invalid env value
+    // did not zero out (or otherwise corrupt) the budget.
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const outcome = await isolated.executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api',
+      args: { action: 'UPDATE', customer_id: '1', entity_type: 'KEYWORD', criterion_resource_name: 'customers/1/adGroupCriteria/x' },
+      runId,
+      execute,
+    });
+    expect(outcome.status).toBe('success');
+    expect(execute).toHaveBeenCalled();
   });
 });
