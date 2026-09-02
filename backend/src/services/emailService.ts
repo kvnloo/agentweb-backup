@@ -1,5 +1,4 @@
 import dotenv from 'dotenv';
-import { createHash } from 'crypto';
 import { isSuppressedSendResult } from '../utils/nonProdEmailGuard';
 
 import { resendService } from './resendService';
@@ -1983,21 +1982,30 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
   ) {
     const emailListForClaim = Array.isArray(toEmails) ? toEmails : [toEmails];
     // ENG-1297: a scheduled run's automated completion nudge can re-invoke this after
-    // the notification for THIS session + recipient set + content has already gone
-    // out (the nudge fires because an unrelated requirement is still unmet, not
-    // because the notification failed) — the observed production outcome was a
-    // duplicate report email. Claim atomically BEFORE sending so a repeat call for
-    // the same session, recipients, and content is a no-op instead of a second send.
-    // notify_session is a general-purpose DEFAULT tool available in every session
-    // (not just scheduled nudges), so the claim member folds in a hash of the
-    // subject/content: a different recipient set, a different session, OR genuinely
-    // different content still claims independently, rather than being silently and
-    // permanently suppressed as a "duplicate" of an unrelated earlier notification.
+    // the notification for THIS session + recipient set has already gone out (the
+    // nudge fires because an unrelated requirement is still unmet, not because the
+    // notification failed) — the observed production outcome was a duplicate report
+    // email. Claim atomically BEFORE sending so a repeat call for the same session
+    // and recipients is a no-op instead of a second send.
+    //
+    // Deliberately NOT content-aware (a prior version of this guard hashed
+    // subject+content into the claim member so a genuinely different notification
+    // to the same recipients wouldn't be permanently suppressed). Re-derived
+    // against the actual production incident this ticket reports (session
+    // 0050a0b4-…): the scheduler's nudge caused the SAME run to re-run its
+    // research, regenerate an "updated" report, and re-notify the same recipient
+    // — different content both times (9588 vs 11359 chars, a restructured report).
+    // A content hash produces a different signature for each call and does NOT
+    // suppress that duplicate, so it does not fix the bug it was added for.
+    // Recipient+session is coarser — a genuinely distinct second notification to
+    // the same recipients later in the same session is also suppressed — but that
+    // trade is the one that actually stops the proven regression; the read-only
+    // press circuit breaker (readOnlyPressCircuitBreaker.ts) is the primary fix for
+    // the nudge loop itself, so this guard should rarely even be reached by a
+    // nudge-driven repeat.
     // JSON.stringify (not a bare comma-join) keeps the recipient signature
     // collision-safe against an embedded comma in a single recipient entry.
-    const recipientSignature = JSON.stringify(emailListForClaim.map(e => e.trim().toLowerCase()).sort());
-    const contentSignature = createHash('sha256').update(`${subject || ''} ${content}`).digest('hex').slice(0, 16);
-    const claimMember = `${recipientSignature}:${contentSignature}`;
+    const claimMember = JSON.stringify(emailListForClaim.map(e => e.trim().toLowerCase()).sort());
     const notifyClaimKey = `notify-session:${sessionId}`;
     const claimed = await settingsService.claimSetMember(notifyClaimKey, claimMember);
     if (!claimed) {
