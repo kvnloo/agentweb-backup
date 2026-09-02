@@ -22003,7 +22003,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // outcome is UNKNOWN — it may have actually applied even though this call
       // reported failure. Blindly resubmitting an "update" risks recording a
       // redundant prompt-revision snapshot for a change that already landed.
-      if (/fetch failed|ECONNRESET|econnreset|socket hang up|network error/i.test(safeMessage)) {
+      if (/fetch failed|ECONNRESET|socket hang up|network error/i.test(safeMessage)) {
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: This is a transient connection failure, not a validation error — the write's outcome is unknown, and it may have already applied even though this call reported failure. Before retrying, call list_scheduled_chats (or get_scheduled_chat_storage_diagnostics) with this schedule_id to check the schedule's CURRENT state rather than blindly resubmitting the same change.`;
       }
     }
