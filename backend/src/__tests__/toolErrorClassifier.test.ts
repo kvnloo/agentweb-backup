@@ -131,6 +131,10 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('bad args', 'AgentToolContractValidationError'))).toBe('invalid_args');
   });
 
+  it('classifies a truncated tool-call-arguments error as truncated_response, distinct from invalid_args (ENG-1477)', () => {
+    expect(classifyToolErrorClass(err('cut off mid-object', 'TruncatedToolCallArgumentsError'))).toBe('truncated_response');
+  });
+
   it('uses numeric status properties when the message is unhelpful', () => {
     const withStatus = Object.assign(new Error('request failed'), { status: 429 });
     expect(classifyToolErrorClass(withStatus)).toBe('rate_limit');

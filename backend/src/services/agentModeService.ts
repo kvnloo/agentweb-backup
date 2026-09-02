@@ -56,6 +56,13 @@ import {
   promptRequestsLogo,
 } from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory } from './agentMode/core/toolDispatch';
+import {
+  describeImageReportsFabricatedMetrics,
+  FABRICATED_METRICS_CHECK_PROMPT,
+  FABRICATED_METRICS_CHECK_TIMEOUT_MS,
+  FABRICATED_METRICS_WARNING,
+  promptRisksFabricatedMetrics,
+} from './agentMode/dataFabricationGuard';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
@@ -458,6 +465,35 @@ import {
   META_GOAL_BID_STRATEGY_MAP,
   META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
+
+/**
+ * ENG-1685: build the S3-safe filename for a generated HTML artifact from its
+ * (human-written, arbitrary-content) title.
+ *
+ * Kraftersland/Helen reported "Download failed" on an HTML report artifact whose
+ * displayed filename was truncated mid-word: `..._Weekly_Performance_Repor.html`
+ * (missing the final "t"). Root cause: the sanitize-then-truncate order was
+ * backwards everywhere this ran — `title.replace(...).substring(0, 50)` blindly
+ * cut the ALREADY-underscore-joined string at a fixed 50-char boundary with no
+ * regard for word breaks, so any title whose sanitized form crossed that
+ * boundary lost a fragment of its last word. The 50-char cap itself had no
+ * documented reason: S3 keys allow up to 1024 bytes and this key already has a
+ * userId + timestamp + random token prefix, leaving hundreds of characters of
+ * real headroom — the low, undocumented number was never load-bearing.
+ *
+ * The truncated filename was NOT independently confirmed to be the cause of the
+ * download failure itself (a live repro of the exact reported file's presign +
+ * S3 fetch succeeded end-to-end against production), but it is a real, visible
+ * bug in the same code path and worth fixing regardless — and downloadAsset.ts's
+ * error handling was hardened separately (ENG-1685) to stop collapsing every
+ * failure class into one indistinguishable "Download failed" toast, which is
+ * what made this report undiagnosable from the client side in the first place.
+ */
+export function buildHtmlArtifactFilename(title: string, now: number = Date.now()): string {
+  const HTML_ARTIFACT_FILENAME_TITLE_MAX = 150;
+  const sanitized = (title || '').replace(/[^a-z0-9]/gi, '_').substring(0, HTML_ARTIFACT_FILENAME_TITLE_MAX);
+  return `html_${now}_${sanitized}.html`;
+}
 
 /**
  * Self-learning loop telemetry for agent-mode tool calls.
@@ -2315,6 +2351,29 @@ export class AgentModeService {
     // Net result: Meta/Llama has ZERO entrants after this cleanup. OpenRouter's
     // catalog has no meta-llama/llama-5* listed as of this snapshot (checked
     // live) — this is a real, currently-unfillable gap, not an oversight.
+    // ENG-199/ENG-1685: Claude Fable 5.1 (Anthropic, released 2026-09-01) —
+    // routed through OpenRouter, same convention as every other OpenRouter
+    // entry in this block (id = openrouter/<upstream-provider>/<upstream-model>,
+    // one registry line, no new routing code). This is ENG-199's actual wire-in:
+    // llmPricing.ts had a Fable 5 pricing stub staged since ENG-200 for exactly
+    // this moment, but Fable 5 itself was NEVER added to this llmModels
+    // registry — so there is no existing Fable entry to compare against yet.
+    // Going straight to 5.1 (the current model; Fable 5 is already superseded
+    // as of 2026-09-01) rather than also backfilling the now-superseded 5.
+    // Live AA Intelligence Index score (66, max-effort w/ fallback) confirmed
+    // 2026-09-01 — currently the #1 model on the independent leaderboard, 3pts
+    // above Claude Opus 5 (63). qualityScore/costScore below plug into the
+    // EXISTING dominance rule (getSupportedModelsWithMetadata) automatically —
+    // no dominance action needed today since there's no sibling family member,
+    // but the very next same-family add (e.g. a future Fable 5.2) will
+    // auto-flag whichever one loses on both cost and quality, same as every
+    // other family in this registry.
+    // supportsVision/supportsTemperature per OpenRouter's live model page
+    // (architecture.modality includes image+file input; reasoning-capable).
+    // ENG-199's cost-control blocker (ENG-200) is closed — org/per-user LLM
+    // cost caps already exist and apply automatically to every model priced
+    // in llmPricing.ts, this one included.
+    'openrouter/anthropic/claude-fable-5.1': { name: 'Claude Fable 5.1', family: 'claude-fable', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s top-ranked model for coding & agentic work', client: null, supportsTemperature: false, supportsVision: true, qualityScore: 66, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, max effort w/ fallback, snapshot 2026-09-01' },
     'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // 2026-08-19: qualityScore corrected 52 -> 40. The 52 belonged to a
@@ -4065,6 +4124,49 @@ export class AgentModeService {
             `AgentMode: Discarding ${responseMessage.tool_calls.length} tool call(s) requested during the ` +
             `forced final synthesis in session ${sessionId} — the turn's time budget is spent`
           );
+
+          // ENG-1682 follow-up: a step's deliverable can genuinely finish (e.g.
+          // create_html_file succeeds) in the very turn the time budget runs out —
+          // one tool call before the model would have marked the step completed.
+          // Discarding set_work_plan_status like every other call here leaves that
+          // step stuck "pending" in DynamoDB forever even though the work is done,
+          // which is the same "no visible end results" failure this ticket is
+          // about. Apply it directly instead of executing it through the normal
+          // loop: it's a single bounded DB write, not another LLM round trip, so it
+          // costs nothing against the reserve held back for the forced synthesis
+          // call below, and it closes the gap without reopening the loop.
+          const statusCall = responseMessage.tool_calls.find(
+            (call: any) => call.function?.name === 'set_work_plan_status'
+          );
+          if (statusCall) {
+            try {
+              const args = JSON.parse(statusCall.function.arguments || '{}');
+              if (Array.isArray(args.updates)) {
+                const statusResult = await this.setWorkPlanStatus(args.updates, sessionId);
+                if (statusResult?.success) {
+                  console.warn(
+                    `AgentMode: Applied the discarded set_work_plan_status call in session ${sessionId} ` +
+                    'despite the forced synthesis — the underlying work already finished'
+                  );
+                } else {
+                  // CodeRabbit (PR #2713): setWorkPlanStatus can reject an update (out-of-order,
+                  // missing required calls, insufficient assets, unknown step) without throwing —
+                  // logging an unconditional "Applied" here would misreport a rejected update as
+                  // a success. Report what actually happened instead.
+                  console.warn(
+                    `AgentMode: Discarded set_work_plan_status call in session ${sessionId} was rejected ` +
+                    `(${statusResult?.message || 'no message'}) — the step's status was not changed`
+                  );
+                }
+              }
+            } catch (statusError) {
+              console.error(
+                `AgentMode: Failed to apply the discarded set_work_plan_status call in session ${sessionId}:`,
+                statusError
+              );
+            }
+          }
+
           delete responseMessage.tool_calls;
         }
 
@@ -6476,7 +6578,11 @@ export class AgentModeService {
         // returns success:true with no imageUrl. Dropping this flag made that state
         // indistinguishable from a broken generation downstream (the auto-revision
         // path reported it as "failed to extract asset URL").
-        ...(actualResult.awaitingUserConfirmation === true && { awaitingUserConfirmation: true })
+        ...(actualResult.awaitingUserConfirmation === true && { awaitingUserConfirmation: true }),
+        // ENG-1027: the post-generation data-fabrication check's warning must survive
+        // this minimizer (everything unnamed here is dropped) or Emma never sees it
+        // and silently presents invented numbers as real data.
+        ...(actualResult.dataReliabilityWarning && { dataReliabilityWarning: actualResult.dataReliabilityWarning })
       };
     }
 
@@ -26555,7 +26661,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     imageModel?: string,
     logoImage?: string,
     confirm?: boolean,
-    category?: string
+    category?: string,
+    metricsVerified?: boolean
   ): Promise<any> {
     // ENG-343: the producing flow must self-declare the eval use case — Matt's
     // review feedback differs entirely between ads and organic posts, and a
@@ -26807,6 +26914,36 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           },
         });
 
+        // ENG-1027 data-fabrication backstop: the tool-description guidance alone is
+        // instruction-following-dependent, and live verification showed the image
+        // model can invent metrics even in prompts that never asked for real data
+        // (a bare "metrics preview" dashboard element is enough). For prompts shaped
+        // like a dashboard/table that Emma hasn't declared use verified real values
+        // (metricsVerified), run one bounded describe_image check against the actual
+        // output and surface a warning so Emma discloses rather than silently
+        // presenting invented numbers. Timeboxed tighter than describe_image's own
+        // 90s ENG-294 bound — this is an added, best-effort safety net the user never
+        // explicitly asked for, not worth spending that much turn budget on.
+        let dataReliabilityWarning: string | undefined;
+        if (promptRisksFabricatedMetrics(prompt, metricsVerified)) {
+          console.log(`AgentMode: generate_image data-fabrication check triggered (session ${sessionId})`);
+          try {
+            const visionCheck = await withTimeoutOrReject(
+              this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT),
+              FABRICATED_METRICS_CHECK_TIMEOUT_MS,
+              'generate_image data-fabrication check'
+            );
+            if (visionCheck?.success && describeImageReportsFabricatedMetrics(visionCheck.description)) {
+              dataReliabilityWarning = FABRICATED_METRICS_WARNING;
+              console.log(`AgentMode: generate_image data-fabrication check WARNED (session ${sessionId})`);
+            } else {
+              console.log(`AgentMode: generate_image data-fabrication check clear (session ${sessionId})`);
+            }
+          } catch (visionErr) {
+            console.warn('AgentMode: generate_image data-fabrication check failed/timed out (non-fatal):', visionErr);
+          }
+        }
+
         return {
           success: true,
           message: `✅ Image "${result.filename}" generated successfully!`,
@@ -26816,6 +26953,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           size: size,
           quality: quality,
           imageModel: imageModelUsed,
+          ...(dataReliabilityWarning ? { dataReliabilityWarning } : {}),
           ...(fallbackUsed ? { fallbackUsed: true, primaryError } : {})
         };
       } else {
@@ -29797,7 +29935,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       if (!isEmail && isCompleteHtmlDocument(contentDraft)) {
         console.log('AgentMode: create_html_file — draft is already complete HTML, uploading directly (skipping render)');
         const { uploadFileToS3 } = await import('../utils/s3Utils');
-        const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+        const filename = buildHtmlArtifactFilename(title);
         const uploadableHtml = await this.inlinePrivateS3Images(contentDraft, documentType, userId);
         const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
         if (!uploadResult.success || !uploadResult.url) {
@@ -30031,7 +30169,7 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Upload to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
-      const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+      const filename = buildHtmlArtifactFilename(title);
       const uploadableHtml = await this.inlinePrivateS3Images(htmlContent, documentType, userId);
       const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
 
@@ -30200,7 +30338,7 @@ Return the HTML body fragment for this section only.`;
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const fallbackHtml = await renderMarkdownReportDocumentAsync(title, contentDraft);
       const uploadableHtml = await this.inlinePrivateS3Images(fallbackHtml, documentType, userId);
-      const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+      const filename = buildHtmlArtifactFilename(title);
       uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
@@ -31478,6 +31616,43 @@ ${strippedHtml}`;
       const nextInputStep = workPlan.steps
         .sort((a: any, b: any) => a.stepCount - b.stepCount)
         .find((s: any) => s.status === 'pending' && s.inputRequest);
+
+      // ENG-1682: a step's own pendingWorkPlanInput is only cleared by the
+      // structured WorkPlanInputCard submission (updateSessionWorkPlanInputRequest
+      // with a null value). A user who answers the step conversationally in chat
+      // instead -- the ordinary way people talk to Emma -- never hits that path,
+      // so the now-resolved step's request stays status:'awaiting' forever. The
+      // customer portal's Details surface (the default landing view) treats any
+      // 'awaiting' input as still-active and hides the entire message list --
+      // every later step's deliverable included -- behind that stale card for
+      // the rest of the session. Clear it the moment its own step resolves, the
+      // same instant we'd otherwise replace it with the next step's request.
+      const resolvedStepCounts = new Set(
+        updatedSteps
+          .filter(s => s.status === 'completed' || s.status === 'skipped')
+          .map(s => s.stepCount),
+      );
+      const staleInputForResolvedStep = Boolean(
+        session.pendingWorkPlanInput
+          && session.pendingWorkPlanInput.status === 'awaiting'
+          && resolvedStepCounts.has(session.pendingWorkPlanInput.stepCount),
+      );
+
+      // CodeRabbit (PR #2713): bypassing failIfAwaitingExists entirely for the write
+      // below would also skip its pendingUserQuestion check, letting a NEW work-plan
+      // input land while a genuinely concurrent ask_user_question is still awaiting --
+      // two simultaneous prompts, an invalid state neither surface expects. Clear the
+      // known-stale record as its OWN guarded step first (matched by requestId, so a
+      // race that already replaced it fails closed instead of clobbering the newer
+      // one), THEN let the write below keep its full, unmodified guard -- it now
+      // correctly finds pendingWorkPlanInput cleared while still enforcing the
+      // pendingUserQuestion half of the check.
+      if (staleInputForResolvedStep) {
+        await chatbotDb.updateSessionWorkPlanInputRequest(sessionId, null, {
+          requireStillAwaiting: session.pendingWorkPlanInput!.requestId,
+        });
+      }
+
       if (nextInputStep?.inputRequest) {
         await chatbotDb.updateSessionWorkPlanInputRequest(
           sessionId,

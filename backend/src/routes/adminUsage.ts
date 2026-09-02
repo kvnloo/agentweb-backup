@@ -25,6 +25,7 @@ import {
   getUserXOrgRollup,
 } from "../services/usageAnalyticsService";
 import { twitterService } from "../services/twitterService";
+import { buildUnitEconomicsReport } from "../services/llmUnitEconomicsService";
 
 const router = express.Router();
 
@@ -309,6 +310,46 @@ router.get(
       console.error("[adminUsage] x-reconciliation: allocated totals failed:", error);
       return res.status(500).json({
         message: "Failed to compute X reconciliation",
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
+);
+
+/**
+ * ENG-1139 — per-billing-subject unit economics for a billing period.
+ *
+ * Admin-only, same per-route `authenticateToken + isAdmin` as every other route
+ * in this file (AC6: no customer surface can reach COGS, thresholds or the price
+ * book). Extends the ENG-353 admin surface rather than adding a parallel
+ * dashboard (AC7).
+ *
+ *   GET /api/admin/usage/unit-economics?month=YYYY-MM
+ *       [&tier=Pro][&state=hard_only][&account=<id-or-email substring>]
+ *       [&model=<model id>][&purchasedOnly=true]
+ */
+router.get(
+  "/usage/unit-economics",
+  authenticateToken,
+  isAdmin,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const month = String(req.query.month || "");
+      if (!MONTH_RE.test(month)) {
+        return res.status(400).json({ message: "month must be YYYY-MM" });
+      }
+      const report = await buildUnitEconomicsReport(month, {
+        tier: req.query.tier ? String(req.query.tier) : undefined,
+        usageState: req.query.state ? String(req.query.state) : undefined,
+        account: req.query.account ? String(req.query.account) : undefined,
+        model: req.query.model ? String(req.query.model) : undefined,
+        purchasedOnly: String(req.query.purchasedOnly || "") === "true",
+      });
+      return res.json(report);
+    } catch (error) {
+      console.error("[adminUsage] unit-economics failed:", error);
+      return res.status(500).json({
+        message: "Failed to build the unit-economics report",
         error: error instanceof Error ? error.message : "Unknown error",
       });
     }
