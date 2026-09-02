@@ -567,16 +567,13 @@ export async function repointStaleAccountReferences(
         candidateRevisions,
         PROMPT_REVISIONS_BUDGET_BYTES,
       );
-      const nextRevisions = trimmedRevisions.length > 0 ? trimmedRevisions : candidateRevisions.slice(-1);
-      // Same observability as the customer-facing edit path's shedOldest — this
-      // trim is otherwise invisible (nothing in any UI reads promptRevisions), so
-      // the log is the only trace that older history was dropped here.
-      if (nextRevisions.length < candidateRevisions.length) {
-        console.warn(
-          `${TAG} repoint for schedule ${s.scheduleId} is over the promptRevisions byte budget — `
-          + `dropped ${candidateRevisions.length - nextRevisions.length} of ${candidateRevisions.length} entries to fit`
-        );
-      }
+      // `trimListToItemBudget` guarantees `trimmedRevisions` fits the budget whenever
+      // it's non-empty — the empty case is the ONLY time the fallback below can still
+      // be over budget (the single newest entry alone exceeds it, kept anyway so the
+      // rewrite stays reversible). Track that distinction for the log below.
+      const usedFallback = trimmedRevisions.length === 0;
+      const nextRevisions = usedFallback ? candidateRevisions.slice(-1) : trimmedRevisions;
+      const droppedForBudget = candidateRevisions.length - nextRevisions.length;
 
       try {
         await scheduleDb.updateSchedule(
@@ -602,6 +599,24 @@ export async function repointStaleAccountReferences(
           continue;
         }
         throw writeError;
+      }
+      // Same observability as the customer-facing edit path's shedOldest — this
+      // trim is otherwise invisible (nothing in any UI reads promptRevisions), so
+      // the log is the only trace that older history was dropped here. Logged only
+      // AFTER the write above succeeds, so it never claims a drop that wasn't
+      // actually persisted (a lost race or a size rejection above `continue`s first).
+      if (droppedForBudget > 0) {
+        if (usedFallback) {
+          console.warn(
+            `${TAG} repoint for schedule ${s.scheduleId} kept only the newest promptRevisions entry — `
+            + `it alone still exceeds the byte budget after dropping ${droppedForBudget} older entries`
+          );
+        } else {
+          console.warn(
+            `${TAG} repoint for schedule ${s.scheduleId} is over the promptRevisions byte budget — `
+            + `dropped ${droppedForBudget} of ${candidateRevisions.length} entries to fit`
+          );
+        }
       }
       repointed += 1;
       console.log(`${TAG} repointed schedule ${s.scheduleId} from stale account(s) to ${newAccountId}`);
