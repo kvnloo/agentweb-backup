@@ -90,12 +90,26 @@ export function toolResultError(result: unknown): Error | null {
   // structured { success: false, ... } result (e.g. twitterOutreach's catch-all)
   // only carries the error MESSAGE by the time it gets here — the numeric HTTP
   // status the original error threw with (`.code`, e.g. twitter-api-v2's 403) is
-  // gone unless the handler also copies it onto the result object as `code`. When
-  // it does, attach it to the reconstructed Error so classifyToolErrorClass's
-  // status-based branch still fires instead of falling back to the generic
-  // 'Error' class the message text alone cannot match.
+  // gone unless the handler also copies it onto the result object. When it does,
+  // attach it to the reconstructed Error so classifyToolErrorClass's status-based
+  // branch still fires instead of falling back to the generic 'Error' class the
+  // message text alone cannot match.
+  //
+  // Two field names are read because two conventions already exist in the
+  // codebase: `code` (twitterOutreach/twitterManagePost, mirroring twitter-api-v2's
+  // own ApiResponseError.code) and `status` (handleHubspotApi/handleAttioApi,
+  // mirroring axios's error.response.status). Both are guarded to the HTTP range
+  // (100-599) — same guard classifyToolErrorClass already applies to `.code` —
+  // because this field is caller-supplied and not itself proof the number is an
+  // HTTP status: a handler that naively forwards a vendor BUSINESS error code
+  // (e.g. Meta Graph's `error.code`, which is not an HTTP status and can still
+  // land in 100-599 by coincidence) would misclassify through this same path.
+  // The guard cannot fully prevent that — it only rejects obvious garbage — so
+  // each call site is still responsible for extracting the correct field.
+  const isHttpRange = (n: unknown): n is number => typeof n === 'number' && n >= 100 && n <= 599;
   const withCode = (err: Error): Error => {
-    if (typeof obj.code === 'number') (err as { code?: number }).code = obj.code;
+    const code = isHttpRange(obj.code) ? obj.code : isHttpRange(obj.status) ? obj.status : undefined;
+    if (code !== undefined) (err as { code?: number }).code = code;
     return err;
   };
 

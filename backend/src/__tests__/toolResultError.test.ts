@@ -132,4 +132,31 @@ describe('toolResultError', () => {
       expect((err as { code?: number })?.code).toBeUndefined();
     });
   });
+
+  describe('ENG-1300 follow-up — a numeric `status` field is read the same way as `code`', () => {
+    it('attaches a top-level numeric status (HubSpot/Attio convention) to the reconstructed Error', () => {
+      const err = toolResultError({
+        success: false,
+        status: 403,
+        error: 'This app does not have MISSING_SCOPES permission for this call.',
+      });
+      expect(err).toMatchObject({ code: 403 });
+      expect(classifyToolErrorClass(err)).toBe('auth');
+    });
+
+    it('prefers `code` over `status` when a result somehow carries both', () => {
+      const err = toolResultError({ success: false, code: 429, status: 500, error: 'x' });
+      expect(err).toMatchObject({ code: 429 });
+    });
+
+    it('ignores a `status` outside the HTTP range (100-599) as garbage, not a real status', () => {
+      const err = toolResultError({ success: false, status: 3, error: 'x' });
+      expect((err as { code?: number })?.code).toBeUndefined();
+    });
+
+    it('ignores a non-numeric `code`/`status` (e.g. a string vendor code) rather than misreading it', () => {
+      const err = toolResultError({ success: false, code: 'ThrottlingException', status: 'rejected', error: 'x' });
+      expect((err as { code?: number })?.code).toBeUndefined();
+    });
+  });
 });
