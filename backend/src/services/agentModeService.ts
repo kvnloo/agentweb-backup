@@ -1343,9 +1343,15 @@ export class AgentModeService {
   // 2026-08-19 (Harsha, live picker review): Auto/default moved off Opus,
   // through GLM 5.2 and GPT-5.6 Luna, to Gemini 3.7 Flash — Google's newest
   // Flash-line model (GA 2026-08-13), cheap ($0.75/$3.75 per 1M, Google's own
-  // direct rate — not a multi-provider OpenRouter blend), and it dominates
+  // direct rate — not a multi-provider OpenRouter blend), and it dominated
   // every other model in the `gemini-flash` family band for band.
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.7-flash';
+  // 2026-09-02 (Harsha, in-session approval): moved again, from Gemini 3.7
+  // Flash to Gemini 3.8 Flash. Same family/tier/pricing, 3.8 dominates 3.7 on
+  // quality (59 vs 56) — the dominance system correctly auto-flagged 3.7
+  // legacy the moment 3.8 was added to the catalog, and leaving the default
+  // pinned to a legacy model would contradict AC2 of the acceptance suite
+  // this default has always carried (see agentModeService.defaultModel*.test.ts).
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.8-flash';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
