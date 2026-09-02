@@ -610,6 +610,157 @@ export async function recordLoopAttributionOutcome(
   return { status: 'applied' };
 }
 
+export interface LinearIssueSummary {
+  identifier: string;
+  issueId: string;
+  title: string;
+  priority: number;
+  state: string;
+  stateType: string;
+  labels: string[];
+  assigneeName: string | null;
+  assigneeEmail: string | null;
+  updatedAt: string;
+}
+
+export interface LinearRelatedIssue {
+  identifier: string;
+  title: string;
+  stateType: string;
+}
+
+export interface LinearIssueDetail extends LinearIssueSummary {
+  description: string;
+  team: string;
+  comments: IssueCommentDetail[];
+  subIssues: { identifier: string; title: string; state: string; stateType: string }[];
+  blocks: LinearRelatedIssue[];
+  blockedBy: LinearRelatedIssue[];
+  related: LinearRelatedIssue[];
+}
+
+/**
+ * Search/list issues with filters — the general-purpose admin read behind board-triage tooling
+ * (ENG-789). team defaults to ENG; priorities follow Linear's enum (1=Urgent..4=Low).
+ */
+export async function searchIssues(params: {
+  teamKey?: string;
+  stateTypes?: string[];
+  priorities?: number[];
+  labelName?: string;
+  assigneeEmail?: string;
+  limit?: number;
+}): Promise<LinearIssueSummary[]> {
+  const filter: Record<string, any> = { team: { key: { eq: params.teamKey || TEAM_KEY } } };
+  if (params.stateTypes?.length) filter.state = { type: { in: params.stateTypes } };
+  if (params.priorities?.length) filter.priority = { in: params.priorities };
+  if (params.labelName) filter.labels = { name: { eq: params.labelName } };
+  if (params.assigneeEmail) filter.assignee = { email: { eq: params.assigneeEmail } };
+  const data = await linearGraphQL(
+    `query($filter: IssueFilter!, $limit: Int!) {
+      issues(first: $limit, orderBy: updatedAt, filter: $filter) {
+        nodes {
+          id identifier title priority updatedAt
+          state { name type }
+          labels(first: 50) { nodes { name } }
+          assignee { name email }
+        }
+      }
+    }`,
+    { filter, limit: params.limit ?? 50 },
+  );
+  return (data?.issues?.nodes || []).map((n: any) => ({
+    identifier: n.identifier,
+    issueId: n.id,
+    title: n.title || '',
+    priority: typeof n.priority === 'number' ? n.priority : 0,
+    state: n.state?.name || '',
+    stateType: n.state?.type || '',
+    labels: (n.labels?.nodes || []).map((l: any) => l.name),
+    assigneeName: n.assignee?.name ?? null,
+    assigneeEmail: n.assignee?.email ?? null,
+    updatedAt: n.updatedAt || '',
+  }));
+}
+
+/** Resolve an issue ref ("ENG-42" or a raw Linear uuid) to its internal id. */
+async function resolveIssueId(ref: string): Promise<string> {
+  const m = /^([A-Za-z]+)-(\d+)$/.exec(ref.trim());
+  if (!m) return ref.trim();
+  const data = await linearGraphQL(
+    `query($tk: String!, $n: Float!) { issues(filter: { team: { key: { eq: $tk } }, number: { eq: $n } }, first: 1) { nodes { id } } }`,
+    { tk: m[1].toUpperCase(), n: Number(m[2]) },
+  );
+  const id = data?.issues?.nodes?.[0]?.id;
+  if (!id) throw new Error(`Linear issue "${ref}" not found`);
+  return id;
+}
+
+/**
+ * Full read of a single issue for board triage (ENG-789): detail, comments, and sub-issue /
+ * blocking relationships in one call. `relations`/`inverseRelations` are outgoing/incoming
+ * relation edges (Linear's directional model) — a "blocks" edge FROM this issue means this issue
+ * blocks the related one; a "blocks" edge INTO this issue (inverseRelations) means this issue is
+ * blocked by the related one.
+ */
+export async function getIssueFullDetail(ref: string): Promise<LinearIssueDetail> {
+  const issueId = await resolveIssueId(ref);
+  const data = await linearGraphQL(
+    `query($id: String!) {
+      issue(id: $id) {
+        id identifier title description priority updatedAt
+        state { name type }
+        team { key }
+        labels(first: 50) { nodes { name } }
+        assignee { name email }
+        comments(first: 250, orderBy: createdAt) { nodes { body createdAt } pageInfo { hasNextPage } }
+        children(first: 50) { nodes { identifier title state { name type } } }
+        relations(first: 50) { nodes { type relatedIssue { identifier title state { type } } } }
+        inverseRelations(first: 50) { nodes { type relatedIssue { identifier title state { type } } } }
+      }
+    }`,
+    { id: issueId },
+  );
+  const issue = data?.issue;
+  if (!issue) throw new Error(`Linear issue "${ref}" not found`);
+  if (issue.comments?.pageInfo?.hasNextPage) {
+    console.error(`[linear] issue ${ref} has >250 comments — read connector page is truncated`);
+  }
+  const toRelated = (nodes: any[]): LinearRelatedIssue[] => nodes
+    .filter((r) => r.relatedIssue)
+    .map((r) => ({
+      identifier: r.relatedIssue.identifier,
+      title: r.relatedIssue.title || '',
+      stateType: r.relatedIssue.state?.type || '',
+    }));
+  const outgoing: any[] = issue.relations?.nodes || [];
+  const incoming: any[] = issue.inverseRelations?.nodes || [];
+  return {
+    identifier: issue.identifier,
+    issueId: issue.id,
+    title: issue.title || '',
+    description: issue.description || '',
+    priority: typeof issue.priority === 'number' ? issue.priority : 0,
+    state: issue.state?.name || '',
+    stateType: issue.state?.type || '',
+    team: issue.team?.key || '',
+    labels: (issue.labels?.nodes || []).map((l: any) => l.name),
+    assigneeName: issue.assignee?.name ?? null,
+    assigneeEmail: issue.assignee?.email ?? null,
+    updatedAt: issue.updatedAt || '',
+    comments: (issue.comments?.nodes || []).map((c: any) => ({ body: c.body || '', createdAt: c.createdAt || '' })),
+    subIssues: (issue.children?.nodes || []).map((c: any) => ({
+      identifier: c.identifier,
+      title: c.title || '',
+      state: c.state?.name || '',
+      stateType: c.state?.type || '',
+    })),
+    blocks: toRelated(outgoing.filter((r) => r.type === 'blocks')),
+    blockedBy: toRelated(incoming.filter((r) => r.type === 'blocks')),
+    related: toRelated([...outgoing, ...incoming].filter((r) => r.type === 'related')),
+  };
+}
+
 export interface EngineeringBugStats {
   netOpenBugs: number;
   opened7d: number;
