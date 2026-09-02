@@ -69,6 +69,24 @@ describe('promptRisksFabricatedMetrics (ENG-1027)', () => {
     expect(promptRisksFabricatedMetrics('A photo of two friends chatting at a cafe table over coffee')).toBe(false);
   });
 
+  // ENG-1027 (round 4): live-replaying the EXACT original bug-reporting scenario
+  // post-merge — the real customer's verbatim creative brief for the "A4" image
+  // that first surfaced this ticket — reproduced the fabricated-numbers failure in
+  // production with the check never firing. The prompt says "spreadsheet", which
+  // the regex never covered even after the round-3 hardening. This is the literal
+  // scenario that reported ENG-1027, so it's the most important case to cover.
+  it('flags a "budget review spreadsheet" prompt (the literal original ENG-1027 scenario)', () => {
+    const prompt =
+      'A realistic, tight crop macro desk photograph of a computer monitor displaying a budget review ' +
+      'spreadsheet, taken slightly from the side with natural workplace lighting and shallow depth of field. ' +
+      'One specific row in sharp focus is clearly labeled \'AI + marketing automation\'. In that row, the spend ' +
+      'cell is covered with a solid dark redacted block, and the \'Pipeline attributed\' cell shows only a ' +
+      'single em dash. The surrounding spreadsheet rows above and below are soft and out of focus with generic ' +
+      'non-specific labels and no readable numbers. Absolutely no people, no invented dollar amounts, no fake ' +
+      'percentages, and no fake customer names.';
+    expect(promptRisksFabricatedMetrics(prompt)).toBe(true);
+  });
+
   it('handles empty/non-string input', () => {
     expect(promptRisksFabricatedMetrics('')).toBe(false);
     expect(promptRisksFabricatedMetrics(undefined as any)).toBe(false);
