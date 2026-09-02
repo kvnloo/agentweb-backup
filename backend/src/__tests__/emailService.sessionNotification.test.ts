@@ -126,6 +126,21 @@ describe('emailService.sendSessionNotificationEmail', () => {
       expect(embeddedCommaMember).not.toBe(splitRecipientsMember);
     });
 
+    it('de-duplicates repeated recipients so a listed-twice call collides with a listed-once call (CodeRabbit)', async () => {
+      // Sorting alone does not collapse repeats: ["a@x.com","a@x.com"] and ["a@x.com"]
+      // must produce the SAME claim member, or a call that happens to list the same
+      // address twice would claim a distinct signature from a later, legitimate call
+      // listing it once — letting that second call slip past the guard.
+      jest.spyOn(emailService, 'sendEmailStrict').mockResolvedValue({ messageId: 'msg-1' });
+
+      await emailService.sendSessionNotificationEmail(['a@x.com', 'a@x.com'], 'session-dedup-1', 'Report');
+      await emailService.sendSessionNotificationEmail(['a@x.com'], 'session-dedup-1', 'Report');
+
+      const [, repeatedMember] = (settingsService.claimSetMember as jest.Mock).mock.calls[0];
+      const [, singleMember] = (settingsService.claimSetMember as jest.Mock).mock.calls[1];
+      expect(repeatedMember).toBe(singleMember);
+    });
+
     // A prior version of this guard folded a hash of subject+content into the claim
     // member specifically so a same-session, same-recipients call with DIFFERENT
     // content would claim independently. Reverted: re-derived against the actual
