@@ -713,5 +713,34 @@ describe('AgentModeService - callMetaAdsInsightsApiWrapper', () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain('Meta Insights Job timed out.');
     });
+
+    // ENG-1300: this wrapper talks to the Graph API directly via axios (no SDK),
+    // so the real HTTP status lives at error.response.status — never the Meta
+    // business `.code` nested in response.data.error, which only coincidentally
+    // overlaps the HTTP range.
+    it('ENG-1300: a 403 (error.response.status, axios-shaped) classifies as auth/config end-to-end', async () => {
+      mockedAxios.post.mockRejectedValueOnce({
+        response: {
+          status: 403,
+          data: { error: { message: 'Permission denied for this ad account', code: 200 } },
+        },
+      });
+
+      const result = await service.callMetaAdsInsightsApiWrapper(userId, {
+        account_id: '922903076601160',
+        object_type: 'account',
+        fields: ['impressions'],
+        date_preset: 'last_30d',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(403);
+      const { toolResultError } = await import('../utils/toolResultError');
+      const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+      const { classifyToolFailureType } = await import('../utils/toolFailureType');
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    });
   });
 });
