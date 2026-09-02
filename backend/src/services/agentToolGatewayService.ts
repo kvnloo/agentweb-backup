@@ -736,6 +736,34 @@ export function validateAndRepairToolArgs(
   for (const key of Object.keys(repairedArgs)) {
     if (properties[key]) continue;
 
+    // ENG-1668: a common LLM mistake — inventing a wrapper object (e.g.
+    // `params: { criterion_resource_name: ... }`) around fields that actually
+    // belong at the top level, instead of matching the flat schema. Verified in
+    // production session 87334a61-2e06-4018-960e-9e7759403423: the model supplied
+    // every required resource-name argument, just nested one level too deep, and
+    // the handler reported them as missing since it only reads top-level args.
+    // Hoist any of the wrapper's OWN keys that match a currently-missing
+    // top-level property, so a value the model DID provide isn't silently
+    // dropped. Only fills empty slots — never overwrites a value already
+    // present at the top level — and only applies to a key that isn't itself a
+    // declared property, so a genuinely nested schema field (e.g. this same
+    // tool's `address` object for CAMPAIGN ADD_PROXIMITY) is left untouched.
+    const wrapperValue = repairedArgs[key];
+    if (wrapperValue && typeof wrapperValue === 'object' && !Array.isArray(wrapperValue)) {
+      const nested = wrapperValue as Record<string, unknown>;
+      const hoistedKeys = Object.keys(nested).filter((nestedKey) =>
+        properties[nestedKey] && repairedArgs[nestedKey] === undefined
+      );
+      if (hoistedKeys.length > 0) {
+        for (const nestedKey of hoistedKeys) {
+          repairedArgs[nestedKey] = nested[nestedKey];
+          repairs.push(`${key}.${nestedKey}->${nestedKey}`);
+        }
+        delete repairedArgs[key];
+        continue;
+      }
+    }
+
     const aliasTarget = findAliasTarget({
       key,
       value: repairedArgs[key],
