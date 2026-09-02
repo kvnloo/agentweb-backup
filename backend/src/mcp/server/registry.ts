@@ -38,8 +38,9 @@ export interface McpToolHandler {
    * ENG-1276 follow-up — declares that EVERY call to this tool, for ANY
    * arguments, has no external side effect (nothing published, sent, or
    * written to a customer's live account/CRM — pure read/compute/research).
-   * Consulted by the scheduled-run conditional-skip veto
-   * (`isReadOnlyToolName` in agentModeController.ts) so a schedule's "check
+   * Consulted by the scheduled-run conditional-skip veto and the ENG-1297
+   * read-only press circuit breaker (`isReadOnlyToolName` in
+   * utils/toolWriteClassification.ts) so a schedule's "check
    * something first" step doesn't get misclassified as a write just because
    * its name doesn't lead with get/read/list/... — the exact bug that broke
    * perform_data_analysis (ENG-1276).

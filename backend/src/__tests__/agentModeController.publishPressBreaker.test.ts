@@ -12,6 +12,7 @@ jest.mock('../services/subscriptionService', () => ({
   getAllowedFunctionCalls: jest.fn(async () => [
     'post_on_connected_account',
     'get_marketing_tips',
+    'save_memory',
     'create_work_plan',
     'modify_work_plan',
     'set_work_plan_status',
@@ -206,15 +207,22 @@ describe('runScheduledChat — publish-press circuit breaker (ENG-947)', () => {
     expect((result as any).publishHeldForApproval).toBeUndefined();
   });
 
-  it('leaves NON-publish requirements on the full retry budget', async () => {
-    const readOnlySchedule = {
+  it('leaves a non-publish WRITE requirement on the full retry budget', async () => {
+    // save_memory is a write (it has an external side effect) but not publish-classified
+    // and not read-only, so NEITHER the ENG-947 publish breaker NOR the ENG-1297
+    // read-only breaker should touch it — this is the ENG-947 breaker's own scope
+    // boundary. (get_marketing_tips used to sit here, but it's read-only and is now
+    // deliberately capped early by the ENG-1297 breaker — see
+    // readOnlyPressCircuitBreaker.test.ts and the scheduledChat.test.ts coverage for
+    // that case.)
+    const nonPublishWriteSchedule = {
       ...publishSchedule,
-      requiredFunctionCalls: ['get_marketing_tips'],
+      requiredFunctionCalls: ['save_memory'],
     };
-    mockScheduleDb.getScheduleById.mockResolvedValue(readOnlySchedule as any);
+    mockScheduleDb.getScheduleById.mockResolvedValue(nonPublishWriteSchedule as any);
     mockWorker.runInWorker.mockResolvedValue(workerReply([], 'Here is a summary.') as any);
 
-    const result = await runScheduledChat(readOnlySchedule, 'kevin', true);
+    const result = await runScheduledChat(nonPublishWriteSchedule, 'kevin', true);
 
     expect(mockWorker.runInWorker).toHaveBeenCalledTimes(20);
     expect(result.attempt).toBe(20);

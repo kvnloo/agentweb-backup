@@ -13,7 +13,7 @@
  *   timeout | auth | rate_limit | quota_exceeded | invalid_args | not_found |
  *   network | upstream_5xx | policy_blocked | repeated_failure |
  *   tool_unavailable | upstream_rejected | empty_result | invalid_output |
- *   subscription_blocked
+ *   subscription_blocked | truncated_response
  *
  * The three trailing classes were added 2026-06-14 after a 7-day production
  * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
@@ -57,6 +57,11 @@ const GATEWAY_NAME_CLASSES: Record<string, string> = {
   // Typed X credit-exhaustion (ENG-664) — classify by name so a 402 clusters as
   // a billing stop even when it crosses a module/mock boundary.
   XCreditsExhaustedError: 'payment_required',
+  // A tool call's arguments were a clean-but-incomplete JSON prefix — the
+  // stream was cut off mid-generation, not a formatting mistake (ENG-1477
+  // follow-up; see repairToolCallArguments.ts). Distinct from invalid_args so
+  // the model gets retry guidance instead of "fix your arguments first".
+  TruncatedToolCallArgumentsError: 'truncated_response',
 };
 
 function classFromStatus(status: number): string | null {
@@ -116,7 +121,7 @@ function classFromMessage(message: string): string | null {
 
   // Bad arguments the model emitted — schema-validation rejections (the
   // contract layer rejects before execution) plus classic validation phrasing.
-  if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short/.test(m)) return 'invalid_args';
+  if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short|too large to save|is too large/.test(m)) return 'invalid_args';
 
   if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials|not authorized|do not have permission|permission to|no secrets configured|not a member of channel|account connected|account not configured|not configured to access/.test(m)) return 'auth';
   if (/enotfound|econnrefused|econnreset|eai_again|socket hang up|network error|fetch failed/.test(m)) return 'network';

@@ -12,7 +12,7 @@
  * This module derives an explicit `Retryable: yes/no` verdict + actionable next
  * step from the toolErrorClassifier classes (utils/toolErrorClassifier.ts):
  *
- *   rate_limit / timeout / network / upstream_5xx → transient → retryable
+ *   rate_limit / timeout / network / upstream_5xx / truncated_response → transient → retryable
  *   auth / upstream_rejected / invalid_args (schema reject) / tool_unavailable /
  *   invalid_output / policy_blocked / subscription_blocked
  *                                                  → terminal  → NOT retryable
@@ -37,6 +37,11 @@ export const RETRYABLE_ERROR_CLASSES: ReadonlySet<string> = new Set([
   'timeout',
   'network',
   'upstream_5xx',
+  // A tool call's arguments were a clean-but-incomplete JSON prefix (the
+  // stream got cut off, not a bad-args mistake) — retrying the identical
+  // call can plausibly produce a complete response next time (ENG-1477
+  // follow-up).
+  'truncated_response',
 ]);
 
 /**
@@ -84,6 +89,7 @@ const NEXT_STEP_BY_CLASS: Record<string, string> = {
   policy_blocked: 'the tool gateway policy blocked this call. Do NOT retry it — follow the policy guidance or tell the user what is blocked.',
   not_found: 'the target was not found. Do NOT repeat the identical call — verify the identifier/name first or ask the user.',
   empty_result: 'the call succeeded but returned nothing. Do NOT repeat the identical call — broaden the query or try a different source.',
+  truncated_response: 'your previous response for this call was cut off mid-generation — there is nothing wrong with the arguments themselves. Retry the SAME tool call and emit the complete arguments in one go, including every required field.',
 };
 
 const DEFAULT_NEXT_STEP =

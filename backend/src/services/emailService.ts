@@ -10,6 +10,7 @@ import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, reso
 import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
+import { resetDateFromMonth, formatResetDateLong } from '../utils/usageCycle';
 
 // ENG-351: resolve {{cite:N}} markers in Emma's text to inline source attributions, using the
 // citation metadata on the session's last assistant message. Email has no chip renderer, so this
@@ -1342,6 +1343,10 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       // also-exceeded token counter would be worded in tokens, contradicting the
       // in-app message the same block produces.
       costEnforced?: boolean;
+      // ENG-1344: the billing month (`YYYY-MM`), used to name the reset DATE.
+      // Optional only because this type under-declared the `TokenUsageStatus` the
+      // sole caller has always passed whole — every runtime call already carries it.
+      month?: string;
     }
   ) {
     try {
@@ -1370,6 +1375,14 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       const usageLine = `<strong>Usage:</strong> ${limitPercent}% of your monthly allowance used.`;
       const usageLineText = `Usage: ${limitPercent}% of your monthly allowance used.`;
       const allowanceResetNoun = 'usage allowance';
+      // ENG-1344: "resets at the start of each billing period" is the exact
+      // vagueness the escalating customer could not decode. Name the day when we
+      // can derive it; keep the old sentence when we cannot, rather than guess.
+      const resetIso = resetDateFromMonth(usageStatus.month);
+      const resetLabel = formatResetDateLong(resetIso);
+      const allowanceResetClause = resetLabel
+        ? `Your ${allowanceResetNoun} resets on ${resetLabel}.`
+        : `Your ${allowanceResetNoun} resets at the start of each billing period.`;
 
       const html = `
         <html>
@@ -1403,7 +1416,7 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
                   ${usageLine}
                 </p>
                 <p style="margin: 10px 0 0 0; line-height: 1.6;">
-                  Your ${allowanceResetNoun} resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+                  ${allowanceResetClause} To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
                 </p>
               </div>
             </div>
@@ -1425,7 +1438,7 @@ Your scheduled chat "${scheduleName}" was scheduled to run at ${currentDate}, bu
 
 ${usageLineText}
 
-Your ${allowanceResetNoun} resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+${allowanceResetClause} To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
 
 ---
 This is an automated email from your scheduled chat.
@@ -1967,6 +1980,53 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     content: string,
     subject?: string
   ) {
+    const emailListForClaim = Array.isArray(toEmails) ? toEmails : [toEmails];
+    // ENG-1297: a scheduled run's automated completion nudge can re-invoke this after
+    // the notification for THIS session + recipient set has already gone out (the
+    // nudge fires because an unrelated requirement is still unmet, not because the
+    // notification failed) — the observed production outcome was a duplicate report
+    // email. Claim atomically BEFORE sending so a repeat call for the same session
+    // and recipients is a no-op instead of a second send.
+    //
+    // Deliberately NOT content-aware (a prior version of this guard hashed
+    // subject+content into the claim member so a genuinely different notification
+    // to the same recipients wouldn't be permanently suppressed). Re-derived
+    // against the actual production incident this ticket reports (session
+    // 0050a0b4-…): the scheduler's nudge caused the SAME run to re-run its
+    // research, regenerate an "updated" report, and re-notify the same recipient
+    // — different content both times (9588 vs 11359 chars, a restructured report).
+    // A content hash produces a different signature for each call and does NOT
+    // suppress that duplicate, so it does not fix the bug it was added for.
+    // Recipient+session is coarser — a genuinely distinct second notification to
+    // the same recipients later in the same session is also suppressed — but that
+    // trade is the one that actually stops the proven regression.
+    //
+    // NOT superseded by the read-only press circuit breaker
+    // (readOnlyPressCircuitBreaker.ts): that breaker still allows exactly ONE
+    // nudge per the ticket's own recommendation ("cap nudges, suggest 1"), and in
+    // the real incident the duplicate send happened on the response to that
+    // FIRST, still-permitted nudge — the model complied immediately, so the
+    // breaker's budget was never exhausted before the second notify_session call
+    // went out. The breaker only caps the COST of a run that keeps refusing (the
+    // sibling session in this ticket, d1f7942d-…); this guard is what actually
+    // stops the duplicate SEND when a run complies instead.
+    // JSON.stringify (not a bare comma-join) keeps the recipient signature
+    // collision-safe against an embedded comma in a single recipient entry.
+    // De-duplicated via Set before sorting (CodeRabbit): sort() alone does not
+    // collapse repeats, so a call listing the same address twice would claim a
+    // different signature than a later, legitimate call listing it once —
+    // letting that second call slip past the guard as if it were a distinct
+    // recipient set.
+    const claimMember = JSON.stringify(
+      [...new Set(emailListForClaim.map(e => e.trim().toLowerCase()))].sort()
+    );
+    const notifyClaimKey = `notify-session:${sessionId}`;
+    const claimed = await settingsService.claimSetMember(notifyClaimKey, claimMember);
+    if (!claimed) {
+      console.log(`Session notification to ${emailListForClaim.join(', ')} for session ${sessionId} was already sent — skipping duplicate.`);
+      return { sent: false, duplicate: true };
+    }
+
     try {
       const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -2056,9 +2116,18 @@ Sent via AgentWeb: ${customerFrontendUrl}
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       await this.sendEmailStrict(emailList, emailSubject, text, html);
       console.log(`Session notification email sent to: ${emailList.join(', ')}`);
+      return { sent: true, duplicate: false };
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending session notification email to ${emailList.join(', ')}:`, error);
+      // The primary action failed, so release the claim — a retry (nudge-driven or
+      // otherwise) must be allowed to actually send, not get silently swallowed as
+      // "already sent" for a notification that never went out.
+      try {
+        await settingsService.releaseSetMember(notifyClaimKey, claimMember);
+      } catch (releaseError) {
+        console.error(`Failed to release notify-session claim for session ${sessionId}:`, releaseError);
+      }
       throw error; // Let the tool surface the error to the agent
     }
   },
