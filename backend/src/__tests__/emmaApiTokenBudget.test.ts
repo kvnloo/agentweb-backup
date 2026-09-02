@@ -24,7 +24,11 @@ jest.mock('../middleware/auth', () => ({
 }));
 
 const mockCheckTokenUsage = jest.fn();
+// Spread the real module: replacing it wholesale dropped `toCustomerTokenUsage`,
+// so the projection silently returned undefined the moment this path started
+// using it. Only `checkTokenUsage` needs to be a stub.
 jest.mock('../services/tokenUsageService', () => ({
+  ...jest.requireActual('../services/tokenUsageService'),
   checkTokenUsage: (...args: any[]) => mockCheckTokenUsage(...args),
 }));
 

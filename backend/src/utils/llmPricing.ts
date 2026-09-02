@@ -95,6 +95,15 @@ export function cacheWriteCost(
 // the lookup and record $0 — the exact blind spot ENG-200 exists to close.
 const FABLE_5_PRICE = withDerivedCache(10, 50);
 const HAIKU_4_5_PRICE = withDerivedCache(1, 5);
+// Fable 5.1 (released 2026-09-01): same $10/$50 base rate as Fable 5, but
+// Anthropic cut cache-read pricing 75% at this generation ($1.00 -> $0.25 per
+// 1M cached input tokens) — confirmed live on openrouter.ai/anthropic/claude-fable-5.1
+// (Anthropic-served row) 2026-09-01. withDerivedCache's 10%-of-input convention
+// would give $1.00, which is 4x too high for this specific model; the override
+// below is required, not optional, or every Fable 5.1 cache-read call
+// over-bills 4x. cacheWritePerM is left on the standard 125%-of-input
+// convention (Anthropic did not publish a changed write rate).
+const FABLE_5_1_PRICE: ModelPrice = { ...withDerivedCache(10, 50), cacheReadPerM: 0.25 };
 
 /**
  * Token-priced models. Sources:
@@ -204,6 +213,18 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'openrouter/openai/gpt-5.6-sol': withDerivedCache(5.0, 30.0),
   'openrouter/openai/gpt-5.6-terra': withDerivedCache(2.5, 15.0),
   'openrouter/openai/gpt-5.6-luna': withDerivedCache(1.0, 6.0),
+  // ENG-199/ENG-1685: Claude Fable 5.1 (Anthropic, released 2026-09-01),
+  // routed through OpenRouter per the ENG-9/ENG-1414 gateway convention —
+  // same as every other OpenRouter entry in this block, NOT the direct
+  // Bedrock/Vertex path FABLE_5_1_PRICE's sibling FABLE_5_PRICE also serves
+  // (see 'claude-fable-5' / 'anthropic.claude-fable-5' above; that pair
+  // predates the OpenRouter migration and stays for the ids that still
+  // resolve there). Live-verified against openrouter.ai/anthropic/claude-fable-5.1
+  // 2026-09-01: $10/$50 base rate (unchanged from Fable 5), cache-read cut
+  // 75% to $0.25/1M (Anthropic-served row — OpenRouter's Balanced routing
+  // mode's default provider). FABLE_5_1_PRICE already encodes the override;
+  // reused here (not re-derived) so the two ids can never drift on price.
+  'openrouter/anthropic/claude-fable-5.1': FABLE_5_1_PRICE,
   'openrouter/x-ai/grok-4.6': withDerivedCache(2.0, 6.0), // was $3/$15 — stale, ~2x over live
   'openrouter/deepseek/deepseek-v4-pro': withDerivedCache(0.657, 1.315), // live "62% off" promo; lowest-confidence entry in this batch — the promo makes list price hard to reconstruct cleanly, re-verify if this model becomes cost-sensitive
   'openrouter/deepseek/deepseek-v4-flash': withDerivedCache(0.068, 0.168), // was ~2x over live
@@ -271,6 +292,25 @@ export const VIDEO_GENERATION_PRICING_USD_PER_CLIP: Record<string, number> = {
  * Single source of truth for image cost — used by the generation source meter and
  * agent-mode session accounting alike.
  */
+/**
+ * True when `model` is priced PER GENERATION (an image, or a video clip) rather
+ * than per token.
+ *
+ * ENG-1691: these models are billed by the artefact, so token counts describe
+ * nothing chargeable about the call. Metering one through the token path writes
+ * a $0 row alongside the real per-generation row — two ledger entries for one
+ * API call, on a model that generates no text. `llmClients.ts` already states
+ * the rule ("NOT for image/video, which are per-generation priced"); this makes
+ * it checkable instead of a comment a caller has to have read.
+ */
+export function isPerGenerationPriced(model: string | undefined | null): boolean {
+  if (!model) return false;
+  return (
+    Object.prototype.hasOwnProperty.call(IMAGE_GENERATION_PRICING_USD, model) ||
+    Object.prototype.hasOwnProperty.call(VIDEO_GENERATION_PRICING_USD_PER_CLIP, model)
+  );
+}
+
 export function imageGenerationCostUsd(model: string): number {
   return IMAGE_GENERATION_PRICING_USD[model] ?? 0.04;
 }
