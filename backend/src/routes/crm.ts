@@ -23,6 +23,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
@@ -6211,17 +6212,24 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     const riskyLeadsList = leads.filter((l: any) => l.email && validationStatus(l) === 'risky');
     const undeliverableCount = undeliverableLeadsList.length;
     const riskyCount = riskyLeadsList.length;
-    // Eligibility = has email && not DNC && not undeliverable. Single boolean
-    // filter (not arithmetic subtraction) so overlapping categories don't
-    // produce negative counts.
+    // ENG-1194: catches malformed addresses and provider-disallowed test domains
+    // (e.g. example.com) that the async email_validation enrichment never covers
+    // — leads it hasn't run against still had a blank status, so they slipped
+    // through as "eligible" and failed with a 422 at send time.
+    const invalidLeadsList = leads.filter((l: any) => l.email && !isEligibleGroupEmailRecipient(l.email));
+    const invalidCount = invalidLeadsList.length;
+    // Eligibility = has email && not DNC && not undeliverable && not
+    // malformed/test-domain. Single boolean filter (not arithmetic
+    // subtraction) so overlapping categories don't produce negative counts.
     const eligibleLeads = leads.filter((l: any) =>
-      l.email && !isDoNotContact(l) && validationStatus(l) !== 'undeliverable',
+      l.email && !isDoNotContact(l) && validationStatus(l) !== 'undeliverable' && isEligibleGroupEmailRecipient(l.email),
     ).length;
 
     // Return small samples (first 50) of email lists so the UI modals can show
     // exactly which addresses fall in each bucket. Cap at 50 to keep payload tight.
     const undeliverableEmails = undeliverableLeadsList.slice(0, 50).map((l: any) => l.email);
     const riskyEmails = riskyLeadsList.slice(0, 50).map((l: any) => l.email);
+    const invalidEmails = invalidLeadsList.slice(0, 50).map((l: any) => l.email);
 
     return res.json({
       totalLeads,
@@ -6231,8 +6239,10 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
       noEmailCount,
       undeliverableCount,
       riskyCount,
+      invalidCount,
       undeliverableEmails,
       riskyEmails,
+      invalidEmails,
     });
   } catch (error) {
     console.error('Error previewing group email:', error);
@@ -6273,8 +6283,10 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
 
     let leads = await fetchAllLeadsForGroupEmail(listId);
 
-    // Only consider eligible leads (have email, not do-not-contact/unsubscribed)
-    const eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
+    // Only consider eligible leads (have email, not do-not-contact/unsubscribed, valid syntax/domain)
+    const eligibleLeads = leads.filter(
+      (l: any) => l.email && !isDoNotContact(l) && isEligibleGroupEmailRecipient(l.email),
+    );
     const eligibleCount = eligibleLeads.length;
 
     // Auto-fix dark mode: inject color-scheme opt-out before format check so
@@ -6377,6 +6389,14 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     // Separate eligible leads from skipped ones (do-not-contact includes unsubscribed + DNC)
     const skippedDoNotContact = leads.filter((l: any) => isDoNotContact(l)).length;
     let eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
+
+    // ENG-1194: malformed addresses and provider-disallowed test domains (e.g.
+    // example.com) always fail at the provider — same validator preview uses,
+    // so preview's eligible count matches what's actually attempted here.
+    // Unlike undeliverable, there's no override: these can never be sent.
+    const beforeInvalidCount = eligibleLeads.length;
+    eligibleLeads = eligibleLeads.filter((l: any) => isEligibleGroupEmailRecipient(l.email));
+    const skippedInvalid = beforeInvalidCount - eligibleLeads.length;
 
     // Filter undeliverable emails. Two override modes:
     //   - includeUndeliverableEmails: string[]  → per-address whitelist (Proposal B)
@@ -6545,6 +6565,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedDoNotContact,
       skippedMissingVars,
       skippedUndeliverable,
+      skippedInvalid,
       skippedDueToLimit,
       skippedLeadIds,
       stoppedEarlyReason,

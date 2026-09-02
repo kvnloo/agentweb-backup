@@ -726,8 +726,8 @@ describe('AgentModeService - createHtmlFile', () => {
       );
     });
 
-    it('should truncate long titles in filename', async () => {
-      const longTitle = 'A'.repeat(100);
+    it('caps very long titles at 150 chars, still bounded (ENG-1686: was 50, too aggressive)', async () => {
+      const longTitle = 'A'.repeat(300);
       const result = await (agentModeService as any).createHtmlFile(
         longTitle,
         'Test content',
@@ -736,9 +736,11 @@ describe('AgentModeService - createHtmlFile', () => {
         'session123'
       );
 
-      // Filename should be truncated to 50 characters (plus extension)
-      expect(result.filename.length).toBeLessThan(100);
-      expect(result.filename).toMatch(/^html_\d+_A{1,50}\.html$/);
+      // Filename should be truncated to 150 sanitized chars (plus prefix/extension).
+      // ENG-1686 raised this from 50 -- the old cap cut real report titles
+      // mid-word (Kraftersland: "...Weekly_Performance_Report" -> "...Repor").
+      expect(result.filename.length).toBeLessThan(200);
+      expect(result.filename).toMatch(/^html_\d+_A{1,150}\.html$/);
     });
 
     it('should default to document mode and report an HTML file', async () => {
