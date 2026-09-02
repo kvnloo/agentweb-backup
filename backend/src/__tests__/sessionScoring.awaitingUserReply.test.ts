@@ -16,9 +16,12 @@
  *      cannot mask it (ENG-392).
  *   2. applyAwaitingReplyGuard: a narrow, code-level backstop that raises a
  *      self-contradictory verdict (goalCompletion <=3, dataAccuracy and
- *      outputQuality both >=4, and a reason with NO criticism of the
- *      assistant) to a passing score, without touching any session where the
- *      judge's own reason actually finds fault.
+ *      outputQuality both >=4, a reason that AFFIRMATIVELY states the
+ *      awaiting-reply/ended-before-response rationale, and no criticism of
+ *      the assistant scoped to a clause that actually names the assistant as
+ *      its subject) to a passing score, without touching any session where
+ *      the judge's own reason actually finds fault or where the low score has
+ *      some other, unstated cause.
  */
 import {
   scoreSession,
@@ -148,7 +151,14 @@ describe('SessionScoring - awaiting user reply (ENG-1296)', () => {
     expect(result.dimensions?.goalCompletion).toBeGreaterThanOrEqual(4);
   });
 
-  it('REGRESSION FIXTURE (session 28a2d125): raises a verdict that docks goalCompletion with no explicit "awaiting reply" wording but no criticism either', async () => {
+  it('session 28a2d125 (no explicit "awaiting reply" wording): the code-level guard leaves it alone; the fix here is prompt-level (AWAITING_USER_REPLY_CLAUSE), not the backstop', async () => {
+    // NOTE: this reason has no affirmative awaiting-reply/ended-before-reply
+    // wording, so applyAwaitingReplyGuard's positive-detection regex correctly
+    // does not fire for it (see the code-review fix: firing on "no criticism
+    // keyword matched" instead of an affirmative match would also silently
+    // raise a genuine unlabeled goalCompletion failure). Production judges
+    // still avoid this exact dock via AWAITING_USER_REPLY_CLAUSE in the
+    // system prompt — this test only covers the code-level backstop.
     mockCallLLM.mockResolvedValue(
       makeLLMResponse(
         3,
@@ -156,6 +166,37 @@ describe('SessionScoring - awaiting user reply (ENG-1296)', () => {
         "The user asked a question that lacked context ('enable that'). The assistant handled this gracefully " +
           'by explaining what was missing, providing a helpful general answer based on common scenarios ' +
           '(audience matching), and clearly outlining the next steps to get a precise answer.'
+      )
+    );
+
+    const result = await scoreSessionWithJudge(ambiguousFragmentMessages, ambiguousFragmentMessages.length, judge);
+
+    expect(result.score).toBe(3);
+    expect(result.dimensions?.goalCompletion).toBe(3);
+  });
+
+  it('does NOT raise a genuinely low score phrased without any listed criticism keyword and without awaiting-reply wording (locks in the positive-detection fix)', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(
+        2,
+        { goalCompletion: 2, dataAccuracy: 5, outputQuality: 5 },
+        'The assistant asked an unnecessary clarifying question instead of completing the task.'
+      )
+    );
+
+    const result = await scoreSessionWithJudge(ambiguousFragmentMessages, ambiguousFragmentMessages.length, judge);
+
+    expect(result.score).toBe(2);
+    expect(result.dimensions?.goalCompletion).toBe(2);
+  });
+
+  it('does NOT raise a low score when "vague"/"confusing" describe the USER\'s request, not the assistant\'s handling', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(
+        3,
+        { goalCompletion: 3, dataAccuracy: 5, outputQuality: 5 },
+        "The user's message was vague, but the assistant correctly declined to guess and asked a focused " +
+          'clarifying question instead. The conversation ended before the user could reply.'
       )
     );
 
