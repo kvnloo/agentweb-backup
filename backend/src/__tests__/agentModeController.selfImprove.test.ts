@@ -424,12 +424,21 @@ describe('updateScheduledChat prompt revision history', () => {
     } as unknown as Request;
 
     const res = makeRes();
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
     await agentModeController.updateScheduledChat(req, res);
 
     expect(res.status).not.toHaveBeenCalledWith(400);
     const updates = mockScheduleDb.updateSchedule.mock.calls[0][1] as any;
     expect(updates.promptRevisions).toHaveLength(1);
     expect(updates.promptRevisions[0].startingMessage).toBe('p'.repeat(160000));
+    // No existing history means nothing was literally "dropped" — but this
+    // schedule's very first revision already sits over the byte sub-budget,
+    // which is exactly the condition this observability exists to flag. Must
+    // not stay silent just because there was nothing to trim away (code review
+    // follow-up).
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('kept the newest promptRevisions entry even though it alone exceeds the budget — no older entries existed to drop')
+    );
   });
 });
 
