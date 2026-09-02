@@ -853,6 +853,63 @@ describe('repointStaleAccountReferences (ENG-1366)', () => {
     await expect(repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID)).resolves.toBe(0);
   });
 
+  // ENG-1672: a flat count cap alone still let promptRevisions alone approach
+  // DynamoDB's item ceiling from a handful of large prompts, the same gap the
+  // customer-facing edit path had. Bound by bytes too, and never erase the
+  // newest entry (the pre-repoint text this rewrite must stay reversible against)
+  // even when it alone exceeds the budget.
+  it('keeps the newest revision even when it alone exceeds the byte budget', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    const originalMessage = `use ${ACCOUNT_ID} for all actions. ` + 'p'.repeat(160000); // alone exceeds the 150KB budget
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: originalMessage, promptRevisions: [] },
+    ]);
+    scheduleDb.updateSchedule.mockResolvedValue(undefined);
+
+    const repointed = await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(repointed).toBe(1);
+    const [, updates] = scheduleDb.updateSchedule.mock.calls[0];
+    expect(updates.promptRevisions).toHaveLength(1);
+    expect(updates.promptRevisions[0].startingMessage).toBe(originalMessage);
+  });
+
+  // ENG-1672: an item-size rejection is a property of the ONE schedule that hit
+  // it (e.g. its own history is already huge), not a reason to abandon repointing
+  // this user's OTHER, unrelated schedules — the old code's bare `throw` aborted
+  // the whole loop, silently leaving every schedule after the oversized one still
+  // pinned to the dead account.
+  it('skips a schedule at the item-size ceiling without aborting repointing this user\'s other schedules', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: `use ${ACCOUNT_ID}` },
+      { scheduleId: 'b', startingMessage: `also use ${ACCOUNT_ID}` },
+    ]);
+    const itemSizeError = Object.assign(new Error('Item size has exceeded the maximum allowed size'), {
+      code: 'ValidationException',
+    });
+    scheduleDb.updateSchedule
+      .mockRejectedValueOnce(itemSizeError)
+      .mockResolvedValueOnce(undefined);
+
+    const repointed = await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(repointed).toBe(1);
+    expect(scheduleDb.updateSchedule).toHaveBeenCalledTimes(2);
+    expect(scheduleDb.updateSchedule).toHaveBeenNthCalledWith(
+      2,
+      'b',
+      expect.objectContaining({ startingMessage: `also use ${NEW_ACCOUNT_ID}` }),
+      expect.anything(),
+    );
+  });
+
   it('is a no-op and writes nothing when no schedule references any stale id', async () => {
     getAccountsByUserId.mockResolvedValue([
       { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
