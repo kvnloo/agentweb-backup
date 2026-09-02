@@ -56,6 +56,9 @@ jest.mock('../services/googleAdsService', () => ({
 
 import { AgentModeService } from '../services/agentModeService';
 import { googleAdsService } from '../services/googleAdsService';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 let service: AgentModeService;
 beforeEach(() => {
@@ -1041,6 +1044,51 @@ describe('handleCallGoogleAdsApi — error handling', () => {
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/Unsupported entity_type/);
   });
+
+  // ENG-1300: the "CODE: message" formatter above renders Google Ads' own
+  // business error codes (e.g. "BAD_FIELD") into the message text — that is
+  // NOT an HTTP status and classifyToolErrorClass would misclassify if it were
+  // used for `code`. The real HTTP status is error.response.status, and
+  // googleAdsService.callApi rethrows the SAME axios error unchanged, so it's
+  // still there for the taking.
+  it('ENG-1300: a 403 (error.response.status) classifies as auth/config end-to-end, distinct from the Google Ads business error code in the message', async () => {
+    (googleAdsService.listCampaigns as jest.Mock).mockRejectedValueOnce({
+      response: {
+        status: 403,
+        data: { error: { details: [{ errors: [
+          { errorCode: { authorizationError: 'USER_PERMISSION_DENIED' }, message: 'User does not have permission to access customer.' },
+        ] }] } },
+      },
+    });
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'LIST',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('USER_PERMISSION_DENIED');
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+  });
+
+  it('ENG-1300: a 429 (error.response.status) classifies as rate_limit, not conflated with a Google Ads QUOTA_ERROR business code', async () => {
+    (googleAdsService.listCampaigns as jest.Mock).mockRejectedValueOnce({
+      response: {
+        status: 429,
+        data: { error: { details: [{ errors: [
+          { errorCode: { quotaError: 'RESOURCE_EXHAUSTED' }, message: 'Too many requests.' },
+        ] }] } },
+      },
+    });
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'LIST',
+    });
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('rate_limit');
+  });
 });
 
 describe('handleCallGoogleAdsReportingApi — error handling', () => {
@@ -1077,6 +1125,18 @@ describe('handleCallGoogleAdsReportingApi — error handling', () => {
     expect(result.error).toBe('mode must be "raw" or "dashboard"');
   });
 
+  it('ENG-1300: a 403 (error.response.status) classifies as auth/config end-to-end', async () => {
+    (googleAdsService.getQuickMetrics as jest.Mock).mockRejectedValueOnce({
+      response: { status: 403, data: { error: { details: [{ errors: [{ message: 'Permission denied.' }] }] } } },
+    });
+    const result = await service.handleCallGoogleAdsReportingApi('user-123', {
+      customer_id: '1234567890',
+      mode: 'dashboard',
+    });
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+  });
 });
 
 // ENG-1514. A PAUSED create must round-trip as PAUSED.
