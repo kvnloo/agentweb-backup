@@ -22,6 +22,14 @@ interface ClientScopedContext {
   isDelegatedAccess?: boolean;
   sessionId?: string;
   overrideToken?: string;
+  /** ENG-1557: populated only on a successful client_id resolution, so a
+   * write-capable caller (manage_leads action:add) can build its own audit
+   * trail / dry-run preview against the resolved identities without a second
+   * redundant userDb lookup. */
+  resolvedScope?: {
+    caller: { userId: string; email: string };
+    target: { userId: string; email: string };
+  };
 }
 
 /**
@@ -103,5 +111,12 @@ export async function resolveClientScopedContext(context: any, clientId: unknown
     targetEmail: target.email,
   });
 
-  return { ...base, overrideToken };
+  return {
+    ...base,
+    overrideToken,
+    resolvedScope: {
+      caller: { userId: caller.userId, email: caller.email },
+      target: { userId: target.userId, email: target.email },
+    },
+  };
 }

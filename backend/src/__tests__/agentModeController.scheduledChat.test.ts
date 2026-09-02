@@ -801,14 +801,23 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       const result = await runScheduledChat(scheduleWithSearchWeb, mockUserId, true);
 
-      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
+      // ENG-1297: you_search_web is read-only, so once it's the ONLY unmet
+      // requirement the read-only press circuit breaker stops the run after its
+      // (small) press budget instead of grinding to maxAttempts (20) — the run
+      // still correctly recognizes legacy_news_search does NOT satisfy
+      // you_search_web (functionCallMatches/functionCallMisses below are
+      // unchanged), it just no longer pays for 18 more identical presses to
+      // reach that same conclusion, and ends as a successful, waived run rather
+      // than a hard failure.
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(2);
       expect(result).toEqual(
         expect.objectContaining({
-          status: 'failure',
-          passed: false,
-          attempt: 20,
+          status: 'success',
+          passed: true,
+          attempt: 2,
           functionCallMatches: [],
           functionCallMisses: ['you_search_web'],
+          readOnlyRequirementWaived: true,
         })
       );
     });

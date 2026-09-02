@@ -1179,5 +1179,29 @@ describe('formatToolError for perform_data_analysis', () => {
       const result = (svc as any).formatToolError('manage_scheduled_chat', 'Internal server error');
       expect(result).toContain('Adjust the plan or ask the user for missing info');
     });
+
+    // ENG-1672: a schedule write blocked by DynamoDB's 400KB item ceiling must tell
+    // the model this is NOT retryable as-is, point it at the diagnostics tool, and
+    // NOT fall through to the generic "adjust the plan" guidance.
+    it('returns size-block guidance and points at storage diagnostics for a too-large-to-save error', () => {
+      const result = (svc as any).formatToolError(
+        'manage_scheduled_chat',
+        "Scheduled chat is too large to save (about 391KB against DynamoDB's 400KB per-item limit) even after dropping saved history. The starting message is 10240 characters — shorten it and try again."
+      );
+      expect(result).toContain('get_scheduled_chat_storage_diagnostics');
+      expect(result).toMatch(/not.*transient|NOT a transient/i);
+      expect(result).not.toContain('Adjust the plan or ask the user for missing info');
+    });
+
+    // ENG-1672: a bare connection-level failure (e.g. the self-call's "fetch
+    // failed") gives no HTTP response at all, so the write's outcome is unknown —
+    // it may have already applied. The model must check current state instead of
+    // blindly resubmitting, which risks a redundant prompt-revision entry.
+    it('returns a check-before-retry warning for a bare network failure, not a generic retry prompt', () => {
+      const result = (svc as any).formatToolError('manage_scheduled_chat', 'fetch failed');
+      expect(result).toContain('list_scheduled_chats');
+      expect(result).toMatch(/may have already applied|outcome is unknown/i);
+      expect(result).not.toContain('Adjust the plan or ask the user for missing info');
+    });
   });
 });
