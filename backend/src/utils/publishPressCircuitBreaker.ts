@@ -342,10 +342,23 @@ export function classifyPublishStall(params: {
       ? params.heldToFunctionNames
       : new Set(params.heldToFunctionNames)
     : null;
+  // Performance (CodeRabbit review): only a requirement with a REGISTERED
+  // equivalence route can ever satisfy `matchingEquivalentRoute` below, so
+  // pre-filter to that (small, fixed-size) subset ONCE here rather than
+  // re-scanning every unmet requirement — including ones with no route at
+  // all — for every successful write. Widening `admitted` above (ENG-930) to
+  // let `explicitlyWithheld`/`publishExcludedFromScope` through with a
+  // mixed, non-publish-shaped unmet set means this can no longer assume the
+  // whole array is small/publish-only, so the filter is worth doing even
+  // though route registrations themselves are still capped by the fixed
+  // `EQUIVALENT_PUBLISH_ROUTES` table.
+  const unmetWithEquivalenceRoutes = unmetRequiredFunctions.filter(
+    (requirement) => typeof requirement === 'string' && hasKnownEquivalenceRoute(requirement)
+  );
   const wroteSomethingElse = (externalWritesSucceeded || []).some((entry) => {
     const name = typeof entry?.name === 'string' ? entry.name : '';
     if (!name || unmet.has(name)) return false;
-    return unmetRequiredFunctions.some((requirement) => {
+    return unmetWithEquivalenceRoutes.some((requirement) => {
       if (!matchingEquivalentRoute(requirement, entry)) return false;
       // Both names separately required as their OWN line items: the call
       // already satisfied its own requirement, so it must not also disqualify
