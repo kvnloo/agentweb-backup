@@ -396,6 +396,7 @@ import {
   collectPendingDestinations,
   collectPendingCreativeIds,
   computeTrackingOverrideDigest,
+  computeMetaWriteManifestDigest,
   trackingOverrideTokenMatches,
 } from './metaLaunchGate';
 import { HubSpotService } from './hubspotService';
@@ -19293,6 +19294,45 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * ENG-1642: check whether this exact Meta write is authorized by an
+   * answered `meta_write_manifest` question in the session, and if so claim
+   * it (at-most-once). Returns true only when a fresh claim succeeds THIS
+   * call — a digest not in any manifest, an unanswered/non-human-attributed
+   * manifest, or a digest already consumed all return false, which falls
+   * through to the normal confirmation halt.
+   */
+  private async claimMetaWriteManifestGrant(
+    sessionId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any,
+  ): Promise<boolean> {
+    const digest = computeMetaWriteManifestDigest(getJwtSecret(), {
+      entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params,
+    });
+    const session = await chatbotDb.getChatSession(sessionId);
+    const manifestQuestion = findQuestionByKind(
+      session?.pendingUserQuestion, session?.answeredQuestions, 'meta_write_manifest'
+    );
+    const gate = checkQuestionGate(manifestQuestion);
+    if (!gate.allowed) return false;
+    // The card's approve-option payload carries the digests it authorizes
+    // (see the `meta_write_manifest` card producer) — the digest for THIS
+    // call must be one of them, not merely "some manifest was answered".
+    const grantedDigests: unknown = (gate.payload as any)?.digests;
+    if (!Array.isArray(grantedDigests) || !grantedDigests.includes(digest)) return false;
+    // Session already recorded this exact digest consumed — a repeat of the
+    // same call re-confirms rather than executing again (acceptance
+    // criterion 3).
+    if (session?.consumedMetaWriteManifestDigests?.[digest]) return false;
+    return chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
+  }
+
+  /**
    * Loop halt seam for the human-in-the-loop confirmation gate. Scans one iteration's
    * tool results and returns the user-facing prompt to surface (or null to continue).
    * Only tool results that set `awaitingUserConfirmation === true` halt the turn — this
@@ -19907,7 +19947,31 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       : '';
     const overrideApproved =
       overrideClaimed && trackingOverrideTokenMatches((params as any)?.tracking_override_token, overrideDigest);
-    if (AgentModeService.isMetaWriteAction(entity_type, action) && (!confirmed || (overrideClaimed && !overrideApproved))) {
+
+    // ENG-1642: an approved deployment manifest authorizes its exact writes
+    // without re-confirmation. `confirmed` from the model-controlled `confirm`
+    // flag is never itself trustworthy (that's the whole reason the gate
+    // below exists) — but a call whose canonical digest appears in a
+    // HUMAN-attributed, answered `meta_write_manifest` question, and has not
+    // already been consumed in this session, may execute once without the
+    // halt. Deliberately narrower than the tracking-override mechanism: this
+    // never implies `override_tracking_check` (acceptance criterion 5), so
+    // the tracking pre-flight below is unaffected either way.
+    let manifestGranted = false;
+    if (
+      !confirmed &&
+      AgentModeService.isMetaWriteAction(entity_type, action) &&
+      sessionId
+    ) {
+      manifestGranted = await this.claimMetaWriteManifestGrant(
+        sessionId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+      );
+    }
+
+    if (
+      AgentModeService.isMetaWriteAction(entity_type, action) &&
+      (!confirmed && !manifestGranted || (overrideClaimed && !overrideApproved))
+    ) {
       const { summary, target } = await this.buildMetaWriteConfirmation(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
