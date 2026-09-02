@@ -352,8 +352,13 @@ export function classifyPublishStall(params: {
   // whole array is small/publish-only, so the filter is worth doing even
   // though route registrations themselves are still capped by the fixed
   // `EQUIVALENT_PUBLISH_ROUTES` table.
-  const unmetWithEquivalenceRoutes = unmetRequiredFunctions.filter(
-    (requirement) => typeof requirement === 'string' && hasKnownEquivalenceRoute(requirement)
+  // Deduplicated (CodeRabbit review): a resumed run's combined requirement
+  // list is not guaranteed unique, and each duplicate would otherwise be
+  // re-tested against every successful write for no additional information —
+  // `matchingEquivalentRoute(requirement, entry)` returns the same result for
+  // the same `requirement` regardless of how many times it appears here.
+  const unmetWithEquivalenceRoutes = Array.from(
+    new Set(unmetRequiredFunctions.filter((requirement) => typeof requirement === 'string' && hasKnownEquivalenceRoute(requirement)))
   );
   const wroteSomethingElse = (externalWritesSucceeded || []).some((entry) => {
     const name = typeof entry?.name === 'string' ? entry.name : '';

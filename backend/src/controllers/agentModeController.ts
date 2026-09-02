@@ -5653,8 +5653,13 @@ export async function runScheduledChat(
     // non-publish prep call for that same excluded publish (e.g. generate_image)
     // would otherwise press to the full budget on its own. See
     // publishPressCircuitBreaker's `publishExcludedFromScope` doc comment.
+    //
+    // Set-based membership (CodeRabbit review) — requiredFunctionCalls has no
+    // cardinality limit at the schedule create/update boundary, so a nested
+    // `.some()` here would be O(p*r) instead of O(p+r).
+    const requiredFunctionNamesInScope = new Set(requiredFunctions.map((reqFunc) => reqFunc.functionName));
     const publishRequirementExcludedFromScope = getRequiredPublishTools(expectedFunctionCalls).some(
-      (name) => !requiredFunctions.some((reqFunc) => reqFunc.functionName === name)
+      (name) => !requiredFunctionNamesInScope.has(name)
     );
 
     // On a resume, the original task prompt is already the first message of the
