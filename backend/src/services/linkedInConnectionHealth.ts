@@ -28,6 +28,7 @@ import {
 } from './connectedAccountsDb';
 import { emailService } from './emailService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { PROMPT_REVISIONS_BUDGET_BYTES, trimListToItemBudget, isDynamoItemSizeError } from '../utils/dynamoItemBudget';
 
 const TAG = '[linkedInConnectionHealth]';
 
@@ -507,6 +508,10 @@ export async function clearDisconnectFlag(viewerUserId: string, accountId: strin
  *    `promptRevisions` first — the exact mechanism the customer's own manual
  *    edit already uses (`agentModeController.ts`'s `updateScheduledChat`) — so
  *    an unwanted rewrite is always visible and reversible, never silently lost.
+ *    Bounded by `PROMPT_REVISIONS_BUDGET_BYTES` the same way (ENG-1672): a flat
+ *    count cap alone still let promptRevisions creep toward DynamoDB's item
+ *    ceiling, and a schedule that hit it here would silently stay pinned to a
+ *    dead account forever (see the per-schedule size-error handling below).
  * 2. Two near-simultaneous reconnects for the same user (or a human editing the
  *    schedule at that exact moment) could both read the same stale text before
  *    either writes. Without a check, the second write would silently clobber
@@ -516,6 +521,12 @@ export async function clearDisconnectFlag(viewerUserId: string, accountId: strin
  *    of a lost update, and is treated as a no-op: the writer that won already
  *    left correct state, and a schedule that's still stale gets another chance
  *    on the next reconnect or gate evaluation either way.
+ * 3. A genuine item-size rejection (ENG-1672) is scoped to the ONE schedule that
+ *    hit it, not the whole batch: `throw`ing there would abort the loop and skip
+ *    every OTHER schedule of this user's still waiting to be repointed, even ones
+ *    that would have succeeded. The affected schedule itself is retried on the
+ *    next reconnect (its `needs_reconnect` stale-account text is unchanged), same
+ *    as the concurrent-write case above.
  */
 const REPOINT_REVISION_LIMIT = 10;
 
@@ -542,10 +553,27 @@ export async function repointStaleAccountReferences(
       if (updated === original) continue;
 
       const existingRevisions = Array.isArray(s?.promptRevisions) ? s.promptRevisions : [];
-      const nextRevisions = [
+      const candidateRevisions = [
         ...existingRevisions,
         { startingMessage: original, updatedAt: new Date().toISOString() },
       ].slice(-REPOINT_REVISION_LIMIT);
+      // ENG-1672: bound by bytes too, same as the customer's own manual edit path —
+      // a flat count cap alone still let promptRevisions alone approach DynamoDB's
+      // item ceiling from a handful of large prompts. Never let the trim erase the
+      // newest entry (the pre-repoint text this rewrite must stay reversible against).
+      const { kept: trimmedRevisions } = trimListToItemBudget(
+        {},
+        'promptRevisions',
+        candidateRevisions,
+        PROMPT_REVISIONS_BUDGET_BYTES,
+      );
+      // `trimListToItemBudget` guarantees `trimmedRevisions` fits the budget whenever
+      // it's non-empty — the empty case is the ONLY time the fallback below can still
+      // be over budget (the single newest entry alone exceeds it, kept anyway so the
+      // rewrite stays reversible). Track that distinction for the log below.
+      const usedFallback = trimmedRevisions.length === 0;
+      const nextRevisions = usedFallback ? candidateRevisions.slice(-1) : trimmedRevisions;
+      const droppedForBudget = candidateRevisions.length - nextRevisions.length;
 
       try {
         await scheduleDb.updateSchedule(
@@ -562,7 +590,41 @@ export async function repointStaleAccountReferences(
           console.log(`${TAG} repoint for schedule ${s.scheduleId} lost a concurrent write, skipping`);
           continue;
         }
+        // ENG-1672: an item-size rejection (still too large even after trimming
+        // promptRevisions above — e.g. a huge startingMessage or runResults) must
+        // skip only THIS schedule, not abort repointing the rest of this user's
+        // batch. Falling through to the outer catch would do exactly that.
+        if (isDynamoItemSizeError(writeError)) {
+          console.error(`${TAG} repoint for schedule ${s.scheduleId} skipped — item too large to save even after trimming history:`, writeError);
+          continue;
+        }
         throw writeError;
+      }
+      // Same observability as the customer-facing edit path's shedOldest — this
+      // trim is otherwise invisible (nothing in any UI reads promptRevisions), so
+      // the log is the only trace that older history was dropped here. Logged only
+      // AFTER the write above succeeds, so it never claims a drop that wasn't
+      // actually persisted (a lost race or a size rejection above `continue`s first).
+      //
+      // `usedFallback` always logs, even when `droppedForBudget === 0` — that
+      // happens when there was no existing history to drop in the first place
+      // (this repoint's own snapshot is the schedule's very first revision, and
+      // it alone already exceeds the budget). The whole reason this sub-budget
+      // exists is to flag a schedule sitting at that edge; staying silent just
+      // because nothing existed yet to trim away would silently defeat that.
+      if (usedFallback) {
+        console.warn(
+          droppedForBudget > 0
+            ? `${TAG} repoint for schedule ${s.scheduleId} kept only the newest promptRevisions entry — `
+              + `it alone still exceeds the byte budget after dropping ${droppedForBudget} older entries`
+            : `${TAG} repoint for schedule ${s.scheduleId} kept the newest promptRevisions entry even though `
+              + `it alone exceeds the byte budget — no older entries existed to drop`
+        );
+      } else if (droppedForBudget > 0) {
+        console.warn(
+          `${TAG} repoint for schedule ${s.scheduleId} is over the promptRevisions byte budget — `
+          + `dropped ${droppedForBudget} of ${candidateRevisions.length} entries to fit`
+        );
       }
       repointed += 1;
       console.log(`${TAG} repointed schedule ${s.scheduleId} from stale account(s) to ${newAccountId}`);

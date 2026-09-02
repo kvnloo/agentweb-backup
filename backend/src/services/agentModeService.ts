@@ -1807,12 +1807,20 @@ export class AgentModeService {
         if (toList.length === 0) {
           throw new Error('At least one valid email address is required in the "to" field.');
         }
-        await emailService.sendSessionNotificationEmail(
+        const result = await emailService.sendSessionNotificationEmail(
           toList,
           context.sessionId,
           args.message,
           args.subject
         );
+        if (result?.duplicate) {
+          return {
+            success: true,
+            sent_to: [],
+            duplicate_suppressed: true,
+            message: `A session notification to ${toList.join(', ')} was already sent earlier in this session — skipped to avoid sending a duplicate email.`
+          };
+        }
         return {
           success: true,
           sent_to: toList,
@@ -21991,6 +21999,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
       if (safeMessage.includes('Scheduled chat not found')) {
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The schedule_id doesn't exist or doesn't belong to this user. Call list_scheduled_chats to get a valid schedule_id before retrying update/toggle/delete.`;
+      }
+      // ENG-1672: the schedule is at or over DynamoDB's 400KB item ceiling, almost
+      // always from accumulated promptRevisions/runResults history — automatic
+      // trimming already ran and still couldn't make room. Retrying the same-size
+      // payload will fail identically; only a shorter starting_message helps.
+      if (safeMessage.includes('too large to save')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: This schedule is at or over DynamoDB's 400KB per-item storage limit — automatic history trimming already ran and there is no more room. This is NOT a transient error; do not retry with the same-length starting_message. Call get_scheduled_chat_storage_diagnostics with this schedule_id for a byte breakdown, then shorten starting_message further before retrying.`;
+      }
+      // A bare connection-level failure (no HTTP response at all) means the write's
+      // outcome is UNKNOWN — it may have actually applied even though this call
+      // reported failure. Blindly resubmitting an "update" risks recording a
+      // redundant prompt-revision snapshot for a change that already landed.
+      if (/fetch failed|ECONNRESET|socket hang up|network error/i.test(safeMessage)) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: This is a transient connection failure, not a validation error — the write's outcome is unknown, and it may have already applied even though this call reported failure. Before retrying, call list_scheduled_chats (or get_scheduled_chat_storage_diagnostics) with this schedule_id to check the schedule's CURRENT state rather than blindly resubmitting the same change.`;
       }
     }
     // ENG-971: bookkeeping / side-effect tools (save_memory, save_org_memory, …)

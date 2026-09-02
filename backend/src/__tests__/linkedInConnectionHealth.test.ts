@@ -14,6 +14,7 @@ import {
   DISCONNECT_REMINDER_MS,
   VERIFY_STAMP_INTERVAL_MS,
 } from '../services/linkedInConnectionHealth';
+import { PROMPT_REVISIONS_BUDGET_BYTES, estimateDynamoItemBytes } from '../utils/dynamoItemBudget';
 
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
@@ -851,6 +852,148 @@ describe('repointStaleAccountReferences (ENG-1366)', () => {
     scheduleDb.updateSchedule.mockRejectedValue(new Error('dynamo down'));
 
     await expect(repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID)).resolves.toBe(0);
+  });
+
+  // ENG-1672: a flat count cap alone still let promptRevisions alone approach
+  // DynamoDB's item ceiling from a handful of large prompts, the same gap the
+  // customer-facing edit path had. Bound by bytes too, and never erase the
+  // newest entry (the pre-repoint text this rewrite must stay reversible against)
+  // even when it alone exceeds the budget.
+  it('keeps the newest revision even when it alone exceeds the byte budget', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    const originalMessage = `use ${ACCOUNT_ID} for all actions. ` + 'p'.repeat(160000); // alone exceeds the 150KB budget
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: originalMessage, promptRevisions: [] },
+    ]);
+    scheduleDb.updateSchedule.mockResolvedValue(undefined);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const repointed = await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(repointed).toBe(1);
+    const [, updates] = scheduleDb.updateSchedule.mock.calls[0];
+    expect(updates.promptRevisions).toHaveLength(1);
+    expect(updates.promptRevisions[0].startingMessage).toBe(originalMessage);
+    // No existing history means nothing was literally "dropped" — but this
+    // schedule's very first revision already sits over the byte sub-budget,
+    // which is exactly the condition this observability exists to flag. Must
+    // not stay silent just because there was nothing to trim away.
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('kept the newest promptRevisions entry even though it alone exceeds the byte budget — no older entries existed to drop')
+    );
+  });
+
+  // ENG-1672 (code review follow-up): the combined case the above test doesn't
+  // cover — the newest entry is oversized AND older history already exists. The
+  // guard still keeps only the newest (same as above), but the log's wording must
+  // not claim it "fits the budget" when it still doesn't — the surviving entry is
+  // kept anyway specifically because it doesn't fit and there's nothing smaller to
+  // fall back to.
+  it('logs the fallback wording (not "dropped to fit") when the newest entry alone still exceeds the budget after dropping older history', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    const existingRevisions = [
+      { startingMessage: 'small revision one', updatedAt: '2026-01-01T00:00:00.000Z' },
+      { startingMessage: 'small revision two', updatedAt: '2026-01-02T00:00:00.000Z' },
+    ];
+    const originalMessage = `use ${ACCOUNT_ID} for all actions. ` + 'p'.repeat(160000); // alone exceeds the 150KB budget
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: originalMessage, promptRevisions: existingRevisions },
+    ]);
+    scheduleDb.updateSchedule.mockResolvedValue(undefined);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const repointed = await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(repointed).toBe(1);
+    const [, updates] = scheduleDb.updateSchedule.mock.calls[0];
+    // Both small existing revisions are gone; only the oversized newest survives.
+    expect(updates.promptRevisions).toHaveLength(1);
+    expect(updates.promptRevisions[0].startingMessage).toBe(originalMessage);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('kept only the newest promptRevisions entry — it alone still exceeds the byte budget after dropping 2 older entries')
+    );
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('dropped to fit'));
+  });
+
+  // ENG-1672: the ordinary partial-trim case — several old revisions dropped so
+  // the total fits the budget, the newest (including the one this repoint just
+  // created) survives untouched. The other two ENG-1672 tests above/below only
+  // cover the edges (a single oversized entry, and a rejection past this trim);
+  // this covers the common in-between case. Sizes below are verified (not
+  // guessed) to force exactly 2 of 4 existing revisions dropped, via the same
+  // trimListToItemBudget the implementation calls.
+  it('drops the oldest revisions to fit the byte budget, leaving the newest (including this repoint) untouched', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    const existingRevisions = Array.from({ length: 4 }, (_, i) => ({
+      startingMessage: 'p'.repeat(60000),
+      updatedAt: `2026-01-0${i + 1}T00:00:00.000Z`,
+    }));
+    const originalMessage = `use ${ACCOUNT_ID}`;
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: originalMessage, promptRevisions: existingRevisions },
+    ]);
+    scheduleDb.updateSchedule.mockResolvedValue(undefined);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const repointed = await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(repointed).toBe(1);
+    const [, updates] = scheduleDb.updateSchedule.mock.calls[0];
+    const revisionBytes = estimateDynamoItemBytes({ promptRevisions: updates.promptRevisions });
+    expect(revisionBytes).toBeLessThanOrEqual(PROMPT_REVISIONS_BUDGET_BYTES);
+    // Exactly the two oldest existing revisions are dropped; the two newest
+    // existing ones AND the just-created repoint snapshot survive, in order —
+    // not just "some entries, some budget", but the SPECIFIC right ones.
+    expect(updates.promptRevisions).toEqual([
+      existingRevisions[2],
+      existingRevisions[3],
+      expect.objectContaining({ startingMessage: originalMessage }),
+    ]);
+    // The trim is otherwise invisible (no UI reads promptRevisions) — confirm the
+    // one trace it leaves actually fires, with the count this scenario produces.
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('dropped 2 of 5 entries to fit'));
+  });
+
+  // ENG-1672: an item-size rejection is a property of the ONE schedule that hit
+  // it (e.g. its own history is already huge), not a reason to abandon repointing
+  // this user's OTHER, unrelated schedules — the old code's bare `throw` aborted
+  // the whole loop, silently leaving every schedule after the oversized one still
+  // pinned to the dead account.
+  it('skips a schedule at the item-size ceiling without aborting repointing this user\'s other schedules', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: `use ${ACCOUNT_ID}` },
+      { scheduleId: 'b', startingMessage: `also use ${ACCOUNT_ID}` },
+    ]);
+    const itemSizeError = Object.assign(new Error('Item size has exceeded the maximum allowed size'), {
+      code: 'ValidationException',
+    });
+    scheduleDb.updateSchedule
+      .mockRejectedValueOnce(itemSizeError)
+      .mockResolvedValueOnce(undefined);
+
+    const repointed = await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(repointed).toBe(1);
+    expect(scheduleDb.updateSchedule).toHaveBeenCalledTimes(2);
+    expect(scheduleDb.updateSchedule).toHaveBeenNthCalledWith(
+      2,
+      'b',
+      expect.objectContaining({ startingMessage: `also use ${NEW_ACCOUNT_ID}` }),
+      expect.anything(),
+    );
   });
 
   it('is a no-op and writes nothing when no schedule references any stale id', async () => {
