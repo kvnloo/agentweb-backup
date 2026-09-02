@@ -1613,7 +1613,8 @@ async function retractJudgeScore(session: ChatSession, judgeId: string): Promise
 
 export async function scoreSessionWithJudgeIfNeeded(
   session: ChatSession,
-  judge: ScoringJudge
+  judge: ScoringJudge,
+  opts?: { force?: boolean }
 ): Promise<NonNullable<ChatSession["judgeScores"]>[string] | null> {
   const messageCount = session.messageCount ?? session.messages?.length ?? 0;
 
@@ -1650,9 +1651,20 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
-  // Skip if already scored by this judge, up-to-date, and has dimensional scores
+  // Skip if already scored by this judge, up-to-date, and has dimensional scores.
+  // ENG-1296: this guard means a rubric/prompt fix NEVER self-heals a session
+  // already scored under the old rules — evaluatedMessageIndex never regresses,
+  // so it stays "up to date" forever. opts.force is the explicit admin escape
+  // hatch (POST /chat-sessions/judge-score) for re-running a specific session
+  // through the current judge after a scoring-rule change, without weakening
+  // the default skip that makes routine sync/backfill cheap.
   const existingJudgeScore = session.judgeScores?.[judge.id];
-  if (existingJudgeScore && existingJudgeScore.evaluatedMessageIndex >= messageCount && existingJudgeScore.dimensions) {
+  if (
+    !opts?.force &&
+    existingJudgeScore &&
+    existingJudgeScore.evaluatedMessageIndex >= messageCount &&
+    existingJudgeScore.dimensions
+  ) {
     return null;
   }
 
@@ -1755,7 +1767,8 @@ const skip = (skipReason: ScoringSkipReason): SessionScoringAttempt => ({ score:
  * care about the reason.
  */
 export async function attemptSessionScore(
-  session: ChatSession
+  session: ChatSession,
+  opts?: { force?: boolean }
 ): Promise<SessionScoringAttempt> {
   // Skip if admin has overridden the score
   if (session.satisfactionScore?.adminOverride) {
@@ -1800,8 +1813,13 @@ export async function attemptSessionScore(
     return skip("publish-gate-withheld");
   }
 
-  // Skip if already scored, up-to-date, and has dimensional scores
+  // Skip if already scored, up-to-date, and has dimensional scores.
+  // ENG-1296: same force escape hatch as scoreSessionWithJudgeIfNeeded above —
+  // without it, a session already scored under a pre-fix rubric never
+  // regresses evaluatedMessageIndex, so it stays "up to date" and skipped
+  // forever, and a rubric/prompt fix can never retroactively correct it.
   if (
+    !opts?.force &&
     session.satisfactionScore &&
     session.satisfactionScore.evaluatedMessageIndex >= messageCount &&
     session.satisfactionScore.dimensions
@@ -1895,7 +1913,8 @@ export async function attemptSessionScore(
  * the skip reason.
  */
 export async function scoreSessionIfNeeded(
-  session: ChatSession
+  session: ChatSession,
+  opts?: { force?: boolean }
 ): Promise<ChatSession["satisfactionScore"] | null> {
-  return (await attemptSessionScore(session)).score;
+  return (await attemptSessionScore(session, opts)).score;
 }
