@@ -252,7 +252,11 @@ function applyFabricationGuard(
 /**
  * Assistant-directed criticism markers. Deliberately plain substring keywords
  * (not a single dense regex) so the list stays easy to extend and audit.
- * Matched case-insensitively against the judge's own "reason" text.
+ * Matched case-insensitively, but only within a clause that also names the
+ * assistant as its subject (see reasonCriticizesAssistant) — matching
+ * anywhere in the full reason would also catch these words describing the
+ * USER's request ("the user's message was vague") as if they criticized the
+ * assistant.
  */
 const ASSISTANT_CRITICISM_KEYWORDS = [
   "fail", "incorrect", "inaccura", "hallucinat", "fabricat", "mistake",
@@ -263,10 +267,33 @@ const ASSISTANT_CRITICISM_KEYWORDS = [
   "repeated itself", "confusing", "poorly", "vague",
 ];
 
+/** Matches a clause whose subject is the assistant, not the user or the request. */
+const ASSISTANT_SUBJECT_RE = /\b(?:the\s+assistant|assistant|it)\b/i;
+
+/**
+ * ENG-1296 follow-up: a criticism keyword only counts when it appears in the
+ * same clause as an assistant-subject reference. Splitting on sentence
+ * boundaries and comma+contrast conjunctions ("but"/"however"/...) keeps
+ * "the user's message was vague, but the assistant correctly declined to
+ * guess" from being misread as the assistant being criticized for vagueness.
+ */
 function reasonCriticizesAssistant(reason: string): boolean {
-  const lower = reason.toLowerCase();
-  return ASSISTANT_CRITICISM_KEYWORDS.some((kw) => lower.includes(kw));
+  const clauses = reason.split(/(?<=[.!?;])\s+|,\s*(?:but|however|though|yet|while)\s+/i);
+  return clauses.some((clause) => {
+    if (!ASSISTANT_SUBJECT_RE.test(clause)) return false;
+    const lower = clause.toLowerCase();
+    return ASSISTANT_CRITICISM_KEYWORDS.some((kw) => lower.includes(kw));
+  });
 }
+
+/**
+ * Positive-detection signal that the judge's stated rationale is specifically
+ * "the conversation ended / the user hasn't replied yet", the exact ENG-1296
+ * pattern — as opposed to any other reason a goalCompletion score might be
+ * low. Matched against the raw reason text.
+ */
+const AWAITING_REPLY_RATIONALE_RE =
+  /\bconversation ended\b|\bended before\b|\bawaiting\s+(?:a\s+)?(?:user\s+)?response\b|\bhas\s+not\s+yet\s+responded\b/i;
 
 /**
  * ENG-1296: the Fangfang Judge scored three sessions goalCompletion 3 where
@@ -281,13 +308,19 @@ function reasonCriticizesAssistant(reason: string): boolean {
  * defect.
  *
  * This is a narrow, code-level sanity check, same shape as
- * applyFabricationGuard: a judge whose own reason contains NO criticism of
- * the assistant, yet whose dataAccuracy/outputQuality are both already high
- * (>=4), cannot coherently justify a goalCompletion <=3 — that combination is
- * self-contradictory, not a genuine low score. It leaves alone any session
- * where the judge actually found fault (a criticism keyword is present) or
- * where dataAccuracy/outputQuality are themselves low, so a truly bad session
- * is never masked by this guard.
+ * applyFabricationGuard, but detection is POSITIVE, not the absence of a
+ * blocklist match: it only raises the score when the reason affirmatively
+ * states the awaiting-reply/ended-before-response rationale
+ * (AWAITING_REPLY_RATIONALE_RE) AND contains no criticism of the assistant.
+ * An earlier version fired whenever ~24 fixed criticism keywords failed to
+ * match anywhere in the reason, which meant a genuine goalCompletion failure
+ * phrased without any of those words (e.g. "the assistant asked an
+ * unnecessary clarifying question instead of completing the task") was
+ * silently force-raised to a passing score whenever dataAccuracy/
+ * outputQuality were already high — masking real failures, the mirror image
+ * of the bug this guard exists to fix. Requiring the affirmative rationale
+ * first means a criticism phrased in unlisted words is left alone rather
+ * than being treated as "no criticism found".
  */
 function applyAwaitingReplyGuard(
   reason: string,
@@ -297,6 +330,7 @@ function applyAwaitingReplyGuard(
   if (!dimensions) return { score, dimensions };
   if (dimensions.goalCompletion > 3) return { score, dimensions };
   if (dimensions.dataAccuracy < 4 || dimensions.outputQuality < 4) return { score, dimensions };
+  if (!AWAITING_REPLY_RATIONALE_RE.test(reason)) return { score, dimensions };
   if (reasonCriticizesAssistant(reason)) return { score, dimensions };
 
   return {
@@ -1346,9 +1380,10 @@ export async function scoreSession(
   const { agentModeService } = await import("./agentModeService");
   // Append the zero-task clause, the ENG-1312 verbosity/permission clause, the
   // ENG-1245 publish-approval-withholding clause, the ENG-1223
-  // fabrication-grounding clause, and the ENG-1164 output-integrity-guard
-  // clause to whatever prompt is configured — the stored override, if any,
-  // would otherwise mask them entirely (ENG-392/ENG-830).
+  // fabrication-grounding clause, the ENG-1164 output-integrity-guard clause,
+  // and the ENG-1296 awaiting-user-reply clause to whatever prompt is
+  // configured — the stored override, if any, would otherwise mask them
+  // entirely (ENG-392/ENG-830).
   const systemPrompt =
     (await getDefaultScoringPrompt()) +
     NO_TASK_JUDGMENT_CLAUSE +
@@ -1456,9 +1491,11 @@ export async function scoreSessionWithJudge(
       // ENG-1312 verbosity/permission dimensions, score a real publish-approval
       // hold as fabricated (ENG-1245), credit a fabricated simulation as
       // success (ENG-1223 — this is literally how Fangfang Judge produced this
-      // bug), or penalize declining a guard-blocked punctuation-only reply
-      // (ENG-1164 — Fangfang and Matt Judge both did this) just because its
-      // own prompt predates these rules.
+      // bug), penalize declining a guard-blocked punctuation-only reply
+      // (ENG-1164 — Fangfang and Matt Judge both did this), or dock
+      // goalCompletion purely because the conversation ended before the user
+      // replied (ENG-1296 — the same two judges also did this) just because
+      // its own prompt predates these rules.
       {
         role: "system",
         content:
