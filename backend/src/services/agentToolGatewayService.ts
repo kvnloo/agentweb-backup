@@ -742,23 +742,41 @@ export function validateAndRepairToolArgs(
     // production session 87334a61-2e06-4018-960e-9e7759403423: the model supplied
     // every required resource-name argument, just nested one level too deep, and
     // the handler reported them as missing since it only reads top-level args.
-    // Hoist any of the wrapper's OWN keys that match a currently-missing
-    // top-level property, so a value the model DID provide isn't silently
-    // dropped. Only fills empty slots — never overwrites a value already
-    // present at the top level — and only applies to a key that isn't itself a
+    // Hoist the wrapper's own keys up to the top level — either an exact
+    // property-name match, or (ENG-1668 follow-up) the SAME alias resolution
+    // applied to top-level keys below, so a nested key that is BOTH misplaced
+    // AND misnamed (e.g. `params: { criterion: ... }` instead of
+    // criterion_resource_name) is still caught rather than silently dropped.
+    // Only fills empty slots — never overwrites a value already present at the
+    // top level — and only applies to a wrapper key that isn't itself a
     // declared property, so a genuinely nested schema field (e.g. this same
     // tool's `address` object for CAMPAIGN ADD_PROXIMITY) is left untouched.
+    // Hoists apply one at a time so a second nested key can't clobber the
+    // first's target once it's filled.
     const wrapperValue = repairedArgs[key];
     if (wrapperValue && typeof wrapperValue === 'object' && !Array.isArray(wrapperValue)) {
       const nested = wrapperValue as Record<string, unknown>;
-      const hoistedKeys = Object.keys(nested).filter((nestedKey) =>
-        properties[nestedKey] && repairedArgs[nestedKey] === undefined
-      );
-      if (hoistedKeys.length > 0) {
-        for (const nestedKey of hoistedKeys) {
-          repairedArgs[nestedKey] = nested[nestedKey];
-          repairs.push(`${key}.${nestedKey}->${nestedKey}`);
-        }
+      let hoistedAny = false;
+      for (const nestedKey of Object.keys(nested)) {
+        const nestedTarget = properties[nestedKey] && repairedArgs[nestedKey] === undefined
+          ? nestedKey
+          : !properties[nestedKey]
+          ? findAliasTarget({
+              key: nestedKey,
+              value: nested[nestedKey],
+              properties,
+              required,
+              existingArgs: repairedArgs,
+              allowExplicitAliasRepair: true,
+              allowSemanticUrlRepair: lowRiskRepairAllowed,
+            })
+          : null;
+        if (!nestedTarget) continue;
+        repairedArgs[nestedTarget] = nested[nestedKey];
+        repairs.push(`${key}.${nestedKey}->${nestedTarget}`);
+        hoistedAny = true;
+      }
+      if (hoistedAny) {
         delete repairedArgs[key];
         continue;
       }
