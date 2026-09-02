@@ -352,7 +352,7 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
   });
 
   it('stops after AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS rounds and posts a graceful closing message', async () => {
-    const AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS = 3;
+    const AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS = 2; // ENG-1700 follow-up: lowered from 3
     const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
     // A persistently broken tool: every round, including the customer's own turn, fails.

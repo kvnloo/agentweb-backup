@@ -840,7 +840,13 @@ const SCHEDULED_RUN_RESUME_MESSAGE =
 // plan, mirroring AUTO_MEDIA_CONTINUATION_MAX_ROUNDS — a model that keeps refusing to
 // progress despite the resume instruction must not turn one request into an unbounded
 // background retry loop.
-const AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS = 3;
+//
+// ENG-1700 follow-up: lowered from 3 to 2. The ENG-1700 fix means every occurrence of a
+// still-open upstream bug (ENG-1477, create_html_file failing ~25% of the time) now costs up
+// to MAX_ROUNDS auto-continuation LLM calls instead of zero — deliberately trading some cost
+// for auto-recovery, but 2 rounds captures most of that recovery value at 2/3 the spend of 3,
+// until ENG-1477 itself is fixed.
+const AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS = 2;
 
 // ENG-1684: fired by the SERVER when an autocomplete=true work plan's turn ends with no
 // tool calls and at least one step still not completed/skipped — the exact stall pattern
