@@ -308,10 +308,14 @@ export type PublishStallReason =
  * to the same problem — see `shouldStopPressingForPublish`'s doc comment. When
  * a publish tool was authorization-scoped OUT of this run entirely, it can
  * never appear in `unmetRequiredFunctions` for `hasUnmetPublishRequirement` to
- * find, so the caller passes this instead. Since the excluded tool cannot
- * appear in `publishToolsAttempted` either (nothing was ever asked to call
- * it), the tail below correctly falls through to `held-for-approval`, never
- * `publish-tool-failing`.
+ * find, so the caller passes this instead. `unmet` can then legitimately
+ * contain a NON-publish name (e.g. generate_image, once its own publish
+ * sibling has been excluded) — so `triedTheNamedTool` below must require the
+ * matched name to ALSO be publish-classified before crediting
+ * `publish-tool-failing`. Without that extra check, a failed generate_image
+ * call would satisfy `unmet.has('generate_image')` and get reported as "the
+ * publish integration is broken", when the failure has nothing to do with
+ * publishing at all.
  */
 export function classifyPublishStall(params: {
   pressAttempt: number;
@@ -364,7 +368,7 @@ export function classifyPublishStall(params: {
     return null;
   }
   const triedTheNamedTool = (params.publishToolsAttempted || []).some(
-    (name) => typeof name === 'string' && unmet.has(name),
+    (name) => typeof name === 'string' && unmet.has(name) && (isPublishName(name) || hasKnownEquivalenceRoute(name)),
   );
   return triedTheNamedTool ? 'publish-tool-failing' : 'held-for-approval';
 }
