@@ -1999,10 +1999,17 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     // suppress that duplicate, so it does not fix the bug it was added for.
     // Recipient+session is coarser — a genuinely distinct second notification to
     // the same recipients later in the same session is also suppressed — but that
-    // trade is the one that actually stops the proven regression; the read-only
-    // press circuit breaker (readOnlyPressCircuitBreaker.ts) is the primary fix for
-    // the nudge loop itself, so this guard should rarely even be reached by a
-    // nudge-driven repeat.
+    // trade is the one that actually stops the proven regression.
+    //
+    // NOT superseded by the read-only press circuit breaker
+    // (readOnlyPressCircuitBreaker.ts): that breaker still allows exactly ONE
+    // nudge per the ticket's own recommendation ("cap nudges, suggest 1"), and in
+    // the real incident the duplicate send happened on the response to that
+    // FIRST, still-permitted nudge — the model complied immediately, so the
+    // breaker's budget was never exhausted before the second notify_session call
+    // went out. The breaker only caps the COST of a run that keeps refusing (the
+    // sibling session in this ticket, d1f7942d-…); this guard is what actually
+    // stops the duplicate SEND when a run complies instead.
     // JSON.stringify (not a bare comma-join) keeps the recipient signature
     // collision-safe against an embedded comma in a single recipient entry.
     const claimMember = JSON.stringify(emailListForClaim.map(e => e.trim().toLowerCase()).sort());
