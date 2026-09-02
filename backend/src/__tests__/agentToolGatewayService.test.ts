@@ -3036,6 +3036,71 @@ describe('ENG-1668 — call_google_ads_api breaker scope', () => {
     expect(outcome.status).toBe('success');
     expect(execute).toHaveBeenCalled();
   });
+
+  // ENG-1668 follow-up: the production incident dispatched 4 call_google_ads_api
+  // calls from ONE assistant turn — real dispatch (toolDispatch.ts) runs these via
+  // Promise.all, not sequentially. Without an in-flight reservation, every sibling's
+  // check reads the same stale confirmed count before any of them resolves, so a
+  // whole concurrent batch could slip past the budget at once. These tests dispatch
+  // via a real Promise.all (not sequential awaits) to actually exercise that ordering.
+  it('a concurrent batch does not overshoot the run-scoped budget: only headroom-worth of calls proceed', async () => {
+    const runId = 'run-1668-concurrent-overshoot';
+    // 9 confirmed failures, one short of the budget (10).
+    for (let i = 0; i < 9; i += 1) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api',
+        args: { action: 'UPDATE', customer_id: '5092566541', entity_type: `ENTITY_${i}`, campaign_resource_name: `customers/5092566541/campaigns/${i}` },
+        runId,
+        execute: () => Promise.reject(new Error(`some field is required for ENTITY_${i} UPDATE`)),
+      });
+    }
+    // 4 MORE dispatched concurrently, matching the real production shape.
+    const executes = Array.from({ length: 4 }, () => jest.fn().mockRejectedValue(new Error('boom')));
+    const outcomes = await Promise.all(
+      executes.map((execute, i) => executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api',
+        args: { action: 'UPDATE', customer_id: '5092566541', entity_type: `CONCURRENT_${i}`, campaign_resource_name: `customers/5092566541/campaigns/c${i}` },
+        runId,
+        execute,
+      }))
+    );
+    // Only 1 unit of headroom was left (9 confirmed, budget 10) — exactly 1 of the
+    // 4 concurrent calls should actually execute; the other 3 are blocked on the
+    // reservation before ever reaching execute().
+    const executedCount = executes.filter((fn) => fn.mock.calls.length > 0).length;
+    const budgetBlocked = outcomes.filter((o) => o.status === 'error' && o.error instanceof AgentToolBudgetExceededError);
+    expect(executedCount).toBe(1);
+    expect(budgetBlocked.length).toBe(3);
+    // The one that did execute failed on its own real error, not a budget block.
+    const executed = outcomes.find((o, i) => executes[i].mock.calls.length > 0);
+    expect(executed?.status).toBe('error');
+    if (executed?.status === 'error') expect(executed.error).not.toBeInstanceOf(AgentToolBudgetExceededError);
+  });
+
+  it('a concurrent batch well within budget is not falsely blocked, and reservations release cleanly', async () => {
+    const runId = 'run-1668-concurrent-legitimate';
+    const executes = Array.from({ length: 4 }, () => jest.fn().mockResolvedValue({ success: true }));
+    const outcomes = await Promise.all(
+      executes.map((execute, i) => executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api',
+        args: { action: 'UPDATE', customer_id: '5092566541', entity_type: 'KEYWORD', criterion_resource_name: `customers/5092566541/adGroupCriteria/${i}` },
+        runId,
+        execute,
+      }))
+    );
+    expect(outcomes.every((o) => o.status === 'success')).toBe(true);
+    executes.forEach((fn) => expect(fn).toHaveBeenCalled());
+
+    // Reservations are released once resolved, not leaked — a later call sees a
+    // fully clean budget, not lingering pending state from the resolved batch.
+    const finalCheck = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api',
+      args: { action: 'UPDATE', customer_id: '5092566541', entity_type: 'KEYWORD', criterion_resource_name: 'customers/5092566541/adGroupCriteria/final' },
+      runId,
+      execute: jest.fn().mockResolvedValue({ success: true }),
+    });
+    expect(finalCheck.status).toBe('success');
+  });
 });
 
 /*
