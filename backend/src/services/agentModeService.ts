@@ -25421,9 +25421,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         resultSource,
         error: error instanceof Error ? error.message : 'Unknown error',
         // ENG-1300: googleapis' customsearch client throws a GaxiosError, whose
-        // .code is genuinely the numeric HTTP status (unlike Meta's business-code
-        // .code) — same convention already established for Drive/Calendar.
-        code: (error as any)?.code || (error as any)?.response?.status,
+        // .status/.code are genuinely the numeric HTTP status (unlike Meta's
+        // business-code .code) — same convention already established for
+        // Drive/Calendar. .status checked first since GaxiosError's own docs
+        // treat it as canonical; .code and .response?.status are fallbacks
+        // for other error shapes that can reach this catch.
+        code: (error as any)?.status ?? (error as any)?.code ?? (error as any)?.response?.status,
       };
     }
   }

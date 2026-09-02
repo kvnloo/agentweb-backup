@@ -109,25 +109,41 @@ export const fetchWithRetryAndPaging = async (url: string): Promise<any> => {
   // reading. Non-enumerable so it never leaks into a JSON.stringify of the Meta
   // payload itself (logging, caching, etc.).
   if (data && typeof data === 'object') {
-    Object.defineProperty(data, '__httpStatus', { value: response.status, enumerable: false });
+    // configurable: true — a later page's failure (below) needs to overwrite
+    // this once the first page's own status is no longer the whole story.
+    Object.defineProperty(data, '__httpStatus', { value: response.status, enumerable: false, configurable: true });
   }
 
   // Check if there's a paging.next URL for more data
   if (data.paging && data.paging.next) {
     console.log(`Meta API: Fetching next page of data from ${data.paging.next.substring(0, 100)}...`);
-    
+
     // Recursively fetch next page
     const nextPageData = await fetchWithRetryAndPaging(data.paging.next);
-    
+
     // Merge the data arrays
     if (data.data && Array.isArray(data.data) && nextPageData.data && Array.isArray(nextPageData.data)) {
       data.data = [...data.data, ...nextPageData.data];
     }
-    
+
+    // ENG-1300: a later page can fail (non-2xx) without this function
+    // throwing — by design, per the comment above on returning-not-throwing —
+    // so that failure would otherwise be silently hidden behind the FIRST
+    // page's own success status once the data arrays are merged into one
+    // seemingly-complete result. The overall multi-page fetch is only as
+    // successful as its least successful page.
+    const nextPageStatus = (nextPageData as any)?.__httpStatus;
+    if (typeof nextPageStatus === 'number' && nextPageStatus >= 400 && data && typeof data === 'object') {
+      Object.defineProperty(data, '__httpStatus', { value: nextPageStatus, enumerable: false, configurable: true });
+      if (nextPageData.error && !data.error) {
+        data.error = nextPageData.error;
+      }
+    }
+
     // Remove paging info since we've fetched all pages
     delete data.paging;
   }
-  
+
   return data;
 };
 

@@ -510,10 +510,18 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         if (error?.message?.includes('deactivated')) {
           throw error;
         }
-        // Unlike the message-sniffing branches elsewhere in this file, this
-        // catch is unconditionally a getValidToken failure — the message is
-        // always "please reconnect", so attaching 401 here describes this
-        // code path itself rather than guessing at an unrelated error.
+        // getValidToken can also propagate a ConnectedAccountChanged-coded
+        // error (a conditional-write race, not an auth failure) or a raw
+        // config-load failure (getLinkedInConfig() throws OUTSIDE its own
+        // try/catch, so that shape reaches here uncategorized) — neither is
+        // "please reconnect", so only relabel the specific messages
+        // getValidToken actually uses for a genuine token/auth failure
+        // (positive match, not "everything except deactivated").
+        const isTokenAuthFailure = typeof error?.message === 'string'
+          && error.message.includes('access token expired');
+        if (!isTokenAuthFailure) {
+          throw error;
+        }
         rethrowWithCode('Failed to authenticate with LinkedIn. Please reconnect your account.', 401);
       }
 
@@ -730,8 +738,14 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       if (error?.message?.includes('deactivated')) {
         throw error; // Re-throw deactivated app errors
       }
-      // Unconditionally a getValidToken failure here — see the matching
-      // comment above in getPostMetrics.
+      // Only relabel a genuine token/auth failure — see the matching comment
+      // above in getPostMetrics for why this can't be "everything except
+      // deactivated" (ConnectedAccountChanged, config-load failures).
+      const isTokenAuthFailure = typeof error?.message === 'string'
+        && error.message.includes('access token expired');
+      if (!isTokenAuthFailure) {
+        throw error;
+      }
       rethrowWithCode('Failed to authenticate with LinkedIn. Please reconnect your account.', 401);
     }
 

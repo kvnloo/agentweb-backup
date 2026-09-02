@@ -108,7 +108,17 @@ export function toolResultError(result: unknown): Error | null {
   // each call site is still responsible for extracting the correct field.
   const isHttpRange = (n: unknown): n is number => typeof n === 'number' && n >= 100 && n <= 599;
   const withCode = (err: Error): Error => {
-    const code = isHttpRange(obj.code) ? obj.code : isHttpRange(obj.status) ? obj.status : undefined;
+    // statusCode checked first: a field named exactly that (the AWS SDK v2
+    // convention — S3 upload failures thread it through as `code` today, but
+    // a future caller could pass it through verbatim under its own name) is
+    // an unambiguous signal that the number is a transport status, unlike
+    // `code`, which is overloaded with vendor business codes elsewhere in
+    // this codebase (Meta, Google Ads) — preferring it when present is
+    // defense-in-depth against exactly that collision.
+    const code = isHttpRange(obj.statusCode) ? obj.statusCode
+      : isHttpRange(obj.code) ? obj.code
+      : isHttpRange(obj.status) ? obj.status
+      : undefined;
     if (code !== undefined) (err as { code?: number }).code = code;
     return err;
   };
