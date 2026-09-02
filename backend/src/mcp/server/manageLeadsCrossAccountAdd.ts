@@ -139,10 +139,7 @@ export async function executeCrossAccountLeadAdd(args: any, context: any): Promi
   const c = await resolveClientScopedContext(context, args.client_id, 'manage_leads');
   const scope = c.resolvedScope!; // always populated here — client_id is guaranteed present by the caller in apiTools.ts
 
-  const leadPayload = normalizeAddLeadPayload(args.leads);
-  const dryRun = resolveDryRunFlag(args.dry_run);
-
-  const auditBase = {
+  const auditIdentity = {
     actorUserId: scope.caller.userId,
     actorEmail: scope.caller.email,
     action: 'manage_leads_cross_account_add' as const,
@@ -150,6 +147,24 @@ export async function executeCrossAccountLeadAdd(args: any, context: any): Promi
     targetUserId: scope.target.userId,
     targetEmail: scope.target.email,
     listId,
+  };
+
+  // normalizeAddLeadPayload/resolveDryRunFlag can throw (malformed leads,
+  // non-boolean dry_run). Without this, that attempt left no trace beyond the
+  // generic "admin scoped to customer" event from resolveClientScopedContext
+  // — the one audit trail this write-capable path is meant to keep closely.
+  let leadPayload: Record<string, unknown>;
+  let dryRun: boolean;
+  try {
+    leadPayload = normalizeAddLeadPayload(args.leads);
+    dryRun = resolveDryRunFlag(args.dry_run);
+  } catch (error: any) {
+    recordAdminAudit({ ...auditIdentity, outcome: 'invalid_payload', error: error?.message });
+    throw error;
+  }
+
+  const auditBase = {
+    ...auditIdentity,
     leadEmail: typeof leadPayload.email === 'string' ? leadPayload.email : undefined,
     dryRun,
   };
@@ -158,6 +173,7 @@ export async function executeCrossAccountLeadAdd(args: any, context: any): Promi
     recordAdminAudit({ ...auditBase, outcome: 'planned' });
     try {
       const preview = await previewLeadAdd(scope.target.userId, listId, leadPayload);
+      recordAdminAudit({ ...auditBase, outcome: 'previewed', wouldSucceed: preview.wouldSucceed, reason: preview.reason });
       return jsonResult({ dryRun: true, ...preview });
     } catch (error: any) {
       recordAdminAudit({ ...auditBase, outcome: 'failed', error: error?.message });
