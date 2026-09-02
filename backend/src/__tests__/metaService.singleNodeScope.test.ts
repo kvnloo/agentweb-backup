@@ -10,7 +10,7 @@
 // the same guard. These pin that they now have it, and that the refusal does not disclose
 // which account actually owns the node.
 
-import { MetaService, isMetaAccountScopeRefusal } from '../services/metaService';
+import { MetaService, isMetaAccountScopeRefusal, META_ACCOUNT_SCOPE_REFUSAL_MARKER } from '../services/metaService';
 import { FacebookAdsApi, AdAccount, Campaign, AdSet, Ad } from 'facebook-nodejs-business-sdk';
 
 jest.mock('facebook-nodejs-business-sdk', () => ({
@@ -261,6 +261,43 @@ describe('single-entity Meta node reads are bounded by the selected ad account',
       }
       expect(thrown).toBeDefined();
       expect(isMetaAccountScopeRefusal(thrown)).toBe(true);
+    });
+
+    /*
+     * "We could not check" and "it is in another account" are different facts, and only one of
+     * them has a remedy the user can act on.
+     *
+     * Both refuse — an unverifiable node must fail closed, or the guard is optional. But the
+     * mismatch branch says "select that account and try again", which is exactly right there and
+     * unactionable when Meta simply did not report an owner: there is no other account to select.
+     * The marker stays identical on both so `isMetaAccountScopeRefusal` keeps recognising them
+     * and no caller degrades past the guard.
+     */
+    it('gives the unverifiable-owner branch its own remedy, without disclosing anything', async () => {
+      // Graph answers the node but omits account_id, despite the read asking for it.
+      const get = jest.fn().mockResolvedValue({ _data: { id: 'ad_9', name: 'No owner field' } });
+      (Ad as unknown as jest.Mock).mockImplementation(() => ({ get }));
+
+      const message = await refusalMessage(service.getAd(token, 'ad_9', SELECTED));
+
+      expect(message).toContain(META_ACCOUNT_SCOPE_REFUSAL_MARKER);
+      expect(message).toMatch(/did not report which ad account owns it/i);
+      expect(message).toMatch(/failed check, not a proven mismatch/i);
+      // The mismatch remedy must NOT be offered here — there is no other account to select.
+      expect(message).not.toMatch(/select that account and try again/i);
+      // Still a refusal every caller recognises, so a write stays fail-closed.
+      expect(isMetaAccountScopeRefusal(new Error(message))).toBe(true);
+    });
+
+    it('keeps the select-another-account remedy on a genuine mismatch', async () => {
+      // Control: the discrimination above must not strip the remedy from the branch that has one.
+      const get = nodeGet(OTHER_TENANT, { id: 'ad_9', name: 'Someone else\u2019s ad' });
+      (Ad as unknown as jest.Mock).mockImplementation(() => ({ get }));
+
+      const message = await refusalMessage(service.getAd(token, 'ad_9', SELECTED));
+
+      expect(message).toMatch(/select that account and try again/i);
+      expect(message).not.toContain(OTHER_TENANT);
     });
 
     it('does not recognise a transient Graph failure as a tenancy refusal', async () => {

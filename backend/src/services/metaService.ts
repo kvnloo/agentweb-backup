@@ -1291,7 +1291,10 @@ export class MetaService {
       [...MetaService.CAMPAIGN_READ_FIELDS];
     try {
       this.initApi(accessToken);
-      if (options.campaignId) {
+      // `!== undefined`, not truthiness: `''` is the input `resolveScopeId` exists to REFUSE, and
+      // a truthy test skipped the branch entirely and fell through to the account-wide list —
+      // the silent widening the guard was written to stop, on the one input that names it.
+      if (options.campaignId !== undefined && options.campaignId !== null) {
         const wantedId = MetaService.resolveScopeId(options.campaignId, 'campaign_id')!;
         this.log(`Fetching single campaign ${wantedId}`, { fields });
         const campaign = new Campaign(wantedId);
@@ -1441,7 +1444,8 @@ export class MetaService {
       [...MetaService.AD_SET_READ_FIELDS];
     try {
       this.initApi(accessToken);
-      if (options.adSetId) {
+      // Same reason as the single-campaign branch above.
+      if (options.adSetId !== undefined && options.adSetId !== null) {
         const wantedId = MetaService.resolveScopeId(options.adSetId, 'ad_set_id')!;
         this.log(`Fetching single ad set ${wantedId}`, { fields });
         const adSet = new AdSet(wantedId);
@@ -2209,7 +2213,11 @@ export class MetaService {
    * otherwise have succeeded because the probe blipped. Edge-scoped callers still need
    * `assertNodeInAccount`, having no payload response to fold the field into.
    */
-  private static assertOwnedByAccount(
+  /**
+   * Public so the one guard that predates it (`AD_CREATIVE GET` in agentModeService) can share
+   * this exact refusal instead of hand-rolling a near-copy that names the owning account.
+   */
+  public static assertOwnedByAccount(
     ownerAccountId: unknown,
     nodeId: string,
     nodeLabel: string,
@@ -2226,19 +2234,41 @@ export class MetaService {
      * could learn which ad account owns it, which is cross-account disclosure of exactly the
      * kind the guard exists to prevent — a block that answers the question it is refusing.
      *
-     * So the caller (and the model, and ultimately the user) gets one generic message for every
-     * failed branch, and the discriminating detail goes to the server log only.
+     * So the caller (and the model, and ultimately the user) gets the SAME marker sentence on
+     * every failed branch, and the owning account never appears in any of them — the log keeps
+     * that. What may differ after the marker is the remedy, because "select the other account"
+     * is right for a mismatch and impossible when Meta reported no owner at all; see `refuse`.
      */
-    const refuse = (serverDetail: string): never => {
+    /*
+     * One marker sentence for every branch, but the REMEDY may differ.
+     *
+     * The marker is what `isMetaAccountScopeRefusal` keys on, so it must not vary — a caller
+     * that stops recognising a refusal degrades past a guard it was told to respect, and for a
+     * write that means proceeding to confirmation on a node the guard refused. What may vary is
+     * the sentence after it, and it should: "select that account and try again" is the right
+     * remedy when the node lives in a DIFFERENT account, and no remedy at all when Meta simply
+     * did not tell us who owns it. Naming an action the user cannot take is the ENG-1636 shape.
+     *
+     * Neither variant discloses the owning account — that is the oracle this guard exists to
+     * refuse, and the discriminating detail stays in the server log.
+     */
+    const OTHER_ACCOUNT_REMEDY = 'If it belongs to a different ad account, select that account and try again.';
+    const refuse = (serverDetail: string, remedy: string = OTHER_ACCOUNT_REMEDY): never => {
       console.warn(`[MetaService] scope ownership refused: ${serverDetail}`);
       throw new Error(
-        `The requested ${nodeLabel.toLowerCase()} ${META_ACCOUNT_SCOPE_REFUSAL_MARKER}. ` +
-        `If it belongs to a different ad account, select that account and try again.`,
+        `The requested ${nodeLabel.toLowerCase()} ${META_ACCOUNT_SCOPE_REFUSAL_MARKER}. ${remedy}`,
       );
     };
 
     if (!owner) {
-      refuse(`no account_id on ${nodeLabel} ${nodeId}`);
+      // Fails closed on purpose: the field was requested, so its absence means the assumption
+      // behind this check no longer holds — not that the node is in scope.
+      refuse(
+        `no account_id on ${nodeLabel} ${nodeId}`,
+        `Meta did not report which ad account owns it, so ownership could not be CONFIRMED — ` +
+        `this is a failed check, not a proven mismatch. Retry; if it persists, verify the object ` +
+        `in Meta Ads Manager and that the intended ad account is selected.`,
+      );
     }
     // Both sides must be known. An empty selected account cannot be compared against anything,
     // so treating it as "no mismatch" would pass every node the token can reach.
