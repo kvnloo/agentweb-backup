@@ -467,6 +467,35 @@ import {
 } from '../utils/metaConstants';
 
 /**
+ * ENG-1685: build the S3-safe filename for a generated HTML artifact from its
+ * (human-written, arbitrary-content) title.
+ *
+ * Kraftersland/Helen reported "Download failed" on an HTML report artifact whose
+ * displayed filename was truncated mid-word: `..._Weekly_Performance_Repor.html`
+ * (missing the final "t"). Root cause: the sanitize-then-truncate order was
+ * backwards everywhere this ran — `title.replace(...).substring(0, 50)` blindly
+ * cut the ALREADY-underscore-joined string at a fixed 50-char boundary with no
+ * regard for word breaks, so any title whose sanitized form crossed that
+ * boundary lost a fragment of its last word. The 50-char cap itself had no
+ * documented reason: S3 keys allow up to 1024 bytes and this key already has a
+ * userId + timestamp + random token prefix, leaving hundreds of characters of
+ * real headroom — the low, undocumented number was never load-bearing.
+ *
+ * The truncated filename was NOT independently confirmed to be the cause of the
+ * download failure itself (a live repro of the exact reported file's presign +
+ * S3 fetch succeeded end-to-end against production), but it is a real, visible
+ * bug in the same code path and worth fixing regardless — and downloadAsset.ts's
+ * error handling was hardened separately (ENG-1685) to stop collapsing every
+ * failure class into one indistinguishable "Download failed" toast, which is
+ * what made this report undiagnosable from the client side in the first place.
+ */
+export function buildHtmlArtifactFilename(title: string, now: number = Date.now()): string {
+  const HTML_ARTIFACT_FILENAME_TITLE_MAX = 150;
+  const sanitized = (title || '').replace(/[^a-z0-9]/gi, '_').substring(0, HTML_ARTIFACT_FILENAME_TITLE_MAX);
+  return `html_${now}_${sanitized}.html`;
+}
+
+/**
  * Self-learning loop telemetry for agent-mode tool calls.
  *
  * Emits one decision event + per-tool invoked/succeeded/failed events into the
@@ -29869,7 +29898,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       if (!isEmail && isCompleteHtmlDocument(contentDraft)) {
         console.log('AgentMode: create_html_file — draft is already complete HTML, uploading directly (skipping render)');
         const { uploadFileToS3 } = await import('../utils/s3Utils');
-        const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+        const filename = buildHtmlArtifactFilename(title);
         const uploadableHtml = await this.inlinePrivateS3Images(contentDraft, documentType, userId);
         const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
         if (!uploadResult.success || !uploadResult.url) {
@@ -30103,7 +30132,7 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Upload to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
-      const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+      const filename = buildHtmlArtifactFilename(title);
       const uploadableHtml = await this.inlinePrivateS3Images(htmlContent, documentType, userId);
       const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
 
@@ -30272,7 +30301,7 @@ Return the HTML body fragment for this section only.`;
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const fallbackHtml = await renderMarkdownReportDocumentAsync(title, contentDraft);
       const uploadableHtml = await this.inlinePrivateS3Images(fallbackHtml, documentType, userId);
-      const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+      const filename = buildHtmlArtifactFilename(title);
       uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
