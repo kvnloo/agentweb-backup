@@ -45,6 +45,7 @@ describe('resolveClientScopedContext', () => {
     const result = await resolveClientScopedContext(context, undefined, 'list_tasks');
 
     expect(result).toEqual({ userId: 'admin-1', agentUserId: undefined, isDelegatedAccess: undefined, sessionId: 'sess-1' });
+    expect(result.resolvedScope).toBeUndefined();
     expect(mockUserDb.getUserById).not.toHaveBeenCalled();
     expect(mockMintDelegateToken).not.toHaveBeenCalled();
     expect(mockRecordAdminAudit).not.toHaveBeenCalled();
@@ -168,6 +169,23 @@ describe('resolveClientScopedContext', () => {
       300,
     );
     expect(result.overrideToken).toBe('minted-delegate-token');
+  });
+
+  // ENG-1557: resolvedScope feeds the audit trail / dry-run preview for
+  // write-capable callers (manage_leads action:add) without a second
+  // redundant userDb lookup — must carry the resolved caller+target identities.
+  it('populates resolvedScope with caller and target identities on successful resolution', async () => {
+    const caller = { userId: 'admin-1', email: 'admin@example.com', isAdmin: true };
+    const target = { userId: 'target-1', email: 'customer@example.com', roles: ['customer'] };
+    mockUserDb.getUserById.mockResolvedValue(caller as any);
+    mockUserDb.getUserByEmail.mockResolvedValue(target as any);
+
+    const result = await resolveClientScopedContext({ userId: 'admin-1' }, 'customer@example.com', 'manage_leads');
+
+    expect(result.resolvedScope).toEqual({
+      caller: { userId: 'admin-1', email: 'admin@example.com' },
+      target: { userId: 'target-1', email: 'customer@example.com' },
+    });
   });
 
   it('resolves a client_id without "@" via getUserById, not getUserByEmail', async () => {
