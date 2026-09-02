@@ -220,6 +220,33 @@ describe('admin client_id scoping — end to end (ENG-1596 / ENG-1557 v1)', () =
       expect(mockMcpFetch).not.toHaveBeenCalled();
     });
 
+    // Adversarial-review finding (round 3): a malformed leads/dry_run value
+    // that fails AFTER a real admin is correctly scoped to a real target
+    // previously left no trace beyond the generic "admin scoped to customer"
+    // event — the manage_leads_cross_account_add audit trail itself never
+    // recorded that an add was attempted or why it failed.
+    it('audits an invalid payload (malformed leads or dry_run) instead of leaving no trace', async () => {
+      await expect(
+        mcpToolRegistry.execute('manage_leads', addArgs({ leads: [null] }), callerContext)
+      ).rejects.toThrow('requires the single lead to be an object');
+      expect(mockRecordAdminAudit).toHaveBeenCalledWith(expect.objectContaining({
+        outcome: 'invalid_payload',
+        targetUserId: 'target-1',
+      }));
+
+      mockRecordAdminAudit.mockClear();
+
+      await expect(
+        mcpToolRegistry.execute('manage_leads', addArgs({ dry_run: 'true' as any }), callerContext)
+      ).rejects.toThrow('dry_run must be a boolean');
+      expect(mockRecordAdminAudit).toHaveBeenCalledWith(expect.objectContaining({
+        outcome: 'invalid_payload',
+        targetUserId: 'target-1',
+      }));
+
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+    });
+
     it('dry_run:true previews without mutating, regardless of the flag being unset', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', name: 'My List', userId: 'target-1' } as any);
       mockCanDestructiveCrmList.mockResolvedValue(true);
@@ -231,6 +258,10 @@ describe('admin client_id scoping — end to end (ENG-1596 / ENG-1557 v1)', () =
       expect(JSON.parse((result as any).content[0].text).wouldSucceed).toBe(true);
       expect(mockCanDestructiveCrmList).toHaveBeenCalledWith('target-1', expect.objectContaining({ userId: 'target-1' }));
       expect(mockRecordAdminAudit).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'planned', dryRun: true, targetUserId: 'target-1' }));
+      // Adversarial-review finding (round 3): the real-write branch logs a
+      // terminal 'created' outcome; the dry-run branch previously stopped at
+      // 'planned' with no record of the actual verdict it computed.
+      expect(mockRecordAdminAudit).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'previewed', wouldSucceed: true }));
     });
 
     it('dry_run:true previews without mutating, even when the flag is enabled — dry_run wins', async () => {
