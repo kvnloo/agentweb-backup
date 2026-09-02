@@ -208,6 +208,18 @@ describe('AgentModeService - Tool Descriptions', () => {
       expect(systemPrompt).toContain('"I\'ll draft this FROM [sender] TO [recipient] - correct?"');
     });
 
+    it('should infer a single plausible reply direction instead of asking when only one external party is named', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('Single-plausible-direction case — infer, don\'t ask');
+      expect(systemPrompt).toContain('draft it as a reply FROM the team TO that external party');
+      expect(systemPrompt).toContain('asking is the same as producing no draft at all');
+    });
+
+    it('should only block unattended runs on genuine multi-party ambiguity, not a single inferable direction', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('If only one direction is plausible, draft it per the single-plausible-direction case above instead of stopping');
+    });
+
     it('should not polish inbound text when the user asked for a reply', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
       expect(systemPrompt).toContain('Do not merely polish an inbound message when the user asked for a reply');
