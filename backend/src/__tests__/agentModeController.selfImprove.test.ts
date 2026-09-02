@@ -397,6 +397,40 @@ describe('updateScheduledChat prompt revision history', () => {
     expect(updates.promptRevisions[updates.promptRevisions.length - 1].startingMessage)
       .toBe('p'.repeat(35000));
   });
+
+  // ENG-1672 regression: trimListToItemBudget returns kept: [] when even the
+  // single newest entry alone exceeds PROMPT_REVISIONS_BUDGET_BYTES (e.g. the
+  // previous prompt itself was huge) — shedOldest must recover that entry
+  // rather than writing an empty array back, which would silently erase all
+  // revision history, including the one this very edit just created. The
+  // total projected item stays well under SCHEDULE_ITEM_BUDGET_BYTES here so
+  // this exercises the own-budget guard in isolation, not the whole-item 400.
+  it('keeps the newest revision even when it alone exceeds the byte budget', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue({
+      scheduleId: 'sched-oversized-revision',
+      userId: mockUserId,
+      scheduleName: 'S',
+      startingMessage: 'p'.repeat(160000), // alone exceeds the 150KB PROMPT_REVISIONS_BUDGET_BYTES
+      frequency: 'daily',
+      emailNotifications: ['owner@example.com'],
+      selfImprove: true,
+      promptRevisions: [],
+    } as any);
+
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      params: { scheduleId: 'sched-oversized-revision' },
+      body: { startingMessage: 'short new prompt' },
+    } as unknown as Request;
+
+    const res = makeRes();
+    await agentModeController.updateScheduledChat(req, res);
+
+    expect(res.status).not.toHaveBeenCalledWith(400);
+    const updates = mockScheduleDb.updateSchedule.mock.calls[0][1] as any;
+    expect(updates.promptRevisions).toHaveLength(1);
+    expect(updates.promptRevisions[0].startingMessage).toBe('p'.repeat(160000));
+  });
 });
 
 // ENG-1048: a schedule with a ~35k-character prompt accumulates 10 full-prompt
