@@ -28,6 +28,7 @@ import {
 } from './connectedAccountsDb';
 import { emailService } from './emailService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { PROMPT_REVISIONS_BUDGET_BYTES, trimListToItemBudget, isDynamoItemSizeError } from '../utils/dynamoItemBudget';
 
 const TAG = '[linkedInConnectionHealth]';
 
@@ -507,6 +508,10 @@ export async function clearDisconnectFlag(viewerUserId: string, accountId: strin
  *    `promptRevisions` first — the exact mechanism the customer's own manual
  *    edit already uses (`agentModeController.ts`'s `updateScheduledChat`) — so
  *    an unwanted rewrite is always visible and reversible, never silently lost.
+ *    Bounded by `PROMPT_REVISIONS_BUDGET_BYTES` the same way (ENG-1672): a flat
+ *    count cap alone still let promptRevisions creep toward DynamoDB's item
+ *    ceiling, and a schedule that hit it here would silently stay pinned to a
+ *    dead account forever (see the per-schedule size-error handling below).
  * 2. Two near-simultaneous reconnects for the same user (or a human editing the
  *    schedule at that exact moment) could both read the same stale text before
  *    either writes. Without a check, the second write would silently clobber
@@ -516,6 +521,12 @@ export async function clearDisconnectFlag(viewerUserId: string, accountId: strin
  *    of a lost update, and is treated as a no-op: the writer that won already
  *    left correct state, and a schedule that's still stale gets another chance
  *    on the next reconnect or gate evaluation either way.
+ * 3. A genuine item-size rejection (ENG-1672) is scoped to the ONE schedule that
+ *    hit it, not the whole batch: `throw`ing there would abort the loop and skip
+ *    every OTHER schedule of this user's still waiting to be repointed, even ones
+ *    that would have succeeded. The affected schedule itself is retried on the
+ *    next reconnect (its `needs_reconnect` stale-account text is unchanged), same
+ *    as the concurrent-write case above.
  */
 const REPOINT_REVISION_LIMIT = 10;
 
@@ -542,10 +553,21 @@ export async function repointStaleAccountReferences(
       if (updated === original) continue;
 
       const existingRevisions = Array.isArray(s?.promptRevisions) ? s.promptRevisions : [];
-      const nextRevisions = [
+      const candidateRevisions = [
         ...existingRevisions,
         { startingMessage: original, updatedAt: new Date().toISOString() },
       ].slice(-REPOINT_REVISION_LIMIT);
+      // ENG-1672: bound by bytes too, same as the customer's own manual edit path —
+      // a flat count cap alone still let promptRevisions alone approach DynamoDB's
+      // item ceiling from a handful of large prompts. Never let the trim erase the
+      // newest entry (the pre-repoint text this rewrite must stay reversible against).
+      const { kept: trimmedRevisions } = trimListToItemBudget(
+        {},
+        'promptRevisions',
+        candidateRevisions,
+        PROMPT_REVISIONS_BUDGET_BYTES,
+      );
+      const nextRevisions = trimmedRevisions.length > 0 ? trimmedRevisions : candidateRevisions.slice(-1);
 
       try {
         await scheduleDb.updateSchedule(
@@ -560,6 +582,14 @@ export async function repointStaleAccountReferences(
       } catch (writeError: any) {
         if (writeError?.code === 'ConditionalCheckFailedException') {
           console.log(`${TAG} repoint for schedule ${s.scheduleId} lost a concurrent write, skipping`);
+          continue;
+        }
+        // ENG-1672: an item-size rejection (still too large even after trimming
+        // promptRevisions above — e.g. a huge startingMessage or runResults) must
+        // skip only THIS schedule, not abort repointing the rest of this user's
+        // batch. Falling through to the outer catch would do exactly that.
+        if (isDynamoItemSizeError(writeError)) {
+          console.error(`${TAG} repoint for schedule ${s.scheduleId} skipped — item too large to save even after trimming history:`, writeError);
           continue;
         }
         throw writeError;
