@@ -240,7 +240,19 @@ describe('AgentModeService - Tool Descriptions', () => {
     it('should treat a requested draft as the primary deliverable over a related tool action', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
       expect(systemPrompt).toContain('that draft IS the primary deliverable');
-      expect(systemPrompt).toContain('never a substitute for it');
+      expect(systemPrompt).toContain('do not substitute one for the other, do both');
+    });
+
+    it('should require verifying with tools before the draft describes a technical ask\'s outcome', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('call that tool — or its read/list equivalent — BEFORE writing the draft');
+    });
+
+    it('should bind drafted content to Truthful Reporting, not just the assistant\'s own narration', async () => {
+      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      expect(systemPrompt).toContain('Truthful Reporting applies to drafted content, not just your own narration');
+      expect(systemPrompt).toContain('you must have the tool result behind that claim in THIS session');
+      expect(systemPrompt).toContain('A confident-sounding draft that asserts a false completion is worse than no draft');
     });
 
     it('should require a per-ask status line and forbid silently dropping an ask', async () => {
