@@ -3082,4 +3082,48 @@ describe('ENG-1668 — hoists a stray nested wrapper object before validation', 
 
     expect(result.status).toBe('invalid');
   });
+
+  // ENG-1668 follow-up: the compound mistake — nested AND misnamed at once —
+  // is caught by running the SAME alias resolution used on top-level keys
+  // against the wrapper's nested keys too, not just an exact property-name match.
+  it('hoists a nested key that is ALSO misnamed, via an explicit schema alias', () => {
+    const schemaWithAlias = {
+      ...googleAdsSchema,
+      properties: {
+        ...googleAdsSchema.properties,
+        criterion_resource_name: { type: 'string', aliases: ['criterion'] },
+      },
+    };
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        action: 'UPDATE', customer_id: '5092566541', entity_type: 'KEYWORD',
+        params: { criterion: 'customers/5092566541/adGroupCriteria/201989695567~26782521' },
+      },
+      inputSchema: schemaWithAlias,
+    });
+
+    expect(result.status).toBe('repaired');
+    expect((result.args as Record<string, unknown>).criterion_resource_name)
+      .toBe('customers/5092566541/adGroupCriteria/201989695567~26782521');
+    expect((result.args as Record<string, unknown>).params).toBeUndefined();
+    expect(result.repairs).toEqual(['params.criterion->criterion_resource_name']);
+  });
+
+  it('hoists a nested key matching a global default alias (query -> search_query)', () => {
+    const searchSchema = {
+      type: 'object',
+      properties: { query: { type: 'string' }, customer_id: { type: 'string' } },
+      required: ['customer_id'],
+    };
+    const result = validateAndRepairToolArgs({
+      toolName: 'you_search_web',
+      args: { customer_id: '1', filters: { search_query: 'agentweb' } },
+      inputSchema: searchSchema,
+    });
+
+    expect(result.status).toBe('repaired');
+    expect((result.args as Record<string, unknown>).query).toBe('agentweb');
+    expect(result.repairs).toEqual(['filters.search_query->query']);
+  });
 });
