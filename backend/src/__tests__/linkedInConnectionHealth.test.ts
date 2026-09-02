@@ -869,6 +869,7 @@ describe('repointStaleAccountReferences (ENG-1366)', () => {
       { scheduleId: 'a', startingMessage: originalMessage, promptRevisions: [] },
     ]);
     scheduleDb.updateSchedule.mockResolvedValue(undefined);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
 
     const repointed = await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
 
@@ -876,6 +877,13 @@ describe('repointStaleAccountReferences (ENG-1366)', () => {
     const [, updates] = scheduleDb.updateSchedule.mock.calls[0];
     expect(updates.promptRevisions).toHaveLength(1);
     expect(updates.promptRevisions[0].startingMessage).toBe(originalMessage);
+    // No existing history means nothing was literally "dropped" — but this
+    // schedule's very first revision already sits over the byte sub-budget,
+    // which is exactly the condition this observability exists to flag. Must
+    // not stay silent just because there was nothing to trim away.
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('kept the newest promptRevisions entry even though it alone exceeds the byte budget — no older entries existed to drop')
+    );
   });
 
   // ENG-1672 (code review follow-up): the combined case the above test doesn't
