@@ -1,17 +1,28 @@
 import { AGENT_MODE_SYSTEM_PROMPT } from '../docs/agentModeSystemPrompt';
 
-// ENG-828: a landing-page generation/fix session (b397bf89) hit V0_CALL_TIMEOUT
-// mid-work-plan and stopped, leaving the "Fix Deviations & Confirm Final Page"
-// step stranded pending with no resume path — even though the underlying v0
-// job (v0ChatId) stays reusable and a retry does NOT re-charge or restart it.
+// ENG-828: a landing-page work-plan session (b397bf89) stalled mid-flight and
+// left the "Fix Deviations & Confirm Final Page" step stranded `pending` with
+// no resume path. The raw DynamoDB record (workPlan.steps + failedFunctions)
+// shows the step that actually failed there called `coding_agent` (a 10-min
+// internal timeout, `state: 'timed_out'`, `retryable: true`) — not a v0-backed
+// tool; the session's own satisfaction-score reasoning is what named
+// "V0_CALL_TIMEOUT", and isn't itself raw evidence of which tool failed. That
+// distinction matters here because coding_agent, unlike v0-backed tools,
+// does NOT resume an in-flight job on retry — see the "does NOT resume"
+// carve-out below.
 //
-// Root cause: the system prompt's Anti-Loop Rule ("NEVER call the same tool
-// with identical arguments more than once") has no exception for a transient/
-// infrastructure failure (timeout, 5xx, network blip) — only for an explicit
-// user regeneration request. So the model correctly explained the timeout
-// but never retried, even though retrying was safe and often would have
-// resumed the same in-flight job. Fix: teach the model this class of failure
-// is retryable once, automatically, before surfacing it to the user.
+// Root cause (confirmed generally, independent of which single tool tripped
+// it in that session): the system prompt's Anti-Loop Rule ("NEVER call the
+// same tool with identical arguments more than once") had no exception for a
+// transient/infrastructure failure (timeout, 5xx, network blip) — only for an
+// explicit user regeneration request. v0Service itself never auto-retries a
+// timeout (every withRetry call site passes `retryOnTimeout: false`), so any
+// V0_CALL_TIMEOUT/V0_GENERATION_TIMEOUT reaches the model on the first
+// attempt — and the model correctly explained the failure but never retried,
+// even when retrying was safe (v0-backed tools resume the same in-flight
+// chat rather than restarting). Fix: teach the model this class of failure is
+// retryable once, automatically, before surfacing it to the user — while
+// warning it that coding_agent specifically restarts from scratch on retry.
 describe('Agent Mode system prompt — retrying a transient infrastructure failure', () => {
   it('carves out a transient-failure exception distinct from user-requested regeneration', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Retrying a Transient Failure');
