@@ -29,7 +29,7 @@ import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
 import { cronJobRegistry } from '../utils/cronJobRegistry';
 import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
-import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, classifyPublishStall } from '../utils/publishPressCircuitBreaker';
+import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, hasUnmetPublishRequirement, classifyPublishStall } from '../utils/publishPressCircuitBreaker';
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
@@ -3401,6 +3401,18 @@ export async function runVerifiedChat(
      * required-function list together, so they still cannot disagree.
      */
     refreshPublishAuthorization?: () => Promise<SchedulePublishAuthorization | null>;
+    // ENG-930: true when the schedule's OWN requiredFunctionCalls names a publish-
+    // capable tool that `filterRequiredFunctionsToAuthorizedScope` (ENG-827) has
+    // already removed from `requiredFunctions` above, because this run is not
+    // authorized to publish. Once that happens the excluded tool can never again
+    // appear in `functionCallMisses`, so the publish-press breaker's normal
+    // `hasUnmetPublishRequirement` check — which only looks at what's currently
+    // unmet — can never see it either. A co-required non-publish prep call for
+    // that same excluded publish (e.g. generate_image) would otherwise press to
+    // the full `maxAttempts` budget on its own, reproducing this ticket's loop
+    // through a second door. See publishPressCircuitBreaker's
+    // `publishExcludedFromScope` doc comment.
+    publishRequirementExcludedFromScope?: boolean;
     // ENG-936: approval-bound source URLs for `generate_image` revisions in
     // this run. Passed through to the tool dispatcher so confirm=true edits of
     // the wrong source are rejected before execution.
@@ -3425,6 +3437,7 @@ export async function runVerifiedChat(
     publishAuthorization,
     refreshPublishAuthorization,
     publishAuthorized,
+    publishRequirementExcludedFromScope = false,
     approvedRevisionImageSources,
   } = params;
 
@@ -4146,12 +4159,37 @@ export async function runVerifiedChat(
       // having never been asked to publish once. So increment only on the attempts
       // that actually reached the publish-only-unmet state, which is exactly the
       // state whose next retry message carries the publish ask.
+      //
+      // ENG-930: `isPublishOnlyUnmet` alone never fires for a schedule whose
+      // requiredFunctionCalls pair a publish tool with a non-publish PREP call for
+      // it (e.g. ['post_on_connected_account', 'generate_image']) — a run that
+      // holds the publish has no reason to spend a generation call on an image for
+      // content that will never post, so that prep call stays unmet forever and the
+      // set is never PURELY publish-shaped. Confirmed live: schedule 34154af9
+      // pressed 19 identical times (68 messages, $8.07) on 2026-08-12, three days
+      // AFTER ENG-947 shipped, because of exactly this. `withholdIsGenuine` is the
+      // SAME verified (not just model-claimed) signal ENG-803's completion gate
+      // already trusts below (classifyScheduledContinuationAsync) — reused here so
+      // a schedule that pairs a publish call with a prep call gets the identical
+      // one-and-done treatment as a pure publish-only schedule, instead of pressing
+      // to the full 20-attempt cap on the one detail ENG-947 didn't cover.
+      //
+      // Resolved LAZILY, same as classifyScheduledContinuationAsync below: `publishAuthorized`
+      // here is the RESOLVER (`() => Promise<boolean | undefined>`), not a boolean —
+      // only await it when the content actually looks like it carries the marker, so
+      // a turn without one never pays for a schedule read.
+      const responseContentForWithhold = response?.content || '';
+      const genuinelyWithheldPublish = scheduledRunWithheldPublish(responseContentForWithhold)
+        ? withholdIsGenuine(responseContentForWithhold, await publishAuthorized?.())
+        : false;
       const publishIsTheOnlyThingLeft =
         completionGate &&
         !allFunctionCallsMet &&
         allKeywordsMet &&
         (!workPlan || workPlanCompleted) &&
-        isPublishOnlyUnmet(functionCallMisses);
+        (isPublishOnlyUnmet(functionCallMisses) ||
+          (genuinelyWithheldPublish &&
+            (hasUnmetPublishRequirement(functionCallMisses) || publishRequirementExcludedFromScope)));
       if (publishIsTheOnlyThingLeft) {
         publishPressAttempts++;
       }
@@ -4212,6 +4250,8 @@ export async function runVerifiedChat(
             // requirement whose sibling was since narrowed OUT — risking a
             // second live publish through the tool that's still required.
             heldToFunctionNames: new Set(requiredFunctions.map((reqFunc) => reqFunc.functionName)),
+            explicitlyWithheld: genuinelyWithheldPublish,
+            publishExcludedFromScope: publishRequirementExcludedFromScope,
           })
         : null;
       if (publishStall) {
@@ -5565,6 +5605,17 @@ export async function runScheduledChat(
         functionName: funcName,
         minCount: functionCallMinCalls[funcName] || 1
       }));
+    // ENG-930: a publish tool the schedule itself names in requiredFunctionCalls,
+    // but that authorization scoping just above has ALREADY excluded from
+    // `requiredFunctions` because this run is not authorized to publish. Once
+    // excluded it can never reappear in functionCallMisses, so the publish-press
+    // breaker's normal unmet-set check can never see it — a co-required
+    // non-publish prep call for that same excluded publish (e.g. generate_image)
+    // would otherwise press to the full budget on its own. See
+    // publishPressCircuitBreaker's `publishExcludedFromScope` doc comment.
+    const publishRequirementExcludedFromScope = getRequiredPublishTools(expectedFunctionCalls).some(
+      (name) => !requiredFunctions.some((reqFunc) => reqFunc.functionName === name)
+    );
 
     // On a resume, the original task prompt is already the first message of the
     // session being continued; re-sending it would make the model start over. Send
@@ -5639,6 +5690,7 @@ export async function runScheduledChat(
       // guard. A snapshot taken here would go stale the moment the owner toggles the
       // setting mid-run (Greptile review #30).
       publishAuthorized: () => resolveLivePublishAuthorized(schedule.scheduleId),
+      publishRequirementExcludedFromScope,
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
       parkNotifiable: true,
