@@ -96,6 +96,43 @@ export function priorTurnNeedsWorkPlanDispositionRetry(message: unknown): boolea
   return failure?.retryable === true;
 }
 
+// Mirrors the transient/infrastructure error shapes the "Retrying a Transient
+// Failure" system-prompt carve-out (ENG-828) names: v0 timeout codes, 5xx/
+// network errors, and a plain "timed out" (coding_agent's own message, which
+// carries no error code — only `result.retryable`).
+const TRANSIENT_ERROR_PATTERN =
+  /V0_CALL_TIMEOUT|V0_GENERATION_TIMEOUT|fetch failed|ECONNRESET|ENOTFOUND|network error|NetworkError|ETIMEDOUT|socket hang up|Connect Timeout|timed out|UND_ERR/i;
+
+/**
+ * ENG-828: true when the pending step's own tool was retried once per the
+ * "Retrying a Transient Failure" carve-out and failed BOTH times with a
+ * transient/infrastructure-shaped error. Without this, a turn that correctly
+ * leaves the step `pending` and explains the platform failure honestly still
+ * has `before.pendingStepCount === after.pendingStepCount` with no
+ * `awaitingAction` — indistinguishable, to decideWorkPlanTurnDisposition, from
+ * a turn that produced no structured outcome at all. That misclassifies a
+ * legitimate exhausted-retry outcome as `invalid`, which overwrites the
+ * model's own honest explanation with the generic "I couldn't create the
+ * decision card... Please retry" fallback (reproduced live testing ENG-828).
+ */
+export function hadExhaustedTransientStepFailure(
+  toolCalls: Array<{ name?: unknown; error?: unknown; result?: unknown }> | undefined,
+  requiredFunctionCalls: unknown,
+): boolean {
+  if (!Array.isArray(toolCalls) || !Array.isArray(requiredFunctionCalls)) return false;
+  for (const toolName of requiredFunctionCalls) {
+    if (typeof toolName !== 'string') continue;
+    const callsForTool = toolCalls.filter((tc) => tc?.name === toolName);
+    if (callsForTool.length === 0) continue;
+    const last = callsForTool[callsForTool.length - 1];
+    const errorText = typeof last.error === 'string' ? last.error : undefined;
+    if (!errorText) continue;
+    const retryable = asRecord(last.result)?.retryable === true;
+    if (retryable || TRANSIENT_ERROR_PATTERN.test(errorText)) return true;
+  }
+  return false;
+}
+
 export function decideWorkPlanTurnDisposition({
   before,
   after,

@@ -26,6 +26,7 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
+  hadExhaustedTransientStepFailure,
   snapshotWorkPlanTurn,
   type WorkPlanTurnDisposition,
 } from './agentMode/core/workPlanTurnDisposition';
@@ -4331,12 +4332,24 @@ export class AgentModeService {
 
           if (requireWorkPlanDisposition) {
             const latestSession = await chatbotDb.getChatSession(sessionId, true);
+            // ENG-828: the pending step's own required tool retried once (per the
+            // "Retrying a Transient Failure" carve-out) and failed both times — a
+            // legitimate exhausted-retry outcome, not a malformed turn. Without this,
+            // it falls through to `invalid` below and the generic "couldn't create
+            // the decision card" fallback overwrites the model's own honest
+            // explanation (reproduced live testing this ticket's fix).
+            const pendingStep = workPlanTurnBefore.pendingStepCount !== undefined
+              ? (latestSession as any)?.workPlan?.steps?.find(
+                (s: any) => s?.stepCount === workPlanTurnBefore.pendingStepCount,
+              )
+              : undefined;
             workPlanTurnDisposition = decideWorkPlanTurnDisposition({
               before: workPlanTurnBefore,
               after: snapshotWorkPlanTurn(latestSession),
               failed: finishReason === 'content_filter'
                 || stopReason === 'guardrail_intervened'
-                || stopReason === 'content_filtered',
+                || stopReason === 'content_filtered'
+                || hadExhaustedTransientStepFailure(toolCalls, pendingStep?.requiredFunctionCalls),
             });
 
             if (workPlanTurnDisposition.kind === 'invalid') {
