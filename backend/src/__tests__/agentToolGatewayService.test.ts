@@ -2900,6 +2900,31 @@ describe('ENG-1668 — call_google_ads_api breaker scope', () => {
     keywords: [{ text: 'epsom salt', matchType: 'PHRASE' }],
   });
 
+  // ENG-1668 follow-up: CAMPAIGN UPDATE can optionally carry budget_resource_name
+  // (reassigning the campaign onto a shared budget) alongside the always-present
+  // campaign_resource_name — campaign_resource_name must win the scope, or two
+  // DIFFERENT campaigns reassigned onto the SAME shared budget would collide.
+  it('scopes CAMPAIGN UPDATE by campaign, not by a shared budget it is being reassigned to', async () => {
+    const runId = 'run-1668-shared-budget';
+    const campaignUpdate = (campaignId: string) => ({
+      action: 'UPDATE', customer_id: '5092566541', entity_type: 'CAMPAIGN',
+      campaign_resource_name: `customers/5092566541/campaigns/${campaignId}`,
+      budget_resource_name: 'customers/5092566541/campaignBudgets/SHARED',
+    });
+    for (let i = 0; i < 2; i += 1) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args: campaignUpdate('campaign-A'), runId,
+        execute: () => Promise.reject(new Error('final_url_suffix is invalid for CAMPAIGN UPDATE')),
+      });
+    }
+    const executeB = jest.fn().mockResolvedValue({ success: true });
+    const outcomeB = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: campaignUpdate('campaign-B'), runId, execute: executeB,
+    });
+    expect(outcomeB.status).toBe('success');
+    expect(executeB).toHaveBeenCalled();
+  });
+
   it('the production shape: a tripped BUDGET UPDATE bucket does not block a corrected KEYWORD UPDATE or KEYWORD ADD_NEGATIVE', async () => {
     const runId = 'run-1668-budget-vs-keyword';
     for (let i = 0; i < 2; i += 1) {
