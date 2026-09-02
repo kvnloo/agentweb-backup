@@ -2966,6 +2966,76 @@ describe('ENG-1668 — call_google_ads_api breaker scope', () => {
     expect(list.status).toBe('success');
     expect(executeList).toHaveBeenCalled();
   });
+
+  // ENG-1668 follow-up: per-scope breaker isolation (above) means a model that fails
+  // a DIFFERENT entity/action every attempt never trips any single bucket. This run-
+  // scoped aggregate is the backstop for that "diagonal drift" pattern.
+  it('a run-scoped aggregate trips when the model fails 10 DIFFERENT entity/action combos, none individually tripped', async () => {
+    const runId = 'run-1668-diagonal-drift';
+    const distinctFailingCalls = Array.from({ length: 10 }, (_, i) => ({
+      action: 'UPDATE',
+      customer_id: '5092566541',
+      entity_type: `ENTITY_${i}`,
+      campaign_resource_name: `customers/5092566541/campaigns/${i}`,
+    }));
+    for (const args of distinctFailingCalls) {
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args, runId,
+        execute: () => Promise.reject(new Error(`some field is required for ${args.entity_type} UPDATE`)),
+      });
+      // Each individual call still fails on its own merits — none of these trip
+      // their OWN per-scope bucket (only 1 failure each, threshold is 2-3).
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') expect(outcome.error).not.toBeInstanceOf(AgentToolBudgetExceededError);
+    }
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const blocked = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api',
+      args: { action: 'UPDATE', customer_id: '5092566541', entity_type: 'ENTITY_NEW', campaign_resource_name: 'customers/5092566541/campaigns/new' },
+      runId,
+      execute,
+    });
+    expect(blocked.status).toBe('error');
+    if (blocked.status === 'error') expect(blocked.error).toBeInstanceOf(AgentToolBudgetExceededError);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('does not trip the aggregate for a legitimate mix of successes and failures below budget', async () => {
+    const runId = 'run-1668-legitimate-mix';
+    for (let i = 0; i < 5; i += 1) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api',
+        args: { action: 'UPDATE', customer_id: '5092566541', entity_type: `ENTITY_${i}`, campaign_resource_name: `customers/5092566541/campaigns/${i}` },
+        runId,
+        execute: () => Promise.reject(new Error(`some field is required for ENTITY_${i} UPDATE`)),
+      });
+    }
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const outcome = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: keywordUpdate(), runId, execute,
+    });
+    expect(outcome.status).toBe('success');
+    expect(execute).toHaveBeenCalled();
+  });
+
+  it('the aggregate is run-scoped, not session-wide: a fresh runId starts clean', async () => {
+    const staleRunId = 'run-1668-stale';
+    for (let i = 0; i < 10; i += 1) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api',
+        args: { action: 'UPDATE', customer_id: '5092566541', entity_type: `ENTITY_${i}`, campaign_resource_name: `customers/5092566541/campaigns/${i}` },
+        runId: staleRunId,
+        execute: () => Promise.reject(new Error(`some field is required for ENTITY_${i} UPDATE`)),
+      });
+    }
+    const freshRunId = 'run-1668-fresh';
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const outcome = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: keywordUpdate(), runId: freshRunId, execute,
+    });
+    expect(outcome.status).toBe('success');
+    expect(execute).toHaveBeenCalled();
+  });
 });
 
 /*
