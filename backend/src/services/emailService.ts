@@ -2012,7 +2012,14 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     // stops the duplicate SEND when a run complies instead.
     // JSON.stringify (not a bare comma-join) keeps the recipient signature
     // collision-safe against an embedded comma in a single recipient entry.
-    const claimMember = JSON.stringify(emailListForClaim.map(e => e.trim().toLowerCase()).sort());
+    // De-duplicated via Set before sorting (CodeRabbit): sort() alone does not
+    // collapse repeats, so a call listing the same address twice would claim a
+    // different signature than a later, legitimate call listing it once —
+    // letting that second call slip past the guard as if it were a distinct
+    // recipient set.
+    const claimMember = JSON.stringify(
+      [...new Set(emailListForClaim.map(e => e.trim().toLowerCase()))].sort()
+    );
     const notifyClaimKey = `notify-session:${sessionId}`;
     const claimed = await settingsService.claimSetMember(notifyClaimKey, claimMember);
     if (!claimed) {
