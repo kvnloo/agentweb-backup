@@ -285,6 +285,20 @@ describe('admin client_id scoping — end to end (ENG-1596 / ENG-1557 v1)', () =
 
       expect(mockRecordAdminAudit).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', error: 'downstream 500' }));
     });
+
+    // Adversarial-review finding: `dry_run` is this tool's advertised safety
+    // valve for the flag-gated write. A truthy-but-not-boolean value (a
+    // caller-side typo, e.g. the string "true") must never silently coerce to
+    // `false` and fall through to a real write once the flag is on.
+    it('rejects a non-boolean dry_run instead of silently treating it as false', async () => {
+      process.env.MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED = 'true';
+
+      await expect(
+        mcpToolRegistry.execute('manage_leads', addArgs({ dry_run: 'true' as any }), callerContext)
+      ).rejects.toThrow('dry_run must be a boolean');
+
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+    });
   });
 
   describe('manage_leads action:add — self-scoped (no client_id), regression guards', () => {
@@ -316,6 +330,39 @@ describe('admin client_id scoping — end to end (ENG-1596 / ENG-1557 v1)', () =
           leads: [{ email: 'a@example.com' }, { email: 'b@example.com' }],
         }, callerContext)
       ).rejects.toThrow('exactly one lead per call');
+
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+    });
+
+    // Adversarial-review finding: a non-object entry (null, a string, an
+    // array) previously reached mcpFetch as-is. `null`/`undefined` are falsy,
+    // so httpClient's `if (body && ...)` guard skips sending a body at all —
+    // silently creating an EMPTY lead on a real write instead of erroring.
+    it('rejects a non-object lead entry (null, string, array) instead of silently sending an empty body', async () => {
+      await expect(
+        mcpToolRegistry.execute('manage_leads', { action: 'add', list_id: 'list-1', leads: [null] }, callerContext)
+      ).rejects.toThrow('requires the single lead to be an object');
+
+      await expect(
+        mcpToolRegistry.execute('manage_leads', { action: 'add', list_id: 'list-1', leads: ['not-an-object'] }, callerContext)
+      ).rejects.toThrow('requires the single lead to be an object');
+
+      await expect(
+        mcpToolRegistry.execute('manage_leads', { action: 'add', list_id: 'list-1', leads: [['nested', 'array']] }, callerContext)
+      ).rejects.toThrow('requires the single lead to be an object');
+
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+    });
+
+    it('rejects a non-boolean dry_run instead of silently treating it as false', async () => {
+      await expect(
+        mcpToolRegistry.execute('manage_leads', {
+          action: 'add',
+          list_id: 'list-1',
+          leads: [{ email: 'lead@example.com' }],
+          dry_run: 'true' as any,
+        }, callerContext)
+      ).rejects.toThrow('dry_run must be a boolean');
 
       expect(mockMcpFetch).not.toHaveBeenCalled();
     });
