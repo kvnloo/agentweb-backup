@@ -3380,18 +3380,26 @@ export async function runVerifiedChat(
      * required-function list together, so they still cannot disagree.
      */
     refreshPublishAuthorization?: () => Promise<SchedulePublishAuthorization | null>;
-    // ENG-930: true when the schedule's OWN requiredFunctionCalls names a publish-
-    // capable tool that `filterRequiredFunctionsToAuthorizedScope` (ENG-827) has
-    // already removed from `requiredFunctions` above, because this run is not
-    // authorized to publish. Once that happens the excluded tool can never again
-    // appear in `functionCallMisses`, so the publish-press breaker's normal
-    // `hasUnmetPublishRequirement` check — which only looks at what's currently
-    // unmet — can never see it either. A co-required non-publish prep call for
-    // that same excluded publish (e.g. generate_image) would otherwise press to
-    // the full `maxAttempts` budget on its own, reproducing this ticket's loop
-    // through a second door. See publishPressCircuitBreaker's
-    // `publishExcludedFromScope` doc comment.
-    publishRequirementExcludedFromScope?: boolean;
+    // ENG-930: the schedule's OWN requiredFunctionCalls, publish-capable names
+    // only (via getRequiredPublishTools) — i.e. BEFORE
+    // `filterRequiredFunctionsToAuthorizedScope` (ENG-827) may have removed one
+    // from `requiredFunctions` because this run is not authorized to publish.
+    // Once excluded, the tool can never again appear in `functionCallMisses`,
+    // so the publish-press breaker's normal `hasUnmetPublishRequirement` check
+    // — which only looks at what's currently unmet — can never see it either.
+    // A co-required non-publish prep call for that same excluded publish (e.g.
+    // generate_image) would otherwise press to the full `maxAttempts` budget
+    // on its own, reproducing this ticket's loop through a second door. See
+    // publishPressCircuitBreaker's `publishExcludedFromScope` doc comment.
+    //
+    // CodeRabbit review: this MUST be recomputed against the CURRENT
+    // `requiredFunctions` inside the loop, not resolved once into a boolean
+    // by the caller — `requiredFunctions` narrows again mid-run if the owner
+    // revokes consent (see the `refreshPublishAuthorization` handling above),
+    // and a run that started authorized then got revoked needs the exclusion
+    // to become true THAT turn, not stay stuck at a stale `false` from
+    // admission time.
+    originalPublishTools?: string[];
     // ENG-936: approval-bound source URLs for `generate_image` revisions in
     // this run. Passed through to the tool dispatcher so confirm=true edits of
     // the wrong source are rejected before execution.
@@ -3416,7 +3424,7 @@ export async function runVerifiedChat(
     publishAuthorization,
     refreshPublishAuthorization,
     publishAuthorized,
-    publishRequirementExcludedFromScope = false,
+    originalPublishTools = [],
     approvedRevisionImageSources,
   } = params;
 
@@ -4166,6 +4174,15 @@ export async function runVerifiedChat(
       const genuinelyWithheldPublish = scheduledRunWithheldPublish(responseContentForWithhold)
         ? withholdIsGenuine(responseContentForWithhold, await publishAuthorized?.())
         : false;
+      // Recomputed EVERY attempt against the CURRENT `requiredFunctions`, not
+      // resolved once by the caller — `requiredFunctions` narrows again above
+      // (ENG-827) if the owner revokes consent mid-run, so a run that started
+      // authorized and lost it partway through must see the exclusion become
+      // true THAT turn (CodeRabbit review).
+      const requiredFunctionNamesInScope = new Set(requiredFunctions.map((reqFunc) => reqFunc.functionName));
+      const publishRequirementExcludedFromScope = originalPublishTools.some(
+        (name) => !requiredFunctionNamesInScope.has(name)
+      );
       const publishIsTheOnlyThingLeft =
         completionGate &&
         !allFunctionCallsMet &&
@@ -5645,22 +5662,17 @@ export async function runScheduledChat(
         functionName: funcName,
         minCount: functionCallMinCalls[funcName] || 1
       }));
-    // ENG-930: a publish tool the schedule itself names in requiredFunctionCalls,
-    // but that authorization scoping just above has ALREADY excluded from
-    // `requiredFunctions` because this run is not authorized to publish. Once
-    // excluded it can never reappear in functionCallMisses, so the publish-press
-    // breaker's normal unmet-set check can never see it — a co-required
-    // non-publish prep call for that same excluded publish (e.g. generate_image)
-    // would otherwise press to the full budget on its own. See
-    // publishPressCircuitBreaker's `publishExcludedFromScope` doc comment.
-    //
-    // Set-based membership (CodeRabbit review) — requiredFunctionCalls has no
-    // cardinality limit at the schedule create/update boundary, so a nested
-    // `.some()` here would be O(p*r) instead of O(p+r).
-    const requiredFunctionNamesInScope = new Set(requiredFunctions.map((reqFunc) => reqFunc.functionName));
-    const publishRequirementExcludedFromScope = getRequiredPublishTools(expectedFunctionCalls).some(
-      (name) => !requiredFunctionNamesInScope.has(name)
-    );
+    // ENG-930: the schedule's OWN publish-capable requiredFunctionCalls names,
+    // BEFORE authorization scoping just above may have excluded one from
+    // `requiredFunctions`. Passed through (not resolved to a boolean here) so
+    // `runVerifiedChat` can recompute the exclusion fresh every attempt
+    // against whatever `requiredFunctions` narrows to mid-run if the owner
+    // revokes consent — a run admitted authorized must not carry a
+    // permanently-false exclusion flag from this one admission-time read
+    // (CodeRabbit review). See publishPressCircuitBreaker's
+    // `publishExcludedFromScope` doc comment for why the exclusion matters at
+    // all.
+    const originalPublishTools = getRequiredPublishTools(expectedFunctionCalls);
 
     // On a resume, the original task prompt is already the first message of the
     // session being continued; re-sending it would make the model start over. Send
@@ -5735,7 +5747,7 @@ export async function runScheduledChat(
       // guard. A snapshot taken here would go stale the moment the owner toggles the
       // setting mid-run (Greptile review #30).
       publishAuthorized: () => resolveLivePublishAuthorized(schedule.scheduleId),
-      publishRequirementExcludedFromScope,
+      originalPublishTools,
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
       parkNotifiable: true,
