@@ -115,6 +115,9 @@ jest.mock('../mcp/server/registry', () => ({
 jest.mock('../mcp/server/apiTools', () => ({ adminToolNames: [] }));
 
 import { agentModeService } from '../services/agentModeService';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 const USER = 'user-456';
 const LIST_ID = 'attio-list-1';
@@ -414,6 +417,40 @@ describe('LISTS LIST', () => {
     const result = await at({ entity_type: 'LISTS', action: 'LIST' });
     expect(result.success).toBe(true);
     expect(result.lists).toEqual([{ id: 'l1', name: 'Deals' }, { id: 'l2', name: 'VIPs' }]);
+  });
+});
+
+describe('LISTS LIST — error handling', () => {
+  it('surfaces the real HTTP status on the result (handleAttioApiImpl already computes it)', async () => {
+    const err: any = new Error('Forbidden');
+    err.response = { status: 403, data: { message: 'missing scope' } };
+    mockGetAllLists.mockRejectedValue(err);
+    const result = await at({ entity_type: 'LISTS', action: 'LIST' });
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(403);
+    expect(result.attioError).toEqual({ message: 'missing scope' });
+  });
+
+  // ENG-1300 follow-up: the status was always on the result — the gap was
+  // toolResultError never reading it, so this classified as the generic
+  // 'Error'/'bug' in tool telemetry despite a clean 403 being available.
+  it('ENG-1300: a 403 classifies as auth/config end-to-end, not the generic Error/bug fallback', async () => {
+    const err: any = new Error('Forbidden');
+    err.response = { status: 403 };
+    mockGetAllLists.mockRejectedValue(err);
+    const result = await at({ entity_type: 'LISTS', action: 'LIST' });
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+  });
+
+  it('a 429 classifies as rate_limit end-to-end', async () => {
+    const err: any = new Error('Too Many Requests');
+    err.response = { status: 429 };
+    mockGetAllLists.mockRejectedValue(err);
+    const result = await at({ entity_type: 'LISTS', action: 'LIST' });
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('rate_limit');
   });
 });
 

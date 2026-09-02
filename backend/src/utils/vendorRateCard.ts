@@ -59,11 +59,30 @@ const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
     email_reveal: { recordingUnit: "reveal", usdPerUnit: 0.0495 },
     phone_reveal: { recordingUnit: "reveal", usdPerUnit: 0.395 },
     full_enrichment: { recordingUnit: "enrichment", usdPerUnit: 0.445 },
+    // ENG-696: basic /people/match with no email/phone reveal — Apollo's
+    // cheapest person-match credit tier (same class as org enrichment below).
+    person_match: { recordingUnit: "match", usdPerUnit: 0.0495 },
+    // ENG-696 — confirmed via Apollo's official API docs (docs.apollo.io
+    // /reference/organization-enrichment, docs.apollo.io/docs/api-pricing,
+    // checked 2026-09-02): /organizations/enrich costs 1 credit per call,
+    // the same credit tier as person_match's /people/match. Priced at the
+    // same $0.0495/credit rate used for person_match above.
+    org_enrichment: { recordingUnit: "enrichment", usdPerUnit: 0.0495 },
   },
   "enrich.so": {
     email_lookup: { recordingUnit: "lookup", usdPerUnit: 0.005 },
     phone_finder: { recordingUnit: "lookup", usdPerUnit: 0.25 },
     email_validation: { recordingUnit: "validation", usdPerUnit: 0.0005 },
+    // ENG-696 — confirmed via enrich.so's official docs (doc.enrich.so
+    // /look-up-a-professional-profile-by-email-27483203e0, enrich.so/pricing,
+    // checked 2026-09-02): reverse (lookup-by-email) costs 10 credits per
+    // successful lookup vs. email_lookup's 1 credit, consistent with the
+    // route's materially lower daily cap (50/day vs 1000/day — see
+    // enrichSoQuota.ts DEFAULT_LOOKUP_BY_EMAIL_DAILY_LIMIT). Priced at
+    // 10x email_lookup's confirmed per-credit rate. No charge is booked on a
+    // no-profile-found response since recordVendorUsage only fires on the
+    // successful-call path.
+    reverse_lookup: { recordingUnit: "lookup", usdPerUnit: 0.05 },
   },
   "2captcha": {
     solve: { recordingUnit: "solve", usdPerUnit: 0.00725 },

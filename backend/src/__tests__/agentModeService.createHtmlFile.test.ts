@@ -242,6 +242,33 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(result.error).toContain('S3 upload failed');
     });
 
+    // ENG-1300: uploadFileToS3 now exposes AWS SDK v2's numeric statusCode;
+    // prove it survives the nested rethrow to createHtmlFile's own catch.
+    it('ENG-1300: a coded S3 upload failure classifies as auth/config end-to-end', async () => {
+      mockUploadFileToS3.mockResolvedValue({
+        success: false,
+        error: 'Access Denied',
+        statusCode: 403,
+      });
+
+      const result = await (agentModeService as any).createHtmlFile(
+        'Test Title',
+        'Test content',
+        '',
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(403);
+      const { toolResultError } = await import('../utils/toolResultError');
+      const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+      const { classifyToolFailureType } = await import('../utils/toolFailureType');
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    });
+
     // ENG-873: a render failure must no longer discard the draft. The draft is
     // rendered deterministically instead, so the deliverable still exists.
     it('degrades to a deterministic render when the LLM generation errors', async () => {

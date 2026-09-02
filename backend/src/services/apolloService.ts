@@ -38,6 +38,13 @@ import {
 } from './apolloFieldMapper';
 import type { ApolloQuotaTracker } from './apolloQuota';
 
+// Vendor $ ledger mirroring lives in apolloServiceFactory.ts (ENG-696) —
+// that's the module that actually calls out to the Apollo API, matching the
+// vendorMeteringCoverageGuard's per-file model (see ENG-701). This module
+// threads `userId` and the endpoint/tier down to the injected ApolloHttpClient
+// via an optional ctx argument so the factory's real HTTP wrapper can record
+// against the durable ledger right at the point it reaches the vendor.
+
 // ─── Result envelopes ─────────────────────────────────────────────────────────
 
 export interface MatchResult {
@@ -96,6 +103,10 @@ export interface ApolloHttpClient {
     lastName?: string;
     organizationName?: string;
     domain?: string;
+    /** ENG-696: request owner, threaded through so the factory's HTTP
+     *  wrapper can mirror this call into the $ ledger right where it
+     *  reaches the vendor. Absent means platform/system (AC2). */
+    userId?: string;
   }): Promise<any>;
   /** Email finder. In Apollo this is the same /people/match endpoint with
    *  reveal_email=false but we keep it conceptually distinct so we can quota
@@ -123,9 +134,11 @@ export interface ApolloHttpClient {
     linkedinUrl?: string;
     runWaterfall?: boolean;
     webhookUrl?: string;
+    /** ENG-696: request owner (see match()'s userId doc above). */
+    userId?: string;
   }): Promise<any>;
   /** Org enrichment. /organizations/enrich. */
-  enrichOrg(domain: string): Promise<any>;
+  enrichOrg(domain: string, userId?: string): Promise<any>;
 }
 
 export interface CacheRow {
@@ -309,6 +322,7 @@ export class ApolloService {
           lastName: input.lastName,
           organizationName: input.organizationName,
           domain: input.domain,
+          userId: opts.userId,
         });
         return apiResp?.data ?? apiResp;
       },
@@ -376,6 +390,7 @@ export class ApolloService {
         ...buildOrgIdentifierForFindEmail(input.domain, input.company),
         linkedinUrl: input.linkedinUrl,
         runWaterfall: true,
+        userId: opts.userId,
         // The factory's HTTP client supplies the webhook URL from env config.
       });
       if (this.deps.quota && opts.userId) {
@@ -412,6 +427,7 @@ export class ApolloService {
           // Doesn't affect our cache key (intentional — see apolloCacheKeys.ts
           // FindInput.linkedinUrl).
           linkedinUrl: input.linkedinUrl,
+          userId: opts.userId,
         });
         return apiResp?.data ?? apiResp;
       },
@@ -441,7 +457,7 @@ export class ApolloService {
       'org',
       key,
       async () => {
-        const apiResp = await this.deps.http.enrichOrg(domain.trim());
+        const apiResp = await this.deps.http.enrichOrg(domain.trim(), opts.userId);
         return apiResp?.data ?? apiResp;
       },
       opts,

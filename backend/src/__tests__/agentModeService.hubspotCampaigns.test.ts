@@ -98,6 +98,9 @@ jest.mock('../mcp/server/apiTools', () => ({ adminToolNames: [] }));
 
 import { agentModeService } from '../services/agentModeService';
 import { crmDb } from '../services/db';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 const mockGetLeadLists = crmDb.getLeadListsByUserId as jest.Mock;
 
@@ -342,6 +345,20 @@ describe('CAMPAIGN — error handling', () => {
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/access denied/i);
     expect(result.status).toBe(403);
+  });
+
+  // ENG-1300 follow-up: result.status has always been correct here — the gap was
+  // toolResultError never reading a `status` field (only `code`), so a real 403
+  // still classified as the generic 'Error'/'bug' in tool telemetry. Proves the
+  // full chain, not just that the field exists on the result.
+  it('ENG-1300: a 403 classifies as auth/config end-to-end, not the generic Error/bug fallback', async () => {
+    const err: any = new Error('Forbidden');
+    err.response = { status: 403 };
+    mockListCampaigns.mockRejectedValue(err);
+    const result = await hubspot({ action: 'LIST' });
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
   });
 
   it('returns reconnect guidance on 403 with MISSING_SCOPES category', async () => {
