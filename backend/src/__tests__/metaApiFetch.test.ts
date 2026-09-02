@@ -336,6 +336,40 @@ describe('Meta API Fetch Utilities', () => {
 
       await expect(fetchWithRetryAndPaging('https://example.com/api')).rejects.toMatchObject({ status: 502 });
     });
+
+    // ENG-1300 (CodeRabbit): fetchWithRetryAndPaging doesn't throw on a
+    // non-2xx page (by design — see the contract comment above) so a LATER
+    // page's failure used to be silently swallowed: the final merged result
+    // kept the FIRST page's 200 __httpStatus even though page 2 genuinely
+    // failed, hiding a truncated data set behind an apparent-success status.
+    it('ENG-1300: a later page\'s failure status overrides the first page\'s __httpStatus', async () => {
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        if (url.includes('after=page2')) {
+          return Promise.resolve({
+            ok: false,
+            status: 403,
+            json: () => Promise.resolve({ error: { message: 'Permission denied', code: 200 } }),
+          });
+        }
+
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({
+            data: [{ id: '1', name: 'Item 1' }],
+            paging: { next: 'https://example.com/api?after=page2' },
+          }),
+        });
+      }) as jest.Mock;
+
+      const result = await fetchWithRetryAndPaging('https://example.com/api');
+
+      // Page 1's data is still present (best-effort partial result)...
+      expect(result.data).toHaveLength(1);
+      // ...but the overall status must reflect the failing page, not page 1's 200.
+      expect((result as any).__httpStatus).toBe(403);
+      expect(result.error).toEqual({ message: 'Permission denied', code: 200 });
+    });
   });
 
   describe('Integration - Retry and Pagination', () => {

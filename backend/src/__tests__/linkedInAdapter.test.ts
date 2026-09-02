@@ -532,6 +532,37 @@ describe('LinkedInAdapter', () => {
 
       expect(result).toEqual([]);
     });
+
+    // ENG-1300 (CodeRabbit): the token-fetch catch used to relabel ANY
+    // getValidToken failure except "deactivated" as a 401 "please reconnect"
+    // error. A ConnectedAccountChanged-coded failure (a conditional-write
+    // race, not an auth failure) must survive unchanged instead.
+    it('propagates a ConnectedAccountChanged error unchanged instead of relabeling it 401', async () => {
+      const expiredAccount: ConnectedAccount = {
+        ...mockPersonalAccount,
+        config: {
+          ...mockPersonalAccount.config,
+          token_expires_at: Date.now() - 1000,
+        },
+      };
+      mockLinkedInService.refreshAccessToken.mockResolvedValue({
+        access_token: 'refreshed-token',
+        refresh_token: 'refreshed-refresh-token',
+        expires_in: 3600,
+      });
+      mockUpdateAccountTokens.mockRejectedValue(
+        Object.assign(new Error('LinkedIn account changed or disconnected while refreshing; retry'), {
+          code: 'ConnectedAccountChanged',
+        }),
+      );
+
+      await expect(
+        adapter.getPostMetrics(expiredAccount, ['post1'], 'user-123'),
+      ).rejects.toMatchObject({
+        code: 'ConnectedAccountChanged',
+        message: expect.stringContaining('changed or disconnected'),
+      });
+    });
   });
 
   describe('getAccountMetrics', () => {
@@ -1156,6 +1187,37 @@ describe('LinkedInAdapter', () => {
         await expect(
           adapter.getPostAnalytics(expiredAccount, ['post-1'], 'user-123')
         ).rejects.toThrow(/deactivated/i);
+      });
+
+      // ENG-1300 (CodeRabbit): same relabeling bug as getPostMetrics — a
+      // ConnectedAccountChanged-coded failure must survive unchanged instead
+      // of being turned into a 401 "please reconnect" error.
+      it('propagates a ConnectedAccountChanged error unchanged instead of relabeling it 401', async () => {
+        const expiredAccount = {
+          ...mockPersonalAccount,
+          config: {
+            ...mockPersonalAccount.config,
+            token_expires_at: Date.now() - 1000,
+            refresh_token: 'valid-refresh',
+          }
+        };
+        mockLinkedInService.refreshAccessToken.mockResolvedValue({
+          access_token: 'refreshed-token',
+          refresh_token: 'refreshed-refresh-token',
+          expires_in: 3600,
+        });
+        mockUpdateAccountTokens.mockRejectedValue(
+          Object.assign(new Error('LinkedIn account changed or disconnected while refreshing; retry'), {
+            code: 'ConnectedAccountChanged',
+          }),
+        );
+
+        await expect(
+          adapter.getPostAnalytics(expiredAccount, ['post-1'], 'user-123')
+        ).rejects.toMatchObject({
+          code: 'ConnectedAccountChanged',
+          message: expect.stringContaining('changed or disconnected'),
+        });
       });
     });
 

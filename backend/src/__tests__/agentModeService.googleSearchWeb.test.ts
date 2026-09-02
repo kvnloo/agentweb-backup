@@ -84,4 +84,20 @@ describe('AgentModeService - googleSearchWeb', () => {
     const classified = toolResultError(result);
     expect(classifyToolErrorClass(classified)).toBe('rate_limit');
   });
+
+  // ENG-1300 (CodeRabbit): GaxiosError's own docs treat `.status` as the
+  // canonical numeric HTTP status field (`.code` is a documented fallback,
+  // not the primary one) — when a thrown error carries both, `.status` must
+  // win so a stale/mismatched `.code` can't shadow the real status.
+  it('ENG-1300: prefers GaxiosError .status over .code when both are present', async () => {
+    const gaxiosError: any = new Error('Forbidden');
+    gaxiosError.status = 403;
+    gaxiosError.code = 500;
+    mockSearch.mockRejectedValue(gaxiosError);
+
+    const result = await agentModeService.googleSearchWeb('test', 5);
+
+    expect(result.success).toBe(false);
+    expect(result.code).toBe(403);
+  });
 });

@@ -159,4 +159,22 @@ describe('toolResultError', () => {
       expect((err as { code?: number })?.code).toBeUndefined();
     });
   });
+
+  describe('ENG-1300 CodeRabbit follow-up — a numeric `statusCode` field (AWS SDK v2 convention) is preferred', () => {
+    it('attaches a top-level numeric statusCode to the reconstructed Error', () => {
+      const err = toolResultError({ success: false, statusCode: 403, error: 'Access Denied' });
+      expect(err).toMatchObject({ code: 403 });
+      expect(classifyToolErrorClass(err)).toBe('auth');
+    });
+
+    it('prefers `statusCode` over `code` and `status` when a result carries all three', () => {
+      const err = toolResultError({ success: false, statusCode: 403, code: 429, status: 500, error: 'x' });
+      expect(err).toMatchObject({ code: 403 });
+    });
+
+    it('ignores a `statusCode` outside the HTTP range (100-599) as garbage, not a real status', () => {
+      const err = toolResultError({ success: false, statusCode: 3, error: 'x' });
+      expect((err as { code?: number })?.code).toBeUndefined();
+    });
+  });
 });
