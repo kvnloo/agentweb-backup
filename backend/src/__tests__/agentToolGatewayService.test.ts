@@ -2967,3 +2967,119 @@ describe('ENG-1668 — call_google_ads_api breaker scope', () => {
     expect(executeList).toHaveBeenCalled();
   });
 });
+
+/*
+ * ENG-1668 — the model's FIRST attempt in production session
+ * 87334a61-2e06-4018-960e-9e7759403423 nested every resource-name argument
+ * inside an invented `params: {...}` wrapper that isn't part of the schema,
+ * e.g. { action: 'UPDATE', entity_type: 'KEYWORD', params: { criterion_resource_name, status } }.
+ * The values were present, just one level too deep, so validateAndRepairToolArgs
+ * should hoist them rather than let the handler report them as missing.
+ */
+describe('ENG-1668 — hoists a stray nested wrapper object before validation', () => {
+  // Trimmed mirror of call_google_ads_api's real schema (emma/tools.ts).
+  const googleAdsSchema = {
+    type: 'object',
+    properties: {
+      customer_id: { type: 'string' },
+      entity_type: { type: 'string' },
+      action: { type: 'string' },
+      status: { type: 'string' },
+      budget_resource_name: { type: 'string' },
+      amount_micros: { type: 'number' },
+      campaign_resource_name: { type: 'string' },
+      criterion_resource_name: { type: 'string' },
+      keywords: { type: 'array' },
+      address: { type: 'object', properties: { street_address: { type: 'string' } } },
+    },
+    required: ['customer_id', 'entity_type', 'action'],
+  };
+
+  it('hoists nested fields that match missing top-level properties, e.g. KEYWORD UPDATE', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        action: 'UPDATE',
+        customer_id: '5092566541',
+        entity_type: 'KEYWORD',
+        keywords: [],
+        params: {
+          criterion_resource_name: 'customers/5092566541/adGroupCriteria/201989695567~26782521',
+          status: 'PAUSED',
+        },
+      },
+      inputSchema: googleAdsSchema,
+    });
+
+    expect(result.status).toBe('repaired');
+    expect(result.args).toEqual(expect.objectContaining({
+      criterion_resource_name: 'customers/5092566541/adGroupCriteria/201989695567~26782521',
+      status: 'PAUSED',
+    }));
+    expect((result.args as Record<string, unknown>).params).toBeUndefined();
+    expect(result.repairs).toEqual(expect.arrayContaining([
+      'params.criterion_resource_name->criterion_resource_name',
+      'params.status->status',
+    ]));
+    expect(result.issues).toEqual([]);
+  });
+
+  it('hoists nested fields for BUDGET UPDATE', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        entity_type: 'BUDGET', amount_micros: 25000000, action: 'UPDATE', customer_id: '5092566541',
+        params: { budget_resource_name: 'customers/5092566541/campaignBudgets/15706805175' },
+      },
+      inputSchema: googleAdsSchema,
+    });
+
+    expect(result.status).toBe('repaired');
+    expect((result.args as Record<string, unknown>).budget_resource_name)
+      .toBe('customers/5092566541/campaignBudgets/15706805175');
+    expect(result.issues).toEqual([]);
+  });
+
+  it('never overwrites a value already present at the top level', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        action: 'UPDATE', customer_id: '5092566541', entity_type: 'BUDGET',
+        budget_resource_name: 'customers/5092566541/campaignBudgets/REAL',
+        params: { budget_resource_name: 'customers/5092566541/campaignBudgets/DECOY' },
+      },
+      inputSchema: googleAdsSchema,
+    });
+
+    expect((result.args as Record<string, unknown>).budget_resource_name)
+      .toBe('customers/5092566541/campaignBudgets/REAL');
+  });
+
+  it('leaves a genuinely nested schema property (address) untouched', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        action: 'ADD_PROXIMITY', customer_id: '5092566541', entity_type: 'CAMPAIGN',
+        address: { street_address: '1 Main St' },
+      },
+      inputSchema: googleAdsSchema,
+    });
+
+    expect(result.status).toBe('valid');
+    expect((result.args as Record<string, unknown>).address).toEqual({ street_address: '1 Main St' });
+    expect(result.repairs).toEqual([]);
+  });
+
+  it('still flags a wrapper whose keys match nothing in the schema', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        action: 'UPDATE', customer_id: '5092566541', entity_type: 'BUDGET',
+        params: { some_unrelated_field: 'x' },
+      },
+      inputSchema: { ...googleAdsSchema, additionalProperties: false },
+    });
+
+    expect(result.status).toBe('invalid');
+  });
+});
