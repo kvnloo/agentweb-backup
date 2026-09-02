@@ -1,6 +1,7 @@
 import {
   MAX_PUBLISH_PRESS_ATTEMPTS,
   isPublishOnlyUnmet,
+  hasUnmetPublishRequirement,
   shouldStopPressingForPublish,
   classifyPublishStall,
 } from '../utils/publishPressCircuitBreaker';
@@ -391,6 +392,121 @@ describe('classifyPublishStall (ENG-947)', () => {
         unmetRequiredFunctions: ['twitter_manage_post'],
         externalWritesSucceeded: [entry('post_on_connected_account', { platform: 'twitter' })],
         heldToFunctionNames: ['twitter_manage_post'],
+      }),
+    ).toBe('requirement-names-unused-publish-tool');
+  });
+});
+
+describe('hasUnmetPublishRequirement (ENG-930)', () => {
+  it('is true when a publish tool is unmet, even alongside a non-publish co-requirement', () => {
+    expect(hasUnmetPublishRequirement(['post_on_connected_account', 'generate_image'])).toBe(true);
+    expect(hasUnmetPublishRequirement(['generate_image', 'post_on_connected_account'])).toBe(true);
+  });
+
+  it('is false when no unmet requirement is publish-shaped', () => {
+    expect(hasUnmetPublishRequirement(['generate_image'])).toBe(false);
+    expect(hasUnmetPublishRequirement(['generate_image', 'analyze_competitors'])).toBe(false);
+  });
+
+  it('is false for an empty or malformed set', () => {
+    expect(hasUnmetPublishRequirement([])).toBe(false);
+    expect(hasUnmetPublishRequirement(undefined as any)).toBe(false);
+  });
+});
+
+/**
+ * ENG-930: the reported schedules (34154af9 "Kevin — X Evening Post", e7ed196d
+ * "Kevin — X Morning Post") both carry `requiredFunctionCalls:
+ * ['post_on_connected_account', 'generate_image']`. A run that holds the
+ * publish never calls generate_image either — there is no point rendering an
+ * image for a post that will not go out — so the unmet set is always the pair,
+ * never purely publish-shaped, and `isPublishOnlyUnmet` never returns true.
+ * That silently disabled BOTH ENG-947's press budget and (via
+ * runVerifiedChat's `publishIsTheOnlyThingLeft` gate) the entry point for this
+ * whole module. Confirmed live: session 0ef2078d-17c5-4d2e-bb9c-9b61d7664b75
+ * (2026-08-12, three days after ENG-947 shipped) still pressed 19 identical
+ * times, 68 messages, $8.07 — the exact pre-ENG-947 severity.
+ *
+ * `explicitlyWithheld` is the fix: a caller that has independently verified
+ * (via agentModeController.withholdIsGenuine — NOT just model prose) that the
+ * run settled on a genuine publish-withhold can admit a mixed unmet set past
+ * the entry gate and skip the budget wait entirely, matching this ticket's own
+ * fix recommendation #2 ("once the agent has declined a publish once with a
+ * stated reason, further nudges should terminate the run instead of looping").
+ */
+describe('explicitlyWithheld — mixed publish + non-publish co-requirement (ENG-930)', () => {
+  it('shouldStopPressingForPublish: a mixed unmet set never trips WITHOUT explicitlyWithheld, no matter the press count', () => {
+    expect(
+      shouldStopPressingForPublish({
+        pressAttempt: 19,
+        unmetRequiredFunctions: ['post_on_connected_account', 'generate_image'],
+      }),
+    ).toBe(false);
+  });
+
+  it('shouldStopPressingForPublish: explicitlyWithheld trips IMMEDIATELY on a mixed unmet set, before the budget would otherwise allow it', () => {
+    expect(
+      shouldStopPressingForPublish({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['post_on_connected_account', 'generate_image'],
+        explicitlyWithheld: true,
+      }),
+    ).toBe(true);
+  });
+
+  it('shouldStopPressingForPublish: explicitlyWithheld does nothing when no unmet requirement is actually a publish call', () => {
+    expect(
+      shouldStopPressingForPublish({
+        pressAttempt: 19,
+        unmetRequiredFunctions: ['generate_image', 'analyze_competitors'],
+        explicitlyWithheld: true,
+      }),
+    ).toBe(false);
+  });
+
+  it('classifyPublishStall: a mixed unmet set is never classified WITHOUT explicitlyWithheld (pre-fix reproduction)', () => {
+    expect(
+      classifyPublishStall({
+        pressAttempt: 19,
+        unmetRequiredFunctions: ['post_on_connected_account', 'generate_image'],
+        externalWritesSucceeded: [],
+      }),
+    ).toBeNull();
+  });
+
+  it('classifyPublishStall: explicitlyWithheld classifies a mixed unmet set as held-for-approval on the first press', () => {
+    expect(
+      classifyPublishStall({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['post_on_connected_account', 'generate_image'],
+        externalWritesSucceeded: [],
+        explicitlyWithheld: true,
+      }),
+    ).toBe('held-for-approval');
+  });
+
+  it('classifyPublishStall: explicitlyWithheld still reports publish-tool-failing when the named tool was actually attempted and errored', () => {
+    expect(
+      classifyPublishStall({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['post_on_connected_account', 'generate_image'],
+        externalWritesSucceeded: [],
+        publishToolsAttempted: ['post_on_connected_account'],
+        explicitlyWithheld: true,
+      }),
+    ).toBe('publish-tool-failing');
+  });
+
+  it('classifyPublishStall: the ENG-1599 tool-mismatch check still takes precedence over explicitlyWithheld', () => {
+    // If the run actually published via an equivalent route, that fact matters
+    // more than the withhold marker (which would then be a stale/contradicted
+    // statement) — the mismatch must still win.
+    expect(
+      classifyPublishStall({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['post_on_connected_account', 'generate_image'],
+        externalWritesSucceeded: [entry('twitter_manage_post', { action: 'post_thread' })],
+        explicitlyWithheld: true,
       }),
     ).toBe('requirement-names-unused-publish-tool');
   });
