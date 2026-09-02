@@ -27,6 +27,29 @@ export const DYNAMO_MAX_ITEM_BYTES = 400 * 1024;
 export const SCHEDULE_ITEM_BUDGET_BYTES = 380 * 1024;
 
 /**
+ * ENG-1672: promptRevisions' OWN byte budget, checked on every edit independent of
+ * the flat SCHEDULE_PROMPT_REVISION_LIMIT count. A self-improve schedule snapshots
+ * a FULL prompt on every reflection, so a large prompt (~35KB) reaches this budget
+ * from just a handful of revisions — well before the count limit ever triggers. The
+ * reported schedule sat at 331KB of revision history from only 9 entries, 95%+ of
+ * DynamoDB's 400KB item ceiling on revisions alone, so a self-improving schedule
+ * must not be able to wedge itself out of being editable just by running its normal
+ * daily cycle. Deliberately well under half of SCHEDULE_ITEM_BUDGET_BYTES so the
+ * rest of the item (current prompt, run history) keeps real headroom.
+ *
+ * Sign-off (code review, ENG-1672): this trims revision history proactively —
+ * on ANY edit where promptRevisions alone crosses this budget, even for a
+ * schedule whose total item size is nowhere near SCHEDULE_ITEM_BUDGET_BYTES or
+ * DYNAMO_MAX_ITEM_BYTES. That is an intentional behavior change from the
+ * pre-ENG-1672 code (which only trimmed once the WHOLE item crossed budget),
+ * confirmed here rather than left implicit: it is exactly what the ticket
+ * asked for (aggressive-enough trimming that a self-improving schedule cannot
+ * wedge itself out of being editable), traded deliberately against holding
+ * more revision-undo history for schedules that would otherwise have kept it.
+ */
+export const PROMPT_REVISIONS_BUDGET_BYTES = 150 * 1024;
+
+/**
  * The most run results a single write can shed alongside an edit and stay inside
  * DynamoDB's 4 KB `UpdateExpression` limit — each dropped entry is named by index.
  * The shed has to ride the edit's own write (deleting history first and then failing
