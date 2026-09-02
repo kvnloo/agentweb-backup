@@ -208,6 +208,29 @@ describe('SessionScoring - awaiting user reply (ENG-1296)', () => {
     expect(result.dimensions?.goalCompletion).toBeGreaterThanOrEqual(4);
   });
 
+  it('does NOT raise a low score when the awaiting-reply rationale is PAIRED with real criticism in the same reason (CodeRabbit PR #2723)', async () => {
+    // Distinct from the "unnecessary clarifying question" test above: that one
+    // has no "conversation ended" phrase, so AWAITING_REPLY_RATIONALE_RE never
+    // matches and the guard exits before reasonCriticizesAssistant even runs.
+    // This reason combines BOTH — the rationale regex matches on the first
+    // clause, and only reasonCriticizesAssistant recognizing "unnecessary" as
+    // a criticism keyword (on the second, comma-"but"-split clause) stops the
+    // guard from masking this genuine goalCompletion failure.
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(
+        2,
+        { goalCompletion: 2, dataAccuracy: 5, outputQuality: 5 },
+        'The conversation ended before the user replied, but the assistant asked an unnecessary clarifying ' +
+          'question instead of completing the task.'
+      )
+    );
+
+    const result = await scoreSessionWithJudge(ambiguousFragmentMessages, ambiguousFragmentMessages.length, judge);
+
+    expect(result.score).toBe(2);
+    expect(result.dimensions?.goalCompletion).toBe(2);
+  });
+
   it('does NOT raise a genuinely low score when the reason actually criticizes the assistant', async () => {
     mockCallLLM.mockResolvedValue(
       makeLLMResponse(
