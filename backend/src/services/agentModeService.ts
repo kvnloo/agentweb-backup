@@ -17044,7 +17044,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'LIST':
         // Thread the campaign_id filter and any explicit fields selection so the caller can
         // read budget/bid config and target a single campaign (ENG-398).
-        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: campaign_id, fields: params?.fields });
+        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: AgentModeService.optionalScopeId(campaign_id, 'campaign_id'), fields: params?.fields });
       case 'CREATE':
         return this.createMetaAdsCampaign(userId, { ...params, account_id });
       case 'UPDATE':
@@ -17064,7 +17064,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'LIST':
         // Thread the ad_set_id target and any explicit fields selection so the caller can
         // read optimization_goal / promoted_object / etc. for a single ad set (ENG-398).
-        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: ad_set_id, fields: params?.fields });
+        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: AgentModeService.optionalScopeId(ad_set_id, 'ad_set_id'), fields: params?.fields });
       case 'CREATE':
         // Explicitly pass account_id in args for createMetaAdsAdSet as it expects it in the args object
         return this.createMetaAdsAdSet(userId, { ...params, account_id, campaign_id });
@@ -19384,7 +19384,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     ad_set_id: string | undefined,
     ad_id: string | undefined,
     params: any
-  ): Promise<{ summary: string; target: Record<string, any>; tenancyRefused: boolean }> {
+  ): Promise<{ summary: string; target: Record<string, any>; tenancyRefused: boolean; tenancyRefusalMessage?: string }> {
     let accessToken = '';
     /*
      * The account the write will ACTUALLY execute against — not the raw argument.
@@ -19428,8 +19428,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
      * details `assertOwnedByAccount` refuses to emit, and they must not be reconstructed here.
      */
     let tenancyRefused = false;
+    /*
+     * The guard's OWN sentence, kept rather than re-written.
+     *
+     * assertOwnedByAccount deliberately varies its remedy by branch — the no-owner branch says
+     * "ownership could not be CONFIRMED ... Retry" and specifically avoids "select the other
+     * account", because there is no other account to select. Collapsing all of that into a
+     * boolean and emitting one fixed sentence here handed exactly that unusable remedy back on
+     * exactly that branch. The message is non-oracle by construction (no name, no owning
+     * account, no id), so relaying it discloses nothing the guard did not already choose to say.
+     */
+    let tenancyRefusalMessage: string | undefined;
     const degradeUnlessRefused = (err: unknown): undefined => {
-      if (isMetaAccountScopeRefusal(err)) tenancyRefused = true;
+      if (isMetaAccountScopeRefusal(err)) {
+        tenancyRefused = true;
+        const m = (err as { message?: unknown } | undefined)?.message;
+        if (typeof m === 'string' && !tenancyRefusalMessage) tenancyRefusalMessage = m;
+      }
       return undefined;
     };
     const resolveCampaign = async (id?: string) => {
@@ -19559,7 +19574,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
     }
 
-    return { summary: lines.join(' '), target, tenancyRefused };
+    return { summary: lines.join(' '), target, tenancyRefused, tenancyRefusalMessage };
   }
 
   private static readonly META_OBJECTIVE_VALUES = [
@@ -19993,7 +20008,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const overrideApproved =
       overrideClaimed && trackingOverrideTokenMatches((params as any)?.tracking_override_token, overrideDigest);
     if (AgentModeService.isMetaWriteAction(entity_type, action) && (!confirmed || (overrideClaimed && !overrideApproved))) {
-      const { summary, target, tenancyRefused } = await this.buildMetaWriteConfirmation(
+      const { summary, target, tenancyRefused, tenancyRefusalMessage } = await this.buildMetaWriteConfirmation(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
       /*
@@ -20018,8 +20033,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         const refusal =
           `Blocked: the target of this Meta Ads ${entity_type} ${action} is not available in the selected ` +
           `ad account (${target.account_id}), so it was not prepared for confirmation and nothing was sent to Meta. ` +
-          `Do not ask the user to approve this change. If the target belongs to a different ad account, ` +
-          `select that account and try again.`;
+          `Do not ask the user to approve this change. ` +
+          // The guard's own remedy, which differs by branch — see tenancyRefusalMessage above.
+          AgentModeService.remedyFromScopeRefusal(tenancyRefusalMessage);
         return {
           success: false,
           blocked: true,
@@ -22298,6 +22314,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * Reads both shapes googleapis surfaces: `err.errors` on the GaxiosError itself, and the raw
    * `err.response.data.error.errors` when the error crossed a module boundary un-normalised.
    */
+  /**
+   * The remedy half of an ad-account scope refusal — everything after the marker sentence.
+   *
+   * A bare `slice(indexOf('. ') + 2)` looked fine and fails badly: when the separator is absent
+   * `indexOf` returns -1, `slice(1)` drops the first CHARACTER, and the user reads "he requested
+   * campaign is not available...". Falls back to the generic remedy instead of emitting a
+   * mangled sentence, because a refusal that looks corrupted reads as a bug in the product.
+   */
+  private static remedyFromScopeRefusal(refusal: string | undefined): string {
+    const GENERIC = 'If the target belongs to a different ad account, select that account and try again.';
+    if (!refusal) return GENERIC;
+    const at = refusal.indexOf('. ');
+    if (at < 0) return GENERIC;
+    const remedy = refusal.slice(at + 2).trim();
+    return remedy || GENERIC;
+  }
+
   private static driveErrorReasons(err: any): string[] {
     const raw = [
       ...(Array.isArray(err?.errors) ? err.errors : []),
@@ -22351,7 +22384,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (code === 403 || code === 401) return 'permission denied';
     if (code === 429) return 'rate limited';
     if (code === 400) return 'invalid request';
-    if (typeof err?.message === 'string' && /did not respond within/i.test(err.message)) {
+    /*
+     * Both timeout shapes. `did not respond within` is `metaService.withReadDeadline`'s wording
+     * and no Drive call can produce it — a Drive request timeout comes from node-fetch as
+     * `network timeout at: <url>`, so this branch was dead for the very calls it was added for
+     * and every one of them fell through to the generic "temporary Drive error".
+     */
+    if (typeof err?.message === 'string' && /did not respond within|network timeout at/i.test(err.message)) {
       return 'temporary Drive error (timed out)';
     }
     return 'temporary Drive error';
@@ -22401,6 +22440,87 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   private static driveRequestTimeout(deadline: number): number {
     return Math.max(AgentModeService.DRIVE_REQUEST_TIMEOUT_FLOOR_MS, deadline - Date.now());
+  }
+
+  /**
+   * Per-request options for a Drive call inside a walk: the remaining budget as a timeout, AND
+   * the retries turned off.
+   *
+   * `timeout` alone bounds nothing here. `googleapis-common/apirequest.js:263` sets
+   * `options.retry = true` by default, and gaxios only skips retrying an `AbortError` — a
+   * node-fetch request timeout raises a `FetchError`, so `noResponseRetries: 2` applies and one
+   * logical request is issued THREE times, each with the full timeout. Measured: 1 attempt /
+   * ~1.0s with retry off, 3 attempts / ~3.6s with googleapis' default against a server that
+   * accepts and never responds. A 15s walk budget became ~45s, and `readGoogleDriveSharedFile`
+   * does this twice in sequence.
+   *
+   * (Bare gaxios and google-auth-library's DefaultTransporter do NOT retry, so probing those
+   * says the timeout is fine. It is the googleapis layer that turns retries on.)
+   *
+   * Retrying is also wrong on its own terms: the budget is what is running out, so a second and
+   * third attempt spend time the walk does not have and triple Drive quota use on exactly the
+   * calls most likely to be near a limit.
+   */
+  /** A Drive failure worth one more attempt: transport-level, not an answer from Drive. */
+  /**
+   * A model-supplied scope id, with "" read as "not supplied".
+   *
+   * `resolveScopeId` refuses a blank scope id deep in metaService, and it is right to: a blank
+   * computed internally means a scope failed to resolve, and widening the read to the whole
+   * account is how ENG-1476 showed a customer another campaign's ads. But a MODEL emitting
+   * `campaign_id: ""` for an optional field means "I am not scoping this", and turning that
+   * into a hard error is a failure the user sees for no reason.
+   *
+   * So the interpretation happens here, at the boundary where caller intent is known, and the
+   * guard stays strict underneath. Logged, so a model that does this constantly is visible
+   * rather than silently accommodated.
+   */
+  private static optionalScopeId(value: unknown, label: string): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    const trimmed = String(value).trim();
+    if (trimmed) return trimmed;
+    console.log(`[AgentMode] ${label} arrived empty from the caller; treating as not supplied.`);
+    return undefined;
+  }
+
+  private static isTransientDriveError(err: any): boolean {
+    const code = AgentModeService.driveErrorCode(err);
+    if (code !== undefined && code < 500) return false;           // 4xx is an answer, not a blip
+    if (code !== undefined && code >= 500) return true;           // 5xx
+    const msg = typeof err?.message === 'string' ? err.message : '';
+    return /network timeout at|econnreset|econnrefused|enotfound|eai_again|socket hang up|fetch failed/i.test(msg);
+  }
+
+  /**
+   * One retry for a transient Drive failure — but only if a full second attempt still fits
+   * inside the walk's remaining budget.
+   *
+   * Turning googleapis' retries off was necessary (it reused the SAME timeout on each of three
+   * attempts, so one hung request cost 3× the budget) but it also removed the cheap win: a
+   * single dropped connection used to be absorbed and now surfaces as an incomplete read. This
+   * restores that without the overrun, because the decision is made against `deadline` and the
+   * second attempt's timeout is recomputed from what is actually left.
+   *
+   * Deliberately not retrying 4xx: a 403, 404 or a throttle is Drive ANSWERING, and repeating
+   * the question does not change the answer — it just spends budget the walk needs.
+   */
+  private static async withDriveRetry<T>(deadline: number, run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (err: any) {
+      if (!AgentModeService.isTransientDriveError(err)) throw err;
+      // A second attempt must fit whole; a sliver of budget buys nothing but another timeout.
+      if (Date.now() + AgentModeService.DRIVE_REQUEST_TIMEOUT_FLOOR_MS >= deadline) throw err;
+      console.log('AgentMode: retrying a transient Drive failure once within the walk budget:', err?.message);
+      return await run();
+    }
+  }
+
+  private static driveRequestOptions(deadline: number): { timeout: number; retryConfig: { noResponseRetries: number } } {
+    return {
+      timeout: AgentModeService.driveRequestTimeout(deadline),
+      retryConfig: { noResponseRetries: 0 },
+    };
   }
 
   // ENG-1624: a registered gdrive: KB folder is authorized by its root ID only, but
@@ -22478,14 +22598,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           // Each request carries its own deadline (see driveRequestTimeout): the loop-level
           // check above only runs BEFORE a request starts, so it cannot interrupt one already
           // in flight. A failure here is caught below and reported as an incomplete walk.
-          resp = await drive.files.list({
+          // Options built INSIDE the closure so a retry recomputes its timeout from the budget
+          // actually remaining, rather than reusing the first attempt's.
+          resp = await AgentModeService.withDriveRetry(deadline, () => drive.files.list({
             q: `'${current}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
             fields: 'nextPageToken, files(id, name)',
             pageSize: 1000,
             ...(pageToken && { pageToken }),
             supportsAllDrives: true,
             includeItemsFromAllDrives: true,
-          }, { timeout: AgentModeService.driveRequestTimeout(deadline) });
+          }, AgentModeService.driveRequestOptions(deadline)));
         } catch (err: any) {
           const code = AgentModeService.driveErrorCode(err);
           /*
@@ -22595,7 +22717,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
         let resp: any;
         try {
-          resp = await drive.files.list({
+          // Same budgeted single retry as the folder walk — see withDriveRetry.
+          resp = await AgentModeService.withDriveRetry(deadline, () => drive.files.list({
           q: `${parentClause} and ${extraClause}`,
           // nextPageToken must be requested explicitly — it isn't returned by
           // default, which is exactly why the old single-page fetch had no way
@@ -22606,7 +22729,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           ...(orderBy && { orderBy }),
           supportsAllDrives: true,
           includeItemsFromAllDrives: true,
-          }, { timeout: AgentModeService.driveRequestTimeout(deadline) });
+          }, AgentModeService.driveRequestOptions(deadline)));
         } catch (err) {
           /*
            * A failed request — most likely the per-request timeout firing near the end of the
@@ -23642,6 +23765,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // to paginate" — it means the listing itself may be incomplete, not just
       // capped.
       const hasIncompleteFolderScan = knowledgeBases.some((kb: any) => kb.folderScanIncomplete);
+      /*
+       * The third consumer of the throttle split, which was missed when the other two got it.
+       * A throttled walk sets `truncated` as well, so this listing said "too large to fully scan
+       * or could not be accessed" about a rate-limited read — the wrong-cause sentence, telling
+       * the user to narrow a search that will throttle identically.
+       */
+      const hasThrottledFolderScan = knowledgeBases.some((kb: any) => kb.folderScanThrottled);
       // A Drive KB's file query hit its per-batch target — its `totalFiles` is a
       // floor, not an exact count, even though `files`/`hasMore` are still correct.
       const hasLowerBoundTotals = knowledgeBases.some((kb: any) => kb.totalFilesIsLowerBound);
@@ -23659,7 +23789,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasIncompleteFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be fully listed (see listingFailed) — their file lists may be empty OR partial, so treat any file missing from them as unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasThrottledFolderScan ? ' Google Drive rate-limited the scan of some folders — a temporary quota answer, not a size or permissions problem; wait a minute and retry rather than narrowing.' : ''}${hasIncompleteFolderScan && !hasThrottledFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be fully listed (see listingFailed) — their file lists may be empty OR partial, so treat any file missing from them as unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         // Same rule as the per-source objects: every completeness flag ahead of the payload,
         // because `knowledge_bases` is what pushes this result past the offload threshold and
         // anything after it falls outside the sealed prefix the model actually reads.
@@ -23668,6 +23798,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(appliedFilters.length > 0 && { appliedFilters }),
         ...(hasMorePages && { hasMore: true }),
         ...(hasIncompleteFolderScan && { folderScanIncomplete: true }),
+        ...(hasThrottledFolderScan && { folderScanThrottled: true }),
         ...(hasLowerBoundTotals && { totalFilesIsLowerBound: true }),
         ...(failedDriveCount > 0 && { driveListingFailures: failedDriveCount }),
         ...(driveEnumerationFailed && { driveEnumerationFailed: true }),
@@ -24020,7 +24151,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       + `The only thing that changes the outcome is a SMALLER search scope: ask the user for the `
       + `file's direct Google Drive link, or for the specific sub-folder it lives in so that `
       + `sub-folder can be registered as its own knowledge base source. If neither is available, `
-      + `tell the user plainly that this folder is too large to search within the read budget — `
+      + `tell the user plainly that this folder exceeded the read budget for a single search — `
       + `do not describe it as a temporary glitch and do not try again.`;
   }
 
