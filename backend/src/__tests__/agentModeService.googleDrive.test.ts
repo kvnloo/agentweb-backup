@@ -152,6 +152,13 @@ function makeApiError(code: number, message = 'API error') {
   return err;
 }
 
+/** A Drive error carrying the `error.errors[].reason` that discriminates a 403's real cause. */
+function makeApiErrorWithReason(code: number, reason: string, message = 'API error') {
+  const err: any = makeApiError(code, message);
+  err.errors = [{ domain: 'usageLimits', reason, message }];
+  return err;
+}
+
 // ── Test suite ────────────────────────────────────────────────────────────────
 
 describe('AgentModeService - Google Drive methods', () => {
@@ -1230,6 +1237,113 @@ describe('AgentModeService - Google Drive methods', () => {
         expect(result.message).toMatch(/itself could not be accessed/i);
       });
 
+      /*
+       * When the root is unreadable AND the file search also failed, the ACTIONABLE cause wins.
+       *
+       * Drive answers 403 for a permission denial and for `userRateLimitExceeded` alike, and the
+       * folder walk buckets every 403 as "permission" — so an unshared root very often makes the
+       * name query fail too and BOTH flags are set. The incomplete-search branch used to be
+       * checked first, which replaced the one remedy the user can act on ("share it with
+       * <service-account>") with "retry the read", which cannot work while the folder stays
+       * unshared. Same "remedy that cannot work" shape as ENG-1636.
+       *
+       * The search caveat is not dropped — it is appended, so the message carries the cause AND
+       * the fact that absence was never confirmed.
+       */
+      it('prefers the shareable-root remedy over "retry" when BOTH the root and the search fail', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes('mimeType')) {
+            return Promise.reject(makeApiError(403, 'insufficientPermissions'));
+          }
+          // The name query fails too — the usual consequence of the same lost access.
+          return Promise.reject(makeApiError(403, 'insufficientPermissions'));
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/itself could not be accessed/i);
+        expect(result.message).toMatch(/share it with/i);
+        // The caveat rides along rather than replacing the remedy.
+        expect(result.message).toMatch(/not a confirmed absence/i);
+      });
+
+      /*
+       * A THROTTLED 403 is not an access decision.
+       *
+       * Drive returns 403 for `userRateLimitExceeded` / `dailyLimitExceeded` as well as for a
+       * genuine permission denial, and the walk used to bucket every 403 as "permission" — so a
+       * rate-limited user was told to share a folder with the service account that they had
+       * already shared. The remedy could not work, and the one that would (wait and retry) was
+       * never offered. `error.errors[].reason` is what tells them apart, and it was discarded.
+       */
+      it('does not tell a RATE-LIMITED user to share a folder they already shared', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes('mimeType')) {
+            return Promise.reject(makeApiErrorWithReason(403, 'userRateLimitExceeded'));
+          }
+          return Promise.reject(makeApiErrorWithReason(403, 'userRateLimitExceeded'));
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        // Not a permissions answer …
+        expect(result.message).not.toMatch(/share it with/i);
+        expect(result.message).not.toMatch(/itself could not be accessed/i);
+        /*
+         * … and not a SIZE answer either, which is the trap the first version of this fix fell
+         * into: routing a throttled 403 into the incomplete-walk branch made it inherit "the
+         * folder tree is large enough that the scan stopped", so the user was told their folder
+         * was too big and invited to narrow a search that would throttle identically. A quota
+         * answer describes Drive, not the folder.
+         */
+        expect(result.message).not.toMatch(/large enough/i);
+        expect(result.message).toMatch(/narrowing will not help/i);
+        expect(result.message).toMatch(/rate-limited the scan/i);
+        expect(result.message).toMatch(/temporary quota answer/i);
+        expect(result.message).toMatch(/Do NOT report the file as absent/i);
+      });
+
+      /*
+       * gaxios surfaces `code` as a STRING in some shapes, and every handler in this file
+       * compares it strictly (`code === 403`). A string `'403'` therefore matched no branch and
+       * fell through to the generic "temporary Drive error", losing both the permission remedy
+       * and the throttle one. Normalised once in `driveErrorCode`.
+       */
+      it('handles a status code that arrives as a string, not a number', async () => {
+        const stringCoded: any = new Error('API error');
+        stringCoded.code = '403';
+        stringCoded.errors = [{ domain: 'global', reason: 'insufficientPermissions' }];
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes('mimeType')) return Promise.reject(stringCoded);
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        // Reaches the permission branch instead of the generic fallback.
+        expect(result.message).toMatch(/itself could not be accessed/i);
+        expect(result.message).toMatch(/share it with/i);
+      });
+
+      it('still treats a genuine permission 403 as restricted', async () => {
+        // The control for the test above — the discrimination must not disarm the real case.
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes('mimeType')) {
+            return Promise.reject(makeApiErrorWithReason(403, 'insufficientPermissions'));
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/itself could not be accessed/i);
+        expect(result.message).toMatch(/share it with/i);
+      });
+
       it('follows nextPageToken when a folder has more sub-folders than fit in one page', async () => {
         const PAGE1_CHILD = 'page-1-child';
         const PAGE2_CHILD = 'page-2-child';
@@ -2011,7 +2125,39 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(gdriveKb).toBeDefined();
       expect(gdriveKb.listingFailed).toBe(true);
       expect(gdriveKb.files).toEqual([]);
-      expect(result.message).toMatch(/could not be listed.*shown as empty|shown as empty.*not absent/i);
+      /*
+       * The aggregate sentence used to say the failed sources are "shown as empty". That is a
+       * state the code cannot produce: queryDriveFilesAcrossFolders sets `failed` AFTER merging
+       * whatever batches succeeded, so a failed source can carry a PARTIAL list — and a model
+       * told the list is "empty" will read a short list as complete. The message must cover
+       * both shapes and end on the conclusion that matters: missing ≠ absent.
+       */
+      expect(result.message).toMatch(/could not be fully listed/i);
+      expect(result.message).toMatch(/empty OR partial/i);
+      expect(result.message).toMatch(/unknown, not absent/i);
+      expect(result.message).not.toMatch(/shown as empty/i);
+
+      /*
+       * FIELD ORDER IS THE ASSERTION, not a style preference.
+       *
+       * A knowledge-base listing routinely clears the S3 offload threshold, after which the
+       * model is handed a SEALED fixed-length PREFIX of this JSON — anything serialized after
+       * the file array is not there at all. Measured at the default limit of 100 files, one
+       * Drive source reached ~20.5k chars with `listingFailed` landing past the 20k cut: the
+       * flag was set, was correct, and was unreadable on exactly the listings that need it.
+       *
+       * Asserting on the serialized offsets is what makes a future `{...kb, someFlag}` — which
+       * appends behind the payload — fail here rather than in production.
+       */
+      const perSource = JSON.stringify(gdriveKb);
+      expect(perSource.indexOf('"listingFailed"')).toBeGreaterThan(-1);
+      expect(perSource.indexOf('"listingFailed"')).toBeLessThan(perSource.indexOf('"files"'));
+
+      const topLevel = JSON.stringify(result);
+      for (const field of ['"message"', '"totalKnowledgeBases"', '"driveListingFailures"']) {
+        expect(topLevel.indexOf(field)).toBeGreaterThan(-1);
+        expect(topLevel.indexOf(field)).toBeLessThan(topLevel.indexOf('"knowledge_bases"'));
+      }
     });
 
     it('never puts the raw error object (or its message) in the returned payload', async () => {
@@ -2939,6 +3085,80 @@ describe('AgentModeService - Google Drive methods', () => {
       const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
       expect(html).toContain('<span style="font-family:Verdana">text</span>');
       expect(html).not.toContain('javascript=alert');
+    });
+  });
+
+  /*
+   * ENG-1584's sentence, on the search edge.
+   *
+   * `Found N item(s) matching "x"` off a hard `pageSize: 20`, with `nextPageToken` not even
+   * requested, reads as "these are all the matches" and means "these are the first 20". A model
+   * that searches for a file, does not see it, and reports it absent is the exact failure that
+   * told a customer a protected ad did not exist. The sibling `listGoogleDriveFolder` already
+   * reported `hasMore`; this read did not.
+   *
+   * The 20-item bound is deliberate and stays — a name search is a lookup, not an inventory.
+   * Going UNANNOUNCED was the defect.
+   */
+  describe('searchGoogleDrive announces an incomplete result', () => {
+    const driveFile = (id: string, name: string) => ({
+      id, name, mimeType: 'application/pdf', webViewLink: `https://drive/${id}`, parents: ['p1'],
+    });
+
+    it('requests nextPageToken at all — without it the cap is unknowable', async () => {
+      mockDriveFiles.list.mockResolvedValue({ data: { files: [driveFile('f1', 'Report.pdf')] } });
+
+      await service.searchGoogleDrive('Report', USER_ID);
+
+      expect(mockDriveFiles.list.mock.calls[0][0].fields).toContain('nextPageToken');
+    });
+
+    it('labels a full page with more behind it as INCOMPLETE, not as a count', async () => {
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [driveFile('f1', 'Report.pdf')], nextPageToken: 'more' },
+      });
+
+      const result = await service.searchGoogleDrive('Report', USER_ID);
+
+      expect(result.complete).toBe(false);
+      expect(result.hasMore).toBe(true);
+      expect(result.message).toMatch(/INCOMPLETE/);
+      expect(result.message).toMatch(/Do NOT conclude a file is absent/i);
+      // Completeness ahead of the payload — see the field-order rationale above.
+      const serialized = JSON.stringify(result);
+      expect(serialized.indexOf('"complete"')).toBeLessThan(serialized.indexOf('"results"'));
+    });
+
+    it('says "complete list" only when Drive returned no continuation token', async () => {
+      mockDriveFiles.list.mockResolvedValue({ data: { files: [driveFile('f1', 'Report.pdf')] } });
+
+      const result = await service.searchGoogleDrive('Report', USER_ID);
+
+      expect(result.complete).toBe(true);
+      expect(result.hasMore).toBeUndefined();
+      expect(result.message).toContain('(complete list)');
+      expect(result.message).not.toMatch(/INCOMPLETE/);
+    });
+
+    it('an EMPTY first page with more behind it is not evidence of absence', async () => {
+      // The most dangerous shape: zero rows plus a continuation token. "No items found" here
+      // is the absence claim itself.
+      mockDriveFiles.list.mockResolvedValue({ data: { files: [], nextPageToken: 'more' } });
+
+      const result = await service.searchGoogleDrive('Missing', USER_ID);
+
+      expect(result.complete).toBe(false);
+      expect(result.message).toMatch(/MORE PAGES EXIST/);
+      expect(result.message).toMatch(/not evidence that nothing matches/i);
+    });
+
+    it('a genuinely empty search still reports a clean, complete absence', async () => {
+      mockDriveFiles.list.mockResolvedValue({ data: { files: [] } });
+
+      const result = await service.searchGoogleDrive('Missing', USER_ID);
+
+      expect(result.complete).toBe(true);
+      expect(result.message).toContain('(complete search)');
     });
   });
 });

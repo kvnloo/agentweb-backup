@@ -16313,8 +16313,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
        * Graph message is passed through when there is one.
        */
       const campaignsTruncated = campaignsData.pagingTruncated === true;
+      /*
+       * Graph's own error text reaches the user here, and some of it names the object:
+       * `Unsupported get request. Object with ID '120...' does not exist`. The product rule that
+       * raw Meta ids are never shown to users does not stop applying because the string came
+       * from Meta — this PR stripped ids out of every launch-gate block message for the same
+       * reason. Long digit runs are the only id shape Graph emits, so masking them keeps the
+       * diagnostic ("rate limit", "unsupported request") and drops the identifier.
+       */
       const pagingErrorMessage = typeof campaignsData.pagingError?.message === 'string'
-        ? campaignsData.pagingError.message
+        ? campaignsData.pagingError.message.replace(/\d{8,}/g, '[id]')
         : undefined;
       return {
         success: true,
@@ -17016,29 +17024,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Fails closed: an unverifiable node is refused rather than returned. We
         // request account_id explicitly, so its absence on an otherwise valid
         // node means the assumption behind this check no longer holds.
+        //
+        // Delegated to `MetaService.assertOwnedByAccount` rather than compared inline. The
+        // hand-rolled version this replaces named the OWNING account in the mismatch message
+        // (`belongs to ad account <owner>`), which is the oracle the guard exists to prevent:
+        // anyone able to guess a creative id could learn which ad account owns it, from the
+        // very error refusing to disclose it. The shared helper keeps all three branches
+        // (unverifiable owner / unresolved selection / mismatch) but emits ONE generic sentence
+        // and sends the discriminating detail to the server log. It also means this refusal is
+        // now recognised by `isMetaAccountScopeRefusal`, so callers can tell it apart from a
+        // transient Graph failure instead of degrading past it.
         if (creative && creative.id) {
-          const norm = (id: unknown) => String(id ?? '').replace(/^act_/, '').trim();
-          const owner = norm(creative.account_id);
-          const selected = norm(accountId);
-          if (!owner) {
-            throw new Error(
-              `Could not verify which ad account creative ${params.creative_id} belongs to; refusing to return it.`,
-            );
-          }
-          // Both sides must be known. An empty resolved account cannot be
-          // compared against anything, so treating it as "no mismatch" would
-          // reopen the exact bypass this check exists to close — the guard
-          // would silently pass every creative the token can reach.
-          if (!selected) {
-            throw new Error(
-              `Could not determine which ad account was selected; refusing to return creative ${params.creative_id}.`,
-            );
-          }
-          if (owner !== selected) {
-            throw new Error(
-              `Ad creative ${params.creative_id} belongs to ad account ${owner}, not the selected account ${selected}.`,
-            );
-          }
+          MetaService.assertOwnedByAccount(creative.account_id, params.creative_id, 'Ad creative', accountId);
         }
 
         return {
@@ -19275,13 +19272,28 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     params: any
   ): Promise<{ summary: string; target: Record<string, any>; tenancyRefused: boolean }> {
     let accessToken = '';
+    /*
+     * The account the write will ACTUALLY execute against — not the raw argument.
+     *
+     * `getMetaCredentials` resolves the account when the caller omitted it (the common
+     * single-connected-account case, and `POST /emma/meta-ads/marketing-api` validates
+     * nothing). Destructuring only `accessToken` threw that resolved id away and left every
+     * ownership check below comparing against `undefined`, which `assertOwnedByAccount`
+     * correctly fails closed on — so a user's own campaign came back refused as a cross-tenant
+     * violation, and the prompt rendered "in ad account undefined". The guard was right; it was
+     * being handed the wrong account. Execution resolves the same way, so this is also the id
+     * the confirmation text must name.
+     */
+    let scopeAccountId = account_id;
     try {
-      ({ accessToken } = await this.getMetaCredentials(userId, account_id));
+      const creds = await this.getMetaCredentials(userId, account_id);
+      accessToken = creds.accessToken;
+      if (creds.accountId) scopeAccountId = creds.accountId;
     } catch {
       // Credential failure surfaces during execution; still require confirmation here.
     }
 
-    const target: Record<string, any> = { entity_type, action, account_id };
+    const target: Record<string, any> = { entity_type, action, account_id: scopeAccountId };
     const lines: string[] = [];
 
     /*
@@ -19290,7 +19302,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
      * That `catch` was written for a transient Graph blip, and for that it is right: a name we
      * could not fetch degrades to the raw id and the user is still asked to approve.
      *
-     * The ownership check these resolvers now pass `account_id` to throws through the SAME
+     * The ownership check these resolvers now pass `scopeAccountId` to throws through the SAME
      * catch, and it does not mean "we could not look" — it means "we looked, and this node is
      * not in the selected ad account". Swallowed as a blip, the prompt degraded to `ID <id>`
      * and the write went on to confirmation, which is the gate approving a write to a node the
@@ -19308,7 +19320,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     };
     const resolveCampaign = async (id?: string) => {
       if (!id || !accessToken) return undefined;
-      try { return await metaService.getCampaign(account_id, accessToken, id); }
+      try { return await metaService.getCampaign(scopeAccountId, accessToken, id); }
       catch (err) { return degradeUnlessRefused(err); }
     };
     const resolveAdSet = async (id?: string) => {
@@ -19316,7 +19328,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // This result's NAME is rendered into the prompt the user approves, so the node must be
       // proven to belong to the selected account first — otherwise an id from another ad account
       // discloses that account's ad set name to this user.
-      try { return await metaService.getAdSet(accessToken, id, account_id); }
+      try { return await metaService.getAdSet(accessToken, id, scopeAccountId); }
       catch (err) { return degradeUnlessRefused(err); }
     };
     const resolveAd = async (id?: string) => {
@@ -19324,7 +19336,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Same reason as resolveAdSet above: this result's NAME is rendered into the prompt the
       // user approves, so an ad id from another ad account the token can reach would disclose
       // that account's ad name to this user.
-      try { return await metaService.getAd(accessToken, id, account_id); }
+      try { return await metaService.getAd(accessToken, id, scopeAccountId); }
       catch (err) { return degradeUnlessRefused(err); }
     };
     const nameOf = (entity: any, id?: string) =>
@@ -19334,19 +19346,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (action === 'CREATE') {
         target.campaign_name = params.name;
         target.objective = params.objective;
-        lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${account_id}.`);
+        lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${scopeAccountId}.`);
       } else {
         const campaign = await resolveCampaign(campaign_id);
         target.campaign = nameOf(campaign, campaign_id);
         target.campaign_id = campaign_id;
-        lines.push(`${action} campaign ${target.campaign} in ad account ${account_id}.`);
+        lines.push(`${action} campaign ${target.campaign} in ad account ${scopeAccountId}.`);
       }
     } else if (entity_type === 'AD_SET') {
       if (action === 'CREATE') {
         const campaign = await resolveCampaign(campaign_id);
         target.campaign = nameOf(campaign, campaign_id);
         target.ad_set_name = params.name;
-        lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${account_id}).`);
+        lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${scopeAccountId}).`);
       } else {
         const adSet = await resolveAdSet(ad_set_id);
         const campaign = await resolveCampaign(adSet?.campaign_id);
@@ -19361,7 +19373,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         target.ad_name = params.name;
         target.ad_set = nameOf(adSet, ad_set_id);
         target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
-        lines.push(`Publish a NEW ad "${params.name}" into ad set ${target.ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''} (ad account ${account_id}).`);
+        lines.push(`Publish a NEW ad "${params.name}" into ad set ${target.ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''} (ad account ${scopeAccountId}).`);
       } else if (action === 'COPY_AD') {
         const sourceAd = await resolveAd(ad_id);
         const targetAdSetId = params.adset_id || sourceAd?.adset_id;
@@ -19396,15 +19408,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } else if (entity_type === 'AD_CREATIVE') {
       // Account-level asset (CREATE only — uploads/list are not gated).
       target.creative_name = params.name;
-      lines.push(`Create a NEW ad creative${params.name ? ` "${params.name}"` : ''} in ad account ${account_id}.`);
+      lines.push(`Create a NEW ad creative${params.name ? ` "${params.name}"` : ''} in ad account ${scopeAccountId}.`);
     } else if (entity_type === 'CUSTOM_AUDIENCE') {
       if (action === 'UPLOAD_USERS') {
         target.audience_id = params.id;
-        lines.push(`Upload user data (PII) to custom audience ID ${params.id} in ad account ${account_id}.`);
+        lines.push(`Upload user data (PII) to custom audience ID ${params.id} in ad account ${scopeAccountId}.`);
       } else {
         target.audience_name = params.name;
         target.subtype = params.subtype;
-        lines.push(`Create a NEW ${params.subtype ? `${params.subtype} ` : ''}custom audience "${params.name}" in ad account ${account_id}.`);
+        lines.push(`Create a NEW ${params.subtype ? `${params.subtype} ` : ''}custom audience "${params.name}" in ad account ${scopeAccountId}.`);
       }
     }
 
@@ -19880,11 +19892,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
        * supplied: no name, no owning account, no id. `assertOwnedByAccount` withholds those
        * because a block that answers "which account owns this?" is the oracle it is preventing,
        * and relaying it through the confirmation gate would hand back the same answer.
+       *
+       * ⚠ `target.account_id`, NOT the raw `account_id` argument. `buildMetaWriteConfirmation`
+       * scopes against the account `getMetaCredentials` RESOLVED — which is the whole point of
+       * that fix — but this message beside it still read the raw argument, so a caller that
+       * omitted `account_id` (single-account users; the REST route validates nothing) was told
+       * the target "is not available in the selected ad account (undefined)". The refusal was
+       * correct and its explanation named an account that does not exist.
        */
       if (tenancyRefused) {
         const refusal =
           `Blocked: the target of this Meta Ads ${entity_type} ${action} is not available in the selected ` +
-          `ad account (${account_id}), so it was not prepared for confirmation and nothing was sent to Meta. ` +
+          `ad account (${target.account_id}), so it was not prepared for confirmation and nothing was sent to Meta. ` +
           `Do not ask the user to approve this change. If the target belongs to a different ad account, ` +
           `select that account and try again.`;
         return {
@@ -22138,8 +22157,69 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * sensitive request context. The full error is still logged server-side by
    * the caller, same as before — only this classified string reaches the model.
    */
+  /**
+   * Drive answers 403 for THROTTLING as well as for permission denial.
+   *
+   * `userRateLimitExceeded`, `rateLimitExceeded`, `dailyLimitExceeded` and
+   * `sharingRateLimitExceeded` all arrive as HTTP 403 with the real cause in
+   * `error.errors[].reason`. Keying on the status alone therefore called a throttled request
+   * "permission denied", and the caller's remedy became "share this folder with the service
+   * account" for a folder that is already shared — a remedy that cannot work, told to a user
+   * whose only real option was to wait.
+   *
+   * Reads both shapes googleapis surfaces: `err.errors` on the GaxiosError itself, and the raw
+   * `err.response.data.error.errors` when the error crossed a module boundary un-normalised.
+   */
+  private static driveErrorReasons(err: any): string[] {
+    const raw = [
+      ...(Array.isArray(err?.errors) ? err.errors : []),
+      ...(Array.isArray(err?.response?.data?.error?.errors) ? err.response.data.error.errors : []),
+    ];
+    return raw.map((e: any) => String(e?.reason ?? '')).filter(Boolean);
+  }
+
+  /** True when a 401/403 is really a quota/throttle answer, not an access decision. */
+  private static isDriveThrottle(err: any): boolean {
+    return AgentModeService.driveErrorReasons(err).some(r => /ratelimitexceeded|dailylimitexceeded/i.test(r));
+  }
+
+  /**
+   * The HTTP status of a Drive error, as a NUMBER.
+   *
+   * gaxios surfaces `code` as a string in some shapes (notably when the response body carries no
+   * `error.code`), and every `code === 403` comparison in this file is strict — so a string
+   * `'403'` silently matched nothing and fell through to the generic "temporary Drive error"
+   * branch. Coercing once, in one place, is what stops each new handler from inheriting that.
+   */
+  private static driveErrorCode(err: any): number | undefined {
+    const raw = err?.code ?? err?.status;
+    const n = typeof raw === 'number' ? raw : Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  }
+
+  /**
+   * The refusal a THROTTLED Drive call should return, or null when it is not a throttle.
+   *
+   * Drive answers 403 for quota exhaustion as well as for permission denial, and every handler
+   * in this file read the status alone — so a rate-limited user was told their connection had
+   * expired, or that Emma lacks access to a folder she can see, or that a Sheet "was not created
+   * by Emma". All false, and all pointing at a fix that cannot work. One sentence, one place, so
+   * the next handler cannot reintroduce it.
+   */
+  private static driveThrottleRefusal(err: any): { success: false; message: string } | null {
+    const code = AgentModeService.driveErrorCode(err);
+    if ((code !== 403 && code !== 401) || !AgentModeService.isDriveThrottle(err)) return null;
+    return {
+      success: false,
+      message:
+        'Google Drive is rate-limiting this account right now — this is a temporary quota answer, '
+        + 'NOT a permissions problem, so nothing needs to be shared or reconnected. Wait a minute and retry.',
+    };
+  }
+
   private classifyDriveError(err: any): string {
-    const code = err?.code || err?.status;
+    const code = AgentModeService.driveErrorCode(err);
+    if ((code === 403 || code === 401) && AgentModeService.isDriveThrottle(err)) return 'rate limited';
     if (code === 403 || code === 401) return 'permission denied';
     if (code === 429) return 'rate limited';
     if (code === 400) return 'invalid request';
@@ -22216,6 +22296,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     folderIds: string[];
     restricted: Array<{ id: string; name: string }>;
     rootRestricted: boolean;
+    /**
+     * The walk stopped because Drive THROTTLED it, not because the tree was too large.
+     *
+     * Kept distinct from `truncated` because the two need opposite sentences: a large tree tells
+     * the user to narrow the search, a quota answer tells them to wait. Folding a throttle into
+     * `truncated` is what made a rate-limited read report "the folder tree is large enough that
+     * the scan stopped" about a folder with four files in it.
+     */
+    throttled: boolean;
     truncated: boolean;
     folderNames: Map<string, string>;
   }> {
@@ -22225,6 +22314,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const queue: string[] = [rootFolderId];
     const restricted: Array<{ id: string; name: string }> = [];
     let rootRestricted = false;
+    let throttled = false;
     let truncated = false;
     /*
      * "The walk is incomplete" and "stop walking" are DIFFERENT facts, and conflating them cost
@@ -22269,8 +22359,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             includeItemsFromAllDrives: true,
           }, { timeout: AgentModeService.driveRequestTimeout(deadline) });
         } catch (err: any) {
-          const code = err?.code || err?.status;
-          if (code === 403 || code === 401) {
+          const code = AgentModeService.driveErrorCode(err);
+          /*
+           * A THROTTLED 403 is not an access decision, so it must not land in the permission
+           * buckets: `rootRestricted`/`restricted` are what produce "share it with the service
+           * account", and telling a rate-limited user to share an already-shared folder is a
+           * remedy that cannot work. Falls through to the incomplete-walk branch below, whose
+           * "the walk did not finish, retry" is the correct answer for a quota answer.
+           */
+          if (AgentModeService.isDriveThrottle(err)) throttled = true;
+          if ((code === 403 || code === 401) && !AgentModeService.isDriveThrottle(err)) {
             if (current === rootFolderId) {
               rootRestricted = true;
             } else {
@@ -22310,7 +22408,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       } while (pageToken);
     }
 
-    return { folderIds, restricted, rootRestricted, truncated, folderNames };
+    return { folderIds, restricted, rootRestricted, truncated, throttled, folderNames };
   }
 
   // ENG-1624: `'<id>' in parents` clauses joined with OR grow ~52 chars per Drive
@@ -23026,7 +23124,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             )
           );
 
-          for (const { folder, folderIds, restricted, rootRestricted, truncated } of treeResults) {
+          for (const { folder, folderIds, restricted, rootRestricted, truncated, throttled } of treeResults) {
             try {
               // Structural, not name-based: a root only counts as nested
               // when its OWN id was actually discovered inside another
@@ -23101,18 +23199,33 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // itself being unreadable) must not present its partial file list as
               // complete.
               const folderScanIncomplete = truncated || rootRestricted;
+              // Same distinction the readers draw: a throttled scan is incomplete for a reason
+              // the user acts on differently (wait) than a large one (narrow).
+              const folderScanThrottled = throttled;
               // A batch that hit its per-batch target means `totalMatchingFiles`
               // wasn't fully counted — it's a floor, not an exact total. Getting an
               // exact total would mean fully paginating every batch, which isn't
               // worth the API cost just to render one page.
               const totalFilesIsLowerBound = capped;
 
+              /*
+               * ⚠ Field order is load-bearing: every completeness signal goes BEFORE `files`.
+               *
+               * A knowledge-base listing routinely clears the S3 offload threshold, after which
+               * the model is handed a SEALED fixed-length PREFIX of this JSON — anything
+               * serialized after the file array is simply not there. Measured at the default
+               * limit of 100 files, one Drive source alone reached ~20.5k chars with
+               * `listingFailed` landing past the 20k cut: the flag existed, was correct, and
+               * was unreadable on exactly the listings that need it. Same failure the
+               * `buildListResult` helper exists to prevent on the Meta side.
+               *
+               * `files` LAST, always. Anything appended after it is invisible.
+               */
               knowledgeBases.push({
                 identifier: `gdrive:${folder.folderId}`,
                 name: folder.name,
                 type: 'google-drive',
                 updatedAt: allFiles.length > 0 ? allFiles[0].modifiedTime : undefined,
-                files: driveFiles,
                 totalFiles: totalMatchingFiles,
                 hasMore: allFiles.length > driveOffset + driveLimit,
                 offset: driveOffset,
@@ -23129,12 +23242,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 ...(restricted.length > 0 && { inaccessibleFolders: restricted.map(r => r.name) }),
                 ...(rootRestricted && { inaccessibleRoot: true }),
                 ...(folderScanIncomplete && { folderScanIncomplete: true }),
+                ...(folderScanThrottled && { folderScanThrottled: true }),
                 // ENG-1624: this root's own id was found inside another
                 // registered root's resolved tree — its files are already
                 // counted there too. Kept as its own entry (never silently
                 // dropped), just labeled, so a saved gdrive:<this-id>
                 // reference still resolves exactly as it does today.
                 ...(ancestor && { nestedUnder: `gdrive:${ancestor.folder.folderId}` }),
+                files: driveFiles,
               });
             } catch (folderErr: any) {
               // ENG-1624: this used to just log and move on, which silently
@@ -23150,9 +23265,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 identifier: `gdrive:${folder.folderId}`,
                 name: folder.name,
                 type: 'google-drive',
-                files: [],
                 listingFailed: true,
                 listingFailedReason: this.classifyDriveError(folderErr),
+                // Same ordering rule as the success path above — `files` last.
+                files: [],
               });
             }
           }
@@ -23401,8 +23517,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // A Drive KB's file query hit its per-batch target — its `totalFiles` is a
       // floor, not an exact count, even though `files`/`hasMore` are still correct.
       const hasLowerBoundTotals = knowledgeBases.some((kb: any) => kb.totalFilesIsLowerBound);
-      // A Drive KB whose listing errored outright — shown with empty `files`, not
-      // dropped, but that empty array must not be mistaken for "no files exist."
+      // A Drive KB whose listing errored — shown rather than dropped, but its `files` must not
+      // be read as the folder's true contents. NOT necessarily empty: `queryDriveFilesAcrossFolders`
+      // sets `failed` after merging whatever batches did succeed, so a failed source can carry a
+      // PARTIAL list. Saying "shown as empty" there described a state that does not exist and
+      // invited the model to trust a short list as complete.
       const failedDriveCount = knowledgeBases.filter((kb: any) => kb.listingFailed).length;
       // A Drive KB nested inside another registered Drive KB's tree — its files
       // are already reflected in the parent's own listing (and in the
@@ -23412,8 +23531,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasIncompleteFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be listed and are shown as empty — their contents are unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
-        knowledge_bases: knowledgeBases,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasIncompleteFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be fully listed (see listingFailed) — their file lists may be empty OR partial, so treat any file missing from them as unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        // Same rule as the per-source objects: every completeness flag ahead of the payload,
+        // because `knowledge_bases` is what pushes this result past the offload threshold and
+        // anything after it falls outside the sealed prefix the model actually reads.
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles,
         ...(appliedFilters.length > 0 && { appliedFilters }),
@@ -23422,6 +23543,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(hasLowerBoundTotals && { totalFilesIsLowerBound: true }),
         ...(failedDriveCount > 0 && { driveListingFailures: failedDriveCount }),
         ...(driveEnumerationFailed && { driveEnumerationFailed: true }),
+        knowledge_bases: knowledgeBases,
       };
     } catch (error) {
       console.error('AgentMode: Error listing knowledge base files:', error);
@@ -23792,7 +23914,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       // Find the file by name anywhere in the registered folder's tree (ENG-1624:
       // not just its direct children).
-      const { folderIds, restricted, rootRestricted, truncated: folderScanTruncated, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      const { folderIds, restricted, rootRestricted, truncated: folderScanTruncated, throttled: folderScanThrottled, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
       // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
       // lets an ambiguous name (same filename in two sub-folders) be detected and
       // reported instead of one candidate being picked arbitrarily.
@@ -23821,16 +23943,48 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
          * name query is what would have found the file, so if IT did not complete, nothing here
          * knows whether the file is there.
          */
-        if (nameQueryFailed || nameQueryCapped) {
+        /*
+         * `rootRestricted` is checked BEFORE the incomplete-search branch, and the order is the
+         * point.
+         *
+         * Drive answers 403 for a permission denial AND for `userRateLimitExceeded`. The walk
+         * now separates the two (`isDriveThrottle`), so `rootRestricted` means a real access
+         * decision — but an unreadable root still very often makes the name query fail too, so
+         * both flags are set at once. Ranking the search failure first replaced the one remedy the user can act on —
+         * share the folder with the service account — with "retry the read", which cannot work
+         * while the folder stays unshared. Same "remedy that cannot work" shape as ENG-1636.
+         *
+         * The incomplete-search caveat is not lost: it is appended, so the message carries the
+         * actionable cause AND the fact that absence was never confirmed.
+         */
+        /*
+         * A quota answer is not a shape answer, and it outranks everything below.
+         *
+         * A throttled walk sets `truncated`, and the only branch that consumed it said "the
+         * folder tree is large enough that the scan stopped" — so a rate-limited user was told
+         * their folder was too big and invited to narrow a search that would throttle just the
+         * same. Every other branch here describes the folder; this one describes Drive.
+         */
+        if (folderScanThrottled) {
           return {
             success: false,
-            message: this.driveNameSearchIncompleteMessage(fileName, rootName, nameQueryFailed)
+            message: `File "${fileName}" was not found, but Google Drive rate-limited the scan of `
+              + `folder "${rootName}", so the search did not finish. This is a temporary quota answer, `
+              + `NOT a permissions or size problem — nothing needs to be shared and narrowing will not `
+              + `help. Wait a minute and try again. Do NOT report the file as absent.`,
           };
         }
         if (rootRestricted) {
           return {
             success: false,
             message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+              + (nameQueryFailed || nameQueryCapped ? ' The file search did not complete either, so this is not a confirmed absence.' : '')
+          };
+        }
+        if (nameQueryFailed || nameQueryCapped) {
+          return {
+            success: false,
+            message: this.driveNameSearchIncompleteMessage(fileName, rootName, nameQueryFailed)
           };
         }
         if (restricted.length > 0) {
@@ -23843,7 +23997,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (folderScanTruncated) {
           return {
             success: false,
-            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder tree is large enough that the scan stopped before covering it entirely, so this is not a confirmed absence.`
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree (it hit a folder-count bound, or a sub-folder read failed), so this is not a confirmed absence. Retry: if a sub-folder failed transiently the next scan may complete.`
           };
         }
         return { success: false, message: `File "${fileName}" not found in Google Drive folder "${rootName}"` };
@@ -23945,7 +24099,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       // Search the whole folder tree rooted at the registered folder (ENG-1624),
       // not just its direct children.
-      const { folderIds, restricted, rootRestricted, truncated, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      const { folderIds, restricted, rootRestricted, truncated, throttled: folderScanThrottled, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
       // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
       // lets an ambiguous name (same filename in two sub-folders) be detected and
       // reported instead of one candidate being materialized arbitrarily.
@@ -23964,16 +24118,48 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // reports a failed request as `failed`/`capped` instead of throwing, so ignoring both
         // flags turned an errored search into a definitive "not found". Shared wording too, so
         // the transient/deterministic split cannot drift between the two call sites.
-        if (nameQueryFailed || nameQueryCapped) {
+        /*
+         * `rootRestricted` is checked BEFORE the incomplete-search branch, and the order is the
+         * point.
+         *
+         * Drive answers 403 for a permission denial AND for `userRateLimitExceeded`. The walk
+         * now separates the two (`isDriveThrottle`), so `rootRestricted` means a real access
+         * decision — but an unreadable root still very often makes the name query fail too, so
+         * both flags are set at once. Ranking the search failure first replaced the one remedy the user can act on —
+         * share the folder with the service account — with "retry the read", which cannot work
+         * while the folder stays unshared. Same "remedy that cannot work" shape as ENG-1636.
+         *
+         * The incomplete-search caveat is not lost: it is appended, so the message carries the
+         * actionable cause AND the fact that absence was never confirmed.
+         */
+        /*
+         * A quota answer is not a shape answer, and it outranks everything below.
+         *
+         * A throttled walk sets `truncated`, and the only branch that consumed it said "the
+         * folder tree is large enough that the scan stopped" — so a rate-limited user was told
+         * their folder was too big and invited to narrow a search that would throttle just the
+         * same. Every other branch here describes the folder; this one describes Drive.
+         */
+        if (folderScanThrottled) {
           return {
             success: false,
-            message: this.driveNameSearchIncompleteMessage(fileName, rootName, nameQueryFailed)
+            message: `File "${fileName}" was not found, but Google Drive rate-limited the scan of `
+              + `folder "${rootName}", so the search did not finish. This is a temporary quota answer, `
+              + `NOT a permissions or size problem — nothing needs to be shared and narrowing will not `
+              + `help. Wait a minute and try again. Do NOT report the file as absent.`,
           };
         }
         if (rootRestricted) {
           return {
             success: false,
             message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+              + (nameQueryFailed || nameQueryCapped ? ' The file search did not complete either, so this is not a confirmed absence.' : '')
+          };
+        }
+        if (nameQueryFailed || nameQueryCapped) {
+          return {
+            success: false,
+            message: this.driveNameSearchIncompleteMessage(fileName, rootName, nameQueryFailed)
           };
         }
         if (restricted.length > 0) {
@@ -23986,7 +24172,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (truncated) {
           return {
             success: false,
-            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder tree is large enough that the scan stopped before covering it entirely, so this is not a confirmed absence.`
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree (it hit a folder-count bound, or a sub-folder read failed), so this is not a confirmed absence. Retry: if a sub-folder failed transiently the next scan may complete.`
           };
         }
         return { success: false, message: `File "${fileName}" not found in Google Drive folder` };
@@ -24066,10 +24252,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error materializing knowledge base asset:', error);
-      const code = error?.code || error?.status;
+      const code = AgentModeService.driveErrorCode(error);
       if (code === 404) {
         return { success: false, message: `File "${fileName}" not found or not accessible` };
       }
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
         return { success: false, message: 'Access denied reading this Google Drive file' };
       }
@@ -24400,7 +24588,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         files: formatted,
       };
     } catch (err: any) {
-      const code = err?.code || err?.status;
+      const code = AgentModeService.driveErrorCode(err);
+      const throttled = AgentModeService.driveThrottleRefusal(err);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
         return { success: false, message: 'Google Drive access denied. Your Google Drive connection may have expired — reconnect in Settings → Connected Accounts.' };
       }
@@ -24427,7 +24617,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return { success: true, folder_id: folderId, folder_url: folderUrl, name: resp.data.name };
     } catch (err: any) {
-      const code = err?.code || err?.status;
+      const code = AgentModeService.driveErrorCode(err);
+      const throttled = AgentModeService.driveThrottleRefusal(err);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
         return { success: false, message: 'Cannot create folder in that location — Emma does not have access to the specified parent folder.' };
       }
@@ -24455,7 +24647,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       const resp = await drive.files.list({
         q,
-        fields: 'files(id,name,mimeType,webViewLink,parents)',
+        // `nextPageToken` is requested so this read can tell a complete result from a capped
+        // one. Without it the 20-row cap below was invisible and unknowable.
+        fields: 'nextPageToken, files(id,name,mimeType,webViewLink,parents)',
         orderBy: 'modifiedTime desc',
         pageSize: 20,
         supportsAllDrives: true,
@@ -24463,8 +24657,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       const files = resp.data.files || [];
+      /*
+       * ENG-1584, same sentence, different edge.
+       *
+       * `Found ${n} item(s) matching "x"` off a hard `pageSize: 20` with no `nextPageToken`
+       * requested reads as "these are all the matches" and means "these are the first 20". A
+       * model that searches for a file, sees it missing, and reports it absent is the exact
+       * failure that told a customer a protected ad did not exist. The sibling
+       * `listGoogleDriveFolder` already reports `hasMore`; this read did not.
+       *
+       * Deliberately NOT drained into full pagination: a name-substring search is an
+       * interactive lookup, not an inventory, and 20 newest-first matches is the right size.
+       * The bound is fine — going UNANNOUNCED was the defect.
+       */
+      const hasMore = !!resp.data.nextPageToken;
       if (files.length === 0) {
-        return { success: true, message: `No items found matching "${query}".`, results: [] };
+        return {
+          success: true,
+          complete: !hasMore,
+          message: hasMore
+            ? `No items found in the first page of matches for "${query}", but MORE PAGES EXIST — this is not evidence that nothing matches. Narrow the query and search again.`
+            : `No items found matching "${query}" (complete search).`,
+          results: [],
+        };
       }
 
       const results = files.map(f => ({
@@ -24475,9 +24690,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         parent_folder_ids: f.parents,
       }));
 
-      return { success: true, message: `Found ${results.length} item(s) matching "${query}".`, results };
+      // Completeness ahead of the payload — anything after `results` can fall outside the
+      // sealed prefix the model reads once this result is offloaded.
+      return {
+        success: true,
+        complete: !hasMore,
+        ...(hasMore && { hasMore: true }),
+        totalCount: results.length,
+        message: hasMore
+          ? `Found ${results.length} item(s) matching "${query}", but THIS LIST IS INCOMPLETE — Drive had more matches and the search stopped at its 20-item bound. Do NOT conclude a file is absent from Drive because it is not here. Narrow the query and search again.`
+          : `Found ${results.length} item(s) matching "${query}" (complete list).`,
+        results,
+      };
     } catch (err: any) {
-      const code = err?.code || err?.status;
+      const code = AgentModeService.driveErrorCode(err);
+      const throttled = AgentModeService.driveThrottleRefusal(err);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
         return { success: false, message: 'Google Drive access denied. Ensure Drive is connected in Settings → Connected Accounts.' };
       }
@@ -25216,7 +25444,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error creating Google Doc:', error);
-      const code = error?.code || error?.status;
+      const code = AgentModeService.driveErrorCode(error);
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
         return { success: false, message: 'Cannot create Doc in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
       }
@@ -25251,7 +25481,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error updating Google Doc:', error);
-      const code = error?.code || error?.status;
+      const code = AgentModeService.driveErrorCode(error);
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
         return { success: false, message: 'Cannot update this Google Doc — you may not have edit access to it, or it may have been deleted.' };
       }
@@ -25317,7 +25549,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         try { await drive.files.delete({ fileId: sheetId }); } catch {}
       }
       console.error('AgentMode: Error creating Google Sheet:', error);
-      const code = error?.code || error?.status;
+      const code = AgentModeService.driveErrorCode(error);
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
         return { success: false, message: 'Cannot create Sheet in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
       }
@@ -25353,7 +25587,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error updating Google Sheet:', error);
-      const code = error?.code || error?.status;
+      const code = AgentModeService.driveErrorCode(error);
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
         return { success: false, message: 'Cannot update this Google Sheet — it was not created by Emma. Emma can only edit Sheets she created.' };
       }

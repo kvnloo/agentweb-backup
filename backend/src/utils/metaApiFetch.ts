@@ -98,6 +98,11 @@ export const fetchWithRetry = async (url: string, retries: number = 3, delayMs: 
  * that: the exact defect this file is being changed to prevent. 500 pages is a runaway guard,
  * not a page-size policy — it sits far beyond any realistic dashboard query while still
  * bounding the recursion.
+ *
+ * Counts pages FOLLOWED, not pages returned: the first page is fetched before any budget is
+ * spent, so a full run reads `META_PAGING_MAX_PAGES + 1` pages. Irrelevant at this magnitude,
+ * but the warning below states the followed count so the log never claims a number the code
+ * did not do.
  */
 export const META_PAGING_MAX_PAGES = 500;
 
@@ -126,7 +131,7 @@ export const fetchWithRetryAndPaging = async (url: string, pagesRemaining: numbe
     if (pagesRemaining <= 0) {
       // Announce the stop. A silently short list reads as a complete one — the exact
       // failure that told a customer an ad they were protecting did not exist.
-      console.warn(`Meta API: paging stopped at the ${META_PAGING_MAX_PAGES}-page bound for ${redactGraphUrl(url)}`);
+      console.warn(`Meta API: paging stopped after following the ${META_PAGING_MAX_PAGES}-page bound for ${redactGraphUrl(url)}`);
       data.pagingTruncated = true;
       delete data.paging;
       return data;
