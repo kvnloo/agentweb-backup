@@ -342,10 +342,38 @@ function metaMarketingFailureScope(args: unknown): string {
   return createHash('sha256').update(JSON.stringify([entity, action, target])).digest('hex');
 }
 
+// ENG-1668: same shared-bucket class as ENG-1636 above, hit on call_google_ads_api
+// instead of Meta. Verified against production session 87334a61-2e06-4018-960e-
+// 9e7759403423: a BUDGET UPDATE call missing budget_resource_name tripped the
+// tool-wide bucket, then blocked the model's very next, fully corrected KEYWORD
+// UPDATE and KEYWORD ADD_NEGATIVE calls — reporting the stale BUDGET UPDATE error
+// for both even though neither one touched a budget. Most-specific resource name
+// wins so a write against one entity and a read/list against another never share
+// a bucket; JSON-encode like the scopes above so no id can forge a collision.
+function googleAdsFailureScope(args: unknown): string {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const record = args as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+  const entity = str(record.entity_type).toUpperCase();
+  const action = str(record.action).toUpperCase();
+  const target =
+    str(record.budget_resource_name) ||
+    str(record.campaign_resource_name) ||
+    str(record.ad_group_resource_name) ||
+    str(record.criterion_resource_name) ||
+    str(record.ad_resource_name) ||
+    str(record.asset_group_resource_name) ||
+    str(record.conversion_action_resource_name) ||
+    str(record.customer_id);
+  if (!entity && !action && !target) return '';
+  return createHash('sha256').update(JSON.stringify([entity, action, target])).digest('hex');
+}
+
 function failureScope(toolName: string, args: unknown): string {
   if (toolName === 'get_chat_history') return chatHistoryFailureScope(args);
   if (toolName === 'get_lead_details') return leadDetailsFailureScope(args);
   if (toolName === 'call_meta_marketing_api') return metaMarketingFailureScope(args);
+  if (toolName === 'call_google_ads_api') return googleAdsFailureScope(args);
   if (toolName !== 'linkedin_outreach') return '';
   if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
   const record = args as Record<string, unknown>;
