@@ -2873,3 +2873,97 @@ describe('ENG-1636 — call_meta_marketing_api breaker scope and policy refusals
     expect(execute).not.toHaveBeenCalled();
   });
 });
+
+/*
+ * ENG-1668 — reproduces production session 87334a61-2e06-4018-960e-9e7759403423:
+ * two BUDGET UPDATE calls missing budget_resource_name tripped the (previously
+ * unscoped) call_google_ads_api bucket, then blocked the model's very next,
+ * fully corrected KEYWORD UPDATE and KEYWORD ADD_NEGATIVE calls — reporting the
+ * stale BUDGET UPDATE "required" error for both even though neither touched a
+ * budget. Same class of bug, and same fix, as ENG-1636 above.
+ */
+describe('ENG-1668 — call_google_ads_api breaker scope', () => {
+  beforeEach(() => {
+    _resetAgentToolFailureBreaker();
+  });
+
+  const budgetUpdate = () => ({
+    action: 'UPDATE', customer_id: '5092566541', entity_type: 'BUDGET', amount_micros: 25000000,
+  });
+  const keywordUpdate = () => ({
+    action: 'UPDATE', status: 'PAUSED', customer_id: '5092566541', entity_type: 'KEYWORD',
+    criterion_resource_name: 'customers/5092566541/adGroupCriteria/201989695567~26782521',
+  });
+  const keywordAddNegative = () => ({
+    action: 'ADD_NEGATIVE', customer_id: '5092566541', entity_type: 'KEYWORD',
+    campaign_resource_name: 'customers/5092566541/campaigns/24022076797',
+    keywords: [{ text: 'epsom salt', matchType: 'PHRASE' }],
+  });
+
+  it('the production shape: a tripped BUDGET UPDATE bucket does not block a corrected KEYWORD UPDATE or KEYWORD ADD_NEGATIVE', async () => {
+    const runId = 'run-1668-budget-vs-keyword';
+    for (let i = 0; i < 2; i += 1) {
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args: budgetUpdate(), runId,
+        execute: () => Promise.reject(new Error('budget_resource_name and amount_micros are required for BUDGET UPDATE')),
+      });
+      expect(outcome.status).toBe('error');
+    }
+    const blockedBudget = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: budgetUpdate(), runId,
+      execute: jest.fn().mockResolvedValue({ success: true }),
+    });
+    expect(blockedBudget.status).toBe('error');
+    if (blockedBudget.status === 'error') expect(blockedBudget.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+
+    const executeKeywordUpdate = jest.fn().mockResolvedValue({ success: true });
+    const keywordUpdateOutcome = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: keywordUpdate(), runId, execute: executeKeywordUpdate,
+    });
+    expect(keywordUpdateOutcome.status).toBe('success');
+    expect(executeKeywordUpdate).toHaveBeenCalled();
+
+    const executeAddNegative = jest.fn().mockResolvedValue({ success: true });
+    const addNegativeOutcome = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: keywordAddNegative(), runId, execute: executeAddNegative,
+    });
+    expect(addNegativeOutcome.status).toBe('success');
+    expect(executeAddNegative).toHaveBeenCalled();
+  });
+
+  it('genuine repeats against the SAME resource still trip', async () => {
+    const runId = 'run-1668-genuine';
+    for (let i = 0; i < 2; i += 1) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args: keywordUpdate(), runId,
+        execute: () => Promise.reject(new Error('criterion_resource_name is required for KEYWORD UPDATE')),
+      });
+    }
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const blocked = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: keywordUpdate(), runId, execute,
+    });
+    expect(blocked.status).toBe('error');
+    if (blocked.status === 'error') expect(blocked.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('a LIST/read call survives a tripped write bucket for the same tool', async () => {
+    const runId = 'run-1668-read';
+    for (let i = 0; i < 2; i += 1) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args: budgetUpdate(), runId,
+        execute: () => Promise.reject(new Error('budget_resource_name and amount_micros are required for BUDGET UPDATE')),
+      });
+    }
+    const executeList = jest.fn().mockResolvedValue({ success: true, campaigns: [] });
+    const list = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api',
+      args: { action: 'LIST', customer_id: '5092566541', entity_type: 'CAMPAIGN' },
+      runId,
+      execute: executeList,
+    });
+    expect(list.status).toBe('success');
+    expect(executeList).toHaveBeenCalled();
+  });
+});
