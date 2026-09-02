@@ -264,7 +264,7 @@ const ASSISTANT_CRITICISM_KEYWORDS = [
   "did not", "didn't", "never", "could not", "couldn't", "neglect",
   "overlook", "ignor", "unhelpful", "inadequate", "insufficient",
   "inappropriate", "should have", "too verbose", "too long",
-  "repeated itself", "confusing", "poorly", "vague",
+  "repeated itself", "confusing", "poorly", "vague", "unnecessary",
 ];
 
 /** Matches a clause whose subject is the assistant, not the user or the request. */
