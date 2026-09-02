@@ -437,8 +437,49 @@ describe('updateScheduledChat prompt revision history', () => {
     // not stay silent just because there was nothing to trim away (code review
     // follow-up).
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('kept the newest promptRevisions entry even though it alone exceeds the budget — no older entries existed to drop')
+      expect.stringContaining('kept the newest promptRevisions entry even though it alone exceeds the byte budget — no older entries existed to drop')
     );
+  });
+
+  // ENG-1672 (code review follow-up): the combined case the test above doesn't
+  // cover — the newest entry is oversized AND older history already exists, so
+  // older entries genuinely get dropped (dropped > 0) on the way to the same
+  // fallback. Must use the "dropped N older entries" wording, not the
+  // "no older entries existed" wording the empty-history case above uses.
+  it('logs the fallback wording with a real drop count when older history also exists', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue({
+      scheduleId: 'sched-oversized-revision-with-history',
+      userId: mockUserId,
+      scheduleName: 'S',
+      startingMessage: 'p'.repeat(160000), // alone exceeds the 150KB PROMPT_REVISIONS_BUDGET_BYTES
+      frequency: 'daily',
+      emailNotifications: ['owner@example.com'],
+      selfImprove: true,
+      promptRevisions: [
+        { startingMessage: 'small revision one', updatedAt: '2026-01-01T00:00:00.000Z' },
+        { startingMessage: 'small revision two', updatedAt: '2026-01-02T00:00:00.000Z' },
+      ],
+    } as any);
+
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      params: { scheduleId: 'sched-oversized-revision-with-history' },
+      body: { startingMessage: 'short new prompt' },
+    } as unknown as Request;
+
+    const res = makeRes();
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    await agentModeController.updateScheduledChat(req, res);
+
+    expect(res.status).not.toHaveBeenCalledWith(400);
+    const updates = mockScheduleDb.updateSchedule.mock.calls[0][1] as any;
+    // Both small existing revisions are gone; only the oversized newest survives.
+    expect(updates.promptRevisions).toHaveLength(1);
+    expect(updates.promptRevisions[0].startingMessage).toBe('p'.repeat(160000));
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('kept only the newest promptRevisions entry — it alone still exceeds the byte budget after dropping 2 older entries')
+    );
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('no older entries existed to drop'));
   });
 });
 
@@ -526,6 +567,39 @@ describe('updateScheduledChat DynamoDB item budget', () => {
     expect(kept[kept.length - 1].runId).toBe('run-11');
     expect(estimateDynamoItemBytes({ ...schedule, runResults: kept, ...(mockScheduleDb.updateSchedule.mock.calls[0][1] as any) }))
       .toBeLessThanOrEqual(SCHEDULE_ITEM_BUDGET_BYTES);
+  });
+
+  // ENG-1672 (code review follow-up): shedOldest is shared by promptRevisions
+  // (own byte sub-budget) and runResults (only the whole-item budget, no
+  // separate sub-budget of its own) — the "usedFallback" logging branch was
+  // only tested for promptRevisions elsewhere in this file. Unlike
+  // promptRevisions, runResults has no smaller isolated budget to fall inside
+  // of: if even the single newest run result alone doesn't fit the real
+  // 380KB ceiling, keeping it anyway (correctly, via the same "never erase
+  // the newest entry" guard) still leaves the whole item over budget, so the
+  // request is correctly rejected with 400 regardless. The log still fires
+  // (unconditionally, as a side effect of the trim itself) before that
+  // rejection is reached — asserting it does is the point of this test.
+  it('logs the runResults fallback wording even though the write is still rejected as too large', async () => {
+    const runResults = Array.from({ length: 3 }, (_, i) => ({ runId: `run-${i}`, summary: 'r'.repeat(385000) }));
+    const schedule = nearLimitSchedule({ promptRevisions: [], startingMessage: 'p'.repeat(5000), runResults });
+    mockScheduleDb.getScheduleById.mockResolvedValue(schedule as any);
+
+    const res = makeRes();
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      params: { scheduleId: 'sched-big' },
+      body: { startingMessage: 'q'.repeat(6000) },
+    } as unknown as Request;
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await agentModeController.updateScheduledChat(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('kept only the newest runResults entry — it alone still exceeds the byte budget after dropping 2 older entries')
+    );
   });
 
   // FAIL: the trimmed history must NEVER be written back from this handler's own read.
