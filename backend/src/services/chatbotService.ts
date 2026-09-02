@@ -603,6 +603,7 @@ export interface MetaMeasurementCheckRecord {
    * recording which ad a block was about.
    */
   adId?: string;
+  creativeId?: string;
   action: string;
   outcome: 'passed' | 'blocked' | 'overridden';
   /** Per-destination check results (url + status + detected pixels). */

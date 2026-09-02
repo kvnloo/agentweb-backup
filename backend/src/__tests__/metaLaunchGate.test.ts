@@ -539,9 +539,21 @@ describe('referenced creative destinations (ENG-941)', () => {
        * exactly and get the identical block back. Same defect class the sibling branch is already
        * guarded against at the ad-set assertion above.
        */
-      expect(out.blockResult.error).not.toMatch(/supply the destination on the request/i);
+      /*
+       * The destination remedy may be MENTIONED, but only qualified. It works for an AD CREATE
+       * and not for the campaign/ad-set UPDATEs that also reach this branch, where
+       * `collectPendingDestinations` returns [] unconditionally. The defect was stating it
+       * flatly, as if the caller could add link_url and retry.
+       */
+      expect(out.blockResult.error).toMatch(/for an AD CREATE/i);
       expect(out.blockResult.error).not.toMatch(/narrow the launch to a single ad/i);
-      // What remains has to actually be actionable.
+      /*
+       * And the extended launch budget must be named, so "just wait longer" is visibly already
+       * tried. This branch is now the genuinely-enormous case, not the 45-second case: reading
+       * the campaign gets four minutes because refusing a launch is far more expensive to the
+       * user than a slow one.
+       */
+      expect(out.blockResult.error).toMatch(/extended launch read budget/i);
       expect(out.blockResult.error).toMatch(/tracking-check override/i);
     });
   });
@@ -644,9 +656,18 @@ describe('referenced creative destinations (ENG-941)', () => {
       { resolveCreativeDestinations }, undefined, [], ['120299'],
     );
     expect(out.proceed).toBe(false);
-    expect(out.blockResult.error).toContain('120299');
+    /*
+     * Same rule as the ad-level blocks in this function: the id comes out of the text the user
+     * reads and goes onto the ledger row instead. This assertion used to REQUIRE the id in the
+     * message — the last place in this module still doing it.
+     */
+    expect(out.blockResult.error).toContain('could not verify where the requested ad creative sends people');
+    expect(out.blockResult.error).not.toContain('120299');
     expect(mockPreflight).not.toHaveBeenCalled();
-    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'blocked' }));
+    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      outcome: 'blocked',
+      creativeId: '120299',
+    }));
   });
 
   it('blocks when a referenced creative resolves to no destination at all — the shape was not understood', async () => {
@@ -656,7 +677,10 @@ describe('referenced creative destinations (ENG-941)', () => {
       { resolveCreativeDestinations: jest.fn().mockResolvedValue([]) }, undefined, [], ['120299'],
     );
     expect(out.proceed).toBe(false);
-    expect(out.blockResult.error).toContain('120299');
+    // Id on the ledger, not in the user-facing text — see the sibling test above.
+    expect(out.blockResult.error).not.toContain('120299');
+    expect(out.blockResult.error).toContain('reported no destination URL');
+    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ creativeId: '120299' }));
   });
 
   it('still honours an explicit override when a creative cannot be resolved', async () => {

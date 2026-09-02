@@ -63,6 +63,20 @@ const SPEND_ACTIONS = new Set(['CREATE', 'UPDATE', 'COPY_AD']);
  * the check IS reached, and this entry is what correctly lets it through. Removing it on a
  * reachability argument would turn a stray-but-harmless argument into a blocked launch.
  */
+/**
+ * The ad-list read budget for a LAUNCH, as opposed to an ordinary list read.
+ *
+ * metaService's 45s ceiling is right for a background read, where stopping early costs a warning
+ * and nothing else. Here an incomplete read REFUSES the action, and a campaign large enough to
+ * cross the bound crosses it every time — so that campaign could not be launched at all without
+ * waving away a safety warning on every attempt. A toll booth, not a guard.
+ *
+ * A launch is precisely where waiting is worth it: the user asked for it, is waiting on it, and
+ * it is about to spend their money. Lives here rather than in metaService because it is a policy
+ * of this gate, not a property of the read.
+ */
+export const META_LAUNCH_READ_MAX_MS = 240_000;
+
 const NO_EXISTING_ADS_ACTIONS = new Set([
   'CAMPAIGN_CREATE',
   'AD_SET_CREATE',
@@ -92,6 +106,46 @@ export interface MetaGateDeps {
 /** How far back counts as "recent" when explaining a block. */
 const ACTIVITY_WINDOW_DAYS = 7;
 
+/**
+ * Per-call ceiling for the gate's own Graph reads.
+ *
+ * 10s was too tight for the same reason 45s was too tight on the ad list: a timeout here does not
+ * degrade an answer, it REFUSES a launch. A creative that Graph is merely slow to return is
+ * indistinguishable, at the call site, from one that cannot be read at all — so a slow response
+ * blocked a launch over latency, on an action about to spend the user's money.
+ *
+ * Matched to `metaService`'s META_READ_CALL_TIMEOUT_MS so every Graph read in the launch path
+ * has the same patience. Still far inside the 600s nginx/ALB ceiling.
+ */
+const GATE_GRAPH_CALL_TIMEOUT_MS = 30_000;
+
+/** True for a failure worth one more attempt — a transport blip, not an answer from Graph. */
+function isTransientGraphFailure(err: any): boolean {
+  const status = err?.response?.status;
+  if (typeof status === 'number') return status >= 500;   // 4xx is Graph answering
+  return /timeout|econnreset|econnrefused|enotfound|eai_again|socket hang up|network/i.test(
+    String(err?.code || err?.message || ''),
+  );
+}
+
+/**
+ * One retry for a transient failure, then give up.
+ *
+ * Deliberately not a general retry policy: a 4xx is Graph telling us the creative cannot be
+ * read, and asking twice does not change that. Only a blip gets a second chance — which is the
+ * difference between "we could not see this destination" (a real reason to block a launch) and
+ * "the network hiccuped" (not a reason to block anything).
+ */
+async function withOneTransientRetry<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err: any) {
+    if (!isTransientGraphFailure(err)) throw err;
+    console.log('[META GATE] retrying a transient Graph failure once:', err?.message);
+    return await run();
+  }
+}
+
 /* istanbul ignore next — network boundary; tests inject resolveCreativeDestinations. */
 async function defaultResolveCreativeDestinations(creativeId: string, accessToken: string): Promise<string[]> {
   const axios = (await import('axios')).default;
@@ -105,7 +159,7 @@ async function defaultResolveCreativeDestinations(creativeId: string, accessToke
   const url =
     `https://graph.facebook.com/${apiVersion}/${creativeId}` +
     `?fields=${fields}&access_token=${encodeURIComponent(accessToken)}`;
-  const res = await axios.get(url, { timeout: 10_000 });
+  const res = await withOneTransientRetry(async () => axios.get(url, { timeout: GATE_GRAPH_CALL_TIMEOUT_MS }));
   return [...new Set(extractDestinationUrls(res.data))];
 }
 
@@ -117,7 +171,7 @@ async function defaultPixelHasRecentActivity(pixelId: string, accessToken: strin
   const url =
     `https://graph.facebook.com/${apiVersion}/${pixelId}/stats` +
     `?aggregation=event&start_time=${since}&access_token=${encodeURIComponent(accessToken)}`;
-  const res = await axios.get<{ data?: unknown[] }>(url, { timeout: 10_000 });
+  const res = await withOneTransientRetry(async () => axios.get<{ data?: unknown[] }>(url, { timeout: GATE_GRAPH_CALL_TIMEOUT_MS }));
   return Array.isArray(res.data?.data) && res.data.data.length > 0;
 }
 
@@ -169,6 +223,8 @@ export interface MetaMeasurementCheckRecord {
    * ad" became unanswerable. The id belongs here, server-side, not in text a customer reads.
    */
   adId?: string;
+  /** The creative a creative-resolution block was about — same reasoning as `adId`. */
+  creativeId?: string;
   action: string;
   outcome: 'passed' | 'blocked' | 'overridden';
   urlResults: Array<{ url: string; status: string; mechanisms: string[]; error?: string }>;
@@ -396,13 +452,19 @@ export async function runMetaTrackingGate(
       }
       if (failure || urls.length === 0) {
         const message =
-          `Launch blocked: could not verify where ad creative ${creativeId} sends people` +
-          `${failure ? ` (${failure})` : ' — the creative reported no destination URL'}. ` +
+          // No raw id: same rule as the sibling blocks in this function, which had theirs
+          // removed. The creative is the one named in this request, so "the ad creative" is
+          // unambiguous; the id goes to the ledger row below.
+          `Launch blocked: could not verify where the requested ad creative sends people` +
+          // Graph's own error text, masked: it can name the object ("Object with ID '120...'
+          // does not exist"), and it is relayed to the user like everything else here.
+          `${failure ? ` (${failure.replace(/\d{8,}/g, '[id]')})` : ' — the creative reported no destination URL'}. ` +
           `An ad whose destination cannot be read is treated as unmeasured, never as measured. ` +
           `Retry once the creative can be read, inline the destination on the request, or use an ` +
           `explicit tracking-check override if you accept the risk.`;
         await record(sessionId, {
-          accountId, campaignId, ...(adId && { adId }), action, outcome: override ? 'overridden' : 'blocked',
+          accountId, campaignId, ...(adId && { adId }), creativeId, action,
+          outcome: override ? 'overridden' : 'blocked',
           urlResults: [], checkedAt: new Date().toISOString(),
         });
         if (override) return { proceed: true };
@@ -454,7 +516,17 @@ export async function runMetaTrackingGate(
   let destinationCameFromRequest = false;
   try {
     const [{ items: ads, truncated: adsListTruncated }, { pixels }] = await Promise.all([
-      metaService.listAdsForUtmAudit(accountId, accessToken, campaignId),
+      /*
+       * The LAUNCH budget, not the ordinary read budget.
+       *
+       * A truncated read here refuses the launch rather than degrading an answer, and a campaign
+       * big enough to cross the 45s ceiling crosses it on every attempt — so the user could not
+       * launch that campaign at all without overriding a safety warning every single time. The
+       * campaign is not too big to read; we were not giving it long enough. Reading it takes
+       * longer than a list call should, and for an action that spends the user's money and that
+       * they are actively waiting on, that is the right trade.
+       */
+      metaService.listAdsForUtmAudit(accountId, accessToken, campaignId, { maxMs: META_LAUNCH_READ_MAX_MS }),
       metaService.listPixels(accountId, accessToken),
     ]);
     adsTruncated = !!adsListTruncated;
@@ -521,7 +593,7 @@ export async function runMetaTrackingGate(
      */
     try {
       const { items: accountWide, truncated: accountWideListTruncated } =
-        await metaService.listAdsForUtmAudit(accountId, accessToken, undefined as any);
+        await metaService.listAdsForUtmAudit(accountId, accessToken, undefined as any, { maxMs: META_LAUNCH_READ_MAX_MS });
       accountWideTruncated = !!accountWideListTruncated;
       const named = (accountWide ?? []).filter((a: any) => String(a?.adId) === String(adId));
       const found = named.flatMap((a: any) => a?.destinationUrls ?? []).filter(Boolean);
@@ -615,11 +687,14 @@ export async function runMetaTrackingGate(
   if (!adId && adsTruncated && !destinationCameFromRequest && !NO_EXISTING_ADS_ACTIONS.has(action)) {
     const message =
       `Launch blocked: could not verify Meta tracking because the ad list for this campaign could ` +
-      `not be read completely — it may have hit a size bound, a time bound, or a failed page — so ` +
-      `some ads in this launch were never checked. Retry if the read failed transiently; otherwise ` +
-      `the only way to proceed is an explicit tracking-check override, accepting that some ads in ` +
-      `this launch have not been checked. (Activating a single ad instead does not start this ` +
-      `campaign or ad set, and a destination supplied on the request is not read for these actions.)`;
+      `not be read completely, even with the extended launch read budget (${Math.round(META_LAUNCH_READ_MAX_MS / 1000)}s), ` +
+      `so some ads in this launch were never checked. Tell the user the campaign is unusually ` +
+      `large or Meta is responding slowly, and that this is why it is taking longer than normal. ` +
+      `Retry once — a slow or failed page often succeeds on a second attempt. If it blocks again, ` +
+      `the remaining options are: supply the destination on the request (link_url) for an AD ` +
+      `CREATE, so the check runs against it instead of the ad list; or an explicit tracking-check ` +
+      `override, accepting that some ads have not been checked. Activating a single ad does not ` +
+      `start a campaign or ad set, and campaign/ad-set UPDATEs carry no destination of their own.`;
     // No `adId` spread here: this branch is guarded by `!adId`, so it could only ever be absent.
     await record(sessionId, {
       accountId, campaignId, action, outcome: override ? 'overridden' : 'blocked',
