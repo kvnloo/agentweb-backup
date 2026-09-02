@@ -36686,15 +36686,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };
     } catch (error: any) {
+      // ENG-1300: `code` here is the real numeric HTTP status (googleAdsService.
+      // callApi rethrows the SAME axios error, so error.response.status is
+      // intact) — NOT `gadsErrorCodes` below, which are Google Ads' own string
+      // enum names (e.g. "REQUEST_ERROR"), not HTTP statuses. Conflating the two
+      // would misclassify: a business code that happens to fall in 100-599
+      // would be read as if it were the transport status.
+      const code = error?.response?.status;
       if (error instanceof NegativeCampaignCriteriaValidationError) {
         return {
           success: false,
           errorType: error.errorType,
           errorCode: error.errorCode,
           error: error.message,
+          code,
         };
       }
-      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
+      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true, code };
       console.error('[AgentMode] handleCallGoogleAdsApi error:', error);
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
       const gadsErrorCodes = gadsErrors
@@ -36712,9 +36720,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           errorType: gadsError ? 'GOOGLE_ADS_API_ERROR' : 'INTERNAL_ERROR',
           errorCode: gadsErrorCodes[0] || 'UNKNOWN_GOOGLE_ADS_ERROR',
           error: gadsError || error.message || 'Unknown error',
+          code,
         };
       }
-      return { success: false, error: gadsError || error.message || 'Unknown error' };
+      return { success: false, error: gadsError || error.message || 'Unknown error', code };
     }
   }
 
@@ -36747,11 +36756,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       return { success: false, error: 'mode must be "raw" or "dashboard"' };
     } catch (error: any) {
-      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
+      // ENG-1300: see handleCallGoogleAdsApi's catch above for why `code` is
+      // error.response.status specifically, never a Google Ads business code.
+      const code = error?.response?.status;
+      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true, code };
       console.error('[AgentMode] handleCallGoogleAdsReportingApi error:', error);
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
       const gadsError = gadsErrors.length ? gadsErrors.map((e: any) => e.message).join('; ') : undefined;
-      return { success: false, error: gadsError || error.message || 'Unknown error' };
+      return { success: false, error: gadsError || error.message || 'Unknown error', code };
     }
   }
 
