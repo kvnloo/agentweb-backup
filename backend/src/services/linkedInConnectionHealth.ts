@@ -605,18 +605,26 @@ export async function repointStaleAccountReferences(
       // the log is the only trace that older history was dropped here. Logged only
       // AFTER the write above succeeds, so it never claims a drop that wasn't
       // actually persisted (a lost race or a size rejection above `continue`s first).
-      if (droppedForBudget > 0) {
-        if (usedFallback) {
-          console.warn(
-            `${TAG} repoint for schedule ${s.scheduleId} kept only the newest promptRevisions entry — `
-            + `it alone still exceeds the byte budget after dropping ${droppedForBudget} older entries`
-          );
-        } else {
-          console.warn(
-            `${TAG} repoint for schedule ${s.scheduleId} is over the promptRevisions byte budget — `
-            + `dropped ${droppedForBudget} of ${candidateRevisions.length} entries to fit`
-          );
-        }
+      //
+      // `usedFallback` always logs, even when `droppedForBudget === 0` — that
+      // happens when there was no existing history to drop in the first place
+      // (this repoint's own snapshot is the schedule's very first revision, and
+      // it alone already exceeds the budget). The whole reason this sub-budget
+      // exists is to flag a schedule sitting at that edge; staying silent just
+      // because nothing existed yet to trim away would silently defeat that.
+      if (usedFallback) {
+        console.warn(
+          droppedForBudget > 0
+            ? `${TAG} repoint for schedule ${s.scheduleId} kept only the newest promptRevisions entry — `
+              + `it alone still exceeds the byte budget after dropping ${droppedForBudget} older entries`
+            : `${TAG} repoint for schedule ${s.scheduleId} kept the newest promptRevisions entry even though `
+              + `it alone exceeds the byte budget — no older entries existed to drop`
+        );
+      } else if (droppedForBudget > 0) {
+        console.warn(
+          `${TAG} repoint for schedule ${s.scheduleId} is over the promptRevisions byte budget — `
+          + `dropped ${droppedForBudget} of ${candidateRevisions.length} entries to fit`
+        );
       }
       repointed += 1;
       console.log(`${TAG} repointed schedule ${s.scheduleId} from stale account(s) to ${newAccountId}`);
