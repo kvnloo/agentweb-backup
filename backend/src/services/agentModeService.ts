@@ -2702,7 +2702,18 @@ export class AgentModeService {
       // until ENG-753 rotates the key to an Auth key and the BYOK slot's
       // uptime recovers — remove this then, since it forfeits the BYOK cost
       // discount in exchange for reliability.
-      params.provider.ignore = ['google-ai-studio'];
+      //
+      // DO NOT change this to 'google-ai-studio' or 'google-vertex' — those
+      // are the slugs OpenRouter's separate BYOK-credential-creation API
+      // uses, not what `provider.ignore` matches on here. This param matches
+      // against the `provider_name` string from GET /v1/models/{id}/endpoints
+      // ("Google" vs "Google AI Studio"), confirmed by 10 live A/B calls
+      // (PR #2732): ignore:['Google'] -> 5/5 landed on Google AI Studio
+      // (correct); ignore:['google-ai-studio'] -> 5/5 landed on Google, i.e.
+      // the DEGRADED slot (backwards). A doc-based static-analysis suggestion
+      // proposed the slug form once already and was reverted for this reason
+      // — verify empirically against live traffic before changing this line.
+      params.provider.ignore = ['Google'];
     }
     // OpenRouter reports its own billed amount as zero for BYOK requests even
     // though the upstream provider still bills the inference. Request the
