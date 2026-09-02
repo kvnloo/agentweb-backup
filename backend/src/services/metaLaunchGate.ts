@@ -52,6 +52,17 @@ const SPEND_ACTIONS = new Set(['CREATE', 'UPDATE', 'COPY_AD']);
  * launches are still checked against the campaign's readable destinations, which is the
  * pre-existing (and separately arguable) behaviour, unchanged here.
  */
+/*
+ * Actions that activate no PRE-EXISTING ad, so the completeness of the ad list says nothing
+ * about them and must not block them (see the truncation check below).
+ *
+ * ⚠ `CAMPAIGN_CREATE` looks dead and is not. The usual CAMPAIGN CREATE never reaches that check:
+ * `resolveMetaActivationCampaignId` returns the caller's `campaignId` untouched for any non-AD
+ * entity, so a create arrives with it undefined and is blocked earlier by the no-campaign guard.
+ * But nothing rejects a `campaign_id` supplied alongside a CAMPAIGN CREATE — and when one is,
+ * the check IS reached, and this entry is what correctly lets it through. Removing it on a
+ * reachability argument would turn a stray-but-harmless argument into a blocked launch.
+ */
 const NO_EXISTING_ADS_ACTIONS = new Set([
   'CAMPAIGN_CREATE',
   'AD_SET_CREATE',
@@ -148,6 +159,16 @@ async function serverSideHint(
 export interface MetaMeasurementCheckRecord {
   accountId: string;
   campaignId?: string;
+  /**
+   * The ad an AD-entity gate decision was about.
+   *
+   * Added when the block messages stopped naming ids: those sentences are relayed to the user,
+   * so the id had to come out of them — but it was the ONLY place the ad was ever recorded, and
+   * removing it left every ad-level block in a campaign writing an identical ledger row,
+   * indistinguishable even from the campaign-wide truncation block. "Emma refused to activate my
+   * ad" became unanswerable. The id belongs here, server-side, not in text a customer reads.
+   */
+  adId?: string;
   action: string;
   outcome: 'passed' | 'blocked' | 'overridden';
   urlResults: Array<{ url: string; status: string; mechanisms: string[]; error?: string }>;
@@ -381,7 +402,7 @@ export async function runMetaTrackingGate(
           `Retry once the creative can be read, inline the destination on the request, or use an ` +
           `explicit tracking-check override if you accept the risk.`;
         await record(sessionId, {
-          accountId, campaignId, action, outcome: override ? 'overridden' : 'blocked',
+          accountId, campaignId, ...(adId && { adId }), action, outcome: override ? 'overridden' : 'blocked',
           urlResults: [], checkedAt: new Date().toISOString(),
         });
         if (override) return { proceed: true };
@@ -409,7 +430,7 @@ export async function runMetaTrackingGate(
       `${action}. Without a campaign the check cannot tell which destinations this launch would send ` +
       `traffic to. Retry with the campaign id, or use an explicit tracking-check override.`;
     await record(sessionId, {
-      accountId, campaignId, action, outcome: override ? 'overridden' : 'blocked',
+      accountId, campaignId, ...(adId && { adId }), action, outcome: override ? 'overridden' : 'blocked',
       urlResults: [], checkedAt: new Date().toISOString(),
     });
     if (override) return { proceed: true };
@@ -470,7 +491,7 @@ export async function runMetaTrackingGate(
       `A pre-flight that cannot complete is treated as unmeasured, never as measured — relaunch once the check can run, ` +
       `or use an explicit tracking-check override if you accept the risk.`;
     await record(sessionId, {
-      accountId, campaignId, action, outcome: override ? 'overridden' : 'blocked',
+      accountId, campaignId, ...(adId && { adId }), action, outcome: override ? 'overridden' : 'blocked',
       urlResults: [], checkedAt: new Date().toISOString(),
     });
     if (override) return { proceed: true };
@@ -530,23 +551,37 @@ export async function runMetaTrackingGate(
      * and suppressed the one accurate sentence — that the ad may belong to a different campaign.
      * Narrowing the request cannot help when the ad is not in this campaign at all.
      */
+    /*
+     * No raw Meta ids in this text.
+     *
+     * `error` is read by the model and relayed to the user, so an id interpolated here surfaces
+     * in the product as `ad 120210000000000000` — which the user cannot act on and should not be
+     * shown. The ad and campaign are the ones the caller named in this very request, so "the ad"
+     * and "this campaign" are unambiguous without them.
+     *
+     * Nothing is lost for debugging — but only because `adId` was ADDED to the ledger record in
+     * the same change. It was not there before: `MetaMeasurementCheckRecord` carried only
+     * `accountId`/`campaignId`, and `blockResult` carries no ids at all, so taking the id out of
+     * the prose without adding it here would have erased the ad from every trace we keep.
+     */
     const message = adsTruncated
-      ? `Launch blocked: could not verify Meta tracking for ad ${adId}. The ad list for campaign ` +
-        `${campaignId} was too large to read completely, so the ad was not necessarily absent — it ` +
-        `may simply not have been reached. Narrow the request to the ad set that contains the ad, ` +
-        `supply the destination on the request, or use an explicit tracking-check override.`
+      ? `Launch blocked: could not verify Meta tracking for the requested ad. The ad list for this ` +
+        `campaign could not be read completely — it may have hit a size bound, a time bound, or a ` +
+        `failed page — so the ad was not necessarily absent; it may simply not have been reached. ` +
+        `Supply the destination on the request, retry if the read failed transiently, or use an ` +
+        `explicit tracking-check override.`
       : accountWideTruncated
-        ? `Launch blocked: could not verify Meta tracking because ad ${adId} was not found in campaign ` +
-          `${campaignId}, and the account-wide search for it was too large to read completely, so where ` +
+        ? `Launch blocked: could not verify Meta tracking because the requested ad was not found in ` +
+          `this campaign, and the account-wide search for it was too large to read completely, so where ` +
           `it does live could not be established. The ad this launch would activate may belong to a ` +
           `different campaign. Retry with the campaign that actually contains the ad, supply the ` +
           `destination on the request, or use an explicit tracking-check override.`
-        : `Launch blocked: could not verify Meta tracking because ad ${adId} was not found in campaign ` +
-          `${campaignId}. The ad this launch would activate may belong to a different campaign, so the ` +
+        : `Launch blocked: could not verify Meta tracking because the requested ad was not found in ` +
+          `this campaign. The ad this launch would activate may belong to a different campaign, so the ` +
           `check cannot tell where it sends people. Retry with the campaign that actually contains the ad, ` +
           `supply the destination on the request, or use an explicit tracking-check override.`;
     await record(sessionId, {
-      accountId, campaignId, action, outcome: override ? 'overridden' : 'blocked',
+      accountId, campaignId, ...(adId && { adId }), action, outcome: override ? 'overridden' : 'blocked',
       urlResults: [], checkedAt: new Date().toISOString(),
     });
     if (override) return { proceed: true };
@@ -579,10 +614,13 @@ export async function runMetaTrackingGate(
    */
   if (!adId && adsTruncated && !destinationCameFromRequest && !NO_EXISTING_ADS_ACTIONS.has(action)) {
     const message =
-      `Launch blocked: could not verify Meta tracking because the ad list for campaign ${campaignId} ` +
-      `was too large to read completely, so some ads in this launch were never checked. Narrow the ` +
-      `launch to a single ad, supply the destination on the request, or use an explicit ` +
-      `tracking-check override if you accept the risk.`;
+      `Launch blocked: could not verify Meta tracking because the ad list for this campaign could ` +
+      `not be read completely — it may have hit a size bound, a time bound, or a failed page — so ` +
+      `some ads in this launch were never checked. Retry if the read failed transiently; otherwise ` +
+      `the only way to proceed is an explicit tracking-check override, accepting that some ads in ` +
+      `this launch have not been checked. (Activating a single ad instead does not start this ` +
+      `campaign or ad set, and a destination supplied on the request is not read for these actions.)`;
+    // No `adId` spread here: this branch is guarded by `!adId`, so it could only ever be absent.
     await record(sessionId, {
       accountId, campaignId, action, outcome: override ? 'overridden' : 'blocked',
       urlResults: [], checkedAt: new Date().toISOString(),
@@ -600,14 +638,14 @@ export async function runMetaTrackingGate(
   const urlResults = gate.results.map(r => ({ url: r.url, status: r.status, mechanisms: r.mechanisms, error: r.error }));
 
   if (gate.ok) {
-    await record(sessionId, { accountId, campaignId, action, outcome: 'passed', urlResults, checkedAt: new Date().toISOString() });
+    await record(sessionId, { accountId, campaignId, ...(adId && { adId }), action, outcome: 'passed', urlResults, checkedAt: new Date().toISOString() });
     return { proceed: true };
   }
   if (override) {
-    await record(sessionId, { accountId, campaignId, action, outcome: 'overridden', urlResults, checkedAt: new Date().toISOString() });
+    await record(sessionId, { accountId, campaignId, ...(adId && { adId }), action, outcome: 'overridden', urlResults, checkedAt: new Date().toISOString() });
     return { proceed: true };
   }
-  await record(sessionId, { accountId, campaignId, action, outcome: 'blocked', urlResults, checkedAt: new Date().toISOString() });
+  await record(sessionId, { accountId, campaignId, ...(adId && { adId }), action, outcome: 'blocked', urlResults, checkedAt: new Date().toISOString() });
   const hint = await serverSideHint(pixelIds, accessToken, deps);
   return {
     proceed: false,

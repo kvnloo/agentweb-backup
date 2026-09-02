@@ -57,7 +57,7 @@ describe('Meta launch gate (ENG-941)', () => {
       // An empty destination list from a truncated read is "we did not fetch them", not
       // "there are none" — the old code returned proceed:true here.
       expect(out.proceed).toBe(false);
-      expect(out.blockResult.error).toMatch(/too large to read completely/i);
+      expect(out.blockResult.error).toMatch(/could not be read completely/i);
       expect(mockRecord).toHaveBeenCalledWith('sess-t', expect.objectContaining({ outcome: 'blocked' }));
     });
 
@@ -115,6 +115,16 @@ describe('Meta launch gate (ENG-941)', () => {
       // ENG-1636's lesson: a pre-flight that names the wrong remedy sends the reader to fix
       // a cause that is not theirs.
       expect(out.blockResult.error).toMatch(/not necessarily absent|not have been reached/i);
+      /*
+       * Same guard the accountWideTruncated branch below already carries, applied to the branch
+       * beside it: this module has NO ad-set concept — zero references, and
+       * `metaService.listAdsForUtmAudit` takes a campaign id and nothing else — so narrowing to
+       * an ad set cannot make the gate's read smaller or change the outcome. The reasoning was
+       * written for one branch and not applied to its sibling.
+       */
+      expect(out.blockResult.error).not.toMatch(/narrow the request to the ad set/i);
+      // Supplying the destination IS honoured for an AD entity, so it stays.
+      expect(out.blockResult.error).toMatch(/supply the destination on the request/i);
       expect(out.blockResult.error).not.toMatch(/may belong to a different campaign/i);
     });
 
@@ -161,7 +171,7 @@ describe('Meta launch gate (ENG-941)', () => {
 
       expect(out.proceed).toBe(false);
       expect(out.blockResult.error).toMatch(/may belong to a different campaign/i);
-      expect(out.blockResult.error).not.toMatch(/too large to read completely/i);
+      expect(out.blockResult.error).not.toMatch(/could not be read completely/i);
       expect(out.blockResult.error).not.toMatch(/account-wide search/i);
     });
   });
@@ -511,7 +521,7 @@ describe('referenced creative destinations (ENG-941)', () => {
       );
 
       expect(out.proceed).toBe(false);
-      expect(out.blockResult.error).toMatch(/too large to read completely/i);
+      expect(out.blockResult.error).toMatch(/could not be read completely/i);
     });
 
     it('offers a remedy a CREATE can actually follow', async () => {
@@ -521,7 +531,18 @@ describe('referenced creative destinations (ENG-941)', () => {
         creds, CAMPAIGN, 'UPDATE', false, 'sess-c', {}, undefined, [], [],
       );
 
-      expect(out.blockResult.error).toMatch(/supply the destination on the request/i);
+      /*
+       * This branch fires only for CAMPAIGN_UPDATE / AD_SET_UPDATE / AD_CREATE, and
+       * `collectPendingDestinations` returns [] unconditionally for the two UPDATEs (campaigns
+       * carry no destination; an ad set carries one only on CREATE). So "supply the destination
+       * on the request" — which this test used to REQUIRE — is a remedy the caller can follow
+       * exactly and get the identical block back. Same defect class the sibling branch is already
+       * guarded against at the ad-set assertion above.
+       */
+      expect(out.blockResult.error).not.toMatch(/supply the destination on the request/i);
+      expect(out.blockResult.error).not.toMatch(/narrow the launch to a single ad/i);
+      // What remains has to actually be actionable.
+      expect(out.blockResult.error).toMatch(/tracking-check override/i);
     });
   });
 
@@ -577,7 +598,7 @@ describe('referenced creative destinations (ENG-941)', () => {
       );
 
       expect(out.proceed).toBe(false);
-      expect(out.blockResult.error).toMatch(/too large to read completely/i);
+      expect(out.blockResult.error).toMatch(/could not be read completely/i);
     });
 
     it('still checks the campaign destinations it CAN read for an empty-container launch', async () => {
@@ -787,9 +808,30 @@ describe('named-ad scoping must not silently pass (ENG-941)', () => {
     ], truncated: false, pagesFetched: 1 });
     const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42');
     expect(out.proceed).toBe(false);
-    expect(out.blockResult.error).toContain('ad-42');
+    /*
+     * The block must say WHICH failure this is, without printing a raw Meta id.
+     *
+     * These assertions used to pin `ad-42` in the model/user-visible text. Product rule: ids are
+     * not shown to the user, and this string is relayed to them. The ad is the one the caller
+     * just named in this request, so the sentence is unambiguous without it — and the id is
+     * still recorded on the ledger entry for debugging.
+     */
+    expect(out.blockResult.error).toContain('the requested ad was not found in this campaign');
+    expect(out.blockResult.error).not.toContain('ad-42');
     expect(mockPreflight).not.toHaveBeenCalled();
-    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'blocked' }));
+    /*
+     * The id has to survive SOMEWHERE, and the ledger is the only place left.
+     *
+     * Taking it out of the block text is right — that text reaches the user. But it was the only
+     * record of which ad was refused: `blockResult` carries no ids, the gate logs none, and the
+     * ledger row was `{accountId, campaignId, action, outcome}`, identical for every ad in the
+     * campaign AND for the campaign-wide truncation block. "Emma refused to activate my ad" had
+     * no answer. Removing the id from prose and adding it here are one change, not two.
+     */
+    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      outcome: 'blocked',
+      adId: 'ad-42',
+    }));
   });
 
   it('proceeds when the copy carries its own destination, which is what will serve', async () => {
@@ -837,7 +879,8 @@ describe('named-ad lookup falls back to the account before blocking (ENG-941)', 
     mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42');
     expect(out.proceed).toBe(false);
-    expect(out.blockResult.error).toContain('ad-42');
+    expect(out.blockResult.error).toContain('the requested ad was not found in this campaign');
+    expect(out.blockResult.error).not.toContain('ad-42');
   });
 
   it('does not pay for the account-wide lookup when the campaign scope already found the ad', async () => {

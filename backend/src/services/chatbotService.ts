@@ -588,6 +588,13 @@ function keywordBasedChunkRetrieval(
 export interface MetaMeasurementCheckRecord {
   accountId: string;
   campaignId?: string;
+  /**
+   * Kept in step with `metaLaunchGate.ts`'s declaration of the same name — structural typing
+   * means a field added there and not here still persists (DynamoDB is schemaless), so the
+   * compiler will NOT catch the drift. It went missing once already, when the gate started
+   * recording which ad a block was about.
+   */
+  adId?: string;
   action: string;
   outcome: 'passed' | 'blocked' | 'overridden';
   /** Per-destination check results (url + status + detected pixels). */
