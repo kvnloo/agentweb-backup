@@ -249,6 +249,79 @@ function applyFabricationGuard(
   return { score: Math.min(score, 2), dimensions: guardedDimensions };
 }
 
+/**
+ * Assistant-directed criticism markers. Deliberately plain substring keywords
+ * (not a single dense regex) so the list stays easy to extend and audit.
+ * Matched case-insensitively against the judge's own "reason" text.
+ */
+const ASSISTANT_CRITICISM_KEYWORDS = [
+  "fail", "incorrect", "inaccura", "hallucinat", "fabricat", "mistake",
+  "error", "wrong", "misunderstood", "misread", "misinterpret",
+  "did not", "didn't", "never", "could not", "couldn't", "neglect",
+  "overlook", "ignor", "unhelpful", "inadequate", "insufficient",
+  "inappropriate", "should have", "too verbose", "too long",
+  "repeated itself", "confusing", "poorly", "vague",
+];
+
+function reasonCriticizesAssistant(reason: string): boolean {
+  const lower = reason.toLowerCase();
+  return ASSISTANT_CRITICISM_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+/**
+ * ENG-1296: the Fangfang Judge scored three sessions goalCompletion 3 where
+ * the user's request was a genuinely ambiguous fragment and the assistant's
+ * ONLY move was to decline to guess and ask one focused clarifying question —
+ * textbook-correct handling per the Drafting Direction Guard. Each reason
+ * PRAISED that handling in full ("handled it excellently", "handled this
+ * gracefully") and docked goalCompletion purely because the conversation
+ * ended before the user replied — something entirely outside the assistant's
+ * control. The general satisfaction judge and Matt Judge scored the same
+ * three sessions 5/5/5, proving 3 was a judge-specific artifact, not a real
+ * defect.
+ *
+ * This is a narrow, code-level sanity check, same shape as
+ * applyFabricationGuard: a judge whose own reason contains NO criticism of
+ * the assistant, yet whose dataAccuracy/outputQuality are both already high
+ * (>=4), cannot coherently justify a goalCompletion <=3 — that combination is
+ * self-contradictory, not a genuine low score. It leaves alone any session
+ * where the judge actually found fault (a criticism keyword is present) or
+ * where dataAccuracy/outputQuality are themselves low, so a truly bad session
+ * is never masked by this guard.
+ */
+function applyAwaitingReplyGuard(
+  reason: string,
+  score: number,
+  dimensions: ScoringResult["dimensions"]
+): { score: number; dimensions: ScoringResult["dimensions"] } {
+  if (!dimensions) return { score, dimensions };
+  if (dimensions.goalCompletion > 3) return { score, dimensions };
+  if (dimensions.dataAccuracy < 4 || dimensions.outputQuality < 4) return { score, dimensions };
+  if (reasonCriticizesAssistant(reason)) return { score, dimensions };
+
+  return {
+    score: Math.max(score, 4),
+    dimensions: { ...dimensions, goalCompletion: Math.max(dimensions.goalCompletion, 4) },
+  };
+}
+
+/**
+ * ENG-1296: goalCompletion must not be scored on whether the user has replied
+ * yet — that is outside the assistant's control. Appended at call time, same
+ * reasoning as NO_TASK_JUDGMENT_CLAUSE: both the default prompt and a custom
+ * `ScoringJudge.systemPrompt` (Fangfang Judge, Matt Judge) are AW-Settings
+ * data that predates this rule, so writing it only into
+ * DEFAULT_SCORING_SYSTEM_PROMPT would leave whatever prompt is actually
+ * configured blind to it (ENG-392).
+ */
+export const AWAITING_USER_REPLY_CLAUSE = `
+
+IMPORTANT: A conversation that ends on the assistant's own well-formed clarifying question:
+- If the user's request was genuinely ambiguous or a bare fragment, and the assistant's LAST turn correctly identified the ambiguity, avoided guessing or taking any irreversible action, and asked ONE focused question to resolve it, that is complete, correct handling — even if the conversation ends there with no user reply yet.
+- Score goalCompletion on the QUALITY of that clarifying question (was it focused and correct, and did it avoid guessing?), NOT on whether the user has replied. Whether or when the user replies is outside the assistant's control and must never be treated as a goal-completion failure.
+- Example: the user pastes an ambiguous third-party message fragment with no explicit instruction; the assistant flags the ambiguity, declines to guess, and asks a single clear clarifying question; the conversation ends there. This is goalCompletion 5 — do not write a reason like "the conversation ended before the user could respond, so the goal is not yet complete" and do not score it 3 as a "neutral" placeholder.
+- Sanity check before finalizing: if your own "reason" text contains no criticism of the assistant's handling, goalCompletion (and the overall score) must not be 3 or lower.`;
+
 export const DEFAULT_SCORING_SYSTEM_PROMPT = `You are an expert at evaluating user satisfaction in AI chat sessions.
 Analyze the conversation and rate the user's satisfaction on a scale of 1-5:
 1 = Very unsatisfied (frustrated, angry, repeated failures, gave up)
@@ -1282,7 +1355,8 @@ export async function scoreSession(
     VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
     PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
     FABRICATION_GROUNDING_CLAUSE +
-    OUTPUT_INTEGRITY_GUARD_CLAUSE;
+    OUTPUT_INTEGRITY_GUARD_CLAUSE +
+    AWAITING_USER_REPLY_CLAUSE;
   // Persisted setting — validate before calling, or a retired id throws
   // `Invalid model` and the session silently goes unscored (ENG-744).
   const model = await resolveScoringModel(await getDefaultScoringModel());
@@ -1320,13 +1394,14 @@ export async function scoreSession(
   }
   const score = Math.max(1, Math.min(5, Math.round(rawScore)));
   const reason = parsed.reason || "No reason provided";
-  const guarded = applyFabricationGuard(
+  const fabricationGuarded = applyFabricationGuard(
     manifest.count,
     reason,
     score,
     parseDimensions(parsed),
     parseAssertsToolDerivedData(parsed)
   );
+  const guarded = applyAwaitingReplyGuard(reason, fabricationGuarded.score, fabricationGuarded.dimensions);
 
   return {
     score: guarded.score,
@@ -1392,7 +1467,8 @@ export async function scoreSessionWithJudge(
           VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
           PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
           FABRICATION_GROUNDING_CLAUSE +
-          OUTPUT_INTEGRITY_GUARD_CLAUSE,
+          OUTPUT_INTEGRITY_GUARD_CLAUSE +
+          AWAITING_USER_REPLY_CLAUSE,
       },
       { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },
     ],
@@ -1420,13 +1496,14 @@ export async function scoreSessionWithJudge(
   }
   const score = Math.max(1, Math.min(5, Math.round(rawScore)));
   const reason = parsed.reason || "No reason provided";
-  const guarded = applyFabricationGuard(
+  const fabricationGuarded = applyFabricationGuard(
     manifest.count,
     reason,
     score,
     parseDimensions(parsed),
     parseAssertsToolDerivedData(parsed)
   );
+  const guarded = applyAwaitingReplyGuard(reason, fabricationGuarded.score, fabricationGuarded.dimensions);
 
   return {
     score: guarded.score,
