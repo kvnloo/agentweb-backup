@@ -1807,12 +1807,20 @@ export class AgentModeService {
         if (toList.length === 0) {
           throw new Error('At least one valid email address is required in the "to" field.');
         }
-        await emailService.sendSessionNotificationEmail(
+        const result = await emailService.sendSessionNotificationEmail(
           toList,
           context.sessionId,
           args.message,
           args.subject
         );
+        if (result?.duplicate) {
+          return {
+            success: true,
+            sent_to: [],
+            duplicate_suppressed: true,
+            message: `A session notification to ${toList.join(', ')} was already sent earlier in this session — skipped to avoid sending a duplicate email.`
+          };
+        }
         return {
           success: true,
           sent_to: toList,
