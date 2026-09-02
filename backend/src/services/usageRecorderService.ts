@@ -11,7 +11,7 @@
  *    tokens are still counted.
  */
 
-import { getModelPrice, cacheWriteCost, CacheWriteByTtl } from "../utils/llmPricing";
+import { getModelPrice, cacheWriteCost, CacheWriteByTtl, isPerGenerationPriced } from "../utils/llmPricing";
 import { usageRecordDb, CostSource } from "./usageRecordDb";
 // tokenUsageService is lazy-required inside meterUserUsage (not statically imported):
 // it pulls in db.ts -> config/aws.ts, and usageRecorderService is imported very widely
@@ -148,6 +148,24 @@ function isUnpriced(model: string): boolean {
  */
 export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
   try {
+    // ENG-1691: a model priced PER GENERATION (image, video clip) carries no
+    // token rate, so token-metering it writes a $0 row beside the real
+    // per-generation row — two ledger entries for one API call, on a model that
+    // produces no text. `llmClients.ts` already states the rule; this enforces
+    // it at the single point every caller passes through.
+    //
+    // Keyed on the ABSENCE of an override rather than on the feature name: the
+    // legitimate per-generation record supplies `costUsdOverride`, and that is
+    // what distinguishes it from a wrapper that merely observed the same call.
+    // Guarding on `feature` instead would break the moment a caller relabels.
+    //
+    // ENG-700 is unaffected: a model in NEITHER price book has no override and
+    // is not per-generation priced, so it still records and still tags
+    // `unpriced`.
+    if (ctx.costUsdOverride == null && isPerGenerationPriced(ctx.model)) {
+      return;
+    }
+
     const userId = ctx.userId || "system";
     const billingUserId = ctx.billingUserId || userId;
     const date = ctx.date || new Date().toISOString().slice(0, 10);
