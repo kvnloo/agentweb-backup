@@ -503,6 +503,52 @@ describe('runScheduledChat — publish tool excluded from scope entirely, mixed 
     expect(mockWorker.runInWorker).toHaveBeenCalledTimes(20);
     expect((result as any).publishHeldForApproval).toBeUndefined();
   });
+
+  /**
+   * CodeRabbit review (ENG-930): `publishRequirementExcludedFromScope` must be
+   * recomputed against the CURRENT `requiredFunctions` every attempt, not
+   * resolved once at admission — `requiredFunctions` narrows again mid-run
+   * (ENG-827) when the owner revokes consent. A run admitted AUTHORIZED (both
+   * tools required) that then has consent revoked mid-run must have the
+   * exclusion become true THAT turn, not stay stuck at a stale `false` from
+   * admission — otherwise it presses generate_image to the full budget even
+   * though the schedule is no longer authorized to publish.
+   */
+  it('CodeRabbit review: authorization revoked MID-RUN still excludes the publish tool that turn, instead of pressing generate_image to 20', async () => {
+    const startsAuthorizedSchedule = {
+      ...publishSchedule,
+      scheduleId: 'schedule-930-revoked-midrun',
+      // No explicit autopublishAuthorized/requirePublishApproval: the legacy
+      // grandfather default resolves this AUTHORIZED at admission because
+      // requiredFunctionCalls names a publish tool.
+      requiredFunctionCalls: ['post_on_connected_account', 'generate_image'],
+    };
+    const revokedSchedule = { ...startsAuthorizedSchedule, autopublishAuthorized: false };
+
+    // The live schedule read backs BOTH refreshPublishAuthorization (checked
+    // at the top of every attempt) and the marker-genuineness check (checked
+    // after every response that looks like a withhold) — both resolve
+    // AUTHORIZED for attempt 1's pair of reads, then REVOKED from then on,
+    // simulating the owner revoking consent partway through the run.
+    let getScheduleCalls = 0;
+    mockScheduleDb.getScheduleById.mockImplementation(async () => {
+      getScheduleCalls++;
+      return (getScheduleCalls <= 2 ? startsAuthorizedSchedule : revokedSchedule) as any;
+    });
+    mockWorker.runInWorker.mockResolvedValue(workerReply([], GENUINE_WITHHOLD) as any);
+
+    const result = await runScheduledChat(startsAuthorizedSchedule, 'kevin', true);
+
+    // Attempt 1 ran while still authorized — the marker isn't genuine yet and
+    // both tools are still required, so nothing stops the run early. Attempt
+    // 2 sees the revocation: post_on_connected_account drops out of scope,
+    // the marker becomes genuine, and the run stops THAT turn instead of
+    // pressing the now-orphaned generate_image requirement to attempt 20.
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(2);
+    expect(result.attempt).toBe(2);
+    expect((result as any).publishHeldForApproval).toBe(true);
+    expect(result.status).toBe('failure');
+  });
 });
 
 /**
