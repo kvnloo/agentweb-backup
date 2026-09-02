@@ -26,6 +26,9 @@ jest.mock('../config/integrations', () => ({
 
 import axios from 'axios';
 import { emmaToolRegistry } from '../emma/registry';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 // Import tools to register them
 import '../emma/fathomTools';
@@ -257,6 +260,23 @@ describe('fathom_get_meetings', () => {
     expect(result.success).toBe(false);
     expect(result.message).toContain('reconnect');
   });
+
+  // ENG-1300: the reconnect message text ("is invalid or has been revoked")
+  // doesn't match any of classifyToolErrorClass's message-based patterns, so
+  // without `status` riding along on the result this fell back to the generic
+  // Error/bug class in tool telemetry.
+  it('ENG-1300: a 401 classifies as auth/config end-to-end, not the generic Error/bug fallback', async () => {
+    mockedGetAccounts.mockResolvedValue([makeFathomAccount()] as any);
+    mockedAxios.get = jest.fn().mockRejectedValue({
+      response: { status: 401 },
+      message: 'Request failed with status code 401',
+    });
+
+    const result = await executeTool('fathom_get_meetings', {}, { userId: 'user-1' });
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+  });
 });
 
 describe('fathom_get_transcript', () => {
@@ -347,6 +367,19 @@ describe('fathom_get_transcript', () => {
 
     expect(result.success).toBe(false);
     expect(result.message).toContain('reconnect');
+  });
+
+  it('ENG-1300: a 401 classifies as auth/config end-to-end, not the generic Error/bug fallback', async () => {
+    mockedGetAccounts.mockResolvedValue([makeFathomAccount()] as any);
+    mockedAxios.get = jest.fn().mockRejectedValue({
+      response: { status: 401 },
+      message: 'Request failed with status code 401',
+    });
+
+    const result = await executeTool('fathom_get_transcript', { recording_id: 101 }, { userId: 'user-1' });
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
   });
 });
 

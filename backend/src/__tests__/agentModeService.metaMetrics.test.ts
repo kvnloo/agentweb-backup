@@ -549,6 +549,20 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
       // There are 9 parallel API calls in Promise.all
       expect(attemptCount).toBe(9);
       expect(result.success).toBe(false);
+
+      // ENG-1300: fetchWithRetryAndPaging exposes the real HTTP status as a
+      // non-enumerable __httpStatus field; the per-section classification loop
+      // in getMetaAdsMetrics now threads it onto the thrown error's `.status`,
+      // which the outer catch surfaces as `code` — proving a genuine 404 (no
+      // Meta business `error.code` present on this mock at all) classifies
+      // correctly end-to-end.
+      expect(result.code).toBe(404);
+      const { toolResultError } = await import('../utils/toolResultError');
+      const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+      const { classifyToolFailureType } = await import('../utils/toolFailureType');
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('not_found');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
     });
 
     it('should give up after 3 retry attempts', async () => {
@@ -594,6 +608,54 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
       expect(attemptCount).toBe(27); // 9 × 3
       expect(result.success).toBe(false);
     }, 15000); // Longer timeout for multiple retries
+  });
+
+  describe('ENG-1300: real HTTP status vs Meta business code', () => {
+    it('errorType still derives from the Meta business code (190) while `code` derives from the real HTTP status — the two can legitimately differ and must not be confused', async () => {
+      const mockUser = {
+        id: 'user123',
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
+      };
+
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      global.fetch = jest.fn().mockImplementation(() => {
+        return Promise.resolve({
+          ok: false,
+          // Deliberately a different value than the business code below, so a test
+          // that passed only because the two numbers happened to match would be
+          // worthless — this proves they're read from genuinely separate sources.
+          status: 400,
+          json: () => Promise.resolve({
+            error: { message: 'Error validating access token', code: 190 } // Meta's OAuth-error business code
+          })
+        });
+      }) as jest.Mock;
+
+      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
+
+      expect(result.success).toBe(false);
+      expect(result.errorType).toBe('connection'); // derived from the business code 190, by design
+      expect(result.code).toBe(400); // derived from the real HTTP status, not 190
+
+      const { toolResultError } = await import('../utils/toolResultError');
+      const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('invalid_args'); // classFromStatus(400), not auth from the 190
+    });
   });
 
   describe('Partial breakdown failure (ENG-104)', () => {

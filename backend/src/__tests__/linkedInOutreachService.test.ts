@@ -295,6 +295,22 @@ describe('LinkedInOutreachService', () => {
       expect((thrown as any).structuredError).toBeDefined();
     });
 
+    // ENG-1300: handleError already computed structuredError.status for its own
+    // classification above, but only attached it nested under .structuredError —
+    // classifyToolErrorClass (and toolResultError's reconstruction) only read a
+    // top-level .status/.statusCode/.code, so every caller through handleError
+    // classified as generic Error/bug regardless of the real HTTP status.
+    it('mirrors structuredError.status onto a top-level .code so the generic classifier can see it', async () => {
+      const unipileError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 422, type: 'errors/already_invited_recently', title: 'Should delay new invitation to this recipient' }
+      });
+      (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValue(unipileError);
+
+      const thrown = await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false).catch(e => e);
+      expect((thrown as any).structuredError.status).toBe(422);
+      expect((thrown as any).code).toBe(422);
+    });
+
     it('auto-trims an over-limit message to the default 300-char cap instead of failing', async () => {
       const longMessage = 'a'.repeat(301);
       await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, longMessage);

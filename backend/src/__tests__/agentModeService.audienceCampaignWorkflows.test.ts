@@ -58,6 +58,9 @@ jest.mock('../utils/ssrfGuard', () => ({
 
 import axios from 'axios';
 import { AgentModeService } from '../services/agentModeService';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 /*
  * ENG-941: the launch tracking gate resolves Meta credentials before it runs, and this
@@ -911,6 +914,32 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       // failed-release retries also made a genuinely completed launch's
       // token replayable after the staleness window.
       expect(markPreviewTokenSucceeded).toHaveBeenCalledWith(USER_ID, expect.any(String));
+    });
+
+    // ENG-1300: createMetaAdsAdSet already returns `code` on failure (fixed
+    // separately), but executeAudienceCampaignLaunch rethrows a plain Error when
+    // it sees success:false — proving that code survives THIS extra rethrow to
+    // launchAudienceCampaign's own catch, not just createMetaAdsAdSet's own.
+    it('ENG-1300: a coded ad-set-creation failure classifies as auth/config end-to-end', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'create',
+        audience: { id: 'aud_seed_1', name: 'RankAI Warm List' },
+        created: true,
+        sourceSummary: 'CSV upload (https://s3.example.com/audience.csv)',
+        failures: [],
+      });
+      jest.spyOn(agentModeService, 'createMetaAdsAdSet').mockResolvedValueOnce({
+        success: false, message: 'Insufficient permission to create ad set', code: 403,
+      } as any);
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm(baseArgs()));
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(403);
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
     });
 
     // Greptile finding: releasing the confirm token on a downstream failure

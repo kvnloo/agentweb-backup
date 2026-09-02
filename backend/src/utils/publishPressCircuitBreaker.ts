@@ -114,6 +114,36 @@ export function isPublishOnlyUnmet(unmetRequiredFunctions: string[]): boolean {
 }
 
 /**
+ * ENG-930: true when AT LEAST ONE unmet requirement is publish-shaped — the
+ * relaxed, `.some()` counterpart to `isPublishOnlyUnmet`'s `.every()`.
+ *
+ * Needed because a schedule can require a publish call ALONGSIDE a non-publish
+ * PREP call for that same publish — e.g.
+ * `requiredFunctionCalls: ['post_on_connected_account', 'generate_image']`.
+ * A run that legitimately
+ * holds the publish also has no reason to spend a generation call on an image
+ * for content that will never go out, so `generate_image` stays unmet forever
+ * too. `isPublishOnlyUnmet` then never returns true (the set is never PURELY
+ * publish-shaped), so `shouldStopPressingForPublish`/`classifyPublishStall`
+ * never engage and the run presses to the full `maxAttempts` (20) every day —
+ * the exact ENG-947 loop, reproduced by a co-required tool ENG-947 didn't
+ * anticipate. Confirmed live: a production schedule pressed 19 identical
+ * times (68 messages, $8.07), three days AFTER ENG-947 shipped.
+ *
+ * This helper only answers "is a publish call among what's unmet" — it is
+ * deliberately NOT sufficient on its own to stop pressing (a co-required
+ * report_leads or send_email alongside an untouched publish call still has
+ * genuine work left). It is only safe to act on when paired with a GENUINE,
+ * verified publish-withhold declaration — see `explicitlyWithheld` below.
+ */
+export function hasUnmetPublishRequirement(unmetRequiredFunctions: string[]): boolean {
+  if (!Array.isArray(unmetRequiredFunctions)) return false;
+  return unmetRequiredFunctions.some(
+    (name) => typeof name === 'string' && (isPublishName(name) || hasKnownEquivalenceRoute(name))
+  );
+}
+
+/**
  * True when a scheduled run has spent its press budget and the ONLY thing still
  * missing is one or more publish tools.
  *
@@ -121,14 +151,48 @@ export function isPublishOnlyUnmet(unmetRequiredFunctions: string[]): boolean {
  * attempts that ended in the publish-only-unmet state (the initial turn that
  * reached it, plus each press sent afterwards) — never the run-wide attempt
  * counter, which other retry paths also consume.
+ *
+ * ENG-930 `explicitlyWithheld`: when the caller has independently verified
+ * (NOT just read model prose — see agentModeController.withholdIsGenuine) that
+ * this run settled on a genuine publish-withhold, stop immediately regardless
+ * of the press budget or of a co-required non-publish call staying unmet. The
+ * model has already explained itself once; per this ticket's own fix
+ * direction, a further press cannot change that answer, so there is nothing
+ * left to spend the budget waiting for.
+ *
+ * ENG-930 `publishExcludedFromScope`: a SECOND, narrower door to the same
+ * problem. `filterRequiredFunctionsToAuthorizedScope` (ENG-827) removes a
+ * publish-capable tool from the run's requirement set ENTIRELY once the
+ * schedule is confirmed unauthorized for it — so on a schedule with an
+ * explicit `requirePublishApproval: true` or a revoked grant,
+ * `unmetRequiredFunctions` never contains the publish tool at all, and
+ * `hasUnmetPublishRequirement` can never see it either. A co-required
+ * non-publish prep call for that same excluded publish (e.g. generate_image)
+ * is then the ONLY thing left unmet, and would otherwise press to the full
+ * budget forever — the same loop, reached through the door
+ * `hasUnmetPublishRequirement` cannot open because the tool it looks for was
+ * already taken off the table before this function ever ran. The caller sets
+ * this when it independently knows (from the schedule's own
+ * requiredFunctionCalls, before authorization-scoping) that a publish tool
+ * was excluded — never inferred from the unmet set itself.
  */
 export function shouldStopPressingForPublish(params: {
   pressAttempt: number;
   unmetRequiredFunctions: string[];
   /** Override for the press budget; defaults to MAX_PUBLISH_PRESS_ATTEMPTS. */
   maxPressAttempts?: number;
+  /** ENG-930: a verified, genuine publish-withhold — see doc comment above. */
+  explicitlyWithheld?: boolean;
+  /** ENG-930: a publish tool was authorization-scoped out of this run entirely — see doc comment above. */
+  publishExcludedFromScope?: boolean;
 }): boolean {
-  const { pressAttempt, unmetRequiredFunctions } = params;
+  const { pressAttempt, unmetRequiredFunctions, explicitlyWithheld } = params;
+  if (
+    explicitlyWithheld &&
+    (hasUnmetPublishRequirement(unmetRequiredFunctions) || params.publishExcludedFromScope === true)
+  ) {
+    return true;
+  }
   const budget = params.maxPressAttempts ?? MAX_PUBLISH_PRESS_ATTEMPTS;
   if (!isPublishOnlyUnmet(unmetRequiredFunctions)) return false;
   return pressAttempt >= budget;
@@ -231,6 +295,27 @@ export type PublishStallReason =
  * attempted. Omitted (or a name not in the set) keeps the existing behavior —
  * no evidenced schedule requires both names of any pair today, so this is a
  * defensive suppression, not a common case.
+ *
+ * `explicitlyWithheld` (ENG-930) admits the run past the entry gate when the
+ * unmet set is NOT purely publish-shaped, as long as a publish call is still
+ * one of the unmet names — see `hasUnmetPublishRequirement`'s doc comment for
+ * why a co-required non-publish prep call (e.g. generate_image) otherwise
+ * keeps this classifier from ever running at all. The `wroteSomethingElse` and
+ * budget checks below still apply on top — this only widens the entry gate,
+ * it does not skip the more specific checks that follow it.
+ *
+ * `publishExcludedFromScope` (ENG-930) admits the run through the SECOND door
+ * to the same problem — see `shouldStopPressingForPublish`'s doc comment. When
+ * a publish tool was authorization-scoped OUT of this run entirely, it can
+ * never appear in `unmetRequiredFunctions` for `hasUnmetPublishRequirement` to
+ * find, so the caller passes this instead. `unmet` can then legitimately
+ * contain a NON-publish name (e.g. generate_image, once its own publish
+ * sibling has been excluded) — so `triedTheNamedTool` below must require the
+ * matched name to ALSO be publish-classified before crediting
+ * `publish-tool-failing`. Without that extra check, a failed generate_image
+ * call would satisfy `unmet.has('generate_image')` and get reported as "the
+ * publish integration is broken", when the failure has nothing to do with
+ * publishing at all.
  */
 export function classifyPublishStall(params: {
   pressAttempt: number;
@@ -239,9 +324,17 @@ export function classifyPublishStall(params: {
   publishToolsAttempted?: string[];
   maxPressAttempts?: number;
   heldToFunctionNames?: Iterable<string> | Set<string>;
+  /** ENG-930: a verified, genuine publish-withhold — see shouldStopPressingForPublish. */
+  explicitlyWithheld?: boolean;
+  /** ENG-930: a publish tool was authorization-scoped out of this run entirely — see shouldStopPressingForPublish. */
+  publishExcludedFromScope?: boolean;
 }): PublishStallReason | null {
-  const { unmetRequiredFunctions, externalWritesSucceeded } = params;
-  if (!isPublishOnlyUnmet(unmetRequiredFunctions)) return null;
+  const { unmetRequiredFunctions, externalWritesSucceeded, explicitlyWithheld, publishExcludedFromScope } = params;
+  const admitted =
+    isPublishOnlyUnmet(unmetRequiredFunctions) ||
+    (explicitlyWithheld === true &&
+      (hasUnmetPublishRequirement(unmetRequiredFunctions) || publishExcludedFromScope === true));
+  if (!admitted) return null;
 
   const unmet = new Set(unmetRequiredFunctions);
   const held = params.heldToFunctionNames
@@ -249,10 +342,28 @@ export function classifyPublishStall(params: {
       ? params.heldToFunctionNames
       : new Set(params.heldToFunctionNames)
     : null;
+  // Performance (CodeRabbit review): only a requirement with a REGISTERED
+  // equivalence route can ever satisfy `matchingEquivalentRoute` below, so
+  // pre-filter to that (small, fixed-size) subset ONCE here rather than
+  // re-scanning every unmet requirement — including ones with no route at
+  // all — for every successful write. Widening `admitted` above (ENG-930) to
+  // let `explicitlyWithheld`/`publishExcludedFromScope` through with a
+  // mixed, non-publish-shaped unmet set means this can no longer assume the
+  // whole array is small/publish-only, so the filter is worth doing even
+  // though route registrations themselves are still capped by the fixed
+  // `EQUIVALENT_PUBLISH_ROUTES` table.
+  // Deduplicated (CodeRabbit review): a resumed run's combined requirement
+  // list is not guaranteed unique, and each duplicate would otherwise be
+  // re-tested against every successful write for no additional information —
+  // `matchingEquivalentRoute(requirement, entry)` returns the same result for
+  // the same `requirement` regardless of how many times it appears here.
+  const unmetWithEquivalenceRoutes = Array.from(
+    new Set(unmetRequiredFunctions.filter((requirement) => typeof requirement === 'string' && hasKnownEquivalenceRoute(requirement)))
+  );
   const wroteSomethingElse = (externalWritesSucceeded || []).some((entry) => {
     const name = typeof entry?.name === 'string' ? entry.name : '';
     if (!name || unmet.has(name)) return false;
-    return unmetRequiredFunctions.some((requirement) => {
+    return unmetWithEquivalenceRoutes.some((requirement) => {
       if (!matchingEquivalentRoute(requirement, entry)) return false;
       // Both names separately required as their OWN line items: the call
       // already satisfied its own requirement, so it must not also disqualify
@@ -268,12 +379,14 @@ export function classifyPublishStall(params: {
       pressAttempt: params.pressAttempt,
       unmetRequiredFunctions,
       maxPressAttempts: params.maxPressAttempts,
+      explicitlyWithheld,
+      publishExcludedFromScope,
     })
   ) {
     return null;
   }
   const triedTheNamedTool = (params.publishToolsAttempted || []).some(
-    (name) => typeof name === 'string' && unmet.has(name),
+    (name) => typeof name === 'string' && unmet.has(name) && (isPublishName(name) || hasKnownEquivalenceRoute(name)),
   );
   return triedTheNamedTool ? 'publish-tool-failing' : 'held-for-approval';
 }
