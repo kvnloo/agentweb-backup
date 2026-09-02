@@ -510,4 +510,41 @@ describe('explicitlyWithheld — mixed publish + non-publish co-requirement (ENG
       }),
     ).toBe('requirement-names-unused-publish-tool');
   });
+
+  /**
+   * CodeRabbit review (ENG-930): once `publishExcludedFromScope` admits a set
+   * where the publish tool itself has already been excluded, `unmet` can
+   * legitimately contain ONLY a non-publish name (e.g. generate_image). A
+   * FAILED call to that non-publish tool must not be credited as evidence the
+   * PUBLISH integration is broken — `triedTheNamedTool` has to require the
+   * matched name to actually be publish-classified, not just present in
+   * `unmet`, or a failed generate_image call gets misreported as
+   * `publish-tool-failing` ("the integration is broken") when the failure has
+   * nothing to do with publishing.
+   */
+  it('classifyPublishStall: publishExcludedFromScope does NOT credit a failed NON-publish tool as publish-tool-failing', () => {
+    expect(
+      classifyPublishStall({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['generate_image'],
+        externalWritesSucceeded: [],
+        publishToolsAttempted: ['generate_image'],
+        explicitlyWithheld: true,
+        publishExcludedFromScope: true,
+      }),
+    ).toBe('held-for-approval');
+  });
+
+  it('classifyPublishStall: publishExcludedFromScope still reports publish-tool-failing for an actual publish-tool failure', () => {
+    expect(
+      classifyPublishStall({
+        pressAttempt: 1,
+        unmetRequiredFunctions: ['generate_image', 'twitter_manage_post'],
+        externalWritesSucceeded: [],
+        publishToolsAttempted: ['generate_image', 'twitter_manage_post'],
+        explicitlyWithheld: true,
+        publishExcludedFromScope: true,
+      }),
+    ).toBe('publish-tool-failing');
+  });
 });
