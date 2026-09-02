@@ -216,6 +216,21 @@ const EXPENSIVE_MEDIA_FAILURE_BUDGET = 2;
 // reduced-request recovery paths (sync=false, smaller window/limit) still run before the
 // aggregate cap engages — only a sustained, multi-bucket timeout spiral trips it.
 const CHAT_HISTORY_FAILURE_BUDGET = 6;
+// ENG-1668 follow-up: scoping call_google_ads_api's breaker per (entity, action,
+// target) (googleAdsFailureScope, below) fixed the false cross-action blocking that
+// caused this ticket, but it also means each of the tool's ~35+ entity/action
+// combinations now gets its OWN fresh 2-3-failure allowance — a model that fails a
+// DIFFERENT combination every attempt (rather than repeating one mistake) could
+// burn far more failed calls than the old shared-bucket breaker ever allowed before
+// tripping anything. Same gap class ENG-291 hit with get_chat_history's cost-scoped
+// buckets; same fix shape: a coarse run-scoped cap on TOTAL call_google_ads_api
+// failures regardless of which scope they land in. Kept run-scoped (not session-wide
+// like CHAT_HISTORY_FAILURE_BUDGET) deliberately: a stale count should not persist
+// into an unrelated later turn and reintroduce the over-blocking this ticket was
+// about. Threshold well above the worst real session on record (8 failures, all pre-
+// dating the hoist fix that now prevents most of them outright) and well below the
+// theoretical worst-case drift, so only a genuine multi-vector spiral trips it.
+const GOOGLE_ADS_RUN_FAILURE_BUDGET = 10;
 const MAX_TRACKED_RUNS = 500;
 const ERROR_KEY_LENGTH = 80;
 
@@ -539,6 +554,17 @@ function countToolFailures(runId: string, toolName: string): number {
     if (key.startsWith(prefix)) total += count;
   }
   return total;
+}
+
+// ENG-1668 follow-up: a run-scoped backstop, separate from aggregateFailureBudget
+// above — that one is keyed by budgetScopeId (session-wide, for tools whose failures
+// are deliberately tracked cross-run), this one by runId directly, using the SAME
+// per-run counts every per-scope breaker check already writes via recordToolFailure.
+// No new recording path needed.
+function findTrippedRunBudget(runId: string, toolName: string): { count: number; budget: number } | null {
+  if (toolName !== 'call_google_ads_api') return null;
+  const count = countToolFailures(runId, toolName);
+  return count >= GOOGLE_ADS_RUN_FAILURE_BUDGET ? { count, budget: GOOGLE_ADS_RUN_FAILURE_BUDGET } : null;
 }
 
 function findTrippedBudget(runId: string, toolName: string): { count: number; budget: number } | null {
@@ -952,6 +978,21 @@ export async function executeAgentToolThroughGateway(
           trippedBudget.count,
           trippedBudget.budget,
           input.budgetScopeId ? 'session' : 'run',
+        ),
+        policyDecision,
+        durationMs: Math.max(0, now() - startedAt),
+      };
+    }
+
+    const trippedRunBudget = findTrippedRunBudget(input.runId, policyDecision.toolName);
+    if (trippedRunBudget) {
+      return {
+        status: 'error',
+        error: new AgentToolBudgetExceededError(
+          policyDecision.toolName,
+          trippedRunBudget.count,
+          trippedRunBudget.budget,
+          'run',
         ),
         policyDecision,
         durationMs: Math.max(0, now() - startedAt),
