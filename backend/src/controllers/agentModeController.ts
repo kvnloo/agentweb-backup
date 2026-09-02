@@ -1375,11 +1375,35 @@ async function scheduleAutoWorkPlanContinuation(
   // human's own turn may have already resolved it (or the plan itself) in that gap, since we
   // only re-checked the stall condition AFTER a round used to fire, never immediately before.
   // Re-verify against the session's current state before spending a turn on a continuation
-  // nobody needs anymore. Plain (non-consistent) read, same as every other getChatSession call
-  // in this file — DynamoDB eventual consistency here is an accepted, ordinary risk, not one
-  // this specific check is positioned to eliminate (see ENG-1699 investigation notes).
-  const currentSession = await chatbotDb.getChatSession(sessionId).catch(() => null);
-  if (!currentSession?.workPlan?.autocomplete || !workPlanHasPendingStep(currentSession.workPlan)) {
+  // nobody needs anymore.
+  //
+  // Plain (non-consistent) read — NOT because eventual consistency doesn't matter here (it
+  // does), but because `getChatSession`'s `consistentRead` param never actually reaches the
+  // base session record `workPlan` lives on: it's threaded only into getMessagesFromMessagesTable
+  // (see getChatSession's own implementation), so passing `true` the way ENG-510's
+  // getChatSession(sessionId, true) does at the timeout-handling call site above (which reads
+  // .messages, not .workPlan) would be no-op rigor here, not a real fix. Ordinary DynamoDB
+  // read-after-write lag on a single-item read is normally sub-second in-region; worst case on a
+  // stale read is one extra harmless turn, the same failure mode this whole function replaces.
+  //
+  // On a lookup failure (not "resolved", genuinely couldn't check): fail OPEN — proceed to
+  // generate anyway, same as this function's pre-ENG-1699 behavior — rather than silently
+  // treating "couldn't check" as "already resolved" and dropping the entire stall backstop with
+  // no operator visibility. Every other failure branch in this function logs; this one must too.
+  let currentSessionLookupFailed = false;
+  const currentSession = await chatbotDb.getChatSession(sessionId).catch((lookupErr) => {
+    console.error(
+      `AgentMode: work-plan auto-continuation pre-fire recheck failed to read session ${sessionId} ` +
+      `— proceeding to generate anyway (fail open) rather than silently skipping the backstop:`,
+      lookupErr,
+    );
+    currentSessionLookupFailed = true;
+    return null;
+  });
+  if (
+    !currentSessionLookupFailed &&
+    (!currentSession?.workPlan?.autocomplete || !workPlanHasPendingStep(currentSession.workPlan))
+  ) {
     autoContinuationSessions.delete(sessionId);
     releaseSessionGeneration(sessionId);
     return;

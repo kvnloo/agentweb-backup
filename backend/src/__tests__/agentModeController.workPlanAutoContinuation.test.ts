@@ -294,6 +294,42 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
   });
 
+  it('ENG-1699 follow-up: fails OPEN (still generates) when the pre-fire recheck itself cannot read the session', async () => {
+    // A transient DB error here must not be silently treated as "stall already resolved" —
+    // that would drop the entire backstop with no operator visibility. The recheck should log
+    // the failure and proceed to generate anyway, same as this function's pre-ENG-1699 behavior.
+    // Only the recheck's OWN getChatSession call should reject: generateSessionResponse itself
+    // also calls getChatSession internally to load/re-read the session, and those must keep
+    // succeeding for round 2 to actually run — this isolates the recheck's failure specifically.
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    mockWorkerService.runInWorker
+      .mockResolvedValueOnce(workerResponse('Step 6 was interrupted.', [failedToolCall()]))
+      .mockImplementationOnce(async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue(baseSession(completedWorkPlan) as any);
+        return workerResponse('Report generated.', []);
+      });
+
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq(), res);
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+
+    // Reject exactly the next getChatSession call (the recheck's own) — every call after that
+    // falls back to whatever mockResolvedValue is current, matching a real one-time transient error.
+    mockChatbotDb.getChatSession.mockRejectedValueOnce(new Error('DynamoDB throttled'));
+    await flush();
+
+    // Failed open: the continuation still generated, it wasn't silently skipped.
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('pre-fire recheck failed to read session'),
+      expect.any(Error),
+    );
+    expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+
+    consoleErrorSpy.mockRestore();
+  });
+
   it('does not double-fire alongside a media-budget deferral on the same turn', async () => {
     // A step whose tool is generate_image can hit BOTH detectors at once if they aren't
     // mutually exclusive — this is the interaction bug the ENG-1700 design review caught.
