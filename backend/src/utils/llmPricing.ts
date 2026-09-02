@@ -292,6 +292,25 @@ export const VIDEO_GENERATION_PRICING_USD_PER_CLIP: Record<string, number> = {
  * Single source of truth for image cost — used by the generation source meter and
  * agent-mode session accounting alike.
  */
+/**
+ * True when `model` is priced PER GENERATION (an image, or a video clip) rather
+ * than per token.
+ *
+ * ENG-1691: these models are billed by the artefact, so token counts describe
+ * nothing chargeable about the call. Metering one through the token path writes
+ * a $0 row alongside the real per-generation row — two ledger entries for one
+ * API call, on a model that generates no text. `llmClients.ts` already states
+ * the rule ("NOT for image/video, which are per-generation priced"); this makes
+ * it checkable instead of a comment a caller has to have read.
+ */
+export function isPerGenerationPriced(model: string | undefined | null): boolean {
+  if (!model) return false;
+  return (
+    Object.prototype.hasOwnProperty.call(IMAGE_GENERATION_PRICING_USD, model) ||
+    Object.prototype.hasOwnProperty.call(VIDEO_GENERATION_PRICING_USD_PER_CLIP, model)
+  );
+}
+
 export function imageGenerationCostUsd(model: string): number {
   return IMAGE_GENERATION_PRICING_USD[model] ?? 0.04;
 }
