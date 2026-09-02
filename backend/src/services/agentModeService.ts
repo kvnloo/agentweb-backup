@@ -17763,7 +17763,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad creative'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17795,7 +17797,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ads.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17817,7 +17821,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17877,7 +17883,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to update Meta ad campaign.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17896,7 +17904,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to delete Meta ad campaign.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17922,7 +17932,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to update Meta ad set.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17941,7 +17953,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to delete Meta ad set.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18020,7 +18034,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: this.enrichMetaError(error, 'update Meta ad'),
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18393,7 +18409,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to delete Meta ad.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18462,7 +18480,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to retag Meta ad UTMs.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18530,6 +18550,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               classification: structured.classification,
             }
           : undefined,
+        // ENG-1300: top-level `code` is the real numeric HTTP status, deliberately
+        // separate from meta_error.code above (Meta's business error code). Covers
+        // both the SDK-shaped Meta upload failure (error.status) and a plain axios
+        // failure downloading the source image (error.response?.status).
+        code: error?.status ?? error?.response?.status,
       };
     }
   }
@@ -18552,7 +18577,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to upload Meta ad video. Ensure the URL is publicly accessible.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -19742,7 +19769,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // Ensure response data is a string for parsing
               userPayload = typeof response.data === 'object' ? JSON.stringify(response.data) : response.data;
             } catch (fetchError: any) {
-              throw new Error(`Failed to fetch CSV content from URL: ${fetchError.message}`);
+              // ENG-1300: this rethrow reaches the outer catch below, which extracts
+              // error?.status ?? error?.response?.status — without forwarding it here,
+              // a 403/404 fetching the CSV would be lost before it ever gets there.
+              const wrapped: any = new Error(`Failed to fetch CSV content from URL: ${fetchError.message}`);
+              wrapped.status = fetchError?.response?.status;
+              throw wrapped;
             }
           }
 
@@ -19879,7 +19911,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message,
-        error: error.message
+        error: error.message,
+        // ENG-1300: top-level `code` is the real numeric HTTP status — never
+        // structured.code above, which is Meta's business error code (e.g. the
+        // 1870090 subcode branch here has nothing to do with an HTTP status).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
