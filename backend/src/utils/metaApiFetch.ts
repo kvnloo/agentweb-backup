@@ -86,7 +86,19 @@ export const fetchWithRetry = async (url: string, retries: number = 3, delayMs: 
 export const fetchWithRetryAndPaging = async (url: string): Promise<any> => {
   const response = await fetchWithRetry(url);
   const data = await response.json();
-  
+
+  // ENG-1300: this helper returns the parsed body even on a non-2xx response
+  // (existing callers — routes/meta.ts, clientHealthService.ts — already build
+  // their own `data.error` checks around that contract, and getMetaAdsMetrics
+  // below has its own per-section Meta-business-code classification that reading
+  // this wrong would silently break) — so rather than changing that contract,
+  // expose the real HTTP status as a non-enumerable field callers can opt into
+  // reading. Non-enumerable so it never leaks into a JSON.stringify of the Meta
+  // payload itself (logging, caching, etc.).
+  if (data && typeof data === 'object') {
+    Object.defineProperty(data, '__httpStatus', { value: response.status, enumerable: false });
+  }
+
   // Check if there's a paging.next URL for more data
   if (data.paging && data.paging.next) {
     console.log(`Meta API: Fetching next page of data from ${data.paging.next.substring(0, 100)}...`);

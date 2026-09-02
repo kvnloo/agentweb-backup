@@ -15960,7 +15960,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return {
           success: false,
           message: `Failed to fetch campaigns: ${campaignsData.error.message}`,
-          error: campaignsData.error.message
+          error: campaignsData.error.message,
+          // ENG-1300: fetchWithRetryAndPaging exposes the real HTTP status as a
+          // non-enumerable __httpStatus field — never campaignsData.error.code,
+          // which is Meta's own business error code, not an HTTP status.
+          code: (campaignsData as any).__httpStatus
         };
       }
 
@@ -18693,6 +18697,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         typedError.metaMetricsErrorType = connectionFailure
           ? 'connection'
           : (permissionFailure ? 'permission' : 'api');
+        // ENG-1300: the real HTTP status, never `code` above (Meta's business code).
+        typedError.status = (response as any)?.__httpStatus;
         throw typedError;
       }
       // ENG-104: breakdown endpoints are NON-fatal (we proceed without them), but
@@ -18781,7 +18787,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message,
         error: message,
-        errorType
+        errorType,
+        // ENG-1300: real HTTP status when the failure came from a coded fetch
+        // (typedError.status above); getMetaCredentials failures don't carry one.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -20543,8 +20552,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         workflow,
         ledger: { failures: [{ step: 'launch', message: error.message }] },
         message: error.message || `Failed to launch ${workflow} campaign.`,
+        // ENG-1300: SDK-shaped error (metaService.handleError preserves .status) —
+        // never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
+  }
+
+  // ENG-1300: executeAudienceCampaignLaunch rethrows a plain Error whenever a
+  // step it calls (manageMetaCustomAudiences, listMetaAdsAdSets,
+  // createMetaAdsAdSet — all already fixed to return a numeric `code` on
+  // failure) reports success:false, so the caller's classification is lost one
+  // rethrow before it ever reaches launchAudienceCampaign's outer catch. Carry
+  // it forward instead of discarding it.
+  private rethrowStepFailure(result: { message?: string; code?: number }, fallbackMessage: string): never {
+    const err: any = new Error(result.message || fallbackMessage);
+    err.status = result.code;
+    throw err;
   }
 
   private async executeAudienceCampaignLaunch(
@@ -20593,7 +20617,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         const lookalikeName = `${args.audience_name} - Lookalike`;
         const lookalikeListResult = await this.manageMetaCustomAudiences(userId, 'LIST', args.account_id, {});
         if (!lookalikeListResult.success) {
-          throw new Error(lookalikeListResult.message || 'Failed to list existing Meta custom audiences.');
+          this.rethrowStepFailure(lookalikeListResult, 'Failed to list existing Meta custom audiences.');
         }
         // Greptile follow-up findings: name-only matching isn't enough — a
         // same-named lookalike from an earlier launch with a DIFFERENT
@@ -20631,7 +20655,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             confirm: true,
           });
           if (!lookalikeResult.success) {
-            throw new Error(lookalikeResult.message || 'Failed to create Lookalike Audience.');
+            this.rethrowStepFailure(lookalikeResult, 'Failed to create Lookalike Audience.');
           }
           lookalikeAudience = lookalikeResult.audience;
         }
@@ -20676,7 +20700,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const adSetName = args.ad_set_params?.name;
       const existingAdSetsResult = await this.listMetaAdsAdSets(userId, args.campaign_id, args.account_id);
       if (!existingAdSetsResult.success) {
-        throw new Error(existingAdSetsResult.message || 'Failed to list existing Meta ad sets.');
+        this.rethrowStepFailure(existingAdSetsResult, 'Failed to list existing Meta ad sets.');
       }
       // Greptile follow-up findings: name + targeted-audience alone isn't
       // enough — a same-named ad set targeting the same audience but with
@@ -20765,7 +20789,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           targeting,
         });
         if (!adSetResult.success) {
-          throw new Error(adSetResult.message || 'Failed to create ad set.');
+          this.rethrowStepFailure(adSetResult, 'Failed to create ad set.');
         }
         adSet = adSetResult.adSet;
       }
@@ -20843,7 +20867,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to search ad targeting.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
