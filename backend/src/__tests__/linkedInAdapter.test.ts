@@ -172,6 +172,26 @@ describe('LinkedInAdapter', () => {
       );
     });
 
+    // ENG-1300: "access token expired" matches no classifyToolErrorClass message
+    // heuristic, so without a numeric code this misclassified as generic Error/bug.
+    it('attaches the numeric status as .code on the rethrown 401 error', async () => {
+      mockLinkedInService.createPost.mockRejectedValue({
+        response: { status: 401 },
+        message: 'Unauthorized',
+      });
+
+      await expect(adapter.createPost(mockPersonalAccount, 'Test')).rejects.toMatchObject({ code: 401 });
+    });
+
+    it('attaches the numeric status as .code on the rethrown 429 error', async () => {
+      mockLinkedInService.createPost.mockRejectedValue({
+        response: { status: 429 },
+        message: 'Too Many Requests',
+      });
+
+      await expect(adapter.createPost(mockPersonalAccount, 'Test')).rejects.toMatchObject({ code: 429 });
+    });
+
     it('should throw error for 403 response (permission denied)', async () => {
       const error = {
         response: { status: 403, data: { message: 'Permission denied' } },
@@ -542,6 +562,18 @@ describe('LinkedInAdapter', () => {
       await expect(adapter.getAccountMetrics(mockPersonalAccount)).rejects.toThrow(
         'Analytics permissions are missing. Permission denied'
       );
+    });
+
+    // ENG-1300: "Analytics permissions are missing" matches no classifyToolErrorClass
+    // message heuristic ("permission to X" ≠ "permissions are missing") — the code
+    // is genuinely load-bearing here, not just defense-in-depth.
+    it('attaches the real status as .code when it was genuinely returned', async () => {
+      mockLinkedInService.getPersonalFollowerCount.mockRejectedValue({
+        response: { status: 403 },
+        message: 'Permission denied'
+      });
+
+      await expect(adapter.getAccountMetrics(mockPersonalAccount)).rejects.toMatchObject({ code: 403 });
     });
 
     it('should return aggregated metrics for company account including totalFollowerCount', async () => {
@@ -1253,6 +1285,19 @@ describe('LinkedInAdapter', () => {
       ).rejects.toThrow('LinkedIn access token expired');
     });
 
+    // ENG-1300: proves the numeric status survives onto the rethrown error too,
+    // not just the friendly message — see the sibling test in createPost above.
+    it('attaches the numeric status as .code on the rethrown 401 error', async () => {
+      mockLinkedInService.createComment.mockRejectedValue({
+        response: { status: 401 },
+        message: 'Unauthorized',
+      });
+
+      await expect(
+        adapter.createComment(mockPersonalAccount, 'urn:li:share:123', 'Comment')
+      ).rejects.toMatchObject({ code: 401 });
+    });
+
     it('should throw specific error for 403 response', async () => {
       mockLinkedInService.createComment.mockRejectedValue({
         response: { status: 403 },
@@ -1262,6 +1307,17 @@ describe('LinkedInAdapter', () => {
       await expect(
         adapter.createComment(mockPersonalAccount, 'urn:li:share:123', 'Comment')
       ).rejects.toThrow('Permission denied');
+    });
+
+    it('attaches the numeric status as .code on the rethrown 403 error', async () => {
+      mockLinkedInService.createComment.mockRejectedValue({
+        response: { status: 403 },
+        message: 'Forbidden',
+      });
+
+      await expect(
+        adapter.createComment(mockPersonalAccount, 'urn:li:share:123', 'Comment')
+      ).rejects.toMatchObject({ code: 403 });
     });
 
     it('should throw specific error for 429 rate limit', async () => {
