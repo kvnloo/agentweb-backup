@@ -16559,9 +16559,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // which tells the model nothing it can act on and reads as an opaque
       // outage. Meta's actual explanation lives in response.data.error — surface
       // it, minus the credential material Meta echoes back (ENG-630).
+      // ENG-1300: the real HTTP status is `error.response?.status` (axios shape) —
+      // NEVER the Meta business `.code` nested in response.data.error, which
+      // coincidentally overlaps the HTTP range (e.g. Meta code 404 is unrelated
+      // to HTTP 404).
       return {
         success: false,
         error: describeMetaGraphApiError(error) || error.message,
+        code: error?.status ?? error?.response?.status,
       };
     }
   }
@@ -16900,11 +16905,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error copying Meta ad:', error);
+      // ENG-1300: metaService's handleError rethrows the SDK's FacebookRequestError
+      // unchanged (only attaching structuredError), so its own `.status` (the real
+      // HTTP status) survives — never structuredError.code, which is Meta's business
+      // error code and only coincidentally overlaps the HTTP range.
       return {
         success: false,
         message: this.enrichMetaError(error, 'copy Meta ad'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -16927,7 +16937,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta pages.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — metaService's handleError rethrows the
+        // original FacebookRequestError, so its `.status` is the real HTTP status.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17077,7 +17090,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to manage Meta datasets.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — metaService's handleError rethrows the
+        // original FacebookRequestError, so its `.status` is the real HTTP status.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17131,7 +17147,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: error.message || 'Failed to fetch Meta ad campaigns.',
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17271,7 +17289,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad campaign'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17332,7 +17352,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ad sets.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17626,7 +17648,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad set'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17657,7 +17681,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ad creatives.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -32552,7 +32578,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         ? 'Account token expired. Please reconnect the account in Settings.'
         : (error?.message ?? 'Unknown error');
       console.error('AgentMode: Error posting on account:', error);
-      return { success: false, message: `Failed to post: ${message}` };
+      // ENG-1300: the LinkedIn adapter (and X's mapListScopeError) attach the
+      // real HTTP status as .code on the thrown error — carry it through so a
+      // 401/403 classifies as auth/config instead of the generic bug fallback.
+      return { success: false, message: `Failed to post: ${message}`, code: error?.code };
     }
   }
 
@@ -32658,7 +32687,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (message.includes('access token expired')) {
         message = 'Account token expired. Please reconnect the account in Settings.';
       }
-      return { success: false, message: `Failed to repost: ${message}` };
+      return { success: false, message: `Failed to repost: ${message}`, code: error?.code };
     }
   }
 
@@ -32772,7 +32801,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         return {
           success: false,
-          message: `Failed to comment: ${message}`
+          message: `Failed to comment: ${message}`,
+          code: error?.code
         };
       }
 
@@ -32862,7 +32892,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
       return {
         success: false,
-        message: `Failed to list comments: ${message}`
+        message: `Failed to list comments: ${message}`,
+        code: error?.code
       };
     }
   }
@@ -32946,7 +32977,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         return {
           success: false,
-          message: `Failed to react: ${message}`
+          message: `Failed to react: ${message}`,
+          code: error?.code
         };
       }
 
@@ -33012,6 +33044,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           success: false,
           message: `Failed to load posts: ${accountResult.error}`,
           error: accountResult.error,
+          code: accountResult.code,
         };
       }
 
@@ -33081,7 +33114,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       } catch (error: any) {
         return {
           success: false,
-          message: `Failed to load metrics: ${error.message}`
+          message: `Failed to load metrics: ${error.message}`,
+          code: error?.code
         };
       }
 
@@ -33155,7 +33189,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return {
         success: false,
         message: 'Failed to get post analytics',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        code: (error as any)?.code
       };
     }
   }
@@ -34442,10 +34477,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
 
+      // ENG-1300: LinkedInOutreachService.handleError already classifies the
+      // status into structuredError.status/.classification for its own
+      // reconnect-detection logic above — read the same field here so the
+      // generic fallback path also reaches the tool-error classifier as
+      // auth/rate_limit/etc. instead of a bare Error/bug.
       return {
         success: false,
         message: 'LinkedIn outreach action failed',
-        error: errorMessage
+        error: errorMessage,
+        code: (error as any)?.code ?? structuredError?.status
       };
     }
   }
