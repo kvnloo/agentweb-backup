@@ -15,6 +15,8 @@ import {
   deleteSlackMessage,
   getSlackUserDisplayName,
   getSlackUserEmail,
+  getSlackUserTeamId,
+  getOwnSlackTeamId,
   resolveSlackMentionsInText,
   downloadSlackFile,
   resolveSlackFileUrl
@@ -517,7 +519,27 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           if (channelLinkIntent) {
             const requesterEmail = (await getSlackUserEmail(slackUserId))?.toLowerCase();
             const targetEmail = channelLinkIntent.targetEmail;
-            const canLinkChannel = requesterEmail === targetEmail || requesterEmail?.endsWith('@agentweb.pro');
+            let canLinkChannel = requesterEmail === targetEmail || requesterEmail?.endsWith('@agentweb.pro');
+
+            // ENG-1294: requesterEmail depends on Slack's profile.email resolving, which needs the
+            // users:read.email bot scope and has empirically failed for verified AgentWeb admins
+            // (ENG-1263 — Fangfang's own email failed to resolve even though the rest of her
+            // profile did). Without this, nobody whose email fails to resolve can ever use the
+            // remedy this very handler tells them to run. Fall back to team_id: it rides the same
+            // users.info response but doesn't need that scope. It only proves "this Slack user
+            // belongs to our own workspace" — never enough to pick which AgentWeb account a
+            // mention resolves to, but that's not the question here: targetEmail is typed
+            // explicitly by the requester, so this only decides whether an AgentWeb workspace
+            // member is allowed to run the link command at all — the same authorization the
+            // requesterEmail?.endsWith('@agentweb.pro') check above already grants to any
+            // internal admin, just via a signal that doesn't depend on the broken field.
+            if (!canLinkChannel) {
+              const [senderTeamId, ownTeamId] = await Promise.all([
+                getSlackUserTeamId(slackUserId),
+                getOwnSlackTeamId(),
+              ]);
+              canLinkChannel = !!senderTeamId && !!ownTeamId && senderTeamId === ownTeamId;
+            }
 
             if (!canLinkChannel) {
               await slackClient.chat.postMessage({
