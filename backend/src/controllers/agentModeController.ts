@@ -858,20 +858,36 @@ const AUTO_WORK_PLAN_CONTINUATION_MESSAGE =
   'actually done.';
 
 /**
- * ENG-1684: true when this turn's own settled response left an autocomplete work plan
- * stalled — no tool calls at all in the final turn, but the plan still has a step that
- * isn't completed/skipped. Scoped tightly to autocomplete plans: an INTERACTIVE plan
- * pausing on a real question is correct behavior (a human can answer it), so this must
- * never fire there — only autocomplete plans carry the "never wait on the user" contract
- * that makes an unanswered pause a bug rather than a feature.
+ * ENG-1684/ENG-1700: true when this turn's own settled response left an autocomplete work
+ * plan stalled, and nothing else already owns resuming it. A stall is either zero tool calls
+ * at all, or one or more tool calls that ALL failed (ENG-1700: e.g. create_html_file rejecting
+ * its payload repeatedly) — either shape leaves the plan making no forward progress. Deferred
+ * media-budget calls are excluded: scheduleAutoMediaContinuation already owns resuming that
+ * turn, and firing both continuations would race for the same session lock.
+ * Scoped tightly to autocomplete plans: an INTERACTIVE plan pausing on a real question is
+ * correct behavior (a human can answer it), so this must never fire there — only autocomplete
+ * plans carry the "never wait on the user" contract that makes an unanswered pause a bug
+ * rather than a feature.
  */
 export function hasStalledAutocompleteWorkPlan(
   workPlan: { autocomplete?: boolean; steps?: Array<{ status?: string }> } | undefined | null,
   toolCalls: unknown[] | undefined | null,
 ): boolean {
   if (!workPlan?.autocomplete) return false;
-  if (Array.isArray(toolCalls) && toolCalls.length > 0) return false;
-  const steps = Array.isArray(workPlan.steps) ? workPlan.steps : [];
+  const calls = Array.isArray(toolCalls) ? toolCalls : [];
+  if (hasDeferredMediaBudgetToolCall(calls as any[])) return false;
+  if (calls.some((tc) => toolCallSucceeded(tc))) return false;
+  return workPlanHasPendingStep(workPlan);
+}
+
+/** ENG-1699: whether an autocomplete work plan still has unfinished work, independent of any
+ * specific turn's tool-call history. Shared by hasStalledAutocompleteWorkPlan (which also asks
+ * "did this turn make progress") and scheduleAutoWorkPlanContinuation's pre-fire re-check
+ * (which only needs "is there still something to do"). */
+function workPlanHasPendingStep(
+  workPlan: { steps?: Array<{ status?: string }> } | undefined | null,
+): boolean {
+  const steps = Array.isArray(workPlan?.steps) ? workPlan!.steps : [];
   return steps.some((s) => s?.status !== 'completed' && s?.status !== 'skipped');
 }
 
@@ -1354,6 +1370,20 @@ async function scheduleAutoWorkPlanContinuation(
   // turn still leaves the plan stalled, its own response re-triggers this path.
   if (!tryClaimSessionGeneration(sessionId)) return;
   autoContinuationSessions.add(sessionId);
+
+  // ENG-1699: this callback was scheduled via setImmediate after a stall was detected — a
+  // human's own turn may have already resolved it (or the plan itself) in that gap, since we
+  // only re-checked the stall condition AFTER a round used to fire, never immediately before.
+  // Re-verify against the session's current state before spending a turn on a continuation
+  // nobody needs anymore. Plain (non-consistent) read, same as every other getChatSession call
+  // in this file — DynamoDB eventual consistency here is an accepted, ordinary risk, not one
+  // this specific check is positioned to eliminate (see ENG-1699 investigation notes).
+  const currentSession = await chatbotDb.getChatSession(sessionId).catch(() => null);
+  if (!currentSession?.workPlan?.autocomplete || !workPlanHasPendingStep(currentSession.workPlan)) {
+    autoContinuationSessions.delete(sessionId);
+    releaseSessionGeneration(sessionId);
+    return;
+  }
 
   let stillStalled = false;
   withGenerationTimeout(
