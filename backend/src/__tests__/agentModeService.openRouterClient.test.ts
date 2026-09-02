@@ -590,7 +590,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(request).not.toHaveProperty('max_completion_tokens');
   });
 
-  it('skips the degraded BYOK "Google" provider slot for Gemini calls (ENG-1702)', async () => {
+  it('skips the degraded BYOK "google-ai-studio" provider slot for Gemini calls (ENG-1702)', async () => {
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
     jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -607,7 +607,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(request.provider).toEqual({
       allow_fallbacks: true,
       require_parameters: true,
-      ignore: ['Google'],
+      ignore: ['google-ai-studio'],
     });
   });
 

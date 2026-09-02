@@ -2702,7 +2702,7 @@ export class AgentModeService {
       // until ENG-753 rotates the key to an Auth key and the BYOK slot's
       // uptime recovers — remove this then, since it forfeits the BYOK cost
       // discount in exchange for reliability.
-      params.provider.ignore = ['Google'];
+      params.provider.ignore = ['google-ai-studio'];
     }
     // OpenRouter reports its own billed amount as zero for BYOK requests even
     // though the upstream provider still bills the inference. Request the
