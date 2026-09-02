@@ -298,10 +298,43 @@ describe('Meta API Fetch Utilities', () => {
       }) as jest.Mock;
 
       const result = await fetchWithRetryAndPaging('https://example.com/api');
-      
+
       expect(result.success).toBe(true);
       expect(result.message).toBe('Operation completed');
       expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-1300: this helper returns the parsed body even on a non-2xx response
+    // (existing callers build their own `data.error` checks around that
+    // contract) — so callers that want the real HTTP status read this
+    // non-enumerable field instead of the helper changing its throw/return
+    // contract entirely.
+    it('ENG-1300: exposes the real HTTP status as a non-enumerable __httpStatus field', async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: () => Promise.resolve({ error: { message: 'Invalid OAuth access token', code: 190 } })
+      }) as jest.Mock;
+
+      const result = await fetchWithRetryAndPaging('https://example.com/api');
+
+      expect((result as any).__httpStatus).toBe(401);
+      // Non-enumerable: must not leak into a JSON.stringify of the payload.
+      expect(JSON.stringify(result)).not.toContain('__httpStatus');
+    });
+
+    // ENG-1300: a non-2xx response is sometimes a gateway/proxy error page or
+    // other non-JSON body rather than Meta's usual { error: {...} } shape —
+    // response.json() throws in that case, and without explicit handling the
+    // real HTTP status would be lost entirely (a bare SyntaxError carries none).
+    it('ENG-1300: attaches the real HTTP status even when the error body is not valid JSON', async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: false,
+        status: 502,
+        json: () => Promise.reject(new SyntaxError('Unexpected token < in JSON')),
+      }) as jest.Mock;
+
+      await expect(fetchWithRetryAndPaging('https://example.com/api')).rejects.toMatchObject({ status: 502 });
     });
   });
 
