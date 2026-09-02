@@ -90,6 +90,7 @@ import { validateNewChatHeroGreeting } from '../utils/newChatHeroGreeting';
 import { normalizeEmailList } from '../utils/validation';
 import {
   MAX_ATOMIC_RUN_RESULT_REMOVALS,
+  PROMPT_REVISIONS_BUDGET_BYTES,
   SCHEDULE_ITEM_BUDGET_BYTES,
   estimateDynamoItemBytes,
   getScheduleStorageDiagnostics,
@@ -10934,7 +10935,9 @@ export const agentModeController = {
       // Whenever the prompt actually changes, snapshot the PREVIOUS prompt into the
       // revision history so it can be reverted. This applies to every update path —
       // manual edits, Emma's manage_scheduled_chat tool, and self-improve. Keep the
-      // most recent SCHEDULE_PROMPT_REVISION_LIMIT revisions only.
+      // most recent SCHEDULE_PROMPT_REVISION_LIMIT revisions only; PROMPT_REVISIONS_BUDGET_BYTES
+      // (ENG-1672) is enforced below, inside shedOldest, which has the real projected
+      // item and already owns every other trim decision for this write.
       const previousStartingMessage = existingSchedule.startingMessage || '';
       if (effectiveStartingMessage !== previousStartingMessage) {
         const existingRevisions = Array.isArray((existingSchedule as any).promptRevisions)
@@ -11029,11 +11032,27 @@ export const agentModeController = {
         ? (existingSchedule as any).runResults
         : [];
       let runResultsToShed = 0;
-      const shedOldest = (listKey: 'promptRevisions' | 'runResults') => {
-        if (estimateDynamoItemBytes(projectedItem) <= SCHEDULE_ITEM_BUDGET_BYTES) return;
+      // `ownBudgetBytes` (ENG-1672) lets promptRevisions trim proactively against its
+      // OWN dedicated budget — before the whole item ever crosses SCHEDULE_ITEM_BUDGET_BYTES
+      // — since a self-improve schedule's revision history alone can approach the item
+      // ceiling from just a handful of entries. That trim runs isolated (against `{}`,
+      // not the real projected item) so unrelated fields never inflate how aggressively
+      // it sheds; a whole-item overflow still trims against the real projected item, same
+      // as before ENG-1672.
+      const shedOldest = (listKey: 'promptRevisions' | 'runResults', ownBudgetBytes?: number) => {
         const list = Array.isArray(projectedItem[listKey]) ? projectedItem[listKey] : [];
         if (list.length === 0) return;
-        const { kept, dropped } = trimListToItemBudget(projectedItem, listKey, list);
+        const overOwnBudget = ownBudgetBytes !== undefined
+          && estimateDynamoItemBytes({ [listKey]: list }) > ownBudgetBytes;
+        if (!overOwnBudget && estimateDynamoItemBytes(projectedItem) <= SCHEDULE_ITEM_BUDGET_BYTES) return;
+        const { kept: trimmed } = overOwnBudget
+          ? trimListToItemBudget({}, listKey, list, ownBudgetBytes)
+          : trimListToItemBudget(projectedItem, listKey, list);
+        // Never let a trim erase the newest entry outright — including the one this
+        // very edit just created — even when it alone exceeds the budget; a genuinely
+        // oversized write is still caught by the whole-item check below.
+        const kept = trimmed.length > 0 ? trimmed : list.slice(-1);
+        const dropped = list.length - kept.length;
         if (dropped === 0) return;
         console.warn(
           `AgentMode: schedule ${scheduleId} is over the DynamoDB item budget — dropped the ${dropped} oldest of ${list.length} ${listKey} entries to fit`
@@ -11051,7 +11070,7 @@ export const agentModeController = {
       };
       // Revision history first: it is pure undo state. Run history is only shed once
       // revisions are exhausted, because it feeds the run-health summary.
-      shedOldest('promptRevisions');
+      shedOldest('promptRevisions', PROMPT_REVISIONS_BUDGET_BYTES);
       shedOldest('runResults');
       if (estimateDynamoItemBytes(projectedItem) > SCHEDULE_ITEM_BUDGET_BYTES) {
         return res.status(400).json({

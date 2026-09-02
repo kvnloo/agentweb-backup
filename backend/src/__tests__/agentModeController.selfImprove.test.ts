@@ -116,7 +116,7 @@ import {
   runScheduleSelfImprovement,
   SCHEDULE_PROMPT_REVISION_LIMIT,
 } from '../controllers/agentModeController';
-import { SCHEDULE_ITEM_BUDGET_BYTES, estimateDynamoItemBytes } from '../utils/dynamoItemBudget';
+import { SCHEDULE_ITEM_BUDGET_BYTES, PROMPT_REVISIONS_BUDGET_BYTES, estimateDynamoItemBytes } from '../utils/dynamoItemBudget';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -356,6 +356,81 @@ describe('updateScheduledChat prompt revision history', () => {
     expect(updates.promptRevisions[0].startingMessage).toBe('rev 1');
     expect(updates.promptRevisions[SCHEDULE_PROMPT_REVISION_LIMIT - 1].startingMessage).toBe('current prompt');
   });
+
+  // ENG-1672: a self-improve schedule snapshots a FULL prompt on every daily
+  // reflection. With a ~35KB prompt, promptRevisions alone reaches ~330KB from
+  // just 9 entries — well under the flat SCHEDULE_PROMPT_REVISION_LIMIT (10) count,
+  // but already 95%+ of DynamoDB's 400KB item ceiling (the reported schedule's
+  // actual numbers). Bound promptRevisions by its OWN byte budget too, so a
+  // self-improving schedule cannot creep the whole item toward the edge just by
+  // running its normal daily cycle, well before the count limit ever kicks in.
+  it('prunes prompt revisions by byte budget even when under the count limit', async () => {
+    const bigRevisions = Array.from({ length: 8 }, (_, i) => ({
+      startingMessage: 'p'.repeat(35000),
+      updatedAt: new Date(2026, 7, i + 1).toISOString(),
+    }));
+
+    mockScheduleDb.getScheduleById.mockResolvedValue({
+      scheduleId: 'sched-selfimprove',
+      userId: mockUserId,
+      scheduleName: 'S',
+      startingMessage: 'p'.repeat(35000),
+      frequency: 'daily',
+      emailNotifications: ['owner@example.com'],
+      selfImprove: true,
+      promptRevisions: bigRevisions,
+    } as any);
+
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      params: { scheduleId: 'sched-selfimprove' },
+      body: { startingMessage: 'q'.repeat(10000) },
+    } as unknown as Request;
+
+    await agentModeController.updateScheduledChat(req, makeRes());
+
+    const updates = mockScheduleDb.updateSchedule.mock.calls[0][1] as any;
+    expect(updates.promptRevisions.length).toBeLessThan(bigRevisions.length + 1);
+    const revisionBytes = estimateDynamoItemBytes({ promptRevisions: updates.promptRevisions });
+    expect(revisionBytes).toBeLessThanOrEqual(PROMPT_REVISIONS_BUDGET_BYTES);
+    // The newest revision (the prompt this edit just replaced) always survives.
+    expect(updates.promptRevisions[updates.promptRevisions.length - 1].startingMessage)
+      .toBe('p'.repeat(35000));
+  });
+
+  // ENG-1672 regression: trimListToItemBudget returns kept: [] when even the
+  // single newest entry alone exceeds PROMPT_REVISIONS_BUDGET_BYTES (e.g. the
+  // previous prompt itself was huge) — shedOldest must recover that entry
+  // rather than writing an empty array back, which would silently erase all
+  // revision history, including the one this very edit just created. The
+  // total projected item stays well under SCHEDULE_ITEM_BUDGET_BYTES here so
+  // this exercises the own-budget guard in isolation, not the whole-item 400.
+  it('keeps the newest revision even when it alone exceeds the byte budget', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue({
+      scheduleId: 'sched-oversized-revision',
+      userId: mockUserId,
+      scheduleName: 'S',
+      startingMessage: 'p'.repeat(160000), // alone exceeds the 150KB PROMPT_REVISIONS_BUDGET_BYTES
+      frequency: 'daily',
+      emailNotifications: ['owner@example.com'],
+      selfImprove: true,
+      promptRevisions: [],
+    } as any);
+
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      params: { scheduleId: 'sched-oversized-revision' },
+      body: { startingMessage: 'short new prompt' },
+    } as unknown as Request;
+
+    const res = makeRes();
+    await agentModeController.updateScheduledChat(req, res);
+
+    expect(res.status).not.toHaveBeenCalledWith(400);
+    const updates = mockScheduleDb.updateSchedule.mock.calls[0][1] as any;
+    expect(updates.promptRevisions).toHaveLength(1);
+    expect(updates.promptRevisions[0].startingMessage).toBe('p'.repeat(160000));
+  });
 });
 
 // ENG-1048: a schedule with a ~35k-character prompt accumulates 10 full-prompt
@@ -522,7 +597,11 @@ describe('updateScheduledChat DynamoDB item budget', () => {
   it('refuses to save rather than shed more history than one write can carry', async () => {
     mockScheduleDb.getScheduleById.mockResolvedValue(nearLimitSchedule({
       promptRevisions: [],
-      startingMessage: 'p'.repeat(300000),
+      // Small: this becomes the one revision snapshotted below, and must stay well
+      // under PROMPT_REVISIONS_BUDGET_BYTES so it isn't the thing forcing the
+      // shed — the point of this test is runResults, not a single oversized revision
+      // (that scenario is covered by ENG-1672's own-budget tests above).
+      startingMessage: 'old prompt',
       // Thousands of tiny entries: fitting the item needs far more removals than a
       // single UpdateExpression can name.
       runResults: Array.from({ length: 6000 }, (_, i) => ({ runId: `r${i}` })),
