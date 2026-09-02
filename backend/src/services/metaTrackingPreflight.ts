@@ -440,19 +440,57 @@ function pixelIds(mechanisms: string[]): string[] {
  * redirect follower and `assertPublicHostname` SSRF guard must stay in the path. A cache that
  * called `axios` directly would be a quiet way to lose both.
  */
+/**
+ * Per-fetch ceiling for a destination page.
+ *
+ * 10s was tight for a real marketing landing page — heavy JS, cold CDN, a slow origin — and a
+ * fetch that misses the ceiling is recorded as `unverifiable`, which BLOCKS the launch. So a
+ * page that is perfectly well tracked could stop a launch purely for being slow, which is
+ * latency masquerading as a tracking failure.
+ *
+ * Fetches run at FETCH_CONCURRENCY, so this costs ceil(N/5) x timeout, not N x timeout — for the
+ * handful of unique destinations a typical campaign has, one batch.
+ */
+const FETCH_TIMEOUT_MS = 25_000;
+
+/**
+ * True for a failure worth one more attempt.
+ *
+ * Deliberately NOT retrying 4xx. A 403 here is usually bot protection answering a datacenter IP
+ * deterministically — a second identical request gets the identical refusal, and retrying only
+ * spends the launch's time. A timeout or a 5xx is the case where trying again genuinely helps.
+ */
+function isTransientFetchFailure(err: any): boolean {
+  const status = err?.response?.status;
+  if (typeof status === 'number') return status >= 500;
+  return /timeout|econnreset|econnrefused|eai_again|socket hang up|network/i.test(
+    String(err?.code || err?.message || ''),
+  );
+}
+
 /* istanbul ignore next — network boundary; unit tests inject `fetchHtml` instead. */
 export async function defaultFetchHtml(url: string): Promise<string> {
   const MAX_HTML_BYTES = 5 * 1024 * 1024;
   return fetchHtmlFollowingRedirects(url, {
-    get: (u: string) =>
-      (axios as any).get(u, {
-        timeout: 10_000,
+    // The retry sits INSIDE `get`, so `assertPublic` and the redirect follower stay in the path
+    // on every attempt — a retry that bypassed them would quietly drop the SSRF guard.
+    get: async (u: string) => {
+      const attempt = () => (axios as any).get(u, {
+        timeout: FETCH_TIMEOUT_MS,
         maxRedirects: 0,
         maxContentLength: MAX_HTML_BYTES,
         validateStatus: (s: number) => s >= 200 && s < 400,
         headers: PREFLIGHT_FETCH_HEADERS,
         responseType: 'text',
-      }),
+      });
+      try {
+        return await attempt();
+      } catch (err: any) {
+        if (!isTransientFetchFailure(err)) throw err;
+        console.log('[META PREFLIGHT] retrying a transient destination fetch once:', u, err?.message);
+        return await attempt();
+      }
+    },
     assertPublic: assertPublicHostname,
   });
 }
@@ -524,12 +562,44 @@ export async function preflightMetaTrackingGate(
  * what we found instead, and — the case people misread most often — that a pixel *was*
  * present but belongs to a different account.
  */
+/**
+ * Does this failure look like a WAF/bot-protection refusal rather than a broken page?
+ *
+ * 403 and 401 are the direct refusals; 503 is what Cloudflare's challenge and several rate
+ * limiters return. Deliberately conservative — a 404 or a 500 is the site being broken or
+ * absent, which is a genuine reason to distrust the destination and must keep reading as one.
+ */
+function isLikelyBotProtection(error: string | undefined): boolean {
+  if (!error) return false;
+  return /\b(401|403|503)\b|forbidden|access denied|captcha|cloudflare|are you a robot|just a moment/i.test(error);
+}
+
 function buildMessage(blocked: MetaUrlTrackingResult[], ownedPixels: Set<string>): string {
   if (blocked.length === 0) return '';
 
   const owned = [...ownedPixels];
   const lines = blocked.map(r => {
     if (r.status === 'unverifiable') {
+      /*
+       * Name bot protection when that is what happened.
+       *
+       * "could not verify (Request failed with status code 403)" is accurate and nearly
+       * useless: a WAF refusing a datacenter IP is the single most common reason a perfectly
+       * well-tracked page cannot be read here, and nobody reads "403" and concludes "my
+       * firewall blocked their crawler, my pixel is fine". Without saying so, the honest
+       * verdict still reads like a tracking problem, and the user either chases a bug that
+       * does not exist or overrides blindly.
+       *
+       * The verdict does not change — we still could not verify, and that still blocks. What
+       * changes is that the override becomes an informed decision instead of a guess.
+       */
+      if (isLikelyBotProtection(r.error)) {
+        return `  • ${r.url} — could not verify: the site refused our automated request `
+          + `(${r.error}), which usually means a firewall or bot protection blocking non-browser `
+          + `clients. This is NOT evidence that the pixel is missing — it means we could not look. `
+          + `Open the page yourself to confirm the pixel is present; if it is, this launch is safe `
+          + `to proceed with an explicit tracking-check override.`;
+      }
       return `  • ${r.url} — could not verify (${r.error}). Treated as unmeasured rather than assumed working.`;
     }
     const onPage = pixelIds(r.mechanisms);

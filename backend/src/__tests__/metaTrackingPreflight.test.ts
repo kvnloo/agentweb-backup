@@ -708,3 +708,35 @@ describe('detectMetaPixels — inert detection must match what the beacon parser
     )).toEqual([`PIXEL:${PIXEL}`]);
   });
 });
+
+describe('a WAF refusal is reported as "we could not look", not as a tracking problem', () => {
+  /*
+   * The most common false block: a marketing landing page behind Cloudflare returns 403 to a
+   * datacenter IP instantly. The page is fine and correctly pixelled; we simply cannot read it.
+   * The verdict is unchanged — unverifiable still blocks — but a user who reads "403" has no way
+   * to know the difference between "my firewall stopped their crawler" and "my pixel is missing",
+   * and will either chase a bug that does not exist or override blindly.
+   */
+  it('names bot protection and says it is not evidence the pixel is absent', async () => {
+    const fetchHtml = jest.fn().mockRejectedValue(new Error('Request failed with status code 403'));
+
+    const out = await preflightMetaTrackingGate(['https://site.example/lp'], ['120299'], { fetchHtml });
+
+    expect(out.ok).toBe(false);
+    expect(out.message).toMatch(/refused our automated request/i);
+    expect(out.message).toMatch(/NOT evidence that the pixel is missing/i);
+    expect(out.message).toMatch(/tracking-check override/i);
+  });
+
+  it('does NOT excuse a broken or missing page', async () => {
+    // A 404/500 is the destination genuinely failing, which must keep reading as a real reason
+    // to distrust it — the discrimination must not become a blanket excuse.
+    const fetchHtml = jest.fn().mockRejectedValue(new Error('Request failed with status code 404'));
+
+    const out = await preflightMetaTrackingGate(['https://site.example/gone'], ['120299'], { fetchHtml });
+
+    expect(out.ok).toBe(false);
+    expect(out.message).not.toMatch(/refused our automated request/i);
+    expect(out.message).toMatch(/could not verify/i);
+  });
+});
