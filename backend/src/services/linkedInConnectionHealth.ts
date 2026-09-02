@@ -568,6 +568,15 @@ export async function repointStaleAccountReferences(
         PROMPT_REVISIONS_BUDGET_BYTES,
       );
       const nextRevisions = trimmedRevisions.length > 0 ? trimmedRevisions : candidateRevisions.slice(-1);
+      // Same observability as the customer-facing edit path's shedOldest — this
+      // trim is otherwise invisible (nothing in any UI reads promptRevisions), so
+      // the log is the only trace that older history was dropped here.
+      if (nextRevisions.length < candidateRevisions.length) {
+        console.warn(
+          `${TAG} repoint for schedule ${s.scheduleId} is over the promptRevisions byte budget — `
+          + `dropped ${candidateRevisions.length - nextRevisions.length} of ${candidateRevisions.length} entries to fit`
+        );
+      }
 
       try {
         await scheduleDb.updateSchedule(
