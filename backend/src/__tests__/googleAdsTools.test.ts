@@ -6,6 +6,7 @@ jest.mock('../services/googleAdsService', () => ({
     listBudgets: jest.fn().mockResolvedValue([{ resourceName: 'customers/123/campaignBudgets/1', name: 'Test Budget', amountMicros: '10000000', explicitlyShared: false, referenceCount: 1 }]),
     listBiddingStrategies: jest.fn().mockResolvedValue([{ resourceName: 'customers/123/biddingStrategies/555', id: '555', name: 'Portfolio tCPA', type: 'TARGET_CPA', status: 'ENABLED' }]),
     createBudget: jest.fn().mockResolvedValue({ resourceName: 'customers/123/campaignBudgets/1' }),
+    updateBudget: jest.fn().mockResolvedValue(undefined),
     createCampaign: jest.fn().mockResolvedValue({ resourceName: 'customers/123/campaigns/1' }),
     pauseCampaign: jest.fn().mockResolvedValue(undefined),
     resumeCampaign: jest.fn().mockResolvedValue(undefined),
@@ -59,6 +60,8 @@ import { googleAdsService } from '../services/googleAdsService';
 import { toolResultError } from '../utils/toolResultError';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { classifyToolFailureType } from '../utils/toolFailureType';
+import { emmaToolRegistry } from '../emma/registry';
+import '../emma/tools';
 
 let service: AgentModeService;
 beforeEach(() => {
@@ -118,6 +121,29 @@ describe('handleCallGoogleAdsApi', () => {
     });
     expect(result.success).toBe(true);
     expect(result.budgetResourceName).toBeDefined();
+  });
+
+  it('handles BUDGET UPDATE action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'BUDGET',
+      action: 'UPDATE',
+      budget_resource_name: 'customers/123/campaignBudgets/1',
+      amount_micros: 20_000_000,
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.updateBudget).toHaveBeenCalledWith('user-123', '1234567890', 'customers/123/campaignBudgets/1', 20_000_000);
+  });
+
+  it('returns error for BUDGET UPDATE without budget_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'BUDGET',
+      action: 'UPDATE',
+      amount_micros: 20_000_000,
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/budget_resource_name/i);
   });
 
   it('handles LOCATION SEARCH action', async () => {
@@ -1227,5 +1253,32 @@ describe('handleCallGoogleAdsApi — a PAUSED create must not come back ENABLED 
       '1234567890',
       expect.objectContaining({ status: 'ENABLED' }),
     );
+  });
+});
+
+// ENG-1668. Production session 87334a61-2e06-4018-960e-9e7759403423 showed
+// gemini-3.7-flash calling KEYWORD UPDATE, KEYWORD ADD_NEGATIVE, and BUDGET
+// UPDATE without the resource-name argument each one requires, even though
+// the top-of-tool ACTION MATRIX names it. The per-field `description` for
+// budget_resource_name, campaign_resource_name, and criterion_resource_name
+// — the text a model leans on when scanning an individual parameter — did
+// not mention these three action combos at all, only ones it does NOT gate
+// (CAMPAIGN CREATE, ADD_PROXIMITY/AD_GROUP LIST, KEYWORD REMOVE). Assert the
+// field descriptions name every write action that actually requires them, so
+// a future edit to the ACTION MATRIX can't drift out of sync with the
+// per-field docs again.
+describe('call_google_ads_api tool schema — per-field description coverage (ENG-1668)', () => {
+  const properties = emmaToolRegistry.getTool('call_google_ads_api')!.definition.inputSchema.properties as Record<string, { description?: string }>;
+
+  it('documents budget_resource_name as required for BUDGET UPDATE', () => {
+    expect(properties.budget_resource_name.description).toMatch(/BUDGET UPDATE/);
+  });
+
+  it('documents campaign_resource_name as usable for KEYWORD ADD_NEGATIVE', () => {
+    expect(properties.campaign_resource_name.description).toMatch(/ADD_NEGATIVE/);
+  });
+
+  it('documents criterion_resource_name as required for KEYWORD UPDATE', () => {
+    expect(properties.criterion_resource_name.description).toMatch(/KEYWORD UPDATE/);
   });
 });
