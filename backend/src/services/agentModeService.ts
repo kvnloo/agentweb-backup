@@ -23552,9 +23552,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error) {
       console.error('AgentMode: Error reading ClickUp doc:', error);
+      // ENG-1300: carry the real numeric HTTP status through so a clean
+      // 401/403/404 classifies as auth/not_found instead of the generic
+      // Error/bug fallback once toolResultError rebuilds an Error from the
+      // message alone.
+      const code = (error as any)?.response?.status || (error as any)?.code;
       return {
         success: false,
-        message: `Failed to read ClickUp document "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read ClickUp document "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code,
       };
     }
   }
@@ -23604,9 +23610,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error) {
       console.error('AgentMode: Error reading ClickUp task:', error);
+      // ENG-1300: carry the real numeric HTTP status through — see readClickUpSharedDoc above.
+      const code = (error as any)?.response?.status || (error as any)?.code;
       return {
         success: false,
-        message: `Failed to read ClickUp task "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read ClickUp task "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code,
       };
     }
   }
@@ -23618,7 +23627,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     content: string,
     userId: string,
     parentDocId?: string
-  ): Promise<{ success: boolean; message: string; docId?: string }> {
+  ): Promise<{ success: boolean; message: string; docId?: string; code?: number }> {
     try {
       const clickUpToken = await getClickUpAccessToken(userId);
       if (!clickUpToken) {
@@ -23679,9 +23688,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         errorMessage = `${clickUpError.err}${clickUpError.ECODE ? ` (ClickUp code: ${clickUpError.ECODE})` : ''}`;
       }
 
+      // ENG-1300: carry the real numeric HTTP status through — see readClickUpSharedDoc
+      // above. Deliberately NOT the ECODE extracted above, which is ClickUp's own
+      // business code (e.g. "OAUTH_019"), not an HTTP status.
+      const code = error?.response?.status;
+
       return {
         success: false,
-        message: `Failed to create ClickUp document "${name}": ${errorMessage}`
+        message: `Failed to create ClickUp document "${name}": ${errorMessage}`,
+        code,
       };
     }
   }
@@ -27730,10 +27745,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
+      // ENG-1300: carry the real HTTP status through when this catch is reached
+      // directly (Payload CMS publish errors and the initial HTML-fetch axios
+      // call) — WebflowBlogPublisher/WordPressBlogPublisher catch and return
+      // their own failures below this method and never throw here.
+      const code = error.response?.status;
+
       return {
         success: false,
         message: errorMessage,
-        error: error.message || 'Unknown error'
+        error: error.message || 'Unknown error',
+        code,
       };
     }
   }
