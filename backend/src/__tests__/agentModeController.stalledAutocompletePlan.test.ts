@@ -120,3 +120,66 @@ describe('hasStalledAutocompleteWorkPlan (ENG-1684)', () => {
     expect(hasStalledAutocompleteWorkPlan({ autocomplete: true } as any, [])).toBe(false);
   });
 });
+
+/**
+ * ENG-1700 — the ENG-1684 fix above only covered a turn with ZERO tool calls. Live-reproduced
+ * 2026-09-02: the Reddit Pain Point Research Report workplan hung ~10 minutes because
+ * create_html_file failed three times in a row (TruncatedToolCallArgumentsError, the separately-
+ * tracked ENG-1477 gateway bug) — the backstop never fired, since tool calls WERE attempted, they
+ * just all failed. A human had to type "continue" manually. Fix: a stall is now "no tool calls" OR
+ * "one or more tool calls, none of which succeeded" — reusing the existing toolCallSucceeded
+ * ledger check (already used elsewhere in this file) rather than a new ad-hoc failure detector.
+ */
+describe('hasStalledAutocompleteWorkPlan (ENG-1700 — all tool calls failed)', () => {
+  it('fires when every tool call this turn failed and a step is still pending', () => {
+    const workPlan = { autocomplete: true, steps: [{ stepCount: 6, status: 'pending' }] };
+    const failedCalls = [
+      { name: 'create_html_file', error: 'TruncatedToolCallArgumentsError: cut off mid-object' },
+    ];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, failedCalls)).toBe(true);
+  });
+
+  it('does not fire when at least one tool call this turn succeeded, even alongside failures', () => {
+    const workPlan = { autocomplete: true, steps: [{ stepCount: 6, status: 'pending' }] };
+    const mixedCalls = [
+      { name: 'create_html_file', error: 'TruncatedToolCallArgumentsError: cut off mid-object' },
+      { name: 'read_market_strategy' }, // no error/result.success===false -> counts as succeeded
+    ];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, mixedCalls)).toBe(false);
+  });
+
+  it('does not fire for an all-failed turn on an interactive (non-autocomplete) plan', () => {
+    const workPlan = { autocomplete: false, steps: [{ stepCount: 6, status: 'pending' }] };
+    const failedCalls = [{ name: 'create_html_file', error: 'TruncatedToolCallArgumentsError' }];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, failedCalls)).toBe(false);
+  });
+
+  it('does not fire for an all-failed turn once every step is already completed or skipped', () => {
+    const workPlan = {
+      autocomplete: true,
+      steps: [{ stepCount: 6, status: 'completed' }],
+    };
+    const failedCalls = [{ name: 'create_html_file', error: 'TruncatedToolCallArgumentsError' }];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, failedCalls)).toBe(false);
+  });
+
+  it('fires for an all-deferred turn that is not the media-budget deferral (e.g. a duplicate call)', () => {
+    // toolCallNeverExecuted (backend/src/utils/toolCallOutcome.ts) also treats a de-duplicated
+    // call as "never executed" -> not succeeded. That's still a stall: nothing progressed.
+    const workPlan = { autocomplete: true, steps: [{ stepCount: 6, status: 'pending' }] };
+    const dedupedCalls = [{ name: 'create_html_file', duplicateOf: 'call_abc123' }];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, dedupedCalls)).toBe(true);
+  });
+
+  it('does NOT fire for a media-budget-deferred call — scheduleAutoMediaContinuation owns resuming that turn', () => {
+    // Exact shape hasDeferredMediaBudgetToolCall (backend/src/utils/timeoutContinuation.ts)
+    // recognizes: result.deferred === true AND result.reason === 'media_generation_time_budget'.
+    // Without this guard, a turn shaped like this would trigger BOTH auto-continuations at once,
+    // racing for the same session-generation lock.
+    const workPlan = { autocomplete: true, steps: [{ stepCount: 6, status: 'pending' }] };
+    const mediaDeferredCalls = [
+      { name: 'generate_image', result: { deferred: true, reason: 'media_generation_time_budget' } },
+    ];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, mediaDeferredCalls)).toBe(false);
+  });
+});
