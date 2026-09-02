@@ -367,6 +367,27 @@ describe('admin client_id scoping — end to end (ENG-1596 / ENG-1557 v1)', () =
       expect(mockMcpFetch).not.toHaveBeenCalled();
     });
 
+    // Adversarial-review finding: the dry-run preview must check permissions
+    // for the SAME identity that the real write (a moment later, via mcpFetch
+    // -> httpClient.ts's `context.userId || context.agentUserId`) will
+    // actually execute as. An internal service-to-service caller can
+    // legitimately set userId and agentUserId to different values
+    // (mcpServerCore.ts) — the preview must not silently check the wrong one.
+    it('previews using the same acting identity the real write would use (userId over agentUserId)', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', name: 'My List', userId: 'target-user-x' } as any);
+      mockCanDestructiveCrmList.mockResolvedValue(true);
+      mockCrmDb.getLeadByEmail.mockResolvedValue(null);
+
+      await mcpToolRegistry.execute('manage_leads', {
+        action: 'add',
+        list_id: 'list-1',
+        leads: [{ email: 'lead@example.com' }],
+        dry_run: true,
+      }, { userId: 'target-user-x', agentUserId: 'internal-service-y' });
+
+      expect(mockCanDestructiveCrmList).toHaveBeenCalledWith('target-user-x', expect.anything());
+    });
+
     it('dry_run:true previews the caller\'s own would-be add, with no client_id involved', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', name: 'My List', userId: 'admin-1' } as any);
       mockCanDestructiveCrmList.mockResolvedValue(true);
