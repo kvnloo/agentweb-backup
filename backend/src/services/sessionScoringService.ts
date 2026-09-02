@@ -249,6 +249,113 @@ function applyFabricationGuard(
   return { score: Math.min(score, 2), dimensions: guardedDimensions };
 }
 
+/**
+ * Assistant-directed criticism markers. Deliberately plain substring keywords
+ * (not a single dense regex) so the list stays easy to extend and audit.
+ * Matched case-insensitively, but only within a clause that also names the
+ * assistant as its subject (see reasonCriticizesAssistant) — matching
+ * anywhere in the full reason would also catch these words describing the
+ * USER's request ("the user's message was vague") as if they criticized the
+ * assistant.
+ */
+const ASSISTANT_CRITICISM_KEYWORDS = [
+  "fail", "incorrect", "inaccura", "hallucinat", "fabricat", "mistake",
+  "error", "wrong", "misunderstood", "misread", "misinterpret",
+  "did not", "didn't", "never", "could not", "couldn't", "neglect",
+  "overlook", "ignor", "unhelpful", "inadequate", "insufficient",
+  "inappropriate", "should have", "too verbose", "too long",
+  "repeated itself", "confusing", "poorly", "vague", "unnecessary",
+];
+
+/** Matches a clause whose subject is the assistant, not the user or the request. */
+const ASSISTANT_SUBJECT_RE = /\b(?:the\s+assistant|assistant|it)\b/i;
+
+/**
+ * ENG-1296 follow-up: a criticism keyword only counts when it appears in the
+ * same clause as an assistant-subject reference. Splitting on sentence
+ * boundaries and comma+contrast conjunctions ("but"/"however"/...) keeps
+ * "the user's message was vague, but the assistant correctly declined to
+ * guess" from being misread as the assistant being criticized for vagueness.
+ */
+function reasonCriticizesAssistant(reason: string): boolean {
+  const clauses = reason.split(/(?<=[.!?;])\s+|,\s*(?:but|however|though|yet|while)\s+/i);
+  return clauses.some((clause) => {
+    if (!ASSISTANT_SUBJECT_RE.test(clause)) return false;
+    const lower = clause.toLowerCase();
+    return ASSISTANT_CRITICISM_KEYWORDS.some((kw) => lower.includes(kw));
+  });
+}
+
+/**
+ * Positive-detection signal that the judge's stated rationale is specifically
+ * "the conversation ended / the user hasn't replied yet", the exact ENG-1296
+ * pattern — as opposed to any other reason a goalCompletion score might be
+ * low. Matched against the raw reason text.
+ */
+const AWAITING_REPLY_RATIONALE_RE =
+  /\bconversation ended\b|\bended before\b|\bawaiting\s+(?:a\s+)?(?:user\s+)?response\b|\bhas\s+not\s+yet\s+responded\b/i;
+
+/**
+ * ENG-1296: the Fangfang Judge scored three sessions goalCompletion 3 where
+ * the user's request was a genuinely ambiguous fragment and the assistant's
+ * ONLY move was to decline to guess and ask one focused clarifying question —
+ * textbook-correct handling per the Drafting Direction Guard. Each reason
+ * PRAISED that handling in full ("handled it excellently", "handled this
+ * gracefully") and docked goalCompletion purely because the conversation
+ * ended before the user replied — something entirely outside the assistant's
+ * control. The general satisfaction judge and Matt Judge scored the same
+ * three sessions 5/5/5, proving 3 was a judge-specific artifact, not a real
+ * defect.
+ *
+ * This is a narrow, code-level sanity check, same shape as
+ * applyFabricationGuard, but detection is POSITIVE, not the absence of a
+ * blocklist match: it only raises the score when the reason affirmatively
+ * states the awaiting-reply/ended-before-response rationale
+ * (AWAITING_REPLY_RATIONALE_RE) AND contains no criticism of the assistant.
+ * An earlier version fired whenever ~24 fixed criticism keywords failed to
+ * match anywhere in the reason, which meant a genuine goalCompletion failure
+ * phrased without any of those words (e.g. "the assistant asked an
+ * unnecessary clarifying question instead of completing the task") was
+ * silently force-raised to a passing score whenever dataAccuracy/
+ * outputQuality were already high — masking real failures, the mirror image
+ * of the bug this guard exists to fix. Requiring the affirmative rationale
+ * first means a criticism phrased in unlisted words is left alone rather
+ * than being treated as "no criticism found".
+ */
+function applyAwaitingReplyGuard(
+  reason: string,
+  score: number,
+  dimensions: ScoringResult["dimensions"]
+): { score: number; dimensions: ScoringResult["dimensions"] } {
+  if (!dimensions) return { score, dimensions };
+  if (dimensions.goalCompletion > 3) return { score, dimensions };
+  if (dimensions.dataAccuracy < 4 || dimensions.outputQuality < 4) return { score, dimensions };
+  if (!AWAITING_REPLY_RATIONALE_RE.test(reason)) return { score, dimensions };
+  if (reasonCriticizesAssistant(reason)) return { score, dimensions };
+
+  return {
+    score: Math.max(score, 4),
+    dimensions: { ...dimensions, goalCompletion: Math.max(dimensions.goalCompletion, 4) },
+  };
+}
+
+/**
+ * ENG-1296: goalCompletion must not be scored on whether the user has replied
+ * yet — that is outside the assistant's control. Appended at call time, same
+ * reasoning as NO_TASK_JUDGMENT_CLAUSE: both the default prompt and a custom
+ * `ScoringJudge.systemPrompt` (Fangfang Judge, Matt Judge) are AW-Settings
+ * data that predates this rule, so writing it only into
+ * DEFAULT_SCORING_SYSTEM_PROMPT would leave whatever prompt is actually
+ * configured blind to it (ENG-392).
+ */
+export const AWAITING_USER_REPLY_CLAUSE = `
+
+IMPORTANT: A conversation that ends on the assistant's own well-formed clarifying question:
+- If the user's request was genuinely ambiguous or a bare fragment, and the assistant's LAST turn correctly identified the ambiguity, avoided guessing or taking any irreversible action, and asked ONE focused question to resolve it, that is complete, correct handling — even if the conversation ends there with no user reply yet.
+- Score goalCompletion on the QUALITY of that clarifying question (was it focused and correct, and did it avoid guessing?), NOT on whether the user has replied. Whether or when the user replies is outside the assistant's control and must never be treated as a goal-completion failure.
+- Example: the user pastes an ambiguous third-party message fragment with no explicit instruction; the assistant flags the ambiguity, declines to guess, and asks a single clear clarifying question; the conversation ends there. This is goalCompletion 5 — do not write a reason like "the conversation ended before the user could respond, so the goal is not yet complete" and do not score it 3 as a "neutral" placeholder.
+- Sanity check before finalizing: if your own "reason" text contains no criticism of the assistant's handling, goalCompletion (and the overall score) must not be 3 or lower.`;
+
 export const DEFAULT_SCORING_SYSTEM_PROMPT = `You are an expert at evaluating user satisfaction in AI chat sessions.
 Analyze the conversation and rate the user's satisfaction on a scale of 1-5:
 1 = Very unsatisfied (frustrated, angry, repeated failures, gave up)
@@ -1273,16 +1380,18 @@ export async function scoreSession(
   const { agentModeService } = await import("./agentModeService");
   // Append the zero-task clause, the ENG-1312 verbosity/permission clause, the
   // ENG-1245 publish-approval-withholding clause, the ENG-1223
-  // fabrication-grounding clause, and the ENG-1164 output-integrity-guard
-  // clause to whatever prompt is configured — the stored override, if any,
-  // would otherwise mask them entirely (ENG-392/ENG-830).
+  // fabrication-grounding clause, the ENG-1164 output-integrity-guard clause,
+  // and the ENG-1296 awaiting-user-reply clause to whatever prompt is
+  // configured — the stored override, if any, would otherwise mask them
+  // entirely (ENG-392/ENG-830).
   const systemPrompt =
     (await getDefaultScoringPrompt()) +
     NO_TASK_JUDGMENT_CLAUSE +
     VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
     PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
     FABRICATION_GROUNDING_CLAUSE +
-    OUTPUT_INTEGRITY_GUARD_CLAUSE;
+    OUTPUT_INTEGRITY_GUARD_CLAUSE +
+    AWAITING_USER_REPLY_CLAUSE;
   // Persisted setting — validate before calling, or a retired id throws
   // `Invalid model` and the session silently goes unscored (ENG-744).
   const model = await resolveScoringModel(await getDefaultScoringModel());
@@ -1320,13 +1429,14 @@ export async function scoreSession(
   }
   const score = Math.max(1, Math.min(5, Math.round(rawScore)));
   const reason = parsed.reason || "No reason provided";
-  const guarded = applyFabricationGuard(
+  const fabricationGuarded = applyFabricationGuard(
     manifest.count,
     reason,
     score,
     parseDimensions(parsed),
     parseAssertsToolDerivedData(parsed)
   );
+  const guarded = applyAwaitingReplyGuard(reason, fabricationGuarded.score, fabricationGuarded.dimensions);
 
   return {
     score: guarded.score,
@@ -1381,9 +1491,11 @@ export async function scoreSessionWithJudge(
       // ENG-1312 verbosity/permission dimensions, score a real publish-approval
       // hold as fabricated (ENG-1245), credit a fabricated simulation as
       // success (ENG-1223 — this is literally how Fangfang Judge produced this
-      // bug), or penalize declining a guard-blocked punctuation-only reply
-      // (ENG-1164 — Fangfang and Matt Judge both did this) just because its
-      // own prompt predates these rules.
+      // bug), penalize declining a guard-blocked punctuation-only reply
+      // (ENG-1164 — Fangfang and Matt Judge both did this), or dock
+      // goalCompletion purely because the conversation ended before the user
+      // replied (ENG-1296 — the same two judges also did this) just because
+      // its own prompt predates these rules.
       {
         role: "system",
         content:
@@ -1392,7 +1504,8 @@ export async function scoreSessionWithJudge(
           VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
           PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
           FABRICATION_GROUNDING_CLAUSE +
-          OUTPUT_INTEGRITY_GUARD_CLAUSE,
+          OUTPUT_INTEGRITY_GUARD_CLAUSE +
+          AWAITING_USER_REPLY_CLAUSE,
       },
       { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },
     ],
@@ -1420,13 +1533,14 @@ export async function scoreSessionWithJudge(
   }
   const score = Math.max(1, Math.min(5, Math.round(rawScore)));
   const reason = parsed.reason || "No reason provided";
-  const guarded = applyFabricationGuard(
+  const fabricationGuarded = applyFabricationGuard(
     manifest.count,
     reason,
     score,
     parseDimensions(parsed),
     parseAssertsToolDerivedData(parsed)
   );
+  const guarded = applyAwaitingReplyGuard(reason, fabricationGuarded.score, fabricationGuarded.dimensions);
 
   return {
     score: guarded.score,
@@ -1499,7 +1613,8 @@ async function retractJudgeScore(session: ChatSession, judgeId: string): Promise
 
 export async function scoreSessionWithJudgeIfNeeded(
   session: ChatSession,
-  judge: ScoringJudge
+  judge: ScoringJudge,
+  opts?: { force?: boolean }
 ): Promise<NonNullable<ChatSession["judgeScores"]>[string] | null> {
   const messageCount = session.messageCount ?? session.messages?.length ?? 0;
 
@@ -1536,9 +1651,20 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
-  // Skip if already scored by this judge, up-to-date, and has dimensional scores
+  // Skip if already scored by this judge, up-to-date, and has dimensional scores.
+  // ENG-1296: this guard means a rubric/prompt fix NEVER self-heals a session
+  // already scored under the old rules — evaluatedMessageIndex never regresses,
+  // so it stays "up to date" forever. opts.force is the explicit admin escape
+  // hatch (POST /chat-sessions/judge-score) for re-running a specific session
+  // through the current judge after a scoring-rule change, without weakening
+  // the default skip that makes routine sync/backfill cheap.
   const existingJudgeScore = session.judgeScores?.[judge.id];
-  if (existingJudgeScore && existingJudgeScore.evaluatedMessageIndex >= messageCount && existingJudgeScore.dimensions) {
+  if (
+    !opts?.force &&
+    existingJudgeScore &&
+    existingJudgeScore.evaluatedMessageIndex >= messageCount &&
+    existingJudgeScore.dimensions
+  ) {
     return null;
   }
 
@@ -1641,7 +1767,8 @@ const skip = (skipReason: ScoringSkipReason): SessionScoringAttempt => ({ score:
  * care about the reason.
  */
 export async function attemptSessionScore(
-  session: ChatSession
+  session: ChatSession,
+  opts?: { force?: boolean }
 ): Promise<SessionScoringAttempt> {
   // Skip if admin has overridden the score
   if (session.satisfactionScore?.adminOverride) {
@@ -1686,8 +1813,13 @@ export async function attemptSessionScore(
     return skip("publish-gate-withheld");
   }
 
-  // Skip if already scored, up-to-date, and has dimensional scores
+  // Skip if already scored, up-to-date, and has dimensional scores.
+  // ENG-1296: same force escape hatch as scoreSessionWithJudgeIfNeeded above —
+  // without it, a session already scored under a pre-fix rubric never
+  // regresses evaluatedMessageIndex, so it stays "up to date" and skipped
+  // forever, and a rubric/prompt fix can never retroactively correct it.
   if (
+    !opts?.force &&
     session.satisfactionScore &&
     session.satisfactionScore.evaluatedMessageIndex >= messageCount &&
     session.satisfactionScore.dimensions
@@ -1781,7 +1913,8 @@ export async function attemptSessionScore(
  * the skip reason.
  */
 export async function scoreSessionIfNeeded(
-  session: ChatSession
+  session: ChatSession,
+  opts?: { force?: boolean }
 ): Promise<ChatSession["satisfactionScore"] | null> {
-  return (await attemptSessionScore(session)).score;
+  return (await attemptSessionScore(session, opts)).score;
 }
