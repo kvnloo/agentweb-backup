@@ -20,16 +20,29 @@
  */
 
 const mockRecordVendorUsage = jest.fn();
+const mockGetAllocatedRate = jest.fn();
+jest.mock('../utils/vendorRateCard', () => {
+  const actual = jest.requireActual('../utils/vendorRateCard');
+  return { ...actual, getAllocatedRate: (...a: any[]) => mockGetAllocatedRate(...a) };
+});
 jest.mock('../services/usageRecorderService', () => ({
   ...jest.requireActual('../services/usageRecorderService'),
   recordVendorUsage: (...a: any[]) => mockRecordVendorUsage(...a),
 }));
 
 import { meteredV0, recordV0Call, reachedVendor } from '../services/v0Metering';
+import { getAllocatedRate } from '../utils/vendorRateCard';
 
 // mockReset, not mockClear: one case installs a throwing implementation and
 // clearAllMocks leaves it in place for every case after it.
-beforeEach(() => mockRecordVendorUsage.mockReset());
+beforeEach(() => {
+  mockRecordVendorUsage.mockReset();
+  // Default to the real card so every other case exercises the approved rate.
+  mockGetAllocatedRate.mockReset();
+  mockGetAllocatedRate.mockImplementation(
+    jest.requireActual('../utils/vendorRateCard').getAllocatedRate
+  );
+});
 
 describe('reachedVendor — did v0 actually answer?', () => {
   it('true when the error carries an HTTP status, in any of its shapes', () => {
@@ -86,14 +99,37 @@ describe('meteredV0 — one record per attempt that reached v0', () => {
 });
 
 describe('the recorded entry', () => {
-  it('AC6 — allocated, with no invented dollar figure', () => {
+  it('AC6 — allocated, carrying the APPROVED rate rather than nothing', () => {
+    // This assertion was inverted in the first version of this file: it asserted
+    // costUsd was undefined, which pinned the bug in place. `allocated` means
+    // "0 or more real dollars from a KNOWN rate" (ENG-700); recording it with no
+    // figure books every generation as confirmed-free spend. The rate exists and
+    // is approved — vendorRateCard.ts, v0.landing_page_generation, ENG-703.
     recordV0Call({ userId: 'u1', operation: 'chat_create' });
     const row = mockRecordVendorUsage.mock.calls[0][0];
     expect(row.provider).toBe('v0');
     expect(row.costSource).toBe('allocated');
-    expect(row.costUsd).toBeUndefined();
+    expect(row.costUsd).toBe(getAllocatedRate('v0', 'landing_page_generation'));
+    expect(row.costUsd).toBeGreaterThan(0);
     expect(row.unit).toBe('generation');
     expect(row.quantity).toBe(1);
+  });
+
+  it('reads the rate from the card instead of embedding a literal', () => {
+    // The card is explicit: "No adapter may embed its own independent dollar
+    // literal for a vendor/unit covered here." A hardcoded 2.0 would pass the
+    // assertion above today and silently diverge the next time the rate moves.
+    const src = require('fs').readFileSync('src/services/v0Metering.ts', 'utf8');
+    expect(src).toContain('getAllocatedRate("v0"');
+    expect(src).not.toMatch(/costUsd:\s*[0-9]/);
+  });
+
+  it('degrades to unpriced — not a silent $0 — if the card loses the entry', () => {
+    mockGetAllocatedRate.mockReturnValueOnce(null);
+    recordV0Call({ userId: 'u1', operation: 'chat_create' });
+    const row = mockRecordVendorUsage.mock.calls[0][0];
+    expect(row.costSource).toBe('unpriced');
+    expect(row.costUsd).toBeUndefined();
   });
 
   it('AC1 — attributed to the user who triggered it', () => {
