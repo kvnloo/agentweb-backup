@@ -46,11 +46,16 @@ import { AdPlatform, UTM_KEYS, UtmKey, readUtmKeys } from "../utils/adUtm";
  *
  * Deliberately a union with the bare array: Meta's reads are paginated and bounded
  * (`metaService`'s drainCursor reports `truncated`), so that adapter can say whether it saw
- * everything. The Google and LinkedIn services expose no equivalent signal, so their adapters
- * keep returning a plain array and are left untouched — `truncated: undefined` therefore means
- * "this platform does not report completeness", which must never be rendered as "complete".
- * Widening the type rather than requiring an object keeps those two adapters unchanged, which
- * is the only way to be certain this change cannot regress them.
+ * everything. Google now does too — `googleAdsService.search` stops at a 50-page cap and
+ * reports it through a `completeness` out-param, so `googleAdReadPort` returns the object form.
+ *
+ * ⚠ The bare-array arm is NOT a licence to stay silent. It survives for LinkedIn alone, whose
+ * `fetchAllPages` has no cap and errors rather than returning a partial page, so its reads are
+ * complete by construction. Any adapter over a BOUNDED read must return the object form: this
+ * doc previously said Google and LinkedIn both "expose no equivalent signal", and that belief
+ * is exactly what let a page-capped Google read print "✅ All N campaign(s) carry UTM tracking"
+ * about ads it never fetched. `truncated: undefined` means "this platform cannot be truncated",
+ * never "we did not check" — and it must never be rendered as a verified "complete".
  */
 export type PortRead<T> = T[] | { items: T[]; truncated?: boolean };
 

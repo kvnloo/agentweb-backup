@@ -105,9 +105,16 @@ describe("adUtmAuditService.auditCampaigns", () => {
       expect(completeness.incomplete).toBe(true);
     });
 
-    it("leaves completeness untouched for a plain-array port (Google/LinkedIn shape)", async () => {
-      // These adapters report no completeness signal, and absence must never be read as
-      // "verified complete" — nor may it invent an incompleteness warning they never raised.
+    it("leaves completeness untouched for a plain-array port (LinkedIn shape)", async () => {
+      /*
+       * A port that reports no completeness signal must not have one invented for it — but the
+       * title used to say "Google/LinkedIn", and that pinned the wrong thing: Google's read IS
+       * bounded (a 50-page cap in googleAdsService.search), so its silence was a missing signal,
+       * not an absent one, and this test read as blessing it. The Google port now reports
+       * `truncated` (see adUtmAuditAdapters.test.ts). LinkedIn's fetchAllPages has no cap and
+       * errors rather than returning a partial page, so it is complete by construction and the
+       * bare-array shape stays correct for it.
+       */
       const { port } = makePort({ c1: { name: "Ordinary", ads: [] } });
       const completeness: { incomplete?: boolean } = {};
 
