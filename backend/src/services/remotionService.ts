@@ -422,7 +422,16 @@ export class RemotionService {
       // ENG-699: record at submission — the only point every render attempt
       // passes through, including one that fails before renderMediaOnLambda
       // even returns a renderId. A metering failure can never fail or delay
-      // the render (recordVendorUsage is fire-and-forget internally).
+      // the render (recordVendorUsage is fire-and-forget internally), so the
+      // cost lookup itself is isolated too — a missing/invalid rate must not
+      // throw synchronously into this method's outer catch and turn a
+      // metering config error into a render failure (CodeRabbit).
+      let submitCostUsd = 0;
+      try {
+        submitCostUsd = computeAllocatedCost("remotion", "render", shardCount);
+      } catch (rateError) {
+        console.error("RemotionService: metering rate lookup failed (non-fatal):", rateError);
+      }
       void recordVendorUsage({
         userId: params.userId,
         provider: "remotion",
@@ -431,8 +440,29 @@ export class RemotionService {
         unit: "render",
         quantity: shardCount,
         costSource: "allocated",
-        costUsd: computeAllocatedCost("remotion", "render", shardCount),
+        costUsd: submitCostUsd,
       });
+
+      // Single failure recorder used by every failed-render exit (fatal
+      // progress error, completed-without-outputFile, and the outer catch)
+      // so no failed render silently leaves a submission with no outcome
+      // (CodeRabbit) — guarded so the outer catch never double-records a
+      // failure already recorded by one of the inner exits.
+      let renderFailedRecorded = false;
+      const recordRenderFailed = () => {
+        if (renderFailedRecorded) return;
+        renderFailedRecorded = true;
+        void recordVendorUsage({
+          userId: params.userId,
+          provider: "remotion",
+          operation: "render_failed",
+          feature: "branded_video",
+          unit: "render",
+          quantity: 1,
+          costSource: "allocated",
+          costUsd: 0,
+        });
+      };
 
       const renderResult = await renderMediaOnLambda({
         region: config.region as any,
@@ -482,16 +512,7 @@ export class RemotionService {
         });
 
         if (progress.fatalErrorEncountered) {
-          void recordVendorUsage({
-            userId: params.userId,
-            provider: "remotion",
-            operation: "render_failed",
-            feature: "branded_video",
-            unit: "render",
-            quantity: 1,
-            costSource: "allocated",
-            costUsd: 0,
-          });
+          recordRenderFailed();
           return {
             success: false,
             error: `Remotion render failed: ${progress.errors?.[0]?.message ?? "unknown error"}`,
@@ -501,6 +522,7 @@ export class RemotionService {
         if (progress.done) {
           const outputFile = progress.outputFile;
           if (!outputFile) {
+            recordRenderFailed();
             return { success: false, error: "Remotion render completed but outputFile is missing" };
           }
           console.log(`RemotionService: Render complete → ${outputFile}`);
@@ -557,6 +579,16 @@ export class RemotionService {
       };
     } catch (error: any) {
       console.error("RemotionService: Error composing video:", error);
+      void recordVendorUsage({
+        userId: params.userId,
+        provider: "remotion",
+        operation: "render_failed",
+        feature: "branded_video",
+        unit: "render",
+        quantity: 1,
+        costSource: "allocated",
+        costUsd: 0,
+      });
       return {
         success: false,
         error: `Remotion composition failed: ${error.message ?? "unknown error"}`,
