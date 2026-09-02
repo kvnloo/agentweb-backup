@@ -13393,7 +13393,15 @@ export class AgentModeService {
       };
     } catch (error) {
       console.error('AgentMode: Error sending email to lead:', error);
-      return { success: false, message: 'Failed to send email', error: error instanceof Error ? error.message : 'Unknown error' };
+      const { emailProviderErrorStatus } = await import('./emailProviderService');
+      return {
+        success: false,
+        message: 'Failed to send email',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: Gmail/Outlook throw fully-typed EmailProviderError
+        // subclasses with no HTTP status of their own — mapped by name.
+        code: emailProviderErrorStatus(error)
+      };
     }
   }
 
@@ -13558,17 +13566,24 @@ export class AgentModeService {
         // configured"). Nearly all are resolved by reconnecting in Settings.
         const raw = error instanceof Error ? error.message : String(error);
         const needsReconnect = senderProvider !== 'resend' && /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
+        // ENG-1300: Gmail/Outlook throw fully-typed EmailProviderError subclasses
+        // with no HTTP status of their own — mapped by name. undefined for Resend
+        // and any other error shape, which is fine: the fields below are additive.
+        const { emailProviderErrorStatus } = await import('./emailProviderService');
+        const code = emailProviderErrorStatus(error);
         if (needsReconnect) {
           return {
             success: false,
             message: `${label} sender needs reconnecting`,
             error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
+            code,
           };
         }
         return {
           success: false,
           message: `${label} send failed`,
           error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
+          code,
         };
       }
 
@@ -13582,7 +13597,13 @@ export class AgentModeService {
       };
     } catch (error) {
       console.error('AgentMode: Error sending email from configured sender:', error);
-      return { success: false, message: 'Failed to send email', error: error instanceof Error ? error.message : 'Unknown error' };
+      const { emailProviderErrorStatus } = await import('./emailProviderService');
+      return {
+        success: false,
+        message: 'Failed to send email',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        code: emailProviderErrorStatus(error)
+      };
     }
   }
 
@@ -16279,7 +16300,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return {
           success: false,
           message: `Failed to fetch campaigns: ${campaignsData.error.message}`,
-          error: campaignsData.error.message
+          error: campaignsData.error.message,
+          // ENG-1300: fetchWithRetryAndPaging exposes the real HTTP status as a
+          // non-enumerable __httpStatus field — never campaignsData.error.code,
+          // which is Meta's own business error code, not an HTTP status.
+          code: (campaignsData as any).__httpStatus
         };
       }
 
@@ -16878,9 +16903,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // which tells the model nothing it can act on and reads as an opaque
       // outage. Meta's actual explanation lives in response.data.error — surface
       // it, minus the credential material Meta echoes back (ENG-630).
+      // ENG-1300: the real HTTP status is `error.response?.status` (axios shape) —
+      // NEVER the Meta business `.code` nested in response.data.error, which
+      // coincidentally overlaps the HTTP range (e.g. Meta code 404 is unrelated
+      // to HTTP 404).
       return {
         success: false,
         error: describeMetaGraphApiError(error) || error.message,
+        code: error?.status ?? error?.response?.status,
       };
     }
   }
@@ -17219,11 +17249,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error copying Meta ad:', error);
+      // ENG-1300: metaService's handleError rethrows the SDK's FacebookRequestError
+      // unchanged (only attaching structuredError), so its own `.status` (the real
+      // HTTP status) survives — never structuredError.code, which is Meta's business
+      // error code and only coincidentally overlaps the HTTP range.
       return {
         success: false,
         message: this.enrichMetaError(error, 'copy Meta ad'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17246,7 +17281,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta pages.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — metaService's handleError rethrows the
+        // original FacebookRequestError, so its `.status` is the real HTTP status.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17396,7 +17434,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to manage Meta datasets.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — metaService's handleError rethrows the
+        // original FacebookRequestError, so its `.status` is the real HTTP status.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17450,7 +17491,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: error.message || 'Failed to fetch Meta ad campaigns.',
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17590,7 +17633,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad campaign'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17651,7 +17696,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ad sets.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17945,7 +17992,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad set'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17976,7 +18025,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ad creatives.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18056,7 +18107,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad creative'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18088,7 +18141,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ads.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18110,7 +18165,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18170,7 +18227,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to update Meta ad campaign.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18189,7 +18248,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to delete Meta ad campaign.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18215,7 +18276,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to update Meta ad set.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18234,7 +18297,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to delete Meta ad set.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18313,7 +18378,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: this.enrichMetaError(error, 'update Meta ad'),
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18686,7 +18753,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to delete Meta ad.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18755,7 +18824,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to retag Meta ad UTMs.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18823,6 +18894,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               classification: structured.classification,
             }
           : undefined,
+        // ENG-1300: top-level `code` is the real numeric HTTP status, deliberately
+        // separate from meta_error.code above (Meta's business error code). Covers
+        // both the SDK-shaped Meta upload failure (error.status) and a plain axios
+        // failure downloading the source image (error.response?.status).
+        code: error?.status ?? error?.response?.status,
       };
     }
   }
@@ -18845,7 +18921,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to upload Meta ad video. Ensure the URL is publicly accessible.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18959,6 +19037,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         typedError.metaMetricsErrorType = connectionFailure
           ? 'connection'
           : (permissionFailure ? 'permission' : 'api');
+        // ENG-1300: the real HTTP status, never `code` above (Meta's business code).
+        typedError.status = (response as any)?.__httpStatus;
         throw typedError;
       }
       // ENG-104: breakdown endpoints are NON-fatal (we proceed without them), but
@@ -19047,7 +19127,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message,
         error: message,
-        errorType
+        errorType,
+        // ENG-1300: real HTTP status when the failure came from a coded fetch
+        // (typedError.status above); getMetaCredentials failures don't carry one.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -20035,7 +20118,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // Ensure response data is a string for parsing
               userPayload = typeof response.data === 'object' ? JSON.stringify(response.data) : response.data;
             } catch (fetchError: any) {
-              throw new Error(`Failed to fetch CSV content from URL: ${fetchError.message}`);
+              // ENG-1300: this rethrow reaches the outer catch below, which extracts
+              // error?.status ?? error?.response?.status — without forwarding it here,
+              // a 403/404 fetching the CSV would be lost before it ever gets there.
+              const wrapped: any = new Error(`Failed to fetch CSV content from URL: ${fetchError.message}`);
+              wrapped.status = fetchError?.response?.status;
+              throw wrapped;
             }
           }
 
@@ -20172,7 +20260,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message,
-        error: error.message
+        error: error.message,
+        // ENG-1300: top-level `code` is the real numeric HTTP status — never
+        // structured.code above, which is Meta's business error code (e.g. the
+        // 1870090 subcode branch here has nothing to do with an HTTP status).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -20800,8 +20892,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         workflow,
         ledger: { failures: [{ step: 'launch', message: error.message }] },
         message: error.message || `Failed to launch ${workflow} campaign.`,
+        // ENG-1300: SDK-shaped error (metaService.handleError preserves .status) —
+        // never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
+  }
+
+  // ENG-1300: executeAudienceCampaignLaunch rethrows a plain Error whenever a
+  // step it calls (manageMetaCustomAudiences, listMetaAdsAdSets,
+  // createMetaAdsAdSet — all already fixed to return a numeric `code` on
+  // failure) reports success:false, so the caller's classification is lost one
+  // rethrow before it ever reaches launchAudienceCampaign's outer catch. Carry
+  // it forward instead of discarding it.
+  private rethrowStepFailure(result: { message?: string; code?: number }, fallbackMessage: string): never {
+    const err: any = new Error(result.message || fallbackMessage);
+    err.status = result.code;
+    throw err;
   }
 
   private async executeAudienceCampaignLaunch(
@@ -20850,7 +20957,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         const lookalikeName = `${args.audience_name} - Lookalike`;
         const lookalikeListResult = await this.manageMetaCustomAudiences(userId, 'LIST', args.account_id, {});
         if (!lookalikeListResult.success) {
-          throw new Error(lookalikeListResult.message || 'Failed to list existing Meta custom audiences.');
+          this.rethrowStepFailure(lookalikeListResult, 'Failed to list existing Meta custom audiences.');
         }
         // Greptile follow-up findings: name-only matching isn't enough — a
         // same-named lookalike from an earlier launch with a DIFFERENT
@@ -20888,7 +20995,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             confirm: true,
           });
           if (!lookalikeResult.success) {
-            throw new Error(lookalikeResult.message || 'Failed to create Lookalike Audience.');
+            this.rethrowStepFailure(lookalikeResult, 'Failed to create Lookalike Audience.');
           }
           lookalikeAudience = lookalikeResult.audience;
         }
@@ -20933,7 +21040,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const adSetName = args.ad_set_params?.name;
       const existingAdSetsResult = await this.listMetaAdsAdSets(userId, args.campaign_id, args.account_id);
       if (!existingAdSetsResult.success) {
-        throw new Error(existingAdSetsResult.message || 'Failed to list existing Meta ad sets.');
+        this.rethrowStepFailure(existingAdSetsResult, 'Failed to list existing Meta ad sets.');
       }
       // Greptile follow-up findings: name + targeted-audience alone isn't
       // enough — a same-named ad set targeting the same audience but with
@@ -21022,7 +21129,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           targeting,
         });
         if (!adSetResult.success) {
-          throw new Error(adSetResult.message || 'Failed to create ad set.');
+          this.rethrowStepFailure(adSetResult, 'Failed to create ad set.');
         }
         adSet = adSetResult.adSet;
       }
@@ -21100,7 +21207,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to search ad targeting.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -22576,6 +22685,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const queryLower = query.toLowerCase();
       const results: Array<{ content: string; source: string }> = [];
       let foreplayResultCount = 0;
+      // ENG-1300: swipefile/board-list failures below are caught and swallowed
+      // so a bad Foreplay board never sinks the whole search — but that meant an
+      // outright auth/rate-limit failure on EVERY source silently reported as
+      // "no ads found" (success:true), exactly the "run looks successful while
+      // operating on partial input" pattern ENG-1300 exists to catch. Track the
+      // top-level failures (not the deliberately-tolerated per-board ones) and
+      // only surface them as a real failure when there are zero results to show
+      // for it — a genuine empty match must still report success.
+      let topLevelError: any = null;
 
       // Search swipefile ads
       try {
@@ -22597,6 +22715,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       } catch (swipeErr) {
         console.log('AgentMode: Error searching Foreplay swipefile:', swipeErr);
+        topLevelError = swipeErr;
       }
 
       // Search board ads
@@ -22622,11 +22741,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               }
             }
           } catch (boardErr) {
+            // Deliberately tolerated — one bad board must not sink every other
+            // board's results, so this one is never promoted to topLevelError.
             console.log(`AgentMode: Error searching Foreplay board ${board.name}:`, boardErr);
           }
         }
       } catch (boardsErr) {
         console.log('AgentMode: Error listing Foreplay boards for search:', boardsErr);
+        topLevelError = topLevelError || boardsErr;
+      }
+
+      if (results.length === 0 && topLevelError) {
+        return {
+          success: false,
+          message: `Failed to search Foreplay ads: ${topLevelError?.message || 'Unknown error'}`,
+          error: topLevelError?.message || 'Unknown error',
+          code: topLevelError?.response?.status,
+          results: [],
+          totalResults: 0
+        };
       }
 
       if (results.length === 0) {
@@ -22651,7 +22784,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to search Foreplay ads. Please try again.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: plain axios error — Foreplay has no known business-code field.
+        code: (error as any)?.response?.status
       };
     }
   }
@@ -22739,7 +22874,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to search Foreplay discovery. Please try again.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        code: (error as any)?.response?.status
       };
     }
   }
@@ -23659,9 +23795,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error) {
       console.error('AgentMode: Error reading Google Drive file:', error);
+      // ENG-1300: carry the real numeric HTTP status through so a clean
+      // 401/403/404 classifies as auth/not_found instead of the generic
+      // Error/bug fallback once toolResultError rebuilds an Error from the
+      // message alone.
+      const code = (error as any)?.code || (error as any)?.status;
       return {
         success: false,
-        message: `Failed to read Google Drive file "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read Google Drive file "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code,
       };
     }
   }
@@ -23879,9 +24021,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error) {
       console.error('AgentMode: Error reading ClickUp doc:', error);
+      // ENG-1300: carry the real numeric HTTP status through so a clean
+      // 401/403/404 classifies as auth/not_found instead of the generic
+      // Error/bug fallback once toolResultError rebuilds an Error from the
+      // message alone.
+      const code = (error as any)?.response?.status || (error as any)?.code;
       return {
         success: false,
-        message: `Failed to read ClickUp document "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read ClickUp document "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code,
       };
     }
   }
@@ -23931,9 +24079,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error) {
       console.error('AgentMode: Error reading ClickUp task:', error);
+      // ENG-1300: carry the real numeric HTTP status through — see readClickUpSharedDoc above.
+      const code = (error as any)?.response?.status || (error as any)?.code;
       return {
         success: false,
-        message: `Failed to read ClickUp task "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read ClickUp task "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code,
       };
     }
   }
@@ -23945,7 +24096,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     content: string,
     userId: string,
     parentDocId?: string
-  ): Promise<{ success: boolean; message: string; docId?: string }> {
+  ): Promise<{ success: boolean; message: string; docId?: string; code?: number }> {
     try {
       const clickUpToken = await getClickUpAccessToken(userId);
       if (!clickUpToken) {
@@ -24006,9 +24157,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         errorMessage = `${clickUpError.err}${clickUpError.ECODE ? ` (ClickUp code: ${clickUpError.ECODE})` : ''}`;
       }
 
+      // ENG-1300: carry the real numeric HTTP status through — see readClickUpSharedDoc
+      // above. Deliberately NOT the ECODE extracted above, which is ClickUp's own
+      // business code (e.g. "OAUTH_019"), not an HTTP status.
+      const code = error?.response?.status;
+
       return {
         success: false,
-        message: `Failed to create ClickUp document "${name}": ${errorMessage}`
+        message: `Failed to create ClickUp document "${name}": ${errorMessage}`,
+        code,
       };
     }
   }
@@ -24062,18 +24219,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const saDrive = await this.getGoogleDriveClient();
           return await readWithDrive(saDrive);
         } catch (saErr: any) {
-          const is404 = saErr?.code === 404 || saErr?.status === 404;
+          // ENG-1300: carry the real numeric HTTP status through so a clean
+          // 401/403/404 classifies as auth/not_found instead of the generic
+          // Error/bug fallback once toolResultError rebuilds an Error from the
+          // message alone.
+          const code = saErr?.code || saErr?.status;
+          const is404 = code === 404;
           const msg = is404
             ? `File not found or not accessible. Share the file with the service account, or connect Google Drive in Settings for files you own.`
             : `Failed to read file: ${saErr instanceof Error ? saErr.message : 'Unknown error'}`;
-          return { success: false, message: msg };
+          return { success: false, message: msg, code };
         }
       }
-      const is404 = oauthErr?.code === 404 || oauthErr?.status === 404;
+      const code = oauthErr?.code || oauthErr?.status;
+      const is404 = code === 404;
       const msg = is404
         ? `File not found or you don't have access (fileId: ${fileId}).`
         : `Failed to read file: ${oauthErr instanceof Error ? oauthErr.message : 'Unknown error'}`;
-      return { success: false, message: msg };
+      return { success: false, message: msg, code };
     }
   }
 
@@ -24154,14 +24317,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         files: formatted,
       };
     } catch (err: any) {
+      // ENG-1300: `code` (GaxiosError — the real numeric HTTP status) is already
+      // computed for the branches below; carry it onto the result too, or a
+      // clean 401/403/404 still classifies as the generic Error/bug fallback
+      // once toolResultError reconstructs an Error from the message alone.
       const code = err?.code || err?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Google Drive access denied. Your Google Drive connection may have expired — reconnect in Settings → Connected Accounts.' };
+        return { success: false, message: 'Google Drive access denied. Your Google Drive connection may have expired — reconnect in Settings → Connected Accounts.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Folder not found. Check the URL or ID and try again.' };
+        return { success: false, message: 'Folder not found. Check the URL or ID and try again.', code };
       }
-      return { success: false, message: err?.message || 'Failed to list folder contents' };
+      return { success: false, message: err?.message || 'Failed to list folder contents', code };
     }
   }
 
@@ -24181,14 +24348,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return { success: true, folder_id: folderId, folder_url: folderUrl, name: resp.data.name };
     } catch (err: any) {
+      // ENG-1300: see listGoogleDriveFolder's catch above for why `code` rides
+      // along on the result.
       const code = err?.code || err?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot create folder in that location — Emma does not have access to the specified parent folder.' };
+        return { success: false, message: 'Cannot create folder in that location — Emma does not have access to the specified parent folder.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Parent folder not found. Check the folder ID and try again.' };
+        return { success: false, message: 'Parent folder not found. Check the folder ID and try again.', code };
       }
-      return { success: false, message: err?.message || 'Failed to create Google Drive folder' };
+      return { success: false, message: err?.message || 'Failed to create Google Drive folder', code };
     }
   }
 
@@ -24231,11 +24400,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return { success: true, message: `Found ${results.length} item(s) matching "${query}".`, results };
     } catch (err: any) {
+      // ENG-1300: see listGoogleDriveFolder's catch above for why `code` rides
+      // along on the result.
       const code = err?.code || err?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Google Drive access denied. Ensure Drive is connected in Settings → Connected Accounts.' };
+        return { success: false, message: 'Google Drive access denied. Ensure Drive is connected in Settings → Connected Accounts.', code };
       }
-      return { success: false, message: err?.message || 'Failed to search Google Drive' };
+      return { success: false, message: err?.message || 'Failed to search Google Drive', code };
     }
   }
 
@@ -24970,14 +25141,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error creating Google Doc:', error);
+      // ENG-1300: carry `code` through so a clean 401/403/404 classifies as
+      // auth/not_found instead of the generic Error/bug fallback.
       const code = error?.code || error?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot create Doc in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
+        return { success: false, message: 'Cannot create Doc in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.' };
+        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.', code };
       }
-      return { success: false, message: `Failed to create Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to create Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -25005,14 +25178,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error updating Google Doc:', error);
+      // ENG-1300: carry `code` through so a clean 401/403/404 classifies as
+      // auth/not_found instead of the generic Error/bug fallback.
       const code = error?.code || error?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot update this Google Doc — you may not have edit access to it, or it may have been deleted.' };
+        return { success: false, message: 'Cannot update this Google Doc — you may not have edit access to it, or it may have been deleted.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Google Doc not found. Check the URL or ID and try again.' };
+        return { success: false, message: 'Google Doc not found. Check the URL or ID and try again.', code };
       }
-      return { success: false, message: `Failed to update Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to update Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -25071,14 +25246,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         try { await drive.files.delete({ fileId: sheetId }); } catch {}
       }
       console.error('AgentMode: Error creating Google Sheet:', error);
+      // ENG-1300: carry `code` through so a clean 401/403/404 classifies as
+      // auth/not_found instead of the generic Error/bug fallback.
       const code = error?.code || error?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot create Sheet in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
+        return { success: false, message: 'Cannot create Sheet in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.' };
+        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.', code };
       }
-      return { success: false, message: `Failed to create Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to create Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -25107,14 +25284,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error updating Google Sheet:', error);
+      // ENG-1300: carry `code` through so a clean 401/403/404 classifies as
+      // auth/not_found instead of the generic Error/bug fallback.
       const code = error?.code || error?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot update this Google Sheet — it was not created by Emma. Emma can only edit Sheets she created.' };
+        return { success: false, message: 'Cannot update this Google Sheet — it was not created by Emma. Emma can only edit Sheets she created.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Google Sheet not found. Check the URL or ID and try again.' };
+        return { success: false, message: 'Google Sheet not found. Check the URL or ID and try again.', code };
       }
-      return { success: false, message: `Failed to update Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to update Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -25170,7 +25349,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       console.error('AgentMode: Error reading Foreplay ad:', error);
       return {
         success: false,
-        message: `Failed to read Foreplay ad "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read Foreplay ad "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code: (error as any)?.response?.status
       };
     }
   }
@@ -25240,6 +25420,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         toolName,
         resultSource,
         error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: googleapis' customsearch client throws a GaxiosError, whose
+        // .status/.code are genuinely the numeric HTTP status (unlike Meta's
+        // business-code .code) — same convention already established for
+        // Drive/Calendar. .status checked first since GaxiosError's own docs
+        // treat it as canonical; .code and .response?.status are fallbacks
+        // for other error shapes that can reach this catch.
+        code: (error as any)?.status ?? (error as any)?.code ?? (error as any)?.response?.status,
       };
     }
   }
@@ -27831,7 +28018,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        uploadErr.status = uploadResult.statusCode;
+        throw uploadErr;
       }
 
       const htmlUrl = uploadResult.url;
@@ -27860,7 +28049,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to create blog article',
-        error: error.message
+        error: error.message,
+        // ENG-1300: real HTTP status from the S3 upload, when the failure came
+        // from there (uploadFileToS3 exposes AWS SDK v2's numeric statusCode —
+        // never .code, a string error name on that SDK).
+        code: error?.status
       };
     }
   }
@@ -28067,10 +28260,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
+      // ENG-1300: carry the real HTTP status through when this catch is reached
+      // directly (Payload CMS publish errors and the initial HTML-fetch axios
+      // call) — WebflowBlogPublisher/WordPressBlogPublisher catch and return
+      // their own failures below this method and never throw here.
+      const code = error.response?.status;
+
       return {
         success: false,
         message: errorMessage,
-        error: error.message || 'Unknown error'
+        error: error.message || 'Unknown error',
+        code,
       };
     }
   }
@@ -28713,7 +28913,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        uploadErr.status = uploadResult.statusCode;
+        throw uploadErr;
       }
 
       const htmlUrl = uploadResult.url;
@@ -28732,7 +28934,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to create social media posts',
-        error: error.message
+        error: error.message,
+        // ENG-1300: this function never actually calls any per-platform social
+        // API — it's a local markdown-to-HTML preview generator, and the only
+        // external call is the S3 upload. Real HTTP status from there, when
+        // that's what failed (uploadFileToS3's numeric statusCode).
+        code: error?.status
       };
     }
   }
@@ -29947,7 +30154,9 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         const uploadableHtml = await this.inlinePrivateS3Images(contentDraft, documentType, userId);
         const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
         if (!uploadResult.success || !uploadResult.url) {
-          throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+          const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+          uploadErr.status = uploadResult.statusCode;
+          throw uploadErr;
         }
         return {
           success: true,
@@ -30182,7 +30391,9 @@ Please generate a complete, professional HTML document that properly formats and
       const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
 
       if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        uploadErr.status = uploadResult.statusCode;
+        throw uploadErr;
       }
 
       const s3Url = uploadResult.url;
@@ -30201,7 +30412,9 @@ Please generate a complete, professional HTML document that properly formats and
       return {
         success: false,
         message: 'Failed to create HTML file',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: real HTTP status from the S3 upload, when that's what failed.
+        code: (error as any)?.status
       };
     }
   }
@@ -32904,7 +33117,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         ? 'Account token expired. Please reconnect the account in Settings.'
         : (error?.message ?? 'Unknown error');
       console.error('AgentMode: Error posting on account:', error);
-      return { success: false, message: `Failed to post: ${message}` };
+      // ENG-1300: the LinkedIn adapter (and X's mapListScopeError) attach the
+      // real HTTP status as .code on the thrown error — carry it through so a
+      // 401/403 classifies as auth/config instead of the generic bug fallback.
+      return { success: false, message: `Failed to post: ${message}`, code: error?.code };
     }
   }
 
@@ -33010,7 +33226,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (message.includes('access token expired')) {
         message = 'Account token expired. Please reconnect the account in Settings.';
       }
-      return { success: false, message: `Failed to repost: ${message}` };
+      return { success: false, message: `Failed to repost: ${message}`, code: error?.code };
     }
   }
 
@@ -33124,7 +33340,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         return {
           success: false,
-          message: `Failed to comment: ${message}`
+          message: `Failed to comment: ${message}`,
+          code: error?.code
         };
       }
 
@@ -33214,7 +33431,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
       return {
         success: false,
-        message: `Failed to list comments: ${message}`
+        message: `Failed to list comments: ${message}`,
+        code: error?.code
       };
     }
   }
@@ -33298,7 +33516,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         return {
           success: false,
-          message: `Failed to react: ${message}`
+          message: `Failed to react: ${message}`,
+          code: error?.code
         };
       }
 
@@ -33364,6 +33583,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           success: false,
           message: `Failed to load posts: ${accountResult.error}`,
           error: accountResult.error,
+          code: accountResult.code,
         };
       }
 
@@ -33433,7 +33653,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       } catch (error: any) {
         return {
           success: false,
-          message: `Failed to load metrics: ${error.message}`
+          message: `Failed to load metrics: ${error.message}`,
+          code: error?.code
         };
       }
 
@@ -33507,7 +33728,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return {
         success: false,
         message: 'Failed to get post analytics',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        code: (error as any)?.code
       };
     }
   }
@@ -34794,10 +35016,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
 
+      // ENG-1300: LinkedInOutreachService.handleError already classifies the
+      // status into structuredError.status/.classification for its own
+      // reconnect-detection logic above — read the same field here so the
+      // generic fallback path also reaches the tool-error classifier as
+      // auth/rate_limit/etc. instead of a bare Error/bug.
       return {
         success: false,
         message: 'LinkedIn outreach action failed',
-        error: errorMessage
+        error: errorMessage,
+        code: (error as any)?.code ?? structuredError?.status
       };
     }
   }
@@ -35027,7 +35255,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // collapsing to a bare "Request failed with code 403" — see describeXApiError.
       const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_manage_post failed:', errorMessage);
-      return { success: false, message: 'Twitter action failed', error: errorMessage };
+      // ENG-1300: same gap as twitterOutreach's catch — this flattens every thrown
+      // error to a message string, which is all toolResultError has to reconstruct
+      // an Error from downstream, so the numeric HTTP status (twitter-api-v2 puts
+      // it on `.code`) must ride along on the result object or a write-path 401/403
+      // (e.g. a reply blocked by X's engagement-gate scope) never classifies as
+      // auth/config either.
+      const code = typeof (error as { code?: unknown })?.code === 'number' ? (error as { code: number }).code : undefined;
+      return { success: false, message: 'Twitter action failed', error: errorMessage, ...(code !== undefined ? { code } : {}) };
     }
   }
 
@@ -35236,7 +35471,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // collapsing to a bare "Request failed with code 403" — see describeXApiError.
       const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_outreach failed:', errorMessage);
-      return { success: false, message: 'Twitter outreach action failed', error: errorMessage };
+      // ENG-1300: this catch flattens every thrown error (including
+      // mapListScopeError's reconnect error) to a message string, which is all
+      // toolResultError has to reconstruct an Error from downstream — so the
+      // numeric HTTP status (twitter-api-v2's ApiResponseError, and our own
+      // mapListScopeError, both put it on `.code`) must ride along on the result
+      // object itself or classifyToolErrorClass never sees it and the whole
+      // auth/config classification this ticket exists for silently never fires.
+      const code = typeof (error as { code?: unknown })?.code === 'number' ? (error as { code: number }).code : undefined;
+      return { success: false, message: 'Twitter outreach action failed', error: errorMessage, ...(code !== undefined ? { code } : {}) };
     }
   }
 
@@ -37045,15 +37288,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };
     } catch (error: any) {
+      // ENG-1300: `code` here is the real numeric HTTP status (googleAdsService.
+      // callApi rethrows the SAME axios error, so error.response.status is
+      // intact) — NOT `gadsErrorCodes` below, which are Google Ads' own string
+      // enum names (e.g. "REQUEST_ERROR"), not HTTP statuses. Conflating the two
+      // would misclassify: a business code that happens to fall in 100-599
+      // would be read as if it were the transport status.
+      const code = error?.response?.status;
       if (error instanceof NegativeCampaignCriteriaValidationError) {
         return {
           success: false,
           errorType: error.errorType,
           errorCode: error.errorCode,
           error: error.message,
+          code,
         };
       }
-      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
+      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true, code };
       console.error('[AgentMode] handleCallGoogleAdsApi error:', error);
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
       const gadsErrorCodes = gadsErrors
@@ -37071,9 +37322,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           errorType: gadsError ? 'GOOGLE_ADS_API_ERROR' : 'INTERNAL_ERROR',
           errorCode: gadsErrorCodes[0] || 'UNKNOWN_GOOGLE_ADS_ERROR',
           error: gadsError || error.message || 'Unknown error',
+          code,
         };
       }
-      return { success: false, error: gadsError || error.message || 'Unknown error' };
+      return { success: false, error: gadsError || error.message || 'Unknown error', code };
     }
   }
 
@@ -37106,11 +37358,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       return { success: false, error: 'mode must be "raw" or "dashboard"' };
     } catch (error: any) {
-      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
+      // ENG-1300: see handleCallGoogleAdsApi's catch above for why `code` is
+      // error.response.status specifically, never a Google Ads business code.
+      const code = error?.response?.status;
+      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true, code };
       console.error('[AgentMode] handleCallGoogleAdsReportingApi error:', error);
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
       const gadsError = gadsErrors.length ? gadsErrors.map((e: any) => e.message).join('; ') : undefined;
-      return { success: false, error: gadsError || error.message || 'Unknown error' };
+      return { success: false, error: gadsError || error.message || 'Unknown error', code };
     }
   }
 

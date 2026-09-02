@@ -259,6 +259,11 @@ describe('AgentModeService.twitterManagePost', () => {
     expect(res.error).toContain('Forbidden');
     expect(res.error).toContain('appropriate oauth1 app permissions');
     expect(res.error).not.toBe('Request failed with code 403');
+    // ENG-1300: twitterManagePost's catch has the same describeXApiError
+    // flattening twitterOutreach's did — this asserts the numeric status rides
+    // along on the result so classifyToolErrorClass sees 'auth', not the
+    // generic 'Error' class the message text alone cannot match.
+    expect(res.code).toBe(403);
   });
 
   it('surfaces the read-only reconnect guard error verbatim', async () => {
@@ -703,6 +708,22 @@ describe('AgentModeService.twitterOutreach', () => {
     const res = await service.twitterOutreach('u', { action: 'get_list_tweets', x_list_id: 'L1' });
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/list\.read|reconnect/i);
+  });
+
+  it('ENG-1300: preserves the mapListScopeError 403 code on the returned result, not just its message', async () => {
+    // Mirrors what TwitterService.mapListScopeError actually throws (a 403-coded
+    // Error) rather than a plain Error, so this exercises the exact shape that
+    // reaches _twitterOutreachImpl's catch in production. Asserting only the
+    // message text (as the test above does) passed even when `.code` was
+    // silently dropped here — this is the assertion that would have caught it.
+    const scopeError: Error & { code?: number } = new Error(
+      'Your X account is missing the "list.read" permission needed to read X Lists. Go to Settings → Connected Accounts and reconnect your X account to grant List access.'
+    );
+    scopeError.code = 403;
+    mockGetListTweets.mockRejectedValueOnce(scopeError);
+    const res = await service.twitterOutreach('u', { action: 'get_list_tweets', x_list_id: 'L1' });
+    expect(res.success).toBe(false);
+    expect(res.code).toBe(403);
   });
 
   it('block calls blockUser with handle', async () => {

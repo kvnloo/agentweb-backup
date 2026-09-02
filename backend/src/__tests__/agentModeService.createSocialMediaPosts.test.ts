@@ -337,6 +337,35 @@ describe('AgentModeService - create_social_media_posts function', () => {
       expect(result.error).toBe('S3 upload failed');
     });
 
+    // ENG-1300: createSocialMediaPosts never actually calls a per-platform
+    // social API — it's a local markdown-to-HTML preview generator whose only
+    // external call is the S3 upload. uploadFileToS3 now exposes AWS SDK v2's
+    // numeric statusCode; prove it survives the nested rethrow to this
+    // function's own catch and classifies correctly.
+    it('ENG-1300: a coded S3 upload failure classifies as auth/config end-to-end', async () => {
+      const mockPosts = [{ type: 'linkedin', content: 'Test post' }];
+      mockUploadFileToS3.mockResolvedValue({
+        success: false,
+        error: 'Access Denied',
+        statusCode: 403,
+      });
+
+      const result = await (agentModeService as any).createSocialMediaPosts(
+        mockPosts,
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(403);
+      const { toolResultError } = await import('../utils/toolResultError');
+      const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+      const { classifyToolFailureType } = await import('../utils/toolFailureType');
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    });
+
     it('should handle S3 upload with no URL', async () => {
       const mockPosts = [
         {

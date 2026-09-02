@@ -85,24 +85,65 @@ export const fetchWithRetry = async (url: string, retries: number = 3, delayMs: 
  */
 export const fetchWithRetryAndPaging = async (url: string): Promise<any> => {
   const response = await fetchWithRetry(url);
-  const data = await response.json();
-  
+  let data: any;
+  try {
+    data = await response.json();
+  } catch (parseErr) {
+    // ENG-1300: a non-2xx response is sometimes a gateway/proxy error page or
+    // other non-JSON body rather than Meta's usual { error: {...} } shape —
+    // .json() throws in that case, and without this the real HTTP status is
+    // lost entirely (the SyntaxError carries none of its own).
+    const err: any = new Error(
+      parseErr instanceof Error ? `Meta API returned a non-JSON response: ${parseErr.message}` : 'Meta API returned a non-JSON response'
+    );
+    err.status = response.status;
+    throw err;
+  }
+
+  // ENG-1300: this helper returns the parsed body even on a non-2xx response
+  // (existing callers — routes/meta.ts, clientHealthService.ts — already build
+  // their own `data.error` checks around that contract, and getMetaAdsMetrics
+  // below has its own per-section Meta-business-code classification that reading
+  // this wrong would silently break) — so rather than changing that contract,
+  // expose the real HTTP status as a non-enumerable field callers can opt into
+  // reading. Non-enumerable so it never leaks into a JSON.stringify of the Meta
+  // payload itself (logging, caching, etc.).
+  if (data && typeof data === 'object') {
+    // configurable: true — a later page's failure (below) needs to overwrite
+    // this once the first page's own status is no longer the whole story.
+    Object.defineProperty(data, '__httpStatus', { value: response.status, enumerable: false, configurable: true });
+  }
+
   // Check if there's a paging.next URL for more data
   if (data.paging && data.paging.next) {
     console.log(`Meta API: Fetching next page of data from ${data.paging.next.substring(0, 100)}...`);
-    
+
     // Recursively fetch next page
     const nextPageData = await fetchWithRetryAndPaging(data.paging.next);
-    
+
     // Merge the data arrays
     if (data.data && Array.isArray(data.data) && nextPageData.data && Array.isArray(nextPageData.data)) {
       data.data = [...data.data, ...nextPageData.data];
     }
-    
+
+    // ENG-1300: a later page can fail (non-2xx) without this function
+    // throwing — by design, per the comment above on returning-not-throwing —
+    // so that failure would otherwise be silently hidden behind the FIRST
+    // page's own success status once the data arrays are merged into one
+    // seemingly-complete result. The overall multi-page fetch is only as
+    // successful as its least successful page.
+    const nextPageStatus = (nextPageData as any)?.__httpStatus;
+    if (typeof nextPageStatus === 'number' && nextPageStatus >= 400 && data && typeof data === 'object') {
+      Object.defineProperty(data, '__httpStatus', { value: nextPageStatus, enumerable: false, configurable: true });
+      if (nextPageData.error && !data.error) {
+        data.error = nextPageData.error;
+      }
+    }
+
     // Remove paging info since we've fetched all pages
     delete data.paging;
   }
-  
+
   return data;
 };
 
