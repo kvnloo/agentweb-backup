@@ -112,6 +112,26 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('Tool "describe_image" is not available. You must install the required skill first using install_skills.'))).toBe('tool_unavailable');
   });
 
+  /*
+   * An install_skills refusal is NOT an uninstalled-skill call: the skill exists, the plan does
+   * not include it. Left unclassified it fell to the legacy `Error` class, whose default next
+   * step ends "...use a different tool" — appended by the dispatcher directly beneath a refusal
+   * whose own text forbids substituting another tool's output. That contradiction is how the
+   * absence of a gated tool becomes a fabricated result (ENG-1625).
+   */
+  it('classifies a plan-gated install_skills refusal as subscription_blocked', () => {
+    expect(classifyToolErrorClass(err(
+      "The requested skills are not available with your current subscription."
+      + " Tell the user plainly that this capability is not on their plan."
+      + " Do NOT substitute a different tool's output for the tool that needed this skill, and do not describe that tool as having run.",
+    ))).toBe('subscription_blocked');
+  });
+
+  it('classifies bad skill ids as invalid_args, not as a plan problem', () => {
+    // The model's fault, not the subscription's — the remedy is different.
+    expect(classifyToolErrorClass(err('No valid skills found for the provided IDs.'))).toBe('invalid_args');
+  });
+
   it('classifies contract/schema-validation rejections as invalid_args (~45)', () => {
     expect(classifyToolErrorClass(err('Tool "read_tool_response" arguments failed schema validation before execution. Argument "char_offset" has the wrong type. Expected number.'))).toBe('invalid_args');
     expect(classifyToolErrorClass(err('Tool "wait_seconds" arguments failed schema validation before execution. Missing required argument "reason".'))).toBe('invalid_args');

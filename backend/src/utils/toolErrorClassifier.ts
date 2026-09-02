@@ -12,7 +12,8 @@
  * breaking change for historical queries:
  *   timeout | auth | rate_limit | quota_exceeded | invalid_args | not_found |
  *   network | upstream_5xx | policy_blocked | repeated_failure |
- *   tool_unavailable | upstream_rejected | empty_result | invalid_output
+ *   tool_unavailable | upstream_rejected | empty_result | invalid_output |
+ *   subscription_blocked
  *
  * The three trailing classes were added 2026-06-14 after a 7-day production
  * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
@@ -94,6 +95,21 @@ function classFromMessage(message: string): string | null {
   // text never gets misread by a later branch. The model invoked a tool the
   // user has not enabled; a config gap, not a failure of the tool itself.
   if (/is not available\. you must install the required skill|install_skills/.test(m)) return 'tool_unavailable';
+
+  /*
+   * install_skills refusals — the skill exists but the user's plan does not include it.
+   *
+   * Checked HERE, above the generic branches, because the refusal text is deliberately written
+   * to forbid substitution ("Do NOT substitute a different tool's output..."). Left unclassified
+   * it fell through to the legacy `Error` class, whose DEFAULT_NEXT_STEP ends "...use a different
+   * tool", so the retryability line appended by the dispatcher instructed the model to do the
+   * exact thing the refusal forbids. That contradiction is how a gated tool's absence turns into
+   * a fabricated result (ENG-1625: a "UTM Tagging Audit Summary — PASS, 6/6 tagged" produced by
+   * a tool that never ran). Both strings below are ours, emitted by installSkills.
+   */
+  if (/not available with your current subscription|capability is not on their plan/.test(m)) return 'subscription_blocked';
+  // Bad skill ids from the model — an argument problem, not a plan problem.
+  if (/no valid skills found/.test(m)) return 'invalid_args';
 
   if (/etimedout|timed?\s*out|deadline exceeded|operation was aborted/.test(m)) return 'timeout';
   if (/too many requests|rate limit/.test(m)) return 'rate_limit';

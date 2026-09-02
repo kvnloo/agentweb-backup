@@ -14,7 +14,8 @@
  *
  *   rate_limit / timeout / network / upstream_5xx → transient → retryable
  *   auth / upstream_rejected / invalid_args (schema reject) / tool_unavailable /
- *   invalid_output / policy_blocked                → terminal  → NOT retryable
+ *   invalid_output / policy_blocked / subscription_blocked
+ *                                                  → terminal  → NOT retryable
  *   anything else (legacy/unknown classes)         → conservative: NOT retryable
  *                                                    as an identical call
  *
@@ -51,6 +52,7 @@ export const FAST_TRIP_ERROR_CLASSES: ReadonlySet<string> = new Set([
   'tool_unavailable',
   'invalid_output',
   'policy_blocked',
+  'subscription_blocked',
 ]);
 
 export function isRetryableErrorClass(errorClass: string): boolean {
@@ -71,7 +73,13 @@ const NEXT_STEP_BY_CLASS: Record<string, string> = {
   auth: 'authentication/permission problem. Do NOT retry — the same call will keep failing. Tell the user to (re)connect the account or fix permissions.',
   upstream_rejected: 'the provider deliberately refused this action (business rule). Do NOT retry the same call — explain the refusal to the user and follow its guidance.',
   invalid_args: 'the arguments were invalid. Do NOT repeat the identical call — fix the arguments to exactly match the tool schema first, then retry with the corrected arguments.',
-  tool_unavailable: 'this tool is not available in this session. Do NOT retry it — install the required skill via install_skills or use a different tool.',
+  tool_unavailable: 'this tool is not available in this session. Do NOT retry it — install the required skill via install_skills, or tell the user the capability is not enabled. Do NOT present another tool\'s output as this tool\'s result.',
+  /*
+   * The plan does not include the skill. The ONLY correct next move is to tell the user; there
+   * is no alternative tool that produces this tool's result, and saying "use a different tool"
+   * here is what turns a refusal into a fabricated answer (ENG-1625).
+   */
+  subscription_blocked: 'the required skill is not included in the user\'s subscription. Do NOT retry it and do NOT substitute another tool — tell the user plainly that this capability is not on their plan.',
   invalid_output: 'the tool ran but produced no usable output. Do NOT repeat the identical call — change the arguments/approach or use a different tool.',
   policy_blocked: 'the tool gateway policy blocked this call. Do NOT retry it — follow the policy guidance or tell the user what is blocked.',
   not_found: 'the target was not found. Do NOT repeat the identical call — verify the identifier/name first or ask the user.',

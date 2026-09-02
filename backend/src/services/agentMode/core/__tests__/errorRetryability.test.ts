@@ -79,6 +79,38 @@ describe('retryabilityLine', () => {
   });
 });
 
+describe('a refusal that forbids substitution is never handed a "use a different tool" verdict', () => {
+  /*
+   * The bug this pins: install_skills' plan refusal says "Do NOT substitute a different tool's
+   * output". Unclassified, it took DEFAULT_NEXT_STEP — "...use a different tool..." — and the
+   * dispatcher appended that directly underneath. The last line the model reads was an
+   * instruction to do the thing the line above forbids, which is the ENG-1625 fabricated
+   * "UTM Tagging Audit Summary — PASS, 6/6 tagged".
+   */
+  it('subscription_blocked tells the model to report, never to substitute', () => {
+    const line = retryabilityLine('subscription_blocked');
+    expect(line).toContain('Retryable: no');
+    expect(line.toLowerCase()).toContain('do not substitute');
+    expect(line.toLowerCase()).not.toContain('use a different tool');
+  });
+
+  it('tool_unavailable no longer suggests substituting either', () => {
+    // Same hazard one wiring change away: this class is what an uninstalled gated tool throws.
+    const line = retryabilityLine('tool_unavailable');
+    expect(line).toContain('install_skills');
+    expect(line.toLowerCase()).not.toContain('use a different tool');
+  });
+
+  it('end to end: the appended verdict does not contradict the refusal above it', () => {
+    const refusal =
+      "⚠️ Tool Error: install_skills\nReason: The requested skills are not available with your current"
+      + " subscription. Do NOT substitute a different tool's output for the tool that needed this skill.";
+    const out = appendRetryabilityGuidance(refusal, 'subscription_blocked');
+    expect(out).toContain(refusal);
+    expect(out.toLowerCase()).not.toContain('use a different tool');
+  });
+});
+
 describe('appendRetryabilityGuidance', () => {
   it('appends the verdict line on its own line after the formatted error', () => {
     const out = appendRetryabilityGuidance('⚠️ Tool Error: send_email\nReason: Unauthorized', 'auth');
