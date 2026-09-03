@@ -80,9 +80,12 @@ describe('enrichSoEmailFinderSpecialist', () => {
       leadId: '1', firstName: 'Alice', lastName: 'Smith', website: 'https://www.acme.com',
     } as any, ctx);
 
-    expect(findEmail).toHaveBeenCalledWith({
-      firstName: 'Alice', lastName: 'Smith', domain: 'acme.com',
-    });
+    // enrich.so calls carry `{ userId }` as a second argument on main, so the provider can bill
+    // and rate-limit per user. Production is correct; only this assertion was left at one arg.
+    expect(findEmail).toHaveBeenCalledWith(
+      { firstName: 'Alice', lastName: 'Smith', domain: 'acme.com' },
+      'u1',
+    );
     expect(r).not.toBeNull();
     expect(r!.value).toBe('alice@acme.com');
     expect(r!.confidence).toBe('high');

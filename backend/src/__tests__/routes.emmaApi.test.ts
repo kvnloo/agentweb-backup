@@ -132,7 +132,12 @@ describe('Emma API Routes', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.results).toHaveLength(1);
-      expect(mockService.youSearchWeb).toHaveBeenCalledWith('test query', 5);
+      /*
+       * youSearchWeb gained freshness/includeDomains/userId (and a purpose default) on main; the
+       * route passes them and only this assertion was left at the old arity. Production is
+       * correct — the userId is what lets the search be attributed and billed to the caller.
+       */
+      expect(mockService.youSearchWeb).toHaveBeenCalledWith('test query', 5, undefined, undefined, 'user-123');
     });
   });
 
