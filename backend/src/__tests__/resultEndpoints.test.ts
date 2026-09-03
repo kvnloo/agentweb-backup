@@ -72,6 +72,9 @@ jest.mock('../controllers/agentModeController', () => ({
   // `code: 'SESSION_BUSY'`.
   isSessionBusyError: jest.fn((error: unknown) =>
     typeof error === 'object' && error !== null && (error as any).code === 'SESSION_BUSY'),
+  // ENG-1719 follow-up: this is a headless, maxAttempts:20 caller, so it must pass the
+  // LONG lock-timeout override rather than relying on the short human-waiting default.
+  RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS: 6 * 60 * 60 * 1000,
 }));
 
 import { settingsService } from '../services/settingsService';
@@ -196,7 +199,10 @@ describe('Result Endpoints', () => {
           requiredFunctions: [{ functionName: 'send_for_review', minCount: 1 }],
           // ENG-634: headless fire-and-forget run must enable completion-gate halt protection.
           completionGate: true,
-        })
+        }),
+        // ENG-1719 follow-up: headless, maxAttempts:20, nobody blocked waiting — must get
+        // the LONG lock-timeout override, not the short human-waiting default.
+        { lockTimeoutMs: 6 * 60 * 60 * 1000 }
       );
     });
 

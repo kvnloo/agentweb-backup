@@ -161,6 +161,7 @@ import {
   runScheduledChat,
   activeSessionGenerations,
   tryClaimSessionGeneration,
+  RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS,
 } from '../controllers/agentModeController';
 
 const mockedGetAllowedFunctionCalls = getAllowedFunctionCalls as jest.MockedFunction<typeof getAllowedFunctionCalls>;
@@ -452,6 +453,38 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
         requestCancelSpy.mockRestore();
       });
+    });
+
+    describe('LONG lock-timeout for headless runs (ENG-1719 follow-up)', () => {
+      beforeEach(() => {
+        jest.useFakeTimers();
+      });
+
+      afterEach(() => {
+        jest.useRealTimers();
+        activeSessionGenerations.clear();
+      });
+
+      it('honors the LONG lock-timeout override instead of the short human-waiting default', async () => {
+        // Worker call never settles — simulates a stuck LLM/tool call. runScheduledChat is
+        // headless (maxAttempts:20, nobody blocked waiting) and must pass
+        // RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS through to runVerifiedChat — if it fell back
+        // to the short human-waiting default instead, this lock would release well before
+        // the 120-minute mark checked below.
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => new Promise(() => {}));
+
+        const runPromise = runScheduledChat(baseSchedule, mockUserId, true);
+
+        // Past the SHORT default (90 min) but well inside the LONG ceiling (6 hr).
+        await jest.advanceTimersByTimeAsync(120 * 60 * 1000);
+        expect(activeSessionGenerations.has(mockSession.sessionId)).toBe(true);
+
+        // Now past the LONG ceiling too — must release.
+        await jest.advanceTimersByTimeAsync(RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS);
+        const result = await runPromise;
+        expect(result.status).toBe('failure');
+        expect(activeSessionGenerations.has(mockSession.sessionId)).toBe(false);
+      }, 30000);
     });
 
     // ENG-657: resume an abandoned run whose instance was terminated mid-flight

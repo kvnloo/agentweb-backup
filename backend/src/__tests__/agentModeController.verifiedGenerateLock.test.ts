@@ -22,6 +22,7 @@ import {
   claimSessionGenerationWithRetry,
   isSessionBusyError,
   runVerifiedChat,
+  RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS,
 } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
@@ -241,9 +242,9 @@ describe('runVerifiedChat participates in the shared session-generation lock (EN
       (error: any) => ({ threw: true as const, error }),
     );
 
-    // Comfortably past the default 30-minute RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS — fake
+    // Comfortably past the default 90-minute RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS — fake
     // timers make this instant, the real wall-clock duration doesn't matter here.
-    await jest.advanceTimersByTimeAsync(31 * 60 * 1000);
+    await jest.advanceTimersByTimeAsync(91 * 60 * 1000);
 
     const result = await outcome;
     expect(result.threw).toBe(true);
@@ -254,6 +255,44 @@ describe('runVerifiedChat participates in the shared session-generation lock (EN
       expect(isSessionBusyError(result.error)).toBe(false);
     }
     // The whole point: the lock released even though the worker call never resolved.
+    expect(activeSessionGenerations.has(sessionId)).toBe(false);
+    expect(tryClaimSessionGeneration(sessionId)).toBe(true);
+  });
+
+  it('ENG-1719 follow-up: a caller-supplied lockTimeoutMs overrides the short default', async () => {
+    // Headless callers (runScheduledChat, resultEndpointController) pass
+    // RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS explicitly. Prove the override is
+    // actually honored: the short default alone would have released this lock
+    // by 91 minutes (previous test) — this run must still hold it there, and only
+    // release once the LONG ceiling is reached.
+    mockWorkerService.runInWorker.mockImplementationOnce(() => new Promise(() => {}));
+
+    const runPromise = runVerifiedChat({
+      sessionId,
+      userId: 'user-1',
+      startingMessage: 'Generate the report.',
+      keywords: [],
+      requiredFunctions: [{ functionName: 'update_html_file', minCount: 1 }],
+      maxAttempts: 1,
+      attachments: [],
+    }, { lockTimeoutMs: RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS });
+    const outcome = runPromise.then(
+      () => ({ threw: false as const }),
+      (error: any) => ({ threw: true as const, error }),
+    );
+
+    // Past the SHORT default (90 min) but still well inside the LONG ceiling (6 hr) —
+    // must still be holding the lock here if the override is honored.
+    await jest.advanceTimersByTimeAsync(120 * 60 * 1000);
+    expect(activeSessionGenerations.has(sessionId)).toBe(true);
+
+    // Now past the LONG ceiling too — must release.
+    await jest.advanceTimersByTimeAsync(5 * 60 * 60 * 1000);
+    const result = await outcome;
+    expect(result.threw).toBe(true);
+    if (result.threw) {
+      expect(result.error.isGenerationTimeout).toBe(true);
+    }
     expect(activeSessionGenerations.has(sessionId)).toBe(false);
     expect(tryClaimSessionGeneration(sessionId)).toBe(true);
   });
