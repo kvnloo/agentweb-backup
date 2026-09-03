@@ -52,6 +52,32 @@ export class EmailProviderError extends Error {
   }
 }
 
+// ENG-1300: every EmailProviderError subclass (Gmail*Error, Outlook*Error)
+// deliberately carries no HTTP status — they abstract away the underlying
+// Gaxios/Graph transport entirely, and this base class stamps `.name` to
+// 'EmailProviderError' uniformly, so even error.name can't disambiguate which
+// subclass fired. Some of their messages happen to match
+// classifyToolErrorClass's message-text heuristics already (e.g. Gmail's own
+// "quota exceeded" phrasing), but most don't ("account not connected" doesn't
+// match any auth pattern) and silently fall to the generic Error/bug class.
+// Since these are OUR OWN typed errors with an unambiguous meaning, mapping by
+// constructor name to a representative HTTP-equivalent status is a real
+// classification, not a guess at an opaque third-party error.
+const EMAIL_PROVIDER_ERROR_STATUS: Record<string, number> = {
+  GmailNotConnectedError: 401,
+  GmailTokenRevokedError: 401,
+  GmailSendNotAuthorizedError: 403,
+  OutlookNotConnectedError: 401,
+  OutlookTokenRevokedError: 401,
+  OutlookSendNotAuthorizedError: 403,
+  OutlookQuotaError: 429,
+};
+
+export function emailProviderErrorStatus(error: unknown): number | undefined {
+  if (!(error instanceof Error)) return undefined;
+  return EMAIL_PROVIDER_ERROR_STATUS[error.constructor?.name ?? ''];
+}
+
 // ── Shared send types ──────────────────────────────────────────────────────
 
 /**

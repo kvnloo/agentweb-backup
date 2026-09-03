@@ -23,6 +23,8 @@ const mockProviderSendEmail = jest.fn();
 jest.mock('../services/emailProviderService', () => ({
   bootstrapEmailProviders: jest.fn(async () => undefined),
   getEmailProvider: jest.fn(() => ({ sendEmail: mockProviderSendEmail })),
+  // ENG-1300: real impl — pure/deterministic, safe to keep real under this mock.
+  emailProviderErrorStatus: jest.requireActual('../services/emailProviderService').emailProviderErrorStatus,
 }));
 
 // Real senderUsageTracker/sendAsSender run for real — only their DynamoDB deps

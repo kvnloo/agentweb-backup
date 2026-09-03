@@ -42,7 +42,11 @@ jest.mock('../services/resendService', () => ({
 jest.mock('../services/gmailService', () => ({
   gmailService: {
     sendEmail: jest.fn(),
-  }
+  },
+  // ENG-1300: real typed error classes — plain classes, no side effects to
+  // import — needed so a test can construct one and prove
+  // emailProviderErrorStatus() maps it correctly.
+  GmailTokenRevokedError: jest.requireActual('../services/gmailService').GmailTokenRevokedError,
 }));
 
 // ENG-265: sendEmailToLead/sendEmailFromConfiguredSender now re-resolve the sender via
@@ -59,7 +63,10 @@ jest.mock('../services/crmSenderService', () => ({
 import { AgentModeService } from '../services/agentModeService';
 import { crmDb, userDb, orgDb } from '../services/db';
 import { resendService } from '../services/resendService';
-import { gmailService } from '../services/gmailService';
+import { gmailService, GmailTokenRevokedError } from '../services/gmailService';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 import { resolveSenderForSend } from '../services/crmSenderService';
 import { LEAD_IMPORT_WRITE_BUDGET_MS } from '../utils/leadImportLedger';
 
@@ -2313,6 +2320,37 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.error).toBe('Token revoked');
     });
 
+    // ENG-1300: Gmail/Outlook throw fully-typed EmailProviderError subclasses
+    // that carry no HTTP status of their own by design — "Gmail access was
+    // revoked" matches no classifyToolErrorClass message heuristic either, so
+    // this classified as generic Error/bug. emailProviderErrorStatus() maps
+    // the real typed error (not just its message) to a representative status.
+    it('ENG-1300: a real GmailTokenRevokedError classifies as auth/config end-to-end', async () => {
+      const gmailSender = {
+        id: 'sender-g2',
+        email: 'test@gmail.com',
+        fromName: 'Test',
+        senderType: 'gmail' as const,
+        gmailAccountId: 'test@gmail.com',
+      };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue({ ...leadWithDraft, selectedSenderId: 'sender-g2' } as any);
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [gmailSender],
+        defaultSenderId: 'sender-g2',
+      });
+      mockGmail.sendEmail.mockRejectedValue(new GmailTokenRevokedError());
+
+      const result = await service.sendEmailToLead(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(401);
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    });
+
     it('should deny access when user is not an org member', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
       (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(false);
@@ -2538,6 +2576,32 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.success).toBe(true);
       expect(result.from).toBe('me@gmail.com');
       expect(mockGmail.sendEmail).toHaveBeenCalled();
+    });
+
+    // ENG-1300: same fix as sendEmailToLead above — a real typed provider error
+    // classifies via emailProviderErrorStatus() instead of falling through to
+    // the generic Error/bug class.
+    it('ENG-1300: a real GmailTokenRevokedError classifies as auth/config end-to-end', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [
+          { id: 'sender-g', email: 'me@gmail.com', fromName: 'Manan', senderType: 'gmail', gmailAccountId: 'me@gmail.com' },
+        ],
+        defaultSenderId: 'sender-g',
+      });
+      mockGmail.sendEmail.mockRejectedValue(new GmailTokenRevokedError());
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(401);
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
     });
 
     it('should include senderType in the availableSenders list on no match', async () => {

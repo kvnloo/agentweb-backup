@@ -213,6 +213,10 @@ export interface S3UploadResult {
   url?: string;
   key?: string;
   error?: string;
+  // ENG-1300: the real HTTP status from AWS SDK v2's error.statusCode, when
+  // present — separate from error.code, which on this SDK is a STRING error
+  // name (e.g. "AccessDenied", "NoSuchBucket"), never a numeric status.
+  statusCode?: number;
 }
 
 /**
@@ -285,7 +289,8 @@ export async function uploadFileToS3(
     console.error('Error in uploadFileToS3:', error);
     return {
       success: false,
-      error: error instanceof Error ? error.message : 'Unknown error'
+      error: error instanceof Error ? error.message : 'Unknown error',
+      statusCode: (error as any)?.statusCode
     };
   }
 }

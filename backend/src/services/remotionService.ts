@@ -1,4 +1,6 @@
 import AWS from "aws-sdk";
+import { recordVendorUsage } from "./usageRecorderService";
+import { computeAllocatedCost } from "../utils/vendorRateCard";
 
 /**
  * Parameters for composing a branded video via Remotion Lambda.
@@ -202,6 +204,22 @@ export function buildRemotionOutputUrl(
   return `https://s3.${region}.amazonaws.com/${bucketName}/renders/${renderId}/${outName}`;
 }
 
+/**
+ * Derive the shard count a Remotion Lambda render will fan out to, given the
+ * fixed `framesPerLambda` value passed to `renderMediaOnLambda`.
+ *
+ * ENG-699: this is the metering quantity recorded at render submission — the
+ * only per-request-attributable cloud-infra cost in the ENG-666 program, since
+ * Remotion Lambda invocation count scales with frame count, not a flat
+ * per-render price. Allocated, never AWS-measured (no per-account Lambda
+ * billing breakdown exists) — see vendorRateCard.ts's `remotion.render` entry.
+ */
+export function computeRemotionShardCount(durationInFrames: number, framesPerLambda: number): number {
+  if (!Number.isFinite(durationInFrames) || durationInFrames <= 0) return 1;
+  if (!Number.isFinite(framesPerLambda) || framesPerLambda <= 0) return 1;
+  return Math.max(1, Math.ceil(durationInFrames / framesPerLambda));
+}
+
 export class RemotionService {
   private config: RemotionConfig | null = null;
 
@@ -398,6 +416,53 @@ export class RemotionService {
       // Capture the exact output key once (it embeds Date.now()) so the detached-handoff
       // URL below matches what the Lambda actually writes.
       const outName = `users/${params.userId}/remotion/${Date.now()}_${filename}`;
+      const framesPerLambda = 60;
+      const shardCount = computeRemotionShardCount(durationInFrames, framesPerLambda);
+
+      // ENG-699: record at submission — the only point every render attempt
+      // passes through, including one that fails before renderMediaOnLambda
+      // even returns a renderId. A metering failure can never fail or delay
+      // the render (recordVendorUsage is fire-and-forget internally), so the
+      // cost lookup itself is isolated too — a missing/invalid rate must not
+      // throw synchronously into this method's outer catch and turn a
+      // metering config error into a render failure (CodeRabbit).
+      let submitCostUsd = 0;
+      try {
+        submitCostUsd = computeAllocatedCost("remotion", "render", shardCount);
+      } catch (rateError) {
+        console.error("RemotionService: metering rate lookup failed (non-fatal):", rateError);
+      }
+      void recordVendorUsage({
+        userId: params.userId,
+        provider: "remotion",
+        operation: "render_submit",
+        feature: "branded_video",
+        unit: "render",
+        quantity: shardCount,
+        costSource: "allocated",
+        costUsd: submitCostUsd,
+      });
+
+      // Single failure recorder used by every failed-render exit (fatal
+      // progress error, completed-without-outputFile, and the outer catch)
+      // so no failed render silently leaves a submission with no outcome
+      // (CodeRabbit) — guarded so the outer catch never double-records a
+      // failure already recorded by one of the inner exits.
+      let renderFailedRecorded = false;
+      const recordRenderFailed = () => {
+        if (renderFailedRecorded) return;
+        renderFailedRecorded = true;
+        void recordVendorUsage({
+          userId: params.userId,
+          provider: "remotion",
+          operation: "render_failed",
+          feature: "branded_video",
+          unit: "render",
+          quantity: 1,
+          costSource: "allocated",
+          costUsd: 0,
+        });
+      };
 
       const renderResult = await renderMediaOnLambda({
         region: config.region as any,
@@ -407,7 +472,7 @@ export class RemotionService {
         inputProps: inputPropsWithDuration,
         codec: "h264",
         imageFormat: "jpeg",
-        framesPerLambda: 60,
+        framesPerLambda,
         outName: outName as any,
         timeoutInMilliseconds: 300000, // 5 minutes
       });
@@ -447,6 +512,7 @@ export class RemotionService {
         });
 
         if (progress.fatalErrorEncountered) {
+          recordRenderFailed();
           return {
             success: false,
             error: `Remotion render failed: ${progress.errors?.[0]?.message ?? "unknown error"}`,
@@ -456,9 +522,20 @@ export class RemotionService {
         if (progress.done) {
           const outputFile = progress.outputFile;
           if (!outputFile) {
+            recordRenderFailed();
             return { success: false, error: "Remotion render completed but outputFile is missing" };
           }
           console.log(`RemotionService: Render complete → ${outputFile}`);
+          void recordVendorUsage({
+            userId: params.userId,
+            provider: "remotion",
+            operation: "render_completed",
+            feature: "branded_video",
+            unit: "render",
+            quantity: 1,
+            costSource: "allocated",
+            costUsd: 0,
+          });
           return {
             success: true,
             status: "complete",
@@ -479,6 +556,16 @@ export class RemotionService {
       console.log(
         `RemotionService: Render still processing after ${polls} poll(s) — handing off detached URL ${detachedOutputUrl}`
       );
+      void recordVendorUsage({
+        userId: params.userId,
+        provider: "remotion",
+        operation: "render_handoff_unobserved",
+        feature: "branded_video",
+        unit: "render",
+        quantity: 1,
+        costSource: "allocated",
+        costUsd: 0,
+      });
       return {
         success: true,
         status: "processing",
@@ -492,6 +579,16 @@ export class RemotionService {
       };
     } catch (error: any) {
       console.error("RemotionService: Error composing video:", error);
+      void recordVendorUsage({
+        userId: params.userId,
+        provider: "remotion",
+        operation: "render_failed",
+        feature: "branded_video",
+        unit: "render",
+        quantity: 1,
+        costSource: "allocated",
+        costUsd: 0,
+      });
       return {
         success: false,
         error: `Remotion composition failed: ${error.message ?? "unknown error"}`,
