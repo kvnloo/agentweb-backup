@@ -48,6 +48,10 @@ import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
+import {
+  normalizeOpenRouterResponseMetadata,
+  normalizeOpenRouterErrorMetadata,
+} from './agentMode/openRouterMetadata';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
@@ -2154,6 +2158,10 @@ export class AgentModeService {
           defaultHeaders: {
             'HTTP-Referer': 'https://app.agentweb.pro',
             'X-Title': 'AgentWeb',
+            // ENG-1712: opt in to OpenRouter's router-metadata block (resolved
+            // provider + is_byok) so the log-only normalizer below has real
+            // data to read instead of always logging undefined.
+            'X-OpenRouter-Metadata': 'enabled',
           },
         });
 
@@ -2859,6 +2867,15 @@ export class AgentModeService {
           params,
           { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
         );
+        // ENG-1712: resolved provider slot + BYOK flag, log-only (no routing
+        // impact) -- lets a production incident/verification tie a specific
+        // call to the provider it actually landed on without reading
+        // credential material out-of-band.
+        const resolvedMetadata = normalizeOpenRouterResponseMetadata(res);
+        console.log(`AgentMode: OpenRouter call succeeded for model "${model}"`, {
+          provider: resolvedMetadata.provider,
+          is_byok: resolvedMetadata.is_byok,
+        });
         // Fire-and-forget usage metering; it must never break an LLM call.
         try {
           const usage: any = (res as any)?.usage;
@@ -2898,6 +2915,9 @@ export class AgentModeService {
           const backoffMs = retryAfterMs ?? 1500 * Math.pow(2, attempt - 1);
           console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms${retryAfterMs !== undefined ? ' (honoring Retry-After)' : ''}`, {
             error: error instanceof Error ? error.message : String(error),
+            // ENG-1712: OpenRouter surfaces the attempted provider/BYOK slot on
+            // some error shapes too (varies by failure type); include when present.
+            ...normalizeOpenRouterErrorMetadata(error),
           });
           await this.sleep(backoffMs);
           continue;
@@ -2908,6 +2928,8 @@ export class AgentModeService {
     console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
       error: lastError instanceof Error ? lastError.message : String(lastError),
       stack: lastError instanceof Error ? lastError.stack : undefined,
+      // ENG-1712: same optional provider/BYOK metadata as the retry-warn path.
+      ...normalizeOpenRouterErrorMetadata(lastError),
     });
     throw lastError;
   }
