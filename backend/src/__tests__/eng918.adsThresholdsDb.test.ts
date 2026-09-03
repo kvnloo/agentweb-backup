@@ -60,4 +60,19 @@ describe('itemToParameter — corrupted data fails loud, not silently', () => {
     const parsed = itemToParameter(item({ currentValue: '4.2' }));
     expect(parsed?.currentValue).toBe(4.2);
   });
+
+  it.each(['', 'admin', 'USER', undefined, null])(
+    'throws for the invalid source %p rather than casting it silently',
+    badSource => {
+      // The precedence rule (a learned write may never overwrite a user-set one) is enforced by
+      // comparing `source === 'user'`. A corrupted source that casts to anything OTHER than the
+      // three real values would silently fail that comparison and let a learned write overwrite
+      // what was actually a human-set value — the exact failure this store exists to prevent.
+      expect(() => itemToParameter(item({ source: badSource }))).toThrow(/invalid.*source/i);
+    },
+  );
+
+  it.each(['default', 'user', 'learned'])('accepts the valid source %p', validSource => {
+    expect(itemToParameter(item({ source: validSource }))?.source).toBe(validSource);
+  });
 });

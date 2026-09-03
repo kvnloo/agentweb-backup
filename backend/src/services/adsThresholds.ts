@@ -300,6 +300,7 @@ export function parseThresholdEntityKey(
 
 export type ThresholdWriteRefusal =
   | 'unknown_parameter'
+  | 'invalid_source'
   | 'learned_would_override_user'
   | 'insufficient_sample'
   | 'not_finite'
@@ -341,6 +342,20 @@ export function evaluateThresholdWrite(args: {
       allowed: false,
       reason: 'unknown_parameter',
       detail: `'${args.paramKey}' is not in THRESHOLD_REGISTRY`,
+    };
+  }
+
+  // 'default' is a STATE a parameter can be in (nothing was ever set, or it was reverted), never
+  // a WRITE a live actor proposes — only 'user' and 'learned' represent an actor asserting a
+  // value. The out-of-bounds check a few lines down branches on `args.source !== 'learned'` to
+  // decide refuse-vs-clamp; without this guard a 'default'-sourced call (permitted by the type,
+  // never issued by any current caller) would fall through that branch as if it were a human
+  // write, refusing rather than clamping, for a source that should never reach here at all.
+  if (args.source === 'default') {
+    return {
+      allowed: false,
+      reason: 'invalid_source',
+      detail: "'default' describes an unset or reverted parameter's state, not a write source",
     };
   }
 

@@ -36,7 +36,6 @@ import {
   type AdsThreshold,
   type AdsPlatform,
   type ThresholdRevision,
-  type ThresholdSource,
 } from './adsThresholds';
 
 // ⚠ Matches every other table in this codebase, and inherits the same FAIL-OPEN hazard: an unset
@@ -93,12 +92,25 @@ export function itemToParameter(item: AWS.DynamoDB.DocumentClient.AttributeMap):
   }
   const currentValue = Number(item.currentValue);
 
+  // `source` gates the precedence rule (a `learned` write may never overwrite a `user` one) —
+  // the ONE guarantee this whole store exists for. A corrupted or blank `source` attribute would
+  // cast to a string that matches neither 'user' nor 'learned' nor 'default', so
+  // `currentSource === 'user'` in evaluateThresholdWrite would silently read as false and let a
+  // learned write overwrite what was actually a human-set value. Validated the same way
+  // currentValue is: an unrecognised value throws rather than being trusted.
+  if (item.source !== 'default' && item.source !== 'user' && item.source !== 'learned') {
+    throw new ThresholdCorruptionError(
+      `${ADS_THRESHOLDS_TABLE} item '${item.entityKey}'/'${item.paramKey}' has an invalid ` +
+        `source (${String(item.source)})`,
+    );
+  }
+
   return {
     accountId: parsed.accountId,
     platform: parsed.platform,
     paramKey: String(item.paramKey),
     currentValue,
-    source: String(item.source) as ThresholdSource,
+    source: item.source,
     updatedAt: String(item.updatedAt),
     learnedCooldownUntil: item.learnedCooldownUntil ? String(item.learnedCooldownUntil) : null,
     revisions: Array.isArray(item.revisions) ? (item.revisions as ThresholdRevision[]) : [],

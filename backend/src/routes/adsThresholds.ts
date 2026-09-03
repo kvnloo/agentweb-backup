@@ -67,6 +67,7 @@ const router = express.Router();
  */
 const REFUSAL_STATUS: Record<string, number> = {
   unknown_parameter: 400,
+  invalid_source: 400,
   not_finite: 400,
   out_of_bounds: 400,
   insufficient_sample: 400,

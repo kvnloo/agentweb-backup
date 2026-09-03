@@ -381,6 +381,22 @@ describe('post-revert cooldown', () => {
 });
 
 describe('refusals', () => {
+  it("refuses source: 'default' as a write — it describes a STATE, not something an actor proposes", () => {
+    // Permitted by the type (ThresholdSource has three values), never issued by any current
+    // caller. Without this guard, a 'default'-sourced call would fall through the out-of-bounds
+    // branch's `source !== 'learned'` check as if it were a human write — refusing rather than
+    // clamping, for a source that should never reach the evaluator at all.
+    const verdict = evaluateThresholdWrite({
+      paramKey: FREQ,
+      requestedValue: 3.7,
+      source: 'default',
+      existing: param(),
+    });
+
+    expect(verdict.allowed).toBe(false);
+    if (!verdict.allowed) expect(verdict.reason).toBe('invalid_source');
+  });
+
   it('refuses an unknown parameter', () => {
     const verdict = evaluateThresholdWrite({
       paramKey: 'nope.notAThing',
