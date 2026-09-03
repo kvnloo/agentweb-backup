@@ -81,7 +81,11 @@ describe('MetaService campaign spend_cap (ENG-1018)', () => {
   });
 
   it('getCampaign reads spend_cap back so a write can be verified', async () => {
-    const get = jest.fn().mockResolvedValue({ _data: { id: 'camp_9', spend_cap: '300000' } });
+    // getCampaign now verifies ownership from the same response, so Graph answers `account_id`
+    // alongside the requested fields; it is stripped before the caller sees the payload.
+    const get = jest.fn().mockResolvedValue({
+      _data: { id: 'camp_9', spend_cap: '300000', account_id: accountId },
+    });
     (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get }));
 
     const result = await service.getCampaign(accountId, token, 'camp_9');

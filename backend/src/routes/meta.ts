@@ -148,7 +148,8 @@ router.get("/ad-performance", async (req, res) => {
     let campaigns;
     try {
       const campaignsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`;
-      console.log("Campaigns URL:", campaignsUrl);
+      // Never log the URL itself: it carries `access_token` in the query string.
+      console.log("Fetching campaigns for act_%s", adAccountId);
 
       const campaignsData = await fetchWithRetryAndPaging(campaignsUrl);
       
@@ -168,7 +169,7 @@ router.get("/ad-performance", async (req, res) => {
     let adSets;
     try {
       const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`;
-      console.log("Ad Sets URL:", adSetsUrl);
+      console.log("Fetching ad sets for act_%s", adAccountId);
       
       const adSetsData = await fetchWithRetryAndPaging(adSetsUrl);
       
@@ -188,7 +189,7 @@ router.get("/ad-performance", async (req, res) => {
     let ads;
     try {
       const adsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`;
-      console.log("Ads URL:", adsUrl);
+      console.log("Fetching ads for act_%s", adAccountId);
       
       const adsData = await fetchWithRetryAndPaging(adsUrl);
       
@@ -560,7 +561,8 @@ router.get("/campaigns-and-adsets", async (req, res) => {
     console.log("Ad Account:", adAccountId);
 
     const businessUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}?fields=account_id,name,currency,timezone_name,business&access_token=${accessToken}`;
-    console.log("Business URL:", businessUrl);
+    // The URL carries `access_token`; log the target, never the query string.
+    console.log("Fetching business portfolio for act_%s", adAccountId);
     
     const businessResponse = await fetch(businessUrl);
     const businessData = await businessResponse.json();
@@ -582,7 +584,7 @@ router.get("/campaigns-and-adsets", async (req, res) => {
     // Now fetch pages from the business portfolio
     console.log("=== Fetching Pages from Business Portfolio ===");
     const pagesUrl = `https://graph.facebook.com/${apiVersion}/${businessId}/owned_pages?fields=id,name,category&access_token=${accessToken}`;
-    console.log("Pages URL:", pagesUrl);
+    console.log("Fetching owned pages for business %s", businessId);
     
     const pagesResponse = await fetch(pagesUrl);
     const pagesData = await pagesResponse.json();
@@ -701,7 +703,7 @@ router.post("/create-ad", async (req, res) => {
     // First, verify the ad account exists and get its details
     console.log("=== Verifying Ad Account ===");
     const accountUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}?fields=account_id,name,currency,timezone_name,account_status&access_token=${accessToken}`;
-    console.log("Account URL:", accountUrl);
+    console.log("Verifying ad account act_%s", adAccountId);
     
     const accountResponse = await fetch(accountUrl);
     const accountData = await accountResponse.json();
