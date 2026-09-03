@@ -22861,6 +22861,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
      * the scan stopped" about a folder with four files in it.
      */
     throttled: boolean;
+    /**
+     * The walk stopped short because a sub-folder read FAILED transiently, as opposed to hitting
+     * the folder-count bound or the wall clock.
+     *
+     * `truncated` alone cannot carry this: two of its three causes are deterministic — the same
+     * tree stops in the same place every time — so a message telling the model to "retry, a
+     * sub-folder may have failed transiently" was advice that could not work for two of them,
+     * and the retryable classification meant each futile attempt re-walked the whole budget.
+     */
+    transientFailure: boolean;
     truncated: boolean;
     folderNames: Map<string, string>;
   }> {
@@ -22871,6 +22881,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const restricted: Array<{ id: string; name: string }> = [];
     let rootRestricted = false;
     let throttled = false;
+    let transientFailure = false;
     let truncated = false;
     /*
      * "The walk is incomplete" and "stop walking" are DIFFERENT facts, and conflating them cost
@@ -22944,6 +22955,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
              * worth far more than one covering 2.
              */
             truncated = true;
+            transientFailure = true;
           }
           console.log(`AgentMode: Could not list subfolders of Drive folder ${current}:`, err);
           break;
@@ -22966,7 +22978,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       } while (pageToken);
     }
 
-    return { folderIds, restricted, rootRestricted, truncated, throttled, folderNames };
+    return { folderIds, restricted, rootRestricted, truncated, throttled, transientFailure, folderNames };
   }
 
   // ENG-1624: `'<id>' in parents` clauses joined with OR grow ~52 chars per Drive
@@ -23015,7 +23027,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     let failed: any;
     // ENG-1624: same time bound as getGoogleDriveFolderTreeIds, and for the same
     // reason — batches and pages here are walked sequentially with no overall
-    // bound otherwise. Crossing it sets `capped`, reusing the existing
+    // bound otherwise. Crossing it sets `capped`, which the listing maps into
+    // `folderScanIncomplete` — it did NOT until a starved source was found being
+    // reported as an empty folder; it was mapped only to a counting-precision
+    // flag. Reusing the existing
     // "incomplete, do not conclude absence" signal.
     const deadline = sharedDeadlineAt ?? (Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS);
     for (let i = 0; i < folderIds.length; i += AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE) {
@@ -24557,7 +24572,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       // Find the file by name anywhere in the registered folder's tree (ENG-1624:
       // not just its direct children).
-      const { folderIds, restricted, rootRestricted, truncated: folderScanTruncated, throttled: folderScanThrottled, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      const { folderIds, restricted, rootRestricted, truncated: folderScanTruncated, throttled: folderScanThrottled, transientFailure: folderScanTransient, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
       // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
       // lets an ambiguous name (same filename in two sub-folders) be detected and
       // reported instead of one candidate being picked arbitrarily.
@@ -24640,7 +24655,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (folderScanTruncated) {
           return {
             success: false,
-            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree (it hit a folder-count bound, or a sub-folder read failed), so this is not a confirmed absence. Retry: if a sub-folder failed transiently the next scan may complete.`
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree, so this is not a confirmed absence. `
+              + (folderScanTransient
+                ? `A sub-folder read failed part-way, so retrying may well complete the scan.`
+                : `It stopped at a fixed folder-count or time bound, so a tree this size will stop in the same place every time. Do NOT retry this same call — narrow to a specific sub-folder, or ask the user for a direct Google Drive link.`)
           };
         }
         return { success: false, message: `File "${fileName}" not found in Google Drive folder "${rootName}"` };
@@ -24748,7 +24766,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       // Search the whole folder tree rooted at the registered folder (ENG-1624),
       // not just its direct children.
-      const { folderIds, restricted, rootRestricted, truncated, throttled: folderScanThrottled, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      const { folderIds, restricted, rootRestricted, truncated, throttled: folderScanThrottled, transientFailure: folderScanTransient, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
       // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
       // lets an ambiguous name (same filename in two sub-folders) be detected and
       // reported instead of one candidate being materialized arbitrarily.
@@ -24821,7 +24839,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (truncated) {
           return {
             success: false,
-            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree (it hit a folder-count bound, or a sub-folder read failed), so this is not a confirmed absence. Retry: if a sub-folder failed transiently the next scan may complete.`
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree, so this is not a confirmed absence. `
+              + (folderScanTransient
+                ? `A sub-folder read failed part-way, so retrying may well complete the scan.`
+                : `It stopped at a fixed folder-count or time bound, so a tree this size will stop in the same place every time. Do NOT retry this same call — narrow to a specific sub-folder, or ask the user for a direct Google Drive link.`)
           };
         }
         return { success: false, message: `File "${fileName}" not found in Google Drive folder` };

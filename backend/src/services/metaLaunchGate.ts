@@ -88,7 +88,10 @@ export const META_LAUNCH_READ_MAX_MS = 240_000;
  *
  * Separate budgets bound the total by construction instead: 240s of reads + 240s of pre-flight
  * = 480s worst case, inside the 600s nginx `proxy_read_timeout` / ALB `IdleTimeout`, with margin.
- * Neither phase can starve the other, and neither can run away.
+ * Neither phase can starve the other, and neither can run away. The optional server-side hint
+ * carries a third, small budget (META_LAUNCH_HINT_MAX_MS) so the totals stay 240 + 240 + 60 =
+ * 540s — still inside 600s once every phase is counted, which the original two-phase arithmetic
+ * did not do.
  */
 export const META_LAUNCH_PREFLIGHT_MAX_MS = 240_000;
 
@@ -535,7 +538,8 @@ export async function runMetaTrackingGate(
        * Each resolve is bounded (30s, plus one retry on a transient failure) but the LOOP was
        * not: a launch referencing several creatives multiplied that budget by however many there
        * were, on top of whatever the ad reads had already spent. Same composition problem as the
-       * two ad reads, one phase later.
+       * two ad reads. (This loop runs BEFORE the ad reads, not after — the earlier wording said
+       * "one phase later", which described the order wrongly even though the hazard is the same.)
        *
        * Out of budget is treated exactly as an unreadable creative, because that is what it is:
        * we did not read it. The existing block message and the override both apply unchanged.
