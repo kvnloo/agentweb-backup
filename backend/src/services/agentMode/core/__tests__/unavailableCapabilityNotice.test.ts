@@ -183,4 +183,24 @@ describe('buildUnavailableCapabilityNotice', () => {
 
     expect(notice).toMatch(/was not produced by that tool/i);
   });
+
+  it('still fires when the failed install is followed by an unrelated LATER successful one', () => {
+    /*
+     * Pins the ledger-index bug: `executePreparedTools` always appends Phase 1 preflight
+     * failures (a skill-gate refusal is one) before any Phase 3 executed result, including every
+     * `install_skills` outcome — so a later, unrelated install succeeding can never mean the
+     * refused tool's own skill arrived. The old code kept an index comparison
+     * (`installSucceededAfter > i`) that read this shape as "obtained afterward" and wrongly
+     * stayed silent. `audit_ad_utm_coverage`'s own skill was never installed; a second,
+     * different install_skills call succeeding later must not silence the notice.
+     */
+    const notice = buildUnavailableCapabilityNotice([
+      { name: 'audit_ad_utm_coverage', error: gateError('audit_ad_utm_coverage') },
+      { name: 'install_skills', error: 'The requested skills are not available with your current subscription.' },
+      { name: 'install_skills', result: { success: true, installedSkills: ['Unrelated Skill'] } },
+      { name: 'call_meta_marketing_api', result: { success: true } },
+    ] as any);
+
+    expect(notice).toContain('audit_ad_utm_coverage');
+  });
 });

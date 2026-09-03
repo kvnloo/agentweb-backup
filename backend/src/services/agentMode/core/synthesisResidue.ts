@@ -746,23 +746,30 @@ export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]):
    *    upstream flags this one: no error is raised, because from installSkills' point of view
    *    the call succeeded.
    *
-   * Note what is deliberately NOT required: that the install came AFTER the refusal. Parallel
-   * tool calls in one assistant message land in the ledger in an arbitrary order, so requiring
-   * `install > refusal` let the identical turn arm or disarm this notice depending on which of
-   * the two the model happened to emit first. Whether the model could obtain the capability is
-   * a property of the TURN, not of the ordering within it.
+   * Note what is deliberately NOT required: that the install came AFTER the refusal, or even
+   * that no install this turn succeeded. Both used to be enforced via a ledger-index comparison
+   * (`installSucceededAfter > i`), which is meaningless: `executePreparedTools` (toolDispatch.ts)
+   * always appends Phase 1 preflight failures — which is what a skill-gate refusal is — before
+   * any Phase 3 executed result, including every `install_skills` outcome, regardless of the
+   * order the model emitted the calls in. So an index comparison could never see a gate refusal
+   * as coming AFTER a successful install; on the real incident shape (a refusal plus ANY
+   * install_skills call, failed or not) it would only ever suppress the notice, never correctly
+   * arm it — including when the turn also contains an install failure that is the actual cause.
+   *
+   * A per-tool "did the skill THIS tool needed actually arrive" check would be the precise fix,
+   * but that requires tracking which install call served which gated tool, which this function
+   * does not yet do (tracked separately). Until then, when the turn contains both a success and
+   * a failure the notice fires — a redundant banner on a turn that in fact recovered is the
+   * cheap direction to be wrong; silently hiding a real gap is not.
    */
   let installAttempted = false;
   let installFailed = false;
-  let installSucceededAfter = -1;
-  calls.forEach((call, i) => {
+  calls.forEach((call) => {
     if (call?.name !== 'install_skills') return;
     installAttempted = true;
     const threw = call?.error !== undefined && call?.error !== null;
     if (threw || isReportedFailure(call) || isPartialInstall(call)) {
       installFailed = true;
-    } else {
-      installSucceededAfter = i;
     }
   });
 
@@ -775,15 +782,13 @@ export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]):
   }
 
   const unavailable = new Set<string>();
-  calls.forEach((call, i) => {
+  calls.forEach((call) => {
     const name = typeof call?.name === 'string' ? call.name : '';
     if (!name || call?.error === undefined || call?.error === null) return;
     const err = call.error instanceof Error ? call.error : new Error(String(call.error));
     if (classifyToolErrorClass(err) !== 'tool_unavailable') return;
     // Ran successfully at some point in the turn — the capability is present.
     if (succeeded.has(name)) return;
-    // Obtained it and chose not to re-run the tool — the model's call, not a gap it papered over.
-    if (installSucceededAfter > i) return;
     // Never tried to obtain it: doing without a speculative tool is not a missing capability.
     if (!installAttempted) return;
     // Every install this turn came back clean, so nothing stopped the model from getting what
