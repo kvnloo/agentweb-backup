@@ -2453,5 +2453,89 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
       expect(mockSendInvitation.mock.calls[0][0]).toBe('capped-account');
       expect(result.data).not.toHaveProperty('accountRouting');
     });
+
+    const routedAccounts = [
+      {
+        platform: 'unipile',
+        account_id: 'capped-account',
+        userId: 'user-1',
+        config: { daily_invite_cap: 10, daily_volume: { invite: { count: 10, windowStartedAt: Date.now() } } },
+      },
+      {
+        platform: 'unipile',
+        account_id: 'headroom-account',
+        userId: 'teammate-2',
+        sharedWithOrg: true,
+        config: { daily_invite_cap: 30, daily_volume: { invite: { count: 1, windowStartedAt: Date.now() } } },
+      },
+    ];
+
+    it('discloses the routing decision on the disconnected-session preflight refusal, not just on success (AC3)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockProbeAccountSession.mockImplementation(async (accountId: string) => (
+        accountId === 'headroom-account' ? 'disconnected' : 'connected'
+      ));
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('LinkedIn account disconnected');
+      // The refusal is for the ROUTED account, not the one the caller named —
+      // without accountRouting on this payload the customer can't tell why.
+      expect(result.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('headroom-account'),
+      });
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+      mockProbeAccountSession.mockResolvedValue('connected');
+    });
+
+    it('discloses the routing decision on the invitation-cooldown refusal, not just on success (AC3)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockIsUnderInvitationCooldown.mockImplementation((accountId: string) => accountId === 'headroom-account');
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Cannot resend yet');
+      expect(result.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('headroom-account'),
+      });
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+      mockIsUnderInvitationCooldown.mockReturnValue(false);
+    });
+
+    it('discloses the routing decision on the hourly/burst pacer refusal, not just on success (AC2 + AC3)', async () => {
+      process.env.LINKEDIN_WRITE_MIN_GAP_MS = '0';
+      process.env.LINKEDIN_WRITE_MAX_PER_HOUR = '1';
+      try {
+        mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+        mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+        mockSendInvitation.mockResolvedValue({ id: 'inv-routed' });
+
+        // First call routes capped-account -> headroom-account and spends its one slot.
+        const first = await service.linkedinOutreach('user-1', routingInviteArgs);
+        // Second call routes to the same headroom-account, which the hourly pacer now refuses.
+        const second = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+        expect(first.success).toBe(true);
+        expect(second.success).toBe(false);
+        expect(second.message).toBe('LinkedIn write actions are being paced');
+        expect(second.accountRouting).toEqual({
+          fromAccountId: 'capped-account',
+          toAccountId: 'headroom-account',
+          reason: expect.stringContaining('headroom-account'),
+        });
+        expect(mockSendInvitation).toHaveBeenCalledTimes(1);
+      } finally {
+        delete process.env.LINKEDIN_WRITE_MIN_GAP_MS;
+        delete process.env.LINKEDIN_WRITE_MAX_PER_HOUR;
+      }
+    });
   });
 });
