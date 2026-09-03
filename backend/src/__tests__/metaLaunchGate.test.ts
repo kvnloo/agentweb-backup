@@ -208,7 +208,13 @@ describe('Meta launch gate (ENG-941)', () => {
   it('passes the ad account\'s own pixel ids into the check', async () => {
     mockListPixels.mockResolvedValue({ pixels: [{ id: PIXEL }, { id: '999' }], truncated: false, pagesFetched: 1 });
     await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-1');
-    expect(mockPreflight).toHaveBeenCalledWith(['https://site.example/lp'], [PIXEL, '999']);
+    /*
+     * Four args now: the pre-flight shares the gate's wall-clock budget, so a launch pointing at
+     * many distinct destinations cannot spend unbounded time on top of the ad reads. Asserting
+     * the deadline is a real number rather than ignoring it — passing `undefined` would silently
+     * restore the unbounded behaviour and this test would not notice.
+     */
+    expect(mockPreflight).toHaveBeenCalledWith(['https://site.example/lp'], [PIXEL, '999'], {}, expect.any(Number));
   });
 
   it('gathers destinations across every ad in the campaign', async () => {
@@ -422,7 +428,7 @@ describe('scoping and bypass fixes (ENG-941)', () => {
       { adId: 'ad-bad', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/bad'] },
     ], truncated: false, pagesFetched: 1 });
     await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_UPDATE', false, 'sess-1', {}, 'ad-good');
-    expect(mockPreflight).toHaveBeenCalledWith(['https://site.example/good'], [PIXEL]);
+    expect(mockPreflight).toHaveBeenCalledWith(['https://site.example/good'], [PIXEL], {}, expect.any(Number));
   });
 
   it('checks the whole campaign when no single ad is named', async () => {

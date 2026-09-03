@@ -491,10 +491,23 @@ export async function runMetaTrackingGate(
     for (const creativeId of pendingCreativeIds) {
       let urls: string[] = [];
       let failure: string | undefined;
-      try {
-        urls = (await resolve(creativeId, accessToken)) ?? [];
-      } catch (err: any) {
-        failure = err?.message || String(err);
+      /*
+       * Each resolve is bounded (30s, plus one retry on a transient failure) but the LOOP was
+       * not: a launch referencing several creatives multiplied that budget by however many there
+       * were, on top of whatever the ad reads had already spent. Same composition problem as the
+       * two ad reads, one phase later.
+       *
+       * Out of budget is treated exactly as an unreadable creative, because that is what it is:
+       * we did not read it. The existing block message and the override both apply unchanged.
+       */
+      if (Date.now() >= gateDeadlineAt) {
+        failure = 'the launch pre-flight ran out of its time budget before this creative could be read';
+      } else {
+        try {
+          urls = (await resolve(creativeId, accessToken)) ?? [];
+        } catch (err: any) {
+          failure = err?.message || String(err);
+        }
       }
       if (failure || urls.length === 0) {
         const message =
@@ -755,7 +768,9 @@ export async function runMetaTrackingGate(
 
   if (destinationUrls.length === 0) return { proceed: true };
 
-  const gate = await preflightMetaTrackingGate(destinationUrls, pixelIds);
+  // Last phase of the same budget — see gateDeadlineAt. Destinations not reached in time come
+  // back `unverifiable`, which is the honest answer and blocks exactly as any other does.
+  const gate = await preflightMetaTrackingGate(destinationUrls, pixelIds, {}, gateDeadlineAt);
   const urlResults = gate.results.map(r => ({ url: r.url, status: r.status, mechanisms: r.mechanisms, error: r.error }));
 
   if (gate.ok) {

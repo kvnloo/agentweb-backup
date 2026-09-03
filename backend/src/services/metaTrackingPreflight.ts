@@ -507,6 +507,20 @@ export async function preflightMetaTrackingGate(
   urls: string[],
   accountPixelIds: string[],
   deps: MetaPreflightDeps = {},
+  /**
+   * A wall-clock deadline shared with the caller, when the caller has already spent part of a
+   * budget before getting here.
+   *
+   * Destinations are fetched in batches of FETCH_CONCURRENCY at up to FETCH_TIMEOUT_MS each (now
+   * twice that, since a transient failure is retried), so a launch pointing at many distinct
+   * pages composes into real time on top of whatever the ad reads already cost. Without a shared
+   * deadline the gate's total is unbounded in aggregate even though every individual step is
+   * bounded — the same shape that let two ad reads spend 480s between them.
+   *
+   * A destination not reached before the deadline is reported `unverifiable`, which is exactly
+   * what it is: we did not look. It blocks like any other unverifiable, and the override remains.
+   */
+  deadlineAt?: number,
 ): Promise<MetaPreflightGateResult> {
   const fetchHtml = deps.fetchHtml ?? defaultFetchHtml;
   const ownedPixels = new Set((accountPixelIds ?? []).filter(Boolean).map(String));
@@ -523,6 +537,17 @@ export async function preflightMetaTrackingGate(
   const results: MetaUrlTrackingResult[] = [];
   for (let i = 0; i < unique.length; i += FETCH_CONCURRENCY) {
     const batch = unique.slice(i, i + FETCH_CONCURRENCY);
+    // Out of budget: report the rest honestly rather than spending time the caller does not have.
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+      results.push(...unique.slice(i).map((url): MetaUrlTrackingResult => ({
+        url,
+        status: 'unverifiable',
+        mechanisms: [],
+        checkedFor: META_TRACKING_MECHANISMS,
+        error: 'not checked — the launch pre-flight ran out of its time budget before reaching this destination',
+      })));
+      break;
+    }
     const settled = await Promise.all(
       batch.map(async (url): Promise<MetaUrlTrackingResult> => {
         try {
