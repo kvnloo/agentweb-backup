@@ -54,7 +54,12 @@ when the bug names a Session ID, User ID, or execution ID.
   Prefer the DynamoDB session/records above when they answer the question.
 
 Rules: **read-only — never write to prod.** This is real customer data (PII): use it to understand
-the bug, but NEVER paste raw session/user/log data into commits, the PR, tests, or comments.
+the bug, but NEVER paste raw session/user/log data into commits, the PR, tests, or comments. Also
+never run a discovery/enumeration call — e.g. `aws secretsmanager list-secrets`, `aws dynamodb
+list-tables` — to see what exists. The runner's IAM role is least-privilege and does not grant
+enumeration, so these calls fail closed and trip an access-denied alarm (ENG-1510). The tables and
+secret paths you need are already named above, or documented by name in the relevant repo's
+CLAUDE.md — read a named resource directly (`get-item`, `get-secret-value`, etc.).
 
 ## What to do
 
