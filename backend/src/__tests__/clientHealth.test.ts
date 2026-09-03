@@ -30,6 +30,10 @@ jest.mock('../utils/metaApiFetch', () => ({
   fetchWithRetryAndPaging: jest.fn().mockResolvedValue({ data: [] }),
 }));
 
+jest.mock('../services/adsThresholdsDb', () => ({
+  getThresholdsForAccount: jest.fn().mockResolvedValue([]),
+}));
+
 import { assessClientHealth, listAllClients } from '../services/clientHealthService';
 
 const { userDb } = require('../services/db');
@@ -148,9 +152,9 @@ describe('Client Health - assessClientHealth', () => {
       })
       .mockResolvedValueOnce({
         data: [
-          { id: 'ad1', name: 'Ad 1', creative: { id: 'cr1' }, status: 'ACTIVE', insights: { data: [{ spend: '50' }] } },
-          { id: 'ad2', name: 'Ad 2', creative: { id: 'cr2' }, status: 'ACTIVE', insights: { data: [{ spend: '40' }] } },
-          { id: 'ad3', name: 'Ad 3', creative: { id: 'cr3' }, status: 'ACTIVE', insights: { data: [{ spend: '10' }] } },
+          { id: 'ad1', name: 'Ad 1', creative: { id: 'cr1' }, status: 'ACTIVE', current_insights: { data: [{ spend: '50' }] } },
+          { id: 'ad2', name: 'Ad 2', creative: { id: 'cr2' }, status: 'ACTIVE', current_insights: { data: [{ spend: '40' }] } },
+          { id: 'ad3', name: 'Ad 3', creative: { id: 'cr3' }, status: 'ACTIVE', current_insights: { data: [{ spend: '10' }] } },
         ],
       });
 
@@ -168,6 +172,119 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.health.creative_variety.distinct_creatives).toBe(3);
     expect(result.health.status).toBeDefined();
     expect(['healthy', 'mediocre', 'at-risk', 'blocked']).toContain(result.health.status);
+  });
+
+  // Fatigue detection: frequency ceiling (default 3.5), CTR-drop / CPM-rise vs prior-period
+  // baseline (defaults 20% / 15%) — resolved from ENG-918's threshold store (mocked empty here,
+  // so registry defaults apply).
+  it('flags a creative fatigued by frequency alone (no prior-period data)', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client User',
+      adAccount: '123456',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({ data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }] })
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: 'ad1',
+            name: 'Fatigued Ad',
+            creative: { id: 'cr1' },
+            status: 'ACTIVE',
+            current_insights: { data: [{ spend: '50', frequency: '4.2', ctr: '1.0', cpm: '10' }] },
+            // No prior_insights — newly launched, no baseline yet.
+          },
+        ],
+      });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.creative_variety.fatigue_warning).toBe(true);
+    expect(result.health.creative_variety.fatigued_creatives).toEqual([
+      { id: 'ad1', name: 'Fatigued Ad', reasons: ['frequency'] },
+    ]);
+  });
+
+  it('flags a creative fatigued by CTR drop and CPM rise vs the prior period, not by frequency', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client User',
+      adAccount: '123456',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({ data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }] })
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: 'ad1',
+            name: 'Drifting Ad',
+            creative: { id: 'cr1' },
+            status: 'ACTIVE',
+            // frequency under the 3.5 default ceiling — should not trigger that reason.
+            current_insights: { data: [{ spend: '50', frequency: '2.0', ctr: '0.5', cpm: '15' }] },
+            // CTR dropped 50% (> 20% default), CPM rose 50% (> 15% default).
+            prior_insights: { data: [{ spend: '50', frequency: '2.0', ctr: '1.0', cpm: '10' }] },
+          },
+        ],
+      });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.creative_variety.fatigue_warning).toBe(true);
+    const flagged = result.health.creative_variety.fatigued_creatives[0];
+    expect(flagged.id).toBe('ad1');
+    expect(flagged.reasons).toContain('ctr_drop');
+    expect(flagged.reasons).toContain('cpm_rise');
+    expect(flagged.reasons).not.toContain('frequency');
+  });
+
+  it('does not flag a healthy creative within all thresholds', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client User',
+      adAccount: '123456',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({ data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }] })
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: 'ad1',
+            name: 'Healthy Ad',
+            creative: { id: 'cr1' },
+            status: 'ACTIVE',
+            current_insights: { data: [{ spend: '50', frequency: '2.0', ctr: '0.95', cpm: '10.5' }] },
+            prior_insights: { data: [{ spend: '50', frequency: '2.0', ctr: '1.0', cpm: '10' }] },
+          },
+        ],
+      });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.creative_variety.fatigue_warning).toBe(false);
+    expect(result.health.creative_variety.fatigued_creatives).toEqual([]);
   });
 
   it('should detect a deployed landing page owned by another member of the client org', async () => {

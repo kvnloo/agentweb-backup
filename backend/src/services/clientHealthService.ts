@@ -11,6 +11,8 @@
 
 import { userDb } from './db';
 import { getAccountsByUserId } from './connectedAccountsDb';
+import { getThresholdsForAccount } from './adsThresholdsDb';
+import { resolveThresholds } from './adsThresholds';
 
 type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked';
 
@@ -36,6 +38,11 @@ interface CreativeVariety {
   cannibalization_warning: boolean;
   fatigue_warning: boolean;
   top_creatives?: Array<{ id: string; name: string; spend_pct: number }>;
+  fatigued_creatives?: Array<{
+    id: string;
+    name: string;
+    reasons: Array<'frequency' | 'ctr_drop' | 'cpm_rise'>;
+  }>;
 }
 
 interface PaymentInfo {
@@ -251,6 +258,15 @@ export async function assessClientHealth(
         const apiVersion = process.env.META_API_VERSION || 'v25.0';
         const adAccountId = client.adAccount || (metaAdAccounts[0]?.config as any)?.ad_account_id;
 
+        // Prior 14-day window immediately preceding the current `date_preset(last_14d)` window,
+        // used as the baseline for CTR-drop / CPM-rise fatigue checks.
+        const priorWindowEndDate = new Date();
+        priorWindowEndDate.setUTCDate(priorWindowEndDate.getUTCDate() - 14);
+        const priorWindowStartDate = new Date(priorWindowEndDate);
+        priorWindowStartDate.setUTCDate(priorWindowStartDate.getUTCDate() - 13);
+        const priorWindowStart = priorWindowStartDate.toISOString().slice(0, 10);
+        const priorWindowEnd = priorWindowEndDate.toISOString().slice(0, 10);
+
         if (adAccountId) {
           // Fetch campaigns
           const campaignsData = await fetchWithRetryAndPaging(
@@ -260,10 +276,18 @@ export async function assessClientHealth(
             (c: any) => c.status === 'ACTIVE'
           );
 
-          // Fetch ad-level data for creative variety analysis
+          // Fetch ad-level data for creative variety + fatigue analysis. `insights` requests
+          // both the current 14-day window and the prior 14-day window (as sibling fields with
+          // distinct aliases) so CTR-drop and CPM-rise can be measured against a real baseline —
+          // a single date_preset only gives a snapshot, not a delta.
           if (activeCampaigns.length > 0) {
+            const filtering = `[{"field":"campaign.id","operator":"IN","value":${JSON.stringify(activeCampaigns.map((c: any) => c.id))}}]`;
+            const insightsFields = 'spend,frequency,ctr,cpm';
             const adData = await fetchWithRetryAndPaging(
-              `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,creative{id,name},status,insights.date_preset(last_14d){spend}&filtering=[{"field":"campaign.id","operator":"IN","value":${JSON.stringify(activeCampaigns.map((c: any) => c.id))}}]&access_token=${accessToken}`
+              `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,creative{id,name},status,` +
+                `current_insights:insights.date_preset(last_14d){${insightsFields}},` +
+                `prior_insights:insights.time_range({"since":"${priorWindowStart}","until":"${priorWindowEnd}"}){${insightsFields}}` +
+                `&filtering=${filtering}&access_token=${accessToken}`
             );
             adLevelData = adData.data || [];
           }
@@ -328,7 +352,7 @@ export async function assessClientHealth(
       platforms: crmPlatforms,
     };
 
-    // --- Creative Variety Heuristic ---
+    // --- Creative Variety + Fatigue Detection ---
     const activeAds = adLevelData.filter((ad: any) => ad.status === 'ACTIVE');
     const distinctCreatives = new Set(
       activeAds.map((ad: any) => ad.creative?.id).filter(Boolean)
@@ -336,15 +360,36 @@ export async function assessClientHealth(
 
     // Compute spend distribution
     let cannibalizationWarning = false;
-    let fatigueWarning = false;
     const topCreatives: Array<{ id: string; name: string; spend_pct: number }> = [];
+    const fatiguedCreatives: Array<{
+      id: string;
+      name: string;
+      reasons: Array<'frequency' | 'ctr_drop' | 'cpm_rise'>;
+    }> = [];
 
     if (activeAds.length > 0) {
+      // Resolved once per assessment (not per-creative) — same thresholds apply to every
+      // creative in this ad account.
+      const adAccountIdForThresholds = client.adAccount || (metaAdAccounts[0]?.config as any)?.ad_account_id;
+      let resolvedThresholds: Record<string, { value: number; source: string }> = {};
+      if (adAccountIdForThresholds) {
+        try {
+          const storedThresholds = await getThresholdsForAccount('meta', adAccountIdForThresholds);
+          resolvedThresholds = resolveThresholds(storedThresholds);
+        } catch (err) {
+          // Non-fatal: fall back to no fatigue checks rather than failing the whole assessment.
+          console.error('Client health: Error resolving ads thresholds:', err);
+        }
+      }
+      const frequencyCritical = resolvedThresholds['creativeFatigue.frequencyCritical']?.value;
+      const ctrDropCriticalPct = resolvedThresholds['creativeFatigue.ctrDropCriticalPct']?.value;
+      const cpmRiseCriticalPct = resolvedThresholds['creativeFatigue.cpmRiseCriticalPct']?.value;
+
       const adSpends = activeAds.map((ad: any) => ({
         id: ad.id,
         name: ad.name,
         creativeId: ad.creative?.id,
-        spend: parseFloat(ad.insights?.data?.[0]?.spend || '0'),
+        spend: parseFloat(ad.current_insights?.data?.[0]?.spend || '0'),
       }));
 
       const totalSpend = adSpends.reduce((sum: number, a: any) => sum + a.spend, 0);
@@ -366,16 +411,54 @@ export async function assessClientHealth(
         }
       }
 
-      if (distinctCreatives <= 1) {
-        fatigueWarning = true;
+      // Per-creative fatigue checks against the resolved thresholds. `frequency` is an absolute
+      // ceiling; `ctr`/`cpm` need the prior-period baseline to express a drop/rise — creatives
+      // with no prior-period data (e.g. newly launched) skip those two checks, since there's no
+      // baseline to compare against.
+      for (const ad of activeAds) {
+        const reasons: Array<'frequency' | 'ctr_drop' | 'cpm_rise'> = [];
+        const cur = ad.current_insights?.data?.[0];
+        const prior = ad.prior_insights?.data?.[0];
+
+        const curFrequency = parseFloat(cur?.frequency || '0');
+        if (frequencyCritical !== undefined && curFrequency > frequencyCritical) {
+          reasons.push('frequency');
+        }
+
+        if (prior) {
+          const curCtr = parseFloat(cur?.ctr || '0');
+          const priorCtr = parseFloat(prior.ctr || '0');
+          if (ctrDropCriticalPct !== undefined && priorCtr > 0) {
+            const ctrDropPct = ((priorCtr - curCtr) / priorCtr) * 100;
+            if (ctrDropPct > ctrDropCriticalPct) {
+              reasons.push('ctr_drop');
+            }
+          }
+
+          const curCpm = parseFloat(cur?.cpm || '0');
+          const priorCpm = parseFloat(prior.cpm || '0');
+          if (cpmRiseCriticalPct !== undefined && priorCpm > 0) {
+            const cpmRisePct = ((curCpm - priorCpm) / priorCpm) * 100;
+            if (cpmRisePct > cpmRiseCriticalPct) {
+              reasons.push('cpm_rise');
+            }
+          }
+        }
+
+        if (reasons.length > 0) {
+          fatiguedCreatives.push({ id: ad.id, name: ad.name, reasons });
+        }
       }
     }
+
+    const fatigueWarning = fatiguedCreatives.length > 0;
 
     const creativeVariety: CreativeVariety = {
       distinct_creatives: distinctCreatives,
       cannibalization_warning: cannibalizationWarning,
       fatigue_warning: fatigueWarning,
       top_creatives: topCreatives,
+      fatigued_creatives: fatiguedCreatives,
     };
 
     // --- Overall Status ---
