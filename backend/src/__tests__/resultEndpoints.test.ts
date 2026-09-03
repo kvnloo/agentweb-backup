@@ -68,6 +68,10 @@ jest.mock('../config', () => ({
 // Mock runVerifiedChat
 jest.mock('../controllers/agentModeController', () => ({
   runVerifiedChat: jest.fn(),
+  // Mirrors the real isSessionBusyError's contract: real SessionBusyError instances carry
+  // `code: 'SESSION_BUSY'`.
+  isSessionBusyError: jest.fn((error: unknown) =>
+    typeof error === 'object' && error !== null && (error as any).code === 'SESSION_BUSY'),
 }));
 
 import { settingsService } from '../services/settingsService';
@@ -194,6 +198,55 @@ describe('Result Endpoints', () => {
           completionGate: true,
         })
       );
+    });
+
+    // ENG-1719: this session is freshly created for this exact request, so contention here
+    // is near-impossible in practice — but if it ever happens it's benign lock contention,
+    // not a real failure, and the fire-and-forget catch shouldn't log it as one. Unlike the
+    // other 4 SessionBusyError call sites, this path never paged on-call to begin with; the
+    // fix is just a log-level distinction (warn vs. error).
+    it('logs a session-busy skip at warn level, not error level, on lock contention', async () => {
+      const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockedRunVerifiedChat.mockRejectedValueOnce(
+        Object.assign(new Error('busy'), { code: 'SESSION_BUSY' }),
+      );
+
+      mockedSettings.getSetting.mockResolvedValue({
+        settingName: 'result-endpoints-config',
+        settingValue: JSON.stringify([sampleConfig]),
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'admin',
+      });
+      mockedChatbot.createChatSession.mockResolvedValue({
+        sessionId: 'test-session-123',
+        userId: 'anon_test',
+        messages: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      mockedChatbot.updateSessionResultEndpointMetadata.mockResolvedValue({} as any);
+      mockedChatbot.createOrReuseInteractiveShare.mockResolvedValue('http://localhost:5174/ishare/test-session-123?conversable=abc');
+      (mockedChatbot as any).updateSessionWorkPlan.mockResolvedValue({} as any);
+      mockedChatbot.updateSessionLlmModel.mockResolvedValue({} as any);
+      mockedAgentMode.getDefaultModel.mockResolvedValue('default-model');
+
+      await request(app)
+        .post('/r/gtm/trigger')
+        .send({ 'Company Name': 'Acme Corp', Industry: 'SaaS' })
+        .expect(200);
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      expect(consoleWarnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('skipped — session was busy with another generation in progress'),
+      );
+      expect(consoleErrorSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('failed'), expect.anything(),
+      );
+
+      consoleWarnSpy.mockRestore();
+      consoleErrorSpy.mockRestore();
     });
   });
 
