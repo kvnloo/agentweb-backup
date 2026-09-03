@@ -57,6 +57,8 @@ jest.mock('../services/slackService', () => {
     deleteSlackMessage: jest.fn().mockResolvedValue(undefined),
     getSlackUserDisplayName: jest.fn().mockResolvedValue('John Doe'),
     getSlackUserEmail: jest.fn().mockResolvedValue('operator@agentweb.pro'),
+    getSlackUserTeamId: jest.fn().mockResolvedValue(null),
+    getOwnSlackTeamId: jest.fn().mockResolvedValue('TAGENTWEB'),
     downloadSlackFile: jest.fn().mockResolvedValue(Buffer.from('file-content')),
   };
 });
@@ -78,7 +80,7 @@ const { userDb } = require('../services/db');
 const { settingsService } = require('../services/settingsService');
 const { chatbotDb } = require('../services/chatbotService');
 const { generateSessionResponse } = require('../controllers/agentModeController');
-const { postThreadResponse, postThinkingMessage, deleteSlackMessage, getSlackUserDisplayName, getSlackUserEmail } = require('../services/slackService');
+const { postThreadResponse, postThinkingMessage, deleteSlackMessage, getSlackUserDisplayName, getSlackUserEmail, getSlackUserTeamId, getOwnSlackTeamId } = require('../services/slackService');
 
 describe('Slack Events API', () => {
   let app: express.Application;
@@ -670,6 +672,7 @@ describe('Slack Events API', () => {
 
     it('rejects channel-link requests from unrelated Slack users', async () => {
       getSlackUserEmail.mockResolvedValue('outsider@example.com');
+      getSlackUserTeamId.mockResolvedValue('TCUSTOMER');
 
       const response = await request(app)
         .post('/api/slack/events')
@@ -693,6 +696,107 @@ describe('Slack Events API', () => {
         channel: 'C_BLOCKED',
         thread_ts: '1234567890.123456',
         text: expect.stringContaining('Only AgentWeb admins or the target account owner can link'),
+      }));
+    });
+
+    it('ENG-1294: falls back to team_id to authorize a link when the requester\'s own email fails to resolve (ENG-1263 pattern)', async () => {
+      // Mirrors the empirically-confirmed prod failure (ENG-1263): a verified AgentWeb admin's
+      // Slack profile.email fails to resolve via users.info (missing users:read.email scope or
+      // similar), even though team_id — which rides the same response but needs no extra scope —
+      // resolves fine. Without this fallback, nobody in that state could ever run the exact
+      // remedy command Emma's own failure message tells them to run.
+      settingsService.getSetting.mockResolvedValue(null);
+      getSlackUserEmail.mockResolvedValue(null);
+      getSlackUserTeamId.mockResolvedValue('TAGENTWEB');
+      userDb.getUserByEmail.mockResolvedValue({ userId: 'user-fangfang', email: 'ftan@agentweb.pro', slackChannels: [] });
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_FANGFANG',
+            text: '<@UEMMA123> for user ftan@agentweb.pro link this channel',
+            channel: 'C_GOTOMARKET',
+            ts: '1234567890.123456',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(userDb.getUserByEmail).toHaveBeenCalledWith('ftan@agentweb.pro');
+      expect(settingsService.setSetting).toHaveBeenCalledWith(
+        'slack_channel_mapping_C_GOTOMARKET',
+        'user-fangfang',
+        'Slack channel to userId mapping for channel C_GOTOMARKET',
+        'system'
+      );
+      expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+        channel: 'C_GOTOMARKET',
+        thread_ts: '1234567890.123456',
+        text: expect.stringContaining('Linked this channel to ftan@agentweb.pro'),
+      }));
+    });
+
+    it('ENG-1294: does not authorize a link via team_id when the requester is on a different workspace (no over-correction)', async () => {
+      // A Slack-Connect guest whose email also fails to resolve must not get authorized just
+      // because *some* team_id resolved — it has to match our own workspace's team_id.
+      getSlackUserEmail.mockResolvedValue(null);
+      getSlackUserTeamId.mockResolvedValue('TCUSTOMER');
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_GUEST',
+            text: '<@UEMMA123> for user matthew@agentweb.pro link to this channel',
+            channel: 'C_BLOCKED2',
+            ts: '1234567890.123456',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(userDb.getUserByEmail).not.toHaveBeenCalled();
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+      expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+        channel: 'C_BLOCKED2',
+        thread_ts: '1234567890.123456',
+        text: expect.stringContaining('Only AgentWeb admins or the target account owner can link'),
+      }));
+    });
+
+    it('ENG-1294: authorizes a link for a requester with a trusted @argusoft.com email', async () => {
+      settingsService.getSetting.mockResolvedValue(null);
+      getSlackUserEmail.mockResolvedValue('operator@argusoft.com');
+      userDb.getUserByEmail.mockResolvedValue({ userId: 'user-matthew', email: 'matthew@agentweb.pro', slackChannels: [] });
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_ARGUSOFT',
+            text: '<@UEMMA123> for user matthew@agentweb.pro link to this channel',
+            channel: 'C_ARGUSOFT',
+            ts: '1234567890.123456',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(userDb.getUserByEmail).toHaveBeenCalledWith('matthew@agentweb.pro');
+      expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+        channel: 'C_ARGUSOFT',
+        thread_ts: '1234567890.123456',
+        text: expect.stringContaining('Linked this channel to matthew@agentweb.pro'),
       }));
     });
 
