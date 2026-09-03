@@ -57,9 +57,12 @@ Rules: **read-only — never write to prod.** This is real customer data (PII): 
 the bug, but NEVER paste raw session/user/log data into commits, the PR, tests, or comments. Also
 never run a discovery/enumeration call — e.g. `aws secretsmanager list-secrets`, `aws dynamodb
 list-tables` — to see what exists. The runner's IAM role is least-privilege and does not grant
-enumeration, so these calls fail closed and trip an access-denied alarm (ENG-1510). The tables and
-secret paths you need are already named above, or documented by name in the relevant repo's
-CLAUDE.md — read a named resource directly (`get-item`, `get-secret-value`, etc.).
+enumeration, so these calls fail closed and trip an access-denied alarm (ENG-1510). The DynamoDB
+tables you need are already named above — read one directly with `get-item`. Never call
+`secretsmanager get-secret-value` to pull a secret's plaintext into your own context: no bug
+investigation needs the actual value, and anything you read here persists in this session's
+transcript. If a fix genuinely needs a secret's value, that's a human/deploy-tooling action, not
+something to fetch mid-investigation.
 
 ## What to do
 
