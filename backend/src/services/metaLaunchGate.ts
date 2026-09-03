@@ -77,6 +77,21 @@ const SPEND_ACTIONS = new Set(['CREATE', 'UPDATE', 'COPY_AD']);
  */
 export const META_LAUNCH_READ_MAX_MS = 240_000;
 
+/**
+ * Budget for the destination pre-flight, kept SEPARATE from the read budget above.
+ *
+ * The two phases must not share one wall. Sharing it bounds the total correctly and then starves
+ * whichever phase runs second: a 200s ad read left the pre-flight 40s, so a launch with a dozen
+ * destinations came back mostly `unverifiable` and was BLOCKED — a launch that would have
+ * succeeded before any of this, because the pre-flight simply took the time it needed. Trading a
+ * request that might overrun for a launch that certainly fails is the wrong trade.
+ *
+ * Separate budgets bound the total by construction instead: 240s of reads + 240s of pre-flight
+ * = 480s worst case, inside the 600s nginx `proxy_read_timeout` / ALB `IdleTimeout`, with margin.
+ * Neither phase can starve the other, and neither can run away.
+ */
+export const META_LAUNCH_PREFLIGHT_MAX_MS = 240_000;
+
 const NO_EXISTING_ADS_ACTIONS = new Set([
   'CAMPAIGN_CREATE',
   'AD_SET_CREATE',
@@ -768,9 +783,21 @@ export async function runMetaTrackingGate(
 
   if (destinationUrls.length === 0) return { proceed: true };
 
-  // Last phase of the same budget — see gateDeadlineAt. Destinations not reached in time come
-  // back `unverifiable`, which is the honest answer and blocks exactly as any other does.
-  const gate = await preflightMetaTrackingGate(destinationUrls, pixelIds, {}, gateDeadlineAt);
+  /*
+   * Its OWN budget, started here — deliberately not `gateDeadlineAt`.
+   *
+   * Sharing the read budget meant a slow ad read starved the pre-flight and turned "we could not
+   * check in time" into a block on a launch that was fine. See META_LAUNCH_PREFLIGHT_MAX_MS: the
+   * two budgets are sized so their sum stays inside the infra ceiling, so bounding each phase
+   * separately costs nothing and removes the starvation.
+   *
+   * Destinations still not reached within THIS budget come back `unverifiable`, which is honest
+   * and blocks as any other unverifiable does — but that now takes a genuinely pathological
+   * number of distinct destinations rather than merely a slow ad list.
+   */
+  const gate = await preflightMetaTrackingGate(
+    destinationUrls, pixelIds, {}, Date.now() + META_LAUNCH_PREFLIGHT_MAX_MS,
+  );
   const urlResults = gate.results.map(r => ({ url: r.url, status: r.status, mechanisms: r.mechanisms, error: r.error }));
 
   if (gate.ok) {
