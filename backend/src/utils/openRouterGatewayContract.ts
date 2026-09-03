@@ -30,6 +30,7 @@ const DIRECT_LOGICAL_MODEL_TO_OPENROUTER_ID: Readonly<Record<string, string>> = 
   'gemini-3.1-flash-lite': 'google/gemini-3.1-flash-lite',
   'gemini-3.5-flash': 'google/gemini-3.5-flash',
   'gemini-3.7-flash': 'google/gemini-3.7-flash',
+  'gemini-3.8-flash': 'google/gemini-3.8-flash',
   'anthropic.claude-sonnet-4-5-20250929-v1:0': 'anthropic/claude-sonnet-4.5',
   'anthropic.claude-sonnet-4-6': 'anthropic/claude-sonnet-4.6',
   'anthropic.claude-opus-4-6-v1': 'anthropic/claude-opus-4.6',

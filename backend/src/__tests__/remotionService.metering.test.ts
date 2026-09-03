@@ -147,4 +147,75 @@ describe('RemotionService.compose — ENG-699 metering', () => {
       })
     );
   });
+
+  it('records render_failed when the poll observes done but outputFile is missing', async () => {
+    mockGetRenderProgress.mockResolvedValue({ done: true, outputFile: undefined });
+
+    const result = await service.compose(baseParams() as any);
+
+    expect(result.success).toBe(false);
+    const operations = mockRecordVendorUsage.mock.calls.map(([ctx]) => ctx.operation);
+    expect(operations).toEqual(expect.arrayContaining(['render_submit', 'render_failed']));
+  });
+
+  it('records render_failed when renderMediaOnLambda itself throws (outer catch)', async () => {
+    mockRenderMediaOnLambda.mockRejectedValue(new Error('lambda invoke failed'));
+
+    const result = await service.compose(baseParams() as any);
+
+    expect(result.success).toBe(false);
+    const operations = mockRecordVendorUsage.mock.calls.map(([ctx]) => ctx.operation);
+    expect(operations).toEqual(expect.arrayContaining(['render_submit', 'render_failed']));
+    // Exactly one render_failed — no double-recording from the outer catch.
+    expect(operations.filter((op) => op === 'render_failed')).toHaveLength(1);
+  });
+
+  it('never throws into the outer catch when the metering rate lookup itself throws', async () => {
+    jest.resetModules();
+    jest.doMock('../utils/vendorRateCard', () => ({
+      computeAllocatedCost: jest.fn(() => {
+        throw new Error('missing rate: remotion.render');
+      }),
+    }));
+    jest.doMock('aws-sdk', () => ({
+      __esModule: true,
+      default: {
+        SecretsManager: jest.fn().mockImplementation(() => ({
+          getSecretValue: jest.fn().mockReturnValue({
+            promise: () =>
+              Promise.resolve({
+                SecretString: JSON.stringify({
+                  functionName: 'remotion-render-fn',
+                  serveUrl: 'https://example.com/serve',
+                  region: 'us-east-1',
+                }),
+              }),
+          }),
+        })),
+      },
+    }));
+    jest.doMock('../services/usageRecorderService', () => ({
+      recordVendorUsage: (...args: unknown[]) => mockRecordVendorUsage(...args),
+    }));
+    jest.doMock('@remotion/lambda/client', () => ({
+      renderMediaOnLambda: (...args: unknown[]) => mockRenderMediaOnLambda(...args),
+      getRenderProgress: (...args: unknown[]) => mockGetRenderProgress(...args),
+    }));
+
+    const { RemotionService: IsolatedRemotionService } = await import('../services/remotionService');
+    const isolatedService = new IsolatedRemotionService();
+    (isolatedService as any).ensureRemotionCredentials = jest.fn().mockResolvedValue(undefined);
+    mockGetRenderProgress.mockResolvedValue({ done: true, outputFile: 'https://out.example.com/final.mp4' });
+
+    const result = await isolatedService.compose(baseParams() as any);
+
+    // The render itself must still succeed — a broken rate card must not
+    // fail the render, only the recorded cost degrades to 0.
+    expect(result.success).toBe(true);
+    const submitCall = mockRecordVendorUsage.mock.calls.find(([ctx]) => ctx.operation === 'render_submit');
+    expect(submitCall![0].costUsd).toBe(0);
+
+    jest.dontMock('../utils/vendorRateCard');
+    jest.resetModules();
+  });
 });

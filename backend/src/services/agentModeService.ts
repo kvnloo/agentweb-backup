@@ -1344,9 +1344,15 @@ export class AgentModeService {
   // 2026-08-19 (Harsha, live picker review): Auto/default moved off Opus,
   // through GLM 5.2 and GPT-5.6 Luna, to Gemini 3.7 Flash — Google's newest
   // Flash-line model (GA 2026-08-13), cheap ($0.75/$3.75 per 1M, Google's own
-  // direct rate — not a multi-provider OpenRouter blend), and it dominates
+  // direct rate — not a multi-provider OpenRouter blend), and it dominated
   // every other model in the `gemini-flash` family band for band.
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.7-flash';
+  // 2026-09-02 (Harsha, in-session approval): moved again, from Gemini 3.7
+  // Flash to Gemini 3.8 Flash. Same family/tier/pricing, 3.8 dominates 3.7 on
+  // quality (59 vs 56) — the dominance system correctly auto-flagged 3.7
+  // legacy the moment 3.8 was added to the catalog, and leaving the default
+  // pinned to a legacy model would contradict AC2 of the acceptance suite
+  // this default has always carried (see agentModeService.defaultModel*.test.ts).
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.8-flash';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -2307,6 +2313,7 @@ export class AgentModeService {
     // vs 3.5's 'medium') and higher quality (56 vs 52) than 3.5 Flash, so 3.5
     // Flash is now correctly auto-flagged legacy.
     'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
+    'gemini-3.8-flash': { name: 'Gemini 3.8 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 59, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-8-flash (high)" page, snapshot 2026-09-02' },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,

@@ -160,30 +160,32 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       });
 
       /*
-       * SUPERSEDED again 2026-08-19 (Harsha, live picker review: default moved
-       * off Opus, through GLM 5.2 and GPT-5.6 Luna, to Gemini 3.7 Flash — see
-       * the comment above the default_model field and
-       * agentModeService.defaultModelGemini37Flash.test.ts). ENG-744's AC #5
+       * SUPERSEDED again 2026-09-02 (Harsha, in-session approval: Gemini 3.8
+       * Flash landed in the same family/tier as Gemini 3.7 Flash and beat it
+       * on quality, dominance correctly flagged 3.7 legacy, and leaving the
+       * pinned default on a legacy model contradicted its own AC2 — see the
+       * comment above the default_model field and
+       * agentModeService.defaultModelGemini38Flash.test.ts). ENG-744's AC #5
        * was "merely ADDING the Claude 5 family must not re-route the default"
        * — that guard is still the intent here: the default only moves by an
        * explicit, approved decision. This is that decision, so the expected
-       * value changes to Gemini 3.7 Flash while the guard itself is kept (it
+       * value changes to Gemini 3.8 Flash while the guard itself is kept (it
        * would still catch an accidental re-route caused by a future catalog
        * addition).
        */
-      it('AC #5 — default model only moves by explicit decision (now Gemini 3.7 Flash, 2026-08-19)', async () => {
+      it('AC #5 — default model only moves by explicit decision (now Gemini 3.8 Flash, 2026-09-02)', async () => {
         // `default_model` is a field initializer and
         // AZURE_OPENAI_DEPLOYMENT_AGENT_MODE takes precedence over the literal,
         // so any runner exporting a deployment override (backend/.env sets one)
         // silently defeated this guard — it asserted the environment rather than
         // the code. Establish the no-override state and construct AFTER clearing,
         // or the field is already resolved. Same reasoning as the suite in
-        // agentModeService.defaultModelGemini37Flash.test.ts.
+        // agentModeService.defaultModelGemini38Flash.test.ts.
         const envOverride = 'AZURE_OPENAI_DEPLOYMENT_AGENT_MODE';
         const savedOverride = process.env[envOverride];
         delete process.env[envOverride];
         try {
-          expect(new AgentModeService().default_model).toBe('gemini-3.7-flash');
+          expect(new AgentModeService().default_model).toBe('gemini-3.8-flash');
         } finally {
           if (savedOverride === undefined) {
             delete process.env[envOverride];
@@ -489,9 +491,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       it('does NOT mark the non-preview, non-dominated Gemini models legacy', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
-        // gemini-3.5-flash is deliberately excluded here — it's now correctly
-        // legacy, dominated band-for-band by gemini-3.7-flash (see above).
-        for (const id of ['gemini-3.1-flash-lite', 'gemini-3.7-flash']) {
+        // gemini-3.5-flash and gemini-3.7-flash are deliberately excluded here
+        // — 3.5 is legacy (dominated by 3.7), and 3.7 is now ALSO legacy
+        // (same `gemini-flash` family, same 'cheap' tier, but Gemini 3.8
+        // Flash beats it on quality: 59 vs 56 — see below).
+        for (const id of ['gemini-3.1-flash-lite']) {
           expect(models.find((m) => m.id === id)!.legacy).toBeUndefined();
         }
       });
@@ -541,10 +545,23 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(flash35.legacy).toBe(true);
       });
 
-      it('Gemini 3.7 Flash itself is never auto-flagged legacy — it is the dominator, not the dominated', async () => {
+      // Gemini 3.8 Flash (added 2026-09-02): same `gemini-flash` family, same
+      // 'cheap' tier as 3.7, higher quality (59 vs 56) — dominance flips 3.7
+      // from "the dominator" to "the dominated", same class of transition
+      // 3.5 Flash went through when 3.7 landed (see above).
+      it('flags Gemini 3.7 Flash as legacy — Gemini 3.8 Flash beats it on quality in the same tier', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         const flash37 = models.find((m) => m.id === 'gemini-3.7-flash')!;
-        expect(flash37.legacy).toBeUndefined();
+        const flash38 = models.find((m) => m.id === 'gemini-3.8-flash')!;
+        expect(flash38.qualityScore).toBeGreaterThan(flash37.qualityScore!);
+        expect(flash38.tier).toBe(flash37.tier);
+        expect(flash37.legacy).toBe(true);
+      });
+
+      it('Gemini 3.8 Flash itself is never auto-flagged legacy — it is the dominator, not the dominated', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const flash38 = models.find((m) => m.id === 'gemini-3.8-flash')!;
+        expect(flash38.legacy).toBeUndefined();
       });
 
       // Gemini 3.1 Flash Lite is a distinct "lightest/fastest" positioning
