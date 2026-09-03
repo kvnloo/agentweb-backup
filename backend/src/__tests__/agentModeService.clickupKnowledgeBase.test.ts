@@ -1,4 +1,13 @@
 import { AgentModeService } from '../services/agentModeService';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
+
+function makeAxiosError(status: number, message = 'Request failed') {
+  const err: any = new Error(message);
+  err.response = { status };
+  return err;
+}
 
 // Mock dependencies
 jest.mock('@google-cloud/storage');
@@ -656,6 +665,43 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       expect(result.success).toBe(true);
       const folderEntries = result.knowledge_bases.filter((kb: any) => kb.type === 'clickup-folder');
       expect(folderEntries).toHaveLength(0);
+    });
+  });
+
+  // ENG-1300: mirrors the "403s classify as auth/config end-to-end" blocks added
+  // for Google Drive/Docs/Sheets — proves the numeric status now rides along on
+  // the failure result so classifyToolErrorClass sees 'auth'/'config' instead of
+  // the generic Error/bug fallback.
+  describe('ENG-1300 — 403s classify as auth/config end-to-end', () => {
+    const expectAuthConfig = (result: any) => {
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    };
+
+    it('readClickUpSharedDoc', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockRejectedValue(makeAxiosError(403));
+      expectAuthConfig(
+        await (agentModeService as any).readClickUpSharedDoc('clickup:ws-1', 'My Doc', 'user-123')
+      );
+    });
+
+    it('readClickUpTask', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockRejectedValue(makeAxiosError(403));
+      expectAuthConfig(
+        await (agentModeService as any).readClickUpTask('clickup-tasks:ws-1', 'My Task', 'user-123')
+      );
+    });
+
+    it('writeClickUpDoc', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      mockCreateDoc.mockRejectedValue(makeAxiosError(403));
+      expectAuthConfig(
+        await (agentModeService as any).writeClickUpDoc('ws-1', 'New Doc', 'content', 'user-123')
+      );
     });
   });
 });

@@ -345,6 +345,27 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(result.message).toContain('Failed to post');
     });
 
+    // ENG-1300: the LinkedIn adapter attaches the real HTTP status as .code on
+    // its rethrown errors (see linkedInAdapter.test.ts) — prove it survives all
+    // the way through postOnConnectedAccount's own catch to the returned result,
+    // so classifyToolErrorClass sees 'auth' instead of the generic Error/bug.
+    it('ENG-1300 — carries the adapter-attached .code through to the result', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
+      const codedError: any = new Error('LinkedIn access token expired. Please reconnect your account.');
+      codedError.code = 401;
+      mockAdapter.createPost.mockRejectedValue(codedError);
+
+      const result = await service.postOnConnectedAccount(
+        'user-123',
+        'urn:li:organization:123456',
+        'Test content'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(401);
+    });
+
     it('does not create a LinkedIn post after its account disconnects', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
       mockGetAccountByIdConsistent.mockResolvedValue(null);

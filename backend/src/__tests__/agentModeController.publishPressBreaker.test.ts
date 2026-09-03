@@ -12,9 +12,13 @@ jest.mock('../services/subscriptionService', () => ({
   getAllowedFunctionCalls: jest.fn(async () => [
     'post_on_connected_account',
     'get_marketing_tips',
+    'save_memory',
     'create_work_plan',
     'modify_work_plan',
     'set_work_plan_status',
+    // ENG-930: both real reported schedules also require generate_image
+    // alongside post_on_connected_account.
+    'generate_image',
   ]),
   // runScheduledChat gates on the 'scheduled_chats' subscription feature before
   // it runs a turn. Without this the module mock returns undefined, the gate
@@ -206,15 +210,22 @@ describe('runScheduledChat — publish-press circuit breaker (ENG-947)', () => {
     expect((result as any).publishHeldForApproval).toBeUndefined();
   });
 
-  it('leaves NON-publish requirements on the full retry budget', async () => {
-    const readOnlySchedule = {
+  it('leaves a non-publish WRITE requirement on the full retry budget', async () => {
+    // save_memory is a write (it has an external side effect) but not publish-classified
+    // and not read-only, so NEITHER the ENG-947 publish breaker NOR the ENG-1297
+    // read-only breaker should touch it — this is the ENG-947 breaker's own scope
+    // boundary. (get_marketing_tips used to sit here, but it's read-only and is now
+    // deliberately capped early by the ENG-1297 breaker — see
+    // readOnlyPressCircuitBreaker.test.ts and the scheduledChat.test.ts coverage for
+    // that case.)
+    const nonPublishWriteSchedule = {
       ...publishSchedule,
-      requiredFunctionCalls: ['get_marketing_tips'],
+      requiredFunctionCalls: ['save_memory'],
     };
-    mockScheduleDb.getScheduleById.mockResolvedValue(readOnlySchedule as any);
+    mockScheduleDb.getScheduleById.mockResolvedValue(nonPublishWriteSchedule as any);
     mockWorker.runInWorker.mockResolvedValue(workerReply([], 'Here is a summary.') as any);
 
-    const result = await runScheduledChat(readOnlySchedule, 'kevin', true);
+    const result = await runScheduledChat(nonPublishWriteSchedule, 'kevin', true);
 
     expect(mockWorker.runInWorker).toHaveBeenCalledTimes(20);
     expect(result.attempt).toBe(20);
@@ -381,6 +392,162 @@ describe('runScheduledChat — publish-press circuit breaker (ENG-947)', () => {
 
     expect(mockWorker.runInWorker).toHaveBeenCalledTimes(20);
     expect((result as any).publishHeldForApproval).toBeUndefined();
+  });
+});
+
+/**
+ * ENG-930 — the ticket's own reported production X-posting schedules both
+ * require `['post_on_connected_account', 'generate_image']`. A run that holds the
+ * publish never generates an image for content that will not post either, so
+ * `generate_image` stays unmet forever too and `isPublishOnlyUnmet` never
+ * fires — see "leaves a MIXED requirement set on the full retry budget" above,
+ * which pins that as the (correct, for a CHEAP/reversible co-requirement)
+ * existing behavior.
+ *
+ * Once a schedule is explicitly unauthorized (owner turned ON "Require
+ * approval before publishing", or revoked a prior grant),
+ * `filterRequiredFunctionsToAuthorizedScope` (ENG-827) removes the publish
+ * tool from `requiredFunctions` ENTIRELY before the retry loop even starts —
+ * so `functionCallMisses` never contains a publish-shaped name at all in this
+ * configuration, and only `generate_image` is left, alone, forever unmet.
+ * That is the second, narrower door `publishExcludedFromScope` opens: this
+ * suite exercises it directly, the one actually reachable through
+ * `runScheduledChat` today (the sibling `explicitlyWithheld` +
+ * `hasUnmetPublishRequirement` path is covered at the unit level in
+ * publishPressCircuitBreaker.test.ts, for callers that verify authorization
+ * without this scoping filter).
+ */
+describe('runScheduledChat — publish tool excluded from scope entirely, mixed with a co-required prep call (ENG-930)', () => {
+  const mixedExcludedSchedule = {
+    ...publishSchedule,
+    scheduleId: 'schedule-930-excluded',
+    // Deterministic UNAUTHORIZED resolution, independent of the legacy
+    // grandfather default — the owner explicitly requires approval.
+    requirePublishApproval: true,
+    requiredFunctionCalls: ['post_on_connected_account', 'generate_image'],
+  };
+
+  const GENUINE_WITHHOLD = [
+    'Morning X post — drafted, held at the publish gate.',
+    'PUBLISH WITHHELD: this schedule requires approval before publishing.',
+  ].join(' ');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockChatbotDb.createChatSession.mockResolvedValue(session as any);
+    mockChatbotDb.getChatSession.mockResolvedValue(session as any);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([{ role: 'assistant', content: 'x' }]);
+    mockChatbotDb.updateSessionLlmModel.mockResolvedValue(session as any);
+    mockAgentModeService.getDefaultModel.mockResolvedValue('gpt-5-chat-2');
+    mockAgentModeService.getScheduledChatsDefaultModel.mockResolvedValue('gpt-5-chat-2');
+    mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
+    mockAgentModeService.generateSessionTitle.mockResolvedValue('Title');
+    (mockAgentModeService as any).generateScheduledChatSummary.mockResolvedValue('Post Drafted');
+    mockScheduleDb.addRunResult.mockResolvedValue(undefined as any);
+    mockScheduleDb.getScheduleById.mockResolvedValue(mixedExcludedSchedule as any);
+    mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([] as any);
+    mockScheduleDb.updateScheduleAfterRun.mockResolvedValue(undefined as any);
+  });
+
+  it('PRE-FIX REPRODUCTION: without a genuine marker, still presses the excluded-publish-plus-prep mix to the full 20', async () => {
+    mockWorker.runInWorker.mockResolvedValue(workerReply([], REFUSAL) as any);
+
+    const result = await runScheduledChat(mixedExcludedSchedule, 'kevin', true);
+
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(20);
+    expect(result.functionCallMisses).toEqual(['generate_image']);
+    expect((result as any).publishHeldForApproval).toBeUndefined();
+  });
+
+  it('FIX: a genuine PUBLISH WITHHELD marker stops the run immediately instead of pressing generate_image to 20', async () => {
+    mockWorker.runInWorker.mockResolvedValue(workerReply([], GENUINE_WITHHOLD) as any);
+
+    const result = await runScheduledChat(mixedExcludedSchedule, 'kevin', true);
+
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+    expect(result.attempt).toBe(1);
+    expect(result.functionCallMisses).toEqual(['generate_image']);
+    expect((result as any).publishHeldForApproval).toBe(true);
+    expect(result.status).toBe('failure');
+  });
+
+  it('persists the held-for-approval marker on the stored run result', async () => {
+    mockWorker.runInWorker.mockResolvedValue(workerReply([], GENUINE_WITHHOLD) as any);
+
+    await runScheduledChat(mixedExcludedSchedule, 'kevin', false);
+
+    expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith(
+      'schedule-930-excluded',
+      expect.objectContaining({ publishHeldForApproval: true, status: 'failure' })
+    );
+  });
+
+  it('a NON-genuine marker (schedule actually resolves authorized) does not exempt the run', async () => {
+    // Same marker text, but this schedule is NOT unauthorized — the marker is
+    // model-authored text and must not be trusted on its own (Greptile review #20).
+    const authorizedSchedule = {
+      ...mixedExcludedSchedule,
+      scheduleId: 'schedule-930-authorized',
+      requirePublishApproval: false,
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
+    };
+    mockScheduleDb.getScheduleById.mockResolvedValue(authorizedSchedule as any);
+    mockWorker.runInWorker.mockResolvedValue(workerReply([], GENUINE_WITHHOLD) as any);
+
+    const result = await runScheduledChat(authorizedSchedule, 'kevin', true);
+
+    // Authorized, so post_on_connected_account is NOT excluded from scope and
+    // stays genuinely unmet alongside generate_image — a mixed, non-publish-only
+    // set that the (correctly unexempted) marker must not short-circuit.
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(20);
+    expect((result as any).publishHeldForApproval).toBeUndefined();
+  });
+
+  /**
+   * CodeRabbit review (ENG-930): `publishRequirementExcludedFromScope` must be
+   * recomputed against the CURRENT `requiredFunctions` every attempt, not
+   * resolved once at admission — `requiredFunctions` narrows again mid-run
+   * (ENG-827) when the owner revokes consent. A run admitted AUTHORIZED (both
+   * tools required) that then has consent revoked mid-run must have the
+   * exclusion become true THAT turn, not stay stuck at a stale `false` from
+   * admission — otherwise it presses generate_image to the full budget even
+   * though the schedule is no longer authorized to publish.
+   */
+  it('CodeRabbit review: authorization revoked MID-RUN still excludes the publish tool that turn, instead of pressing generate_image to 20', async () => {
+    const startsAuthorizedSchedule = {
+      ...publishSchedule,
+      scheduleId: 'schedule-930-revoked-midrun',
+      // No explicit autopublishAuthorized/requirePublishApproval: the legacy
+      // grandfather default resolves this AUTHORIZED at admission because
+      // requiredFunctionCalls names a publish tool.
+      requiredFunctionCalls: ['post_on_connected_account', 'generate_image'],
+    };
+    const revokedSchedule = { ...startsAuthorizedSchedule, autopublishAuthorized: false };
+
+    // The live schedule read backs BOTH refreshPublishAuthorization (checked
+    // at the top of every attempt) and the marker-genuineness check (checked
+    // after every response that looks like a withhold) — both resolve
+    // AUTHORIZED for attempt 1's pair of reads, then REVOKED from then on,
+    // simulating the owner revoking consent partway through the run.
+    let getScheduleCalls = 0;
+    mockScheduleDb.getScheduleById.mockImplementation(async () => {
+      getScheduleCalls++;
+      return (getScheduleCalls <= 2 ? startsAuthorizedSchedule : revokedSchedule) as any;
+    });
+    mockWorker.runInWorker.mockResolvedValue(workerReply([], GENUINE_WITHHOLD) as any);
+
+    const result = await runScheduledChat(startsAuthorizedSchedule, 'kevin', true);
+
+    // Attempt 1 ran while still authorized — the marker isn't genuine yet and
+    // both tools are still required, so nothing stops the run early. Attempt
+    // 2 sees the revocation: post_on_connected_account drops out of scope,
+    // the marker becomes genuine, and the run stops THAT turn instead of
+    // pressing the now-orphaned generate_image requirement to attempt 20.
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(2);
+    expect(result.attempt).toBe(2);
+    expect((result as any).publishHeldForApproval).toBe(true);
+    expect(result.status).toBe('failure');
   });
 });
 

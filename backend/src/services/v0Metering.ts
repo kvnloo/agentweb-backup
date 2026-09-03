@@ -24,13 +24,31 @@
  *
  * ## Cost
  *
- * v0 returns no per-call price — only `.id` is read from the response — so every
- * entry is `costSource: "allocated"` with no dollar figure, per AC6. When a rate
- * card lands, only this file changes. `v0BillingService`'s account-level balance
- * is a periodic drift check, never a per-call cost.
+ * v0's RESPONSE carries no price — only `.id` is read from it. That is exactly
+ * what an allocated rate is for, and one already exists: `vendorRateCard.ts`
+ * prices `v0.landing_page_generation` at $2.00/generation (ENG-703, approved
+ * 2026-08-16), and that module states no adapter may embed its own dollar
+ * literal for a vendor it covers.
+ *
+ * AC6 asks for the cost to be reported as ALLOCATED, which per ENG-700 means
+ * "0 or more real dollars from a known rate" — as opposed to "unpriced", which
+ * means 0 because the rate is missing. An earlier revision of this file recorded
+ * `allocated` with NO figure, which collapses those two into the worst reading:
+ * confirmed-free spend from a known rate. The rate is read from the card here.
+ *
+ * If the card ever loses the entry, this degrades to `unpriced` rather than
+ * booking a silent $0 — ENG-700's signal — instead of throwing, because metering
+ * must never fail a render the vendor has already been paid for.
+ *
+ * `v0BillingService`'s account-level balance stays a periodic drift check, never
+ * a per-call cost.
  */
 
 import { recordVendorUsage } from "./usageRecorderService";
+import { getAllocatedRate } from "../utils/vendorRateCard";
+
+/** The card key for a v0 landing-page generation (ENG-703). */
+const V0_RATE_KEY = "landing_page_generation";
 
 export type V0Operation =
   | "chat_create"
@@ -62,6 +80,8 @@ export function recordV0Call(ctx: V0MeterContext): void {
   // fail a generation the vendor has already been paid for. The try/catch is what
   // makes "metering never breaks generation" true rather than intended.
   try {
+    // Read, never embed. A rate change must stay a one-line edit in the card.
+    const rate = getAllocatedRate("v0", V0_RATE_KEY);
     void recordVendorUsage({
       userId: ctx.userId,
       billingUserId: ctx.billingUserId,
@@ -71,8 +91,10 @@ export function recordV0Call(ctx: V0MeterContext): void {
       feature: "landing_page",
       unit: "generation",
       quantity: 1,
-      // AC6 — allocated for as long as v0 returns no per-call price.
-      costSource: "allocated",
+      ...(rate === null
+        ? // The card lost the entry: make it loud rather than book a silent $0.
+          { costSource: "unpriced" as const }
+        : { costSource: "allocated" as const, costUsd: rate }),
     });
   } catch {
     // Deliberately silent: usageRecorderService already throttles its own failure

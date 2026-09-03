@@ -104,6 +104,13 @@ const HAIKU_4_5_PRICE = withDerivedCache(1, 5);
 // over-bills 4x. cacheWritePerM is left on the standard 125%-of-input
 // convention (Anthropic did not publish a changed write rate).
 const FABLE_5_1_PRICE: ModelPrice = { ...withDerivedCache(10, 50), cacheReadPerM: 0.25 };
+// Gemini 3.8 Flash (released 2026-09-02): same $0.75/$3.75 base rate as
+// Gemini 3.7 Flash, confirmed live on openrouter.ai 2026-09-02. Cache-read
+// follows the standard 10%-of-input convention ($0.075/1M — matches live).
+// Cache-write does NOT: OpenRouter reports $0.041667/1M live, ~22x lower
+// than the derived 125%-of-input rate ($0.9375/1M) — override required or
+// every Gemini 3.8 Flash cache-write call overbills ~22x.
+const GEMINI_3_8_FLASH_PRICE: ModelPrice = { ...withDerivedCache(0.75, 3.75), cacheWritePerM: 0.041667 };
 
 /**
  * Token-priced models. Sources:
@@ -167,6 +174,7 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // Google's official introductory rate (ai.google.dev), verified live 2026-08-19.
   // Scheduled to increase to $1.50/$7.50 on 2027-01-01 — not modeled here yet.
   'gemini-3.7-flash': withDerivedCache(0.75, 3.75),
+  'gemini-3.8-flash': GEMINI_3_8_FLASH_PRICE,
   'gemini-2.5-flash': withDerivedCache(0.3, 2.5), // text/chat model — was MISSING (recorded $0)
   'gemini-3.1-flash-live-preview': withDerivedCache(0.75, 4.5), // $0.75/$4.50 text tokens — verified (langcopilot/cloudprice, 2026). SCOPE: audio/video tokens on the Live API bill at higher per-modality rates not modeled here; this is the text-token approximation used for cost metering.
   // Deep Research agents (Gemini) report usage via usageMetadata and run on

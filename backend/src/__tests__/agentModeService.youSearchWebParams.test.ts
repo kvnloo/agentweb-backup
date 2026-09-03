@@ -55,6 +55,14 @@ describe('youSearchWeb freshness + includeDomains threading (ENG-383)', () => {
     }));
   });
 
+  it('threads the Emma session owner into the paid provider request', async () => {
+    await service.youSearchWeb('owned research', 5, undefined, undefined, 'user-1');
+
+    expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'user-1', purpose: 'agent_research',
+    }));
+  });
+
   it('omitting the new params keeps the provider request identical to before', async () => {
     await service.youSearchWeb('agentweb pricing page', 5);
 
@@ -109,7 +117,7 @@ describe('youSearchWeb freshness + includeDomains threading (ENG-383)', () => {
         { userId: 'u1' },
       );
 
-      expect(spy).toHaveBeenCalledWith('this week reddit ai agents', 5, 'week', ['reddit.com']);
+      expect(spy).toHaveBeenCalledWith('this week reddit ai agents', 5, 'week', ['reddit.com'], 'u1');
       spy.mockRestore();
     });
   });

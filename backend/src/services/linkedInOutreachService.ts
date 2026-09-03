@@ -159,6 +159,14 @@ export class LinkedInOutreachService {
       ? new Error(structuredError.message)
       : (error instanceof Error ? error : new Error(structuredError.message));
     (enhancedError as any).structuredError = structuredError;
+    // ENG-1300: classifyToolErrorClass (and toolResultError's reconstruction)
+    // only look at a top-level .status/.statusCode/.code — structuredError.status
+    // computed above is nested and invisible to them, so every caller through
+    // handleError classified as generic Error/bug regardless of the real HTTP
+    // status. Mirror it to the top level so all of them pick it up at once.
+    if (!Number.isNaN(status)) {
+      (enhancedError as any).code = status;
+    }
     throw enhancedError;
   }
 

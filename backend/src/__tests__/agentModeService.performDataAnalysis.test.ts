@@ -1193,6 +1193,29 @@ describe('formatToolError for perform_data_analysis', () => {
       expect(result).not.toContain('Adjust the plan or ask the user for missing info');
     });
 
+    // ENG-1672 (code review follow-up): the controller throws 3 distinct
+    // "too large to save" message shapes (the one above, plus these two) — all
+    // must hit this branch, not just the first one a test happened to cover.
+    it('returns size-block guidance for the run-history-shed variant of the too-large-to-save error', () => {
+      const result = (svc as any).formatToolError(
+        'manage_scheduled_chat',
+        "Scheduled chat is too large to save — fitting it under DynamoDB's 400KB per-item limit would mean dropping 3 saved runs from this schedule's history at once. The starting message is 10240 characters — shorten it and try again."
+      );
+      expect(result).toContain('get_scheduled_chat_storage_diagnostics');
+      expect(result).toMatch(/not.*transient|NOT a transient/i);
+      expect(result).not.toContain('Adjust the plan or ask the user for missing info');
+    });
+
+    it('returns size-block guidance for the plain over-the-ceiling variant of the too-large-to-save error', () => {
+      const result = (svc as any).formatToolError(
+        'manage_scheduled_chat',
+        "Scheduled chat is too large to save — it exceeds DynamoDB's 400KB per-item limit. Shorten the starting message and try again."
+      );
+      expect(result).toContain('get_scheduled_chat_storage_diagnostics');
+      expect(result).toMatch(/not.*transient|NOT a transient/i);
+      expect(result).not.toContain('Adjust the plan or ask the user for missing info');
+    });
+
     // ENG-1672: a bare connection-level failure (e.g. the self-call's "fetch
     // failed") gives no HTTP response at all, so the write's outcome is unknown —
     // it may have already applied. The model must check current state instead of

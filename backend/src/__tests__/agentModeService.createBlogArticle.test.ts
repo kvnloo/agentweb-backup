@@ -451,6 +451,48 @@ describe('AgentModeService - create_blog_article function', () => {
       expect(result.error).toBe('S3 upload failed');
     });
 
+    // ENG-1300: uploadFileToS3 now exposes AWS SDK v2's numeric statusCode;
+    // prove it survives the nested rethrow to createBlogArticle's own catch.
+    it('ENG-1300: a coded S3 upload failure classifies as auth/config end-to-end', async () => {
+      const mockBlogData = {
+        title: 'Test Title',
+        description: 'Test description',
+        content: 'Test content',
+        imagePrompt: 'Test prompt'
+      };
+
+      mockGenerateBlogContent.mockResolvedValue(mockBlogData);
+      mockGenerateBlogImage.mockResolvedValue({
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png'
+      });
+      mockGenerateBlogHtml.mockReturnValue('<html>Test</html>');
+      mockUploadFileToS3.mockResolvedValue({
+        success: false,
+        error: 'Access Denied',
+        statusCode: 403,
+      });
+
+      const result = await (agentModeService as any).createBlogArticle(
+        'Test Title Draft',
+        '# Test Content Draft',
+        'medium',
+        '',
+        '',
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(403);
+      const { toolResultError } = await import('../utils/toolResultError');
+      const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+      const { classifyToolFailureType } = await import('../utils/toolFailureType');
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    });
+
     it('should handle exceptions during blog creation', async () => {
       mockGenerateBlogContent.mockRejectedValue(new Error('Network error'));
 

@@ -40,6 +40,9 @@ jest.mock('../utils/secretsManager', () => ({
 import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { userDb } from '../services/db';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 describe('AgentModeService - Meta Upload and Advanced Operations', () => {
   let agentModeService: AgentModeService;
@@ -169,6 +172,36 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
           error_user_msg: 'The image dimensions exceed the maximum allowed.',
           classification: 'VALIDATION_ERROR',
         });
+      });
+
+      // ENG-1300: uploadMetaAdsImage already surfaces Meta's structuredError as
+      // `meta_error` (asserted above). This proves the ADDED top-level `code` is
+      // the real HTTP status (error.status, SDK-shaped) living ALONGSIDE
+      // meta_error, never sourced from meta_error.code (Meta's business code —
+      // note the case above uses code 100, a validation code, while THIS case's
+      // real transport status is 403; they must not be confused with each other).
+      it('ENG-1300: a 403 (error.status) rides alongside the existing meta_error, classifies as auth/config', async () => {
+        const imageUrl = 'https://example.com/no-permission.png';
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (axios.get as jest.Mock).mockResolvedValue({ data: Buffer.from('image data') });
+
+        const err: any = new Error('Insufficient permission to upload to this ad account');
+        err.status = 403;
+        err.structuredError = {
+          code: 200,
+          classification: 'PERMISSION_ERROR',
+        };
+        (metaService.uploadImage as jest.Mock).mockRejectedValue(err);
+
+        const result = await agentModeService.uploadMetaAdsImage('user123', imageUrl);
+
+        expect(result.success).toBe(false);
+        expect(result.code).toBe(403);
+        expect(result.meta_error).toEqual({ code: 200, classification: 'PERMISSION_ERROR' });
+        const classified = toolResultError(result);
+        expect(classifyToolErrorClass(classified)).toBe('auth');
+        expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
       });
     });
 
@@ -353,6 +386,49 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
 
         expect(result.success).toBe(false);
         expect(result.message).toBe('Network timeout');
+      });
+
+      // ENG-1300: SDK-shaped error — metaService.handleError rethrows the original
+      // FacebookRequestError, so its `.status` is the real HTTP status.
+      it('ENG-1300: a 401 (error.status) classifies as auth/config end-to-end', async () => {
+        const sdkError: any = new Error('Error validating access token');
+        sdkError.status = 401;
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.createCustomAudience as jest.Mock).mockRejectedValue(sdkError);
+
+        const result = await agentModeService.manageMetaCustomAudiences('user123', 'CREATE', '123456789', {
+          action: 'create', name: 'X', subtype: 'CUSTOM',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.code).toBe(401);
+        const classified = toolResultError(result);
+        expect(classifyToolErrorClass(classified)).toBe('auth');
+        expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+      });
+
+      // ENG-1300 misclassification trap: the sibling test above ("surfaces the
+      // friendly error_user_msg...") uses a structuredError.code of 200 — a Meta
+      // PERMISSION_ERROR business code, not an HTTP status — and carries no real
+      // `.status` at all. `code` on the result must stay unset rather than being
+      // silently backfilled from that business code.
+      it('ENG-1300: a Meta business error code (structuredError.code) alone leaves `code` unset', async () => {
+        const sdkError: any = new Error('Permissions error');
+        sdkError.structuredError = {
+          message: 'Permissions error',
+          code: 200,
+          error_subcode: 1870090,
+          classification: 'PERMISSION_ERROR',
+        };
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.createCustomAudience as jest.Mock).mockRejectedValue(sdkError);
+
+        const result = await agentModeService.manageMetaCustomAudiences('user123', 'CREATE', '123456789', {
+          action: 'create', name: 'X', subtype: 'CUSTOM',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.code).toBeUndefined();
       });
     });
 
@@ -580,6 +656,23 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
 
         expect(result.success).toBe(false);
         expect(result.message).toBe('Invalid search type');
+      });
+
+      // ENG-1300: searchAdTargeting was found outside the original audit (its name
+      // has no "Meta" in it) — same SDK-shaped-error rule applies.
+      it('ENG-1300: a 403 (error.status) classifies as auth/config end-to-end', async () => {
+        const sdkError: any = new Error('Insufficient permission for targeting search');
+        sdkError.status = 403;
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.searchTargeting as jest.Mock).mockRejectedValue(sdkError);
+
+        const result = await agentModeService.searchAdTargeting('user123', '123456789', 'test', 'adinterest');
+
+        expect(result.success).toBe(false);
+        expect(result.code).toBe(403);
+        const classified = toolResultError(result);
+        expect(classifyToolErrorClass(classified)).toBe('auth');
+        expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
       });
 
       it('should use specified account_id when provided', async () => {
