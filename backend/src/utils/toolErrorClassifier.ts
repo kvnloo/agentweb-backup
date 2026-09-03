@@ -13,7 +13,8 @@
  *   timeout | auth | rate_limit | quota_exceeded | invalid_args | not_found |
  *   network | upstream_5xx | policy_blocked | repeated_failure |
  *   tool_unavailable | upstream_rejected | empty_result | invalid_output |
- *   subscription_blocked | truncated_response | read_incomplete | read_bounded
+ *   subscription_blocked | truncated_response | read_incomplete | read_bounded |
+ *   scope_refused
  *
  * The three trailing classes were added 2026-06-14 after a 7-day production
  * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
@@ -89,6 +90,40 @@ function classFromMessage(message: string): string | null {
   // session-wide media budget (ENG-1220).
   if (/insufficient_quota|exceeded your current quota|quota exceeded|check your plan and billing/.test(m)) return 'quota_exceeded';
 
+  /*
+   * A read that did not finish is NOT evidence of absence — and until this branch existed, the
+   * classifier said the opposite of the message it was appended to.
+   *
+   * These messages are ours, and every one of them exists to REFUSE an absence conclusion:
+   * "Do NOT report the file as absent", "this is not a confirmed absence", "this is a FAILED
+   * read". Unclassified, they fell to `not_found` (whose next step is "the target was not
+   * found") or, once main widened the `invalid_args` regex with `is too large`, to "fix the
+   * arguments" for a filename that was never wrong. The verdict is appended AFTER the warning,
+   * so it is the last thing the model reads — ENG-1584 reintroduced through the one channel
+   * this PR had not checked.
+   *
+   * Checked ahead of not_found, invalid_args AND the embedded-status regex below for that
+   * reason. That regex matches any whitespace-preceded 3-digit 4xx/5xx-shaped number — including
+   * one interpolated from a FOLDER OR FILE NAME. "Landing 404 Copy.docx" classified not_found and
+   * appended "the target was not found" directly beneath "Do NOT report the file as absent";
+   * "Studio 403 Shared" appended "reconnect the account" beneath "NOT a permissions problem";
+   * "Creative 500x500.png" — an everyday ad dimension in this product — appended "Retryable: yes"
+   * to a deterministic bound. Being ahead of not_found was not enough while the regex that
+   * defeats it ran first.
+   */
+  if (/do not report the file as absent|not a confirmed absence|this is a failed read|rate-limiting this account|rate-limited the scan/.test(m)) {
+    /*
+     * Two sub-cases, and they need OPPOSITE verdicts.
+     *
+     * A wall-clock/scope bound is deterministic — the message itself says "Do NOT retry this
+     * same call ... a tree this large will stop in the same place every time" — so a
+     * `Retryable: yes` beneath it is the same contradiction one level down. A throttle or a
+     * transient page failure clears on its own and must stay retryable.
+     */
+    if (/do not retry this same call|stop in the same place every time/.test(m)) return 'read_bounded';
+    return 'read_incomplete';
+  }
+
   // HTTP status embedded in the message ("status code 429", "503 Service…").
   const statusMatch = m.match(/(?:status(?:\s+code)?\s+|^|\s)([45]\d{2})(?:\s|$|[^\d])/);
   if (statusMatch) {
@@ -112,32 +147,19 @@ function classFromMessage(message: string): string | null {
    * a fabricated result (ENG-1625: a "UTM Tagging Audit Summary — PASS, 6/6 tagged" produced by
    * a tool that never ran). Both strings below are ours, emitted by installSkills.
    */
+
   /*
-   * A read that did not finish is NOT evidence of absence — and until this branch existed, the
-   * classifier said the opposite of the message it was appended to.
+   * An ad-account scope refusal. Unclassified it fell to the legacy `Error` class, whose default
+   * next step ends "...use a different tool" — and for a SCOPE refusal the available different
+   * tool is the unscoped account-wide list, i.e. widening exactly the read whose scope was just
+   * refused. The transient sibling ("could not verify ... please retry") additionally got "do NOT
+   * retry" appended over its own "please retry".
    *
-   * These messages are ours, and every one of them exists to REFUSE an absence conclusion:
-   * "Do NOT report the file as absent", "this is not a confirmed absence", "this is a FAILED
-   * read". Unclassified, they fell to `not_found` (whose next step is "the target was not
-   * found") or, once main widened the `invalid_args` regex with `is too large`, to "fix the
-   * arguments" for a filename that was never wrong. The verdict is appended AFTER the warning,
-   * so it is the last thing the model reads — ENG-1584 reintroduced through the one channel
-   * this PR had not checked.
-   *
-   * Checked ahead of not_found and invalid_args for that reason.
+   * Keyed on the marker `assertOwnedByAccount` guarantees on every branch, and on the
+   * unverifiable-lookup wording that deliberately does NOT carry it.
    */
-  if (/do not report the file as absent|not a confirmed absence|this is a failed read|rate-limiting this account|rate-limited the scan/.test(m)) {
-    /*
-     * Two sub-cases, and they need OPPOSITE verdicts.
-     *
-     * A wall-clock/scope bound is deterministic — the message itself says "Do NOT retry this
-     * same call ... a tree this large will stop in the same place every time" — so a
-     * `Retryable: yes` beneath it is the same contradiction one level down. A throttle or a
-     * transient page failure clears on its own and must stay retryable.
-     */
-    if (/do not retry this same call|stop in the same place every time/.test(m)) return 'read_bounded';
-    return 'read_incomplete';
-  }
+  if (/is not available in the selected ad account/.test(m)) return 'scope_refused';
+  if (/could not verify the requested .* against the selected ad account/.test(m)) return 'upstream_5xx';
 
   if (/not available with your current subscription|capability is not on their plan/.test(m)) return 'subscription_blocked';
   // Bad skill ids from the model — an argument problem, not a plan problem.

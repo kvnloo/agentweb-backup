@@ -65,6 +65,10 @@ export const FAST_TRIP_ERROR_CLASSES: ReadonlySet<string> = new Set([
   'invalid_output',
   'policy_blocked',
   'subscription_blocked',
+  'scope_refused',
+  // finding 8: the one non-retryable class that was missing, on the class whose whole meaning is
+  // "an identical retry is known-pointless".
+  'read_bounded',
 ]);
 
 export function isRetryableErrorClass(errorClass: string): boolean {
@@ -91,6 +95,7 @@ const NEXT_STEP_BY_CLASS: Record<string, string> = {
    * is no alternative tool that produces this tool's result, and saying "use a different tool"
    * here is what turns a refusal into a fabricated answer (ENG-1625).
    */
+  scope_refused: 'the requested object is not in the selected ad account. Do NOT retry it, and do NOT fall back to an account-wide or unscoped list — widening the read is precisely what this refusal prevents. Select the ad account that owns the object, or tell the user it is not available in the one they are using.',
   read_bounded: 'the read stopped at a fixed scope or time bound and will stop in the same place every time, so retrying the identical call cannot help — and it is NOT evidence that anything is absent; never report an item as missing based on it. Narrow the scope instead: a specific sub-folder, campaign or ad set, or ask the user for a direct link.',
   read_incomplete: 'the read did not finish, so it is NOT evidence that anything is absent — never report an item as missing based on this result. If it was throttled or failed transiently, wait briefly and retry ONCE; if it stopped at a scope or budget bound, narrow the scope (a specific folder, campaign or ad set, or ask the user for a direct link) rather than repeating the identical call.',
   subscription_blocked: 'the required skill is not included in the user\'s subscription. Do NOT retry it and do NOT substitute another tool — tell the user plainly that this capability is not on their plan.',

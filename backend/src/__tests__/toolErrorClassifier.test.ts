@@ -216,6 +216,28 @@ describe('classifyToolErrorClass', () => {
     ))).toBe('read_incomplete');
   });
 
+  /*
+   * A file or folder NAME must not change the verdict.
+   *
+   * The embedded-status regex matches any whitespace-preceded 3-digit 4xx/5xx-shaped number, and
+   * these messages interpolate ${fileName}/${rootName}. It ran before the incomplete-read branch,
+   * so "Landing 404 Copy.docx" classified not_found and appended "the target was not found"
+   * directly beneath "Do NOT report the file as absent" — ENG-1584 restored by a customer's
+   * choice of filename. "Creative 500x500.png" is an everyday ad dimension in this product.
+   */
+  it.each([
+    'Client Assets',
+    'Landing 404 Copy.docx',
+    'Studio 403 Shared',
+    'Creative 500x500.png',
+    'Fortune 500 Clients',
+  ])('a name containing a status-shaped number does not hijack the class (%s)', (name) => {
+    const msg =
+      `File "${name}" was not found, but Google Drive rate-limited the scan of folder "${name}". `
+      + 'Wait a minute and try again. Do NOT report the file as absent.';
+    expect(classifyToolErrorClass(err(msg))).toBe('read_incomplete');
+  });
+
   it('separates a DETERMINISTIC bound, which must not be retried, from a transient one', () => {
     // The capped-search message says "Do NOT retry this same call ... will stop in the same
     // place every time". A Retryable: yes beneath that is the same contradiction one level down.
