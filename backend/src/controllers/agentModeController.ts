@@ -934,6 +934,50 @@ export function releaseSessionGeneration(sessionId: string): void {
 }
 
 /**
+ * ENG-1696: thrown when a caller could not claim a session's generation lock
+ * even after claimSessionGenerationWithRetry's bounded wait — i.e. the session
+ * was continuously busy for the whole retry window. `code` mirrors the shape
+ * of /generate's own busy rejection so callers can render the same message.
+ */
+export class SessionBusyError extends Error {
+  code = 'SESSION_BUSY';
+  constructor(sessionId: string) {
+    super(`Session ${sessionId} is busy — a generation is already in progress.`);
+    this.name = 'SessionBusyError';
+  }
+}
+
+export function isSessionBusyError(error: unknown): boolean {
+  return error instanceof SessionBusyError
+    || (typeof error === 'object' && error !== null && (error as any).code === 'SESSION_BUSY');
+}
+
+/**
+ * ENG-1696: claim the generation lock, retrying with a short backoff if it's
+ * currently held, instead of failing on the first collision. /generate and
+ * /verified-generate can legitimately be triggered on the same session close
+ * together (e.g. a live chat turn and an Images/Videos/ResearchReports report
+ * generation) — a brief wait absorbs that overlap instead of instantly
+ * rejecting (or, before this fix, silently letting both write `workPlan`
+ * unguarded and corrupting whichever wrote second). Exported so tests can
+ * override the timing.
+ */
+export async function claimSessionGenerationWithRetry(
+  sessionId: string,
+  { retries = 6, delayMs = 2000 }: { retries?: number; delayMs?: number } = {},
+): Promise<boolean> {
+  for (let i = 0; i <= retries; i++) {
+    if (tryClaimSessionGeneration(sessionId)) {
+      return true;
+    }
+    if (i < retries) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  return false;
+}
+
+/**
  * ENG-1189: waits for every in-flight interactive Agent Mode turn (tracked by
  * activeSessionGenerations, held for the full turn including its tool-call
  * loop) to finish, up to the same drain ceiling used for cron/worker
@@ -3365,7 +3409,7 @@ type RunVerifiedChatResult = {
 
 // Common function to run verified chat with work plan, keywords, and function call verification
 // Used by both scheduled chat and verified-generate
-export async function runVerifiedChat(
+async function runVerifiedChatInner(
   params: {
     sessionId: string;
     userId: string;
@@ -4533,6 +4577,36 @@ export async function runVerifiedChat(
     attempts: attempt,
     workPlanCompleted: false
   };
+}
+
+/**
+ * ENG-1696: public entry point. Wraps runVerifiedChatInner with the same
+ * per-session generation lock /generate uses (activeSessionGenerations), so a
+ * live chat turn and a verified-generate run (interactive or scheduled) can
+ * never write `session.workPlan` concurrently — chatbotService.updateSessionWorkPlan
+ * is a plain unconditional overwrite with no version/condition check, so an
+ * unguarded race silently discards whichever side wrote second. One claim per
+ * invocation, held for the whole multi-attempt run (mirroring how /generate
+ * holds its own claim across generateSessionResponse's internal continuation
+ * rounds) — not one claim per attempt, since this is one logical unit of work.
+ * On failure to claim within the retry window, throws SessionBusyError; callers
+ * (the interactive /verified-generate handler, and the scheduled-run path) are
+ * both expected to handle that explicitly rather than let it read as a generic
+ * failure.
+ */
+export async function runVerifiedChat(
+  params: Parameters<typeof runVerifiedChatInner>[0],
+): Promise<RunVerifiedChatResult> {
+  const { sessionId } = params;
+  const claimed = await claimSessionGenerationWithRetry(sessionId);
+  if (!claimed) {
+    throw new SessionBusyError(sessionId);
+  }
+  try {
+    return await runVerifiedChatInner(params);
+  } finally {
+    releaseSessionGeneration(sessionId);
+  }
 }
 
 class ZeroAssistantOutputError extends Error {
@@ -13239,11 +13313,20 @@ export const agentModeController = {
       // drained separately via scheduledRunTracker/cronJobRegistry), so this
       // interactive call is tracked at THIS call site specifically — not
       // inside runVerifiedChat itself, which would double-count scheduled
-      // work. Unlike /generate, this endpoint has no per-session concurrency
-      // lock to reuse (activeSessionGenerations would be wrong here: two
-      // concurrent calls for the same session would race each other's
-      // add/delete), so it's tracked via cronJobRegistry's generic in-flight
-      // tracker instead — the same one server.ts's drain already awaits.
+      // work. This in-flight tracking is orthogonal to the per-session
+      // generation LOCK: ENG-1696 found that runVerifiedChat previously took
+      // no lock at all, so a live /generate turn and a verified-generate call
+      // for the SAME session could both write session.workPlan concurrently
+      // and silently corrupt it (updateSessionWorkPlan is an unconditional
+      // overwrite). runVerifiedChat now claims activeSessionGenerations
+      // itself (with a bounded retry — see claimSessionGenerationWithRetry),
+      // the same lock /generate uses; a prior version of this comment argued
+      // that lock "would be wrong" here because two concurrent verifiedGenerate
+      // calls would "race each other's add/delete" — that reasoning didn't
+      // hold up (a second claimant's tryClaimSessionGeneration simply returns
+      // false and is correctly rejected/retried, no actual race), and it never
+      // considered the /generate-vs-verified-generate collision in the first
+      // place, which is the real bug.
       const result = await cronJobRegistry.track('verifiedGenerateTurn', runVerifiedChat({
         sessionId,
         userId: user.userId,
@@ -13281,6 +13364,17 @@ export const agentModeController = {
         sessionId: sessionId
       });
     } catch (error: any) {
+      // ENG-1696: a busy session is an expected, benign outcome (the other
+      // side just needs to finish), not a real failure — return the same
+      // 409 shape /generate itself returns on collision, and skip the
+      // generic error path (no oncall alert, no 500) entirely.
+      if (isSessionBusyError(error)) {
+        return res.status(409).json({
+          error: 'Session is busy',
+          message: 'A response is already being generated for this session. Please wait.',
+          code: 'SESSION_BUSY',
+        });
+      }
       console.error('AgentMode: Verified generate error:', error);
       const sessionId = req.body?.sessionId;
       const user = req.user as User;
