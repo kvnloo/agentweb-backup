@@ -63,9 +63,11 @@ jest.mock('../services/agentMode/linkedInDailyVolumeGate', () => ({
   paceLinkedInWrite: (...args: any[]) => mockPaceLinkedInWrite(...args),
 }));
 
+const mockPeekWriteCooldown = jest.fn(() => ({ active: false, expiresAt: null }));
 jest.mock('../services/linkedInWritePacer', () => ({
   resolveDailyInviteCap: jest.fn((cap: number | null | undefined) => (typeof cap === 'number' ? cap : 10)),
   dailyMessageCap: jest.fn(() => 20),
+  peekWriteCooldown: (...args: any[]) => mockPeekWriteCooldown(...args),
 }));
 
 jest.mock('../services/agentModeService', () => ({ agentModeService: {} }));
@@ -322,6 +324,7 @@ describe('GET /api/crm/linkedin/daily-quota', () => {
         accountId: 'acct-owned',
         invites: expect.objectContaining({ used: 3, cap: 10, remaining: 7 }),
         messages: expect.objectContaining({ used: 5, cap: 20, remaining: 15 }),
+        cooldown: expect.objectContaining({ active: expect.any(Boolean), expiresAt: null }),
       }),
     );
   });

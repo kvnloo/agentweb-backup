@@ -4657,7 +4657,7 @@ router.get('/linkedin/daily-quota', async (req: Request, res: Response) => {
     }
 
     const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
-    const { resolveDailyInviteCap, dailyMessageCap } = await import('../services/linkedInWritePacer');
+    const { resolveDailyInviteCap, dailyMessageCap, peekWriteCooldown } = await import('../services/linkedInWritePacer');
     const resolvedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
     if (!resolvedAccount) {
       return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
@@ -4689,6 +4689,7 @@ router.get('/linkedin/daily-quota', async (req: Request, res: Response) => {
         remaining: messageCap > 0 ? Math.max(0, messageCap - messageUsed) : null,
         windowResetsAt: messageWindowExpired ? null : new Date(messageWindow!.windowStartedAt + DAY_MS).toISOString(),
       },
+      cooldown: peekWriteCooldown(accountId, now),
     });
   } catch (error: any) {
     console.error('Error fetching LinkedIn daily quota:', error);
