@@ -26,6 +26,8 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
+  findWorkPlanStepByCount,
+  hadExhaustedTransientStepFailure,
   snapshotWorkPlanTurn,
   type WorkPlanTurnDisposition,
 } from './agentMode/core/workPlanTurnDisposition';
@@ -162,7 +164,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -4391,12 +4393,20 @@ export class AgentModeService {
 
           if (requireWorkPlanDisposition) {
             const latestSession = await chatbotDb.getChatSession(sessionId, true);
+            // ENG-828: the pending step's own required tool retried once (per the
+            // "Retrying a Transient Failure" carve-out) and failed both times — a
+            // legitimate exhausted-retry outcome, not a malformed turn. Without this,
+            // it falls through to `invalid` below and the generic "couldn't create
+            // the decision card" fallback overwrites the model's own honest
+            // explanation (reproduced live testing this ticket's fix).
+            const pendingStep = findWorkPlanStepByCount(latestSession, workPlanTurnBefore.pendingStepCount);
             workPlanTurnDisposition = decideWorkPlanTurnDisposition({
               before: workPlanTurnBefore,
               after: snapshotWorkPlanTurn(latestSession),
               failed: finishReason === 'content_filter'
                 || stopReason === 'guardrail_intervened'
-                || stopReason === 'content_filtered',
+                || stopReason === 'content_filtered'
+                || hadExhaustedTransientStepFailure(toolCalls, pendingStep?.requiredFunctionCalls),
             });
 
             if (workPlanTurnDisposition.kind === 'invalid') {
