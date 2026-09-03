@@ -4411,10 +4411,22 @@ router.post('/lists/:listId/check-linkedin-connections', async (req: Request, re
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    // Only check connections using the LinkedIn account explicitly assigned to this list.
-    // No fallback to user-level or site-wide accounts.
-    const accountId: string | null = (list as any).linkedInAccountId ?? null;
-    if (!accountId) return res.json({ connected: [], invited: [] });
+    // ENG-1612 gap #6/#4: don't require a list-level linkedInAccountId — fall back to
+    // the caller's own connected account (same fallback POST /check-linkedin-connections
+    // already uses for the cross-list Inbox view) so a list without one still shows real
+    // connection/invite state instead of silently rendering as "not invited".
+    let accountId: string | null = (list as any).linkedInAccountId ?? null;
+    let accountSource: 'list' | 'user' | null = accountId ? 'list' : null;
+    if (!accountId) {
+      const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+      accountId = await linkedInOutreachService.resolveUserOwnedAccountId(userId);
+      if (accountId) accountSource = 'user';
+    }
+    if (!accountId) {
+      // Explicit empty-state: distinguishable from "checked, nothing found" so the UI can
+      // render "connect a LinkedIn account" instead of reading this as zero connections.
+      return res.json({ connected: [], invited: [], accountId: null, noLinkedInAccountConnected: true });
+    }
 
     const { getConnectionByProfileUrlAndAccount } = await import('../services/unipileConnectionsDb');
     const { getSentInvitationByProfileUrlAndAccount } = await import('../services/unipileSentInvitationsDb');
@@ -4423,19 +4435,264 @@ router.post('/lists/:listId/check-linkedin-connections', async (req: Request, re
     const invited: Array<{ url: string; sentAt: string | null }> = [];
     await Promise.all(urls.map(async (url: string) => {
       const normalizedUrl = url.trim().toLowerCase().replace(/\/?$/, '/');
-      const conn = await getConnectionByProfileUrlAndAccount(url, accountId).catch(() => null);
+      const conn = await getConnectionByProfileUrlAndAccount(url, accountId!).catch(() => null);
       if (conn) {
         connected.push({ url: normalizedUrl, connectedAt: conn.connectedAt ?? null });
         return; // already connected — pending-invite state is irrelevant
       }
-      const inv = await getSentInvitationByProfileUrlAndAccount(url, accountId).catch(() => null);
+      const inv = await getSentInvitationByProfileUrlAndAccount(url, accountId!).catch(() => null);
       if (inv) invited.push({ url: normalizedUrl, sentAt: inv.sentAt ?? null });
     }));
 
-    return res.json({ connected, invited });
+    return res.json({ connected, invited, accountId, accountSource });
   } catch (error: any) {
     console.error('Error checking LinkedIn connections:', error);
     return res.status(500).json({ message: error.message || 'Failed to check LinkedIn connections' });
+  }
+});
+
+/**
+ * @route GET /api/crm/linkedin/sent-invitations
+ * @desc List this user's pending (sent, not-yet-accepted) LinkedIn connection invitations
+ *       for a given account, from the AW-UnipileSentInvitations cache (synced ~10 min by
+ *       linkedInConnectionSyncCron). Exposes ENG-1612 gap #1: the backend already
+ *       materializes the full pending set per account, but there was no list endpoint.
+ * @query { accountId?: string } — defaults to the caller's own connected Unipile account.
+ * @access Private
+ */
+router.get('/linkedin/sent-invitations', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const requestedAccountId = typeof req.query.accountId === 'string' ? req.query.accountId : null;
+
+    // Only ever list invitations for an account this user actually owns (their own
+    // connected account, or an org-shared one) — never an arbitrary accountId string.
+    const ownedAccountIds = await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+    let accountId: string | null = requestedAccountId;
+    if (accountId && !ownedAccountIds.includes(accountId)) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+    if (!accountId) accountId = ownedAccountIds[0] ?? null;
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected. Connect a LinkedIn account in Settings first.' });
+    }
+
+    const { getAllSentInvitationsByAccount } = await import('../services/unipileSentInvitationsDb');
+    const invitations = await getAllSentInvitationsByAccount(accountId);
+    // Newest first — that's the useful reading order for a "manage my pending invites" view.
+    invitations.sort((a, b) => new Date(b.sentAt).getTime() - new Date(a.sentAt).getTime());
+
+    return res.json({ accountId, invitations });
+  } catch (error: any) {
+    console.error('Error listing LinkedIn sent invitations:', error);
+    return res.status(500).json({ message: error.message || 'Failed to list LinkedIn sent invitations' });
+  }
+});
+
+/**
+ * @route POST /api/crm/linkedin/sent-invitations/:invitationId/withdraw
+ * @desc Withdraw (cancel) a pending LinkedIn connection invitation. Wires the existing
+ *       linkedInOutreachService.cancelInvitation to the UI (ENG-1612 gap #2) and cleans
+ *       up the pending-invite cache write-through so the amber dot/chip clear immediately
+ *       rather than waiting for the next cron prune (mirrors the Emma tool-call cleanup
+ *       in agentModeService.ts's 'cancel-invitation' case).
+ *
+ *       Routes through the same pace/cooldown gate as Emma's cancel-invitation action
+ *       (linkedInDailyVolumeGate.ts) — a UI-initiated withdraw must not bypass the
+ *       account-health pacer that the manual crm.ts send paths currently do (ENG-1612 #5).
+ * @body { accountId: string }
+ * @access Private
+ */
+router.post('/linkedin/sent-invitations/:invitationId/withdraw', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { invitationId } = req.params;
+    const { accountId } = req.body;
+    if (!invitationId) return res.status(400).json({ message: 'invitationId is required' });
+    if (!accountId || typeof accountId !== 'string') {
+      return res.status(400).json({ message: 'accountId is required' });
+    }
+
+    const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+    const resolvedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+    if (!resolvedAccount) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+
+    const paced = await paceLinkedInWrite('cancel-invitation', resolvedAccount, accountId);
+    if (paced.refusal) {
+      return res.status(429).json(paced.refusal);
+    }
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const cancelResult = await linkedInOutreachService.cancelInvitation(invitationId, accountId);
+
+    // Best-effort cache write-through, same as the Emma tool path — a failed cleanup
+    // must not turn a successful withdrawal into a reported failure (the 10-min cron
+    // prune is the backstop either way).
+    const { deleteSentInvitationByInvitationId } = await import('../services/unipileSentInvitationsDb');
+    await deleteSentInvitationByInvitationId(accountId, invitationId).catch((err) =>
+      console.error(`[crm] Failed to drop withdrawn invitation ${invitationId} from cache:`, err),
+    );
+
+    return res.json({ success: true, invitationId, accountId, result: cancelResult });
+  } catch (error: any) {
+    console.error('Error withdrawing LinkedIn invitation:', error);
+    return res.status(500).json({ message: error.message || 'Failed to withdraw LinkedIn invitation' });
+  }
+});
+
+/**
+ * @route GET /api/crm/linkedin/received-invitations
+ * @desc List LinkedIn connection invitations received FROM others, so they're visible
+ *       and acceptable from the UI (ENG-1612 gap #3/AC #3) — previously Emma-chat-only
+ *       via linkedInOutreachService.listReceivedInvitations.
+ * @query { accountId?: string, cursor?: string }
+ * @access Private
+ */
+router.get('/linkedin/received-invitations', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const requestedAccountId = typeof req.query.accountId === 'string' ? req.query.accountId : null;
+    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+
+    const ownedAccountIds = await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+    let accountId: string | null = requestedAccountId;
+    if (accountId && !ownedAccountIds.includes(accountId)) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+    if (!accountId) accountId = ownedAccountIds[0] ?? null;
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected. Connect a LinkedIn account in Settings first.' });
+    }
+
+    const result = await linkedInOutreachService.listReceivedInvitations(accountId, cursor);
+    return res.json({ accountId, ...result });
+  } catch (error: any) {
+    console.error('Error listing LinkedIn received invitations:', error);
+    return res.status(500).json({ message: error.message || 'Failed to list LinkedIn received invitations' });
+  }
+});
+
+/**
+ * @route POST /api/crm/linkedin/received-invitations/:invitationId/accept
+ * @desc Accept a received LinkedIn connection invitation (ENG-1612 gap #3/AC #3).
+ * @body { accountId: string, sharedSecret: string }
+ * @access Private
+ */
+router.post('/linkedin/received-invitations/:invitationId/accept', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { invitationId } = req.params;
+    const { accountId, sharedSecret } = req.body;
+    if (!invitationId) return res.status(400).json({ message: 'invitationId is required' });
+    if (!accountId || typeof accountId !== 'string') {
+      return res.status(400).json({ message: 'accountId is required' });
+    }
+    if (!sharedSecret || typeof sharedSecret !== 'string') {
+      return res.status(400).json({ message: 'sharedSecret is required (returned by GET /linkedin/received-invitations)' });
+    }
+
+    const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+    const resolvedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+    if (!resolvedAccount) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+
+    const paced = await paceLinkedInWrite('accept-invitation', resolvedAccount, accountId);
+    if (paced.refusal) {
+      return res.status(429).json(paced.refusal);
+    }
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, accountId, sharedSecret);
+
+    return res.json({ success: true, invitationId, accountId, result: acceptResult });
+  } catch (error: any) {
+    console.error('Error accepting LinkedIn invitation:', error);
+    return res.status(500).json({ message: error.message || 'Failed to accept LinkedIn invitation' });
+  }
+});
+
+/**
+ * @route GET /api/crm/linkedin/daily-quota
+ * @desc Remaining daily invite/message quota + any active hourly/burst cooldown for an
+ *       account, from linkedInDailyVolumeGate / linkedInWritePacer state (ENG-1612 gap #6/
+ *       AC #5) — so a Send button can show "7 of 10 invites left today" or "cooling down
+ *       until 14:32" before the user attempts a send that the pacer would refuse anyway.
+ *       Read-only: does not reserve a slot.
+ * @query { accountId?: string }
+ * @access Private
+ */
+router.get('/linkedin/daily-quota', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const requestedAccountId = typeof req.query.accountId === 'string' ? req.query.accountId : null;
+    const ownedAccountIds = await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+    let accountId: string | null = requestedAccountId;
+    if (accountId && !ownedAccountIds.includes(accountId)) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+    if (!accountId) accountId = ownedAccountIds[0] ?? null;
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected. Connect a LinkedIn account in Settings first.' });
+    }
+
+    const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+    const { resolveDailyInviteCap, dailyMessageCap } = await import('../services/linkedInWritePacer');
+    const resolvedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+    if (!resolvedAccount) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+
+    const now = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const inviteCap = resolveDailyInviteCap(resolvedAccount.configuredDailyInviteCap);
+    const inviteWindow = resolvedAccount.dailyVolumeState?.invite;
+    const inviteWindowExpired = !inviteWindow || now - inviteWindow.windowStartedAt >= DAY_MS;
+    const inviteUsed = inviteWindowExpired ? 0 : inviteWindow!.count;
+
+    const messageCap = dailyMessageCap();
+    const messageWindow = resolvedAccount.dailyVolumeState?.message;
+    const messageWindowExpired = !messageWindow || now - messageWindow.windowStartedAt >= DAY_MS;
+    const messageUsed = messageWindowExpired ? 0 : messageWindow!.count;
+
+    return res.json({
+      accountId,
+      invites: {
+        used: inviteUsed,
+        cap: Number.isFinite(inviteCap) ? inviteCap : null, // null = uncapped (operator disabled)
+        remaining: Number.isFinite(inviteCap) ? Math.max(0, inviteCap - inviteUsed) : null,
+        windowResetsAt: inviteWindowExpired ? null : new Date(inviteWindow!.windowStartedAt + DAY_MS).toISOString(),
+      },
+      messages: {
+        used: messageUsed,
+        cap: messageCap > 0 ? messageCap : null, // null = uncapped (operator disabled or Jest)
+        remaining: messageCap > 0 ? Math.max(0, messageCap - messageUsed) : null,
+        windowResetsAt: messageWindowExpired ? null : new Date(messageWindow!.windowStartedAt + DAY_MS).toISOString(),
+      },
+    });
+  } catch (error: any) {
+    console.error('Error fetching LinkedIn daily quota:', error);
+    return res.status(500).json({ message: error.message || 'Failed to fetch LinkedIn daily quota' });
   }
 });
 
