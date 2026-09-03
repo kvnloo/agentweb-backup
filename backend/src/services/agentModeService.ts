@@ -16480,7 +16480,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`
       );
 
-      if (campaignsData.error) {
+      /*
+       * A later page's failure must not throw away the pages that succeeded.
+       *
+       * ENG-1300 makes fetchWithRetryAndPaging set `data.error` when any page returns non-2xx,
+       * so callers cannot mistake a partial multi-page read for a clean one. Correct — but this
+       * branch reads `error` as "the whole read failed" and returns success:false with NO
+       * campaigns, so a 5xx on page 3 discarded the rows from pages 1 and 2 that were read
+       * perfectly well. That is the ENG-1584 failure from the other direction: not a short list
+       * presented as complete, but a real list presented as nothing at all.
+       *
+       * A hard failure is still right when nothing was read. When rows exist AND the read
+       * reported itself truncated, fall through to the partial path below, which returns those
+       * rows with an explicit INCOMPLETE warning and the failed page's reason.
+       */
+      const hasPartialRows = Array.isArray(campaignsData.data) && campaignsData.data.length > 0;
+      if (campaignsData.error && !(hasPartialRows && campaignsData.pagingTruncated)) {
         console.error('AgentMode: Campaigns API Error:', campaignsData.error);
         return {
           success: false,
@@ -20236,9 +20251,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
        * `tenancyRefused` here would silently restore the bug where a node the ownership guard
        * had already refused still reached a confirmation prompt.
        *
-       * A manifest grant skipping this block is correct and not a bypass of that guard: the
-       * ownership check also runs inside the write itself, so a granted call still cannot
-       * touch a node outside the selected ad account.
+       * ⚠ A manifest grant SKIPS this block, and with it the tenancy refusal. Do not read that
+       * as safe on the grounds that the write re-checks: it does not. `updateCampaign`,
+       * `updateAdSet`, `updateAd` and the three deletes take an access token and a node id and
+       * no ad-account id at all, so nothing below this point verifies ownership.
+       *
+       * Not a regression — before this PR there was no tenancy check on this path either, and
+       * ENG-1642 changes who may skip the confirmation, not what the writes check. But the
+       * manifest path is the one write route with no ownership check anywhere in it, and that
+       * belongs on the write-scoping work rather than being assumed away here.
        */
       const { summary, target, tenancyRefused, tenancyRefusalMessage } = await this.buildMetaWriteConfirmation(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
@@ -22671,8 +22692,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * Crossing it sets `truncated`/`capped` — the same "incomplete, do not
    * conclude absence" signal the count bounds already use, not a new failure
    * mode.
+   *
+   * ⚠ Raised from 15s. The reasoning above is sound about the SHAPE of the calls and wrong about
+   * the consequence of stopping: an incomplete read is not a free outcome. It is what makes the
+   * agent say "that file is not in your Drive" about a folder it only partly looked at — the
+   * ENG-1584 sentence, on the Drive side. The tree is not too large to read; we were not giving
+   * it long enough, exactly as the launch pre-flight was not.
+   *
+   * 15s bought a snappier turn at the cost of a wrong answer. 90s reads an ordinary customer's
+   * tree comfortably and a large one completely, still finishes far inside nginx/ALB's 600s, and
+   * costs nothing at all in the common case — it is a deadline, not a delay, so a tree that
+   * takes two seconds still takes two seconds.
    */
-  private static readonly DRIVE_LIST_WALK_MAX_MS = 15_000;
+  private static readonly DRIVE_LIST_WALK_MAX_MS = 90_000;
 
   /**
    * ENG-1476 follow-up: per-REQUEST deadline, derived from the walk-wide one rather than fixed.

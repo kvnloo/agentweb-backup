@@ -149,6 +149,15 @@ const FAKE_ACCOUNT = {
 
 const USER_ID = 'user-123';
 
+/**
+ * The service's own walk budget, read rather than duplicated.
+ *
+ * These tests assert behaviour RELATIVE to the budget — "a request's timeout never exceeds it",
+ * "the walk stops once it is spent" — so pinning 15_000 made them fail the moment the budget was
+ * raised, even though every one of those behaviours still held.
+ */
+const WALK_BUDGET_MS: number = (AgentModeService as any).DRIVE_LIST_WALK_MAX_MS;
+
 function makeApiError(code: number, message = 'API error') {
   const err: any = new Error(message);
   err.code = code;
@@ -1234,7 +1243,7 @@ describe('AgentModeService - Google Drive methods', () => {
           // Derived from the walk's REMAINING budget, so it can never be longer than the walk
           // itself would allow — a per-request timeout must not outlive the bound it protects.
           expect(call[1].timeout).toBeGreaterThan(0);
-          expect(call[1].timeout).toBeLessThanOrEqual(15_000);
+          expect(call[1].timeout).toBeLessThanOrEqual(WALK_BUDGET_MS);
         }
       });
 
@@ -1254,7 +1263,7 @@ describe('AgentModeService - Google Drive methods', () => {
             n += 1;
             // Leaves ~500ms of the 15s budget, which is below the floor but still passes the
             // loop's pre-check — the only window in which the floor is reachable at all.
-            if (n === 1) jest.advanceTimersByTime(14_500);
+            if (n === 1) jest.advanceTimersByTime(WALK_BUDGET_MS - 500);
             if (q.includes('mimeType') && n === 1) {
               return Promise.resolve({ data: { files: [{ id: SUB, name: '4x5' }] } });
             }
@@ -1589,7 +1598,7 @@ describe('AgentModeService - Google Drive methods', () => {
             if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
               return Promise.resolve({ data: { files: [] } });
             }
-            jest.advanceTimersByTime(20_000);
+            jest.advanceTimersByTime(WALK_BUDGET_MS + 5_000);
             return Promise.resolve({ data: { files: [], nextPageToken: 'page-2' } });
           });
 
@@ -1784,8 +1793,14 @@ describe('AgentModeService - Google Drive methods', () => {
           expect(result.success).toBe(false);
           expect(result.message).not.toBe('File "ad.png" not found in Google Drive folder');
           expect(result.message).toMatch(/stopped before covering it entirely|not a confirmed absence/i);
-          // Bounded — a handful of folders inside the time budget, not hundreds.
-          expect(depth).toBeLessThan(10);
+          /*
+           * Bounded by the TIME budget, not by a magic number. Each simulated folder discovery
+           * costs 5s above, so the walk should stop after roughly WALK_BUDGET_MS/5s of them —
+           * the assertion tracks the budget instead of pinning a count that silently encodes it.
+           * What is being proven is that an unbounded (one-child-per-folder) tree terminates,
+           * not that it terminates at any particular depth.
+           */
+          expect(depth).toBeLessThan(WALK_BUDGET_MS / 5_000 + 3);
         } finally {
           jest.useRealTimers();
         }
@@ -2151,7 +2166,7 @@ describe('AgentModeService - Google Drive methods', () => {
           callCount++;
           // Each simulated page "costs" wall-clock time past the walk's own
           // budget — a slow/throttled Drive response, not a huge result set.
-          jest.advanceTimersByTime(20_000);
+          jest.advanceTimersByTime(WALK_BUDGET_MS + 5_000);
           return Promise.resolve({
             data: {
               files: [{ id: 'file-1', name: 'a.png', mimeType: 'image/png', size: '10', modifiedTime: '2026-08-01T00:00:00Z' }],
@@ -2432,7 +2447,7 @@ describe('AgentModeService - Google Drive methods', () => {
               // Discovering PARENT's one child costs enough time that the walk
               // is truncated before it can ever descend into that child and
               // find CHILD underneath it.
-              jest.advanceTimersByTime(20_000);
+              jest.advanceTimersByTime(WALK_BUDGET_MS + 5_000);
               return Promise.resolve({ data: { files: [{ id: DECOY, name: 'decoy' }] } });
             }
             return Promise.resolve({ data: { files: [] } }); // CHILD's own walk (registered separately) is fast and clean
@@ -2579,7 +2594,7 @@ describe('AgentModeService - Google Drive methods', () => {
           }
           // The name query returns a page and a cursor, but burns the whole budget doing it —
           // so the read stops at the bound rather than erroring.
-          jest.advanceTimersByTime(20_000);
+          jest.advanceTimersByTime(WALK_BUDGET_MS + 5_000);
           return Promise.resolve({ data: { files: [], nextPageToken: 'page-2' } });
         });
 

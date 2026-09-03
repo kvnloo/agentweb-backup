@@ -216,6 +216,12 @@ export const fetchWithRetryAndPaging = async (url: string, pagesRemaining: numbe
     const nextPageStatus = (nextPageData as any)?.__httpStatus;
     if (typeof nextPageStatus === 'number' && nextPageStatus >= 400 && data && typeof data === 'object') {
       Object.defineProperty(data, '__httpStatus', { value: nextPageStatus, enumerable: false, configurable: true });
+      /*
+       * ENG-1300's contract, restored deliberately: `data.error` IS set from the failed page,
+       * and its test asserts exactly that. Callers that must keep partial rows handle it at
+       * their own level — see listMetaAdsCampaigns — rather than this shared helper quietly
+       * withholding the error from every caller to suit one of them.
+       */
       if (nextPageData.error && !data.error) {
         data.error = nextPageData.error;
       }
