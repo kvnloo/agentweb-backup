@@ -846,7 +846,7 @@ const SCHEDULED_RUN_RESUME_MESSAGE =
 // to MAX_ROUNDS auto-continuation LLM calls instead of zero — deliberately trading some cost
 // for auto-recovery, but 2 rounds captures most of that recovery value at 2/3 the spend of 3,
 // until ENG-1477 itself is fixed.
-const AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS = 2;
+export const AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS = 2;
 
 // ENG-1684: fired by the SERVER when an autocomplete=true work plan's turn ends with no
 // tool calls and at least one step still not completed/skipped — the exact stall pattern
@@ -1396,8 +1396,11 @@ async function scheduleAutoWorkPlanContinuation(
   // generate anyway, same as this function's pre-ENG-1699 behavior — rather than silently
   // treating "couldn't check" as "already resolved" and dropping the entire stall backstop with
   // no operator visibility. Every other failure branch in this function logs; this one must too.
+  // Cheap base-record read only (no message-table fetch/migration) — workPlan lives on the
+  // base record, same pattern already used by chatSocketHandler.ts/liveVoiceService.ts for
+  // exactly this reason.
   let currentSessionLookupFailed = false;
-  const currentSession = await chatbotDb.getChatSession(sessionId).catch((lookupErr) => {
+  const currentSession = await chatbotDb.getChatSessionRecord(sessionId).catch((lookupErr) => {
     console.error(
       `AgentMode: work-plan auto-continuation pre-fire recheck failed to read session ${sessionId} ` +
       `— proceeding to generate anyway (fail open) rather than silently skipping the backstop:`,
