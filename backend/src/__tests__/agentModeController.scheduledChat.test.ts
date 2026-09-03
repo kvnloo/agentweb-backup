@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import * as sseProgress from '../utils/sseProgress';
 
 // Mock all dependencies before importing the controller
 // Mock subscriptionService so subscription checks always pass in tests
@@ -58,6 +59,7 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   generateMarketingResponseWorkerService: {
     runInWorker: jest.fn(),
     releaseSessionClients: jest.fn(),
+    cancelSession: jest.fn(),
   },
 }));
 
@@ -410,6 +412,45 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
         expect(result.status).toBe('failure');
         expect(mockChatbotDb.updateSessionError).toHaveBeenCalled();
+      });
+    });
+
+    // ENG-1719 follow-up (from a scoped re-review of the fix above): runVerifiedChat only
+    // just gained a wall-clock timeout, so this catch could never receive an
+    // isGenerationTimeout error before now. withGenerationTimeout's own contract is that it
+    // does NOT cancel the underlying generation on timeout — it keeps running. The
+    // zero-output detection below can then misread a merely-slow run as having produced
+    // nothing and schedule an automatic RESUME on the SAME sessionId as little as 15 minutes
+    // later, which would race the still-running orphan for the same session — the identical
+    // concurrent-write class this whole PR exists to close, just self-inflicted this time.
+    describe('generation-timeout orphan cancellation (ENG-1719 follow-up)', () => {
+      it('cancels the orphaned generation before falling through to the normal error path', async () => {
+        const requestCancelSpy = jest.spyOn(sseProgress, 'requestCancel');
+        const timeoutError = Object.assign(new Error('Generation timed out'), { isGenerationTimeout: true });
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(timeoutError);
+
+        const result = await runScheduledChat(baseSchedule, mockUserId, true);
+
+        // Cancelled the orphan...
+        expect(requestCancelSpy).toHaveBeenCalledWith(mockSession.sessionId);
+        expect(mockGenerateMarketingResponseWorkerService.cancelSession).toHaveBeenCalledWith(mockSession.sessionId);
+        // ...but a genuine timeout is NOT benign like SessionBusyError — it still falls
+        // through to the normal error/zero-output handling rather than returning early.
+        expect(result.status).toBe('failure');
+
+        requestCancelSpy.mockRestore();
+      });
+
+      it('does not cancel anything for a non-timeout error', async () => {
+        const requestCancelSpy = jest.spyOn(sseProgress, 'requestCancel');
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(new Error('worker died'));
+
+        await runScheduledChat(baseSchedule, mockUserId, true);
+
+        expect(requestCancelSpy).not.toHaveBeenCalled();
+        expect(mockGenerateMarketingResponseWorkerService.cancelSession).not.toHaveBeenCalled();
+
+        requestCancelSpy.mockRestore();
       });
     });
 
