@@ -18,6 +18,7 @@ import {
   agentModeController,
   activeSessionGenerations,
   autoContinuationSessions,
+  AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS,
 } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
@@ -33,6 +34,7 @@ jest.mock('../services/durableLandingService', () => ({
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getChatSession: jest.fn(),
+    getChatSessionRecord: jest.fn(),
     addMessageToSession: jest.fn(),
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
@@ -59,6 +61,7 @@ jest.mock('../services/agentModeService', () => ({
     generateSessionTitle: jest.fn().mockResolvedValue('Test Title'),
     getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
     generateDiagnosticMessage: jest.fn().mockResolvedValue(null),
+    getSkillsForDisplay: jest.fn().mockResolvedValue([]),
   },
   AgentModeService: jest.fn(),
 }));
@@ -202,6 +205,7 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
       bonus: 0, effectiveAllowance: null, percentUsed: 0, month: '2026-09',
     });
     mockChatbotDb.getChatSession.mockResolvedValue(baseSession(stalledWorkPlan) as any);
+    (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(stalledWorkPlan) as any);
     (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.addMessageToSession.mockResolvedValue(baseSession(stalledWorkPlan) as any);
     mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
@@ -221,6 +225,7 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
       // worker's own return value, so the mock must model that causality explicitly).
       .mockImplementationOnce(async () => {
         mockChatbotDb.getChatSession.mockResolvedValue(baseSession(completedWorkPlan) as any);
+        (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(completedWorkPlan) as any);
         return workerResponse('Report generated.', []);
       });
 
@@ -263,8 +268,9 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
 
     // Before the setImmediate-deferred continuation fires, the plan's own state has moved on
     // (e.g. a human's own message elsewhere completed the step) — simulate that by changing
-    // what getChatSession returns from here on, exactly as a real concurrent write would.
-    mockChatbotDb.getChatSession.mockResolvedValue(baseSession(completedWorkPlan) as any);
+    // what the recheck's own read (getChatSessionRecord) returns from here on, exactly as a
+    // real concurrent write would.
+    (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(completedWorkPlan) as any);
 
     await flush();
 
@@ -272,7 +278,7 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
     // no second worker call, but the recheck itself DID run (proof it's the recheck path that
     // stopped this, not some unrelated reason).
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
-    expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith(mockSessionId);
+    expect(mockChatbotDb.getChatSessionRecord).toHaveBeenCalledWith(mockSessionId);
     expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
     expect(autoContinuationSessions.has(mockSessionId)).toBe(false);
   });
@@ -286,11 +292,11 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
     const res = makeRes();
     await agentModeController.generateResponse(makeReq(), res);
 
-    const callsBeforeFlush = mockChatbotDb.getChatSession.mock.calls.length;
-    mockChatbotDb.getChatSession.mockResolvedValue(baseSession(completedWorkPlan) as any);
+    const callsBeforeFlush = (mockChatbotDb as any).getChatSessionRecord.mock.calls.length;
+    (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(completedWorkPlan) as any);
     await flush();
 
-    expect(mockChatbotDb.getChatSession.mock.calls.length).toBeGreaterThan(callsBeforeFlush);
+    expect((mockChatbotDb as any).getChatSessionRecord.mock.calls.length).toBeGreaterThan(callsBeforeFlush);
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
   });
 
@@ -298,8 +304,8 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
     // A transient DB error here must not be silently treated as "stall already resolved" —
     // that would drop the entire backstop with no operator visibility. The recheck should log
     // the failure and proceed to generate anyway, same as this function's pre-ENG-1699 behavior.
-    // Only the recheck's OWN getChatSession call should reject: generateSessionResponse itself
-    // also calls getChatSession internally to load/re-read the session, and those must keep
+    // Only the recheck's OWN getChatSessionRecord call should reject: generateSessionResponse
+    // itself calls getChatSession internally to load/re-read the session, and those must keep
     // succeeding for round 2 to actually run — this isolates the recheck's failure specifically.
     const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -307,6 +313,7 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
       .mockResolvedValueOnce(workerResponse('Step 6 was interrupted.', [failedToolCall()]))
       .mockImplementationOnce(async () => {
         mockChatbotDb.getChatSession.mockResolvedValue(baseSession(completedWorkPlan) as any);
+        (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(completedWorkPlan) as any);
         return workerResponse('Report generated.', []);
       });
 
@@ -314,9 +321,9 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
     await agentModeController.generateResponse(makeReq(), res);
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
 
-    // Reject exactly the next getChatSession call (the recheck's own) — every call after that
-    // falls back to whatever mockResolvedValue is current, matching a real one-time transient error.
-    mockChatbotDb.getChatSession.mockRejectedValueOnce(new Error('DynamoDB throttled'));
+    // Reject exactly the next getChatSessionRecord call (the recheck's own) — every call after
+    // that falls back to whatever mockResolvedValue is current, matching a real one-time transient error.
+    (mockChatbotDb as any).getChatSessionRecord.mockRejectedValueOnce(new Error('DynamoDB throttled'));
     await flush();
 
     // Failed open: the continuation still generated, it wasn't silently skipped.
@@ -352,7 +359,6 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
   });
 
   it('stops after AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS rounds and posts a graceful closing message', async () => {
-    const AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS = 2; // ENG-1700 follow-up: lowered from 3
     const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
     // A persistently broken tool: every round, including the customer's own turn, fails.
@@ -408,6 +414,7 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
       .mockResolvedValueOnce(workerResponse('Still stuck.', [failedToolCall()]))
       .mockImplementationOnce(async () => {
         mockChatbotDb.getChatSession.mockResolvedValue(baseSession(completedWorkPlan) as any);
+        (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(completedWorkPlan) as any);
         return workerResponse('Report generated.', []);
       });
 

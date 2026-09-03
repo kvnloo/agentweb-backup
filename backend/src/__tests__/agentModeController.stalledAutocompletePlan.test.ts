@@ -44,6 +44,7 @@ jest.mock('../services/agentModeService', () => ({
     generateSessionTitle: jest.fn().mockResolvedValue('Test Title'),
     getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
     generateDiagnosticMessage: jest.fn().mockResolvedValue(null),
+    getSkillsForDisplay: jest.fn().mockResolvedValue([]),
   },
   AgentModeService: jest.fn(),
 }));
