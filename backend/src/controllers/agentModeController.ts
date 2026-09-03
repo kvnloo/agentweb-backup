@@ -1085,10 +1085,15 @@ const GENERATION_TIMEOUT_MS = parseInt(
 // individually-bounded multi-attempt run, not hang detection.
 //
 // Two tiers, sized off real production data (2026-09-03), not guesswork:
-// - SHORT (default): the callers with maxAttempts ~5 where a human or Slack
-//   reviewer is actively waiting (interactive /verified-generate, imageReports,
-//   revisionService, humanEvalActionService, both routes/slack.ts revision
-//   sites). A scan of AW-AssetApprovals' revision chains showed real completions
+// - SHORT (default): the callers where a human or Slack reviewer is actively
+//   waiting (interactive /verified-generate, imageReports, revisionService,
+//   humanEvalActionService, both routes/slack.ts revision sites) — all pass
+//   maxAttempts: 5 except the interactive endpoint, which takes an
+//   unvalidated maxAttempts from the request body (owner-authenticated, no
+//   upper bound enforced) but still gets this default; it was capped at the
+//   old flat 30 minutes regardless of maxAttempts before this change, so this
+//   is strictly more headroom either way, not a new exposure. A scan of
+//   AW-AssetApprovals' revision chains showed real completions
 //   almost entirely under 10 minutes, with one credible legitimate case at 69
 //   minutes and nothing credible above that (a 1041-minute outlier turned out to
 //   be a measurement artifact — two unrelated Slack threads sharing an
