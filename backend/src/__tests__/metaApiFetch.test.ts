@@ -298,10 +298,77 @@ describe('Meta API Fetch Utilities', () => {
       }) as jest.Mock;
 
       const result = await fetchWithRetryAndPaging('https://example.com/api');
-      
+
       expect(result.success).toBe(true);
       expect(result.message).toBe('Operation completed');
       expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-1300: this helper returns the parsed body even on a non-2xx response
+    // (existing callers build their own `data.error` checks around that
+    // contract) — so callers that want the real HTTP status read this
+    // non-enumerable field instead of the helper changing its throw/return
+    // contract entirely.
+    it('ENG-1300: exposes the real HTTP status as a non-enumerable __httpStatus field', async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: () => Promise.resolve({ error: { message: 'Invalid OAuth access token', code: 190 } })
+      }) as jest.Mock;
+
+      const result = await fetchWithRetryAndPaging('https://example.com/api');
+
+      expect((result as any).__httpStatus).toBe(401);
+      // Non-enumerable: must not leak into a JSON.stringify of the payload.
+      expect(JSON.stringify(result)).not.toContain('__httpStatus');
+    });
+
+    // ENG-1300: a non-2xx response is sometimes a gateway/proxy error page or
+    // other non-JSON body rather than Meta's usual { error: {...} } shape —
+    // response.json() throws in that case, and without explicit handling the
+    // real HTTP status would be lost entirely (a bare SyntaxError carries none).
+    it('ENG-1300: attaches the real HTTP status even when the error body is not valid JSON', async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: false,
+        status: 502,
+        json: () => Promise.reject(new SyntaxError('Unexpected token < in JSON')),
+      }) as jest.Mock;
+
+      await expect(fetchWithRetryAndPaging('https://example.com/api')).rejects.toMatchObject({ status: 502 });
+    });
+
+    // ENG-1300 (CodeRabbit): fetchWithRetryAndPaging doesn't throw on a
+    // non-2xx page (by design — see the contract comment above) so a LATER
+    // page's failure used to be silently swallowed: the final merged result
+    // kept the FIRST page's 200 __httpStatus even though page 2 genuinely
+    // failed, hiding a truncated data set behind an apparent-success status.
+    it('ENG-1300: a later page\'s failure status overrides the first page\'s __httpStatus', async () => {
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        if (url.includes('after=page2')) {
+          return Promise.resolve({
+            ok: false,
+            status: 403,
+            json: () => Promise.resolve({ error: { message: 'Permission denied', code: 200 } }),
+          });
+        }
+
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({
+            data: [{ id: '1', name: 'Item 1' }],
+            paging: { next: 'https://example.com/api?after=page2' },
+          }),
+        });
+      }) as jest.Mock;
+
+      const result = await fetchWithRetryAndPaging('https://example.com/api');
+
+      // Page 1's data is still present (best-effort partial result)...
+      expect(result.data).toHaveLength(1);
+      // ...but the overall status must reflect the failing page, not page 1's 200.
+      expect((result as any).__httpStatus).toBe(403);
+      expect(result.error).toEqual({ message: 'Permission denied', code: 200 });
     });
   });
 

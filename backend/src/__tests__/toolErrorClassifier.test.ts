@@ -107,6 +107,23 @@ describe('classifyToolErrorClass', () => {
     ))).toBe('invalid_args');
   });
 
+  // ENG-1672 (code review follow-up): the global `is too large` pattern this
+  // added is a deliberate trade-off, not an oversight — it now also classifies
+  // pre-existing "too large" messages elsewhere in the app that previously fell
+  // through unclassified to the legacy name fallback, including a named error
+  // (gmailService.ts's GmailBodyTooLargeError) that used to keep its own
+  // distinct class via that same fallback. Locked in here so a future change to
+  // either the regex or this error's name can't silently flip this back without
+  // a test noticing.
+  it('reclassifies GmailBodyTooLargeError to invalid_args (accepted trade-off, was previously its own distinct class)', () => {
+    expect(classifyToolErrorClass(err(
+      'Email body is too large (HTML content exceeds 50KB). '
+      + 'Ask the user to open the email directly in Gmail, or specify which part they want — '
+      + 'e.g. "just the subject and sender" or "first paragraph only".',
+      'GmailBodyTooLargeError'
+    ))).toBe('invalid_args');
+  });
+
   it('classifies not-found and network failures', () => {
     expect(classifyToolErrorClass(err('Request failed with status code 404'))).toBe('not_found');
     expect(classifyToolErrorClass(err('getaddrinfo ENOTFOUND api.example.com'))).toBe('network');

@@ -106,4 +106,75 @@ describe('toolResultError', () => {
     expect(err!.name).toBe('ToolResultPolicyBlockedError');
     expect(err).toMatchObject({ reason: 'publish_consent' });
   });
+
+  describe('ENG-1300 — a numeric `code` on the result rides along on the reconstructed Error', () => {
+    it('attaches success:false code so status-based classification still fires', () => {
+      const err = toolResultError({
+        success: false,
+        code: 403,
+        error: 'Your X account is missing the "list.read" permission needed to read X Lists. Go to Settings → Connected Accounts and reconnect your X account to grant List access.',
+      });
+      expect(err).toMatchObject({ code: 403 });
+      // The real regression: this message text alone matches none of
+      // classifyToolErrorClass's message-based patterns, so without `.code`
+      // riding along it silently fell back to the generic 'Error' class.
+      expect(classifyToolErrorClass(err)).toBe('auth');
+    });
+
+    it('attaches isError:true code the same way', () => {
+      const err = toolResultError({ isError: true, code: 429, message: 'Too many requests' });
+      expect(err).toMatchObject({ code: 429 });
+      expect(classifyToolErrorClass(err)).toBe('rate_limit');
+    });
+
+    it('leaves the Error without a code when the result carries none (no regression)', () => {
+      const err = toolResultError({ success: false, error: 'Ad account not configured' });
+      expect((err as { code?: number })?.code).toBeUndefined();
+    });
+  });
+
+  describe('ENG-1300 follow-up — a numeric `status` field is read the same way as `code`', () => {
+    it('attaches a top-level numeric status (HubSpot/Attio convention) to the reconstructed Error', () => {
+      const err = toolResultError({
+        success: false,
+        status: 403,
+        error: 'This app does not have MISSING_SCOPES permission for this call.',
+      });
+      expect(err).toMatchObject({ code: 403 });
+      expect(classifyToolErrorClass(err)).toBe('auth');
+    });
+
+    it('prefers `code` over `status` when a result somehow carries both', () => {
+      const err = toolResultError({ success: false, code: 429, status: 500, error: 'x' });
+      expect(err).toMatchObject({ code: 429 });
+    });
+
+    it('ignores a `status` outside the HTTP range (100-599) as garbage, not a real status', () => {
+      const err = toolResultError({ success: false, status: 3, error: 'x' });
+      expect((err as { code?: number })?.code).toBeUndefined();
+    });
+
+    it('ignores a non-numeric `code`/`status` (e.g. a string vendor code) rather than misreading it', () => {
+      const err = toolResultError({ success: false, code: 'ThrottlingException', status: 'rejected', error: 'x' });
+      expect((err as { code?: number })?.code).toBeUndefined();
+    });
+  });
+
+  describe('ENG-1300 CodeRabbit follow-up — a numeric `statusCode` field (AWS SDK v2 convention) is preferred', () => {
+    it('attaches a top-level numeric statusCode to the reconstructed Error', () => {
+      const err = toolResultError({ success: false, statusCode: 403, error: 'Access Denied' });
+      expect(err).toMatchObject({ code: 403 });
+      expect(classifyToolErrorClass(err)).toBe('auth');
+    });
+
+    it('prefers `statusCode` over `code` and `status` when a result carries all three', () => {
+      const err = toolResultError({ success: false, statusCode: 403, code: 429, status: 500, error: 'x' });
+      expect(err).toMatchObject({ code: 403 });
+    });
+
+    it('ignores a `statusCode` outside the HTTP range (100-599) as garbage, not a real status', () => {
+      const err = toolResultError({ success: false, statusCode: 3, error: 'x' });
+      expect((err as { code?: number })?.code).toBeUndefined();
+    });
+  });
 });

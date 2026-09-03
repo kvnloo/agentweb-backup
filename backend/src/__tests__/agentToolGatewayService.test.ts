@@ -107,6 +107,30 @@ describe('agentToolGatewayService', () => {
     expect(summarizeAgentToolPolicyModes(decisions)).toContain('google_search_web:read:low:observe');
   });
 
+  // ENG-1668 follow-up: an args_repaired flag's message carries the actual
+  // field-level repair detail (which key was hoisted/renamed) — without surfacing
+  // it here, telemetry only ever showed a bare repair COUNT, and diagnosing an
+  // unexpected repair meant re-deriving it from raw args in a session dump.
+  it('includes per-call detail for an args_repaired flag, but not for other flag codes', () => {
+    const decision = evaluateAgentToolPolicy({ toolName: 'call_google_ads_api', args: { action: 'UPDATE' } });
+    decision.flags.push({
+      code: 'args_repaired',
+      severity: 'info',
+      message: 'Tool arguments were repaired before execution: params.criterion_resource_name->criterion_resource_name',
+    });
+
+    const summary = summarizeAgentToolPolicyFlags([decision]);
+
+    expect(summary).toContain(
+      'call_google_ads_api:args_repaired:info(Tool arguments were repaired before execution: params.criterion_resource_name->criterion_resource_name)'
+    );
+    // Every other flag on this decision keeps the compact form (no parenthesized
+    // detail) since their messages are static per-tool templates, not per-call data.
+    const otherEntries = summary!.split(',').filter((entry) => !entry.includes(':args_repaired:'));
+    expect(otherEntries.length).toBeGreaterThan(0);
+    otherEntries.forEach((entry) => expect(entry).not.toMatch(/\(/));
+  });
+
   it('executes allowed tools and returns the exact result object', async () => {
     const result = { ok: true, nested: { id: 'same-reference' } };
     let now = 100;
@@ -2871,5 +2895,506 @@ describe('ENG-1636 — call_meta_marketing_api breaker scope and policy refusals
     expect(blocked.status).toBe('error');
     if (blocked.status === 'error') expect(blocked.error).toBeInstanceOf(AgentToolRepeatedFailureError);
     expect(execute).not.toHaveBeenCalled();
+  });
+});
+
+/*
+ * ENG-1668 — reproduces production session 87334a61-2e06-4018-960e-9e7759403423:
+ * two BUDGET UPDATE calls missing budget_resource_name tripped the (previously
+ * unscoped) call_google_ads_api bucket, then blocked the model's very next,
+ * fully corrected KEYWORD UPDATE and KEYWORD ADD_NEGATIVE calls — reporting the
+ * stale BUDGET UPDATE "required" error for both even though neither touched a
+ * budget. Same class of bug, and same fix, as ENG-1636 above.
+ */
+describe('ENG-1668 — call_google_ads_api breaker scope', () => {
+  beforeEach(() => {
+    _resetAgentToolFailureBreaker();
+  });
+
+  const budgetUpdate = () => ({
+    action: 'UPDATE', customer_id: '5092566541', entity_type: 'BUDGET', amount_micros: 25000000,
+  });
+  const keywordUpdate = () => ({
+    action: 'UPDATE', status: 'PAUSED', customer_id: '5092566541', entity_type: 'KEYWORD',
+    criterion_resource_name: 'customers/5092566541/adGroupCriteria/201989695567~26782521',
+  });
+  const keywordAddNegative = () => ({
+    action: 'ADD_NEGATIVE', customer_id: '5092566541', entity_type: 'KEYWORD',
+    campaign_resource_name: 'customers/5092566541/campaigns/24022076797',
+    keywords: [{ text: 'epsom salt', matchType: 'PHRASE' }],
+  });
+
+  // ENG-1668 follow-up: CAMPAIGN UPDATE can optionally carry budget_resource_name
+  // (reassigning the campaign onto a shared budget) alongside the always-present
+  // campaign_resource_name — campaign_resource_name must win the scope, or two
+  // DIFFERENT campaigns reassigned onto the SAME shared budget would collide.
+  it('scopes CAMPAIGN UPDATE by campaign, not by a shared budget it is being reassigned to', async () => {
+    const runId = 'run-1668-shared-budget';
+    const campaignUpdate = (campaignId: string) => ({
+      action: 'UPDATE', customer_id: '5092566541', entity_type: 'CAMPAIGN',
+      campaign_resource_name: `customers/5092566541/campaigns/${campaignId}`,
+      budget_resource_name: 'customers/5092566541/campaignBudgets/SHARED',
+    });
+    for (let i = 0; i < 2; i += 1) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args: campaignUpdate('campaign-A'), runId,
+        execute: () => Promise.reject(new Error('final_url_suffix is invalid for CAMPAIGN UPDATE')),
+      });
+    }
+    const executeB = jest.fn().mockResolvedValue({ success: true });
+    const outcomeB = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: campaignUpdate('campaign-B'), runId, execute: executeB,
+    });
+    expect(outcomeB.status).toBe('success');
+    expect(executeB).toHaveBeenCalled();
+  });
+
+  it('the production shape: a tripped BUDGET UPDATE bucket does not block a corrected KEYWORD UPDATE or KEYWORD ADD_NEGATIVE', async () => {
+    const runId = 'run-1668-budget-vs-keyword';
+    for (let i = 0; i < 2; i += 1) {
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args: budgetUpdate(), runId,
+        execute: () => Promise.reject(new Error('budget_resource_name and amount_micros are required for BUDGET UPDATE')),
+      });
+      expect(outcome.status).toBe('error');
+    }
+    const blockedBudget = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: budgetUpdate(), runId,
+      execute: jest.fn().mockResolvedValue({ success: true }),
+    });
+    expect(blockedBudget.status).toBe('error');
+    if (blockedBudget.status === 'error') expect(blockedBudget.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+
+    const executeKeywordUpdate = jest.fn().mockResolvedValue({ success: true });
+    const keywordUpdateOutcome = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: keywordUpdate(), runId, execute: executeKeywordUpdate,
+    });
+    expect(keywordUpdateOutcome.status).toBe('success');
+    expect(executeKeywordUpdate).toHaveBeenCalled();
+
+    const executeAddNegative = jest.fn().mockResolvedValue({ success: true });
+    const addNegativeOutcome = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: keywordAddNegative(), runId, execute: executeAddNegative,
+    });
+    expect(addNegativeOutcome.status).toBe('success');
+    expect(executeAddNegative).toHaveBeenCalled();
+  });
+
+  it('genuine repeats against the SAME resource still trip', async () => {
+    const runId = 'run-1668-genuine';
+    for (let i = 0; i < 2; i += 1) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args: keywordUpdate(), runId,
+        execute: () => Promise.reject(new Error('criterion_resource_name is required for KEYWORD UPDATE')),
+      });
+    }
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const blocked = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: keywordUpdate(), runId, execute,
+    });
+    expect(blocked.status).toBe('error');
+    if (blocked.status === 'error') expect(blocked.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('a LIST/read call survives a tripped write bucket for the same tool', async () => {
+    const runId = 'run-1668-read';
+    for (let i = 0; i < 2; i += 1) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args: budgetUpdate(), runId,
+        execute: () => Promise.reject(new Error('budget_resource_name and amount_micros are required for BUDGET UPDATE')),
+      });
+    }
+    const executeList = jest.fn().mockResolvedValue({ success: true, campaigns: [] });
+    const list = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api',
+      args: { action: 'LIST', customer_id: '5092566541', entity_type: 'CAMPAIGN' },
+      runId,
+      execute: executeList,
+    });
+    expect(list.status).toBe('success');
+    expect(executeList).toHaveBeenCalled();
+  });
+
+  // ENG-1668 follow-up: per-scope breaker isolation (above) means a model that fails
+  // a DIFFERENT entity/action every attempt never trips any single bucket. This run-
+  // scoped aggregate is the backstop for that "diagonal drift" pattern.
+  it('a run-scoped aggregate trips when the model fails 10 DIFFERENT entity/action combos, none individually tripped', async () => {
+    const runId = 'run-1668-diagonal-drift';
+    const distinctFailingCalls = Array.from({ length: 10 }, (_, i) => ({
+      action: 'UPDATE',
+      customer_id: '5092566541',
+      entity_type: `ENTITY_${i}`,
+      campaign_resource_name: `customers/5092566541/campaigns/${i}`,
+    }));
+    for (const args of distinctFailingCalls) {
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args, runId,
+        execute: () => Promise.reject(new Error(`some field is required for ${args.entity_type} UPDATE`)),
+      });
+      // Each individual call still fails on its own merits — none of these trip
+      // their OWN per-scope bucket (only 1 failure each, threshold is 2-3).
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') expect(outcome.error).not.toBeInstanceOf(AgentToolBudgetExceededError);
+    }
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const blocked = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api',
+      args: { action: 'UPDATE', customer_id: '5092566541', entity_type: 'ENTITY_NEW', campaign_resource_name: 'customers/5092566541/campaigns/new' },
+      runId,
+      execute,
+    });
+    expect(blocked.status).toBe('error');
+    if (blocked.status === 'error') expect(blocked.error).toBeInstanceOf(AgentToolBudgetExceededError);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('does not trip the aggregate for a legitimate mix of successes and failures below budget', async () => {
+    const runId = 'run-1668-legitimate-mix';
+    for (let i = 0; i < 5; i += 1) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api',
+        args: { action: 'UPDATE', customer_id: '5092566541', entity_type: `ENTITY_${i}`, campaign_resource_name: `customers/5092566541/campaigns/${i}` },
+        runId,
+        execute: () => Promise.reject(new Error(`some field is required for ENTITY_${i} UPDATE`)),
+      });
+    }
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const outcome = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: keywordUpdate(), runId, execute,
+    });
+    expect(outcome.status).toBe('success');
+    expect(execute).toHaveBeenCalled();
+  });
+
+  it('the aggregate is run-scoped, not session-wide: a fresh runId starts clean', async () => {
+    const staleRunId = 'run-1668-stale';
+    for (let i = 0; i < 10; i += 1) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api',
+        args: { action: 'UPDATE', customer_id: '5092566541', entity_type: `ENTITY_${i}`, campaign_resource_name: `customers/5092566541/campaigns/${i}` },
+        runId: staleRunId,
+        execute: () => Promise.reject(new Error(`some field is required for ENTITY_${i} UPDATE`)),
+      });
+    }
+    const freshRunId = 'run-1668-fresh';
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const outcome = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: keywordUpdate(), runId: freshRunId, execute,
+    });
+    expect(outcome.status).toBe('success');
+    expect(execute).toHaveBeenCalled();
+  });
+
+  // ENG-1668 follow-up: the production incident dispatched 4 call_google_ads_api
+  // calls from ONE assistant turn — real dispatch (toolDispatch.ts) runs these via
+  // Promise.all, not sequentially. Without an in-flight reservation, every sibling's
+  // check reads the same stale confirmed count before any of them resolves, so a
+  // whole concurrent batch could slip past the budget at once. These tests dispatch
+  // via a real Promise.all (not sequential awaits) to actually exercise that ordering.
+  it('a concurrent batch does not overshoot the run-scoped budget: only headroom-worth of calls proceed', async () => {
+    const runId = 'run-1668-concurrent-overshoot';
+    // 9 confirmed failures, one short of the budget (10).
+    for (let i = 0; i < 9; i += 1) {
+      await executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api',
+        args: { action: 'UPDATE', customer_id: '5092566541', entity_type: `ENTITY_${i}`, campaign_resource_name: `customers/5092566541/campaigns/${i}` },
+        runId,
+        execute: () => Promise.reject(new Error(`some field is required for ENTITY_${i} UPDATE`)),
+      });
+    }
+    // 4 MORE dispatched concurrently, matching the real production shape.
+    const executes = Array.from({ length: 4 }, () => jest.fn().mockRejectedValue(new Error('boom')));
+    const outcomes = await Promise.all(
+      executes.map((execute, i) => executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api',
+        args: { action: 'UPDATE', customer_id: '5092566541', entity_type: `CONCURRENT_${i}`, campaign_resource_name: `customers/5092566541/campaigns/c${i}` },
+        runId,
+        execute,
+      }))
+    );
+    // Only 1 unit of headroom was left (9 confirmed, budget 10) — exactly 1 of the
+    // 4 concurrent calls should actually execute; the other 3 are blocked on the
+    // reservation before ever reaching execute().
+    const executedCount = executes.filter((fn) => fn.mock.calls.length > 0).length;
+    const budgetBlocked = outcomes.filter((o) => o.status === 'error' && o.error instanceof AgentToolBudgetExceededError);
+    expect(executedCount).toBe(1);
+    expect(budgetBlocked.length).toBe(3);
+    // The one that did execute failed on its own real error, not a budget block.
+    const executed = outcomes.find((o, i) => executes[i].mock.calls.length > 0);
+    expect(executed?.status).toBe('error');
+    if (executed?.status === 'error') expect(executed.error).not.toBeInstanceOf(AgentToolBudgetExceededError);
+  });
+
+  it('a concurrent batch well within budget is not falsely blocked, and reservations release cleanly', async () => {
+    const runId = 'run-1668-concurrent-legitimate';
+    const executes = Array.from({ length: 4 }, () => jest.fn().mockResolvedValue({ success: true }));
+    const outcomes = await Promise.all(
+      executes.map((execute, i) => executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api',
+        args: { action: 'UPDATE', customer_id: '5092566541', entity_type: 'KEYWORD', criterion_resource_name: `customers/5092566541/adGroupCriteria/${i}` },
+        runId,
+        execute,
+      }))
+    );
+    expect(outcomes.every((o) => o.status === 'success')).toBe(true);
+    executes.forEach((fn) => expect(fn).toHaveBeenCalled());
+
+    // Reservations are released once resolved, not leaked — a later call sees a
+    // fully clean budget, not lingering pending state from the resolved batch.
+    const finalCheck = await executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api',
+      args: { action: 'UPDATE', customer_id: '5092566541', entity_type: 'KEYWORD', criterion_resource_name: 'customers/5092566541/adGroupCriteria/final' },
+      runId,
+      execute: jest.fn().mockResolvedValue({ success: true }),
+    });
+    expect(finalCheck.status).toBe('success');
+  });
+});
+
+/*
+ * ENG-1668 — the model's FIRST attempt in production session
+ * 87334a61-2e06-4018-960e-9e7759403423 nested every resource-name argument
+ * inside an invented `params: {...}` wrapper that isn't part of the schema,
+ * e.g. { action: 'UPDATE', entity_type: 'KEYWORD', params: { criterion_resource_name, status } }.
+ * The values were present, just one level too deep, so validateAndRepairToolArgs
+ * should hoist them rather than let the handler report them as missing.
+ */
+describe('ENG-1668 — hoists a stray nested wrapper object before validation', () => {
+  // Trimmed mirror of call_google_ads_api's real schema (emma/tools.ts).
+  const googleAdsSchema = {
+    type: 'object',
+    properties: {
+      customer_id: { type: 'string' },
+      entity_type: { type: 'string' },
+      action: { type: 'string' },
+      status: { type: 'string' },
+      budget_resource_name: { type: 'string' },
+      amount_micros: { type: 'number' },
+      campaign_resource_name: { type: 'string' },
+      criterion_resource_name: { type: 'string' },
+      keywords: { type: 'array' },
+      address: { type: 'object', properties: { street_address: { type: 'string' } } },
+    },
+    required: ['customer_id', 'entity_type', 'action'],
+  };
+
+  it('hoists nested fields that match missing top-level properties, e.g. KEYWORD UPDATE', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        action: 'UPDATE',
+        customer_id: '5092566541',
+        entity_type: 'KEYWORD',
+        keywords: [],
+        params: {
+          criterion_resource_name: 'customers/5092566541/adGroupCriteria/201989695567~26782521',
+          status: 'PAUSED',
+        },
+      },
+      inputSchema: googleAdsSchema,
+    });
+
+    expect(result.status).toBe('repaired');
+    expect(result.args).toEqual(expect.objectContaining({
+      criterion_resource_name: 'customers/5092566541/adGroupCriteria/201989695567~26782521',
+      status: 'PAUSED',
+    }));
+    expect((result.args as Record<string, unknown>).params).toBeUndefined();
+    expect(result.repairs).toEqual(expect.arrayContaining([
+      'params.criterion_resource_name->criterion_resource_name',
+      'params.status->status',
+    ]));
+    expect(result.issues).toEqual([]);
+  });
+
+  it('hoists nested fields for BUDGET UPDATE', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        entity_type: 'BUDGET', amount_micros: 25000000, action: 'UPDATE', customer_id: '5092566541',
+        params: { budget_resource_name: 'customers/5092566541/campaignBudgets/15706805175' },
+      },
+      inputSchema: googleAdsSchema,
+    });
+
+    expect(result.status).toBe('repaired');
+    expect((result.args as Record<string, unknown>).budget_resource_name)
+      .toBe('customers/5092566541/campaignBudgets/15706805175');
+    expect(result.issues).toEqual([]);
+  });
+
+  it('never overwrites a value already present at the top level', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        action: 'UPDATE', customer_id: '5092566541', entity_type: 'BUDGET',
+        budget_resource_name: 'customers/5092566541/campaignBudgets/REAL',
+        params: { budget_resource_name: 'customers/5092566541/campaignBudgets/DECOY' },
+      },
+      inputSchema: googleAdsSchema,
+    });
+
+    expect((result.args as Record<string, unknown>).budget_resource_name)
+      .toBe('customers/5092566541/campaignBudgets/REAL');
+  });
+
+  it('leaves a genuinely nested schema property (address) untouched', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        action: 'ADD_PROXIMITY', customer_id: '5092566541', entity_type: 'CAMPAIGN',
+        address: { street_address: '1 Main St' },
+      },
+      inputSchema: googleAdsSchema,
+    });
+
+    expect(result.status).toBe('valid');
+    expect((result.args as Record<string, unknown>).address).toEqual({ street_address: '1 Main St' });
+    expect(result.repairs).toEqual([]);
+  });
+
+  it('still flags a wrapper whose keys match nothing in the schema', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        action: 'UPDATE', customer_id: '5092566541', entity_type: 'BUDGET',
+        params: { some_unrelated_field: 'x' },
+      },
+      inputSchema: { ...googleAdsSchema, additionalProperties: false },
+    });
+
+    expect(result.status).toBe('invalid');
+  });
+
+  // ENG-1668 follow-up: restrict the hoist to keys that look like an invented
+  // wrapper (LIKELY_WRAPPER_KEY_NAMES) — a tool's own, unrelated field name should
+  // never be treated as a wrapper candidate just because it happens to hold an
+  // object whose keys collide with another property.
+  it('does not hoist from a wrapper key that is not a recognized wrapper name', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        action: 'UPDATE', customer_id: '5092566541', entity_type: 'KEYWORD',
+        metadata: { criterion_resource_name: 'customers/5092566541/adGroupCriteria/x' },
+      },
+      inputSchema: googleAdsSchema,
+    });
+
+    expect((result.args as Record<string, unknown>).criterion_resource_name).toBeUndefined();
+    expect(result.repairs).toEqual([]);
+  });
+
+  // ENG-1668 follow-up: the compound mistake — nested AND misnamed at once —
+  // is caught by running the SAME alias resolution used on top-level keys
+  // against the wrapper's nested keys too, not just an exact property-name match.
+  it('hoists a nested key that is ALSO misnamed, via an explicit schema alias', () => {
+    const schemaWithAlias = {
+      ...googleAdsSchema,
+      properties: {
+        ...googleAdsSchema.properties,
+        criterion_resource_name: { type: 'string', aliases: ['criterion'] },
+      },
+    };
+    const result = validateAndRepairToolArgs({
+      toolName: 'call_google_ads_api',
+      args: {
+        action: 'UPDATE', customer_id: '5092566541', entity_type: 'KEYWORD',
+        params: { criterion: 'customers/5092566541/adGroupCriteria/201989695567~26782521' },
+      },
+      inputSchema: schemaWithAlias,
+    });
+
+    expect(result.status).toBe('repaired');
+    expect((result.args as Record<string, unknown>).criterion_resource_name)
+      .toBe('customers/5092566541/adGroupCriteria/201989695567~26782521');
+    expect((result.args as Record<string, unknown>).params).toBeUndefined();
+    expect(result.repairs).toEqual(['params.criterion->criterion_resource_name']);
+  });
+
+  it('hoists a nested key matching a global default alias (query -> search_query)', () => {
+    const searchSchema = {
+      type: 'object',
+      properties: { query: { type: 'string' }, customer_id: { type: 'string' } },
+      required: ['customer_id'],
+    };
+    const result = validateAndRepairToolArgs({
+      toolName: 'you_search_web',
+      args: { customer_id: '1', filters: { search_query: 'agentweb' } },
+      inputSchema: searchSchema,
+    });
+
+    expect(result.status).toBe('repaired');
+    expect((result.args as Record<string, unknown>).query).toBe('agentweb');
+    expect(result.repairs).toEqual(['filters.search_query->query']);
+  });
+});
+
+// ENG-1668 follow-up: GOOGLE_ADS_RUN_FAILURE_BUDGET is read at module load time
+// (readPositiveIntEnv), so exercising a custom value means loading a fresh module
+// instance with the env var already set — jest.isolateModules + require gives a
+// module registry sandbox with its own fresh runFailureCounts/pendingRunBudget-
+// Reservations state, mirroring attioService.retry.test.ts's pattern for the same
+// kind of module-load-time configuration.
+describe('ENG-1668 follow-up — GOOGLE_ADS_RUN_FAILURE_BUDGET is env-overridable', () => {
+  const ORIGINAL_ENV = process.env.GOOGLE_ADS_RUN_FAILURE_BUDGET;
+
+  afterEach(() => {
+    if (ORIGINAL_ENV === undefined) delete process.env.GOOGLE_ADS_RUN_FAILURE_BUDGET;
+    else process.env.GOOGLE_ADS_RUN_FAILURE_BUDGET = ORIGINAL_ENV;
+  });
+
+  function loadIsolated(envValue: string) {
+    let isolated: typeof import('../services/agentToolGatewayService');
+    jest.isolateModules(() => {
+      process.env.GOOGLE_ADS_RUN_FAILURE_BUDGET = envValue;
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      isolated = require('../services/agentToolGatewayService');
+    });
+    return isolated!;
+  }
+
+  const failingCall = (i: number) => ({
+    action: 'UPDATE', customer_id: '1', entity_type: `ENTITY_${i}`, campaign_resource_name: `customers/1/campaigns/${i}`,
+  });
+
+  it('honors a custom budget from the environment', async () => {
+    const isolated = loadIsolated('2');
+    const runId = 'run-1668-env-budget-custom';
+    for (let i = 0; i < 2; i += 1) {
+      await isolated.executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args: failingCall(i), runId,
+        execute: () => Promise.reject(new Error(`some field is required for ENTITY_${i} UPDATE`)),
+      });
+    }
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const outcome = await isolated.executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api', args: failingCall(99), runId, execute,
+    });
+    expect(outcome.status).toBe('error');
+    if (outcome.status === 'error') expect(outcome.error).toBeInstanceOf(isolated.AgentToolBudgetExceededError);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the default (10) when the env var is invalid', async () => {
+    const isolated = loadIsolated('not-a-number');
+    const runId = 'run-1668-env-budget-invalid';
+    for (let i = 0; i < 9; i += 1) {
+      await isolated.executeAgentToolThroughGateway({
+        toolName: 'call_google_ads_api', args: failingCall(i), runId,
+        execute: () => Promise.reject(new Error(`some field is required for ENTITY_${i} UPDATE`)),
+      });
+    }
+    // Still under the default budget of 10 after 9 failures — an invalid env value
+    // did not zero out (or otherwise corrupt) the budget.
+    const execute = jest.fn().mockResolvedValue({ success: true });
+    const outcome = await isolated.executeAgentToolThroughGateway({
+      toolName: 'call_google_ads_api',
+      args: { action: 'UPDATE', customer_id: '1', entity_type: 'KEYWORD', criterion_resource_name: 'customers/1/adGroupCriteria/x' },
+      runId,
+      execute,
+    });
+    expect(outcome.status).toBe('success');
+    expect(execute).toHaveBeenCalled();
   });
 });

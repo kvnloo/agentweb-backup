@@ -1,15 +1,15 @@
 /**
- * 2026-08-19 — the default (Auto) chat model is Gemini 3.7 Flash.
+ * 2026-09-02 — the default (Auto) chat model is Gemini 3.8 Flash.
  *
- * Third and final default in one live picker review, per Harsha's direct
- * instruction each time: Opus 5/4.8 -> GLM 5.2 -> GPT-5.6 Luna -> Gemini 3.7
- * Flash ("i also think Gemini 3.7 Flash should be the default"). Gemini 3.7
- * Flash is Google's newest Flash-line model (GA 2026-08-13, verified live
- * against three independent sources), priced at Google's own direct rate
- * ($0.75/$3.75 per 1M — not a multi-provider OpenRouter blend like GLM 5.2),
- * and it dominates every other model in the `gemini-flash` family band for
- * band (see the "same-family dominance" suite in agentModeService.sonnet45.
- * test.ts, which flags Gemini 3.5 Flash legacy as a direct consequence).
+ * Supersedes the 2026-08-19 default (Gemini 3.7 Flash, see git history of
+ * this file under its prior name `defaultModelGemini37Flash.test.ts`).
+ * Gemini 3.8 Flash landed in the same `gemini-flash` family, same 'cheap'
+ * tier, and beat 3.7 on quality (59 vs 56) — the dominance system correctly
+ * auto-flagged 3.7 legacy the moment 3.8 joined the catalog (see the
+ * "same-family dominance" suite in agentModeService.sonnet45.test.ts). That
+ * left the pinned default on a legacy model, violating AC2 below. Harsha,
+ * in-session, approved moving the default to 3.8 to resolve it ("why not
+ * move the default to 3.8 gemini then, i'm fine with that").
  *
  * Gemini is neither an AWS Bedrock model nor an OpenRouter model — it routes
  * through the native Gemini client (`getClientForModel`'s `gemini-` prefix
@@ -49,10 +49,11 @@ jest.mock('../services/settingsService');
 jest.mock('../utils/secretsManager');
 
 const GEMINI_3_7_FLASH = 'gemini-3.7-flash';
+const GEMINI_3_8_FLASH = 'gemini-3.8-flash';
 const OPUS_5 = 'anthropic.claude-opus-5';
 const OPUS_4_8 = 'anthropic.claude-opus-4-8';
 
-describe('2026-08-19: default (Auto) chat model is Gemini 3.7 Flash', () => {
+describe('2026-09-02: default (Auto) chat model is Gemini 3.8 Flash', () => {
   let service: AgentModeService;
   const ENV_OVERRIDE = 'AZURE_OPENAI_DEPLOYMENT_AGENT_MODE';
   let savedOverride: string | undefined;
@@ -75,14 +76,14 @@ describe('2026-08-19: default (Auto) chat model is Gemini 3.7 Flash', () => {
     }
   });
 
-  // AC1 — a session with no explicit model selection resolves to Gemini 3.7 Flash.
-  describe('AC1 — no explicit model selection resolves to Gemini 3.7 Flash', () => {
-    it('uses Gemini 3.7 Flash as the code-level default model', () => {
-      expect(service.default_model).toBe(GEMINI_3_7_FLASH);
+  // AC1 — a session with no explicit model selection resolves to Gemini 3.8 Flash.
+  describe('AC1 — no explicit model selection resolves to Gemini 3.8 Flash', () => {
+    it('uses Gemini 3.8 Flash as the code-level default model', () => {
+      expect(service.default_model).toBe(GEMINI_3_8_FLASH);
     });
 
-    it('getDefaultModel() returns Gemini 3.7 Flash when no setting override is configured', async () => {
-      await expect(service.getDefaultModel()).resolves.toBe(GEMINI_3_7_FLASH);
+    it('getDefaultModel() returns Gemini 3.8 Flash when no setting override is configured', async () => {
+      await expect(service.getDefaultModel()).resolves.toBe(GEMINI_3_8_FLASH);
     });
 
     it('the default model is a servable, allow-listed model for every user, not just admins', async () => {
@@ -97,24 +98,25 @@ describe('2026-08-19: default (Auto) chat model is Gemini 3.7 Flash', () => {
       } finally {
         delete process.env[ENV_OVERRIDE];
       }
-      // And with it cleared again, the literal is Gemini 3.7 Flash.
-      expect(new AgentModeService().default_model).toBe(GEMINI_3_7_FLASH);
+      // And with it cleared again, the literal is Gemini 3.8 Flash.
+      expect(new AgentModeService().default_model).toBe(GEMINI_3_8_FLASH);
     });
   });
 
   // AC2 — the default must actually be dispatchable: not adminOnly-gated (or
   // "Auto" would 403 a non-admin) and not legacy (a default should not open
   // new sessions on a superseded model — it's the dominator here, not the
-  // dominated, see the sonnet45 dominance suite).
+  // dominated, see the sonnet45 dominance suite). This is the exact
+  // invariant that moved the default off Gemini 3.7 Flash in the first place.
   describe('AC2 — the default model is dispatchable for every user', () => {
     it('is not adminOnly-gated', () => {
       const llmModels = (service as any).llmModels;
-      expect(llmModels[GEMINI_3_7_FLASH]?.adminOnly).toBeFalsy();
+      expect(llmModels[GEMINI_3_8_FLASH]?.adminOnly).toBeFalsy();
     });
 
-    it('is not flagged legacy', async () => {
+    it('is not flagged legacy — it is the dominator, not the dominated', async () => {
       const models = await service.getSupportedModelsWithMetadata(false);
-      const info = models.find((m) => m.id === GEMINI_3_7_FLASH);
+      const info = models.find((m) => m.id === GEMINI_3_8_FLASH);
       expect(info).toBeDefined();
       expect(info!.legacy).toBeUndefined();
     });
@@ -122,7 +124,7 @@ describe('2026-08-19: default (Auto) chat model is Gemini 3.7 Flash', () => {
     it('routes through the native Gemini client path (the gemini- prefix branch), not Bedrock or OpenRouter', () => {
       // Registry entries route lazily; the dispatch-time branch keys on the
       // id prefix, not a stored client — confirmed here at the id level.
-      expect(GEMINI_3_7_FLASH.startsWith('gemini-')).toBe(true);
+      expect(GEMINI_3_8_FLASH.startsWith('gemini-')).toBe(true);
     });
   });
 
@@ -150,9 +152,9 @@ describe('2026-08-19: default (Auto) chat model is Gemini 3.7 Flash', () => {
   });
 
   // AC4 — cost attribution for the default model is tracked and materially
-  // cheaper than the Opus default it replaces. Gemini 3.7 Flash is Google's
-  // own direct rate (not a multi-provider blend), so an exact-value pin is
-  // appropriate here.
+  // cheaper than the Opus default it replaces. Gemini 3.8 Flash is Google's
+  // own direct rate (not a multi-provider blend, same base rate as 3.7), so
+  // an exact-value pin is appropriate here.
   describe('AC4 — usage/cost attribution for the default model', () => {
     it('prices the default model at Google\'s official introductory rate ($0.75 in / $3.75 out per 1M)', () => {
       const price = getModelPrice(service.default_model);
@@ -162,7 +164,7 @@ describe('2026-08-19: default (Auto) chat model is Gemini 3.7 Flash', () => {
     });
 
     it('is materially cheaper than the Opus 5 default it replaces', () => {
-      const gemini = getModelPrice(GEMINI_3_7_FLASH);
+      const gemini = getModelPrice(GEMINI_3_8_FLASH);
       const opus5 = getModelPrice(OPUS_5);
       expect(gemini).not.toBeNull();
       expect(opus5).not.toBeNull();
@@ -196,6 +198,21 @@ describe('2026-08-19: default (Auto) chat model is Gemini 3.7 Flash', () => {
       const { LIVE_MODEL } = require('../services/liveVoiceService');
       expect(LIVE_MODEL).toBe('models/gemini-3.1-flash-live-preview');
       expect(LIVE_MODEL).not.toBe(`models/${service.default_model}`);
+    });
+  });
+
+  // AC7 — the retired default (Gemini 3.7 Flash) is still fully servable,
+  // just no longer the pinned default and now correctly legacy-flagged.
+  describe('AC7 — the prior default (Gemini 3.7 Flash) remains servable, now correctly legacy', () => {
+    it('still offers Gemini 3.7 Flash as a selectable model', async () => {
+      const models = await service.getSupportedModels(true);
+      expect(models).toContain(GEMINI_3_7_FLASH);
+    });
+
+    it('is now flagged legacy — Gemini 3.8 Flash supersedes it band for band', async () => {
+      const models = await service.getSupportedModelsWithMetadata(true);
+      const flash37 = models.find((m) => m.id === GEMINI_3_7_FLASH)!;
+      expect(flash37.legacy).toBe(true);
     });
   });
 
