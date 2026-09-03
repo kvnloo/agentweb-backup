@@ -220,6 +220,44 @@ describe('runVerifiedChat participates in the shared session-generation lock (EN
     expect(tryClaimSessionGeneration(sessionId)).toBe(true);
   });
 
+  it('ENG-1719: releases the lock if the run itself hangs, instead of holding it forever', async () => {
+    // The worker call never settles — simulates a stuck LLM/tool call inside
+    // runVerifiedChatInner's attempt loop, which (per ENG-907) has no per-attempt
+    // deadline of its own. Before this fix, runVerifiedChat had no outer bound either,
+    // so this would hold activeSessionGenerations until a process restart.
+    mockWorkerService.runInWorker.mockImplementationOnce(() => new Promise(() => {}));
+
+    const runPromise = runVerifiedChat({
+      sessionId,
+      userId: 'user-1',
+      startingMessage: 'Generate the report.',
+      keywords: [],
+      requiredFunctions: [{ functionName: 'update_html_file', minCount: 1 }],
+      maxAttempts: 1,
+      attachments: [],
+    });
+    const outcome = runPromise.then(
+      () => ({ threw: false as const }),
+      (error: any) => ({ threw: true as const, error }),
+    );
+
+    // Comfortably past the default 30-minute RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS — fake
+    // timers make this instant, the real wall-clock duration doesn't matter here.
+    await jest.advanceTimersByTimeAsync(31 * 60 * 1000);
+
+    const result = await outcome;
+    expect(result.threw).toBe(true);
+    if (result.threw) {
+      expect(result.error.isGenerationTimeout).toBe(true);
+      // Distinct from SessionBusyError — this is "the run itself hung", not "someone
+      // else is holding the lock".
+      expect(isSessionBusyError(result.error)).toBe(false);
+    }
+    // The whole point: the lock released even though the worker call never resolved.
+    expect(activeSessionGenerations.has(sessionId)).toBe(false);
+    expect(tryClaimSessionGeneration(sessionId)).toBe(true);
+  });
+
   it('releases the lock even when the run fails internally', async () => {
     mockChatbotDb.getChatSession.mockRejectedValueOnce(new Error('DynamoDB throttled'));
 

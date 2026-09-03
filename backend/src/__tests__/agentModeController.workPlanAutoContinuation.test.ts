@@ -24,7 +24,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { checkTokenUsage } from '../services/tokenUsageService';
-import { progressStore } from '../utils/sseProgress';
+import { progressStore, requestCancel } from '../utils/sseProgress';
 
 jest.mock('../services/durableLandingService', () => ({
   findInFlightJobForSession: jest.fn().mockResolvedValue(null),
@@ -123,6 +123,7 @@ const mockCheckTokenUsage = checkTokenUsage as jest.Mock;
 // can't be spied on directly — assert its two observable effects instead (it does exactly
 // `emitProgress(..., {status:'complete'})` then `progressStore.delete(sessionId)`).
 const mockProgressStoreDelete = (progressStore as any).delete as jest.Mock;
+const mockRequestCancel = requestCancel as jest.Mock;
 
 describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1700/ENG-1699)', () => {
   const mockUserId = 'user-workplan-stall';
@@ -496,6 +497,12 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
       // chain stopped at 2, leaving the plan permanently unfinished with nobody notified.
       expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(3);
       expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+      // ENG-1719: the timed-out round's orphan must be cancelled before recursing — without
+      // this, round 3's generateSessionResponse call could run concurrently with round 2's
+      // still-running orphan, racing to write session.workPlan (the exact corruption class
+      // ENG-1696 exists to prevent, just self-inflicted by this retry chain).
+      expect(mockRequestCancel).toHaveBeenCalledWith(mockSessionId);
+      expect(mockWorkerService.cancelSession).toHaveBeenCalledWith(mockSessionId);
 
       consoleErrorSpy.mockRestore();
     });
