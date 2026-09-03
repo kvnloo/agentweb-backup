@@ -396,6 +396,7 @@ import {
   collectPendingDestinations,
   collectPendingCreativeIds,
   computeTrackingOverrideDigest,
+  computeMetaWriteManifestDigest,
   trackingOverrideTokenMatches,
 } from './metaLaunchGate';
 import { HubSpotService } from './hubspotService';
@@ -1343,9 +1344,15 @@ export class AgentModeService {
   // 2026-08-19 (Harsha, live picker review): Auto/default moved off Opus,
   // through GLM 5.2 and GPT-5.6 Luna, to Gemini 3.7 Flash — Google's newest
   // Flash-line model (GA 2026-08-13), cheap ($0.75/$3.75 per 1M, Google's own
-  // direct rate — not a multi-provider OpenRouter blend), and it dominates
+  // direct rate — not a multi-provider OpenRouter blend), and it dominated
   // every other model in the `gemini-flash` family band for band.
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.7-flash';
+  // 2026-09-02 (Harsha, in-session approval): moved again, from Gemini 3.7
+  // Flash to Gemini 3.8 Flash. Same family/tier/pricing, 3.8 dominates 3.7 on
+  // quality (59 vs 56) — the dominance system correctly auto-flagged 3.7
+  // legacy the moment 3.8 was added to the catalog, and leaving the default
+  // pinned to a legacy model would contradict AC2 of the acceptance suite
+  // this default has always carried (see agentModeService.defaultModel*.test.ts).
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.8-flash';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -2262,6 +2269,7 @@ export class AgentModeService {
     // vs 3.5's 'medium') and higher quality (56 vs 52) than 3.5 Flash, so 3.5
     // Flash is now correctly auto-flagged legacy.
     'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
+    'gemini-3.8-flash': { name: 'Gemini 3.8 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 59, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-8-flash (high)" page, snapshot 2026-09-02' },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
@@ -2649,6 +2657,28 @@ export class AgentModeService {
     }
 
     params.provider = { allow_fallbacks: true, require_parameters: true };
+    if (upstreamModel.startsWith('google/gemini-')) {
+      // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
+      // a legacy Standard API key hitting Google's Sept 2026 Standard-key
+      // cutoff; OpenRouter's own health check showed the "Google" BYOK slot
+      // at 63-85% uptime over 30min vs 99.9%+ on the pooled "Google AI
+      // Studio" slot, and default routing lands on the degraded one. Skip it
+      // until ENG-753 rotates the key to an Auth key and the BYOK slot's
+      // uptime recovers — remove this then, since it forfeits the BYOK cost
+      // discount in exchange for reliability.
+      //
+      // DO NOT change this to 'google-ai-studio' or 'google-vertex' — those
+      // are the slugs OpenRouter's separate BYOK-credential-creation API
+      // uses, not what `provider.ignore` matches on here. This param matches
+      // against the `provider_name` string from GET /v1/models/{id}/endpoints
+      // ("Google" vs "Google AI Studio"), confirmed by 10 live A/B calls
+      // (PR #2732): ignore:['Google'] -> 5/5 landed on Google AI Studio
+      // (correct); ignore:['google-ai-studio'] -> 5/5 landed on Google, i.e.
+      // the DEGRADED slot (backwards). A doc-based static-analysis suggestion
+      // proposed the slug form once already and was reverted for this reason
+      // — verify empirically against live traffic before changing this line.
+      params.provider.ignore = ['Google'];
+    }
     // OpenRouter reports its own billed amount as zero for BYOK requests even
     // though the upstream provider still bills the inference. Request the
     // routing flag so metering can distinguish BYOK from a genuinely free call.
@@ -19227,6 +19257,59 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * ENG-1642: check whether this exact Meta write is authorized by an
+   * answered `meta_write_manifest` question in the session, and if so claim
+   * it (at-most-once). Returns true only when a fresh claim succeeds THIS
+   * call — a digest not in any manifest, an unanswered/non-human-attributed
+   * manifest, or a digest already consumed all return false, which falls
+   * through to the normal confirmation halt.
+   */
+  private async claimMetaWriteManifestGrant(
+    sessionId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any,
+  ): Promise<boolean> {
+    const digest = computeMetaWriteManifestDigest(getJwtSecret(), {
+      entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params,
+    });
+    const session = await chatbotDb.getChatSession(sessionId);
+    // A session can carry MULTIPLE answered `meta_write_manifest` questions
+    // (each roll-off archives the prior one) — a newer manifest must not
+    // hide an EARLIER manifest that still authorizes this call's digest, so
+    // scan every candidate of this kind rather than taking only the single
+    // match `findQuestionByKind` would return.
+    const manifestCandidates: any[] = [];
+    if (session?.pendingUserQuestion?.kind === 'meta_write_manifest') {
+      manifestCandidates.push(session.pendingUserQuestion);
+    }
+    if (session?.answeredQuestions) {
+      for (const q of Object.values(session.answeredQuestions)) {
+        if (q.kind === 'meta_write_manifest') manifestCandidates.push(q);
+      }
+    }
+    // Session already recorded this exact digest consumed — a repeat of the
+    // same call re-confirms rather than executing again (acceptance
+    // criterion 3).
+    if (session?.consumedMetaWriteManifestDigests?.[digest]) return false;
+    for (const manifestQuestion of manifestCandidates) {
+      const gate = checkQuestionGate(manifestQuestion);
+      if (!gate.allowed) continue;
+      // The card's approve-option payload carries the digests it authorizes
+      // (see the `meta_write_manifest` card producer) — the digest for THIS
+      // call must be one of them, not merely "some manifest was answered".
+      const grantedDigests: unknown = (gate.payload as any)?.digests;
+      if (!Array.isArray(grantedDigests) || !grantedDigests.includes(digest)) continue;
+      return chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
+    }
+    return false;
+  }
+
+  /**
    * Loop halt seam for the human-in-the-loop confirmation gate. Scans one iteration's
    * tool results and returns the user-facing prompt to surface (or null to continue).
    * Only tool results that set `awaitingUserConfirmation === true` halt the turn — this
@@ -19841,7 +19924,31 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       : '';
     const overrideApproved =
       overrideClaimed && trackingOverrideTokenMatches((params as any)?.tracking_override_token, overrideDigest);
-    if (AgentModeService.isMetaWriteAction(entity_type, action) && (!confirmed || (overrideClaimed && !overrideApproved))) {
+
+    // ENG-1642: an approved deployment manifest authorizes its exact writes
+    // without re-confirmation. `confirmed` from the model-controlled `confirm`
+    // flag is never itself trustworthy (that's the whole reason the gate
+    // below exists) — but a call whose canonical digest appears in a
+    // HUMAN-attributed, answered `meta_write_manifest` question, and has not
+    // already been consumed in this session, may execute once without the
+    // halt. Deliberately narrower than the tracking-override mechanism: this
+    // never implies `override_tracking_check` (acceptance criterion 5), so
+    // the tracking pre-flight below is unaffected either way.
+    let manifestGranted = false;
+    if (
+      !confirmed &&
+      AgentModeService.isMetaWriteAction(entity_type, action) &&
+      sessionId
+    ) {
+      manifestGranted = await this.claimMetaWriteManifestGrant(
+        sessionId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+      );
+    }
+
+    if (
+      AgentModeService.isMetaWriteAction(entity_type, action) &&
+      (!confirmed && !manifestGranted || (overrideClaimed && !overrideApproved))
+    ) {
       const { summary, target } = await this.buildMetaWriteConfirmation(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
