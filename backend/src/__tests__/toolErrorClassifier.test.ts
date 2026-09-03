@@ -226,11 +226,40 @@ describe('classifyToolErrorClass', () => {
   });
 
   it('main\'s "is too large" invalid_args rule no longer swallows a Drive capped read', () => {
-    // ENG-1672 widened invalid_args with `is too large`; the Drive capped message used to end
-    // "this folder is too large to search within the read budget" and met it at auto-merge.
+    /*
+     * Asserted against the REAL message, not a paraphrase.
+     *
+     * ENG-1672 widened invalid_args with `is too large`, and the Drive capped message used to end
+     * "this folder is too large to search within the read budget" — they met at auto-merge and
+     * the model was told to fix a filename that was never wrong.
+     *
+     * The first version of this test asserted `not.toBe('invalid_args')` on a hand-written
+     * fragment, which classified as the legacy `Error` and so passed before the fix as well as
+     * after: it proved nothing. Pinning the sentence `driveNameSearchIncompleteMessage` actually
+     * emits means a reword that reintroduces the collision fails here.
+     */
+    const REAL_CAPPED_MESSAGE =
+      'File "notes.txt" was not found, but the file search ran out of its time budget before it '
+      + 'had covered the whole folder tree. This is an INCOMPLETE read, not a confirmed absence: '
+      + 'do not report the file as missing. Do NOT retry this same call — the budget is a fixed '
+      + 'wall-clock bound spent walking this folder\'s sub-folders, so a tree this large will stop '
+      + 'in the same place every time. The only thing that changes the outcome is a SMALLER '
+      + 'search scope: ask the user for the file\'s direct Google Drive link, or for the specific '
+      + 'sub-folder it lives in so that sub-folder can be registered as its own knowledge base '
+      + 'source. If neither is available, tell the user plainly that this folder exceeded the '
+      + 'read budget for a single search — do not describe it as a temporary glitch and do not '
+      + 'try again.';
+
+    // Positively classified, not merely "not invalid_args" — a message that matched nothing
+    // would satisfy the negative alone.
+    expect(classifyToolErrorClass(err(REAL_CAPPED_MESSAGE))).toBe('read_bounded');
+    expect(classifyToolErrorClass(err(REAL_CAPPED_MESSAGE))).not.toBe('invalid_args');
+
+    // And the collision itself: the old wording WOULD have been swallowed, which is what makes
+    // the assertion above meaningful rather than incidental.
     expect(classifyToolErrorClass(err(
-      'tell the user plainly that this folder exceeded the read budget for a single search',
-    ))).not.toBe('invalid_args');
+      'tell the user plainly that this folder is too large to search within the read budget',
+    ))).toBe('invalid_args');
   });
 
   it('classifies bad skill ids as invalid_args, not as a plan problem', () => {

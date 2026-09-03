@@ -119,7 +119,10 @@ describe('fetchApolloPerson — no email, name+website path', () => {
       expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' }),
       { userId: 'user-1' },
     );
-    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ email: expect.anything() }));
+    // Two expected args: production calls matchPerson(input, { userId }), and
+    // toHaveBeenCalledWith compares the WHOLE argument list — a one-arg expectation can
+    // never match a two-arg call, so this negative passed no matter what was sent.
+    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ email: expect.anything() }), expect.anything());
   });
 
   it('calls matchPerson with emailDomain when website absent but emailDomain present', async () => {
@@ -241,7 +244,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
     });
 
     expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }), { userId: 'user-1' });
-    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }));
+    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }), expect.anything());
   });
 
   it('passes the lead name alongside the email so matchPerson can run its identity gate', async () => {
@@ -272,7 +275,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
       { userId: 'user-1' },
     );
     // Still must NOT send domain on the email path (preserves cache-key behavior).
-    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }));
+    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }), expect.anything());
   });
 });
 
