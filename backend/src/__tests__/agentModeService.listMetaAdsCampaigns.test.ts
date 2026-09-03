@@ -195,9 +195,11 @@ describe('AgentModeService - List Meta Ads Campaigns', () => {
       global.fetch = jest.fn().mockImplementation(() => {
         return Promise.resolve({
           ok: false,
+          status: 401,
           json: () => Promise.resolve({
             error: {
-              message: 'Invalid OAuth access token'
+              message: 'Invalid OAuth access token',
+              code: 190, // Meta's own business code for this — never the HTTP status.
             }
           })
         });
@@ -208,6 +210,39 @@ describe('AgentModeService - List Meta Ads Campaigns', () => {
       expect(result.success).toBe(false);
       expect(result.message).toContain('Failed to fetch campaigns');
       expect(result.error).toBe('Invalid OAuth access token');
+    });
+
+    // ENG-1300: fetchWithRetryAndPaging previously returned the parsed error body
+    // with no way for the caller to know the real HTTP status — listMetaAdsCampaigns
+    // classified every Meta failure as a generic Error/bug. It now exposes the
+    // response status as a non-enumerable __httpStatus field; this proves it survives
+    // to the tool result and classifies correctly, distinct from Meta's business code.
+    it('ENG-1300: a 401 classifies as auth/config end-to-end, not the Meta business code 190', async () => {
+      const mockUser = { id: 'user123', adAccount: '123456789' };
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      global.fetch = jest.fn().mockImplementation(() => {
+        return Promise.resolve({
+          ok: false,
+          status: 401,
+          json: () => Promise.resolve({
+            error: { message: 'Invalid OAuth access token', code: 190 }
+          })
+        });
+      }) as jest.Mock;
+
+      const result = await agentModeService['listMetaAdsCampaigns']('user123');
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(401);
+
+      const { toolResultError } = await import('../utils/toolResultError');
+      const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+      const { classifyToolFailureType } = await import('../utils/toolFailureType');
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
     });
 
     it('should handle pagination and return all campaigns', async () => {

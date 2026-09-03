@@ -186,17 +186,22 @@ emmaToolRegistry.register({
         events,
       };
     } catch (error: any) {
+      // ENG-1300: carry `status` through so a clean 401/403 classifies as auth/
+      // config instead of the generic Error/bug fallback (the reconnect
+      // message text alone doesn't match classifyToolErrorClass's patterns).
       const status = error?.response?.status || error?.code;
       console.error('[google_calendar_list_events] API error:', error?.message);
       if (status === 403 || status === 401) {
         return {
           success: false,
           message: 'Calendar access denied. Please reconnect your Gmail account with Calendar access in Settings → Connected Accounts.',
+          status,
         };
       }
       return {
         success: false,
         message: `Failed to fetch calendar events: ${error?.message || 'Unknown error'}`,
+        status,
       };
     }
   },
@@ -291,12 +296,13 @@ emmaToolRegistry.register({
         },
       };
     } catch (error: any) {
+      // ENG-1300: carry `status` through — see google_calendar_list_events.
       const status = error?.response?.status || error?.code;
       if (status === 404) {
-        return { success: false, message: `Event ${args.event_id} not found in calendar ${calendarId}.` };
+        return { success: false, message: `Event ${args.event_id} not found in calendar ${calendarId}.`, status };
       }
       console.error('[google_calendar_get_event] API error:', error?.message);
-      return { success: false, message: `Failed to fetch event: ${error?.message || 'Unknown error'}` };
+      return { success: false, message: `Failed to fetch event: ${error?.message || 'Unknown error'}`, status };
     }
   },
 });
@@ -359,7 +365,9 @@ emmaToolRegistry.register({
       };
     } catch (error: any) {
       console.error('[google_calendar_list_calendars] API error:', error?.message);
-      return { success: false, message: `Failed to fetch calendars: ${error?.message || 'Unknown error'}` };
+      // ENG-1300: carry `status` through — see google_calendar_list_events.
+      const status = error?.response?.status || error?.code;
+      return { success: false, message: `Failed to fetch calendars: ${error?.message || 'Unknown error'}`, status };
     }
   },
 });
@@ -558,6 +566,7 @@ emmaToolRegistry.register({
         },
       };
     } catch (error: any) {
+      // ENG-1300: carry `status` through — see google_calendar_list_events.
       const status = error?.response?.status || error?.code;
       console.error('[google_calendar_create_event] API error:', error?.message);
       if (status === 403 || status === 401) {
@@ -567,17 +576,20 @@ emmaToolRegistry.register({
           message:
             'Calendar write access was denied by Google. Please reconnect your Gmail account ' +
             'in Settings → Connected Accounts and allow Calendar access (including managing events).',
+          status,
         };
       }
       if (status === 400) {
         return {
           success: false,
           message: `Could not create the event — Google rejected the request: ${error?.message || 'invalid request'}. Please check the date/time format.`,
+          status,
         };
       }
       return {
         success: false,
         message: `Failed to create calendar event: ${error?.message || 'Unknown error'}`,
+        status,
       };
     }
   },
@@ -743,19 +755,21 @@ emmaToolRegistry.register({
         },
       };
     } catch (error: any) {
+      // ENG-1300: carry `status` through — see google_calendar_list_events.
       const status = error?.response?.status || error?.code;
       console.error('[google_calendar_update_event] API error:', error?.message);
       if (status === 404) {
-        return { success: false, message: `Event ${args.event_id} not found in calendar ${calendarId}.` };
+        return { success: false, message: `Event ${args.event_id} not found in calendar ${calendarId}.`, status };
       }
       if (status === 403 || status === 401) {
         return {
           success: false,
           needs_reconnect: true,
           message: 'Calendar write access denied. Please reconnect your Gmail account in Settings → Connected Accounts.',
+          status,
         };
       }
-      return { success: false, message: `Failed to update event: ${error?.message || 'Unknown error'}` };
+      return { success: false, message: `Failed to update event: ${error?.message || 'Unknown error'}`, status };
     }
   },
 });
@@ -826,22 +840,24 @@ emmaToolRegistry.register({
         event_id: args.event_id,
       };
     } catch (error: any) {
+      // ENG-1300: carry `status` through — see google_calendar_list_events.
       const status = error?.response?.status || error?.code;
       console.error('[google_calendar_delete_event] API error:', error?.message);
       if (status === 404) {
-        return { success: false, message: `Event ${args.event_id} not found in calendar ${calendarId}.` };
+        return { success: false, message: `Event ${args.event_id} not found in calendar ${calendarId}.`, status };
       }
       if (status === 410) {
-        return { success: false, message: `Event ${args.event_id} was already deleted.` };
+        return { success: false, message: `Event ${args.event_id} was already deleted.`, status };
       }
       if (status === 403 || status === 401) {
         return {
           success: false,
           needs_reconnect: true,
           message: 'Calendar write access denied. Please reconnect your Gmail account in Settings → Connected Accounts.',
+          status,
         };
       }
-      return { success: false, message: `Failed to delete event: ${error?.message || 'Unknown error'}` };
+      return { success: false, message: `Failed to delete event: ${error?.message || 'Unknown error'}`, status };
     }
   },
 });

@@ -1,4 +1,7 @@
 import { AgentModeService } from '../services/agentModeService';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 // ── Core dependency mocks (same boilerplate as fathomToolAccess.test.ts) ──────
 
@@ -641,6 +644,59 @@ describe('AgentModeService - Google Drive methods', () => {
   });
 
   // ────────────────────────────────────────────────────────────────────────────
+  // ENG-1300: every "friendly 403 message" test above already proved the USER-
+  // FACING message is unchanged. This proves the other half — the numeric
+  // status now rides along on the result so classifyToolErrorClass sees
+  // 'auth' (classifyToolFailureType 'config') instead of the generic
+  // 'Error'/'bug' fallback a hand-written message alone cannot match. One
+  // representative case per function, not every branch — the branch-level
+  // message-text coverage already exists above.
+  // ────────────────────────────────────────────────────────────────────────────
+
+  describe('ENG-1300 — 403s classify as auth/config end-to-end', () => {
+    const expectAuthConfig = (result: any) => {
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    };
+
+    it('listGoogleDriveFolder', async () => {
+      mockDriveFiles.list.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.listGoogleDriveFolder('folder-id', USER_ID));
+    });
+
+    it('createGoogleDriveFolder', async () => {
+      mockDriveFiles.create.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.createGoogleDriveFolder('name', USER_ID));
+    });
+
+    it('searchGoogleDrive', async () => {
+      mockDriveFiles.list.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.searchGoogleDrive('query', USER_ID));
+    });
+
+    it('createGoogleDoc', async () => {
+      mockDriveFiles.create.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.createGoogleDoc('title', 'content', USER_ID));
+    });
+
+    it('updateGoogleDoc', async () => {
+      mockDriveFiles.update.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.updateGoogleDoc('doc-id', 'content', USER_ID));
+    });
+
+    it('createGoogleSheet', async () => {
+      mockDriveFiles.create.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.createGoogleSheet('title', [['a']], USER_ID));
+    });
+
+    it('updateGoogleSheet', async () => {
+      mockSheetsValues.update.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.updateGoogleSheet('sheet-id', 'A1', [['v']], USER_ID));
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
   // readGoogleFileById
   // ────────────────────────────────────────────────────────────────────────────
 
@@ -775,6 +831,23 @@ describe('AgentModeService - Google Drive methods', () => {
       const result = await service.readGoogleFileById('file-id', USER_ID);
       expect(result.success).toBe(false);
       expect(result.message).toMatch(/not found/i);
+    });
+
+    // ENG-1300: the terminal error after both OAuth and SA fail now carries the
+    // real status through, so this classifies as not_found/config instead of
+    // the generic Error/bug fallback.
+    it('ENG-1300: the terminal 404 (after SA also fails) classifies as not_found/config', async () => {
+      let callCount = 0;
+      mockDriveFiles.get.mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) throw makeApiError(403);
+        throw makeApiError(404);
+      });
+
+      const result = await service.readGoogleFileById('file-id', USER_ID);
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('not_found');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
     });
 
     it('reads Google Doc content via export', async () => {
@@ -2524,6 +2597,31 @@ describe('AgentModeService - Google Drive methods', () => {
       } finally {
         jest.useRealTimers();
       }
+    });
+
+    // ENG-1300: readGoogleDriveSharedFile's own catch (around the content-read
+    // step, after the file is already found) previously flattened any coded
+    // API error to a message-only result. This is the branch, not the
+    // logic-driven "restricted sub-folder" message above (which never throws).
+    it('ENG-1300: a coded error reading file content classifies as auth/config end-to-end', async () => {
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType')) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        if (q.includes("name = 'notes.txt'")) {
+          return Promise.resolve({
+            data: { files: [{ id: 'file-99', name: 'notes.txt', mimeType: 'text/plain', size: '12', modifiedTime: '2026-08-01T00:00:00Z' }] },
+          });
+        }
+        return Promise.resolve({ data: { files: [] } });
+      });
+      mockDriveFiles.get.mockRejectedValue(makeApiError(403));
+
+      const result = await service.readSingleKnowledgeBaseFile(`gdrive:${ROOT}`, 'notes.txt', USER_ID);
+      expect(result.success).toBe(false);
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
     });
 
     it('reports ambiguity instead of silently reading one candidate when the same name exists in two sub-folders', async () => {

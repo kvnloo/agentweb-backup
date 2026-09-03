@@ -26,7 +26,7 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: { recordMetaMeasurementCheck: (...a: any[]) => mockRecord(...a) },
 }));
 
-import { _runMetaTrackingGateForTest } from '../services/metaLaunchGate';
+import { _runMetaTrackingGateForTest, computeMetaWriteManifestDigest } from '../services/metaLaunchGate';
 
 const ACCOUNT = '409853340719899';
 const CAMPAIGN = '120200000000000';
@@ -259,6 +259,37 @@ describe('Meta launch gate (ENG-941)', () => {
     mockRecord.mockRejectedValue(new Error('dynamo down'));
     const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-1');
     expect(out.proceed).toBe(true);
+  });
+});
+
+describe('meta write manifest digest (ENG-1642)', () => {
+  const call = {
+    entity_type: 'AD',
+    action: 'UPDATE',
+    account_id: ACCOUNT,
+    campaign_id: CAMPAIGN,
+    ad_set_id: 'adset-1',
+    ad_id: 'ad-1',
+    params: { status: 'ACTIVE', name: 'Launch ad' },
+  };
+
+  it('is stable when gate-only confirmation fields differ', () => {
+    const preview = computeMetaWriteManifestDigest('manifest-secret', call);
+    const confirmed = computeMetaWriteManifestDigest('manifest-secret', {
+      ...call,
+      params: { ...call.params, confirm: true, tracking_override_token: 'not-part-of-the-write' },
+    });
+    expect(confirmed).toBe(preview);
+  });
+
+  it.each([
+    ['target', { ...call, ad_id: 'another-ad' }],
+    ['action', { ...call, action: 'CREATE' }],
+    ['params', { ...call, params: { ...call.params, name: 'Different creative' } }],
+  ])('changes when the %s changes', (_field, changed) => {
+    expect(computeMetaWriteManifestDigest('manifest-secret', changed)).not.toBe(
+      computeMetaWriteManifestDigest('manifest-secret', call),
+    );
   });
 });
 

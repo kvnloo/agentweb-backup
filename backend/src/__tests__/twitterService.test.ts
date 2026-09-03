@@ -93,6 +93,8 @@ jest.mock('../services/connectedAccountsDb', () => ({
 }));
 
 import { twitterService } from '../services/twitterService';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 const ACCOUNT_ID = 'tw-acct-1';
 const OWNER = 'user-1';
@@ -228,6 +230,26 @@ describe('TwitterService X Lists (read)', () => {
   it('maps a 403 (missing list.read scope) to a clear reconnect error — not a silent empty result', async () => {
     mockListsOwned.mockRejectedValue(Object.assign(new Error('Forbidden'), { code: 403 }));
     await expect(twitterService.getOwnedLists(OWNER, ACCOUNT_ID)).rejects.toThrow(/list\.read|reconnect/i);
+  });
+
+  it('ENG-1300: the mapped list-scope error still classifies as auth/config, not a generic bug', async () => {
+    // The raw twitter-api-v2 ApiResponseError carries `.code = 403`, which
+    // classifyToolErrorClass reads to classify it as 'auth'. mapListScopeError
+    // rewrites the error into a friendlier message for the user — that rewrite
+    // must preserve the 403 signal, or every downstream consumer (tool
+    // scorecard, run-verdict telemetry) sees this well-understood, recurring
+    // account-permission gap as an unclassified 'Error'/'bug' instead of the
+    // 'auth'/'config' class it actually is.
+    mockListsOwned.mockRejectedValue(Object.assign(new Error('Forbidden'), { code: 403 }));
+    let caught: unknown;
+    try {
+      await twitterService.getOwnedLists(OWNER, ACCOUNT_ID);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(classifyToolErrorClass(caught)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(caught), (caught as Error).message)).toBe('config');
   });
 
   it('resolveOwnedListIdByName matches a list name case-insensitively', async () => {

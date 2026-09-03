@@ -378,6 +378,10 @@ export class WebflowBlogPublisher implements BlogPublisher {
         error: 'Webflow API validation error',
         availableCategories: errorInfo.availableCategories || [],
         repairSuggested: errorInfo.repairSuggested || false,
+        // ENG-1300: errorInfo.status (webflowError.response?.status) was already
+        // computed above but never surfaced — return it so a 401/403 classifies
+        // as auth/config instead of the generic bug fallback.
+        code: errorInfo.status,
       };
     }
   }
@@ -511,6 +515,10 @@ export class WordPressBlogPublisher implements BlogPublisher {
         message: errorInfo.message || `WordPress API error: ${errorInfo.status} ${errorInfo.statusText}`,
         error: 'WordPress API error',
         availableCategories: wpConfig.categories ? Object.keys(wpConfig.categories) : [],
+        // ENG-1300: errorInfo.status (wpError.response?.status) was already computed
+        // above but never surfaced. Deliberately NOT errorInfo.code — that's
+        // WordPress's own error slug (e.g. "rest_post_invalid_id"), not an HTTP status.
+        code: errorInfo.status,
       };
     }
   }

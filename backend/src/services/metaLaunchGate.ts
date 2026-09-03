@@ -401,6 +401,21 @@ export function computeTrackingOverrideDigest(secret: string, payload: Record<st
   return createHmac('sha256', secret).update(stableStringify(payload)).digest('hex');
 }
 
+/**
+ * Canonical identity for one Meta write approved by a manifest (ENG-1642).
+ *
+ * A manifest authorizes the write Meta receives, not the control-plane flags used
+ * to reach it.  `confirm` and the tracking-override token are therefore removed
+ * before signing; every target, action, and actual Meta parameter remains bound.
+ * Child ENG-1644 uses this same digest as its pending-approval store key.
+ */
+export function computeMetaWriteManifestDigest(secret: string, payload: Record<string, any>): string {
+  const { params, ...call } = payload;
+  const { confirm: _confirm, tracking_override_token: _trackingOverrideToken, ...metaParams } =
+    params && typeof params === 'object' ? params : {};
+  return computeTrackingOverrideDigest(secret, { ...call, params: metaParams });
+}
+
 /** Constant-time compare that tolerates a caller-supplied value of any shape/length. */
 export function trackingOverrideTokenMatches(supplied: unknown, expected: string): boolean {
   if (typeof supplied !== 'string' || supplied.length !== expected.length) return false;
