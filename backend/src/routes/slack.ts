@@ -1384,6 +1384,14 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                     }
                   }
                 }).catch(async (error) => {
+                  // ENG-1719: expected, benign lock contention (a live chat turn or another
+                  // revision on the same session), not a real failure — paging on-call for
+                  // it was the exact false alarm this fix exists to stop.
+                  const { isSessionBusyError } = await import('../controllers/agentModeController');
+                  if (isSessionBusyError(error)) {
+                    console.warn(`⏳ Agent Mode revision for session ${agentSessionId} skipped — session was busy with another generation in progress.`);
+                    return;
+                  }
                   console.error('❌ Error in Agent Mode verified-generate:', error);
                   try {
                     const isSessionLimit = isSessionLimitError(error);
@@ -1613,6 +1621,14 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         }
                       }
                     }).catch(async (error) => {
+                      // ENG-1719: expected, benign lock contention, not a real failure —
+                      // paging on-call for it was the exact false alarm this fix exists
+                      // to stop.
+                      const { isSessionBusyError } = await import('../controllers/agentModeController');
+                      if (isSessionBusyError(error)) {
+                        console.warn(`⏳ Agent Mode revision for session ${task.sessionId} skipped — session was busy with another generation in progress.`);
+                        return;
+                      }
                       console.error('❌ Error in Agent Mode verified-generate:', error);
                       try {
                         const isSessionLimit = isSessionLimitError(error);
