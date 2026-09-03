@@ -117,6 +117,7 @@ describe('fetchApolloPerson — no email, name+website path', () => {
 
     expect(matchPersonSpy).toHaveBeenCalledWith(
       expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' }),
+      { userId: 'user-1' },
     );
     expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ email: expect.anything() }));
   });
@@ -145,6 +146,7 @@ describe('fetchApolloPerson — no email, name+website path', () => {
 
     expect(matchPersonSpy).toHaveBeenCalledWith(
       expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' }),
+      { userId: 'user-1' },
     );
   });
 
@@ -211,7 +213,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
       refreshFields: new Set(),
     });
 
-    expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }));
+    expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }), { userId: 'user-1' });
   });
 
   it('prefers email over name+domain when both present', async () => {
@@ -238,7 +240,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
       refreshFields: new Set(),
     });
 
-    expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }));
+    expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }), { userId: 'user-1' });
     expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }));
   });
 
@@ -267,6 +269,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
 
     expect(matchPersonSpy).toHaveBeenCalledWith(
       expect.objectContaining({ email: 'joe@us.com', firstName: 'Joe', lastName: 'Hio' }),
+      { userId: 'user-1' },
     );
     // Still must NOT send domain on the email path (preserves cache-key behavior).
     expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }));
@@ -328,7 +331,7 @@ describe('enrichSoReverseLookup adapter', () => {
       mode: 'enrich',
     });
 
-    expect(reverseLookup).toHaveBeenCalledWith('jane@gmail.com');
+    expect(reverseLookup).toHaveBeenCalledWith('jane@gmail.com', { userId: 'user-1' });
   });
 
   it('calls reverseLookup for business email', async () => {
@@ -346,7 +349,7 @@ describe('enrichSoReverseLookup adapter', () => {
       mode: 'enrich',
     });
 
-    expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com');
+    expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com', { userId: 'user-1' });
   });
 });
 
@@ -367,6 +370,7 @@ describe('enrichSoFindEmail adapter', () => {
 
     expect(findEmail).toHaveBeenCalledWith(
       expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' }),
+      { userId: 'user-1' },
     );
   });
 
@@ -389,7 +393,7 @@ describe('enrichSoFindEmail adapter', () => {
     if (!result.ok) return;
     expect(result.resolved.email).toBe('jane@acme.com');
     // reverse-lookup should be chained automatically after email found
-    expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com');
+    expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com', { userId: 'user-1' });
   });
 });
 
