@@ -338,7 +338,7 @@ export function peekWriteCooldown(
   }
 
   const lastWrite = recent.length > 0 ? recent[recent.length - 1] : 0;
-  if (lastWrite > 0) {
+  if (recent.length > 0) {
     const nextAvailable = lastWrite + gap;
     if (nextAvailable > now) {
       return { active: true, expiresAt: new Date(nextAvailable).toISOString() };
