@@ -1,6 +1,7 @@
 import { AgentModeService } from '../services/agentModeService';
 import { toolResultError } from '../utils/toolResultError';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { appendRetryabilityGuidance } from '../services/agentMode/core/errorRetryability';
 import { classifyToolFailureType } from '../utils/toolFailureType';
 
 // ── Core dependency mocks (same boilerplate as fathomToolAccess.test.ts) ──────
@@ -1612,6 +1613,77 @@ describe('AgentModeService - Google Drive methods', () => {
         } finally {
           jest.useRealTimers();
         }
+      });
+
+      /*
+       * The sibling to the wall-clock test above: a walk that stopped because a SUB-FOLDER READ
+       * FAILED, not because it ran out of time. Only this cause can be cleared by trying again,
+       * so it is the one case where telling the model to retry is correct — and unlike the
+       * deterministic case, this exercises the branch through the real classifier too.
+       */
+      it('DOES tell the model retrying may help when a sub-folder read failed transiently', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            if (q.includes(`'${ROOT}' in parents`)) {
+              return Promise.resolve({ data: { files: [{ id: 'bad-sub', name: 'bad' }] } });
+            }
+            const e: any = new Error('socket hang up');
+            e.code = 'ECONNRESET';
+            return Promise.reject(e);
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/not a confirmed absence/i);
+        expect(result.message).toMatch(/retrying may well complete the scan/i);
+
+        const classified = classifyToolErrorClass(new Error(result.message));
+        expect(classified).toBe('read_incomplete');
+        expect(appendRetryabilityGuidance('x', classified)).toMatch(/Retryable: yes/i);
+      });
+
+      /*
+       * The case the previous round of this fix got wrong: a walk that hit BOTH a transient
+       * sub-folder failure AND a deterministic bound (the folder-count ceiling) in the same walk.
+       * transientFailure alone is not enough to promise a useful retry, because the deterministic
+       * bound will stop the walk in the same place next time regardless.
+       */
+      it('does NOT promise a useful retry when a transient failure AND a deterministic bound both fired', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            if (q.includes(`'${ROOT}' in parents`)) {
+              return Promise.resolve({
+                data: { files: [{ id: 'bad-sub', name: 'bad' }, { id: 'big-sub', name: 'big' }] },
+              });
+            }
+            if (q.includes(`'bad-sub' in parents`)) {
+              const e: any = new Error('socket hang up');
+              e.code = 'ECONNRESET';
+              return Promise.reject(e);
+            }
+            if (q.includes(`'big-sub' in parents`)) {
+              return Promise.resolve({
+                data: { files: Array.from({ length: 600 }, (_, i) => ({ id: `g${i}`, name: `g${i}` })) },
+              });
+            }
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/not a confirmed absence/i);
+        // The transient-only wording must NOT appear — the bound makes a retry futile regardless.
+        expect(result.message).not.toMatch(/retrying may well complete the scan/i);
+        expect(result.message).toMatch(/stop in the same place every time/i);
+
+        const classified = classifyToolErrorClass(new Error(result.message));
+        expect(classified).toBe('read_bounded');
+        expect(appendRetryabilityGuidance('x', classified)).toMatch(/Retryable: no/i);
       });
 
       it('reports ambiguity instead of silently materializing one candidate when the same name exists in two sub-folders', async () => {

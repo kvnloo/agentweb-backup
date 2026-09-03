@@ -16501,8 +16501,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           success: false,
           // Masked like the paging sibling below: Graph error text can name the object
           // ("Object with ID '120...' does not exist"), and this string reaches the user.
-          message: `Failed to fetch campaigns: ${String(campaignsData.error.message ?? '').replace(/\d{8,}/g, '[id]')}`,
-          error: campaignsData.error.message,
+          // Both fields. `extractToolResultMessage` reads `error` BEFORE `message`, so masking
+          // only `message` masked nothing — the raw id reached the model through `error`. The
+          // paging sibling below is on a success result carrying only `message`, which is why
+          // one field was enough there and is not here.
+          message: `Failed to fetch campaigns: ${AgentModeService.maskMetaIds(campaignsData.error.message)}`,
+          error: AgentModeService.maskMetaIds(campaignsData.error.message),
           // ENG-1300: fetchWithRetryAndPaging exposes the real HTTP status as a
           // non-enumerable __httpStatus field — never campaignsData.error.code,
           // which is Meta's own business error code, not an HTTP status.
@@ -17263,7 +17267,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
         return {
           success: true,
-          message: `Fetched ad creative ${params.creative_id}`,
+          // No raw id in the prose — same rule the guard three lines above exists to enforce, and
+          // nothing is lost: `creative.id`/`creative.name` are always requested (metaService.ts)
+          // and remain on the structured `creative` object below for the model to reference.
+          message: creative?.name
+            ? `Fetched the requested ad creative "${creative.name}".`
+            : `Fetched the requested ad creative.`,
           creative,
         };
       }
@@ -22628,6 +22637,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return remedy || GENERIC;
   }
 
+  /**
+   * Strip long digit runs from text that reaches a user.
+   *
+   * Graph error bodies name the object ("Object with ID '120...' does not exist"), and the
+   * product rule against showing raw Meta ids does not stop applying because the string came
+   * from Meta. A helper rather than a repeated regex because the last attempt masked one field
+   * and left the sibling field — which is the one actually read — untouched.
+   */
+  private static maskMetaIds(text: unknown): string {
+    return String(text ?? '').replace(/\d{8,}/g, '[id]');
+  }
+
   private static driveErrorReasons(err: any): string[] {
     const raw = [
       ...(Array.isArray(err?.errors) ? err.errors : []),
@@ -22871,6 +22892,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
      * and the retryable classification meant each futile attempt re-walked the whole budget.
      */
     transientFailure: boolean;
+    /**
+     * The walk hit a deterministic bound — the folder-count ceiling or the wall clock.
+     *
+     * Not exclusive with `transientFailure`, and correlated with it: `withDriveRetry` spends
+     * budget on a transient failure, which makes the clock more likely to run out in the same
+     * walk. A walk with both must NOT advise a retry, because the bound will stop it in the same
+     * place next time — verified by probe: a transport failure on one child followed by the
+     * folder-count ceiling sets both flags.
+     */
+    boundedStop: boolean;
     truncated: boolean;
     folderNames: Map<string, string>;
   }> {
@@ -22882,6 +22913,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     let rootRestricted = false;
     let throttled = false;
     let transientFailure = false;
+    let boundedStop = false;
     let truncated = false;
     /*
      * "The walk is incomplete" and "stop walking" are DIFFERENT facts, and conflating them cost
@@ -22901,6 +22933,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     while (queue.length > 0 && !stopWalk) {
       if (Date.now() >= deadline) {
         truncated = true;
+        boundedStop = true;
         stopWalk = true;
         break;
       }
@@ -22909,6 +22942,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       do {
         if (Date.now() >= deadline) {
           truncated = true;
+          boundedStop = true;
           stopWalk = true;
           break;
         }
@@ -22965,6 +22999,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           if (!f.id || folderIdSet.has(f.id)) continue;
           if (folderIds.length >= maxFolders) {
             truncated = true;
+            boundedStop = true;
             stopWalk = true;
             break;
           }
@@ -22978,7 +23013,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       } while (pageToken);
     }
 
-    return { folderIds, restricted, rootRestricted, truncated, throttled, transientFailure, folderNames };
+    return { folderIds, restricted, rootRestricted, truncated, throttled, transientFailure, boundedStop, folderNames };
   }
 
   // ENG-1624: `'<id>' in parents` clauses joined with OR grow ~52 chars per Drive
@@ -23018,9 +23053,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
      * invisible (6 x 15s); raising the budget is what made it reachable.
      */
     sharedDeadlineAt?: number,
-  ): Promise<{ files: Map<string, any>; capped: boolean; failed?: any }> {
+  ): Promise<{ files: Map<string, any>; capped: boolean; incomplete: boolean; failed?: any }> {
     const merged = new Map<string, any>();
     let capped = false;
+    /*
+     * `capped` covers three stops and only two of them mean the read is INCOMPLETE.
+     *
+     * The third — "this batch hit offset+limit+1 and there is more" — is ordinary pagination,
+     * already reported exactly by `totalFilesIsLowerBound`, with `files` correct and `hasMore`
+     * exact. Folding it into the incompleteness signal made every routine paginated listing
+     * announce "some folders were too large to fully scan or could not be accessed": the
+     * wrong-cause sentence, on healthy reads, which is the failure this PR exists to remove.
+     */
+    let incomplete = false;
     // Distinguished from `capped`: "we stopped at a bound" and "a request errored" are different
     // facts and their callers need different things. The listing path reports a failed source as
     // failed rather than merely short; the search path treats either as incomplete.
@@ -23036,6 +23081,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     for (let i = 0; i < folderIds.length; i += AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE) {
       if (Date.now() >= deadline) {
         capped = true;
+        incomplete = true;
         break;
       }
       const batch = folderIds.slice(i, i + AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE);
@@ -23045,6 +23091,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       do {
         if (Date.now() >= deadline) {
           capped = true;
+          incomplete = true;
           pageToken = undefined;
           break;
         }
@@ -23074,6 +23121,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
            */
           console.log('AgentMode: Drive file query batch failed; reporting the read as incomplete:', err);
           capped = true;
+          incomplete = true;
           failed = err;
           break;
         }
@@ -23092,7 +23140,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       } while (pageToken);
     }
-    return { files: merged, capped, failed };
+    return { files: merged, capped, incomplete, failed };
   }
 
   private extractGoogleFileId(urlOrId: string): string {
@@ -23800,7 +23848,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // min(trueTotal, K+1) files, so `allFiles.length > offset+limit` is
               // true exactly when more files really exist beyond this page.
               const perBatchTarget = driveOffset + driveLimit + 1;
-              const { files: filesMap, capped, failed: queryFailed } = await this.queryDriveFilesAcrossFolders(
+              const { files: filesMap, capped, incomplete: queryIncomplete, failed: queryFailed } = await this.queryDriveFilesAcrossFolders(
                 drive,
                 folderIds,
                 extraClause,
@@ -23839,7 +23887,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                * on the Drive side, and it was created by the fix that gave the listing one shared
                * budget — the remedy for one composition bug producing a false absence instead.
                */
-              const folderScanIncomplete = truncated || rootRestricted || capped;
+              // `queryIncomplete`, not `capped`: the latter also fires on ordinary pagination.
+              const folderScanIncomplete = truncated || rootRestricted || queryIncomplete;
               // Same distinction the readers draw: a throttled scan is incomplete for a reason
               // the user acts on differently (wait) than a large one (narrow).
               const folderScanThrottled = throttled;
@@ -24170,6 +24219,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
        * or share the others.
        */
       const hasThrottledFolderScan = knowledgeBases.some((kb: any) => kb.folderScanThrottled);
+      /*
+       * Only claim "too large or inaccessible" about a source that is NOT merely throttled.
+       *
+       * A throttled walk sets `throttled` AND `truncated` in the same branch, so for a single
+       * source both flags describe the same stop — and the two sentences then contradict each
+       * other outright: "a temporary quota answer, not a size or permissions problem" followed
+       * immediately by "too large to fully scan or could not be accessed". Suppressing the size
+       * sentence whenever ANY source was throttled was also wrong, because it hid a real
+       * incompleteness on the other sources. Per-source is the only reading that is right in
+       * both shapes.
+       */
+      const hasIncompleteFolderScanBeyondThrottle = knowledgeBases.some(
+        (kb: any) => kb.folderScanIncomplete && !kb.folderScanThrottled,
+      );
       // A Drive KB's file query hit its per-batch target — its `totalFiles` is a
       // floor, not an exact count, even though `files`/`hasMore` are still correct.
       const hasLowerBoundTotals = knowledgeBases.some((kb: any) => kb.totalFilesIsLowerBound);
@@ -24187,7 +24250,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasThrottledFolderScan ? ' Google Drive rate-limited the scan of some folders — a temporary quota answer, not a size or permissions problem; wait a minute and retry rather than narrowing.' : ''}${hasIncompleteFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be fully listed (see listingFailed) — their file lists may be empty OR partial, so treat any file missing from them as unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasThrottledFolderScan ? ' Google Drive rate-limited the scan of some folders — a temporary quota answer, not a size or permissions problem; wait a minute and retry rather than narrowing.' : ''}${hasIncompleteFolderScanBeyondThrottle ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be fully listed (see listingFailed) — their file lists may be empty OR partial, so treat any file missing from them as unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         // Same rule as the per-source objects: every completeness flag ahead of the payload,
         // because `knowledge_bases` is what pushes this result past the offload threshold and
         // anything after it falls outside the sealed prefix the model actually reads.
@@ -24572,7 +24635,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       // Find the file by name anywhere in the registered folder's tree (ENG-1624:
       // not just its direct children).
-      const { folderIds, restricted, rootRestricted, truncated: folderScanTruncated, throttled: folderScanThrottled, transientFailure: folderScanTransient, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      const { folderIds, restricted, rootRestricted, truncated: folderScanTruncated, throttled: folderScanThrottled, transientFailure: folderScanTransient, boundedStop: folderScanBounded, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
       // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
       // lets an ambiguous name (same filename in two sub-folders) be detected and
       // reported instead of one candidate being picked arbitrarily.
@@ -24656,7 +24719,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           return {
             success: false,
             message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree, so this is not a confirmed absence. `
-              + (folderScanTransient
+              // Deterministic bound checked FIRST: the causes are not exclusive, and a walk that
+              // hit both will hit the bound again next time, so a retry cannot help.
+              + (folderScanTransient && !folderScanBounded
                 ? `A sub-folder read failed part-way, so retrying may well complete the scan.`
                 : `It stopped at a fixed folder-count or time bound, so a tree this size will stop in the same place every time. Do NOT retry this same call — narrow to a specific sub-folder, or ask the user for a direct Google Drive link.`)
           };
@@ -24766,7 +24831,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       // Search the whole folder tree rooted at the registered folder (ENG-1624),
       // not just its direct children.
-      const { folderIds, restricted, rootRestricted, truncated, throttled: folderScanThrottled, transientFailure: folderScanTransient, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      const { folderIds, restricted, rootRestricted, truncated, throttled: folderScanThrottled, transientFailure: folderScanTransient, boundedStop: folderScanBounded, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
       // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
       // lets an ambiguous name (same filename in two sub-folders) be detected and
       // reported instead of one candidate being materialized arbitrarily.
@@ -24840,7 +24905,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           return {
             success: false,
             message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree, so this is not a confirmed absence. `
-              + (folderScanTransient
+              // Deterministic bound checked FIRST: the causes are not exclusive, and a walk that
+              // hit both will hit the bound again next time, so a retry cannot help.
+              + (folderScanTransient && !folderScanBounded
                 ? `A sub-folder read failed part-way, so retrying may well complete the scan.`
                 : `It stopped at a fixed folder-count or time bound, so a tree this size will stop in the same place every time. Do NOT retry this same call — narrow to a specific sub-folder, or ask the user for a direct Google Drive link.`)
           };
