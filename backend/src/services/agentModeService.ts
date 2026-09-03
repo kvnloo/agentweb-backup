@@ -2857,6 +2857,18 @@ export class AgentModeService {
           params,
           { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
         );
+        // ENG-1712: resolved provider slot + BYOK flag, log-only (no routing
+        // impact) -- lets a production incident/verification tie a specific
+        // call to the provider it actually landed on without reading
+        // credential material out-of-band.
+        const resolvedProvider = typeof (res as any)?.provider === 'string'
+          ? (res as any).provider
+          : undefined;
+        const resolvedIsByok = (res as any)?.usage?.is_byok;
+        console.log(`AgentMode: OpenRouter call succeeded for model "${model}"`, {
+          provider: resolvedProvider,
+          is_byok: resolvedIsByok,
+        });
         // Fire-and-forget usage metering; it must never break an LLM call.
         try {
           const usage: any = (res as any)?.usage;
@@ -2896,6 +2908,10 @@ export class AgentModeService {
           const backoffMs = retryAfterMs ?? 1500 * Math.pow(2, attempt - 1);
           console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms${retryAfterMs !== undefined ? ' (honoring Retry-After)' : ''}`, {
             error: error instanceof Error ? error.message : String(error),
+            // ENG-1712: OpenRouter surfaces the attempted provider/BYOK slot on
+            // some error shapes too (varies by failure type); include when present.
+            provider: typeof (error as any)?.provider === 'string' ? (error as any).provider : undefined,
+            is_byok: (error as any)?.usage?.is_byok,
           });
           await this.sleep(backoffMs);
           continue;
@@ -2906,6 +2922,9 @@ export class AgentModeService {
     console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
       error: lastError instanceof Error ? lastError.message : String(lastError),
       stack: lastError instanceof Error ? lastError.stack : undefined,
+      // ENG-1712: same optional provider/BYOK metadata as the retry-warn path.
+      provider: typeof (lastError as any)?.provider === 'string' ? (lastError as any).provider : undefined,
+      is_byok: (lastError as any)?.usage?.is_byok,
     });
     throw lastError;
   }
