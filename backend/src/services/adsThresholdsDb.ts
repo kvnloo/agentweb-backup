@@ -11,7 +11,6 @@
  *   RANGE paramKey   "creativeFatigue.frequencyCritical"
  *
  *   currentValue          3.5
- *   defaultValue          3.5
  *   source                'default' | 'user' | 'learned'
  *   updatedAt             ISO
  *   learnedCooldownUntil  ISO | absent
@@ -24,10 +23,13 @@
  *
  * `platform` and `accountId` are NOT stored as their own attributes: both are derivable from
  * `entityKey`, and a derived value cannot drift from the key that indexes it. Same reasoning as
- * `AW-MetaCapiKeyCoverage`'s `date`/`eventName`.
+ * `AW-MetaCapiKeyCoverage`'s `date`/`eventName`. `defaultValue` is not stored at all — see
+ * `adsThresholds.ts`'s `buildThresholdRevert` doc comment for why that field was removed rather
+ * than merely documented as untrustworthy.
  */
 
 import AWS from 'aws-sdk';
+import { paginatedQuery } from '../utils/dynamoPagination';
 import {
   buildThresholdEntityKey,
   parseThresholdEntityKey,
@@ -57,16 +59,45 @@ export class ThresholdConflictError extends Error {
   }
 }
 
-function itemToParameter(item: AWS.DynamoDB.DocumentClient.AttributeMap): AdsThreshold | null {
+/** Raised when a stored item cannot be trusted — e.g. a non-finite currentValue. */
+export class ThresholdCorruptionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ThresholdCorruptionError';
+  }
+}
+
+/**
+ * Convert a raw DynamoDB item into an `AdsThreshold`, or throw if it cannot be trusted.
+ *
+ * `Number(item.currentValue)` on a missing or malformed attribute silently produces `NaN`
+ * rather than an error, and `NaN` defeats validation the same way it does everywhere else in
+ * this module: every bounds/movement-cap comparison against `NaN` is `false`, so a corrupted
+ * item would silently bypass every guarantee this store exists to provide. Throwing surfaces
+ * the corruption immediately — the route layer's existing `try/catch` turns it into a clear
+ * logged 500 rather than a silently-wrong 200.
+ */
+/** Exported for direct unit testing — pure, touches no AWS SDK state. */
+export function itemToParameter(item: AWS.DynamoDB.DocumentClient.AttributeMap): AdsThreshold | null {
   const parsed = parseThresholdEntityKey(String(item.entityKey));
   if (!parsed) return null;
+
+  // `item.currentValue == null` is checked explicitly, separately from Number.isFinite: `Number(null)`
+  // is `0`, not `NaN` — a missing/null attribute would otherwise convert to a plausible-looking
+  // real number instead of failing the finiteness check below.
+  if (item.currentValue == null || !Number.isFinite(Number(item.currentValue))) {
+    throw new ThresholdCorruptionError(
+      `${ADS_THRESHOLDS_TABLE} item '${item.entityKey}'/'${item.paramKey}' has a non-finite ` +
+        `currentValue (${String(item.currentValue)})`,
+    );
+  }
+  const currentValue = Number(item.currentValue);
 
   return {
     accountId: parsed.accountId,
     platform: parsed.platform,
     paramKey: String(item.paramKey),
-    currentValue: Number(item.currentValue),
-    defaultValue: Number(item.defaultValue),
+    currentValue,
     source: String(item.source) as ThresholdSource,
     updatedAt: String(item.updatedAt),
     learnedCooldownUntil: item.learnedCooldownUntil ? String(item.learnedCooldownUntil) : null,
@@ -92,36 +123,29 @@ export async function getThreshold(
 /**
  * Every stored parameter for one ad account.
  *
- * Pages to exhaustion. A short read would silently drop overrides and resolve those parameters
- * back to their defaults — which reads as "nobody ever set anything" rather than as a failed
- * read, and would quietly undo a customer's configuration at the point of use.
+ * Pages to exhaustion via the shared `paginatedQuery` helper (also used by 12+ other services in
+ * this codebase) rather than a one-off loop, so a future pagination fix lands here automatically
+ * instead of needing to be found and re-applied by hand. A short read would silently drop
+ * overrides and resolve those parameters back to their defaults — which reads as "nobody ever
+ * set anything" rather than as a failed read, and would quietly undo a customer's configuration
+ * at the point of use.
  */
 export async function getThresholdsForAccount(
   platform: AdsPlatform,
   accountId: string,
 ): Promise<AdsThreshold[]> {
+  const items = await paginatedQuery<AWS.DynamoDB.DocumentClient.AttributeMap>(dynamodb, {
+    TableName: ADS_THRESHOLDS_TABLE,
+    KeyConditionExpression: 'entityKey = :e',
+    ExpressionAttributeValues: { ':e': buildThresholdEntityKey(platform, accountId) },
+    Limit: PAGE_SIZE,
+  });
+
   const rows: AdsThreshold[] = [];
-  let startKey: AWS.DynamoDB.DocumentClient.Key | undefined;
-
-  do {
-    const result = await dynamodb
-      .query({
-        TableName: ADS_THRESHOLDS_TABLE,
-        KeyConditionExpression: 'entityKey = :e',
-        ExpressionAttributeValues: { ':e': buildThresholdEntityKey(platform, accountId) },
-        Limit: PAGE_SIZE,
-        ExclusiveStartKey: startKey,
-      })
-      .promise();
-
-    for (const item of result.Items || []) {
-      const parameter = itemToParameter(item);
-      if (parameter) rows.push(parameter);
-    }
-
-    startKey = result.LastEvaluatedKey;
-  } while (startKey);
-
+  for (const item of items) {
+    const parameter = itemToParameter(item);
+    if (parameter) rows.push(parameter);
+  }
   return rows;
 }
 
@@ -150,7 +174,6 @@ export async function putThreshold(
     entityKey: buildThresholdEntityKey(parameter.platform, parameter.accountId),
     paramKey: parameter.paramKey,
     currentValue: parameter.currentValue,
-    defaultValue: parameter.defaultValue,
     source: parameter.source,
     updatedAt: parameter.updatedAt,
     revisions: parameter.revisions,

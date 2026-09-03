@@ -15,6 +15,7 @@ import {
   buildThresholdEntityKey,
   buildThresholdRevert,
   evaluateThresholdWrite,
+  getThresholdDefinition,
   parseThresholdEntityKey,
   resolveThresholds,
   type AdsThreshold,
@@ -29,7 +30,6 @@ function param(overrides: Partial<AdsThreshold> = {}): AdsThreshold {
     platform: 'meta',
     paramKey: FREQ,
     currentValue: 3.5,
-    defaultValue: 3.5,
     source: 'default',
     updatedAt: '2026-09-01T00:00:00.000Z',
     learnedCooldownUntil: null,
@@ -90,7 +90,10 @@ describe('movement cap', () => {
 
     expect(verdict.allowed).toBe(true);
     if (verdict.allowed) {
-      expect(verdict.value).toBeCloseTo(4.2, 10);
+      // Exact, not toBeCloseTo: 3.5 + 0.7 is 4.2 in decimal but 4.199999999999999 in float64.
+      // The rounding fix is what makes an EXACT match possible — toBeCloseTo would pass even if
+      // that rounding regressed, so it can't be the assertion protecting it.
+      expect(verdict.value).toBe(4.2);
       expect(verdict.requestedValue).toBe(6.0);
       expect(verdict.clampedBy).toBe('movementCap');
     }
@@ -106,7 +109,22 @@ describe('movement cap', () => {
     });
 
     expect(verdict.allowed).toBe(true);
-    if (verdict.allowed) expect(verdict.value).toBeCloseTo(2.8, 10);
+    if (verdict.allowed) expect(verdict.value).toBe(2.8);
+  });
+
+  it('rounds clamped output so a UI-displayed figure round-trips to the same stored value', () => {
+    // 2.8 - Math.abs(2.8)*0.2 is 2.2399999999999998 in raw float64. A human who sees "2.24"
+    // displayed and later PUTs exactly 2.24 must land on the identical stored number, or the
+    // no-change check treats a no-op re-submission as a real edit and pollutes the audit trail.
+    const verdict = evaluateThresholdWrite({
+      paramKey: FREQ,
+      requestedValue: 1.0,
+      source: 'learned',
+      sampleSize: 500,
+      existing: param({ currentValue: 2.8, source: 'default' }),
+    });
+    expect(verdict.allowed).toBe(true);
+    if (verdict.allowed) expect(verdict.value).toBe(2.24);
   });
 
   it('does NOT clamp a user write inside bounds — a human typing a value is not the mistake the cap guards', () => {
@@ -160,7 +178,7 @@ describe('bounds — refuse a human, clamp a machine', () => {
     });
 
     expect(verdict.allowed).toBe(true);
-    if (verdict.allowed) expect(verdict.value).toBe(THRESHOLD_REGISTRY[FREQ].max);
+    if (verdict.allowed) expect(verdict.value).toBe(THRESHOLD_REGISTRY.get(FREQ)!.max);
   });
 
   it('stops a capped learned value walking past the floor over repeated cycles', () => {
@@ -178,7 +196,7 @@ describe('bounds — refuse a human, clamp a machine', () => {
       current = param({ currentValue: verdict.value, source: 'learned' });
     }
 
-    expect(current.currentValue).toBe(THRESHOLD_REGISTRY[FREQ].min);
+    expect(current.currentValue).toBe(THRESHOLD_REGISTRY.get(FREQ)!.min);
   });
 });
 
@@ -217,6 +235,48 @@ describe('sample-size gate', () => {
     });
 
     expect(verdict.allowed).toBe(true);
+  });
+
+  it('treats a NaN sample size as insufficient, not as passing — `?? 0` alone would not catch this', () => {
+    // NaN ?? 0 is still NaN, and every numeric comparison against NaN is false, so
+    // `NaN < minSampleSize` would silently evaluate to false and let the write through.
+    const verdict = evaluateThresholdWrite({
+      paramKey: FREQ,
+      requestedValue: 3.6,
+      source: 'learned',
+      sampleSize: NaN,
+      existing: param(),
+    });
+
+    expect(verdict.allowed).toBe(false);
+    if (!verdict.allowed) expect(verdict.reason).toBe('insufficient_sample');
+  });
+});
+
+describe('registry lookup — prototype pollution', () => {
+  // paramKey arrives straight off the URL path on every route, so it is fully caller-controlled.
+  // A plain object literal's bracket access falls through the prototype chain for property
+  // names like '__proto__': `REGISTRY['__proto__']` returns Object.prototype itself, which is
+  // truthy, so `?? null` does not catch it, and the resulting "definition" has undefined
+  // min/max — every bounds/movement-cap comparison against undefined is false, so validation is
+  // silently skipped entirely. A Map has no such fallthrough.
+  it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty'])(
+    'refuses the prototype-chain key %p as an unknown parameter, not a valid one',
+    key => {
+      const verdict = evaluateThresholdWrite({
+        paramKey: key,
+        requestedValue: 1e9,
+        source: 'user',
+        existing: null,
+      });
+
+      expect(verdict.allowed).toBe(false);
+      if (!verdict.allowed) expect(verdict.reason).toBe('unknown_parameter');
+    },
+  );
+
+  it.each(['__proto__', 'constructor'])('getThresholdDefinition(%p) returns null, not Object.prototype', key => {
+    expect(getThresholdDefinition(key)).toBeNull();
   });
 });
 
@@ -360,7 +420,7 @@ describe('refusals', () => {
   it('falls back to the registry default as the baseline when nothing is stored', () => {
     const verdict = evaluateThresholdWrite({
       paramKey: FREQ,
-      requestedValue: THRESHOLD_REGISTRY[FREQ].defaultValue,
+      requestedValue: THRESHOLD_REGISTRY.get(FREQ)!.defaultValue,
       source: 'user',
       existing: null,
     });
@@ -451,20 +511,53 @@ describe('revisions', () => {
 });
 
 describe('revert', () => {
-  it('restores from the REGISTRY, not from a stale stored default', () => {
-    // Written when the default was 9.9; the registry has since moved to 3.5.
-    const stale = param({ currentValue: 6.0, defaultValue: 9.9, source: 'user' });
-
+  it('restores the current registry default', () => {
+    // AdsThreshold carries no defaultValue field at all — see the service's doc comment on
+    // WHY: storing one was the original version of this exact bug (revert reading a stale
+    // stored copy instead of the registry's current value). Removing the field is what makes
+    // that class of bug impossible rather than merely fixed once.
     const reverted = buildThresholdRevert({
-      existing: stale,
+      existing: param({ currentValue: 6.0, source: 'user' }),
       changedBy: 'user-1',
       changedAt: '2026-09-03T10:00:00.000Z',
     });
 
-    expect(reverted.currentValue).toBe(THRESHOLD_REGISTRY[FREQ].defaultValue);
-    expect(reverted.currentValue).not.toBe(9.9);
-    // The denormalised copy is refreshed too, so the item stops carrying the stale number.
-    expect(reverted.defaultValue).toBe(THRESHOLD_REGISTRY[FREQ].defaultValue);
+    expect(reverted.currentValue).toBe(THRESHOLD_REGISTRY.get(FREQ)!.defaultValue);
+  });
+
+  it('throws rather than silently disarming the cooldown on an unparseable changedAt', () => {
+    // The sibling read path (evaluateThresholdWrite's cooldown check) fails CLOSED on a bad
+    // timestamp — an unparseable stamp reads as "still in cooldown". Silently writing
+    // learnedCooldownUntil: null here would do the opposite: the one caller that passed a bad
+    // clock reading would be the one revert that gets NO protection at all.
+    expect(() =>
+      buildThresholdRevert({
+        existing: param({ currentValue: 3.0, source: 'user' }),
+        changedBy: 'user-1',
+        changedAt: 'not-a-timestamp',
+      }),
+    ).toThrow(/not a parseable timestamp/);
+  });
+
+  it('throws for a parameter no longer in the registry, rather than reverting to a stale defaultValue', () => {
+    expect(() =>
+      buildThresholdRevert({
+        existing: param({ paramKey: 'retired.threshold', currentValue: 3.0, source: 'user' }),
+        changedBy: 'user-1',
+        changedAt: '2026-09-03T10:00:00.000Z',
+      }),
+    ).toThrow(/not in THRESHOLD_REGISTRY/);
+  });
+
+  it('rejects evidence over the length cap', () => {
+    expect(() =>
+      buildThresholdRevert({
+        existing: param({ currentValue: 3.0, source: 'user' }),
+        changedBy: 'user-1',
+        changedAt: '2026-09-03T10:00:00.000Z',
+        evidence: 'x'.repeat(3000),
+      }),
+    ).toThrow(/exceeds/);
   });
 
   it('preserves history and re-opens the parameter to learned writes after the cooldown', () => {
@@ -541,15 +634,15 @@ describe('resolveThresholds', () => {
 
     expect(resolved[FREQ]).toEqual({ value: 3.0, source: 'user' });
     expect(resolved[CTR]).toEqual({
-      value: THRESHOLD_REGISTRY[CTR].defaultValue,
+      value: THRESHOLD_REGISTRY.get(CTR)!.defaultValue,
       source: 'default',
     });
-    expect(Object.keys(resolved).sort()).toEqual(Object.keys(THRESHOLD_REGISTRY).sort());
+    expect(Object.keys(resolved).sort()).toEqual(Array.from(THRESHOLD_REGISTRY.keys()).sort());
   });
 
   it('returns a full set of defaults for an account that has never set anything', () => {
     const resolved = resolveThresholds([]);
-    expect(Object.keys(resolved)).toHaveLength(Object.keys(THRESHOLD_REGISTRY).length);
+    expect(Object.keys(resolved)).toHaveLength(THRESHOLD_REGISTRY.size);
     expect(Object.values(resolved).every(r => r.source === 'default')).toBe(true);
   });
 });

@@ -68,6 +68,19 @@
  * `loops/` framework reaches the same conclusion from the other direction — its `LearningStore`
  * exposes `lastOutcomeForRule` specifically so the policy layer can apply a "failure-driven
  * cooldown — don't re-propose a fix whose last shipped version regressed."
+ *
+ * ─── Why the registry is a Map, not a plain object ────────────────────────────────────────
+ *
+ * `paramKey` is attacker-controlled — it arrives straight off the URL path on every route. A
+ * plain object literal's bracket access (`REGISTRY[paramKey]`) falls through the PROTOTYPE CHAIN
+ * for inherited property names: `REGISTRY['__proto__']` returns `Object.prototype` itself, which
+ * is truthy, so `?? null` does not catch it — the lookup silently "succeeds" with an object whose
+ * `min`/`max` are `undefined`, and every bounds/movement-cap comparison against `undefined` is
+ * `false`, so the entire validation this module exists to provide is skipped for that key. A
+ * `Map` has no such fallthrough: `.get()` only ever returns entries actually inserted via
+ * `.set()`/the constructor, so `'__proto__'`, `'constructor'`, `'toString'`, etc. all correctly
+ * return `undefined`. This closes the whole class rather than special-casing the two or three
+ * property names someone happened to think of.
  */
 
 export type ThresholdSource = 'default' | 'user' | 'learned';
@@ -85,6 +98,20 @@ export type AdsPlatform = 'meta' | 'google_ads' | 'linkedin_ads';
  * same observations that produced the value a human just rejected.
  */
 export const LEARNED_COOLDOWN_DAYS = 30;
+
+/**
+ * Round to a fixed precision after clamping.
+ *
+ * Clamping is float64 arithmetic and can leave binary-fraction dust — `2.8 - Math.abs(2.8)*0.2`
+ * is `2.2399999999999998`, not `2.24`. Left unrounded, a UI that displays the rounded figure and
+ * a human who later types that exact figure back in produces a value that is NOT `=== ` the
+ * stored one, so a write that changed nothing meaningful gets recorded as a new audit revision —
+ * noise in the exact trail this feature exists to keep trustworthy.
+ */
+const CLAMP_PRECISION = 6;
+function roundClamped(value: number): number {
+  return Number(value.toFixed(CLAMP_PRECISION));
+}
 
 export interface ThresholdRevision {
   value: number;
@@ -106,7 +133,6 @@ export interface AdsThreshold {
   platform: AdsPlatform;
   paramKey: string;
   currentValue: number;
-  defaultValue: number;
   source: ThresholdSource;
   updatedAt: string;
   /** ISO timestamp until which `learned` writes are refused. Set by a revert. */
@@ -144,6 +170,16 @@ export interface ThresholdDefinition {
 export const REVISION_HISTORY_LIMIT = 20;
 
 /**
+ * Maximum length of a free-text `evidence` string.
+ *
+ * `revisions` is capped by COUNT (`REVISION_HISTORY_LIMIT`), not by byte size, so an
+ * unbounded evidence string can still push a single item past DynamoDB's 400KB ceiling — at
+ * which point the write fails with a generic error rather than a clear "your input is too long."
+ * 2000 characters is generous for a justification and cheap to enforce at the boundary instead.
+ */
+export const MAX_EVIDENCE_LENGTH = 2000;
+
+/**
  * The registry, and the single source of truth for defaults.
  *
  * Values seed CS-16's operational thresholds, decided 2026-07-27 and reaffirmed 2026-08-16
@@ -156,9 +192,12 @@ export const REVISION_HISTORY_LIMIT = 20;
  * (`OPTIMISATION_ABSENCE_DAYS`, `EVENT_MIX_ABSENCE_DAYS`, …): those were calibrated by replaying
  * a real outage and are platform-mechanics, not per-client business judgement. Do not fold them
  * in here without a separate decision.
+ *
+ * A plain array of entries feeds a `Map` rather than an object literal — see the header for why
+ * a `Map` is load-bearing here, not a style preference.
  */
-export const THRESHOLD_REGISTRY: Readonly<Record<string, ThresholdDefinition>> = Object.freeze({
-  'creativeFatigue.ctrDropCriticalPct': {
+const THRESHOLD_DEFINITIONS: readonly ThresholdDefinition[] = [
+  {
     key: 'creativeFatigue.ctrDropCriticalPct',
     defaultValue: 20,
     min: 5,
@@ -168,7 +207,7 @@ export const THRESHOLD_REGISTRY: Readonly<Record<string, ThresholdDefinition>> =
     unit: 'percent',
     description: 'CTR decline vs baseline that contributes to a critical fatigue verdict.',
   },
-  'creativeFatigue.frequencyCritical': {
+  {
     key: 'creativeFatigue.frequencyCritical',
     defaultValue: 3.5,
     min: 1.5,
@@ -178,7 +217,7 @@ export const THRESHOLD_REGISTRY: Readonly<Record<string, ThresholdDefinition>> =
     unit: 'ratio',
     description: 'Impressions-per-person ceiling above which an ad set reads as saturated.',
   },
-  'creativeFatigue.cpmRiseCriticalPct': {
+  {
     key: 'creativeFatigue.cpmRiseCriticalPct',
     defaultValue: 15,
     min: 5,
@@ -188,7 +227,7 @@ export const THRESHOLD_REGISTRY: Readonly<Record<string, ThresholdDefinition>> =
     unit: 'percent',
     description: 'CPM increase vs baseline that contributes to a critical fatigue verdict.',
   },
-  'campaignHealth.cplDriftCriticalPct': {
+  {
     key: 'campaignHealth.cplDriftCriticalPct',
     defaultValue: 40,
     min: 10,
@@ -198,7 +237,7 @@ export const THRESHOLD_REGISTRY: Readonly<Record<string, ThresholdDefinition>> =
     unit: 'percent',
     description: 'Cost-per-lead drift vs trailing baseline that escalates to critical.',
   },
-  'campaignHealth.pacingMissCriticalPct': {
+  {
     key: 'campaignHealth.pacingMissCriticalPct',
     defaultValue: 35,
     min: 10,
@@ -208,7 +247,7 @@ export const THRESHOLD_REGISTRY: Readonly<Record<string, ThresholdDefinition>> =
     unit: 'percent',
     description: 'Budget pacing miss that escalates to critical.',
   },
-  'campaignHealth.pacingWatchPct': {
+  {
     key: 'campaignHealth.pacingWatchPct',
     defaultValue: 20,
     min: 5,
@@ -218,10 +257,14 @@ export const THRESHOLD_REGISTRY: Readonly<Record<string, ThresholdDefinition>> =
     unit: 'percent',
     description: 'Budget pacing deviation that raises a watch (not critical) signal.',
   },
-});
+];
+
+export const THRESHOLD_REGISTRY: ReadonlyMap<string, ThresholdDefinition> = new Map(
+  THRESHOLD_DEFINITIONS.map(def => [def.key, def]),
+);
 
 export function getThresholdDefinition(paramKey: string): ThresholdDefinition | null {
-  return THRESHOLD_REGISTRY[paramKey] ?? null;
+  return THRESHOLD_REGISTRY.get(paramKey) ?? null;
 }
 
 /**
@@ -342,7 +385,10 @@ export function evaluateThresholdWrite(args: {
       }
     }
 
-    const n = args.sampleSize ?? 0;
+    // `?? 0` alone is not enough: it only replaces null/undefined, and `NaN ?? 0` is still
+    // `NaN` — every comparison against NaN is false, so a NaN sample size would sail straight
+    // past `n < definition.minSampleSize` below. Number.isFinite rejects NaN too.
+    const n = Number.isFinite(args.sampleSize) ? (args.sampleSize as number) : 0;
     if (n < definition.minSampleSize) {
       return {
         allowed: false,
@@ -382,6 +428,8 @@ export function evaluateThresholdWrite(args: {
       value = bounded;
       clampedBy = 'bounds';
     }
+
+    if (clampedBy) value = roundClamped(value);
   }
 
   if (value === currentValue) {
@@ -414,8 +462,6 @@ export function applyThresholdWrite(args: {
   changedAt: string;
   existing: AdsThreshold | null;
 }): AdsThreshold {
-  const definition = getThresholdDefinition(args.paramKey);
-  const defaultValue = definition ? definition.defaultValue : args.value;
   const previousValue = args.existing ? args.existing.currentValue : null;
 
   const revision: ThresholdRevision = {
@@ -433,7 +479,6 @@ export function applyThresholdWrite(args: {
     platform: args.platform,
     paramKey: args.paramKey,
     currentValue: args.value,
-    defaultValue,
     source: args.source,
     updatedAt: args.changedAt,
     // Any successful write clears the cooldown, and it is deliberately NOT conditional on source.
@@ -454,13 +499,22 @@ export function applyThresholdWrite(args: {
  * history with it — and "why is this back at 20?" is exactly the question the history exists to
  * answer.
  *
- * ⚠ The restored value comes from the REGISTRY, not from the stored `defaultValue`. A parameter
- * written long ago carries whatever the default was then, so reverting through the stored copy
- * would restore a number that is no longer anybody's policy. The registry is the source of truth;
- * the stored field is a denormalised convenience.
+ * ⚠ The restored value always comes from the REGISTRY. `AdsThreshold` does not carry its own
+ * `defaultValue` — it did originally, and reverting through THAT stored copy was the exact bug
+ * this function exists to avoid: a parameter written long ago carries whatever the default was
+ * back then, so a stale stored copy would "revert" to a number that is no longer anybody's
+ * policy. Rather than leave a field around that every consumer had to remember not to trust, the
+ * field itself is gone — the registry is the only place a default is allowed to be read from.
  *
  * The reverted state is `source: 'default'` so the parameter is managed again rather than frozen
  * — paired with a cooldown so the loop cannot immediately refit the value just rejected.
+ *
+ * ⚠ Throws rather than silently disarming the cooldown on a bad `changedAt`. The sibling read
+ * path (`evaluateThresholdWrite`'s cooldown check) fails CLOSED on an unparseable timestamp — a
+ * corrupt stamp is treated as "still in cooldown," never as "no cooldown." Silently writing
+ * `learnedCooldownUntil: null` here would do the opposite: the one caller that failed to pass a
+ * valid clock reading would be the one revert that gets NO protection at all. Loud failure here
+ * is safe because every current caller (the HTTP route) always passes `new Date().toISOString()`.
  */
 export function buildThresholdRevert(args: {
   existing: AdsThreshold;
@@ -470,19 +524,27 @@ export function buildThresholdRevert(args: {
   cooldownDays?: number;
 }): AdsThreshold {
   const definition = getThresholdDefinition(args.existing.paramKey);
-  const restored = definition ? definition.defaultValue : args.existing.defaultValue;
+  if (!definition) {
+    throw new Error(`buildThresholdRevert: '${args.existing.paramKey}' is not in THRESHOLD_REGISTRY`);
+  }
 
   const changedAtMs = Date.parse(args.changedAt);
+  if (!Number.isFinite(changedAtMs)) {
+    throw new Error(`buildThresholdRevert: changedAt '${args.changedAt}' is not a parseable timestamp`);
+  }
   const days = args.cooldownDays ?? LEARNED_COOLDOWN_DAYS;
-  const cooldownUntil = Number.isFinite(changedAtMs)
-    ? new Date(changedAtMs + days * 24 * 60 * 60 * 1000).toISOString()
-    : null;
+  const cooldownUntil = new Date(changedAtMs + days * 24 * 60 * 60 * 1000).toISOString();
+
+  const evidence = args.evidence ?? 'Reverted to default';
+  if (evidence.length > MAX_EVIDENCE_LENGTH) {
+    throw new Error(`buildThresholdRevert: evidence exceeds ${MAX_EVIDENCE_LENGTH} characters`);
+  }
 
   const revision: ThresholdRevision = {
-    value: restored,
+    value: definition.defaultValue,
     previousValue: args.existing.currentValue,
     source: 'default',
-    evidence: args.evidence ?? 'Reverted to default',
+    evidence,
     sampleSize: null,
     changedAt: args.changedAt,
     changedBy: args.changedBy,
@@ -490,8 +552,7 @@ export function buildThresholdRevert(args: {
 
   return {
     ...args.existing,
-    currentValue: restored,
-    defaultValue: restored,
+    currentValue: definition.defaultValue,
     source: 'default',
     updatedAt: args.changedAt,
     learnedCooldownUntil: cooldownUntil,
@@ -512,7 +573,7 @@ export function resolveThresholds(
   const byKey = new Map(stored.map(p => [p.paramKey, p]));
   const resolved: Record<string, { value: number; source: ThresholdSource }> = {};
 
-  for (const definition of Object.values(THRESHOLD_REGISTRY)) {
+  for (const definition of THRESHOLD_REGISTRY.values()) {
     const hit = byKey.get(definition.key);
     resolved[definition.key] = hit
       ? { value: hit.currentValue, source: hit.source }

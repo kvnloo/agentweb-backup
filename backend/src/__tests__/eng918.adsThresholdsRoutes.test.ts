@@ -187,7 +187,6 @@ describe('PUT', () => {
       platform: 'meta',
       paramKey: FREQ,
       currentValue: 3.5,
-      defaultValue: 3.5,
       source: 'default',
       updatedAt: '2026-09-01T00:00:00.000Z',
       learnedCooldownUntil: null,
@@ -216,6 +215,48 @@ describe('PUT', () => {
     expect(res.status).toBe(409);
     expect(res.body.reason).toBe('concurrent_modification');
   });
+
+  it('treats re-submitting the current value as an idempotent 200, not a 409 conflict', async () => {
+    (mockDb.getThreshold as jest.Mock).mockResolvedValue({
+      accountId: OWNED,
+      platform: 'meta',
+      paramKey: FREQ,
+      currentValue: 3.0,
+      source: 'user',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+      learnedCooldownUntil: null,
+      revisions: [],
+    });
+
+    const res = await request(app())
+      .put(`/api/ads-thresholds/meta/${OWNED}/${FREQ}`)
+      .send({ value: 3.0, evidence: 'resubmit' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.changed).toBe(false);
+    expect(res.body.value).toBe(3.0);
+    expect(mockDb.putThreshold).not.toHaveBeenCalled();
+  });
+
+  it('404s an unknown parameter rather than falling through to a 400 refusal', async () => {
+    // GET-single and revert both pre-check and 404; PUT used to fall through to
+    // evaluateThresholdWrite's own 400 for the identical condition.
+    const res = await request(app())
+      .put(`/api/ads-thresholds/meta/${OWNED}/nope.notAThing`)
+      .send({ value: 1, evidence: 'x' });
+
+    expect(res.status).toBe(404);
+    expect(mockDb.putThreshold).not.toHaveBeenCalled();
+  });
+
+  it('rejects evidence over the length cap before touching storage', async () => {
+    const res = await request(app())
+      .put(`/api/ads-thresholds/meta/${OWNED}/${FREQ}`)
+      .send({ value: 3.0, evidence: 'x'.repeat(3000) });
+
+    expect(res.status).toBe(400);
+    expect(mockDb.putThreshold).not.toHaveBeenCalled();
+  });
 });
 
 describe('revert', () => {
@@ -235,7 +276,6 @@ describe('revert', () => {
       platform: 'meta',
       paramKey: FREQ,
       currentValue: 3.0,
-      defaultValue: 3.5,
       source: 'user',
       updatedAt: '2026-09-01T00:00:00.000Z',
       learnedCooldownUntil: null,
@@ -259,6 +299,15 @@ describe('revert', () => {
     );
 
     expect(res.status).toBe(404);
+    expect(mockDb.putThreshold).not.toHaveBeenCalled();
+  });
+
+  it('rejects evidence over the length cap before touching storage', async () => {
+    const res = await request(app())
+      .post(`/api/ads-thresholds/meta/${OWNED}/${FREQ}/revert`)
+      .send({ evidence: 'x'.repeat(3000) });
+
+    expect(res.status).toBe(400);
     expect(mockDb.putThreshold).not.toHaveBeenCalled();
   });
 });
