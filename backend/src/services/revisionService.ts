@@ -306,6 +306,20 @@ async function runAgentModeRevision(
         `Agent Mode revision for session ${agentSessionId} skipped — session was busy with ` +
         `another generation in progress. Not a failure; no automatic retry for this path.`
       );
+      // ENG-1745: this used to end here with only a log line — the reviewer who requested
+      // the change got zero signal that it never happened. Tell them explicitly, mirroring
+      // humanEvalActionService's identical fix for the same class of contention.
+      if (approval.slackChannel) {
+        const { postSlackMessage } = await import('./slackService');
+        await postSlackMessage(
+          approval.slackChannel,
+          ':hourglass_flowing_sand: This session was busy with another generation in progress, ' +
+          'so the auto-revision couldn\'t run just now. Please retry the feedback in a moment.',
+          approval.slackMessageTs || undefined,
+        ).catch((slackErr: any) =>
+          console.warn('[revisionService] failed to post session-busy notice:', slackErr?.message || slackErr),
+        );
+      }
       return;
     }
     console.error('Error in Agent Mode verified-generate:', error);
