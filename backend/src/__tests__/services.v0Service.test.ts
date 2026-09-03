@@ -2697,6 +2697,31 @@ describe("v0Service - iterateLandingPage", () => {
     mockChatsGetById.mockReset();
   });
 
+  it("ENG-1694: two DIFFERENT edits in sequence on the same page BOTH reach v0 (no cross-instance reservation collision)", async () => {
+    // AC1: a test sends edit A then edit B and asserts TWO sends, not one skip. This is the
+    // guardedV0IterateMessage reservation, distinct from the pendingIteration/isSameEdit
+    // check on the page record above — it is what protects two concurrent instances, not a
+    // single retry within one instance.
+    mockGet.mockReturnValue(iterRecord());
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } })
+      .mockResolvedValueOnce({ latestVersion: { id: "v_new_a", status: "completed" } });
+    mockChatsSendMessage.mockResolvedValueOnce({});
+
+    await iterateLandingPage("page-1", "user-1", "Edit A: add testimonials");
+
+    mockGet.mockReturnValue(iterRecord());
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_new_a", status: "completed" } })
+      .mockResolvedValueOnce({ latestVersion: { id: "v_new_b", status: "completed" } });
+    mockChatsSendMessage.mockResolvedValueOnce({});
+
+    await iterateLandingPage("page-1", "user-1", "Edit B: make the hero blue");
+
+    expect(mockChatsSendMessage).toHaveBeenCalledTimes(2);
+    mockChatsGetById.mockReset();
+  });
+
   it("a failed iteration leaves the page's status alone — the live page must not be marked failed", async () => {
     mockGet.mockReturnValue(iterRecord({ status: "deployed" }));
     mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } });
