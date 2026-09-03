@@ -11,6 +11,9 @@ import {
   reopenIssue,
   raiseIssueTriage,
   _resetLinearTeamCache,
+  findMostRecentArchivedIssueByLabel,
+  markIssueDuplicateOf,
+  ArchivedDuplicateTargetError,
 } from '../services/linearService';
 import { asLoopId } from '../loops/core/types';
 
@@ -312,6 +315,78 @@ describe('linearService.listOpenBugCanonicals — open-state whitelist (ENG-358)
       expect(query).toContain(`"${openType}"`);
     }
     expect(query).not.toContain('nin');
+  });
+});
+
+describe('linearService.findMostRecentArchivedIssueByLabel (ENG-730)', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('queries with includeArchived: true and returns the first matching archived issue', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({
+      data: { issues: { nodes: [
+        { id: 'u-live', identifier: 'ENG-900', title: 'Still open', description: 'x', archivedAt: null },
+        { id: 'u-461', identifier: 'ENG-461', title: 'Scheduled Chat Abandoned Run Recovered', description: 'Alert Class: scheduled-chat-abandoned-run', archivedAt: '2026-08-26T11:04:27.000Z' },
+      ] } },
+    }) } as any));
+    const res = await findMostRecentArchivedIssueByLabel('Auto', (i) => i.description.includes('scheduled-chat-abandoned-run'));
+    expect(res).toEqual({ identifier: 'ENG-461', issueId: 'u-461', title: 'Scheduled Chat Abandoned Run Recovered', description: 'Alert Class: scheduled-chat-abandoned-run' });
+    const [query, variables] = [
+      JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body).query,
+      JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body).variables,
+    ];
+    expect(query).toContain('includeArchived: true');
+    expect(variables.label).toBe('Auto');
+  });
+
+  it('excludes still-open rows even if includeArchived widens the result set (defense in depth)', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({
+      data: { issues: { nodes: [
+        { id: 'u-live', identifier: 'ENG-900', title: 'Still open, matches too', description: 'Alert Class: x', archivedAt: null },
+      ] } },
+    }) } as any));
+    const res = await findMostRecentArchivedIssueByLabel('Auto', () => true);
+    expect(res).toBeNull();
+  });
+
+  it('returns null when nothing archived matches', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({
+      data: { issues: { nodes: [] } },
+    }) } as any));
+    const res = await findMostRecentArchivedIssueByLabel('Auto', () => true);
+    expect(res).toBeNull();
+  });
+});
+
+describe('linearService.markIssueDuplicateOf — archived target classification (ENG-730 AC5)', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('succeeds and does not throw when the relation is created', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({
+      data: { issueRelationCreate: { success: true } },
+    }) } as any));
+    await expect(markIssueDuplicateOf('uuid-719', 'uuid-461')).resolves.toBeUndefined();
+  });
+
+  // The production incident's exact wording, from Linear's own hard-rejection.
+  it('reclassifies the exact archived-target Linear rejection into ArchivedDuplicateTargetError', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: false, status: 400, json: () => Promise.resolve({
+      errors: [{ message: 'Issues can only be moved to a duplicate state when a duplicate issue relation exists.' }],
+    }) } as any));
+    try {
+      await markIssueDuplicateOf('uuid-719', 'uuid-461');
+      throw new Error('expected rejection');
+    } catch (e) {
+      expect(e).toBeInstanceOf(ArchivedDuplicateTargetError);
+      expect((e as ArchivedDuplicateTargetError).targetIssueId).toBe('uuid-461');
+      expect((e as Error).message).toContain('uuid-461');
+    }
+  });
+
+  it('never swallows: an unrelated Linear failure still propagates, uncaught and unclassified', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: false, status: 400, json: () => Promise.resolve({
+      errors: [{ message: 'Some other Linear validation error' }],
+    }) } as any));
+    await expect(markIssueDuplicateOf('uuid-719', 'uuid-461')).rejects.not.toBeInstanceOf(ArchivedDuplicateTargetError);
   });
 });
 
