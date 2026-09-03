@@ -1076,10 +1076,40 @@ const GENERATION_TIMEOUT_MS = parseInt(
 // budget is sized for one turn and would abort a legitimate multi-attempt run partway
 // through. This is a separate, more generous ceiling whose only job is making sure the LOCK
 // can't be held forever if the run hangs — not tuned to cut off normal completion.
+//
+// A single hung attempt is already caught, independently, one layer down:
+// generateMarketingResponseWorkerService's runInWorker rejects after 45 minutes of
+// INACTIVITY (resets on every progress event, so a genuinely active call is never
+// falsely killed), and ensureWorker has its own 2-minute init timeout. This outer
+// bound's only remaining job is capping AGGREGATE time across an already
+// individually-bounded multi-attempt run, not hang detection.
+//
+// Two tiers, sized off real production data (2026-09-03), not guesswork:
+// - SHORT (default): the callers with maxAttempts ~5 where a human or Slack
+//   reviewer is actively waiting (interactive /verified-generate, imageReports,
+//   revisionService, humanEvalActionService, both routes/slack.ts revision
+//   sites). A scan of AW-AssetApprovals' revision chains showed real completions
+//   almost entirely under 10 minutes, with one credible legitimate case at 69
+//   minutes and nothing credible above that (a 1041-minute outlier turned out to
+//   be a measurement artifact — two unrelated Slack threads sharing an
+//   executionId — not a real run; confirmed via the session's own message log).
+//   90 minutes gives real margin without leaving a stuck interactive/Slack
+//   session locked for hours.
+// - LONG: the headless, maxAttempts:20 callers with nobody blocked waiting
+//   (runScheduledChat, resultEndpointController). A scan of 8,955 real scheduled
+//   runs (AW-TaskSchedules) found the longest legitimate, confirmed-successful
+//   run took 272 minutes — a 30-minute cap would have killed 3.48% of ALL real
+//   runs historically, including confirmed non-hang successes. 6 hours clears
+//   the observed max with ~30% margin.
 const RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS = parseInt(
-  process.env.AGENT_MODE_VERIFIED_CHAT_LOCK_TIMEOUT_MS || '1800000',
+  process.env.AGENT_MODE_VERIFIED_CHAT_LOCK_TIMEOUT_MS || String(90 * 60 * 1000),
   10
-); // 30 minutes default
+); // 90 minutes default — callers where a human is actively waiting
+
+export const RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS = parseInt(
+  process.env.AGENT_MODE_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS || String(6 * 60 * 60 * 1000),
+  10
+); // 6 hours — headless, maxAttempts:20 callers only (runScheduledChat, resultEndpointController)
 
 async function withGenerationTimeout<T>(
   promise: Promise<T>,
@@ -4689,9 +4719,17 @@ async function runVerifiedChatInner(
  * outer bound, a single hung attempt would hold this lock indefinitely: nothing
  * releases it short of a process restart, and every other /generate or
  * verified-generate call on that session 409s the whole time. Race the ENTIRE
- * run through withGenerationTimeout at a separate, more generous ceiling
- * (RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS) than a single turn's budget, so the lock
- * is guaranteed to release even if the run itself hangs.
+ * run through withGenerationTimeout at a separate, more generous ceiling than a
+ * single turn's budget, so the lock is guaranteed to release even if the run
+ * itself hangs.
+ *
+ * `options.lockTimeoutMs` lets a caller opt into a longer ceiling than the
+ * RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS default (see that constant's comment for the
+ * production-data-backed reasoning). Only runScheduledChat and
+ * resultEndpointController — the two headless, maxAttempts:20 callers with no
+ * human waiting — pass RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS explicitly. Every
+ * other caller has a human or Slack reviewer actively waiting, so it keeps the
+ * short default.
  *
  * On failure to claim within the retry window, throws SessionBusyError. This is
  * caller-facing, not just for the interactive endpoint: EVERY caller of this
@@ -4708,6 +4746,7 @@ async function runVerifiedChatInner(
  */
 export async function runVerifiedChat(
   params: Parameters<typeof runVerifiedChatInner>[0],
+  options?: { lockTimeoutMs?: number },
 ): Promise<RunVerifiedChatResult> {
   const { sessionId } = params;
   const claimed = await claimSessionGenerationWithRetry(sessionId);
@@ -4718,7 +4757,7 @@ export async function runVerifiedChat(
     return await withGenerationTimeout(
       runVerifiedChatInner(params),
       sessionId,
-      RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS,
+      options?.lockTimeoutMs ?? RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS,
     );
   } finally {
     releaseSessionGeneration(sessionId);
@@ -6010,6 +6049,10 @@ export async function runScheduledChat(
       // ENG-844: the owner's weekday cadence is evaluated in the schedule's
       // timezone (falls back to UTC when unset).
       scheduleTimezone: schedule.timezone
+    }, {
+      // ENG-1719: headless, maxAttempts:20, nobody blocked waiting — see
+      // RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS's comment for the real-data reasoning.
+      lockTimeoutMs: RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS,
     });
 
     // ENG-396: the run parked on a blocking AskUserQuestion with no human present.
