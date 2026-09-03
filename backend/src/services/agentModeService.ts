@@ -34159,7 +34159,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         ownerUserId: userId,
         state: 'disconnected',
       });
-      return this.linkedInDisconnectedResponse();
+      return withRouting(this.linkedInDisconnectedResponse());
     }
     if (sessionState === 'unknown') {
       console.log(`[AgentMode] linkedinOutreach: account ${account_id} preflight indeterminate — proceeding, reactive handler remains the backstop`);
@@ -34187,7 +34187,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const paceWrite = async (): Promise<{ refusal: any } | null> => {
       if (!PACED_WRITE_ACTIONS.has(action)) return null;
       const result = await paceLinkedInWrite(action, resolvedLinkedInAccount!, account_id);
-      return result.refusal ? { refusal: result.refusal } : null;
+      return result.refusal ? { refusal: withRouting(result.refusal) } : null;
     };
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
@@ -34743,13 +34743,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // for the whole hour the breaker is armed, on every queued invite. Check it
           // here, before the slot is taken.
           if (linkedInOutreachService.isUnderInvitationCooldown(account_id)) {
-            return {
+            return withRouting({
               success: false,
               error:
                 'Cannot resend yet — this LinkedIn Outreach account is under an active account-level '
                 + 'invitation cooldown (its invitation cap was hit on an earlier send this run). '
                 + 'Skip the remaining invites and report what was completed.',
-            };
+            });
           }
           // Past every skip path (already-pending, identity mismatch, cooldown): this
           // call is going to reach LinkedIn, so now is when it should cost a slot.
@@ -35168,7 +35168,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           ownerUserId: userId,
           state: 'disconnected',
         });
-        return this.linkedInDisconnectedResponse();
+        return withRouting(this.linkedInDisconnectedResponse());
       }
 
       // Account-level invitation throttle (ENG-126). Once a LinkedIn account hits
