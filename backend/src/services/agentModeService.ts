@@ -19315,21 +19315,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params,
     });
     const session = await chatbotDb.getChatSession(sessionId);
-    const manifestQuestion = findQuestionByKind(
-      session?.pendingUserQuestion, session?.answeredQuestions, 'meta_write_manifest'
-    );
-    const gate = checkQuestionGate(manifestQuestion);
-    if (!gate.allowed) return false;
-    // The card's approve-option payload carries the digests it authorizes
-    // (see the `meta_write_manifest` card producer) — the digest for THIS
-    // call must be one of them, not merely "some manifest was answered".
-    const grantedDigests: unknown = (gate.payload as any)?.digests;
-    if (!Array.isArray(grantedDigests) || !grantedDigests.includes(digest)) return false;
+    // A session can carry MULTIPLE answered `meta_write_manifest` questions
+    // (each roll-off archives the prior one) — a newer manifest must not
+    // hide an EARLIER manifest that still authorizes this call's digest, so
+    // scan every candidate of this kind rather than taking only the single
+    // match `findQuestionByKind` would return.
+    const manifestCandidates: any[] = [];
+    if (session?.pendingUserQuestion?.kind === 'meta_write_manifest') {
+      manifestCandidates.push(session.pendingUserQuestion);
+    }
+    if (session?.answeredQuestions) {
+      for (const q of Object.values(session.answeredQuestions)) {
+        if (q.kind === 'meta_write_manifest') manifestCandidates.push(q);
+      }
+    }
     // Session already recorded this exact digest consumed — a repeat of the
     // same call re-confirms rather than executing again (acceptance
     // criterion 3).
     if (session?.consumedMetaWriteManifestDigests?.[digest]) return false;
-    return chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
+    for (const manifestQuestion of manifestCandidates) {
+      const gate = checkQuestionGate(manifestQuestion);
+      if (!gate.allowed) continue;
+      // The card's approve-option payload carries the digests it authorizes
+      // (see the `meta_write_manifest` card producer) — the digest for THIS
+      // call must be one of them, not merely "some manifest was answered".
+      const grantedDigests: unknown = (gate.payload as any)?.digests;
+      if (!Array.isArray(grantedDigests) || !grantedDigests.includes(digest)) continue;
+      return chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
+    }
+    return false;
   }
 
   /**
