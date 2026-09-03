@@ -63,7 +63,7 @@ jest.mock('../services/agentMode/linkedInDailyVolumeGate', () => ({
   paceLinkedInWrite: (...args: any[]) => mockPaceLinkedInWrite(...args),
 }));
 
-const mockPeekWriteCooldown = jest.fn(() => ({ active: false, expiresAt: null }));
+const mockPeekWriteCooldown = jest.fn((..._args: any[]) => ({ active: false, expiresAt: null }));
 jest.mock('../services/linkedInWritePacer', () => ({
   resolveDailyInviteCap: jest.fn((cap: number | null | undefined) => (typeof cap === 'number' ? cap : 10)),
   dailyMessageCap: jest.fn(() => 20),
