@@ -386,6 +386,7 @@ import {
   setDailyInviteCap,
   type ResolvedLinkedInAccount,
 } from './agentMode/linkedInDailyVolumeGate';
+import { routeLinkedInWriteToAccountWithHeadroom } from './agentMode/linkedInAccountRouting';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -34060,6 +34061,28 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
     }
 
+    // ENG-1132/ENG-1614: the requested account may be at its own daily
+    // invite/message cap while another account the org has connected and
+    // explicitly shared has headroom to spare. Route the WHOLE write there
+    // instead of failing — this only decides which account gets checked
+    // against the existing pacer/cap below; it never loosens either.
+    // No-op for accept/cancel-invitation (not volume-classed) and for a
+    // single-account customer (no alternate exists): today's behavior is
+    // unchanged in both cases.
+    let accountRouting: { fromAccountId: string; toAccountId: string; reason: string } | null = null;
+    if (PACED_WRITE_ACTIONS.has(action) && resolvedLinkedInAccount) {
+      const routed = await routeLinkedInWriteToAccountWithHeadroom(userId, action, account_id, resolvedLinkedInAccount);
+      if (routed) {
+        console.log(`[AgentMode] linkedinOutreach: ${routed.reason}`);
+        accountRouting = { fromAccountId: account_id, toAccountId: routed.accountId, reason: routed.reason };
+        account_id = routed.accountId;
+        resolvedLinkedInAccount = routed.account;
+      }
+    }
+    const withRouting = (data: any) => (
+      accountRouting && data && typeof data === 'object' ? { ...data, accountRouting } : data
+    );
+
     // For read-only actions (get-profile, search-people, get-company), fall back to
     // site-wide Unipile accounts when the user has no personally-connected account.
     // Write actions (send-invite, send-message, etc.) are excluded from this fallback —
@@ -34772,7 +34795,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               invitationId: (inviteResult && (inviteResult.invitation_id || inviteResult.id)) || undefined,
             });
 
-            return { success: true, data: inviteResult };
+            return { success: true, data: withRouting(inviteResult) };
           } catch (inviteErr: any) {
             if (inviteErr?.noteQuotaExceeded) {
               // Decision gate — do NOT decide for the customer. Ask them, then re-call
@@ -34913,7 +34936,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             }
           }
 
-          return { success: true, data: messageResponse };
+          return { success: true, data: withRouting(messageResponse) };
         }
 
         case 'send-inmail': {
@@ -34955,7 +34978,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             }
           }
 
-          return { success: true, data: inmailResponse };
+          return { success: true, data: withRouting(inmailResponse) };
         }
 
         case 'update-conversation-history': {
