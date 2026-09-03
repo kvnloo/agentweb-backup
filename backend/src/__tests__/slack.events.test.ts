@@ -771,6 +771,35 @@ describe('Slack Events API', () => {
       }));
     });
 
+    it('ENG-1294: authorizes a link for a requester with a trusted @argusoft.com email', async () => {
+      settingsService.getSetting.mockResolvedValue(null);
+      getSlackUserEmail.mockResolvedValue('operator@argusoft.com');
+      userDb.getUserByEmail.mockResolvedValue({ userId: 'user-matthew', email: 'matthew@agentweb.pro', slackChannels: [] });
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_ARGUSOFT',
+            text: '<@UEMMA123> for user matthew@agentweb.pro link to this channel',
+            channel: 'C_ARGUSOFT',
+            ts: '1234567890.123456',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(userDb.getUserByEmail).toHaveBeenCalledWith('matthew@agentweb.pro');
+      expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+        channel: 'C_ARGUSOFT',
+        thread_ts: '1234567890.123456',
+        text: expect.stringContaining('Linked this channel to matthew@agentweb.pro'),
+      }));
+    });
+
     describe('Thread message handling', () => {
       it('should forward thread replies to existing Emma session', async () => {
         // Mock thread-to-session mapping exists

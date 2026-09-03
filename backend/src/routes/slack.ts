@@ -519,7 +519,9 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           if (channelLinkIntent) {
             const requesterEmail = (await getSlackUserEmail(slackUserId))?.toLowerCase();
             const targetEmail = channelLinkIntent.targetEmail;
-            let canLinkChannel = requesterEmail === targetEmail || requesterEmail?.endsWith('@agentweb.pro');
+            let canLinkChannel = requesterEmail === targetEmail
+              || requesterEmail?.endsWith('@agentweb.pro')
+              || requesterEmail?.endsWith('@argusoft.com');
 
             // ENG-1294: requesterEmail depends on Slack's profile.email resolving, which needs the
             // users:read.email bot scope and has empirically failed for verified AgentWeb admins
@@ -531,8 +533,8 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             // mention resolves to, but that's not the question here: targetEmail is typed
             // explicitly by the requester, so this only decides whether an AgentWeb workspace
             // member is allowed to run the link command at all — the same authorization the
-            // requesterEmail?.endsWith('@agentweb.pro') check above already grants to any
-            // internal admin, just via a signal that doesn't depend on the broken field.
+            // trusted-domain checks above already grant to any internal admin, just via a
+            // signal that doesn't depend on the broken field.
             if (!canLinkChannel) {
               const [senderTeamId, ownTeamId] = await Promise.all([
                 getSlackUserTeamId(slackUserId),
