@@ -245,7 +245,28 @@ export class GoogleAdsService {
     }
   }
 
-  async search(customerId: string, accessToken: string, query: string, loginCustomerId?: string): Promise<any[]> {
+  /**
+   * @param completeness Optional out-param. When the `MAX_PAGES` cap stops the walk with rows
+   *   still unread, `completeness.truncated` is set to true.
+   *
+   *   An out-param rather than a widened return type because `search` returns `any[]` to a long
+   *   tail of callers that map straight over it; changing the shape would touch every one of
+   *   them for a signal only the audit path reads. Same trade-off `adUtmAuditService` already
+   *   made for `CampaignAuditReport[]`.
+   *
+   *   Why it exists at all: the cap silently dropped rows, so a caller that counted what it got
+   *   back could not tell a complete read from a capped one. The UTM audit then printed
+   *   "✅ All N campaign(s) on google carry UTM tracking" about ads it had never seen — the
+   *   fabricated-PASS shape this whole change set exists to remove. ~500k rows makes it
+   *   unlikely, not impossible, and "unlikely" is not what a ✅ claims.
+   */
+  async search(
+    customerId: string,
+    accessToken: string,
+    query: string,
+    loginCustomerId?: string,
+    completeness?: { truncated?: boolean },
+  ): Promise<any[]> {
     const MAX_PAGES = 50; // safety cap (~500k rows at the default page size) to avoid a runaway loop
     const all: any[] = [];
     let pageToken: string | undefined;
@@ -258,6 +279,8 @@ export class GoogleAdsService {
       pageToken = data.nextPageToken;
       pages++;
     } while (pageToken && pages < MAX_PAGES);
+    // A token still in hand means Google had more rows and the cap stopped the walk.
+    if (pageToken && completeness) completeness.truncated = true;
     return all;
   }
 
@@ -828,11 +851,13 @@ export class GoogleAdsService {
 
   // ── Campaigns ────────────────────────────────────────────────────────────
 
-  async listCampaigns(userId: string, customerId: string): Promise<{ resourceName: string; id: string; name: string; status: string; type: string }[]> {
+  /** @param completeness Optional out-param — see `search`. Set when the page cap truncated the read. */
+  async listCampaigns(userId: string, customerId: string, completeness?: { truncated?: boolean }): Promise<{ resourceName: string; id: string; name: string; status: string; type: string }[]> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const results = await this.search(customerId, accessToken,
       'SELECT campaign.resource_name, campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type FROM campaign ORDER BY campaign.id',
       loginCustomerId,
+      completeness,
     );
     return results.map((r: any) => ({
       resourceName: r.campaign.resourceName,
@@ -1569,6 +1594,8 @@ export class GoogleAdsService {
     userId: string,
     customerId: string,
     campaignId?: string,
+    /** Optional out-param — see `search`. Set when either underlying query hit the page cap. */
+    completeness?: { truncated?: boolean },
   ): Promise<Array<{
     adId: string;
     campaignId: string;
@@ -1592,9 +1619,10 @@ export class GoogleAdsService {
       'asset_group.id, asset_group.final_urls ' +
       'FROM asset_group' + where;
 
+    // Either query hitting the cap makes the combined result partial, so both feed the same flag.
     const [adRows, assetGroupRows] = await Promise.all([
-      this.search(customerId, accessToken, adQuery, loginCustomerId),
-      this.search(customerId, accessToken, assetGroupQuery, loginCustomerId),
+      this.search(customerId, accessToken, adQuery, loginCustomerId, completeness),
+      this.search(customerId, accessToken, assetGroupQuery, loginCustomerId, completeness),
     ]);
 
     const urls = (value: any): string[] =>

@@ -109,8 +109,12 @@ describe('MetaService', () => {
 
     describe('Campaign Operations', () => {
         it('should get a single campaign', async () => {
+             // Graph returns `account_id` because getCampaign now asks for it in the same call
+             // to verify ownership; it is stripped before the caller sees the payload.
              const mockCampaignData = { id: 'camp_1', name: 'Campaign 1' };
-             const mockGet = jest.fn().mockResolvedValue({ _data: mockCampaignData });
+             const mockGet = jest.fn().mockResolvedValue({
+                 _data: { ...mockCampaignData, account_id: mockAdAccountId },
+             });
              (Campaign as unknown as jest.Mock).mockImplementation(() => ({
                  get: mockGet,
              }));
@@ -120,6 +124,42 @@ describe('MetaService', () => {
              expect(Campaign).toHaveBeenCalledWith('camp_1');
              expect(mockGet).toHaveBeenCalled();
              expect(result).toEqual(mockCampaignData);
+        });
+
+        /*
+         * getCampaign accepted `adAccountId` and never used it. A node id is global, so it
+         * returned any campaign the token could reach — and one caller renders the result's NAME
+         * into the confirmation prompt a user approves, so an id from another ad account
+         * disclosed that account's campaign name to this user.
+         */
+        it('refuses a campaign owned by a different ad account, without naming the owner', async () => {
+             const mockGet = jest.fn().mockResolvedValue({
+                 _data: { id: 'camp_1', name: "Other tenant's campaign", account_id: '9998887776' },
+             });
+             (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get: mockGet }));
+
+             await expect(
+                 service.getCampaign(mockAdAccountId, mockAccessToken, 'camp_1'),
+             ).rejects.toThrow(/not available in the selected ad account/i);
+
+             /*
+              * Asserted on the MESSAGE. `rejects.toThrow(expect.not.stringContaining(x))` reads
+              * like a check on the text and is not one: jest hands `toThrow` the Error OBJECT,
+              * so `stringContaining` is false for every error and its negation is
+              * unconditionally true. An error whose message literally contained '9998887776'
+              * passed it, so the no-oracle property — the whole reason this guard refuses
+              * generically instead of explaining itself — pinned nothing.
+              */
+             let refusal = '';
+             try {
+                 await service.getCampaign(mockAdAccountId, mockAccessToken, 'camp_1');
+                 throw new Error('expected the cross-account read to be refused');
+             } catch (err: any) {
+                 refusal = String(err?.message ?? err);
+             }
+             expect(refusal).toMatch(/not available in the selected ad account/i);
+             expect(refusal).not.toContain('9998887776');
+             expect(refusal).not.toContain('act_9998887776');
         });
 
         it('should list campaigns', async () => {

@@ -14,7 +14,7 @@ import { canEditItem } from "./orgShareService";
 import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
-import { guardedV0ChatCreate, guardedV0CorrectionMessage, clearV0UsageForPage, hashV0Prompt } from "./v0UsageGuard";
+import { guardedV0ChatCreate, guardedV0CorrectionMessage, guardedV0IterateMessage, clearV0UsageForPage, hashV0Prompt } from "./v0UsageGuard";
 import { meteredV0 } from "./v0Metering";
 // Type-only imports from durableLandingService live elsewhere; this constant import is
 // runtime-safe because durableLandingService only imports a TYPE from this module.
@@ -5812,12 +5812,18 @@ export async function iterateLandingPage(
       // refuses). Async returns in seconds; the version wait below absorbs the real time.
       // Safe now only because that wait is anchored to `afterVersionId` — without it, a deploy
       // could grab the PRE-iteration version and silently ship the page without the edit.
-      await withRetry(
-        meteredV0({ userId: iterateActorUserId, billingUserId: iterateOwnerUserId, ...(iterateActorUserId && iterateOwnerUserId && iterateActorUserId !== iterateOwnerUserId ? { onBehalfOf: iterateActorUserId } : {}), operation: "iterate_message" }, () => v0.chats.sendMessage({ chatId, message, responseMode: "async" })),
-        "v0 chat iterate",
-        undefined, undefined, undefined,
-        { retryOnTimeout: false }
-      );
+      await guardedV0IterateMessage({
+        userId: iterateActorUserId,
+        scopeId: id,
+        chatId,
+        message,
+        send: () => withRetry(
+          meteredV0({ userId: iterateActorUserId, billingUserId: iterateOwnerUserId, ...(iterateActorUserId && iterateOwnerUserId && iterateActorUserId !== iterateOwnerUserId ? { onBehalfOf: iterateActorUserId } : {}), operation: "iterate_message" }, () => v0.chats.sendMessage({ chatId, message, responseMode: "async" })),
+          "v0 chat iterate",
+          undefined, undefined, undefined,
+          { retryOnTimeout: false }
+        ),
+      });
 
       // Record it the instant v0 accepts, BEFORE the wait — if the wait dies (timeout, crash,
       // lost response), the retry must know the message is already with v0.

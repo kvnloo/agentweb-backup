@@ -47,6 +47,54 @@ const report = (over: Partial<any> = {}) => ({
 describe('ENG-239 AC3 — audit_ad_utm_coverage tool', () => {
   beforeEach(() => jest.clearAllMocks());
 
+  /*
+   * ENG-1476 follow-up: "All N campaign(s) carry UTM tracking" is a claim about EVERYTHING, so
+   * it may only be made from a read that saw everything. auditCampaigns now reports whether its
+   * reads were bounded; the tool must not spend that on a clean bill of health.
+   */
+  describe('a bounded read never reports a clean bill of health', () => {
+    const runTool = async () => {
+      const tool = emmaToolRegistry.getTool(TOOL)!;
+      return tool.execute({ platform: 'meta', account_id: 'acct-1' }, { userId: 'u1' });
+    };
+
+    it('drops the "All N carry UTM tracking" claim when a read stopped at a bound', async () => {
+      mockAudit.mockImplementation(async (_p: any, _u: any, _a: any, _port: any, completeness: any) => {
+        if (completeness) completeness.incomplete = true;
+        return [report({ tagged: true, missingKeys: [], untaggedAdIds: [] })];
+      });
+
+      const out: any = await runTool();
+
+      expect(out.message).not.toContain('All 1 campaign(s)');
+      expect(out.message).toMatch(/nothing wrong in what was read/i);
+      expect(out.readIncomplete).toBe(true);
+    });
+
+    it('names the campaign list specifically when that is what stopped short', async () => {
+      mockAudit.mockImplementation(async (_p: any, _u: any, _a: any, _port: any, completeness: any) => {
+        if (completeness) { completeness.incomplete = true; completeness.campaignListIncomplete = true; }
+        return [report({ tagged: true, missingKeys: [], untaggedAdIds: [] })];
+      });
+
+      const out: any = await runTool();
+
+      expect(out.message).toMatch(/campaign list stopped at a read bound/i);
+      expect(out.campaignListIncomplete).toBe(true);
+    });
+
+    it('still reports a clean bill of health for a COMPLETE read', async () => {
+      // Guards the opposite error: an ordinary healthy audit must be unchanged.
+      mockAudit.mockResolvedValue([report({ tagged: true, missingKeys: [], untaggedAdIds: [] })]);
+
+      const out: any = await runTool();
+
+      expect(out.message).toContain('All 1 campaign(s)');
+      expect(out.message).not.toMatch(/read bound/i);
+      expect(out.readIncomplete).toBeUndefined();
+    });
+  });
+
   it('is registered in the Emma tool registry', () => {
     expect(emmaToolRegistry.getTool(TOOL)).toBeDefined();
   });
@@ -64,7 +112,10 @@ describe('ENG-239 AC3 — audit_ad_utm_coverage tool', () => {
 
     await tool.execute({ platform: 'google', account_id: 'acct-9' }, { userId: 'u1' });
 
-    expect(mockAudit).toHaveBeenCalledWith('google', 'u1', 'acct-9', { __port: 'google' });
+    // Assert the routing arguments, not the call's arity: the tool now also passes a
+    // completeness out-param, and what this pins is platform/userId/port selection.
+    expect(mockAudit).toHaveBeenCalledTimes(1);
+    expect(mockAudit.mock.calls[0].slice(0, 4)).toEqual(['google', 'u1', 'acct-9', { __port: 'google' }]);
   });
 
   it('summarises which campaigns need action and which are clean', async () => {

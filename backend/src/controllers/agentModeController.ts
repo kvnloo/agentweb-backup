@@ -840,7 +840,13 @@ const SCHEDULED_RUN_RESUME_MESSAGE =
 // plan, mirroring AUTO_MEDIA_CONTINUATION_MAX_ROUNDS — a model that keeps refusing to
 // progress despite the resume instruction must not turn one request into an unbounded
 // background retry loop.
-const AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS = 3;
+//
+// ENG-1700 follow-up: lowered from 3 to 2. The ENG-1700 fix means every occurrence of a
+// still-open upstream bug (ENG-1477, create_html_file failing ~25% of the time) now costs up
+// to MAX_ROUNDS auto-continuation LLM calls instead of zero — deliberately trading some cost
+// for auto-recovery, but 2 rounds captures most of that recovery value at 2/3 the spend of 3,
+// until ENG-1477 itself is fixed.
+export const AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS = 2;
 
 // ENG-1684: fired by the SERVER when an autocomplete=true work plan's turn ends with no
 // tool calls and at least one step still not completed/skipped — the exact stall pattern
@@ -858,20 +864,36 @@ const AUTO_WORK_PLAN_CONTINUATION_MESSAGE =
   'actually done.';
 
 /**
- * ENG-1684: true when this turn's own settled response left an autocomplete work plan
- * stalled — no tool calls at all in the final turn, but the plan still has a step that
- * isn't completed/skipped. Scoped tightly to autocomplete plans: an INTERACTIVE plan
- * pausing on a real question is correct behavior (a human can answer it), so this must
- * never fire there — only autocomplete plans carry the "never wait on the user" contract
- * that makes an unanswered pause a bug rather than a feature.
+ * ENG-1684/ENG-1700: true when this turn's own settled response left an autocomplete work
+ * plan stalled, and nothing else already owns resuming it. A stall is either zero tool calls
+ * at all, or one or more tool calls that ALL failed (ENG-1700: e.g. create_html_file rejecting
+ * its payload repeatedly) — either shape leaves the plan making no forward progress. Deferred
+ * media-budget calls are excluded: scheduleAutoMediaContinuation already owns resuming that
+ * turn, and firing both continuations would race for the same session lock.
+ * Scoped tightly to autocomplete plans: an INTERACTIVE plan pausing on a real question is
+ * correct behavior (a human can answer it), so this must never fire there — only autocomplete
+ * plans carry the "never wait on the user" contract that makes an unanswered pause a bug
+ * rather than a feature.
  */
 export function hasStalledAutocompleteWorkPlan(
   workPlan: { autocomplete?: boolean; steps?: Array<{ status?: string }> } | undefined | null,
   toolCalls: unknown[] | undefined | null,
 ): boolean {
   if (!workPlan?.autocomplete) return false;
-  if (Array.isArray(toolCalls) && toolCalls.length > 0) return false;
-  const steps = Array.isArray(workPlan.steps) ? workPlan.steps : [];
+  const calls = Array.isArray(toolCalls) ? toolCalls : [];
+  if (hasDeferredMediaBudgetToolCall(calls as any[])) return false;
+  if (calls.some((tc) => toolCallSucceeded(tc))) return false;
+  return workPlanHasPendingStep(workPlan);
+}
+
+/** ENG-1699: whether an autocomplete work plan still has unfinished work, independent of any
+ * specific turn's tool-call history. Shared by hasStalledAutocompleteWorkPlan (which also asks
+ * "did this turn make progress") and scheduleAutoWorkPlanContinuation's pre-fire re-check
+ * (which only needs "is there still something to do"). */
+function workPlanHasPendingStep(
+  workPlan: { steps?: Array<{ status?: string }> } | undefined | null,
+): boolean {
+  const steps = Array.isArray(workPlan?.steps) ? workPlan!.steps : [];
   return steps.some((s) => s?.status !== 'completed' && s?.status !== 'skipped');
 }
 
@@ -1354,6 +1376,47 @@ async function scheduleAutoWorkPlanContinuation(
   // turn still leaves the plan stalled, its own response re-triggers this path.
   if (!tryClaimSessionGeneration(sessionId)) return;
   autoContinuationSessions.add(sessionId);
+
+  // ENG-1699: this callback was scheduled via setImmediate after a stall was detected — a
+  // human's own turn may have already resolved it (or the plan itself) in that gap, since we
+  // only re-checked the stall condition AFTER a round used to fire, never immediately before.
+  // Re-verify against the session's current state before spending a turn on a continuation
+  // nobody needs anymore.
+  //
+  // Plain (non-consistent) read — NOT because eventual consistency doesn't matter here (it
+  // does), but because `getChatSession`'s `consistentRead` param never actually reaches the
+  // base session record `workPlan` lives on: it's threaded only into getMessagesFromMessagesTable
+  // (see getChatSession's own implementation), so passing `true` the way ENG-510's
+  // getChatSession(sessionId, true) does at the timeout-handling call site above (which reads
+  // .messages, not .workPlan) would be no-op rigor here, not a real fix. Ordinary DynamoDB
+  // read-after-write lag on a single-item read is normally sub-second in-region; worst case on a
+  // stale read is one extra harmless turn, the same failure mode this whole function replaces.
+  //
+  // On a lookup failure (not "resolved", genuinely couldn't check): fail OPEN — proceed to
+  // generate anyway, same as this function's pre-ENG-1699 behavior — rather than silently
+  // treating "couldn't check" as "already resolved" and dropping the entire stall backstop with
+  // no operator visibility. Every other failure branch in this function logs; this one must too.
+  // Cheap base-record read only (no message-table fetch/migration) — workPlan lives on the
+  // base record, same pattern already used by chatSocketHandler.ts/liveVoiceService.ts for
+  // exactly this reason.
+  let currentSessionLookupFailed = false;
+  const currentSession = await chatbotDb.getChatSessionRecord(sessionId).catch((lookupErr) => {
+    console.error(
+      `AgentMode: work-plan auto-continuation pre-fire recheck failed to read session ${sessionId} ` +
+      `— proceeding to generate anyway (fail open) rather than silently skipping the backstop:`,
+      lookupErr,
+    );
+    currentSessionLookupFailed = true;
+    return null;
+  });
+  if (
+    !currentSessionLookupFailed &&
+    (!currentSession?.workPlan?.autocomplete || !workPlanHasPendingStep(currentSession.workPlan))
+  ) {
+    autoContinuationSessions.delete(sessionId);
+    releaseSessionGeneration(sessionId);
+    return;
+  }
 
   let stillStalled = false;
   withGenerationTimeout(

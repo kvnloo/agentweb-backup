@@ -112,6 +112,83 @@ describe('AgentModeService - Skills', () => {
       expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
     });
 
+    /*
+     * Observed live (delegated session a1a6345a, Phoenix): the skill gate refused
+     * `audit_ad_utm_coverage`, this install was refused by subscription, and the model then ran
+     * an unrelated AD LIST and presented a confident "UTM Tagging Audit Summary — PASS, 6/6
+     * tagged" table built from it, as though the audit had run. A downstream truthfulness guard
+     * appended a correction, but BELOW the fabricated table.
+     *
+     * The model cannot be unit-tested into honesty, but the two inputs it reasons from can be
+     * pinned: this refusal must read as a hard failure, and it must carry an explicit
+     * instruction not to substitute another tool's output for the gated one.
+     */
+    it('reports a subscription refusal as a hard failure, not an ambiguous message', async () => {
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+      const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+
+      // `success` was previously left undefined here while the success path sets `success: true`,
+      // so a refusal did not necessarily read as a failure at all.
+      expect(result.success).toBe(false);
+    });
+
+    it('tells the model not to substitute another tool for the one that needed the skill', async () => {
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+      const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+
+      expect(result.message).toMatch(/do not substitute/i);
+      expect(result.message).toMatch(/not on their plan/i);
+    });
+
+    /*
+     * The outcome has to survive MINIMIZATION, not just be returned.
+     *
+     * The dispatcher does not store the result — it stores
+     * `extractMinimalToolResult(result, 'install_skills')`, and that function's default branch
+     * returns `{}`. So a refusal that reads perfectly here can still reach the ledger as an
+     * empty object with no `success: false` at all, and anything downstream reading the ledger
+     * to find out whether the install worked sees a shape indistinguishable from a clean one.
+     *
+     * That is not hypothetical: `extractMinimalToolResult`'s own ENG-1207 comment records
+     * `reconcileUnconsumedCursors` being inert in production for exactly this reason while all
+     * of its unit tests passed, because those tests built ledger entries by hand and so never
+     * crossed this function. This test crosses it deliberately.
+     */
+    it('a refused install still reads as a failure AFTER ledger minimization', async () => {
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+      const refusal = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+      const ledgerResult = (agentModeService as any).extractMinimalToolResult(refusal, 'install_skills');
+
+      expect(ledgerResult.success).toBe(false);
+      // The refusal must still be readable in the ledger, not just in the returned object.
+      expect(String(ledgerResult.message)).toMatch(/not available with your current subscription/i);
+    });
+
+    it('a PARTIAL install survives minimization as partial, not as a clean success', async () => {
+      // success:true (something installed) + the refused ids. Without the ids the ledger says
+      // only "the install succeeded", which is true and useless: the one skill the gated tool
+      // needed may be exactly the one that was refused.
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+      ]);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      const partial = await agentModeService.installSkills(
+        ['skill-1', 'utm-audit'],
+        'user-123',
+        'session-123',
+      );
+      expect(partial.success).toBe(true);
+      expect(partial.rejectedSkillIds).toEqual(['utm-audit']);
+
+      const ledgerResult = (agentModeService as any).extractMinimalToolResult(partial, 'install_skills');
+      expect(ledgerResult.success).toBe(true);
+      expect(ledgerResult.rejectedSkillIds).toEqual(['utm-audit']);
+    });
+
     it('should filter out unpublished skills', async () => {
       const skills = [
         { skillId: 'skill-1', name: 'Published', description: 'Desc', toolNames: ['tool1'], isPublished: true },

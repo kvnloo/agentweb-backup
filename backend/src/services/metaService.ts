@@ -140,6 +140,7 @@ export const META_LIST_MAX_PAGES = 25;
  */
 export const META_LIST_MAX_MS = 45_000;
 
+
 /**
  * Ceiling on how long ONE Graph read may block this request.
  *
@@ -162,6 +163,12 @@ export const META_LIST_MAX_MS = 45_000;
  * wait that was previously unbounded anyway. So this is a backstop against a hang, not a latency
  * target. One slow page fits inside META_LIST_MAX_MS; a second cannot, so the loop then stops and
  * reports `truncated` rather than grinding on.
+ *
+ * ⚠ That last sentence holds for the 45s default and NOT for the launch path, which passes
+ * `maxMs: META_LAUNCH_READ_MAX_MS` (240s) — there roughly eight slow pages fit. Deliberate: a
+ * truncated read refuses a launch rather than degrading an answer, so stopping early is the
+ * expensive outcome. Worst case is the 240s loop plus one in-flight 30s page, ~270s, against
+ * nginx `proxy_read_timeout` and the ALB `IdleTimeout` of 600s — checked, with headroom.
  */
 export const META_READ_CALL_TIMEOUT_MS = 30_000;
 
@@ -270,6 +277,33 @@ function parseBusinessUseCaseUsage(response: { headers?: { get?: (name: string) 
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The one sentence every ad-account ownership refusal carries (`assertOwnedByAccount`).
+ *
+ * A constant, not a literal repeated at the read site, because the pairing is load-bearing: a
+ * caller that has to tell "this node belongs to another ad account" apart from "Meta blipped"
+ * gets it wrong silently if the wording drifts, and gets it wrong in the permissive direction.
+ */
+export const META_ACCOUNT_SCOPE_REFUSAL_MARKER = 'is not available in the selected ad account';
+
+/**
+ * True only for a refusal thrown by the ad-account ownership guard — never for a transient
+ * Graph failure.
+ *
+ * Both arrive at a caller's `catch` as an Error, and they mean opposite things. A timeout, a
+ * 5xx or a rate limit says "we could not look"; this says "we looked, and the node is out of
+ * scope". A caller that treats the second as the first degrades to a best-effort path and
+ * carries on with a node it has been told not to touch.
+ *
+ * Deliberately does NOT match `assertNodeInAccount`'s unverifiable-lookup message ("Could not
+ * verify the requested … please retry"), which is a genuine transient and must keep the
+ * best-effort behaviour.
+ */
+export function isMetaAccountScopeRefusal(error: unknown): boolean {
+  const message = (error as { message?: unknown } | null | undefined)?.message;
+  return typeof message === 'string' && message.includes(META_ACCOUNT_SCOPE_REFUSAL_MARKER);
 }
 
 export class MetaService {
@@ -1217,8 +1251,18 @@ export class MetaService {
       const campaign = new Campaign(campaignId);
       const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap'];
       this.log(`Fetching campaign: ${campaignId}`);
-      const result = await campaign.get(fields);
-      return result._data;
+      /*
+       * `adAccountId` was accepted and never used: a node id is global, so this returned any
+       * campaign the token could reach. It matters more here than on a plain list, because one
+       * caller renders the result's NAME into the confirmation prompt a user approves — so an id
+       * from another ad account disclosed that account's campaign name to this user, which is
+       * precisely the oracle behaviour assertOwnedByAccount refuses to produce.
+       */
+      const result = await campaign.get(MetaService.withOwnershipField(fields));
+      const data = { ...(result?._data ?? {}) };
+      MetaService.assertOwnedByAccount(data.account_id, campaignId, 'Campaign', adAccountId);
+      delete data.account_id;
+      return data;
     } catch (error) {
       return this.handleError(error, 'getCampaign');
     }
@@ -1254,11 +1298,32 @@ export class MetaService {
       [...MetaService.CAMPAIGN_READ_FIELDS];
     try {
       this.initApi(accessToken);
-      if (options.campaignId) {
-        this.log(`Fetching single campaign ${options.campaignId}`, { fields });
-        const campaign = new Campaign(options.campaignId);
-        const result = await MetaService.withReadDeadline<any>(() => campaign.get(fields), 'single campaign fetch');
-        return { campaigns: [result._data], truncated: false, pagesFetched: 1 };
+      // `!== undefined`, not truthiness: `''` is the input `resolveScopeId` exists to REFUSE, and
+      // a truthy test skipped the branch entirely and fell through to the account-wide list —
+      // the silent widening the guard was written to stop, on the one input that names it.
+      if (options.campaignId !== undefined && options.campaignId !== null) {
+        const wantedId = MetaService.resolveScopeId(options.campaignId, 'campaign_id')!;
+        this.log(`Fetching single campaign ${wantedId}`, { fields });
+        const campaign = new Campaign(wantedId);
+        // A node id is global — `new Campaign(id)` is NOT bounded by the ad account the way
+        // the `/act_X/` edge is, and one Meta OAuth token routinely spans several ad accounts.
+        // Without a check the selected-account scope is advisory: a caller could read a campaign
+        // from an account it never selected.
+        //
+        // `account_id` is requested ALONGSIDE the caller's fields so ownership is answered by the
+        // same response as the payload — one round trip, and no separate probe that could fail on
+        // its own and refuse a read which would otherwise have succeeded.
+        const result = await MetaService.withReadDeadline<any>(
+          () => campaign.get(MetaService.withOwnershipField(fields)),
+          'single campaign fetch',
+        );
+        const data = { ...(result?._data ?? {}) };
+        MetaService.assertOwnedByAccount(data.account_id, wantedId, 'Campaign', adAccountId);
+        // Always requested for the check, never by the caller: `account_id` is in neither
+        // READ_FIELDS allow-list, so resolveReadFields would have thrown on an explicit request
+        // for it. Dropped unconditionally, so the payload is exactly what the caller selected.
+        delete data.account_id;
+        return { campaigns: [data], truncated: false, pagesFetched: 1 };
       }
       const account = new AdAccount(`act_${adAccountId}`);
       const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
@@ -1386,11 +1451,24 @@ export class MetaService {
       [...MetaService.AD_SET_READ_FIELDS];
     try {
       this.initApi(accessToken);
-      if (options.adSetId) {
-        this.log(`Fetching single ad set ${options.adSetId}`, { fields });
-        const adSet = new AdSet(options.adSetId);
-        const result = await MetaService.withReadDeadline<any>(() => adSet.get(fields), 'single ad set fetch');
-        return { adSets: [result._data], truncated: false, pagesFetched: 1, scope: { adSetId: options.adSetId } };
+      // Same reason as the single-campaign branch above.
+      if (options.adSetId !== undefined && options.adSetId !== null) {
+        const wantedId = MetaService.resolveScopeId(options.adSetId, 'ad_set_id')!;
+        this.log(`Fetching single ad set ${wantedId}`, { fields });
+        const adSet = new AdSet(wantedId);
+        // Same global-node-id boundary, and the same one-round-trip check, as the single
+        // campaign fetch above.
+        const result = await MetaService.withReadDeadline<any>(
+          () => adSet.get(MetaService.withOwnershipField(fields)),
+          'single ad set fetch',
+        );
+        const data = { ...(result?._data ?? {}) };
+        MetaService.assertOwnedByAccount(data.account_id, wantedId, 'Ad set', adAccountId);
+        // Always requested for the check, never by the caller: `account_id` is in neither
+        // READ_FIELDS allow-list, so resolveReadFields would have thrown on an explicit request
+        // for it. Dropped unconditionally, so the payload is exactly what the caller selected.
+        delete data.account_id;
+        return { adSets: [data], truncated: false, pagesFetched: 1, scope: { adSetId: wantedId } };
       }
 
       const wantedCampaign = MetaService.resolveScopeId(campaignId, 'campaign_id');
@@ -1476,7 +1554,14 @@ export class MetaService {
    * Get a single ad set with the fields needed to confirm a write target
    * (name + the campaign it belongs to).
    */
-  public async getAdSet(accessToken: string, adSetId: string) {
+  public async getAdSet(
+    accessToken: string,
+    adSetId: string,
+    /** When supplied, the node is verified to belong to this ad account before anything is
+     *  returned. Optional so existing read-back callers are unchanged; the callers whose result
+     *  reaches a user-facing prompt pass it. */
+    adAccountId?: string,
+  ) {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
@@ -1490,8 +1575,27 @@ export class MetaService {
         'start_time', 'end_time'
       ];
       this.log(`Fetching ad set: ${adSetId}`);
-      const result = await adSet.get(fields);
-      return result._data;
+      /*
+       * `adAccountId !== undefined/null`, not a truthiness test.
+       *
+       * `if (adAccountId)` treats a caller that SUPPLIED an empty string as one that supplied
+       * nothing, and skips the ownership check entirely — so a scope that failed to resolve
+       * silently widened the read to any ad set the token can reach. getCampaign fails closed
+       * on exactly that input (assertOwnedByAccount refuses when the selected account is
+       * blank); these two now agree. `undefined`/`null` still means "not supplied" and
+       * legitimately opts out, which is what the post-write read-back callers rely on. Same
+       * distinction resolveScopeId already draws for scope ids.
+       */
+      const scoped = adAccountId !== undefined && adAccountId !== null;
+      const result = await adSet.get(
+        scoped ? MetaService.withOwnershipField(fields) : fields,
+      );
+      const data = { ...(result?._data ?? {}) };
+      if (scoped) {
+        MetaService.assertOwnedByAccount(data.account_id, adSetId, 'Ad set', adAccountId);
+        delete data.account_id;
+      }
+      return data;
     } catch (error) {
       return this.handleError(error, 'getAdSet');
     }
@@ -1944,7 +2048,9 @@ export class MetaService {
 
   private async drainCursor(
     cursor: any,
-    maxPages: number
+    maxPages: number,
+    /** Wall-clock budget for this walk. Defaults to the ordinary read ceiling. */
+    maxMs: number = META_LIST_MAX_MS,
   ): Promise<{ items: any[]; truncated: boolean; pagesFetched: number }> {
     /*
      * Normalise the bound before it is used as one. `maxPages` arrives from a caller-supplied
@@ -1966,11 +2072,14 @@ export class MetaService {
     const canPage = typeof cursor?.hasNext === 'function' && typeof cursor?.next === 'function';
     if (!canPage) return { items, truncated: false, pagesFetched };
 
-    const deadline = Date.now() + META_LIST_MAX_MS;
+    // Same normalisation discipline as `pageLimit` above: a caller-supplied budget that is not a
+    // positive safe integer must not quietly become an unbounded walk.
+    const budgetMs = Number.isSafeInteger(maxMs) && maxMs > 0 ? maxMs : META_LIST_MAX_MS;
+    const deadline = Date.now() + budgetMs;
 
     while (cursor.hasNext()) {
       if (Date.now() >= deadline) {
-        this.log(`Stopped paginating at the ${META_LIST_MAX_MS}ms wall-clock bound`, {
+        this.log(`Stopped paginating at the ${budgetMs}ms wall-clock bound`, {
           pagesFetched,
           itemsSoFar: items.length,
         });
@@ -2021,21 +2130,11 @@ export class MetaService {
     return { items, truncated: false, pagesFetched };
   }
 
-  /**
-   * Bind a campaign / ad-set node to the SELECTED ad account before reading through it.
-   *
-   * ⚠ This is a tenancy boundary, not a nicety. Listing through `new AdAccount('act_X')` was
-   * implicitly account-scoped: Meta could only ever hand back X's ads. Reading through
-   * `new Campaign(id)` / `new AdSet(id)` is NOT — a node id addresses a node globally, and one
-   * Meta OAuth token routinely reaches several ad accounts. Without this check a caller could
-   * select account A, pass a campaign id from account B, and receive B's ads labelled as A's.
-   *
-   * `getMetaCredentials` validates the selected account and returns its token; it says nothing
-   * about the node. The token being valid is not the same as the node being in scope. This
-   * mirrors the guard `AD_CREATIVE GET` already applies for exactly this reason (ENG-471).
-   *
-   * Fails closed on every uncertain branch: an unverifiable owner is refused, not returned.
-   */
+  /** Add `account_id` to a field selection so a single-entity read can verify its own ownership. */
+  private static withOwnershipField(fields: string[]): string[] {
+    return fields.includes('account_id') ? fields : [...fields, 'account_id'];
+  }
+
   /**
    * Resolve a scope id that was SUPPLIED versus one that was omitted.
    *
@@ -2058,6 +2157,21 @@ export class MetaService {
     return trimmed;
   }
 
+  /**
+   * Bind a campaign / ad-set node to the SELECTED ad account before reading through it.
+   *
+   * ⚠ This is a tenancy boundary, not a nicety. Listing through `new AdAccount('act_X')` was
+   * implicitly account-scoped: Meta could only ever hand back X's ads. Reading through
+   * `new Campaign(id)` / `new AdSet(id)` is NOT — a node id addresses a node globally, and one
+   * Meta OAuth token routinely reaches several ad accounts. Without this check a caller could
+   * select account A, pass a campaign id from account B, and receive B's ads labelled as A's.
+   *
+   * `getMetaCredentials` validates the selected account and returns its token; it says nothing
+   * about the node. The token being valid is not the same as the node being in scope. This
+   * mirrors the guard `AD_CREATIVE GET` already applies for exactly this reason (ENG-471).
+   *
+   * Fails closed on every uncertain branch: an unverifiable owner is refused, not returned.
+   */
   private async assertNodeInAccount(
     node: any,
     nodeId: string,
@@ -2098,8 +2212,31 @@ export class MetaService {
       );
     }
 
+    MetaService.assertOwnedByAccount(data.account_id, nodeId, nodeLabel, adAccountId);
+  }
+
+  /**
+   * Compare an ALREADY-READ `account_id` against the selected ad account and refuse a mismatch.
+   *
+   * Split out of `assertNodeInAccount` so a caller about to read the node anyway can request
+   * `account_id` in the SAME call and check it here — one round trip instead of two. That
+   * matters on the single-entity paths: a separate probe would double the Graph calls on a
+   * routine read-back path AND add a failure mode of its own, refusing a read that would
+   * otherwise have succeeded because the probe blipped. Edge-scoped callers still need
+   * `assertNodeInAccount`, having no payload response to fold the field into.
+   */
+  /**
+   * Public so the one guard that predates it (`AD_CREATIVE GET` in agentModeService) can share
+   * this exact refusal instead of hand-rolling a near-copy that names the owning account.
+   */
+  public static assertOwnedByAccount(
+    ownerAccountId: unknown,
+    nodeId: string,
+    nodeLabel: string,
+    adAccountId: string,
+  ): void {
     const norm = (id: unknown) => String(id ?? '').replace(/^act_/, '').trim();
-    const owner = norm(data.account_id);
+    const owner = norm(ownerAccountId);
     const selected = norm(adAccountId);
 
     /*
@@ -2109,23 +2246,60 @@ export class MetaService {
      * could learn which ad account owns it, which is cross-account disclosure of exactly the
      * kind the guard exists to prevent — a block that answers the question it is refusing.
      *
-     * So the caller (and the model, and ultimately the user) gets one generic message for every
-     * failed branch, and the discriminating detail goes to the server log only.
+     * So the caller (and the model, and ultimately the user) gets the SAME marker sentence on
+     * every failed branch, and the owning account never appears in any of them — the log keeps
+     * that. What may differ after the marker is the remedy, because "select the other account"
+     * is right for a mismatch and impossible when Meta reported no owner at all; see `refuse`.
      */
-    const refuse = (serverDetail: string): never => {
+    /*
+     * One marker sentence for every branch, but the REMEDY may differ.
+     *
+     * The marker is what `isMetaAccountScopeRefusal` keys on, so it must not vary — a caller
+     * that stops recognising a refusal degrades past a guard it was told to respect, and for a
+     * write that means proceeding to confirmation on a node the guard refused. What may vary is
+     * the sentence after it, and it should: "select that account and try again" is the right
+     * remedy when the node lives in a DIFFERENT account, and no remedy at all when Meta simply
+     * did not tell us who owns it. Naming an action the user cannot take is the ENG-1636 shape.
+     *
+     * Neither variant discloses the owning account — that is the oracle this guard exists to
+     * refuse, and the discriminating detail stays in the server log.
+     */
+    const OTHER_ACCOUNT_REMEDY = 'If it belongs to a different ad account, select that account and try again.';
+    const refuse = (serverDetail: string, remedy: string = OTHER_ACCOUNT_REMEDY): never => {
       console.warn(`[MetaService] scope ownership refused: ${serverDetail}`);
       throw new Error(
-        `The requested ${nodeLabel.toLowerCase()} is not available in the selected ad account.`,
+        `The requested ${nodeLabel.toLowerCase()} ${META_ACCOUNT_SCOPE_REFUSAL_MARKER}. ${remedy}`,
       );
     };
 
     if (!owner) {
-      refuse(`no account_id on ${nodeLabel} ${nodeId}`);
+      // Fails closed on purpose: the field was requested, so its absence means the assumption
+      // behind this check no longer holds — not that the node is in scope.
+      refuse(
+        `no account_id on ${nodeLabel} ${nodeId}`,
+        `Meta did not report which ad account owns it, so ownership could not be CONFIRMED — ` +
+        `this is a failed check, not a proven mismatch. Retry; if it persists, verify the object ` +
+        `in Meta Ads Manager and that the intended ad account is selected.`,
+      );
     }
     // Both sides must be known. An empty selected account cannot be compared against anything,
     // so treating it as "no mismatch" would pass every node the token can reach.
     if (!selected) {
-      refuse(`no selected account resolved for ${nodeLabel} ${nodeId}`);
+      /*
+       * OUR failure, not the user's, and it must not read like theirs.
+       *
+       * This fires when no ad account could be resolved for the request — a credential or
+       * wiring problem on our side. The shared remedy ("it belongs to a different ad account,
+       * select that one") accuses the user of pointing at someone else's node, which is a
+       * confusing, unactionable thing to read about your own campaign. It is the same mistake
+       * that shipped as "in ad account (undefined)" earlier in this work.
+       */
+      refuse(
+        `no selected account resolved for ${nodeLabel} ${nodeId}`,
+        `No ad account could be determined for this request, so ownership could not be checked. ` +
+        `This is a connection problem, not a permissions one — reconnect Meta in Settings, or ` +
+        `name the ad account explicitly, then try again.`,
+      );
     }
     if (owner !== selected) {
       refuse(`${nodeLabel} ${nodeId} owned by ${owner}, selected ${selected}`);
@@ -2288,7 +2462,7 @@ export class MetaService {
     adAccountId: string,
     accessToken: string,
     campaignId?: string,
-    options: { maxPages?: number } = {},
+    options: { maxPages?: number; maxMs?: number } = {},
   ): Promise<{
     items: Array<{ adId: string; campaignId: string; destinationUrls: string[]; urlTags?: string }>;
     truncated: boolean;
@@ -2314,10 +2488,23 @@ export class MetaService {
         params.filtering = [{ field: 'campaign.id', operator: 'IN', value: [campaignId] }];
       }
       this.log(`Listing ads for UTM audit in account: ${adAccountId}`, { fields, campaignId });
-      const cursor = await MetaService.withReadDeadline(async () => account.getAds(fields, params), 'UTM audit ad list');
+      /*
+       * The FIRST page must honour the caller's budget too.
+       *
+       * `drainCursor` applies `maxMs` to the pages it walks, but this initial fetch went through
+       * the fixed per-call ceiling — so a caller arriving with its budget already spent still
+       * paid for one full read. The launch gate's `Math.max(1_000, …)` floor made that concrete:
+       * an exhausted wall still bought a 30s page. Capped to whatever the caller actually has.
+       */
+      const cursor = await MetaService.withReadDeadline(
+        async () => account.getAds(fields, params),
+        'UTM audit ad list',
+        options.maxMs,
+      );
       const { items: pages, truncated, pagesFetched } = await this.drainCursor(
         cursor,
-        options.maxPages ?? META_LIST_MAX_PAGES
+        options.maxPages ?? META_LIST_MAX_PAGES,
+        options.maxMs,
       );
       const items = pages.map((a: any) => {
         const data = a._data ?? a;
@@ -2362,7 +2549,14 @@ export class MetaService {
   /**
    * Get a single ad with its creative reference
    */
-  public async getAd(accessToken: string, adId: string) {
+  public async getAd(
+    accessToken: string,
+    adId: string,
+    /** When supplied, the node is verified to belong to this ad account before anything is
+     *  returned. Optional so existing read-back callers are unchanged; the callers whose result
+     *  reaches a user-facing prompt pass it. Same treatment getAdSet received. */
+    adAccountId?: string,
+  ) {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
@@ -2374,8 +2568,25 @@ export class MetaService {
         'creative{id,name,body,title,image_url,thumbnail_url,object_story_spec,status}'
       ];
       this.log(`Fetching ad: ${adId}`);
-      const result = await ad.get(fields);
-      return result._data;
+      /*
+       * An ad id is a GLOBAL node id, so this returns any ad the token can reach — and one Meta
+       * OAuth token routinely spans several ad accounts. buildMetaWriteConfirmation renders this
+       * result's NAME into the prompt the user approves, so an ad_id from another ad account
+       * disclosed that account's ad name to this user. getCampaign and getAdSet were both given
+       * this check; getAd, the resolver sitting between them, was not.
+       */
+      // Fails closed on a supplied-but-empty account id, exactly as getAdSet and getCampaign do:
+      // "" is a scope that failed to resolve, not a caller opting out of scoping.
+      const scoped = adAccountId !== undefined && adAccountId !== null;
+      const result = await ad.get(
+        scoped ? MetaService.withOwnershipField(fields) : fields,
+      );
+      const data = { ...(result?._data ?? {}) };
+      if (scoped) {
+        MetaService.assertOwnedByAccount(data.account_id, adId, 'Ad', adAccountId);
+        delete data.account_id;
+      }
+      return data;
     } catch (error) {
       return this.handleError(error, 'getAd');
     }
