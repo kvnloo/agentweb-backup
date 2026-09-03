@@ -130,6 +130,41 @@ describe('buildMetaWriteConfirmation scopes to the resolved ad account', () => {
     expect(result.message).not.toContain(OTHER_TENANT);
   });
 
+  /*
+   * The same fail-closed guarantee for AD and AD_SET, not just CAMPAIGN.
+   *
+   * This suite pinned it only for CAMPAIGN — the one entity that happened to be safe, because
+   * `getCampaign` takes the account id positionally. `getAdSet`/`getAd` take it optionally, where
+   * `undefined` means "opt out of the ownership check", so an unresolved account skipped the
+   * guard for them and rendered another tenant's ad NAME into the prompt the user approves.
+   * A test that asserts an invariant for the only entity that already held it is the shape that
+   * let this through.
+   */
+  it.each([
+    ['AD', 'ad_9', undefined, undefined, 'ad_9'],
+    ['AD_SET', undefined, 'set_9', 'set_9', undefined],
+  ])('fails closed for %s when credentials resolve no account', async (entity, _a, _b, adSetId, adId) => {
+    credentialsSpy.mockResolvedValue({ accountId: '', accessToken: 'tok' } as never);
+    const refuse = jest.fn().mockRejectedValue(
+      new Error(`The requested node ${META_ACCOUNT_SCOPE_REFUSAL_MARKER}. Retry.`) as never,
+    );
+    const adSetSpy = jest.spyOn(metaService, 'getAdSet').mockImplementation(refuse as never);
+    const adSpy = jest.spyOn(metaService, 'getAd').mockImplementation(refuse as never);
+    try {
+      const result = await (agentModeService as any).buildMetaWriteConfirmation(
+        USER, entity, 'UPDATE', undefined, undefined, adSetId, adId, { status: 'PAUSED' },
+      );
+      // The guard must have been CONSULTED with a defined account id — `undefined` is the value
+      // that silently disables it.
+      const call = (entity === 'AD' ? adSpy : adSetSpy).mock.calls[0] as any[];
+      expect(call[2]).toBeDefined();
+      expect(result.tenancyRefused).toBe(true);
+    } finally {
+      adSetSpy.mockRestore();
+      adSpy.mockRestore();
+    }
+  });
+
   it('fails closed when credentials resolve no account at all', async () => {
     // Nothing to scope against: the raw argument is empty and the resolver produced nothing.
     // Refusing is correct here — the alternative is an unscoped write prompt.

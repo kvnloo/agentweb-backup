@@ -16499,7 +16499,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.error('AgentMode: Campaigns API Error:', campaignsData.error);
         return {
           success: false,
-          message: `Failed to fetch campaigns: ${campaignsData.error.message}`,
+          // Masked like the paging sibling below: Graph error text can name the object
+          // ("Object with ID '120...' does not exist"), and this string reaches the user.
+          message: `Failed to fetch campaigns: ${String(campaignsData.error.message ?? '').replace(/\d{8,}/g, '[id]')}`,
           error: campaignsData.error.message,
           // ENG-1300: fetchWithRetryAndPaging exposes the real HTTP status as a
           // non-enumerable __httpStatus field — never campaignsData.error.code,
@@ -19611,7 +19613,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
      * being handed the wrong account. Execution resolves the same way, so this is also the id
      * the confirmation text must name.
      */
-    let scopeAccountId = account_id;
+    /*
+     * Always a DEFINED string — never `undefined`.
+     *
+     * `getAdSet`/`getAd` take an optional ad-account id where `undefined` means "the caller is
+     * deliberately opting out of the ownership check" (the post-write read-back callers rely on
+     * that). `getCampaign` takes it as a required positional and fails closed on a blank. So an
+     * unresolved account made the SAME state mean opposite things: campaign refused, ad and ad
+     * set silently unscoped — and an unscoped node read is a cross-tenant oracle, because Meta
+     * ids are global and one token spans several ad accounts. Another tenant's ad name would be
+     * rendered into the prompt the user approves.
+     *
+     * `''` is defined, so the guard runs and `assertOwnedByAccount` refuses a blank selected
+     * account. Opting out stays possible for the callers that mean it; it is just no longer
+     * something an unresolved credential can do by accident.
+     */
+    let scopeAccountId: string = account_id ?? '';
     try {
       const creds = await this.getMetaCredentials(userId, account_id);
       accessToken = creds.accessToken;
@@ -20285,7 +20302,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (tenancyRefused) {
         const refusal =
           `Blocked: the target of this Meta Ads ${entity_type} ${action} is not available in the selected ` +
-          `ad account (${target.account_id}), so it was not prepared for confirmation and nothing was sent to Meta. ` +
+          `ad account (${target.account_id || 'none could be determined'}), so it was not prepared for confirmation ` +
+          `and nothing was sent to Meta. ` +
           `Do not ask the user to approve this change. ` +
           // The guard's own remedy, which differs by branch — see tenancyRefusalMessage above.
           AgentModeService.remedyFromScopeRefusal(tenancyRefusalMessage);
@@ -23340,10 +23358,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           ? `Showing the first ${boundedResults.length} knowledge base results for "${query}" — raise max_results to see more.`
           : `Found ${boundedResults.length} knowledge base results for "${query}"`) + scanIncompleteNote,
         query,
-        results: boundedResults,
+        // Completeness AHEAD of the payload, the same rule listKnowledgeBaseFiles and
+        // searchGoogleDrive follow. Ten results at ~5KB each clears the 8,000-char offload
+        // threshold comfortably, after which the model reads a sealed 20,000-char prefix and
+        // anything serialized after `results` is simply not there. The prose in `message` says
+        // the same thing and is first, so this was mitigated rather than broken — but the
+        // structured flags are what a future consumer will key on.
         returnedResults: boundedResults.length,
         hasMore,
-        ...(driveScanIncomplete && { scanIncomplete: true })
+        ...(driveScanIncomplete && { scanIncomplete: true }),
+        results: boundedResults,
       };
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
@@ -23789,7 +23813,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // ENG-1624: a scan that stopped early (folder-count bound or the root
               // itself being unreadable) must not present its partial file list as
               // complete.
-              const folderScanIncomplete = truncated || rootRestricted;
+              /*
+               * `capped` belongs here too.
+               *
+               * It means the file query stopped at a bound — including the shared listing
+               * deadline, which a slow FIRST source can exhaust before a later source is queried
+               * at all. Mapping it only to `totalFilesIsLowerBound` (a counting-precision flag)
+               * presented a source that was never read as an EMPTY FOLDER: totalFiles 0,
+               * hasMore false, no incompleteness, no "do not conclude absence". That is ENG-1584
+               * on the Drive side, and it was created by the fix that gave the listing one shared
+               * budget — the remedy for one composition bug producing a false absence instead.
+               */
+              const folderScanIncomplete = truncated || rootRestricted || capped;
               // Same distinction the readers draw: a throttled scan is incomplete for a reason
               // the user acts on differently (wait) than a large one (narrow).
               const folderScanThrottled = throttled;
@@ -24111,6 +24146,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
        * or could not be accessed" about a rate-limited read — the wrong-cause sentence, telling
        * the user to narrow a search that will throttle identically.
        */
+      /*
+       * Both sentences, when both are true.
+       *
+       * These are `.some()` over DIFFERENT sources, so suppressing the size/permission sentence
+       * whenever any source was throttled hid a real incompleteness on every other source. The
+       * two facts are independent and the model needs both: wait for the throttled one, narrow
+       * or share the others.
+       */
       const hasThrottledFolderScan = knowledgeBases.some((kb: any) => kb.folderScanThrottled);
       // A Drive KB's file query hit its per-batch target — its `totalFiles` is a
       // floor, not an exact count, even though `files`/`hasMore` are still correct.
@@ -24129,7 +24172,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasThrottledFolderScan ? ' Google Drive rate-limited the scan of some folders — a temporary quota answer, not a size or permissions problem; wait a minute and retry rather than narrowing.' : ''}${hasIncompleteFolderScan && !hasThrottledFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be fully listed (see listingFailed) — their file lists may be empty OR partial, so treat any file missing from them as unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasThrottledFolderScan ? ' Google Drive rate-limited the scan of some folders — a temporary quota answer, not a size or permissions problem; wait a minute and retry rather than narrowing.' : ''}${hasIncompleteFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be fully listed (see listingFailed) — their file lists may be empty OR partial, so treat any file missing from them as unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         // Same rule as the per-source objects: every completeness flag ahead of the payload,
         // because `knowledge_bases` is what pushes this result past the offload threshold and
         // anything after it falls outside the sealed prefix the model actually reads.
