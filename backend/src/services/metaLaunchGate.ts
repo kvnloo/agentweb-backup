@@ -119,13 +119,26 @@ const ACTIVITY_WINDOW_DAYS = 7;
  */
 const GATE_GRAPH_CALL_TIMEOUT_MS = 30_000;
 
-/** True for a failure worth one more attempt — a transport blip, not an answer from Graph. */
+/**
+ * Transport failures worth one retry. `econnaborted`/`etimedout` are the axios and Node spellings
+ * of a timeout and must be here explicitly — matching only the word "timeout" misses both.
+ */
+export const TRANSIENT_NETWORK_RE =
+  /timeout|etimedout|econnaborted|econnreset|econnrefused|enotfound|eai_again|socket hang up|network/i;
+
+/**
+ * True for a failure worth one more attempt — a transport blip, not an answer from Graph.
+ *
+ * ⚠ `[code, message]` joined, NOT `code || message`. axios sets `code = 'ECONNABORTED'` on a
+ * timeout, so a `||` short-circuits and the message ("timeout of 30000ms exceeded") is never
+ * inspected — and 'ECONNABORTED' matches none of the alternations below. The result was a retry
+ * that fired for a connection reset and never for a timeout, which is the failure it was added
+ * for. Verified against the installed axios.
+ */
 function isTransientGraphFailure(err: any): boolean {
   const status = err?.response?.status;
   if (typeof status === 'number') return status >= 500;   // 4xx is Graph answering
-  return /timeout|econnreset|econnrefused|enotfound|eai_again|socket hang up|network/i.test(
-    String(err?.code || err?.message || ''),
-  );
+  return TRANSIENT_NETWORK_RE.test([err?.code, err?.message].join(' '));
 }
 
 /**

@@ -23,6 +23,7 @@
  * than executing the page. That is why the explicit override path exists.
  */
 import axios from 'axios';
+import { TRANSIENT_NETWORK_RE } from './metaLaunchGate';
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { fetchHtmlFollowingRedirects } from './googleAdsTrackingPreflight';
 
@@ -463,9 +464,9 @@ const FETCH_TIMEOUT_MS = 25_000;
 function isTransientFetchFailure(err: any): boolean {
   const status = err?.response?.status;
   if (typeof status === 'number') return status >= 500;
-  return /timeout|econnreset|econnrefused|eai_again|socket hang up|network/i.test(
-    String(err?.code || err?.message || ''),
-  );
+  // Shared with the launch gate: same `[code, message]` reason as there, and one pattern so the
+  // two cannot drift (this copy was already missing `enotfound`).
+  return TRANSIENT_NETWORK_RE.test([err?.code, err?.message].join(' '));
 }
 
 /* istanbul ignore next — network boundary; unit tests inject `fetchHtml` instead. */
