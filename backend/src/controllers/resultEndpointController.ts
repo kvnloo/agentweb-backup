@@ -233,7 +233,15 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
       completionGate: true,
     }).then(result => {
       console.log(`Result endpoint "${resultName}" session ${session.sessionId} completed: success=${result.success}, attempts=${result.attempts}`);
-    }).catch(error => {
+    }).catch(async error => {
+      // ENG-1719: this session was just created for this request, so contention here is
+      // near-impossible in practice — but if it ever happens, it's benign lock contention,
+      // not a real failure, and shouldn't read as one in the logs.
+      const { isSessionBusyError } = await import('../controllers/agentModeController');
+      if (isSessionBusyError(error)) {
+        console.warn(`Result endpoint "${resultName}" session ${session.sessionId} skipped — session was busy with another generation in progress.`);
+        return;
+      }
       console.error(`Result endpoint "${resultName}" session ${session.sessionId} failed:`, error);
     }));
 
