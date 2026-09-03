@@ -205,6 +205,69 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(executedTools).toHaveLength(finalSynthesisPerCall.filter((f) => !f).length);
   });
 
+  it('applies a set_work_plan_status call discarded by the forced synthesis instead of dropping it (ENG-1682 follow-up)', async () => {
+    // Prod session f771b626-…: create_html_file succeeded, but the turn ran out of time
+    // one call before the model could mark the step completed. Discarding that late
+    // set_work_plan_status call like every other one left the step stuck "pending"
+    // forever even though the deliverable was already done. Applying it directly (a
+    // single bounded DB write, not another LLM round trip) closes the gap.
+    const workPlanSession = {
+      sessionId: 'test-session',
+      messages: [],
+      associatedSkills: null,
+      workPlan: {
+        title: 'Test Plan',
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'completed' },
+          { stepCount: 2, title: 'Step 2', status: 'pending' },
+        ],
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    };
+    installStandardMockDeps(workPlanSession);
+    const mockChatbotService = require('../../../services/chatbotService');
+    mockChatbotService.chatbotDb.updateSessionWorkPlan = jest.fn().mockResolvedValue(workPlanSession);
+    mockChatbotService.chatbotDb.updateSessionWorkPlanInputRequest = jest.fn().mockResolvedValue(workPlanSession);
+    mockChatbotService.chatbotDb.updateCalledFunctions = jest.fn().mockResolvedValue(undefined);
+    mockChatbotService.chatbotDb.addAssociatedSkills = jest.fn().mockResolvedValue(undefined);
+
+    const { result, executedTools } = await runRealLoop(
+      (call, isFinalSynthesis) =>
+        isFinalSynthesis
+          ? {
+              content: 'Report generated — here is what I finished before the time limit.',
+              tool_calls: [
+                {
+                  id: 'late-status',
+                  name: 'set_work_plan_status',
+                  arguments: JSON.stringify({
+                    updates: [{ stepCount: 2, status: 'completed', notes: 'Report generated' }],
+                  }),
+                },
+              ],
+            }
+          : {
+              content: `Scanned batch ${call + 1}.`,
+              tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
+            },
+    );
+
+    expect(result.truncatedByTimeBudget).toBe(true);
+    // The late call never ran through the normal tool-execution path...
+    expect(executedTools).not.toContain('set_work_plan_status');
+    // ...but its state effect still applied: the step is completed in the DB despite the
+    // turn running out of time before the model's call could go through normally.
+    expect(mockChatbotService.chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+      'test-session',
+      expect.objectContaining({
+        steps: expect.arrayContaining([
+          expect.objectContaining({ stepCount: 2, status: 'completed', notes: 'Report generated' }),
+        ]),
+      }),
+    );
+  });
+
   it('warns the model to wrap up before it stops honouring tool calls', async () => {
     let sawWrapUpNudge = false;
     let sawFinalNudge = false;

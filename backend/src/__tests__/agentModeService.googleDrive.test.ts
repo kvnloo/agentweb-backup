@@ -1,4 +1,8 @@
 import { AgentModeService } from '../services/agentModeService';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { appendRetryabilityGuidance } from '../services/agentMode/core/errorRetryability';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 // ── Core dependency mocks (same boilerplate as fathomToolAccess.test.ts) ──────
 
@@ -146,9 +150,25 @@ const FAKE_ACCOUNT = {
 
 const USER_ID = 'user-123';
 
+/**
+ * The service's own walk budget, read rather than duplicated.
+ *
+ * These tests assert behaviour RELATIVE to the budget — "a request's timeout never exceeds it",
+ * "the walk stops once it is spent" — so pinning 15_000 made them fail the moment the budget was
+ * raised, even though every one of those behaviours still held.
+ */
+const WALK_BUDGET_MS: number = (AgentModeService as any).DRIVE_LIST_WALK_MAX_MS;
+
 function makeApiError(code: number, message = 'API error') {
   const err: any = new Error(message);
   err.code = code;
+  return err;
+}
+
+/** A Drive error carrying the `error.errors[].reason` that discriminates a 403's real cause. */
+function makeApiErrorWithReason(code: number, reason: string, message = 'API error') {
+  const err: any = makeApiError(code, message);
+  err.errors = [{ domain: 'usageLimits', reason, message }];
   return err;
 }
 
@@ -634,6 +654,59 @@ describe('AgentModeService - Google Drive methods', () => {
   });
 
   // ────────────────────────────────────────────────────────────────────────────
+  // ENG-1300: every "friendly 403 message" test above already proved the USER-
+  // FACING message is unchanged. This proves the other half — the numeric
+  // status now rides along on the result so classifyToolErrorClass sees
+  // 'auth' (classifyToolFailureType 'config') instead of the generic
+  // 'Error'/'bug' fallback a hand-written message alone cannot match. One
+  // representative case per function, not every branch — the branch-level
+  // message-text coverage already exists above.
+  // ────────────────────────────────────────────────────────────────────────────
+
+  describe('ENG-1300 — 403s classify as auth/config end-to-end', () => {
+    const expectAuthConfig = (result: any) => {
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    };
+
+    it('listGoogleDriveFolder', async () => {
+      mockDriveFiles.list.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.listGoogleDriveFolder('folder-id', USER_ID));
+    });
+
+    it('createGoogleDriveFolder', async () => {
+      mockDriveFiles.create.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.createGoogleDriveFolder('name', USER_ID));
+    });
+
+    it('searchGoogleDrive', async () => {
+      mockDriveFiles.list.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.searchGoogleDrive('query', USER_ID));
+    });
+
+    it('createGoogleDoc', async () => {
+      mockDriveFiles.create.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.createGoogleDoc('title', 'content', USER_ID));
+    });
+
+    it('updateGoogleDoc', async () => {
+      mockDriveFiles.update.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.updateGoogleDoc('doc-id', 'content', USER_ID));
+    });
+
+    it('createGoogleSheet', async () => {
+      mockDriveFiles.create.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.createGoogleSheet('title', [['a']], USER_ID));
+    });
+
+    it('updateGoogleSheet', async () => {
+      mockSheetsValues.update.mockRejectedValue(makeApiError(403));
+      expectAuthConfig(await service.updateGoogleSheet('sheet-id', 'A1', [['v']], USER_ID));
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
   // readGoogleFileById
   // ────────────────────────────────────────────────────────────────────────────
 
@@ -768,6 +841,23 @@ describe('AgentModeService - Google Drive methods', () => {
       const result = await service.readGoogleFileById('file-id', USER_ID);
       expect(result.success).toBe(false);
       expect(result.message).toMatch(/not found/i);
+    });
+
+    // ENG-1300: the terminal error after both OAuth and SA fail now carries the
+    // real status through, so this classifies as not_found/config instead of
+    // the generic Error/bug fallback.
+    it('ENG-1300: the terminal 404 (after SA also fails) classifies as not_found/config', async () => {
+      let callCount = 0;
+      mockDriveFiles.get.mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) throw makeApiError(403);
+        throw makeApiError(404);
+      });
+
+      const result = await service.readGoogleFileById('file-id', USER_ID);
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('not_found');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
     });
 
     it('reads Google Doc content via export', async () => {
@@ -919,9 +1009,15 @@ describe('AgentModeService - Google Drive methods', () => {
 
       await service.materializeKnowledgeBaseAsset('gdrive:folder-1', 'ad.png', USER_ID);
 
-      expect(mockDriveFiles.list).toHaveBeenCalledWith(
-        expect.objectContaining({ supportsAllDrives: true, includeItemsFromAllDrives: true })
-      );
+      // Assert on the request options themselves rather than on the call's arity: these
+      // calls now also carry a per-request `timeout` as a second argument, and the invariant
+      // being pinned here is about the shared-drive flags, not how many arguments are passed.
+      expect(mockDriveFiles.list).toHaveBeenCalled();
+      for (const [requestOptions] of mockDriveFiles.list.mock.calls) {
+        expect(requestOptions).toEqual(
+          expect.objectContaining({ supportsAllDrives: true, includeItemsFromAllDrives: true }),
+        );
+      }
     });
 
     it('rejects non-image/video mimetypes without downloading or uploading', async () => {
@@ -1077,6 +1173,117 @@ describe('AgentModeService - Google Drive methods', () => {
         expect(result.url).toMatch(/^https:\/\//);
       });
 
+      /*
+       * ENG-1476 follow-up: Drive's query grammar requires BOTH a backslash and a quote to be
+       * escaped inside a string literal. The call sites escaped only the quote, so a backslash
+       * in a value survived verbatim and could terminate the literal early — an opaque Drive
+       * 400 instead of a match, and the shape that lets a crafted value reach past the
+       * parent-folder clause the query is scoped by.
+       *
+       * Rather than restating the escaping algorithm (a test that mirrors the implementation
+       * proves nothing), these parse the emitted `q` the way Drive would and assert the
+       * literal ROUND-TRIPS back to exactly the caller's value, with the scoping clause intact
+       * outside it.
+       */
+      const parseDriveLiteral = (q: string) => {
+        const marker = "name = '";
+        const start = q.indexOf(marker);
+        if (start < 0) return null;
+        let i = start + marker.length;
+        let out = '';
+        while (i < q.length) {
+          if (q[i] === '\\') { out += q[i + 1]; i += 2; continue; }
+          if (q[i] === "'") return { value: out, rest: q.slice(i + 1) };
+          out += q[i]; i += 1;
+        }
+        return null; // unterminated literal — Drive would 400
+      };
+
+      it.each([
+        ['a trailing backslash', 'report\\'],
+        ['a quote-parity break-out attempt', "x\\' or name != '"],
+        ['a plain apostrophe', "Vince's ad"],
+      ])('keeps the Drive query literal well-formed and scoped for %s', async (_label, fileName) => {
+        mockDriveFiles.list.mockImplementation(() => Promise.resolve({ data: { files: [] } }));
+
+        await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, fileName, USER_ID);
+
+        const nameCall = mockDriveFiles.list.mock.calls.find(([a]: any) => a.q.includes('name = '));
+        expect(nameCall).toBeDefined();
+        const parsed = parseDriveLiteral(nameCall![0].q);
+
+        // The literal terminates (an unescaped backslash would swallow the closing quote)...
+        expect(parsed).not.toBeNull();
+        // ...it carries exactly what the caller asked for, no more and no less...
+        expect(parsed!.value).toBe(fileName);
+        // ...and nothing the caller supplied escaped into query syntax: the clause after the
+        // literal is still ours.
+        expect(parsed!.rest.trimStart()).toMatch(/^and trashed = false/);
+        expect(nameCall![0].q).toContain(`'${ROOT}' in parents`);
+      });
+
+      /*
+       * ENG-1476 follow-up: the walk-wide DRIVE_LIST_WALK_MAX_MS is checked BETWEEN requests,
+       * so it bounds how many calls the walk makes but cannot interrupt one call that has
+       * already been issued and never answers — Node's fetch applies no default deadline.
+       * Every request the walk and the batched file query issue therefore carries its own
+       * timeout, the same split metaService uses (withReadDeadline alongside
+       * META_LIST_MAX_MS).
+       */
+      it('gives every folder-walk and file-query request its own timeout', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes('mimeType')) return Promise.resolve({ data: { files: [] } });
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(mockDriveFiles.list).toHaveBeenCalled();
+        for (const call of mockDriveFiles.list.mock.calls) {
+          expect(call[1]).toEqual(expect.objectContaining({ timeout: expect.any(Number) }));
+          // Derived from the walk's REMAINING budget, so it can never be longer than the walk
+          // itself would allow — a per-request timeout must not outlive the bound it protects.
+          expect(call[1].timeout).toBeGreaterThan(0);
+          expect(call[1].timeout).toBeLessThanOrEqual(WALK_BUDGET_MS);
+        }
+      });
+
+      it('never sends timeout: 0 once the walk budget is all but spent', async () => {
+        /*
+         * The floor only matters when `deadline - Date.now()` has gone to ~0, so the budget has
+         * to actually be consumed for this to pin anything — an assertion made against a fresh
+         * 15s budget passes against an implementation with no floor at all.
+         *
+         * Each folder-discovery call burns most of the budget, so by the later requests the
+         * remaining time is at or below the floor.
+         */
+        jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+        try {
+          let n = 0;
+          mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+            n += 1;
+            // Leaves ~500ms of the 15s budget, which is below the floor but still passes the
+            // loop's pre-check — the only window in which the floor is reachable at all.
+            if (n === 1) jest.advanceTimersByTime(WALK_BUDGET_MS - 500);
+            if (q.includes('mimeType') && n === 1) {
+              return Promise.resolve({ data: { files: [{ id: SUB, name: '4x5' }] } });
+            }
+            return Promise.resolve({ data: { files: [] } });
+          });
+
+          await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+          const timeouts = mockDriveFiles.list.mock.calls.map((c: any) => c[1].timeout);
+          expect(timeouts.length).toBeGreaterThan(1);
+          // Every one is floored, and at least one was issued on a spent budget — so this would
+          // fail against an implementation that passed the raw remaining time.
+          expect(Math.min(...timeouts)).toBeGreaterThanOrEqual(1_000);
+          expect(Math.min(...timeouts)).toBe(1_000);
+        } finally {
+          jest.useRealTimers();
+        }
+      });
+
       it('names the sub-folder that needs sharing when it cannot be listed, instead of a bare "not found"', async () => {
         mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
           if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType')) {
@@ -1111,6 +1318,113 @@ describe('AgentModeService - Google Drive methods', () => {
         expect(result.success).toBe(false);
         expect(result.message).not.toMatch(/sub-folder/i);
         expect(result.message).toMatch(/itself could not be accessed/i);
+      });
+
+      /*
+       * When the root is unreadable AND the file search also failed, the ACTIONABLE cause wins.
+       *
+       * Drive answers 403 for a permission denial and for `userRateLimitExceeded` alike, and the
+       * folder walk buckets every 403 as "permission" — so an unshared root very often makes the
+       * name query fail too and BOTH flags are set. The incomplete-search branch used to be
+       * checked first, which replaced the one remedy the user can act on ("share it with
+       * <service-account>") with "retry the read", which cannot work while the folder stays
+       * unshared. Same "remedy that cannot work" shape as ENG-1636.
+       *
+       * The search caveat is not dropped — it is appended, so the message carries the cause AND
+       * the fact that absence was never confirmed.
+       */
+      it('prefers the shareable-root remedy over "retry" when BOTH the root and the search fail', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes('mimeType')) {
+            return Promise.reject(makeApiError(403, 'insufficientPermissions'));
+          }
+          // The name query fails too — the usual consequence of the same lost access.
+          return Promise.reject(makeApiError(403, 'insufficientPermissions'));
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/itself could not be accessed/i);
+        expect(result.message).toMatch(/share it with/i);
+        // The caveat rides along rather than replacing the remedy.
+        expect(result.message).toMatch(/not a confirmed absence/i);
+      });
+
+      /*
+       * A THROTTLED 403 is not an access decision.
+       *
+       * Drive returns 403 for `userRateLimitExceeded` / `dailyLimitExceeded` as well as for a
+       * genuine permission denial, and the walk used to bucket every 403 as "permission" — so a
+       * rate-limited user was told to share a folder with the service account that they had
+       * already shared. The remedy could not work, and the one that would (wait and retry) was
+       * never offered. `error.errors[].reason` is what tells them apart, and it was discarded.
+       */
+      it('does not tell a RATE-LIMITED user to share a folder they already shared', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes('mimeType')) {
+            return Promise.reject(makeApiErrorWithReason(403, 'userRateLimitExceeded'));
+          }
+          return Promise.reject(makeApiErrorWithReason(403, 'userRateLimitExceeded'));
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        // Not a permissions answer …
+        expect(result.message).not.toMatch(/share it with/i);
+        expect(result.message).not.toMatch(/itself could not be accessed/i);
+        /*
+         * … and not a SIZE answer either, which is the trap the first version of this fix fell
+         * into: routing a throttled 403 into the incomplete-walk branch made it inherit "the
+         * folder tree is large enough that the scan stopped", so the user was told their folder
+         * was too big and invited to narrow a search that would throttle identically. A quota
+         * answer describes Drive, not the folder.
+         */
+        expect(result.message).not.toMatch(/large enough/i);
+        expect(result.message).toMatch(/narrowing will not help/i);
+        expect(result.message).toMatch(/rate-limited the scan/i);
+        expect(result.message).toMatch(/temporary quota answer/i);
+        expect(result.message).toMatch(/Do NOT report the file as absent/i);
+      });
+
+      /*
+       * gaxios surfaces `code` as a STRING in some shapes, and every handler in this file
+       * compares it strictly (`code === 403`). A string `'403'` therefore matched no branch and
+       * fell through to the generic "temporary Drive error", losing both the permission remedy
+       * and the throttle one. Normalised once in `driveErrorCode`.
+       */
+      it('handles a status code that arrives as a string, not a number', async () => {
+        const stringCoded: any = new Error('API error');
+        stringCoded.code = '403';
+        stringCoded.errors = [{ domain: 'global', reason: 'insufficientPermissions' }];
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes('mimeType')) return Promise.reject(stringCoded);
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        // Reaches the permission branch instead of the generic fallback.
+        expect(result.message).toMatch(/itself could not be accessed/i);
+        expect(result.message).toMatch(/share it with/i);
+      });
+
+      it('still treats a genuine permission 403 as restricted', async () => {
+        // The control for the test above — the discrimination must not disarm the real case.
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes('mimeType')) {
+            return Promise.reject(makeApiErrorWithReason(403, 'insufficientPermissions'));
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/itself could not be accessed/i);
+        expect(result.message).toMatch(/share it with/i);
       });
 
       it('follows nextPageToken when a folder has more sub-folders than fit in one page', async () => {
@@ -1149,6 +1463,84 @@ describe('AgentModeService - Google Drive methods', () => {
         expect(result.success).toBe(true);
       });
 
+      /*
+       * `truncated` doubled as the BFS loop condition (`while (queue.length > 0 && !truncated)`),
+       * so recording "this sub-folder could not be listed" also ABANDONED the walk: a 502 on
+       * sub-folder 3 of 40 left the other 37 unvisited. Note the asymmetry it introduced —
+       * a 403/401 takes the `restricted` branch and keeps walking, so a permission failure was
+       * handled better than a transient one.
+       */
+      it('keeps walking the rest of the tree after a transient error on one sub-folder', async () => {
+        const SUB_A = 'sub-a';
+        const SUB_B = 'sub-b';
+        const SUB_C = 'sub-c';
+        const listed: string[] = [];
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            if (q.includes(`'${ROOT}' in parents`)) {
+              return Promise.resolve({
+                data: {
+                  files: [{ id: SUB_A, name: 'a' }, { id: SUB_B, name: 'b' }, { id: SUB_C, name: 'c' }],
+                },
+              });
+            }
+            if (q.includes(`'${SUB_A}' in parents`)) {
+              listed.push(SUB_A);
+              return Promise.resolve({ data: { files: [] } });
+            }
+            if (q.includes(`'${SUB_B}' in parents`)) {
+              listed.push(SUB_B);
+              // Transient, NOT a permission answer — so it does not take the `restricted` branch.
+              return Promise.reject(makeApiError(502, 'Bad Gateway'));
+            }
+            if (q.includes(`'${SUB_C}' in parents`)) {
+              listed.push(SUB_C);
+              return Promise.resolve({ data: { files: [] } });
+            }
+            return Promise.resolve({ data: { files: [] } });
+          }
+          if (q.includes("name = 'ad.png'")) {
+            return Promise.resolve({
+              data: { files: [{ id: 'file-1', name: 'ad.png', mimeType: 'image/png', size: '10', parents: [SUB_C] }] },
+            });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+        mockDriveFiles.get.mockResolvedValue({ data: Buffer.from('bytes') });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        // C comes AFTER the failing B in the queue: it is only reached if the walk continued.
+        expect(listed).toContain(SUB_C);
+
+        // And the file living in C is found, rather than reported missing from a walk that quit.
+        const nameSearchCall = mockDriveFiles.list.mock.calls.find(
+          ([arg]: any) => arg.q.includes("name = 'ad.png'")
+        );
+        expect(nameSearchCall![0].q).toContain(`'${SUB_C}' in parents`);
+        expect(result.success).toBe(true);
+      });
+
+      it('still reports the walk as incomplete after a transient sub-folder error', async () => {
+        // Continuing the walk must not cost the incompleteness signal: the failed sub-folder was
+        // never read, so an empty result from this tree is still not a confirmed absence.
+        const SUB_A = 'sub-a';
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            if (q.includes(`'${ROOT}' in parents`)) {
+              return Promise.resolve({ data: { files: [{ id: SUB_A, name: 'a' }] } });
+            }
+            return Promise.reject(makeApiError(502, 'Bad Gateway'));
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/not a confirmed absence/i);
+      });
+
       it('does not re-list a folder reachable via two different parents, and terminates', async () => {
         const CHILD_A = 'child-a';
         const CHILD_B = 'child-b';
@@ -1176,6 +1568,122 @@ describe('AgentModeService - Google Drive methods', () => {
         // once via B), its children would be listed twice — or, with a real
         // cycle instead of a diamond, the walk would never terminate.
         expect(sharedListCalls).toBe(1);
+      });
+
+      // Same defect as readSingleKnowledgeBaseFile above: both callers ignored the helper's
+      // `failed`/`capped` flags and turned an errored search into a definitive "not found".
+      it('does not claim the asset is absent when the name query itself failed', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            return Promise.resolve({ data: { files: [] } });
+          }
+          return Promise.reject(makeApiError(500, 'Drive did not respond within 8000ms'));
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).not.toMatch(/not found/i);
+        expect(result.message).toMatch(/could not determine/i);
+        expect(result.message).toMatch(/failed/i);
+        expect(result.message).toMatch(/retry the read/i);
+      });
+
+      // The capped/failed split, pinned on this caller too — the two paths were duplicated
+      // literals before, which is exactly how one gets fixed and the other does not.
+      // See readSingleKnowledgeBaseFile's equivalent for why a capped read is not retryable.
+      it('does not tell the model to retry when the name search ran out of its time budget', async () => {
+        jest.useFakeTimers();
+        try {
+          mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+            if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+              return Promise.resolve({ data: { files: [] } });
+            }
+            jest.advanceTimersByTime(WALK_BUDGET_MS + 5_000);
+            return Promise.resolve({ data: { files: [], nextPageToken: 'page-2' } });
+          });
+
+          const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+          expect(result.success).toBe(false);
+          expect(result.message).toMatch(/not a confirmed absence/i);
+          expect(result.message).not.toMatch(/retry the read/i);
+          expect(result.message).toMatch(/do not retry this same call/i);
+          expect(result.message).toMatch(/direct google drive link/i);
+        } finally {
+          jest.useRealTimers();
+        }
+      });
+
+      /*
+       * The sibling to the wall-clock test above: a walk that stopped because a SUB-FOLDER READ
+       * FAILED, not because it ran out of time. Only this cause can be cleared by trying again,
+       * so it is the one case where telling the model to retry is correct — and unlike the
+       * deterministic case, this exercises the branch through the real classifier too.
+       */
+      it('DOES tell the model retrying may help when a sub-folder read failed transiently', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            if (q.includes(`'${ROOT}' in parents`)) {
+              return Promise.resolve({ data: { files: [{ id: 'bad-sub', name: 'bad' }] } });
+            }
+            const e: any = new Error('socket hang up');
+            e.code = 'ECONNRESET';
+            return Promise.reject(e);
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/not a confirmed absence/i);
+        expect(result.message).toMatch(/retrying may well complete the scan/i);
+
+        const classified = classifyToolErrorClass(new Error(result.message));
+        expect(classified).toBe('read_incomplete');
+        expect(appendRetryabilityGuidance('x', classified)).toMatch(/Retryable: yes/i);
+      });
+
+      /*
+       * The case the previous round of this fix got wrong: a walk that hit BOTH a transient
+       * sub-folder failure AND a deterministic bound (the folder-count ceiling) in the same walk.
+       * transientFailure alone is not enough to promise a useful retry, because the deterministic
+       * bound will stop the walk in the same place next time regardless.
+       */
+      it('does NOT promise a useful retry when a transient failure AND a deterministic bound both fired', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            if (q.includes(`'${ROOT}' in parents`)) {
+              return Promise.resolve({
+                data: { files: [{ id: 'bad-sub', name: 'bad' }, { id: 'big-sub', name: 'big' }] },
+              });
+            }
+            if (q.includes(`'bad-sub' in parents`)) {
+              const e: any = new Error('socket hang up');
+              e.code = 'ECONNRESET';
+              return Promise.reject(e);
+            }
+            if (q.includes(`'big-sub' in parents`)) {
+              return Promise.resolve({
+                data: { files: Array.from({ length: 600 }, (_, i) => ({ id: `g${i}`, name: `g${i}` })) },
+              });
+            }
+          }
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.materializeKnowledgeBaseAsset(`gdrive:${ROOT}`, 'ad.png', USER_ID);
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/not a confirmed absence/i);
+        // The transient-only wording must NOT appear — the bound makes a retry futile regardless.
+        expect(result.message).not.toMatch(/retrying may well complete the scan/i);
+        expect(result.message).toMatch(/stop in the same place every time/i);
+
+        const classified = classifyToolErrorClass(new Error(result.message));
+        expect(classified).toBe('read_bounded');
+        expect(appendRetryabilityGuidance('x', classified)).toMatch(/Retryable: no/i);
       });
 
       it('reports ambiguity instead of silently materializing one candidate when the same name exists in two sub-folders', async () => {
@@ -1357,8 +1865,14 @@ describe('AgentModeService - Google Drive methods', () => {
           expect(result.success).toBe(false);
           expect(result.message).not.toBe('File "ad.png" not found in Google Drive folder');
           expect(result.message).toMatch(/stopped before covering it entirely|not a confirmed absence/i);
-          // Bounded — a handful of folders inside the time budget, not hundreds.
-          expect(depth).toBeLessThan(10);
+          /*
+           * Bounded by the TIME budget, not by a magic number. Each simulated folder discovery
+           * costs 5s above, so the walk should stop after roughly WALK_BUDGET_MS/5s of them —
+           * the assertion tracks the budget instead of pinning a count that silently encodes it.
+           * What is being proven is that an unbounded (one-child-per-folder) tree terminates,
+           * not that it terminates at any particular depth.
+           */
+          expect(depth).toBeLessThan(WALK_BUDGET_MS / 5_000 + 3);
         } finally {
           jest.useRealTimers();
         }
@@ -1413,6 +1927,81 @@ describe('AgentModeService - Google Drive methods', () => {
       );
       expect(finalCall).toBeDefined();
       expect(finalCall![0].q).toContain("mimeType != 'application/vnd.google-apps.folder'");
+    });
+
+    /*
+     * modified_after/modified_before reach this method as a bare `type: "string"` off the tool
+     * schema, with no validation anywhere, and were interpolated UNESCAPED into the same `q` as
+     * the parent-folder clause. Drive's `or` binds looser than `and`, so
+     * `"2020-01-01' or name != 'x"` ORs the parent scoping away — and the Drive client is a
+     * SHARED service account with drive.readonly, so what comes back is other tenants' file
+     * names, ids, sizes and modifiedTimes.
+     */
+    describe('date filters cannot escape the parent-folder clause', () => {
+      const INJECTION = "2020-01-01' or name != 'x";
+
+      it('refuses a crafted modified_after before any Drive query runs', async () => {
+        mockDriveFiles.list.mockResolvedValue({ data: { files: [] } });
+
+        const result = await service.listKnowledgeBaseFiles(USER_ID, {
+          kb_type: 'google-drive',
+          modified_after: INJECTION,
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/YYYY-MM-DD/);
+        // The point of the assertion: no `q` was ever built from it, scoped or otherwise.
+        const injected = mockDriveFiles.list.mock.calls.filter(([arg]: any) => arg.q.includes('name !='));
+        expect(injected).toHaveLength(0);
+      });
+
+      it('refuses a crafted modified_before too', async () => {
+        mockDriveFiles.list.mockResolvedValue({ data: { files: [] } });
+
+        const result = await service.listKnowledgeBaseFiles(USER_ID, {
+          kb_type: 'google-drive',
+          modified_before: INJECTION,
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/YYYY-MM-DD/);
+        expect(mockDriveFiles.list.mock.calls.filter(([arg]: any) => arg.q.includes('name !='))).toHaveLength(0);
+      });
+
+      it('refuses a date that is not a real calendar day', async () => {
+        mockDriveFiles.list.mockResolvedValue({ data: { files: [] } });
+
+        const result = await service.listKnowledgeBaseFiles(USER_ID, {
+          kb_type: 'google-drive',
+          modified_after: '2026-02-31',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.message).toMatch(/not a real calendar date/i);
+      });
+
+      it('still applies a well-formed date, inside the quoted literal and after the parent clause', async () => {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes('mimeType =')) return Promise.resolve({ data: { files: [] } });
+          return Promise.resolve({ data: { files: [] } });
+        });
+
+        const result = await service.listKnowledgeBaseFiles(USER_ID, {
+          kb_type: 'google-drive',
+          modified_after: '2026-04-15',
+          modified_before: '2026-04-22',
+        });
+
+        expect(result.success).toBe(true);
+        const listingCall = mockDriveFiles.list.mock.calls.find(([arg]: any) => !arg.q.includes('mimeType ='));
+        expect(listingCall).toBeDefined();
+        const q: string = listingCall![0].q;
+        expect(q).toContain(`'${ROOT}' in parents`);
+        expect(q).toContain("modifiedTime >= '2026-04-15T00:00:00'");
+        expect(q).toContain("modifiedTime <= '2026-04-22T23:59:59'");
+        // Quote parity: every literal in the query is closed, so nothing escaped one.
+        expect((q.match(/'/g) || []).length % 2).toBe(0);
+      });
     });
 
     it('surfaces inaccessibleFolders when a sub-folder cannot be listed, instead of silently shrinking the listing', async () => {
@@ -1649,7 +2238,7 @@ describe('AgentModeService - Google Drive methods', () => {
           callCount++;
           // Each simulated page "costs" wall-clock time past the walk's own
           // budget — a slow/throttled Drive response, not a huge result set.
-          jest.advanceTimersByTime(20_000);
+          jest.advanceTimersByTime(WALK_BUDGET_MS + 5_000);
           return Promise.resolve({
             data: {
               files: [{ id: 'file-1', name: 'a.png', mimeType: 'image/png', size: '10', modifiedTime: '2026-08-01T00:00:00Z' }],
@@ -1696,7 +2285,39 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(gdriveKb).toBeDefined();
       expect(gdriveKb.listingFailed).toBe(true);
       expect(gdriveKb.files).toEqual([]);
-      expect(result.message).toMatch(/could not be listed.*shown as empty|shown as empty.*not absent/i);
+      /*
+       * The aggregate sentence used to say the failed sources are "shown as empty". That is a
+       * state the code cannot produce: queryDriveFilesAcrossFolders sets `failed` AFTER merging
+       * whatever batches succeeded, so a failed source can carry a PARTIAL list — and a model
+       * told the list is "empty" will read a short list as complete. The message must cover
+       * both shapes and end on the conclusion that matters: missing ≠ absent.
+       */
+      expect(result.message).toMatch(/could not be fully listed/i);
+      expect(result.message).toMatch(/empty OR partial/i);
+      expect(result.message).toMatch(/unknown, not absent/i);
+      expect(result.message).not.toMatch(/shown as empty/i);
+
+      /*
+       * FIELD ORDER IS THE ASSERTION, not a style preference.
+       *
+       * A knowledge-base listing routinely clears the S3 offload threshold, after which the
+       * model is handed a SEALED fixed-length PREFIX of this JSON — anything serialized after
+       * the file array is not there at all. Measured at the default limit of 100 files, one
+       * Drive source reached ~20.5k chars with `listingFailed` landing past the 20k cut: the
+       * flag was set, was correct, and was unreadable on exactly the listings that need it.
+       *
+       * Asserting on the serialized offsets is what makes a future `{...kb, someFlag}` — which
+       * appends behind the payload — fail here rather than in production.
+       */
+      const perSource = JSON.stringify(gdriveKb);
+      expect(perSource.indexOf('"listingFailed"')).toBeGreaterThan(-1);
+      expect(perSource.indexOf('"listingFailed"')).toBeLessThan(perSource.indexOf('"files"'));
+
+      const topLevel = JSON.stringify(result);
+      for (const field of ['"message"', '"totalKnowledgeBases"', '"driveListingFailures"']) {
+        expect(topLevel.indexOf(field)).toBeGreaterThan(-1);
+        expect(topLevel.indexOf(field)).toBeLessThan(topLevel.indexOf('"knowledge_bases"'));
+      }
     });
 
     it('never puts the raw error object (or its message) in the returned payload', async () => {
@@ -1898,7 +2519,7 @@ describe('AgentModeService - Google Drive methods', () => {
               // Discovering PARENT's one child costs enough time that the walk
               // is truncated before it can ever descend into that child and
               // find CHILD underneath it.
-              jest.advanceTimersByTime(20_000);
+              jest.advanceTimersByTime(WALK_BUDGET_MS + 5_000);
               return Promise.resolve({ data: { files: [{ id: DECOY, name: 'decoy' }] } });
             }
             return Promise.resolve({ data: { files: [] } }); // CHILD's own walk (registered separately) is fast and clean
@@ -1992,6 +2613,104 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(result.message).toMatch(/share/i);
     });
 
+    /*
+     * queryDriveFilesAcrossFolders no longer throws on a failed request — it merges what it
+     * already has and reports `failed`/`capped` instead, so that a partial read is degraded to
+     * incomplete rather than discarded. This caller destructured only `files` and so read that
+     * empty map as a definitive absence: a timeout or 5xx on the NAME query produced
+     * `File "X" not found in Google Drive folder "Y"`, a confident absence claim from a read
+     * that errored. Before the helper caught the error, the rejection reached the outer try and
+     * correctly said the read had failed.
+     */
+    it('does not claim the file is absent when the name query itself failed', async () => {
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        // The name query — the one that would have found the file — times out.
+        return Promise.reject(makeApiError(500, 'Drive did not respond within 8000ms'));
+      });
+
+      const result = await service.readSingleKnowledgeBaseFile(`gdrive:${ROOT}`, 'notes.txt', USER_ID);
+
+      expect(result.success).toBe(false);
+      expect(result.message).not.toMatch(/not found/i);
+      expect(result.message).toMatch(/could not determine/i);
+      expect(result.message).toMatch(/failed/i);
+      // A request failure IS transient, so "retry" is the right remedy on THIS branch. Pinned
+      // next to the capped test below so the two remedies cannot be collapsed back together.
+      expect(result.message).toMatch(/retry the read/i);
+    });
+
+    /*
+     * The CAPPED branch is not the failed branch, and telling the model to retry it was a
+     * remedy that cannot work.
+     *
+     * `capped` with no `failed` can only mean queryDriveFilesAcrossFolders crossed
+     * DRIVE_LIST_WALK_MAX_MS — a wall-clock bound spent on a folder tree whose size does not
+     * change between attempts, and the SECOND such budget after the folder walk already spent
+     * one. A tree large enough to exhaust it exhausts it again, in the same place, every time.
+     * So "Retry the read." pointed the model at a deterministic non-answer, and each attempt
+     * costs two more 15s budgets out of the turn.
+     *
+     * The time is advanced inside the NAME query specifically, so the folder walk finishes well
+     * inside its own budget: this reproduces capped-without-failed, which is the only shape that
+     * reaches the branch under test.
+     */
+    it('does not tell the model to retry when the name search ran out of its time budget', async () => {
+      jest.useFakeTimers();
+      try {
+        mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+          if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+            return Promise.resolve({ data: { files: [] } });
+          }
+          // The name query returns a page and a cursor, but burns the whole budget doing it —
+          // so the read stops at the bound rather than erroring.
+          jest.advanceTimersByTime(WALK_BUDGET_MS + 5_000);
+          return Promise.resolve({ data: { files: [], nextPageToken: 'page-2' } });
+        });
+
+        const result = await service.readSingleKnowledgeBaseFile(`gdrive:${ROOT}`, 'notes.txt', USER_ID);
+
+        expect(result.success).toBe(false);
+        // Still not an absence claim — that part was already right.
+        expect(result.message).toMatch(/not a confirmed absence/i);
+        // The defect: a retry instruction on a deterministic, non-transient stop.
+        expect(result.message).not.toMatch(/retry the read/i);
+        expect(result.message).toMatch(/do not retry this same call/i);
+        // And a remedy that can actually change the outcome — a smaller search scope.
+        expect(result.message).toMatch(/direct google drive link/i);
+        expect(result.message).toMatch(/sub-folder/i);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    // ENG-1300: readGoogleDriveSharedFile's own catch (around the content-read
+    // step, after the file is already found) previously flattened any coded
+    // API error to a message-only result. This is the branch, not the
+    // logic-driven "restricted sub-folder" message above (which never throws).
+    it('ENG-1300: a coded error reading file content classifies as auth/config end-to-end', async () => {
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes(`'${ROOT}' in parents`) && q.includes('mimeType')) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        if (q.includes("name = 'notes.txt'")) {
+          return Promise.resolve({
+            data: { files: [{ id: 'file-99', name: 'notes.txt', mimeType: 'text/plain', size: '12', modifiedTime: '2026-08-01T00:00:00Z' }] },
+          });
+        }
+        return Promise.resolve({ data: { files: [] } });
+      });
+      mockDriveFiles.get.mockRejectedValue(makeApiError(403));
+
+      const result = await service.readSingleKnowledgeBaseFile(`gdrive:${ROOT}`, 'notes.txt', USER_ID);
+      expect(result.success).toBe(false);
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    });
+
     it('reports ambiguity instead of silently reading one candidate when the same name exists in two sub-folders', async () => {
       const SUB_A = 'ratio-4x5';
       const SUB_B = 'ratio-9x16';
@@ -2065,6 +2784,59 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(fullTextCall).toBeDefined();
       expect(fullTextCall![0].q).toContain(`'${SUB}' in parents`);
       expect(fullTextCall![0].q).toContain(`'${ROOT}' in parents`);
+    });
+
+    it('reports an incomplete search — not an empty one — when a Drive request fails mid-read', async () => {
+      /*
+       * Regression guard. The per-request timeout can fire on a request the walk had not
+       * abandoned (the loop-level deadline only stops NEW requests). If that throw escapes
+       * queryDriveFilesAcrossFolders it reaches a caller that logs and continues, so every row
+       * already merged is discarded and the answer presents an empty result as a COMPLETE
+       * search — the ENG-1584 shape, caused by the guard against it. The helper must degrade
+       * the read to incomplete instead of throwing it away.
+       */
+      let fullTextAttempts = 0;
+      mockDriveFiles.list.mockImplementation(({ q }: { q: string }) => {
+        if (q.includes('mimeType')) {
+          // Tree walk succeeds, so there is a real tree to search.
+          if (q.includes(`'${ROOT}' in parents`)) {
+            return Promise.resolve({ data: { files: [{ id: SUB, name: '4x5' }] } });
+          }
+          return Promise.resolve({ data: { files: [] } });
+        }
+        // The file query itself fails, the way an aborted request does.
+        fullTextAttempts += 1;
+        const err: any = new Error('The user aborted a request.');
+        err.code = 'ECONNABORTED';
+        return Promise.reject(err);
+      });
+
+      const result: any = await service.searchKnowledgeBase('iceberg', 5, USER_ID);
+
+      expect(fullTextAttempts).toBeGreaterThan(0);
+      // Named fields, not `JSON.stringify(result)` against a loose regex — the query string
+      // itself, or any unrelated prose, could satisfy /incomplete|could not|partial/ without the
+      // read ever having been reported as incomplete.
+      expect(result.scanIncomplete).toBe(true);
+      expect(result.message).toMatch(/not confirmed exhaustive/i);
+    });
+
+    /*
+     * The other way this whole source can vanish: an exception BEFORE (or outside) the file
+     * query — getGoogleDriveClient failing, or escapeDriveQueryValue refusing a non-string
+     * query, whose throw lands in exactly this catch. It logged and continued without touching
+     * driveScanIncomplete, so a search missing an entire source reported success and no caveat.
+     */
+    it('reports an incomplete search when the whole Drive source failed', async () => {
+      mockDriveFiles.list.mockRejectedValue(makeApiError(500, 'Internal Error'));
+      const secretsManager = require('../utils/secretsManager');
+      secretsManager.getSecret = jest.fn().mockRejectedValue(new Error('Secrets Manager unavailable'));
+
+      const result: any = await service.searchKnowledgeBase('iceberg', 5, USER_ID);
+
+      expect(result.success).toBe(true);
+      expect(result.scanIncomplete).toBe(true);
+      expect(result.message).toMatch(/not confirmed exhaustive/i);
     });
 
     it('does not present Drive results as exhaustive when a sub-folder could not be scanned', async () => {
@@ -2498,6 +3270,80 @@ describe('AgentModeService - Google Drive methods', () => {
       const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
       expect(html).toContain('<span style="font-family:Verdana">text</span>');
       expect(html).not.toContain('javascript=alert');
+    });
+  });
+
+  /*
+   * ENG-1584's sentence, on the search edge.
+   *
+   * `Found N item(s) matching "x"` off a hard `pageSize: 20`, with `nextPageToken` not even
+   * requested, reads as "these are all the matches" and means "these are the first 20". A model
+   * that searches for a file, does not see it, and reports it absent is the exact failure that
+   * told a customer a protected ad did not exist. The sibling `listGoogleDriveFolder` already
+   * reported `hasMore`; this read did not.
+   *
+   * The 20-item bound is deliberate and stays — a name search is a lookup, not an inventory.
+   * Going UNANNOUNCED was the defect.
+   */
+  describe('searchGoogleDrive announces an incomplete result', () => {
+    const driveFile = (id: string, name: string) => ({
+      id, name, mimeType: 'application/pdf', webViewLink: `https://drive/${id}`, parents: ['p1'],
+    });
+
+    it('requests nextPageToken at all — without it the cap is unknowable', async () => {
+      mockDriveFiles.list.mockResolvedValue({ data: { files: [driveFile('f1', 'Report.pdf')] } });
+
+      await service.searchGoogleDrive('Report', USER_ID);
+
+      expect(mockDriveFiles.list.mock.calls[0][0].fields).toContain('nextPageToken');
+    });
+
+    it('labels a full page with more behind it as INCOMPLETE, not as a count', async () => {
+      mockDriveFiles.list.mockResolvedValue({
+        data: { files: [driveFile('f1', 'Report.pdf')], nextPageToken: 'more' },
+      });
+
+      const result = await service.searchGoogleDrive('Report', USER_ID);
+
+      expect(result.complete).toBe(false);
+      expect(result.hasMore).toBe(true);
+      expect(result.message).toMatch(/INCOMPLETE/);
+      expect(result.message).toMatch(/Do NOT conclude a file is absent/i);
+      // Completeness ahead of the payload — see the field-order rationale above.
+      const serialized = JSON.stringify(result);
+      expect(serialized.indexOf('"complete"')).toBeLessThan(serialized.indexOf('"results"'));
+    });
+
+    it('says "complete list" only when Drive returned no continuation token', async () => {
+      mockDriveFiles.list.mockResolvedValue({ data: { files: [driveFile('f1', 'Report.pdf')] } });
+
+      const result = await service.searchGoogleDrive('Report', USER_ID);
+
+      expect(result.complete).toBe(true);
+      expect(result.hasMore).toBeUndefined();
+      expect(result.message).toContain('(complete list)');
+      expect(result.message).not.toMatch(/INCOMPLETE/);
+    });
+
+    it('an EMPTY first page with more behind it is not evidence of absence', async () => {
+      // The most dangerous shape: zero rows plus a continuation token. "No items found" here
+      // is the absence claim itself.
+      mockDriveFiles.list.mockResolvedValue({ data: { files: [], nextPageToken: 'more' } });
+
+      const result = await service.searchGoogleDrive('Missing', USER_ID);
+
+      expect(result.complete).toBe(false);
+      expect(result.message).toMatch(/MORE PAGES EXIST/);
+      expect(result.message).toMatch(/not evidence that nothing matches/i);
+    });
+
+    it('a genuinely empty search still reports a clean, complete absence', async () => {
+      mockDriveFiles.list.mockResolvedValue({ data: { files: [] } });
+
+      const result = await service.searchGoogleDrive('Missing', USER_ID);
+
+      expect(result.complete).toBe(true);
+      expect(result.message).toContain('(complete search)');
     });
   });
 });

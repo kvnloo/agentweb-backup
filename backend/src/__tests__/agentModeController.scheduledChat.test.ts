@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import * as sseProgress from '../utils/sseProgress';
 
 // Mock all dependencies before importing the controller
 // Mock subscriptionService so subscription checks always pass in tests
@@ -58,6 +59,7 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   generateMarketingResponseWorkerService: {
     runInWorker: jest.fn(),
     releaseSessionClients: jest.fn(),
+    cancelSession: jest.fn(),
   },
 }));
 
@@ -129,6 +131,14 @@ jest.mock('../services/notionService', () => ({
   createOncallItem: jest.fn().mockResolvedValue(undefined),
 }));
 
+// ENG-1719: previously unmocked — real calls silently failed and were swallowed by the
+// caller's own .catch(), which is why no existing test needed this. Mocking it is a strict
+// improvement (a resolved no-op instead of a failing real network call) and lets the new
+// session-busy test below assert it was correctly skipped.
+jest.mock('../services/intakeService', () => ({
+  fileAutoIssue: jest.fn().mockResolvedValue(undefined),
+}));
+
 jest.mock('../services/skillService', () => ({
   skillService: {
     getPublishedSkills: jest.fn().mockResolvedValue([]),
@@ -144,7 +154,15 @@ import { generateMarketingResponseWorkerService } from '../services/generateMark
 import { getAllowedFunctionCalls, getAllowedSkills, isSubscriptionFeatureEnabled } from '../services/subscriptionService';
 import { skillService } from '../services/skillService';
 import { checkTokenUsage } from '../services/tokenUsageService';
-import { agentModeController, runScheduledChat } from '../controllers/agentModeController';
+import { fileAutoIssue } from '../services/intakeService';
+import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import {
+  agentModeController,
+  runScheduledChat,
+  activeSessionGenerations,
+  tryClaimSessionGeneration,
+  RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS,
+} from '../controllers/agentModeController';
 
 const mockedGetAllowedFunctionCalls = getAllowedFunctionCalls as jest.MockedFunction<typeof getAllowedFunctionCalls>;
 const mockedGetAllowedSkills = getAllowedSkills as jest.MockedFunction<typeof getAllowedSkills>;
@@ -159,6 +177,8 @@ const mockTaskDb = taskDb as jest.Mocked<typeof taskDb>;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockEmailService = emailService as jest.Mocked<typeof emailService>;
 const mockGenerateMarketingResponseWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
+const mockFileAutoIssue = fileAutoIssue as jest.Mock;
+const mockSendAgentModeOncallAlert = sendAgentModeOncallAlert as jest.Mock;
 
 describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
   const mockUserId = 'test-user-123';
@@ -339,6 +359,132 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(result.status).toBe('failure');
       expect(mockGenerateMarketingResponseWorkerService.releaseSessionClients)
         .toHaveBeenCalledWith(result.sessionId);
+    });
+
+    // ENG-1719: live-found on production — this schedule's own catch block previously
+    // treated SessionBusyError (thrown by runVerifiedChat when it can't claim the session
+    // lock — e.g. the customer is live-chatting on this exact session when the schedule
+    // fires) exactly like a genuine crash: paged on-call and auto-filed a Linear ticket for
+    // completely ordinary, expected contention that resolves itself at the next run.
+    describe('session-busy contention (ENG-1719)', () => {
+      afterEach(() => {
+        activeSessionGenerations.clear();
+      });
+
+      it('does not page on-call or file an auto-issue when the session is already busy', async () => {
+        // Pre-claim the lock exactly like a live /generate turn on this session would —
+        // runVerifiedChat's own claim (inside its multi-attempt loop, before any
+        // generation happens) then fails and throws SessionBusyError. Real timers: the
+        // claim genuinely retries for ~12s before giving up, same as production.
+        tryClaimSessionGeneration(mockSession.sessionId);
+
+        const result = await runScheduledChat(baseSchedule, mockUserId, true);
+
+        expect(result.status).toBe('failure');
+        expect(result.actualResponse).toMatch(/session was busy/i);
+        // The worker was never even reached — the claim fails before generation starts.
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+        // The whole point of the fix: no false alarm for benign contention.
+        expect(mockSendAgentModeOncallAlert).not.toHaveBeenCalled();
+        expect(mockFileAutoIssue).not.toHaveBeenCalled();
+        // Also must not stamp a scary error onto the customer's own session record.
+        expect(mockChatbotDb.updateSessionError).not.toHaveBeenCalled();
+      }, 15000);
+
+      it('still records a run-history entry, so the skip is not invisible', async () => {
+        tryClaimSessionGeneration(mockSession.sessionId);
+
+        await runScheduledChat(baseSchedule, mockUserId, true);
+
+        expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith(
+          mockScheduleId,
+          expect.objectContaining({ status: 'failure', actualResponse: expect.stringMatching(/session was busy/i) }),
+        );
+      }, 15000);
+
+      it('a genuine (non-busy) failure still writes the session error as before', async () => {
+        // Regression guard for the fix itself: the new branch must be gated on
+        // isSessionBusyError specifically, not swallow every error. updateSessionError is
+        // the one write the busy-branch above explicitly (and only) skips, so it's the
+        // most direct signal that the generic path still runs unchanged for a real failure.
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(new Error('worker died'));
+
+        const result = await runScheduledChat(baseSchedule, mockUserId, true);
+
+        expect(result.status).toBe('failure');
+        expect(mockChatbotDb.updateSessionError).toHaveBeenCalled();
+      });
+    });
+
+    // ENG-1719 follow-up (from a scoped re-review of the fix above): runVerifiedChat only
+    // just gained a wall-clock timeout, so this catch could never receive an
+    // isGenerationTimeout error before now. withGenerationTimeout's own contract is that it
+    // does NOT cancel the underlying generation on timeout — it keeps running. The
+    // zero-output detection below can then misread a merely-slow run as having produced
+    // nothing and schedule an automatic RESUME on the SAME sessionId as little as 15 minutes
+    // later, which would race the still-running orphan for the same session — the identical
+    // concurrent-write class this whole PR exists to close, just self-inflicted this time.
+    describe('generation-timeout orphan cancellation (ENG-1719 follow-up)', () => {
+      it('cancels the orphaned generation before falling through to the normal error path', async () => {
+        const requestCancelSpy = jest.spyOn(sseProgress, 'requestCancel');
+        const timeoutError = Object.assign(new Error('Generation timed out'), { isGenerationTimeout: true });
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(timeoutError);
+
+        const result = await runScheduledChat(baseSchedule, mockUserId, true);
+
+        // Cancelled the orphan...
+        expect(requestCancelSpy).toHaveBeenCalledWith(mockSession.sessionId);
+        expect(mockGenerateMarketingResponseWorkerService.cancelSession).toHaveBeenCalledWith(mockSession.sessionId);
+        // ...but a genuine timeout is NOT benign like SessionBusyError — it still falls
+        // through to the normal error/zero-output handling rather than returning early.
+        expect(result.status).toBe('failure');
+
+        requestCancelSpy.mockRestore();
+      });
+
+      it('does not cancel anything for a non-timeout error', async () => {
+        const requestCancelSpy = jest.spyOn(sseProgress, 'requestCancel');
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(new Error('worker died'));
+
+        await runScheduledChat(baseSchedule, mockUserId, true);
+
+        expect(requestCancelSpy).not.toHaveBeenCalled();
+        expect(mockGenerateMarketingResponseWorkerService.cancelSession).not.toHaveBeenCalled();
+
+        requestCancelSpy.mockRestore();
+      });
+    });
+
+    describe('LONG lock-timeout for headless runs (ENG-1719 follow-up)', () => {
+      beforeEach(() => {
+        jest.useFakeTimers();
+      });
+
+      afterEach(() => {
+        jest.useRealTimers();
+        activeSessionGenerations.clear();
+      });
+
+      it('honors the LONG lock-timeout override instead of the short human-waiting default', async () => {
+        // Worker call never settles — simulates a stuck LLM/tool call. runScheduledChat is
+        // headless (maxAttempts:20, nobody blocked waiting) and must pass
+        // RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS through to runVerifiedChat — if it fell back
+        // to the short human-waiting default instead, this lock would release well before
+        // the 120-minute mark checked below.
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => new Promise(() => {}));
+
+        const runPromise = runScheduledChat(baseSchedule, mockUserId, true);
+
+        // Past the SHORT default (90 min) but well inside the LONG ceiling (6 hr).
+        await jest.advanceTimersByTimeAsync(120 * 60 * 1000);
+        expect(activeSessionGenerations.has(mockSession.sessionId)).toBe(true);
+
+        // Now past the LONG ceiling too — must release.
+        await jest.advanceTimersByTimeAsync(RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS);
+        const result = await runPromise;
+        expect(result.status).toBe('failure');
+        expect(activeSessionGenerations.has(mockSession.sessionId)).toBe(false);
+      }, 30000);
     });
 
     // ENG-657: resume an abandoned run whose instance was terminated mid-flight
@@ -801,14 +947,23 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       const result = await runScheduledChat(scheduleWithSearchWeb, mockUserId, true);
 
-      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
+      // ENG-1297: you_search_web is read-only, so once it's the ONLY unmet
+      // requirement the read-only press circuit breaker stops the run after its
+      // (small) press budget instead of grinding to maxAttempts (20) — the run
+      // still correctly recognizes legacy_news_search does NOT satisfy
+      // you_search_web (functionCallMatches/functionCallMisses below are
+      // unchanged), it just no longer pays for 18 more identical presses to
+      // reach that same conclusion, and ends as a successful, waived run rather
+      // than a hard failure.
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(2);
       expect(result).toEqual(
         expect.objectContaining({
-          status: 'failure',
-          passed: false,
-          attempt: 20,
+          status: 'success',
+          passed: true,
+          attempt: 2,
           functionCallMatches: [],
           functionCallMisses: ['you_search_web'],
+          readOnlyRequirementWaived: true,
         })
       );
     });

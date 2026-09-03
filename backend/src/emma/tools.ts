@@ -4899,7 +4899,7 @@ emmaToolRegistry.register({
   name: 'generate_image',
   definition: {
     name: 'generate_image',
-    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.\n\nMULTIPLE VARIANTS: When the user asks for several INDEPENDENT variants of the same brief (e.g. "generate 3 variants"), emit ALL the generate_image calls together in a SINGLE turn — one tool call per variant. They run in parallel (bounded), so N variants finish in roughly the time of one instead of N× and stay within the turn\'s time limit; generating them one-by-one across separate turns is slow and can time out. Only chain image calls sequentially when a later image genuinely DEPENDS on an earlier one (e.g. editing a just-generated image).\n\nLOGO COMPOSITING BEST PRACTICES (tested and confirmed):\n- When the user wants an image with their logo, ALWAYS use the logo_image parameter with the logo URL from their brand guidelines (read_brand_guidelines tool). Do NOT describe the logo in the prompt — pass the actual PNG URL.\n- For logo compositing, prefer gemini-3.1-flash-image or gemini-3-pro-image-preview. Both successfully composite PNG logos with high fidelity. gemini-3.1-flash-image renders the logo largest and most prominently. These models also produce 4096×4096 output.\n- gpt-image-2 also supports logo compositing via logo_image and works correctly, preserving the logo faithfully at 1024×1024 (may add unrequested design elements around it).\n- gpt-image-1 is NOT reliable for logo compositing — it rewrites the logo (e.g. replaces the actual text in the logo with the company name from the prompt). Avoid gpt-image-1 when logo fidelity matters.\n- NEVER tell the user that AI image generation cannot composite a real logo — gemini-3-pro-image-preview, gemini-3.1-flash-image, and gpt-image-2 all handle it correctly when logo_image is provided.\n- NEVER switch the output format from image to HTML without explicit user approval.\n- Brand guideline PNG logos from the attachments array composite cleanly — use them directly.\n\nTRANSPARENT BACKGROUNDS — DO NOT use generate_image to "redraw the logo on a transparent background". This model redraws the mark and can drift its icon/letters/colors, and it CANNOT guarantee a true alpha channel. To make an existing logo\'s background transparent, use the remove_image_background tool (it operates on the original pixels and outputs genuine alpha). If the user already has a transparent PNG of the logo, use that directly. Only fall back to generation if no source logo exists at all.',
+    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.\n\nMULTIPLE VARIANTS: When the user asks for several INDEPENDENT variants of the same brief (e.g. "generate 3 variants"), emit ALL the generate_image calls together in a SINGLE turn — one tool call per variant. They run in parallel (bounded), so N variants finish in roughly the time of one instead of N× and stay within the turn\'s time limit; generating them one-by-one across separate turns is slow and can time out. Only chain image calls sequentially when a later image genuinely DEPENDS on an earlier one (e.g. editing a just-generated image).\n\nLOGO COMPOSITING BEST PRACTICES (tested and confirmed):\n- When the user wants an image with their logo, ALWAYS use the logo_image parameter with the logo URL from their brand guidelines (read_brand_guidelines tool). Do NOT describe the logo in the prompt — pass the actual PNG URL.\n- For logo compositing, prefer gemini-3.1-flash-image or gemini-3-pro-image-preview. Both successfully composite PNG logos with high fidelity. gemini-3.1-flash-image renders the logo largest and most prominently. These models also produce 4096×4096 output.\n- gpt-image-2 also supports logo compositing via logo_image and works correctly, preserving the logo faithfully at 1024×1024 (may add unrequested design elements around it).\n- gpt-image-1 is NOT reliable for logo compositing — it rewrites the logo (e.g. replaces the actual text in the logo with the company name from the prompt). Avoid gpt-image-1 when logo fidelity matters.\n- NEVER tell the user that AI image generation cannot composite a real logo — gemini-3-pro-image-preview, gemini-3.1-flash-image, and gpt-image-2 all handle it correctly when logo_image is provided.\n- NEVER switch the output format from image to HTML without explicit user approval.\n- Brand guideline PNG logos from the attachments array composite cleanly — use them directly.\n\nTRANSPARENT BACKGROUNDS — DO NOT use generate_image to "redraw the logo on a transparent background". This model redraws the mark and can drift its icon/letters/colors, and it CANNOT guarantee a true alpha channel. To make an existing logo\'s background transparent, use the remove_image_background tool (it operates on the original pixels and outputs genuine alpha). If the user already has a transparent PNG of the logo, use that directly. Only fall back to generation if no source logo exists at all.\n\nTEXT & DATA RELIABILITY (known model limitation — brief around it, do NOT retry expecting a better roll):\n- Image models cannot reliably render small exact text — specific IDs/codes, short spelled-out strings, or any string that must match character-for-character (e.g. "campaign 120214893"). At small sizes the model commonly repeats a garbled or truncated approximation of the string in every occurrence instead of the real value. Do NOT ask for an exact short identifier to appear (especially more than once) and do NOT retry the same prompt hoping the string comes out right next time — it won\'t reliably. Instead brief around it: use a generic/illustrative label ("Campaign A"), keep any exact identifier out of the image and reference it in the surrounding chat text instead, or enlarge it to be the sole hero text of the image rather than one of several small repeated labels.\n- When a prompt asks for a data-shaped layout (a table, chart, or list of metrics), the model tends to invent plausible-looking numbers/data for cells it doesn\'t actually have values for, rather than leaving them blank. NEVER ask generate_image to fill in real metrics or figures you don\'t already have from a tool result — either pass the exact real values in the prompt, or explicitly instruct the prompt to leave those cells blank or empty. Never present the resulting image\'s invented numbers to the user as real data.\n- This also applies when the USER never asked for real data at all. A prompt that merely describes dashboard-like UI elements (a "metrics preview" panel, KPI cards, a progress/stat block, a completion/progress-bar PERCENTAGE) without specifying values will still get invented numbers filled in — the model treats an unstated metric as one it should make up, not one to leave blank. Whenever your own generate_image prompt includes any such element, explicitly state placeholder values ("--", empty, or a generic status word) for it, exactly as you would for an explicit data-table request. Do not assume omitting a value is enough to keep it blank — and do NOT write a specific-looking number into the prompt yourself as a design flourish (e.g. "progress bar at 75%") unless it came from a real tool result. A plausible percentage you invented while writing the prompt is exactly the fabricated data this rule exists to prevent, even though nothing about generating it looks broken.\n- A data-shaped prompt is automatically re-checked against the actual generated image unless you set metrics_verified=true — only do that when every value in the prompt is genuinely sourced from a real tool result this turn, since it skips the check.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4946,6 +4946,10 @@ emmaToolRegistry.register({
           type: 'string',
           enum: ['ad', 'organic_post'],
           description: "REQUIRED use-case declaration for the human eval queue: 'ad' when the image is a paid ad creative (Meta/Google/LinkedIn ads, retargeting creatives), 'organic_post' when it is organic social/content imagery (feed posts, blog headers, non-paid content). Reviewer feedback differs entirely between the two, so declare it from the request's context — never guess randomly; if the user's intent is genuinely unclear, ask them which use case the image is for before generating."
+        },
+        metrics_verified: {
+          type: 'boolean',
+          description: "Set true ONLY when your prompt describes a dashboard/table/metrics-shaped layout AND every number/percentage/dollar figure in it came directly from a real tool result earlier in this conversation (e.g. get_meta_ads_metrics, call_meta_marketing_api). Leave false or omit for any illustrative, placeholder, or self-written figure — including a plausible-looking value you wrote yourself with no real source (e.g. a progress-bar percentage). Omitting this on a data-shaped prompt triggers an automatic post-generation reliability check; setting it true when the values are genuinely real skips that check instead of risking a false 'unverified' caution on accurate data."
         }
       },
       required: ['prompt', 'filename', 'category']
@@ -4969,7 +4973,8 @@ emmaToolRegistry.register({
       args.imageModel,
       args.logo_image,
       args.confirm,
-      args.category
+      args.category,
+      args.metrics_verified
     );
   }
 });
@@ -5406,7 +5411,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains);
+    return await agentModeService.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains, context?.userId);
   }
 });
 
@@ -5437,7 +5442,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchNews(args.query, args.max_results || 10, args.freshness);
+    return await agentModeService.youSearchNews(args.query, args.max_results || 10, args.freshness, context?.userId);
   }
 });
 
@@ -5463,7 +5468,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.googleSearchWeb(args.query, args.max_results || 10);
+    return await agentModeService.googleSearchWeb(args.query, args.max_results || 10, context?.userId);
   }
 });
 
@@ -6023,7 +6028,14 @@ emmaToolRegistry.register({
         format_requirements: { type: "string", description: "Optional additional formatting instructions (e.g. 'use dark theme', 'include charts', 'brand color #1a73e8', 'add a CTA button to book a demo')." },
         document_type: { type: "string", enum: ["document", "email"], description: "Optional. Use 'email' for a one-off newsletter/marketing email so the HTML is email-client-safe (table-based layout, inline CSS, 600px container, no JS). Use 'document' (default) for reports, summaries, audits, and other web-style documents." }
       },
-      required: ["title", "content_draft"]
+      required: ["title", "content_draft"],
+      // ENG-1477: reject any argument outside the four named above. The
+      // handler below only ever reads args.title/content_draft/
+      // format_requirements/document_type by name, so an extra key is
+      // already inert — this makes that safety a schema-enforced guarantee
+      // (agentToolGatewayService.ts's validator) rather than an incidental
+      // property of how execute() happens to be written.
+      additionalProperties: false
     }
   },
   execute: async (args: any, context?: any) => {
@@ -6100,7 +6112,12 @@ emmaToolRegistry.register({
           description: 'REQUIRED: The complete content of the file to save as a string. You must provide the full file content - this tool cannot retrieve content from previous operations.'
         }
       },
-      required: ["file_name", "file_content"]
+      required: ["file_name", "file_content"],
+      // ENG-1477: same reasoning as create_html_file above — the handler
+      // only reads file_name/file_content by name, so reject anything else
+      // at the schema level instead of relying on it being harmlessly
+      // ignored.
+      additionalProperties: false
     }
   },
   execute: async (args: any, context?: any) => {
@@ -7210,6 +7227,80 @@ mcpToolRegistry.register({
   },
 });
 
+const LINEAR_PRIORITY_BY_NAME: Record<string, number> = { Urgent: 1, High: 2, Medium: 3, Low: 4 };
+const LINEAR_STATE_TYPES_BY_BUCKET: Record<string, string[]> = {
+  open: ['triage', 'backlog', 'unstarted', 'started'],
+  completed: ['completed'],
+  canceled: ['canceled'],
+};
+
+mcpToolRegistry.register({
+  name: 'read_linear_issues',
+  definition: {
+    name: 'read_linear_issues',
+    description:
+      'Admin-only, read-only: list/search AgentWeb Linear issues by team, state, priority, label, and ' +
+      'assignee, or read one issue in full detail (description, comments, sub-issues, blocking ' +
+      'relationships). Never mutates Linear and never exposes Linear credentials.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'detail'],
+          description: '"list" to search/filter issues, "detail" to read one issue fully (description, comments, sub-issues, blocking relations).',
+        },
+        team_key: { type: 'string', description: 'Team key, e.g. ENG. Defaults to ENG.' },
+        state: {
+          type: 'string',
+          enum: ['open', 'completed', 'canceled'],
+          description: 'For action=list: "open" (triage/backlog/unstarted/started), "completed", or "canceled". Defaults to open.',
+        },
+        priorities: {
+          type: 'array',
+          items: { type: 'string', enum: ['Urgent', 'High', 'Medium', 'Low'] },
+          description: 'For action=list: filter to these priority levels.',
+        },
+        label_name: { type: 'string', description: 'For action=list: filter to issues carrying this exact label name.' },
+        assignee_email: { type: 'string', description: 'For action=list: filter to issues assigned to this email.' },
+        limit: { type: 'number', description: 'For action=list: max issues to return (default 50, max 100).' },
+        issue_ref: { type: 'string', description: 'For action=detail: issue identifier (e.g. ENG-42) or internal id.' },
+      },
+      required: ['action'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+    const user = await userDb.getUserById(userId);
+    const delegated = context?.isDelegatedAccess === true || context?.isDelegatedAdmin === true;
+    if (user?.isAdmin !== true && !delegated) {
+      throw new Error('Admin access required to read Linear issues');
+    }
+    const { searchIssues, getIssueFullDetail } = await import('../services/linearService');
+    if (args.action === 'detail') {
+      if (!args.issue_ref) throw new Error('issue_ref is required for action=detail');
+      return getIssueFullDetail(args.issue_ref);
+    }
+    if (args.action === 'list') {
+      const priorities = Array.isArray(args.priorities)
+        ? args.priorities.map((p: string) => LINEAR_PRIORITY_BY_NAME[p]).filter((p: number | undefined): p is number => typeof p === 'number')
+        : undefined;
+      const limit = Math.min(Math.max(Number(args.limit) || 50, 1), 100);
+      const issues = await searchIssues({
+        teamKey: args.team_key,
+        stateTypes: LINEAR_STATE_TYPES_BY_BUCKET[args.state || 'open'] || LINEAR_STATE_TYPES_BY_BUCKET.open,
+        priorities,
+        labelName: args.label_name,
+        assigneeEmail: args.assignee_email,
+        limit,
+      });
+      return { issues };
+    }
+    throw new Error(`Unknown action "${args.action}" — expected "list" or "detail"`);
+  },
+});
+
 const bridgedToolNames = [
   // Scheduled Chat tools
   'list_scheduled_chats',
@@ -7248,6 +7339,7 @@ const bridgedToolNames = [
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
 const adminToolNames = [
   'manage_linear_governance_label',
+  'read_linear_issues',
   'list_predefined_work_plans',
   'manage_predefined_work_plan',
   'list_skills',
@@ -8890,7 +8982,7 @@ ACTION MATRIX:
         action: { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         name: { type: 'string' },
         type: { type: 'string', description: 'Campaign type (SEARCH|DISPLAY|PERFORMANCE_MAX), ad group type (SEARCH_STANDARD|DISPLAY_STANDARD), or ad type for AD CREATE (RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD).' },
-        budget_resource_name: { type: 'string', description: 'From BUDGET CREATE. Required for CAMPAIGN CREATE.' },
+        budget_resource_name: { type: 'string', description: 'From BUDGET LIST or BUDGET CREATE. Required for CAMPAIGN CREATE, BUDGET UPDATE (with amount_micros), and BUDGET REMOVE.' },
         amount_micros: { type: 'number', description: 'Budget in micros. $10/day = 10000000.' },
         explicitly_shared: { type: 'boolean', description: 'Whether the budget is explicitly shared across campaigns. Optional for BUDGET CREATE.' },
         bidding_strategy: { type: 'string', enum: ['MAXIMIZE_CONVERSIONS', 'TARGET_CPA', 'TARGET_ROAS', 'MAXIMIZE_CONVERSION_VALUE', 'TARGET_IMPRESSION_SHARE', 'TARGET_SPEND', 'MANUAL_CPC'], description: 'A standard (embedded) bidding strategy. TARGET_SPEND = Maximize Clicks (optionally capped by cpc_bid_ceiling_micros). Mutually exclusive with bidding_strategy_resource_name.' },
@@ -8912,7 +9004,7 @@ ACTION MATRIX:
         time_zone: { type: 'string', description: 'OFFLINE_CONVERSION UPLOAD: override the account time zone (IANA). Normally omit — it is read from the account.' },
         validate_only: { type: 'boolean', description: 'OFFLINE_CONVERSION UPLOAD: ask Google to validate the payload and write NOTHING. Use to rehearse before committing.' },
         conversion_action_resource_name: { type: 'string', description: 'Required for CONVERSION_ACTION UPDATE. From CONVERSION_ACTION LIST or CREATE.' },
-        campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE/ADD_PROXIMITY and AD_GROUP LIST.' },
+        campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE/ADD_PROXIMITY, AD_GROUP LIST, and (as an alternative to ad_group_resource_name) KEYWORD ADD_NEGATIVE.' },
         radius: { type: 'number', description: 'Proximity radius for CAMPAIGN ADD_PROXIMITY, in radius_units (default MILES).' },
         radius_units: { type: 'string', enum: ['MILES', 'KILOMETERS'], description: 'Unit for radius on CAMPAIGN ADD_PROXIMITY. Defaults to MILES.' },
         address: {
@@ -8928,12 +9020,12 @@ ACTION MATRIX:
           },
         },
         final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },
-        ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD/ADD_NEGATIVE/REMOVE, AD LIST/CREATE, AD_GROUP UPDATE.' },
+        ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD, AD LIST/CREATE, AD_GROUP UPDATE. For KEYWORD ADD_NEGATIVE, required only as an alternative to campaign_resource_name (either one works). Not used by KEYWORD REMOVE, which identifies the keyword via criterion_resource_name alone.' },
         ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE/RETAG_UTM. Obtain from AD LIST.' },
         asset_group_resource_name: { type: 'string', description: 'Asset group resource name. Required for ASSET_GROUP RETAG_UTM. Obtain from audit_ad_utm_coverage or a GAQL read on asset_group.' },
         brand_business_name: { type: 'string', description: 'Business name for PMax brand guidelines. Required for PERFORMANCE_MAX CAMPAIGN CREATE when brand guidelines are enforced.' },
         brand_logo_asset_resource_name: { type: 'string', description: 'Logo image asset resource name for PMax brand guidelines. Upload via ASSET UPLOAD first.' },
-        criterion_resource_name: { type: 'string', description: 'Criterion resource name. Required for KEYWORD REMOVE (ad group criterion, from KEYWORD LIST) and CAMPAIGN REMOVE_PROXIMITY (campaign criterion, from a raw GAQL query on campaign_criterion).' },
+        criterion_resource_name: { type: 'string', description: 'Criterion resource name. Required for KEYWORD UPDATE and KEYWORD REMOVE (ad group criterion, from KEYWORD LIST) and CAMPAIGN REMOVE_PROXIMITY (campaign criterion, from a raw GAQL query on campaign_criterion).' },
         placement_urls: { type: 'array', items: { type: 'string' }, description: 'Placement domains or HTTP(S) URLs to add as negative campaign criteria. For CAMPAIGN_CRITERION ADD.' },
         mobile_app_category_resource_names: { type: 'array', items: { type: 'string' }, description: 'Canonical mobileAppCategoryConstants/<id> resource names to add as negative campaign criteria. For CAMPAIGN_CRITERION ADD.' },
         assets: { type: 'array', items: { type: 'object', properties: { fieldType: { type: 'string', enum: ['BUSINESS_NAME', 'LOGO', 'SQUARE_MARKETING_IMAGE', 'MARKETING_IMAGE', 'HEADLINE', 'DESCRIPTION'] }, assetResourceName: { type: 'string' }, text: { type: 'string' } }, required: ['fieldType'] }, description: 'Assets to attach for CAMPAIGN_ASSET ATTACH. Use text for BUSINESS_NAME, assetResourceName for image/logo types.' },
@@ -9534,24 +9626,43 @@ emmaToolRegistry.register({
       throw new Error('account_id is required — get it from list_connected_accounts.');
     }
 
+    // Reads behind this audit can stop at a page or wall-clock bound. Collect that here so a
+    // partial read is never presented as a clean bill of health.
+    const completeness: { incomplete?: boolean; campaignListIncomplete?: boolean } = {};
     const campaigns = await auditCampaigns(
       platform as AdPlatform,
       context.userId,
       accountId,
       port,
+      completeness,
     );
 
     const needingAction = campaigns.filter((c) => !c.tagged);
     const unreadableCount = campaigns.reduce((n, c) => n + c.unreadableAdIds.length, 0);
 
+    /*
+     * "All N campaign(s) carry UTM tracking" is a claim about everything, so it may only be
+     * made from a read that saw everything. Under truncation the audit found nothing wrong in
+     * the part it read, which is a different statement — and reporting the stronger one is
+     * exactly how a bounded read told a customer something did not exist (ENG-1584).
+     */
+    const incompleteNote = completeness.incomplete
+      ? (completeness.campaignListIncomplete
+          ? ` ⚠ The campaign list stopped at a read bound, so campaigns beyond it were never audited.`
+          : ` ⚠ At least one campaign's ad list stopped at a read bound, so some ads were never audited.`) +
+        ` Treat this as "nothing wrong in what was read", not a clean bill of health.`
+      : '';
+
     // Say the unreadable count out loud. Silently folding it into "untagged" would send
     // someone to swap a creative we never actually managed to read.
-    const message = needingAction.length === 0
-      ? `✅ All ${campaigns.length} campaign(s) on ${platform} carry UTM tracking. Nothing to opt in.`
+    const message = (needingAction.length === 0
+      ? (completeness.incomplete
+          ? `No UTM problems found in the ${campaigns.length} campaign(s) read on ${platform}.`
+          : `✅ All ${campaigns.length} campaign(s) on ${platform} carry UTM tracking. Nothing to opt in.`)
       : `${needingAction.length} of ${campaigns.length} campaign(s) on ${platform} need attention.` +
         (unreadableCount > 0
           ? ` ${unreadableCount} ad(s) were unreadable — their destination URL could not be parsed, so they need review by a human rather than an automatic fix.`
-          : '');
+          : '')) + incompleteNote;
 
     return {
       success: true,
@@ -9561,6 +9672,8 @@ emmaToolRegistry.register({
       totalCampaigns: campaigns.length,
       campaignsNeedingAction: needingAction.length,
       unreadableAdCount: unreadableCount,
+      ...(completeness.incomplete ? { readIncomplete: true } : {}),
+      ...(completeness.campaignListIncomplete ? { campaignListIncomplete: true } : {}),
       campaigns,
     };
   },

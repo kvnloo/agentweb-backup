@@ -33,6 +33,7 @@ import type { CacheWriteByTtl } from '../utils/llmPricing';
 import { approvalDb } from './approvalDb';
 import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
 import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
+import { WorkflowRunState } from './agentMode/core/workflow';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -237,6 +238,19 @@ export interface ChatSession {
   // carries typed values rather than an option selection; the write guard
   // still makes the two mutually exclusive while either is awaiting.
   pendingWorkPlanInput?: WorkPlanInputRequest;
+  // ENG-1642: canonical digests (computeMetaWriteManifestDigest) of manifest-
+  // approved Meta writes already executed confirmation-free in this session.
+  // A digest present here has been consumed — the SAME write may not execute
+  // again without a fresh confirmation. Map value is the consumption
+  // timestamp (kept, not just a boolean, purely for audit/debugging).
+  consumedMetaWriteManifestDigests?: Record<string, string>;
+  // ENG-397: the structured, typed workflow run in flight for this session
+  // (if any). Each mutating step's checkpoint (entity IDs + verified
+  // end-state) is persisted here so a killed-and-restarted session resumes
+  // from the last VERIFIED step instead of re-deriving state from chat prose
+  // / re-creating entities. Distinct from `workPlan` (a narrative to-do
+  // list) — see agentMode/core/workflow.ts file header.
+  workflowRun?: WorkflowRunState;
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
@@ -325,6 +339,11 @@ export interface ChatSession {
       instructionCompliance?: number;   // 0-5: explicit instruction followed on first attempt?
       unnecessaryPermissionRequest?: boolean; // asked to confirm a safe (read-only/draft/test) action?
     };
+    // ENG-929: the judge saw a shortened transcript (a very long run exceeded the
+    // scoring context budget). The score is real but formed on partial context —
+    // labelled rather than withheld, since withholding is what silently dropped
+    // the longest sessions from satisfaction reporting.
+    transcriptTruncated?: boolean;
   };
   judgeScores?: Record<string, {  // keyed by judge ID
     score: number;
@@ -583,6 +602,14 @@ function keywordBasedChunkRetrieval(
 export interface MetaMeasurementCheckRecord {
   accountId: string;
   campaignId?: string;
+  /**
+   * Kept in step with `metaLaunchGate.ts`'s declaration of the same name — structural typing
+   * means a field added there and not here still persists (DynamoDB is schemaless), so the
+   * compiler will NOT catch the drift. It went missing once already, when the gate started
+   * recording which ad a block was about.
+   */
+  adId?: string;
+  creativeId?: string;
   action: string;
   outcome: 'passed' | 'blocked' | 'overridden';
   /** Per-destination check results (url + status + detected pixels). */
@@ -3125,6 +3152,93 @@ export class ChatbotDB {
   }
 
   /**
+   * ENG-1642: atomically claim a manifest-granted Meta write digest for
+   * confirmation-free execution, at most once. A digest already present in
+   * `consumedMetaWriteManifestDigests` means that exact write already ran
+   * under this manifest — the caller must fall back to a normal confirmation
+   * rather than executing again. Uses a single conditional DynamoDB update
+   * (attribute_not_exists on the specific map key) so two concurrent
+   * requests carrying the same digest cannot both win the claim — mirrors
+   * the claimPreviewToken conditional-put pattern in
+   * metaAudienceCampaignTokenStore.ts. Returns true only if THIS call
+   * claimed it.
+   */
+  async claimMetaWriteManifestDigest(sessionId: string, digest: string): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression:
+            'SET consumedMetaWriteManifestDigests.#digest = :consumedAt',
+          // attribute_exists(sessionId) is REQUIRED, not optional belt-and-
+          // braces (mirrors the identical guard on the workflowRun writer
+          // above): the attribute_not_exists(...) checks alone are satisfied
+          // identically whether the map/key is merely absent on an existing
+          // row or the whole session item doesn't exist at all — DynamoDB's
+          // conditional UpdateItem creates the item if missing. Without this,
+          // a session deleted before/during this claim would silently upsert
+          // a partial ChatSession row and let a retry return true, granting a
+          // confirmation-free Meta write on a session that no longer exists.
+          ConditionExpression:
+            'attribute_exists(sessionId) AND (attribute_not_exists(consumedMetaWriteManifestDigests) OR attribute_not_exists(consumedMetaWriteManifestDigests.#digest))',
+          ExpressionAttributeNames: { '#digest': digest },
+          ExpressionAttributeValues: { ':consumedAt': new Date().toISOString() },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      // A DynamoDB map SET against a session with no existing
+      // `consumedMetaWriteManifestDigests` attribute at all fails differently
+      // ("document path does not exist") rather than the map-key condition
+      // above — initialize the map on first use, then retry the claim once.
+      // Guarded the same way: only initialize on a session that still exists.
+      if (error?.code === 'ValidationException') {
+        try {
+          await dynamodb
+            .update({
+              TableName: this.tableName,
+              Key: { sessionId },
+              UpdateExpression:
+                'SET consumedMetaWriteManifestDigests = if_not_exists(consumedMetaWriteManifestDigests, :empty)',
+              ConditionExpression: 'attribute_exists(sessionId)',
+              ExpressionAttributeValues: { ':empty': {} },
+            })
+            .promise();
+        } catch (initError: any) {
+          if (initError?.code === 'ConditionalCheckFailedException') return false;
+          throw initError;
+        }
+        return this.claimMetaWriteManifestDigestRetry(sessionId, digest);
+      }
+      console.error('Error claiming Meta write manifest digest:', error);
+      throw error;
+    }
+  }
+
+  /** Single retry after map initialization — never recurses further. */
+  private async claimMetaWriteManifestDigestRetry(sessionId: string, digest: string): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET consumedMetaWriteManifestDigests.#digest = :consumedAt',
+          ConditionExpression: 'attribute_not_exists(consumedMetaWriteManifestDigests.#digest)',
+          ExpressionAttributeNames: { '#digest': digest },
+          ExpressionAttributeValues: { ':consumedAt': new Date().toISOString() },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      console.error('Error claiming Meta write manifest digest (retry):', error);
+      throw error;
+    }
+  }
+
+  /**
    * Persist the typed information a work-plan step is waiting for. The same
    * request is rendered as a chat card in the portal or as MCP elicitation;
    * persisting the channel-neutral form lets a reconnect resume safely.
@@ -3182,6 +3296,77 @@ export class ChatbotDB {
         return null;
       }
       console.error('Error updating session work-plan input request:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-397: persist (or clear) the session's workflow run. Two guard modes,
+   * mirroring updateSessionAskUserQuestion/updateSessionWorkPlanInputRequest:
+   *  - failIfActiveExists: used by startWorkflow — refuses to start a new run
+   *    while an existing one is still 'in_progress'/'blocked_on_parameter'
+   *    (one active workflow run per session, matching the one-question/
+   *    one-input-request invariants elsewhere on ChatSession).
+   *  - requireVersion: used by every step-transition write — optimistic lock
+   *    on WorkflowRunState.version. Caller passes the PRE-transition version;
+   *    the condition checks the STORED version still matches before the new
+   *    (already version+1'd) run overwrites it. Loses the race -> null, and
+   *    the caller must re-read + recompute rather than trust its local object.
+   */
+  async updateSessionWorkflowRun(
+    sessionId: string,
+    workflowRun: WorkflowRunState | null,
+    opts?: { failIfActiveExists?: boolean; requireVersion?: number },
+  ): Promise<ChatSession | null> {
+    const guard = opts?.failIfActiveExists === true && workflowRun !== null;
+    const requireVersion = typeof opts?.requireVersion === 'number' ? opts.requireVersion : undefined;
+
+    const params: any = workflowRun
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET workflowRun = :workflowRun, adminListPartition = :adminListPartition',
+          ExpressionAttributeValues: { ':workflowRun': workflowRun, ':adminListPartition': 'all' },
+          ReturnValues: 'ALL_NEW',
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'REMOVE workflowRun',
+          ReturnValues: 'ALL_NEW',
+        };
+
+    if (guard) {
+      // attribute_exists(sessionId) is REQUIRED here, not optional belt-and-
+      // braces: attribute_not_exists(workflowRun) is satisfied identically
+      // whether the field is merely absent on an existing row or the whole
+      // session item doesn't exist at all — DynamoDB's conditional UpdateItem
+      // creates the item if missing. Without this, a session deleted between
+      // the caller's existence check and this write (or a caller that never
+      // checked) would silently upsert a partial ChatSession row instead of
+      // failing the guard.
+      params.ConditionExpression =
+        'attribute_exists(sessionId) AND (attribute_not_exists(workflowRun) OR workflowRun.#wStatus IN (:completedStatus, :failedStatus))';
+      params.ExpressionAttributeNames = { '#wStatus': 'status' };
+      params.ExpressionAttributeValues[':completedStatus'] = 'completed';
+      params.ExpressionAttributeValues[':failedStatus'] = 'failed';
+    } else if (requireVersion !== undefined) {
+      params.ConditionExpression = 'workflowRun.runId = :requireRunId AND workflowRun.version = :requireVersion';
+      params.ExpressionAttributeValues = {
+        ...(params.ExpressionAttributeValues || {}),
+        ':requireRunId': workflowRun?.runId,
+        ':requireVersion': requireVersion,
+      };
+    }
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      if ((guard || requireVersion !== undefined) && (error as any)?.code === 'ConditionalCheckFailedException') {
+        return null;
+      }
+      console.error('Error updating session workflow run:', error);
       throw error;
     }
   }

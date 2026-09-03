@@ -931,10 +931,18 @@ export class TwitterService {
   // instead of a silent empty result.
   private mapListScopeError(err: unknown): never {
     if (typeof err === 'object' && err !== null && (err as any).code === 403) {
-      throw new Error(
+      // Preserve the 403 on the rewritten error (ENG-1300): classifyToolErrorClass
+      // reads `.code` to classify HTTP errors, and the friendlier message below
+      // matches none of its patterns on its own. Without `.code` this recurring,
+      // well-understood account-permission gap falls back to a generic 'Error'
+      // class ('bug' failure type) instead of 'auth' ('config'), so it never
+      // shows up in the tool scorecard or run-verdict telemetry as what it is.
+      const scopeError: any = new Error(
         'Your X account is missing the "list.read" permission needed to read X Lists. ' +
         'Go to Settings → Connected Accounts and reconnect your X account to grant List access.'
       );
+      scopeError.code = 403;
+      throw scopeError;
     }
     throw err as Error;
   }

@@ -26,6 +26,8 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
+  findWorkPlanStepByCount,
+  hadExhaustedTransientStepFailure,
   snapshotWorkPlanTurn,
   type WorkPlanTurnDisposition,
 } from './agentMode/core/workPlanTurnDisposition';
@@ -46,6 +48,10 @@ import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
+import {
+  normalizeOpenRouterResponseMetadata,
+  normalizeOpenRouterErrorMetadata,
+} from './agentMode/openRouterMetadata';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
@@ -56,11 +62,20 @@ import {
   promptRequestsLogo,
 } from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory } from './agentMode/core/toolDispatch';
+import {
+  describeImageReportsFabricatedMetrics,
+  FABRICATED_METRICS_CHECK_PROMPT,
+  FABRICATED_METRICS_CHECK_TIMEOUT_MS,
+  FABRICATED_METRICS_WARNING,
+  promptRisksFabricatedMetrics,
+} from './agentMode/dataFabricationGuard';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
+import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
+import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
@@ -77,6 +92,8 @@ import {
   applyAnswer,
   buildPendingUserQuestion,
   checkQuestionGate,
+  findAnsweredObjectiveCandidate,
+  summarizeAnsweredObjectiveQuestions,
   findQuestionByKind,
   renderQuestionPrompt,
   verifyExplicitStatement,
@@ -131,7 +148,7 @@ import { enqueueAutoHumanEval } from './autoHumanEvalService';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
-import { SearchResultSource } from '../search/searchProvider';
+import { SearchPurpose, SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import {
@@ -147,7 +164,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -325,7 +342,36 @@ export function isVerificationFunctionCallRetryPress(text: string): boolean {
 export function pressesIrreversiblePublishWrite(text: string): boolean {
   return isVerificationFunctionCallRetryPress(text) && IRREVERSIBLE_PUBLISH_TOOLS.some((tool) => text.includes(tool));
 }
-import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
+
+// ENG-1670: a blind fixed backoff is a guess — OpenRouter documents that a
+// 429/5xx can carry `retry-after` (seconds, or an HTTP-date) or the proactive
+// `retry-after-ms`, and the OpenAI SDK's own (disabled here via maxRetries: 0)
+// retry logic already trusts that header over a computed default when it's
+// present and under 60s. Mirror that instead of guessing: honoring the
+// provider's own signal is correct regardless of whether that signal turns
+// out to be 1.5s or 45s, where a fixed backoff is only right by luck.
+//
+// Shared by callLLM's in-call retry loop AND generateMarketingResponse's
+// outer catch (which persists whether a header was actually present, once the
+// call has exhausted its retries and the whole turn is failing) — one
+// definition, so both readings of the same header can never disagree.
+export function getRetryAfterMs(error: unknown): number | undefined {
+  const headers = (error as any)?.headers;
+  if (!headers) return undefined;
+  const msHeader = headers['retry-after-ms'];
+  if (msHeader) {
+    const ms = parseFloat(msHeader);
+    if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
+  }
+  const secHeader = headers['retry-after'];
+  if (secHeader) {
+    const seconds = parseFloat(secHeader);
+    const ms = !Number.isNaN(seconds) ? seconds * 1000 : Date.parse(secHeader) - Date.now();
+    if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
+  }
+  return undefined;
+}
+import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags, isMetaAccountScopeRefusal } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import {
   isAnonymizedIdentifier,
@@ -356,6 +402,7 @@ import {
   collectPendingDestinations,
   collectPendingCreativeIds,
   computeTrackingOverrideDigest,
+  computeMetaWriteManifestDigest,
   trackingOverrideTokenMatches,
 } from './metaLaunchGate';
 import { HubSpotService } from './hubspotService';
@@ -425,6 +472,35 @@ import {
   META_GOAL_BID_STRATEGY_MAP,
   META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
+
+/**
+ * ENG-1685: build the S3-safe filename for a generated HTML artifact from its
+ * (human-written, arbitrary-content) title.
+ *
+ * Kraftersland/Helen reported "Download failed" on an HTML report artifact whose
+ * displayed filename was truncated mid-word: `..._Weekly_Performance_Repor.html`
+ * (missing the final "t"). Root cause: the sanitize-then-truncate order was
+ * backwards everywhere this ran — `title.replace(...).substring(0, 50)` blindly
+ * cut the ALREADY-underscore-joined string at a fixed 50-char boundary with no
+ * regard for word breaks, so any title whose sanitized form crossed that
+ * boundary lost a fragment of its last word. The 50-char cap itself had no
+ * documented reason: S3 keys allow up to 1024 bytes and this key already has a
+ * userId + timestamp + random token prefix, leaving hundreds of characters of
+ * real headroom — the low, undocumented number was never load-bearing.
+ *
+ * The truncated filename was NOT independently confirmed to be the cause of the
+ * download failure itself (a live repro of the exact reported file's presign +
+ * S3 fetch succeeded end-to-end against production), but it is a real, visible
+ * bug in the same code path and worth fixing regardless — and downloadAsset.ts's
+ * error handling was hardened separately (ENG-1685) to stop collapsing every
+ * failure class into one indistinguishable "Download failed" toast, which is
+ * what made this report undiagnosable from the client side in the first place.
+ */
+export function buildHtmlArtifactFilename(title: string, now: number = Date.now()): string {
+  const HTML_ARTIFACT_FILENAME_TITLE_MAX = 150;
+  const sanitized = (title || '').replace(/[^a-z0-9]/gi, '_').substring(0, HTML_ARTIFACT_FILENAME_TITLE_MAX);
+  return `html_${now}_${sanitized}.html`;
+}
 
 /**
  * Self-learning loop telemetry for agent-mode tool calls.
@@ -1238,6 +1314,61 @@ function linkedInPublicIdFromUrl(url: string | undefined | null): string | null 
 /** Narrow local shape of a stored google_ads config (ENG-1362). */
 type GoogleAdsConfigShape = { customer_id: string; currency?: string; test_account?: boolean };
 
+/**
+ * Escape a value for interpolation into a Google Drive `q` string literal.
+ *
+ * Drive's query grammar requires BOTH `\` and `'` to be escaped inside a string. The call
+ * sites here escaped only the quote, so a backslash in a value survived verbatim: a file
+ * literally named `report\` produced `name = 'report\'`, whose trailing `\'` reads as an
+ * escaped quote, leaving the string unterminated — an opaque Drive 400 rather than a match.
+ * The same gap is what lets a crafted value manipulate quote parity and reach past the
+ * parent-folder clause the query is scoped by, so this is a correctness AND a scoping fix.
+ *
+ * Backslash MUST be replaced first: doing the quote first would then double-escape the
+ * backslashes it just introduced.
+ */
+function escapeDriveQueryValue(value: string): string {
+  // A non-string reaching here used to throw on `.replace`; `String(...)` would instead embed the
+  // literal `undefined` and run a confidently wrong query. Refuse loudly rather than search for a
+  // file named "undefined" and report it missing.
+  if (typeof value !== 'string') {
+    throw new Error(`Drive query value must be a string, received ${value === null ? 'null' : typeof value}`);
+  }
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+/**
+ * Validate a model-supplied Drive date filter, returning the `YYYY-MM-DD` day it names.
+ *
+ * `modified_after`/`modified_before` reach `list_knowledge_base_files` as a bare
+ * `type: "string"` with no schema constraint and no validation anywhere, and were interpolated
+ * UNESCAPED into the same `q` as the parent-folder clause. Drive's `or` binds looser than `and`,
+ * so `modified_after = "2020-01-01' or name != 'x"` ORs the parent scoping away and matches
+ * everything the query can see — and the Drive client is a SHARED service account holding
+ * `drive.readonly`, so that is other tenants' file names, ids, sizes and modifiedTimes.
+ *
+ * Escaping alone would fix the injection. Validating as well is what stops the OTHER failure:
+ * a value that is merely malformed (a full ISO datetime, say) produced
+ * `'2026-04-15T10:00:00ZT00:00:00'` and an opaque Drive 400 rather than a usable error.
+ *
+ * Deliberately strict — a calendar day, which is the only shape the caller then wraps in
+ * `T00:00:00`/`T23:59:59`. Anything else is refused with the expected format named, rather than
+ * guessed at.
+ */
+function validateDriveDateFilter(value: string, label: string): string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new Error(
+      `${label} must be a calendar date in YYYY-MM-DD form (e.g. "2026-04-15"); received ${JSON.stringify(value)}.`,
+    );
+  }
+  // Rejects 2026-02-31 and friends: Date normalises them, so round-tripping is the check.
+  const parsed = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+    throw new Error(`${label} is not a real calendar date: ${JSON.stringify(value)}.`);
+  }
+  return value;
+}
+
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
   // ENG-1295 hardening: self-consistency cache for perform_data_analysis. Keyed by
@@ -1274,9 +1405,15 @@ export class AgentModeService {
   // 2026-08-19 (Harsha, live picker review): Auto/default moved off Opus,
   // through GLM 5.2 and GPT-5.6 Luna, to Gemini 3.7 Flash — Google's newest
   // Flash-line model (GA 2026-08-13), cheap ($0.75/$3.75 per 1M, Google's own
-  // direct rate — not a multi-provider OpenRouter blend), and it dominates
+  // direct rate — not a multi-provider OpenRouter blend), and it dominated
   // every other model in the `gemini-flash` family band for band.
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.7-flash';
+  // 2026-09-02 (Harsha, in-session approval): moved again, from Gemini 3.7
+  // Flash to Gemini 3.8 Flash. Same family/tier/pricing, 3.8 dominates 3.7 on
+  // quality (59 vs 56) — the dominance system correctly auto-flagged 3.7
+  // legacy the moment 3.8 was added to the catalog, and leaving the default
+  // pinned to a legacy model would contradict AC2 of the acceptance suite
+  // this default has always carried (see agentModeService.defaultModel*.test.ts).
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.8-flash';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -1738,12 +1875,20 @@ export class AgentModeService {
         if (toList.length === 0) {
           throw new Error('At least one valid email address is required in the "to" field.');
         }
-        await emailService.sendSessionNotificationEmail(
+        const result = await emailService.sendSessionNotificationEmail(
           toList,
           context.sessionId,
           args.message,
           args.subject
         );
+        if (result?.duplicate) {
+          return {
+            success: true,
+            sent_to: [],
+            duplicate_suppressed: true,
+            message: `A session notification to ${toList.join(', ')} was already sent earlier in this session — skipped to avoid sending a duplicate email.`
+          };
+        }
         return {
           success: true,
           sent_to: toList,
@@ -2068,6 +2213,10 @@ export class AgentModeService {
           defaultHeaders: {
             'HTTP-Referer': 'https://app.agentweb.pro',
             'X-Title': 'AgentWeb',
+            // ENG-1712: opt in to OpenRouter's router-metadata block (resolved
+            // provider + is_byok) so the log-only normalizer below has real
+            // data to read instead of always logging undefined.
+            'X-OpenRouter-Metadata': 'enabled',
           },
         });
 
@@ -2126,6 +2275,17 @@ export class AgentModeService {
 
   /** Media types the vision APIs decode natively. */
   private static readonly VISION_NATIVE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+  // ENG-1670: a scheduled run's own tool-calling loop can fire several Gemini
+  // calls back-to-back within one turn (prod-verified: 4 calls in ~22s on the
+  // "LinkedIn Post Factory" schedule) with nothing pacing them — the schedule
+  // jitter fix (agentModeController.calculateNextRunTime) addresses platform-
+  // wide clustering across DIFFERENT schedules, but does nothing for a single
+  // session's own rapid iteration cadence. Scoped tightly: scheduled runs only
+  // (never adds latency to a live interactive user watching the screen), and
+  // Gemini only (the provider this class of 429 was confirmed against) — not a
+  // blanket delay on every model or every turn.
+  private static readonly SCHEDULED_GEMINI_ITERATION_PACING_MS = 1500;
 
   /**
    * Normalize uploaded image bytes to a vision-decodable representation. This
@@ -2217,7 +2377,14 @@ export class AgentModeService {
     // dominance rule do its job: 3.7 Flash is both cheaper (cost tier 'cheap'
     // vs 3.5's 'medium') and higher quality (56 vs 52) than 3.5 Flash, so 3.5
     // Flash is now correctly auto-flagged legacy.
-    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
+    // ENG-1713: gemini-3.6-flash (band predecessor, not itself in this registry),
+    // 3.7, and 3.8 all deprecate temperature/top_p/top_k per Google's migration
+    // guide (ai.google.dev/gemini-api/docs/latest-model — "Remove deprecated
+    // sampling parameters" — confirmed live 2026-09-03 for both ids). Google
+    // currently ignores the param on these models (soft no-op) but states a
+    // future generation will hard-400 on it, so this is set ahead of that.
+    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
+    'gemini-3.8-flash': { name: 'Gemini 3.8 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 59, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-8-flash (high)" page, snapshot 2026-09-02' },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
@@ -2271,6 +2438,29 @@ export class AgentModeService {
     // Net result: Meta/Llama has ZERO entrants after this cleanup. OpenRouter's
     // catalog has no meta-llama/llama-5* listed as of this snapshot (checked
     // live) — this is a real, currently-unfillable gap, not an oversight.
+    // ENG-199/ENG-1685: Claude Fable 5.1 (Anthropic, released 2026-09-01) —
+    // routed through OpenRouter, same convention as every other OpenRouter
+    // entry in this block (id = openrouter/<upstream-provider>/<upstream-model>,
+    // one registry line, no new routing code). This is ENG-199's actual wire-in:
+    // llmPricing.ts had a Fable 5 pricing stub staged since ENG-200 for exactly
+    // this moment, but Fable 5 itself was NEVER added to this llmModels
+    // registry — so there is no existing Fable entry to compare against yet.
+    // Going straight to 5.1 (the current model; Fable 5 is already superseded
+    // as of 2026-09-01) rather than also backfilling the now-superseded 5.
+    // Live AA Intelligence Index score (66, max-effort w/ fallback) confirmed
+    // 2026-09-01 — currently the #1 model on the independent leaderboard, 3pts
+    // above Claude Opus 5 (63). qualityScore/costScore below plug into the
+    // EXISTING dominance rule (getSupportedModelsWithMetadata) automatically —
+    // no dominance action needed today since there's no sibling family member,
+    // but the very next same-family add (e.g. a future Fable 5.2) will
+    // auto-flag whichever one loses on both cost and quality, same as every
+    // other family in this registry.
+    // supportsVision/supportsTemperature per OpenRouter's live model page
+    // (architecture.modality includes image+file input; reasoning-capable).
+    // ENG-199's cost-control blocker (ENG-200) is closed — org/per-user LLM
+    // cost caps already exist and apply automatically to every model priced
+    // in llmPricing.ts, this one included.
+    'openrouter/anthropic/claude-fable-5.1': { name: 'Claude Fable 5.1', family: 'claude-fable', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s top-ranked model for coding & agentic work', client: null, supportsTemperature: false, supportsVision: true, qualityScore: 66, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, max effort w/ fallback, snapshot 2026-09-01' },
     'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // 2026-08-19: qualityScore corrected 52 -> 40. The 52 belonged to a
@@ -2353,6 +2543,54 @@ export class AgentModeService {
       return [defaultModel, ...models.filter(m => m !== defaultModel)];
     }
     return models;
+  }
+
+  /**
+   * ENG-1205 AC3: the catalog the in-chat model-mention detector matches against.
+   *
+   * Returned rather than reaching into `llmModels` from the util so the detector
+   * stays pure and testable, and so adding a model to the registry extends
+   * mention coverage with no second list to maintain (ENG-1137: never scatter
+   * checks for individual model names).
+   *
+   * Internal-only and Live models are excluded: a user cannot select either, so
+   * naming one is not a request this can honor. Admin-only models ARE included —
+   * a non-admin naming one must be told it is not available to them, which is
+   * precisely the acknowledgement AC3 asks for, and `isModelSelectableBy` below
+   * is what decides which sentence they get.
+   */
+  getModelMentionCatalog(): Array<{ id: string; name?: string; family?: string }> {
+    return Object.keys(this.llmModels)
+      .filter((id) => !this.llmModels[id].internalOnly && !this.llmModels[id].isLive)
+      .map((id) => ({
+        id,
+        name: this.llmModels[id].name,
+        family: this.llmModels[id].family,
+      }));
+  }
+
+  /** Built once per process — `llmModels` is a static registry, not per-request state. */
+  private modelMentionIndex: ModelMentionIndex | null = null;
+
+  getModelMentionIndex(): ModelMentionIndex {
+    if (!this.modelMentionIndex) {
+      this.modelMentionIndex = buildModelMentionIndex(this.getModelMentionCatalog());
+    }
+    return this.modelMentionIndex;
+  }
+
+  /**
+   * Would the model picker accept this id for this user? Mirrors the two gates
+   * `agentModeController.updateSessionLlmModel` applies, in the same order: the
+   * supported-model allow-list, then the non-admin Opus restriction. Kept next
+   * to the registry it reads so the two cannot drift.
+   */
+  isModelSelectableBy(modelId: string, isAdmin: boolean): boolean {
+    const config = this.llmModels[modelId];
+    if (!config || config.internalOnly || config.isLive) return false;
+    if (config.adminOnly && !isAdmin) return false;
+    if (modelId.includes('opus') && !isAdmin) return false;
+    return true;
   }
 
   /**
@@ -2516,6 +2754,7 @@ export class AgentModeService {
       humanPaced = false,
       timeoutMs,
       fallbackModels,
+      taskClass,
     } = options || {};
 
     // AgentWeb owns model selection; OpenRouter owns transport, provider
@@ -2533,6 +2772,28 @@ export class AgentModeService {
     }
 
     params.provider = { allow_fallbacks: true, require_parameters: true };
+    if (upstreamModel.startsWith('google/gemini-')) {
+      // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
+      // a legacy Standard API key hitting Google's Sept 2026 Standard-key
+      // cutoff; OpenRouter's own health check showed the "Google" BYOK slot
+      // at 63-85% uptime over 30min vs 99.9%+ on the pooled "Google AI
+      // Studio" slot, and default routing lands on the degraded one. Skip it
+      // until ENG-753 rotates the key to an Auth key and the BYOK slot's
+      // uptime recovers — remove this then, since it forfeits the BYOK cost
+      // discount in exchange for reliability.
+      //
+      // DO NOT change this to 'google-ai-studio' or 'google-vertex' — those
+      // are the slugs OpenRouter's separate BYOK-credential-creation API
+      // uses, not what `provider.ignore` matches on here. This param matches
+      // against the `provider_name` string from GET /v1/models/{id}/endpoints
+      // ("Google" vs "Google AI Studio"), confirmed by 10 live A/B calls
+      // (PR #2732): ignore:['Google'] -> 5/5 landed on Google AI Studio
+      // (correct); ignore:['google-ai-studio'] -> 5/5 landed on Google, i.e.
+      // the DEGRADED slot (backwards). A doc-based static-analysis suggestion
+      // proposed the slug form once already and was reverted for this reason
+      // — verify empirically against live traffic before changing this line.
+      params.provider.ignore = ['Google'];
+    }
     // OpenRouter reports its own billed amount as zero for BYOK requests even
     // though the upstream provider still bills the inference. Request the
     // routing flag so metering can distinguish BYOK from a genuinely free call.
@@ -2640,13 +2901,42 @@ export class AgentModeService {
       return errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx';
     };
 
+    // A single 1.5s retry wasn't enough to clear a burst-triggered 429 — prod
+    // sessions on the LinkedIn Post Factory SCHEDULED schedule (which fires
+    // several tool calls back-to-back) needed the full 15-60min scheduled-run
+    // backoff to recover from what OpenRouter reported as rate-limited. One
+    // extra attempt, backed by the Retry-After header when the provider sends
+    // one, gives a rate limit real room to clear within the same run before
+    // falling back to that expensive path.
+    //
+    // Scoped to scheduled_background ONLY: this loop is shared by every
+    // caller of callLLM, including a live interactive chat with a human
+    // staring at the screen. Retry-After can legitimately be tens of seconds,
+    // and honoring it across two retries could add up to ~2 minutes of dead
+    // air to an interactive turn that used to fail fast after ~1.5s — a much
+    // worse outcome for that caller than the original single-short-retry
+    // behavior. A headless scheduled run has no one watching and already
+    // tolerates a much larger backoff at the schedule level, so it's the only
+    // context where trading latency for a better shot at recovery is a clear
+    // win rather than a regression.
+    const isScheduledLlmCall = taskClass === 'scheduled_background';
+    const maxAttempts = isScheduledLlmCall ? 3 : 2;
     let lastError: unknown;
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const res = await client.chat.completions.create(
           params,
           { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
         );
+        // ENG-1712: resolved provider slot + BYOK flag, log-only (no routing
+        // impact) -- lets a production incident/verification tie a specific
+        // call to the provider it actually landed on without reading
+        // credential material out-of-band.
+        const resolvedMetadata = normalizeOpenRouterResponseMetadata(res);
+        console.log(`AgentMode: OpenRouter call succeeded for model "${model}"`, {
+          provider: resolvedMetadata.provider,
+          is_byok: resolvedMetadata.is_byok,
+        });
         // Fire-and-forget usage metering; it must never break an LLM call.
         try {
           const usage: any = (res as any)?.usage;
@@ -2677,11 +2967,20 @@ export class AgentModeService {
         return res;
       } catch (error) {
         lastError = error;
-        if (attempt < 2 && isRetryableLlmCallError(error)) {
-          console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying once`, {
+        if (attempt < maxAttempts && isRetryableLlmCallError(error)) {
+          // Retry-After is only honored for scheduled calls (see maxAttempts
+          // comment above) — an interactive/other caller keeps the original
+          // fixed, short backoff so a live turn still fails fast rather than
+          // trusting a provider-reported wait that could be tens of seconds.
+          const retryAfterMs = isScheduledLlmCall ? getRetryAfterMs(error) : undefined;
+          const backoffMs = retryAfterMs ?? 1500 * Math.pow(2, attempt - 1);
+          console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms${retryAfterMs !== undefined ? ' (honoring Retry-After)' : ''}`, {
             error: error instanceof Error ? error.message : String(error),
+            // ENG-1712: OpenRouter surfaces the attempted provider/BYOK slot on
+            // some error shapes too (varies by failure type); include when present.
+            ...normalizeOpenRouterErrorMetadata(error),
           });
-          await this.sleep(1500);
+          await this.sleep(backoffMs);
           continue;
         }
         break;
@@ -2690,6 +2989,8 @@ export class AgentModeService {
     console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
       error: lastError instanceof Error ? lastError.message : String(lastError),
       stack: lastError instanceof Error ? lastError.stack : undefined,
+      // ENG-1712: same optional provider/BYOK metadata as the retry-warn path.
+      ...normalizeOpenRouterErrorMetadata(lastError),
     });
     throw lastError;
   }
@@ -3011,6 +3312,17 @@ export class AgentModeService {
       }
 
       const isAdmin = currentUser?.isAdmin === true;
+
+      // ENG-1205: the correction this turn was admitted under, stamped onto the
+      // turn's assistant messages beside `llm` so a reload can still explain why
+      // the badge disagrees with the picker. The controller wrote this decision
+      // onto the session immediately before dispatch; `resolveTurnModelCorrection`
+      // rejects a slot that does not describe THIS turn, so a resumed or replayed
+      // run degrades to no stamp rather than borrowing a newer turn's model.
+      const turnModelCorrection = resolveTurnModelCorrection(
+        (currentSession as any)?.llmUsagePolicyDecision,
+        llmModel,
+      );
       // Admin tools are available to real admins OR to messages arriving via admin delegated access.
       // iShare sessions always block admin tools even if somehow isDelegatedAccess is set.
       const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
@@ -3697,6 +4009,23 @@ export class AgentModeService {
           }
         }
 
+        // ENG-1670: pace out a scheduled run's own back-to-back Gemini calls within
+        // this turn. Narrow guard: scheduled only (never adds latency for a live
+        // interactive user), Gemini only (the provider this failure was confirmed
+        // against), iteration > 1 only (the turn's first call has nothing preceding
+        // it in this turn to burst against), and skipped once the turn is already
+        // racing its own wall-clock cap — this is defense against this session's own
+        // request rate, not worth trading against the ENG-907 time budget it would
+        // otherwise eat into.
+        if (
+          isScheduledSession
+          && iteration > 1
+          && llmModel.startsWith('gemini')
+          && !forceFinalSynthesis
+        ) {
+          await this.sleep(AgentModeService.SCHEDULED_GEMINI_ITERATION_PACING_MS);
+        }
+
         // Trim large old tool results to prevent context window overflow
         const trimmedMessages = this.trimToolMessagesForContext(messages);
 
@@ -3852,6 +4181,12 @@ export class AgentModeService {
 
         // Add LLM model to the response message
         responseMessage.llm = llmModel;
+        // ENG-1205: and, when the model that ran is not the one that was asked
+        // for, what was asked for — `llm` alone cannot distinguish "you picked
+        // this" from "you were given this".
+        if (turnModelCorrection) {
+          responseMessage.modelCorrection = turnModelCorrection;
+        }
 
         // Attach token usage from the LLM response to the message
         const responseUsage = response.usage;
@@ -3912,6 +4247,49 @@ export class AgentModeService {
             `AgentMode: Discarding ${responseMessage.tool_calls.length} tool call(s) requested during the ` +
             `forced final synthesis in session ${sessionId} — the turn's time budget is spent`
           );
+
+          // ENG-1682 follow-up: a step's deliverable can genuinely finish (e.g.
+          // create_html_file succeeds) in the very turn the time budget runs out —
+          // one tool call before the model would have marked the step completed.
+          // Discarding set_work_plan_status like every other call here leaves that
+          // step stuck "pending" in DynamoDB forever even though the work is done,
+          // which is the same "no visible end results" failure this ticket is
+          // about. Apply it directly instead of executing it through the normal
+          // loop: it's a single bounded DB write, not another LLM round trip, so it
+          // costs nothing against the reserve held back for the forced synthesis
+          // call below, and it closes the gap without reopening the loop.
+          const statusCall = responseMessage.tool_calls.find(
+            (call: any) => call.function?.name === 'set_work_plan_status'
+          );
+          if (statusCall) {
+            try {
+              const args = JSON.parse(statusCall.function.arguments || '{}');
+              if (Array.isArray(args.updates)) {
+                const statusResult = await this.setWorkPlanStatus(args.updates, sessionId);
+                if (statusResult?.success) {
+                  console.warn(
+                    `AgentMode: Applied the discarded set_work_plan_status call in session ${sessionId} ` +
+                    'despite the forced synthesis — the underlying work already finished'
+                  );
+                } else {
+                  // CodeRabbit (PR #2713): setWorkPlanStatus can reject an update (out-of-order,
+                  // missing required calls, insufficient assets, unknown step) without throwing —
+                  // logging an unconditional "Applied" here would misreport a rejected update as
+                  // a success. Report what actually happened instead.
+                  console.warn(
+                    `AgentMode: Discarded set_work_plan_status call in session ${sessionId} was rejected ` +
+                    `(${statusResult?.message || 'no message'}) — the step's status was not changed`
+                  );
+                }
+              }
+            } catch (statusError) {
+              console.error(
+                `AgentMode: Failed to apply the discarded set_work_plan_status call in session ${sessionId}:`,
+                statusError
+              );
+            }
+          }
+
           delete responseMessage.tool_calls;
         }
 
@@ -4076,12 +4454,20 @@ export class AgentModeService {
 
           if (requireWorkPlanDisposition) {
             const latestSession = await chatbotDb.getChatSession(sessionId, true);
+            // ENG-828: the pending step's own required tool retried once (per the
+            // "Retrying a Transient Failure" carve-out) and failed both times — a
+            // legitimate exhausted-retry outcome, not a malformed turn. Without this,
+            // it falls through to `invalid` below and the generic "couldn't create
+            // the decision card" fallback overwrites the model's own honest
+            // explanation (reproduced live testing this ticket's fix).
+            const pendingStep = findWorkPlanStepByCount(latestSession, workPlanTurnBefore.pendingStepCount);
             workPlanTurnDisposition = decideWorkPlanTurnDisposition({
               before: workPlanTurnBefore,
               after: snapshotWorkPlanTurn(latestSession),
               failed: finishReason === 'content_filter'
                 || stopReason === 'guardrail_intervened'
-                || stopReason === 'content_filtered',
+                || stopReason === 'content_filtered'
+                || hadExhaustedTransientStepFailure(toolCalls, pendingStep?.requiredFunctionCalls),
             });
 
             if (workPlanTurnDisposition.kind === 'invalid') {
@@ -4575,6 +4961,50 @@ export class AgentModeService {
         }
       }
 
+      // ENG-1205 AC3: the NAMED half of the same silence. ENG-1565 (below) fires
+      // on "reassess using a new model"; it deliberately does not fire on a
+      // message that names the model it wants, which is what the founders
+      // session actually contained ("Use Opus 5 model, and make sure you sort
+      // all of the 107 leads...", session d5898ffd, 2026-08-14). That request
+      // and the nine turns after it were answered with nothing.
+      //
+      // Runs BEFORE the generic acknowledgement and suppresses it on a hit: a
+      // message can trip both detectors ("switch to a different model, use Opus
+      // 5"), and two stacked notes saying the same thing is worse than one that
+      // names the model. The specific note is strictly more informative.
+      //
+      // `isAdmin` is the session owner's, already resolved above for the system
+      // prompt — so the entitlement branch of the copy costs no extra read.
+      //
+      // Kill switch: set AGENT_MODEL_MENTION_ACK=false to disable. Absent means ON.
+      let modelAckAppended = false;
+      if (content && !wasCancelled && !mockMode
+          && process.env.AGENT_MODEL_MENTION_ACK !== 'false') {
+        try {
+          const reconciled = reconcileModelMentionAck(
+            content,
+            messageContent,
+            llmModel,
+            this.getModelMentionIndex(),
+            (modelId) => this.isModelSelectableBy(modelId, isAdmin),
+          );
+          if (reconciled !== content) {
+            content = reconciled;
+            modelAckAppended = true;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                break;
+              }
+            }
+          }
+        } catch (modelMentionError) {
+          // Advisory, same reasoning as the reconcilers around it: never block
+          // delivery of a reply the user is waiting on over this note.
+          console.warn('AgentMode: model-mention acknowledgement failed', modelMentionError);
+        }
+      }
+
       // ENG-1565: model resolution reads ONLY the request's llmModel field (the
       // picker) — no code path parses chat text for an intent to switch/reassess
       // models. So a message like "reassess using a new model" is inert by
@@ -4591,7 +5021,7 @@ export class AgentModeService {
       // change the model despite the chat text.
       //
       // Kill switch: set AGENT_MODEL_REASSESS_ACK=false to disable. Absent means ON.
-      if (content && !wasCancelled && !mockMode
+      if (content && !wasCancelled && !mockMode && !modelAckAppended
           && process.env.AGENT_MODEL_REASSESS_ACK !== 'false') {
         try {
           const modelBefore = findLastAssistantModel(sessionHistory as any);
@@ -4738,6 +5168,16 @@ export class AgentModeService {
       wrappedError.originalMessage = error?.message || String(error);
       if (error?.status) wrappedError.status = error.status;
       if (error?.code) wrappedError.code = error.code;
+      // ENG-1670: whether the provider actually sent a Retry-After header is not
+      // guaranteed (OpenRouter's own docs: conditional, not promised even for a
+      // single-provider model). Rather than that staying an unanswerable question
+      // every time this fires, persist the answer for THIS occurrence — the last
+      // investigation into this exact failure class had no way to tell, because
+      // nothing captured it and the raw provider response doesn't survive past
+      // this catch block otherwise.
+      wrappedError.retryAfterHeaderPresent = Boolean((error as any)?.headers?.['retry-after'] || (error as any)?.headers?.['retry-after-ms']);
+      const retryAfterMs = getRetryAfterMs(error);
+      if (retryAfterMs !== undefined) wrappedError.retryAfterMs = retryAfterMs;
       if (partialResponseMessages.length > 0) {
         wrappedError.partialUsageMessages = partialResponseMessages;
       }
@@ -5818,7 +6258,7 @@ export class AgentModeService {
   public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
       if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
-        return { message: "skillIds must be a non-empty array of skill IDs." };
+        return { success: false, message: "skillIds must be a non-empty array of skill IDs." };
       }
 
       const availableSkills = await this.getSkillsForDisplay([], userId);
@@ -5849,9 +6289,21 @@ export class AgentModeService {
 
       if (!installedNames.length) {
         if (rejectedSkillIds.length > 0) {
-          return { message: "The requested skills are not available with your current subscription." };
+          /*
+           * `success: false` matters as much as the text: the success path returns
+           * `success: true`, so a bare `{ message }` left `success` undefined and this refusal
+           * did not necessarily read as a hard failure. Combined with a gated tool upstream,
+           * that is how a model ends up substituting another tool's output and presenting it
+           * as the gated tool's result.
+           */
+          return {
+            success: false,
+            message: "The requested skills are not available with your current subscription."
+              + " Tell the user plainly that this capability is not on their plan."
+              + " Do NOT substitute a different tool's output for the tool that needed this skill, and do not describe that tool as having run.",
+          };
         }
-        return { message: "No valid skills found for the provided IDs." };
+        return { success: false, message: "No valid skills found for the provided IDs." };
       }
 
       const result: any = {
@@ -5862,12 +6314,23 @@ export class AgentModeService {
 
       if (rejectedSkillIds.length > 0) {
         result.message += ` ${rejectedSkillIds.length} skill(s) were not available with your subscription.`;
+        /*
+         * The refusal has to be a FIELD, not just prose appended to `message`.
+         *
+         * A partial install returns `success: true` — something did install — so every
+         * "did the install work" test downstream reads it as clean, while the one skill the
+         * model actually needed may be exactly the one that was refused. That distinction is
+         * the whole outcome of the call, and a sentence inside `message` is not something any
+         * consumer can key off: not the model, which has to be told WHICH ids it did not get,
+         * and not any future guard, which would be reduced to string-matching prose.
+         */
+        result.rejectedSkillIds = rejectedSkillIds;
       }
 
       return result;
     } catch (error) {
       console.error('AgentMode: Error in installSkills:', error);
-      return { message: "An error occurred while installing skills." };
+      return { success: false, message: "An error occurred while installing skills." };
     }
   }
 
@@ -6269,7 +6732,11 @@ export class AgentModeService {
         // returns success:true with no imageUrl. Dropping this flag made that state
         // indistinguishable from a broken generation downstream (the auto-revision
         // path reported it as "failed to extract asset URL").
-        ...(actualResult.awaitingUserConfirmation === true && { awaitingUserConfirmation: true })
+        ...(actualResult.awaitingUserConfirmation === true && { awaitingUserConfirmation: true }),
+        // ENG-1027: the post-generation data-fabrication check's warning must survive
+        // this minimizer (everything unnamed here is dropped) or Emma never sees it
+        // and silently presents invented numbers as real data.
+        ...(actualResult.dataReliabilityWarning && { dataReliabilityWarning: actualResult.dataReliabilityWarning })
       };
     }
 
@@ -6507,6 +6974,51 @@ export class AgentModeService {
         verification: actualResult.verification,
         recovery: actualResult.recovery,
         retryable: actualResult.retryable,
+      };
+    }
+
+    /*
+     * install_skills: the OUTCOME survives minimization.
+     *
+     * `installSkills` never throws — every refusal path returns `{ success: false, message }`.
+     * A HARD refusal does still reach the ledger with an `error`, because the dispatcher's
+     * downgrade (toolDispatch.ts, `toolResultError`) converts a `success: false` result into a
+     * tool failure. Verified end-to-end through executePreparedTools, not assumed.
+     *
+     * What that downgrade cannot see is a PARTIAL install: it returns `success: true` because
+     * something installed, so no error is raised, while the one skill the gated tool needed may
+     * be exactly the one that was refused. `rejectedSkillIds` is the only fact that separates a
+     * half-granted install from a granted one, and the default `{}` below stripped it — leaving
+     * the ledger asserting a clean install on the exact shape where the model did not get what
+     * it asked for.
+     *
+     * `success`/`message` ride along so the ledger entry is self-describing rather than
+     * depending on the downgrade staying wired the way it is today. Ids and a short message,
+     * never a payload.
+     */
+    if (toolName === 'install_skills') {
+      // Some registries hand results back wrapped as a JSON string in `content` (see the
+      // branches above). Parse it the same way, so the outcome is read from wherever it is.
+      let actualResult = result;
+      if (result?.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error('AgentMode: Failed to parse install_skills result.content as JSON:', e);
+        }
+      }
+      const a = (actualResult && typeof actualResult === 'object' ? actualResult : {}) as Record<string, any>;
+      return {
+        // `success` only when the result actually carries it. Defaulting a missing flag to
+        // false would let an unrecognised shape read as a FAILED install — reporting a failure
+        // that did not happen is the expensive direction to be wrong here, so an absent flag
+        // stays absent rather than being invented.
+        ...(a.success !== undefined ? { success: a.success === true } : {}),
+        ...(a.message !== undefined ? { message: a.message } : {}),
+        ...(Array.isArray(a.installedSkills) ? { installedSkills: a.installedSkills } : {}),
+        ...(Array.isArray(a.rejectedSkillIds) && a.rejectedSkillIds.length > 0
+          ? { rejectedSkillIds: a.rejectedSkillIds }
+          : {}),
       };
     }
 
@@ -13072,7 +13584,15 @@ export class AgentModeService {
       };
     } catch (error) {
       console.error('AgentMode: Error sending email to lead:', error);
-      return { success: false, message: 'Failed to send email', error: error instanceof Error ? error.message : 'Unknown error' };
+      const { emailProviderErrorStatus } = await import('./emailProviderService');
+      return {
+        success: false,
+        message: 'Failed to send email',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: Gmail/Outlook throw fully-typed EmailProviderError
+        // subclasses with no HTTP status of their own — mapped by name.
+        code: emailProviderErrorStatus(error)
+      };
     }
   }
 
@@ -13237,17 +13757,24 @@ export class AgentModeService {
         // configured"). Nearly all are resolved by reconnecting in Settings.
         const raw = error instanceof Error ? error.message : String(error);
         const needsReconnect = senderProvider !== 'resend' && /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
+        // ENG-1300: Gmail/Outlook throw fully-typed EmailProviderError subclasses
+        // with no HTTP status of their own — mapped by name. undefined for Resend
+        // and any other error shape, which is fine: the fields below are additive.
+        const { emailProviderErrorStatus } = await import('./emailProviderService');
+        const code = emailProviderErrorStatus(error);
         if (needsReconnect) {
           return {
             success: false,
             message: `${label} sender needs reconnecting`,
             error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
+            code,
           };
         }
         return {
           success: false,
           message: `${label} send failed`,
           error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
+          code,
         };
       }
 
@@ -13261,7 +13788,13 @@ export class AgentModeService {
       };
     } catch (error) {
       console.error('AgentMode: Error sending email from configured sender:', error);
-      return { success: false, message: 'Failed to send email', error: error instanceof Error ? error.message : 'Unknown error' };
+      const { emailProviderErrorStatus } = await import('./emailProviderService');
+      return {
+        success: false,
+        message: 'Failed to send email',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        code: emailProviderErrorStatus(error)
+      };
     }
   }
 
@@ -15953,12 +16486,37 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`
       );
 
-      if (campaignsData.error) {
+      /*
+       * A later page's failure must not throw away the pages that succeeded.
+       *
+       * ENG-1300 makes fetchWithRetryAndPaging set `data.error` when any page returns non-2xx,
+       * so callers cannot mistake a partial multi-page read for a clean one. Correct — but this
+       * branch reads `error` as "the whole read failed" and returns success:false with NO
+       * campaigns, so a 5xx on page 3 discarded the rows from pages 1 and 2 that were read
+       * perfectly well. That is the ENG-1584 failure from the other direction: not a short list
+       * presented as complete, but a real list presented as nothing at all.
+       *
+       * A hard failure is still right when nothing was read. When rows exist AND the read
+       * reported itself truncated, fall through to the partial path below, which returns those
+       * rows with an explicit INCOMPLETE warning and the failed page's reason.
+       */
+      const hasPartialRows = Array.isArray(campaignsData.data) && campaignsData.data.length > 0;
+      if (campaignsData.error && !(hasPartialRows && campaignsData.pagingTruncated)) {
         console.error('AgentMode: Campaigns API Error:', campaignsData.error);
         return {
           success: false,
-          message: `Failed to fetch campaigns: ${campaignsData.error.message}`,
-          error: campaignsData.error.message
+          // Masked like the paging sibling below: Graph error text can name the object
+          // ("Object with ID '120...' does not exist"), and this string reaches the user.
+          // Both fields. `extractToolResultMessage` reads `error` BEFORE `message`, so masking
+          // only `message` masked nothing — the raw id reached the model through `error`. The
+          // paging sibling below is on a success result carrying only `message`, which is why
+          // one field was enough there and is not here.
+          message: `Failed to fetch campaigns: ${AgentModeService.maskMetaIds(campaignsData.error.message)}`,
+          error: AgentModeService.maskMetaIds(campaignsData.error.message),
+          // ENG-1300: fetchWithRetryAndPaging exposes the real HTTP status as a
+          // non-enumerable __httpStatus field — never campaignsData.error.code,
+          // which is Meta's own business error code, not an HTTP status.
+          code: (campaignsData as any).__httpStatus
         };
       }
 
@@ -15969,9 +16527,39 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         objective: campaign.objective
       }));
 
+      /*
+       * `fetchWithRetryAndPaging` is bounded (META_PAGING_MAX_PAGES), and this URL sets no
+       * `limit`, so Meta serves its default page size. A bounded read that reports a bare count
+       * is the ENG-1584 sentence — "Found N campaign(s)" reads as "these are all of them". The
+       * helper reports `pagingTruncated`; say so rather than discarding it.
+       *
+       * `pagingTruncated` now covers BOTH stop reasons — the page bound and a page that came
+       * back unreadable — because `fetchWithRetry` returns a non-ok Response once its retries
+       * are exhausted instead of throwing. The `campaignsData.error` check above only ever sees
+       * page 1, so a 429 on page 2 used to reach here indistinguishable from a complete read.
+       * The wording no longer names the page bound as the cause, and the failed page's own
+       * Graph message is passed through when there is one.
+       */
+      const campaignsTruncated = campaignsData.pagingTruncated === true;
+      /*
+       * Graph's own error text reaches the user here, and some of it names the object:
+       * `Unsupported get request. Object with ID '120...' does not exist`. The product rule that
+       * raw Meta ids are never shown to users does not stop applying because the string came
+       * from Meta — this PR stripped ids out of every launch-gate block message for the same
+       * reason. Long digit runs are the only id shape Graph emits, so masking them keeps the
+       * diagnostic ("rate limit", "unsupported request") and drops the identifier.
+       */
+      const pagingErrorMessage = typeof campaignsData.pagingError?.message === 'string'
+        ? campaignsData.pagingError.message.replace(/\d{8,}/g, '[id]')
+        : undefined;
       return {
         success: true,
-        message: `Found ${campaigns.length} campaign(s)`,
+        complete: !campaignsTruncated,
+        ...(campaignsTruncated ? { hasMore: true } : {}),
+        message: campaignsTruncated
+          ? `Found ${campaigns.length} campaign(s), but THIS LIST IS INCOMPLETE — the read stopped before the end of the account`
+            + `${pagingErrorMessage ? ` (${pagingErrorMessage})` : ''}. Do NOT conclude a campaign is absent from it.`
+          : `Found ${campaigns.length} campaign(s) (complete list).`,
         campaigns: campaigns,
         totalCount: campaigns.length
       };
@@ -16557,9 +17145,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // which tells the model nothing it can act on and reads as an opaque
       // outage. Meta's actual explanation lives in response.data.error — surface
       // it, minus the credential material Meta echoes back (ENG-630).
+      // ENG-1300: the real HTTP status is `error.response?.status` (axios shape) —
+      // NEVER the Meta business `.code` nested in response.data.error, which
+      // coincidentally overlaps the HTTP range (e.g. Meta code 404 is unrelated
+      // to HTTP 404).
       return {
         success: false,
         error: describeMetaGraphApiError(error) || error.message,
+        code: error?.status ?? error?.response?.status,
       };
     }
   }
@@ -16570,7 +17163,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'LIST':
         // Thread the campaign_id filter and any explicit fields selection so the caller can
         // read budget/bid config and target a single campaign (ENG-398).
-        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: campaign_id, fields: params?.fields });
+        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: AgentModeService.optionalScopeId(campaign_id, 'campaign_id'), fields: params?.fields });
       case 'CREATE':
         return this.createMetaAdsCampaign(userId, { ...params, account_id });
       case 'UPDATE':
@@ -16590,7 +17183,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'LIST':
         // Thread the ad_set_id target and any explicit fields selection so the caller can
         // read optimization_goal / promoted_object / etc. for a single ad set (ENG-398).
-        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: ad_set_id, fields: params?.fields });
+        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: AgentModeService.optionalScopeId(ad_set_id, 'ad_set_id'), fields: params?.fields });
       case 'CREATE':
         // Explicitly pass account_id in args for createMetaAdsAdSet as it expects it in the args object
         return this.createMetaAdsAdSet(userId, { ...params, account_id, campaign_id });
@@ -16664,34 +17257,28 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Fails closed: an unverifiable node is refused rather than returned. We
         // request account_id explicitly, so its absence on an otherwise valid
         // node means the assumption behind this check no longer holds.
+        //
+        // Delegated to `MetaService.assertOwnedByAccount` rather than compared inline. The
+        // hand-rolled version this replaces named the OWNING account in the mismatch message
+        // (`belongs to ad account <owner>`), which is the oracle the guard exists to prevent:
+        // anyone able to guess a creative id could learn which ad account owns it, from the
+        // very error refusing to disclose it. The shared helper keeps all three branches
+        // (unverifiable owner / unresolved selection / mismatch) but emits ONE generic sentence
+        // and sends the discriminating detail to the server log. It also means this refusal is
+        // now recognised by `isMetaAccountScopeRefusal`, so callers can tell it apart from a
+        // transient Graph failure instead of degrading past it.
         if (creative && creative.id) {
-          const norm = (id: unknown) => String(id ?? '').replace(/^act_/, '').trim();
-          const owner = norm(creative.account_id);
-          const selected = norm(accountId);
-          if (!owner) {
-            throw new Error(
-              `Could not verify which ad account creative ${params.creative_id} belongs to; refusing to return it.`,
-            );
-          }
-          // Both sides must be known. An empty resolved account cannot be
-          // compared against anything, so treating it as "no mismatch" would
-          // reopen the exact bypass this check exists to close — the guard
-          // would silently pass every creative the token can reach.
-          if (!selected) {
-            throw new Error(
-              `Could not determine which ad account was selected; refusing to return creative ${params.creative_id}.`,
-            );
-          }
-          if (owner !== selected) {
-            throw new Error(
-              `Ad creative ${params.creative_id} belongs to ad account ${owner}, not the selected account ${selected}.`,
-            );
-          }
+          MetaService.assertOwnedByAccount(creative.account_id, params.creative_id, 'Ad creative', accountId);
         }
 
         return {
           success: true,
-          message: `Fetched ad creative ${params.creative_id}`,
+          // No raw id in the prose — same rule the guard three lines above exists to enforce, and
+          // nothing is lost: `creative.id`/`creative.name` are always requested (metaService.ts)
+          // and remain on the structured `creative` object below for the model to reference.
+          message: creative?.name
+            ? `Fetched the requested ad creative "${creative.name}".`
+            : `Fetched the requested ad creative.`,
           creative,
         };
       }
@@ -16898,11 +17485,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error copying Meta ad:', error);
+      // ENG-1300: metaService's handleError rethrows the SDK's FacebookRequestError
+      // unchanged (only attaching structuredError), so its own `.status` (the real
+      // HTTP status) survives — never structuredError.code, which is Meta's business
+      // error code and only coincidentally overlaps the HTTP range.
       return {
         success: false,
         message: this.enrichMetaError(error, 'copy Meta ad'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -16925,7 +17517,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta pages.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — metaService's handleError rethrows the
+        // original FacebookRequestError, so its `.status` is the real HTTP status.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17075,7 +17670,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to manage Meta datasets.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — metaService's handleError rethrows the
+        // original FacebookRequestError, so its `.status` is the real HTTP status.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17129,7 +17727,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: error.message || 'Failed to fetch Meta ad campaigns.',
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17269,7 +17869,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad campaign'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17330,7 +17932,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ad sets.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17624,7 +18228,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad set'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17655,7 +18261,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ad creatives.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17735,7 +18343,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad creative'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17767,7 +18377,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ads.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17789,7 +18401,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17849,7 +18463,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to update Meta ad campaign.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17868,7 +18484,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to delete Meta ad campaign.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17894,7 +18512,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to update Meta ad set.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17913,7 +18533,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to delete Meta ad set.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17992,7 +18614,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: this.enrichMetaError(error, 'update Meta ad'),
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18365,7 +18989,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to delete Meta ad.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18434,7 +19060,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to retag Meta ad UTMs.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18502,6 +19130,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               classification: structured.classification,
             }
           : undefined,
+        // ENG-1300: top-level `code` is the real numeric HTTP status, deliberately
+        // separate from meta_error.code above (Meta's business error code). Covers
+        // both the SDK-shaped Meta upload failure (error.status) and a plain axios
+        // failure downloading the source image (error.response?.status).
+        code: error?.status ?? error?.response?.status,
       };
     }
   }
@@ -18524,7 +19157,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to upload Meta ad video. Ensure the URL is publicly accessible.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18638,6 +19273,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         typedError.metaMetricsErrorType = connectionFailure
           ? 'connection'
           : (permissionFailure ? 'permission' : 'api');
+        // ENG-1300: the real HTTP status, never `code` above (Meta's business code).
+        typedError.status = (response as any)?.__httpStatus;
         throw typedError;
       }
       // ENG-104: breakdown endpoints are NON-fatal (we proceed without them), but
@@ -18726,7 +19363,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message,
         error: message,
-        errorType
+        errorType,
+        // ENG-1300: real HTTP status when the failure came from a coded fetch
+        // (typedError.status above); getMetaCredentials failures don't carry one.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18867,6 +19507,59 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * ENG-1642: check whether this exact Meta write is authorized by an
+   * answered `meta_write_manifest` question in the session, and if so claim
+   * it (at-most-once). Returns true only when a fresh claim succeeds THIS
+   * call — a digest not in any manifest, an unanswered/non-human-attributed
+   * manifest, or a digest already consumed all return false, which falls
+   * through to the normal confirmation halt.
+   */
+  private async claimMetaWriteManifestGrant(
+    sessionId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any,
+  ): Promise<boolean> {
+    const digest = computeMetaWriteManifestDigest(getJwtSecret(), {
+      entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params,
+    });
+    const session = await chatbotDb.getChatSession(sessionId);
+    // A session can carry MULTIPLE answered `meta_write_manifest` questions
+    // (each roll-off archives the prior one) — a newer manifest must not
+    // hide an EARLIER manifest that still authorizes this call's digest, so
+    // scan every candidate of this kind rather than taking only the single
+    // match `findQuestionByKind` would return.
+    const manifestCandidates: any[] = [];
+    if (session?.pendingUserQuestion?.kind === 'meta_write_manifest') {
+      manifestCandidates.push(session.pendingUserQuestion);
+    }
+    if (session?.answeredQuestions) {
+      for (const q of Object.values(session.answeredQuestions)) {
+        if (q.kind === 'meta_write_manifest') manifestCandidates.push(q);
+      }
+    }
+    // Session already recorded this exact digest consumed — a repeat of the
+    // same call re-confirms rather than executing again (acceptance
+    // criterion 3).
+    if (session?.consumedMetaWriteManifestDigests?.[digest]) return false;
+    for (const manifestQuestion of manifestCandidates) {
+      const gate = checkQuestionGate(manifestQuestion);
+      if (!gate.allowed) continue;
+      // The card's approve-option payload carries the digests it authorizes
+      // (see the `meta_write_manifest` card producer) — the digest for THIS
+      // call must be one of them, not merely "some manifest was answered".
+      const grantedDigests: unknown = (gate.payload as any)?.digests;
+      if (!Array.isArray(grantedDigests) || !grantedDigests.includes(digest)) continue;
+      return chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
+    }
+    return false;
+  }
+
+  /**
    * Loop halt seam for the human-in-the-loop confirmation gate. Scans one iteration's
    * tool results and returns the user-facing prompt to surface (or null to continue).
    * Only tool results that set `awaitingUserConfirmation === true` halt the turn — this
@@ -18908,6 +19601,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * stops the agent acting on an ambiguous target (e.g. publishing an ad into the
    * wrong campaign). ID→name lookups degrade gracefully to the raw ID if Meta is
    * unreachable — confirmation must still be required even when resolution fails.
+   *
+   * `tenancyRefused` is the ONE resolution failure that must not degrade: see the resolvers
+   * below. The caller blocks the write on it instead of prompting.
    */
   private async buildMetaWriteConfirmation(
     userId: string,
@@ -18918,29 +19614,104 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     ad_set_id: string | undefined,
     ad_id: string | undefined,
     params: any
-  ): Promise<{ summary: string; target: Record<string, any> }> {
+  ): Promise<{ summary: string; target: Record<string, any>; tenancyRefused: boolean; tenancyRefusalMessage?: string }> {
     let accessToken = '';
+    /*
+     * The account the write will ACTUALLY execute against — not the raw argument.
+     *
+     * `getMetaCredentials` resolves the account when the caller omitted it (the common
+     * single-connected-account case, and `POST /emma/meta-ads/marketing-api` validates
+     * nothing). Destructuring only `accessToken` threw that resolved id away and left every
+     * ownership check below comparing against `undefined`, which `assertOwnedByAccount`
+     * correctly fails closed on — so a user's own campaign came back refused as a cross-tenant
+     * violation, and the prompt rendered "in ad account undefined". The guard was right; it was
+     * being handed the wrong account. Execution resolves the same way, so this is also the id
+     * the confirmation text must name.
+     */
+    /*
+     * Always a DEFINED string — never `undefined`.
+     *
+     * `getAdSet`/`getAd` take an optional ad-account id where `undefined` means "the caller is
+     * deliberately opting out of the ownership check" (the post-write read-back callers rely on
+     * that). `getCampaign` takes it as a required positional and fails closed on a blank. So an
+     * unresolved account made the SAME state mean opposite things: campaign refused, ad and ad
+     * set silently unscoped — and an unscoped node read is a cross-tenant oracle, because Meta
+     * ids are global and one token spans several ad accounts. Another tenant's ad name would be
+     * rendered into the prompt the user approves.
+     *
+     * `''` is defined, so the guard runs and `assertOwnedByAccount` refuses a blank selected
+     * account. Opting out stays possible for the callers that mean it; it is just no longer
+     * something an unresolved credential can do by accident.
+     */
+    let scopeAccountId: string = account_id ?? '';
     try {
-      ({ accessToken } = await this.getMetaCredentials(userId, account_id));
+      const creds = await this.getMetaCredentials(userId, account_id);
+      accessToken = creds.accessToken;
+      if (creds.accountId) scopeAccountId = creds.accountId;
     } catch {
       // Credential failure surfaces during execution; still require confirmation here.
     }
 
-    const target: Record<string, any> = { entity_type, action, account_id };
+    const target: Record<string, any> = { entity_type, action, account_id: scopeAccountId };
     const lines: string[] = [];
 
-    // Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
+    /*
+     * Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
+     *
+     * That `catch` was written for a transient Graph blip, and for that it is right: a name we
+     * could not fetch degrades to the raw id and the user is still asked to approve.
+     *
+     * The ownership check these resolvers now pass `scopeAccountId` to throws through the SAME
+     * catch, and it does not mean "we could not look" — it means "we looked, and this node is
+     * not in the selected ad account". Swallowed as a blip, the prompt degraded to `ID <id>`
+     * and the write went on to confirmation, which is the gate approving a write to a node the
+     * guard had already refused. A refusal that only makes the prompt vaguer is not a guard.
+     *
+     * So the two are told apart (`isMetaAccountScopeRefusal`) and only the transient one keeps
+     * the best-effort behaviour. The refusal is recorded as a bare boolean on purpose: WHICH
+     * node was refused, what it is called, and which account owns it are exactly the oracle
+     * details `assertOwnedByAccount` refuses to emit, and they must not be reconstructed here.
+     */
+    let tenancyRefused = false;
+    /*
+     * The guard's OWN sentence, kept rather than re-written.
+     *
+     * assertOwnedByAccount deliberately varies its remedy by branch — the no-owner branch says
+     * "ownership could not be CONFIRMED ... Retry" and specifically avoids "select the other
+     * account", because there is no other account to select. Collapsing all of that into a
+     * boolean and emitting one fixed sentence here handed exactly that unusable remedy back on
+     * exactly that branch. The message is non-oracle by construction (no name, no owning
+     * account, no id), so relaying it discloses nothing the guard did not already choose to say.
+     */
+    let tenancyRefusalMessage: string | undefined;
+    const degradeUnlessRefused = (err: unknown): undefined => {
+      if (isMetaAccountScopeRefusal(err)) {
+        tenancyRefused = true;
+        const m = (err as { message?: unknown } | undefined)?.message;
+        if (typeof m === 'string' && !tenancyRefusalMessage) tenancyRefusalMessage = m;
+      }
+      return undefined;
+    };
     const resolveCampaign = async (id?: string) => {
       if (!id || !accessToken) return undefined;
-      try { return await metaService.getCampaign(account_id, accessToken, id); } catch { return undefined; }
+      try { return await metaService.getCampaign(scopeAccountId, accessToken, id); }
+      catch (err) { return degradeUnlessRefused(err); }
     };
     const resolveAdSet = async (id?: string) => {
       if (!id || !accessToken) return undefined;
-      try { return await metaService.getAdSet(accessToken, id); } catch { return undefined; }
+      // This result's NAME is rendered into the prompt the user approves, so the node must be
+      // proven to belong to the selected account first — otherwise an id from another ad account
+      // discloses that account's ad set name to this user.
+      try { return await metaService.getAdSet(accessToken, id, scopeAccountId); }
+      catch (err) { return degradeUnlessRefused(err); }
     };
     const resolveAd = async (id?: string) => {
       if (!id || !accessToken) return undefined;
-      try { return await metaService.getAd(accessToken, id); } catch { return undefined; }
+      // Same reason as resolveAdSet above: this result's NAME is rendered into the prompt the
+      // user approves, so an ad id from another ad account the token can reach would disclose
+      // that account's ad name to this user.
+      try { return await metaService.getAd(accessToken, id, scopeAccountId); }
+      catch (err) { return degradeUnlessRefused(err); }
     };
     const nameOf = (entity: any, id?: string) =>
       entity?.name ? `"${entity.name}" (${entity.id || id})` : (id ? `ID ${id}` : 'unknown');
@@ -18949,19 +19720,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (action === 'CREATE') {
         target.campaign_name = params.name;
         target.objective = params.objective;
-        lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${account_id}.`);
+        lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${scopeAccountId}.`);
       } else {
         const campaign = await resolveCampaign(campaign_id);
         target.campaign = nameOf(campaign, campaign_id);
         target.campaign_id = campaign_id;
-        lines.push(`${action} campaign ${target.campaign} in ad account ${account_id}.`);
+        lines.push(`${action} campaign ${target.campaign} in ad account ${scopeAccountId}.`);
       }
     } else if (entity_type === 'AD_SET') {
       if (action === 'CREATE') {
         const campaign = await resolveCampaign(campaign_id);
         target.campaign = nameOf(campaign, campaign_id);
         target.ad_set_name = params.name;
-        lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${account_id}).`);
+        lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${scopeAccountId}).`);
       } else {
         const adSet = await resolveAdSet(ad_set_id);
         const campaign = await resolveCampaign(adSet?.campaign_id);
@@ -18976,7 +19747,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         target.ad_name = params.name;
         target.ad_set = nameOf(adSet, ad_set_id);
         target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
-        lines.push(`Publish a NEW ad "${params.name}" into ad set ${target.ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''} (ad account ${account_id}).`);
+        lines.push(`Publish a NEW ad "${params.name}" into ad set ${target.ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''} (ad account ${scopeAccountId}).`);
       } else if (action === 'COPY_AD') {
         const sourceAd = await resolveAd(ad_id);
         const targetAdSetId = params.adset_id || sourceAd?.adset_id;
@@ -19011,15 +19782,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } else if (entity_type === 'AD_CREATIVE') {
       // Account-level asset (CREATE only — uploads/list are not gated).
       target.creative_name = params.name;
-      lines.push(`Create a NEW ad creative${params.name ? ` "${params.name}"` : ''} in ad account ${account_id}.`);
+      lines.push(`Create a NEW ad creative${params.name ? ` "${params.name}"` : ''} in ad account ${scopeAccountId}.`);
     } else if (entity_type === 'CUSTOM_AUDIENCE') {
       if (action === 'UPLOAD_USERS') {
         target.audience_id = params.id;
-        lines.push(`Upload user data (PII) to custom audience ID ${params.id} in ad account ${account_id}.`);
+        lines.push(`Upload user data (PII) to custom audience ID ${params.id} in ad account ${scopeAccountId}.`);
       } else {
         target.audience_name = params.name;
         target.subtype = params.subtype;
-        lines.push(`Create a NEW ${params.subtype ? `${params.subtype} ` : ''}custom audience "${params.name}" in ad account ${account_id}.`);
+        lines.push(`Create a NEW ${params.subtype ? `${params.subtype} ` : ''}custom audience "${params.name}" in ad account ${scopeAccountId}.`);
       }
     }
 
@@ -19048,7 +19819,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
     }
 
-    return { summary: lines.join(' '), target };
+    return { summary: lines.join(' '), target, tenancyRefused, tenancyRefusalMessage };
   }
 
   private static readonly META_OBJECTIVE_VALUES = [
@@ -19105,6 +19876,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     objective: string,
     quote: string,
     objectiveKind: string,
+    sourceQuestionId?: string,
   ): Promise<void> {
     const question = buildPendingUserQuestion({
       questionId: uuidv4(),
@@ -19116,7 +19888,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           consequence: 'Confirmed by the user\'s own words — not shown as a card.',
           recommended: true,
           why: `The user explicitly stated this: "${quote}"`,
-          payload: { objective },
+          payload: { objective, ...(sourceQuestionId ? { sourceQuestionId } : {}) },
         },
         {
           // Structural placeholder only — the primitive requires 2–4 options
@@ -19137,7 +19909,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       optionId: 'confirmed',
       delegated: false,
       answeredBy: 'user',
-      rationale: `Explicitly stated by the user: "${quote}"`,
+      rationale: sourceQuestionId
+        ? `Consumed answered objective card ${sourceQuestionId}`
+        : `Explicitly stated by the user: "${quote}"`,
       at: new Date().toISOString(),
     });
     await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
@@ -19259,6 +20033,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
     }
 
+    const { consumedQuestionIds, hasAnsweredObjectiveCard } = summarizeAnsweredObjectiveQuestions(
+      session?.pendingUserQuestion,
+      session?.answeredQuestions,
+      AgentModeService.META_OBJECTIVE_VALUES,
+    );
+    const looseCandidate = findAnsweredObjectiveCandidate(
+      session?.pendingUserQuestion,
+      session?.answeredQuestions,
+      {
+        accountId: account_id,
+        validObjectives: AgentModeService.META_OBJECTIVE_VALUES,
+        bindsLabel: (objective, text) => Boolean(AgentModeService.META_OBJECTIVE_KEYWORDS[objective]?.test(text)),
+        consumedQuestionIds,
+      },
+    );
+    if (looseCandidate) {
+      await this.persistExplicitObjectiveConfirmation(
+        sessionId,
+        looseCandidate.objective,
+        `answered objective card ${looseCandidate.question.questionId}`,
+        objectiveKind,
+        looseCandidate.question.questionId,
+      );
+      return { allowed: true, objective: looseCandidate.objective };
+    }
+
     // Path 3: nothing settled — surface the blocking ask ourselves. Never
     // proceed on a guess (this is the load-bearing refusal). Recommendation is
     // STATIC per the 80/20 design (Harsha, 2026-07-20) — OUTCOME_LEADS is the
@@ -19299,6 +20099,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const question = buildPendingUserQuestion({
       questionId: uuidv4(),
       question: 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.',
+      intro: hasAnsweredObjectiveCard
+        ? 'You answered an objective question earlier, but it did not match this campaign and account, so I need this one confirmed.'
+        : undefined,
       options,
       immutable: true,
       allowEmmaDecide: true,
@@ -19449,10 +20252,85 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       : '';
     const overrideApproved =
       overrideClaimed && trackingOverrideTokenMatches((params as any)?.tracking_override_token, overrideDigest);
-    if (AgentModeService.isMetaWriteAction(entity_type, action) && (!confirmed || (overrideClaimed && !overrideApproved))) {
-      const { summary, target } = await this.buildMetaWriteConfirmation(
+
+    // ENG-1642: an approved deployment manifest authorizes its exact writes
+    // without re-confirmation. `confirmed` from the model-controlled `confirm`
+    // flag is never itself trustworthy (that's the whole reason the gate
+    // below exists) — but a call whose canonical digest appears in a
+    // HUMAN-attributed, answered `meta_write_manifest` question, and has not
+    // already been consumed in this session, may execute once without the
+    // halt. Deliberately narrower than the tracking-override mechanism: this
+    // never implies `override_tracking_check` (acceptance criterion 5), so
+    // the tracking pre-flight below is unaffected either way.
+    let manifestGranted = false;
+    if (
+      !confirmed &&
+      AgentModeService.isMetaWriteAction(entity_type, action) &&
+      sessionId
+    ) {
+      manifestGranted = await this.claimMetaWriteManifestGrant(
+        sessionId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+      );
+    }
+
+    if (
+      AgentModeService.isMetaWriteAction(entity_type, action) &&
+      (!confirmed && !manifestGranted || (overrideClaimed && !overrideApproved))
+    ) {
+      /*
+       * MERGE NOTE: main's manifest grant decides WHETHER this gate runs; the tenancy fields
+       * decide what it says when it does. Independent, so both are kept — dropping
+       * `tenancyRefused` here would silently restore the bug where a node the ownership guard
+       * had already refused still reached a confirmation prompt.
+       *
+       * ⚠ A manifest grant SKIPS this block, and with it the tenancy refusal. Do not read that
+       * as safe on the grounds that the write re-checks: it does not. `updateCampaign`,
+       * `updateAdSet`, `updateAd` and the three deletes take an access token and a node id and
+       * no ad-account id at all, so nothing below this point verifies ownership.
+       *
+       * Not a regression — before this PR there was no tenancy check on this path either, and
+       * ENG-1642 changes who may skip the confirmation, not what the writes check. But the
+       * manifest path is the one write route with no ownership check anywhere in it, and that
+       * belongs on the write-scoping work rather than being assumed away here.
+       */
+      const { summary, target, tenancyRefused, tenancyRefusalMessage } = await this.buildMetaWriteConfirmation(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
+      /*
+       * A node the ownership guard refused is out of scope for this write, full stop. Asking the
+       * user to approve it — even under a degraded `ID <id>` label — would be the gate granting
+       * exactly what the guard exists to deny, since an approval here is what unlocks the
+       * confirmed replay. Refuse before the prompt is built.
+       *
+       * The refusal says nothing about the node beyond the selected account the caller already
+       * supplied: no name, no owning account, no id. `assertOwnedByAccount` withholds those
+       * because a block that answers "which account owns this?" is the oracle it is preventing,
+       * and relaying it through the confirmation gate would hand back the same answer.
+       *
+       * ⚠ `target.account_id`, NOT the raw `account_id` argument. `buildMetaWriteConfirmation`
+       * scopes against the account `getMetaCredentials` RESOLVED — which is the whole point of
+       * that fix — but this message beside it still read the raw argument, so a caller that
+       * omitted `account_id` (single-account users; the REST route validates nothing) was told
+       * the target "is not available in the selected ad account (undefined)". The refusal was
+       * correct and its explanation named an account that does not exist.
+       */
+      if (tenancyRefused) {
+        const refusal =
+          `Blocked: the target of this Meta Ads ${entity_type} ${action} is not available in the selected ` +
+          `ad account (${target.account_id || 'none could be determined'}), so it was not prepared for confirmation ` +
+          `and nothing was sent to Meta. ` +
+          `Do not ask the user to approve this change. ` +
+          // The guard's own remedy, which differs by branch — see tenancyRefusalMessage above.
+          AgentModeService.remedyFromScopeRefusal(tenancyRefusalMessage);
+        return {
+          success: false,
+          blocked: true,
+          reason: 'account_scope',
+          message: refusal,
+          // Same reason as the validation branch above: `error` is what the model actually reads.
+          error: `ACCOUNT_SCOPE_REFUSED: ${refusal}`,
+        } as any;
+      }
       // `awaitingUserConfirmation` + `confirmationPrompt` are consumed by the agent loop
       // (collectConfirmationPrompt) to HALT the turn and surface the prompt to the user.
       // The turn cannot continue until a NEW human message arrives — the model cannot
@@ -19682,7 +20560,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // Ensure response data is a string for parsing
               userPayload = typeof response.data === 'object' ? JSON.stringify(response.data) : response.data;
             } catch (fetchError: any) {
-              throw new Error(`Failed to fetch CSV content from URL: ${fetchError.message}`);
+              // ENG-1300: this rethrow reaches the outer catch below, which extracts
+              // error?.status ?? error?.response?.status — without forwarding it here,
+              // a 403/404 fetching the CSV would be lost before it ever gets there.
+              const wrapped: any = new Error(`Failed to fetch CSV content from URL: ${fetchError.message}`);
+              wrapped.status = fetchError?.response?.status;
+              throw wrapped;
             }
           }
 
@@ -19819,7 +20702,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message,
-        error: error.message
+        error: error.message,
+        // ENG-1300: top-level `code` is the real numeric HTTP status — never
+        // structured.code above, which is Meta's business error code (e.g. the
+        // 1870090 subcode branch here has nothing to do with an HTTP status).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -20447,8 +21334,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         workflow,
         ledger: { failures: [{ step: 'launch', message: error.message }] },
         message: error.message || `Failed to launch ${workflow} campaign.`,
+        // ENG-1300: SDK-shaped error (metaService.handleError preserves .status) —
+        // never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
+  }
+
+  // ENG-1300: executeAudienceCampaignLaunch rethrows a plain Error whenever a
+  // step it calls (manageMetaCustomAudiences, listMetaAdsAdSets,
+  // createMetaAdsAdSet — all already fixed to return a numeric `code` on
+  // failure) reports success:false, so the caller's classification is lost one
+  // rethrow before it ever reaches launchAudienceCampaign's outer catch. Carry
+  // it forward instead of discarding it.
+  private rethrowStepFailure(result: { message?: string; code?: number }, fallbackMessage: string): never {
+    const err: any = new Error(result.message || fallbackMessage);
+    err.status = result.code;
+    throw err;
   }
 
   private async executeAudienceCampaignLaunch(
@@ -20497,7 +21399,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         const lookalikeName = `${args.audience_name} - Lookalike`;
         const lookalikeListResult = await this.manageMetaCustomAudiences(userId, 'LIST', args.account_id, {});
         if (!lookalikeListResult.success) {
-          throw new Error(lookalikeListResult.message || 'Failed to list existing Meta custom audiences.');
+          this.rethrowStepFailure(lookalikeListResult, 'Failed to list existing Meta custom audiences.');
         }
         // Greptile follow-up findings: name-only matching isn't enough — a
         // same-named lookalike from an earlier launch with a DIFFERENT
@@ -20535,7 +21437,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             confirm: true,
           });
           if (!lookalikeResult.success) {
-            throw new Error(lookalikeResult.message || 'Failed to create Lookalike Audience.');
+            this.rethrowStepFailure(lookalikeResult, 'Failed to create Lookalike Audience.');
           }
           lookalikeAudience = lookalikeResult.audience;
         }
@@ -20580,7 +21482,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const adSetName = args.ad_set_params?.name;
       const existingAdSetsResult = await this.listMetaAdsAdSets(userId, args.campaign_id, args.account_id);
       if (!existingAdSetsResult.success) {
-        throw new Error(existingAdSetsResult.message || 'Failed to list existing Meta ad sets.');
+        this.rethrowStepFailure(existingAdSetsResult, 'Failed to list existing Meta ad sets.');
       }
       // Greptile follow-up findings: name + targeted-audience alone isn't
       // enough — a same-named ad set targeting the same audience but with
@@ -20669,7 +21571,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           targeting,
         });
         if (!adSetResult.success) {
-          throw new Error(adSetResult.message || 'Failed to create ad set.');
+          this.rethrowStepFailure(adSetResult, 'Failed to create ad set.');
         }
         adSet = adSetResult.adSet;
       }
@@ -20747,7 +21649,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to search ad targeting.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -21647,6 +22551,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (safeMessage.includes('Scheduled chat not found')) {
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The schedule_id doesn't exist or doesn't belong to this user. Call list_scheduled_chats to get a valid schedule_id before retrying update/toggle/delete.`;
       }
+      // ENG-1672: the schedule is at or over DynamoDB's 400KB item ceiling, almost
+      // always from accumulated promptRevisions/runResults history — automatic
+      // trimming already ran and still couldn't make room. Retrying the same-size
+      // payload will fail identically; only a shorter starting_message helps.
+      if (safeMessage.includes('too large to save')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: This schedule is at or over DynamoDB's 400KB per-item storage limit — automatic history trimming already ran and there is no more room. This is NOT a transient error; do not retry with the same-length starting_message. Call get_scheduled_chat_storage_diagnostics with this schedule_id for a byte breakdown, then shorten starting_message further before retrying.`;
+      }
+      // A bare connection-level failure (no HTTP response at all) means the write's
+      // outcome is UNKNOWN — it may have actually applied even though this call
+      // reported failure. Blindly resubmitting an "update" risks recording a
+      // redundant prompt-revision snapshot for a change that already landed.
+      if (/fetch failed|ECONNRESET|socket hang up|network error/i.test(safeMessage)) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: This is a transient connection failure, not a validation error — the write's outcome is unknown, and it may have already applied even though this call reported failure. Before retrying, call list_scheduled_chats (or get_scheduled_chat_storage_diagnostics) with this schedule_id to check the schedule's CURRENT state rather than blindly resubmitting the same change.`;
+      }
     }
     // ENG-971: bookkeeping / side-effect tools (save_memory, save_org_memory, …)
     // record a note ABOUT the work — they are not the work. A trailing save_memory
@@ -21695,12 +22613,108 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * sensitive request context. The full error is still logged server-side by
    * the caller, same as before — only this classified string reaches the model.
    */
+  /**
+   * Drive answers 403 for THROTTLING as well as for permission denial.
+   *
+   * `userRateLimitExceeded`, `rateLimitExceeded`, `dailyLimitExceeded` and
+   * `sharingRateLimitExceeded` all arrive as HTTP 403 with the real cause in
+   * `error.errors[].reason`. Keying on the status alone therefore called a throttled request
+   * "permission denied", and the caller's remedy became "share this folder with the service
+   * account" for a folder that is already shared — a remedy that cannot work, told to a user
+   * whose only real option was to wait.
+   *
+   * Reads both shapes googleapis surfaces: `err.errors` on the GaxiosError itself, and the raw
+   * `err.response.data.error.errors` when the error crossed a module boundary un-normalised.
+   */
+  /**
+   * The remedy half of an ad-account scope refusal — everything after the marker sentence.
+   *
+   * A bare `slice(indexOf('. ') + 2)` looked fine and fails badly: when the separator is absent
+   * `indexOf` returns -1, `slice(1)` drops the first CHARACTER, and the user reads "he requested
+   * campaign is not available...". Falls back to the generic remedy instead of emitting a
+   * mangled sentence, because a refusal that looks corrupted reads as a bug in the product.
+   */
+  private static remedyFromScopeRefusal(refusal: string | undefined): string {
+    const GENERIC = 'If the target belongs to a different ad account, select that account and try again.';
+    if (!refusal) return GENERIC;
+    const at = refusal.indexOf('. ');
+    if (at < 0) return GENERIC;
+    const remedy = refusal.slice(at + 2).trim();
+    return remedy || GENERIC;
+  }
+
+  /**
+   * Strip long digit runs from text that reaches a user.
+   *
+   * Graph error bodies name the object ("Object with ID '120...' does not exist"), and the
+   * product rule against showing raw Meta ids does not stop applying because the string came
+   * from Meta. A helper rather than a repeated regex because the last attempt masked one field
+   * and left the sibling field — which is the one actually read — untouched.
+   */
+  private static maskMetaIds(text: unknown): string {
+    return String(text ?? '').replace(/\d{8,}/g, '[id]');
+  }
+
+  private static driveErrorReasons(err: any): string[] {
+    const raw = [
+      ...(Array.isArray(err?.errors) ? err.errors : []),
+      ...(Array.isArray(err?.response?.data?.error?.errors) ? err.response.data.error.errors : []),
+    ];
+    return raw.map((e: any) => String(e?.reason ?? '')).filter(Boolean);
+  }
+
+  /** True when a 401/403 is really a quota/throttle answer, not an access decision. */
+  private static isDriveThrottle(err: any): boolean {
+    return AgentModeService.driveErrorReasons(err).some(r => /ratelimitexceeded|dailylimitexceeded/i.test(r));
+  }
+
+  /**
+   * The HTTP status of a Drive error, as a NUMBER.
+   *
+   * gaxios surfaces `code` as a string in some shapes (notably when the response body carries no
+   * `error.code`), and every `code === 403` comparison in this file is strict — so a string
+   * `'403'` silently matched nothing and fell through to the generic "temporary Drive error"
+   * branch. Coercing once, in one place, is what stops each new handler from inheriting that.
+   */
+  private static driveErrorCode(err: any): number | undefined {
+    const raw = err?.code ?? err?.status;
+    const n = typeof raw === 'number' ? raw : Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  }
+
+  /**
+   * The refusal a THROTTLED Drive call should return, or null when it is not a throttle.
+   *
+   * Drive answers 403 for quota exhaustion as well as for permission denial, and every handler
+   * in this file read the status alone — so a rate-limited user was told their connection had
+   * expired, or that Emma lacks access to a folder she can see, or that a Sheet "was not created
+   * by Emma". All false, and all pointing at a fix that cannot work. One sentence, one place, so
+   * the next handler cannot reintroduce it.
+   */
+  private static driveThrottleRefusal(err: any): { success: false; message: string } | null {
+    const code = AgentModeService.driveErrorCode(err);
+    if ((code !== 403 && code !== 401) || !AgentModeService.isDriveThrottle(err)) return null;
+    return {
+      success: false,
+      message:
+        'Google Drive is rate-limiting this account right now — this is a temporary quota answer, '
+        + 'NOT a permissions problem, so nothing needs to be shared or reconnected. Wait a minute and retry.',
+    };
+  }
+
   private classifyDriveError(err: any): string {
-    const code = err?.code || err?.status;
+    const code = AgentModeService.driveErrorCode(err);
+    if ((code === 403 || code === 401) && AgentModeService.isDriveThrottle(err)) return 'rate limited';
     if (code === 403 || code === 401) return 'permission denied';
     if (code === 429) return 'rate limited';
     if (code === 400) return 'invalid request';
-    if (typeof err?.message === 'string' && /did not respond within/i.test(err.message)) {
+    /*
+     * Both timeout shapes. `did not respond within` is `metaService.withReadDeadline`'s wording
+     * and no Drive call can produce it — a Drive request timeout comes from node-fetch as
+     * `network timeout at: <url>`, so this branch was dead for the very calls it was added for
+     * and every one of them fell through to the generic "temporary Drive error".
+     */
+    if (typeof err?.message === 'string' && /did not respond within|network timeout at/i.test(err.message)) {
       return 'temporary Drive error (timed out)';
     }
     return 'temporary Drive error';
@@ -21723,8 +22737,126 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * Crossing it sets `truncated`/`capped` — the same "incomplete, do not
    * conclude absence" signal the count bounds already use, not a new failure
    * mode.
+   *
+   * ⚠ Raised from 15s. The reasoning above is sound about the SHAPE of the calls and wrong about
+   * the consequence of stopping: an incomplete read is not a free outcome. It is what makes the
+   * agent say "that file is not in your Drive" about a folder it only partly looked at — the
+   * ENG-1584 sentence, on the Drive side. The tree is not too large to read; we were not giving
+   * it long enough, exactly as the launch pre-flight was not.
+   *
+   * 15s bought a snappier turn at the cost of a wrong answer. 90s reads an ordinary customer's
+   * tree comfortably and a large one completely, still finishes far inside nginx/ALB's 600s, and
+   * costs nothing at all in the common case — it is a deadline, not a delay, so a tree that
+   * takes two seconds still takes two seconds.
    */
-  private static readonly DRIVE_LIST_WALK_MAX_MS = 15_000;
+  private static readonly DRIVE_LIST_WALK_MAX_MS = 90_000;
+
+  /**
+   * ENG-1476 follow-up: per-REQUEST deadline, derived from the walk-wide one rather than fixed.
+   *
+   * `DRIVE_LIST_WALK_MAX_MS` is checked BETWEEN requests, so it bounds how many calls the walk
+   * makes but cannot interrupt one already issued that never answers — Node's fetch applies no
+   * default deadline. Same reasoning as `metaService`'s `withReadDeadline` sitting alongside
+   * `META_LIST_MAX_MS`: an elapsed bound limits the WORK, a per-call timeout is what stops a
+   * single stalled read from holding the turn.
+   *
+   * Deliberately the REMAINING walk budget, not a fixed ceiling. A fixed value (10s was the
+   * first attempt) is arbitrary in both directions: too low fails a legitimately slow call that
+   * the walk still had time for — a read that used to succeed now errors — and too high is
+   * meaningless, since the walk stops at its own deadline anyway. Deriving it means a request
+   * can use exactly the time the walk still has and no more, so this can never fail a call the
+   * walk would not have abandoned regardless.
+   *
+   * googleapis' `MethodOptions` extends gaxios' `GaxiosOptions`, so `timeout` is accepted as the
+   * SECOND argument to a method. The floor keeps a near-expired budget from sending `timeout: 0`,
+   * which gaxios reads as "no timeout".
+   */
+  private static readonly DRIVE_REQUEST_TIMEOUT_FLOOR_MS = 1_000;
+
+  private static driveRequestTimeout(deadline: number): number {
+    return Math.max(AgentModeService.DRIVE_REQUEST_TIMEOUT_FLOOR_MS, deadline - Date.now());
+  }
+
+  /**
+   * Per-request options for a Drive call inside a walk: the remaining budget as a timeout, AND
+   * the retries turned off.
+   *
+   * `timeout` alone bounds nothing here. `googleapis-common/apirequest.js:263` sets
+   * `options.retry = true` by default, and gaxios only skips retrying an `AbortError` — a
+   * node-fetch request timeout raises a `FetchError`, so `noResponseRetries: 2` applies and one
+   * logical request is issued THREE times, each with the full timeout. Measured: 1 attempt /
+   * ~1.0s with retry off, 3 attempts / ~3.6s with googleapis' default against a server that
+   * accepts and never responds. A 15s walk budget became ~45s, and `readGoogleDriveSharedFile`
+   * does this twice in sequence.
+   *
+   * (Bare gaxios and google-auth-library's DefaultTransporter do NOT retry, so probing those
+   * says the timeout is fine. It is the googleapis layer that turns retries on.)
+   *
+   * Retrying is also wrong on its own terms: the budget is what is running out, so a second and
+   * third attempt spend time the walk does not have and triple Drive quota use on exactly the
+   * calls most likely to be near a limit.
+   */
+  /** A Drive failure worth one more attempt: transport-level, not an answer from Drive. */
+  /**
+   * A model-supplied scope id, with "" read as "not supplied".
+   *
+   * `resolveScopeId` refuses a blank scope id deep in metaService, and it is right to: a blank
+   * computed internally means a scope failed to resolve, and widening the read to the whole
+   * account is how ENG-1476 showed a customer another campaign's ads. But a MODEL emitting
+   * `campaign_id: ""` for an optional field means "I am not scoping this", and turning that
+   * into a hard error is a failure the user sees for no reason.
+   *
+   * So the interpretation happens here, at the boundary where caller intent is known, and the
+   * guard stays strict underneath. Logged, so a model that does this constantly is visible
+   * rather than silently accommodated.
+   */
+  private static optionalScopeId(value: unknown, label: string): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    const trimmed = String(value).trim();
+    if (trimmed) return trimmed;
+    console.log(`[AgentMode] ${label} arrived empty from the caller; treating as not supplied.`);
+    return undefined;
+  }
+
+  private static isTransientDriveError(err: any): boolean {
+    const code = AgentModeService.driveErrorCode(err);
+    if (code !== undefined && code < 500) return false;           // 4xx is an answer, not a blip
+    if (code !== undefined && code >= 500) return true;           // 5xx
+    const msg = typeof err?.message === 'string' ? err.message : '';
+    return /network timeout at|econnreset|econnrefused|enotfound|eai_again|socket hang up|fetch failed/i.test(msg);
+  }
+
+  /**
+   * One retry for a transient Drive failure — but only if a full second attempt still fits
+   * inside the walk's remaining budget.
+   *
+   * Turning googleapis' retries off was necessary (it reused the SAME timeout on each of three
+   * attempts, so one hung request cost 3× the budget) but it also removed the cheap win: a
+   * single dropped connection used to be absorbed and now surfaces as an incomplete read. This
+   * restores that without the overrun, because the decision is made against `deadline` and the
+   * second attempt's timeout is recomputed from what is actually left.
+   *
+   * Deliberately not retrying 4xx: a 403, 404 or a throttle is Drive ANSWERING, and repeating
+   * the question does not change the answer — it just spends budget the walk needs.
+   */
+  private static async withDriveRetry<T>(deadline: number, run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (err: any) {
+      if (!AgentModeService.isTransientDriveError(err)) throw err;
+      // A second attempt must fit whole; a sliver of budget buys nothing but another timeout.
+      if (Date.now() + AgentModeService.DRIVE_REQUEST_TIMEOUT_FLOOR_MS >= deadline) throw err;
+      console.log('AgentMode: retrying a transient Drive failure once within the walk budget:', err?.message);
+      return await run();
+    }
+  }
+
+  private static driveRequestOptions(deadline: number): { timeout: number; retryConfig: { noResponseRetries: number } } {
+    return {
+      timeout: AgentModeService.driveRequestTimeout(deadline),
+      retryConfig: { noResponseRetries: 0 },
+    };
+  }
 
   // ENG-1624: a registered gdrive: KB folder is authorized by its root ID only, but
   // every Drive query in this file was scoped to `'<folderId>' in parents` — direct
@@ -21747,6 +22879,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     folderIds: string[];
     restricted: Array<{ id: string; name: string }>;
     rootRestricted: boolean;
+    /**
+     * The walk stopped because Drive THROTTLED it, not because the tree was too large.
+     *
+     * Kept distinct from `truncated` because the two need opposite sentences: a large tree tells
+     * the user to narrow the search, a quota answer tells them to wait. Folding a throttle into
+     * `truncated` is what made a rate-limited read report "the folder tree is large enough that
+     * the scan stopped" about a folder with four files in it.
+     */
+    throttled: boolean;
+    /**
+     * The walk stopped short because a sub-folder read FAILED transiently, as opposed to hitting
+     * the folder-count bound or the wall clock.
+     *
+     * `truncated` alone cannot carry this: two of its three causes are deterministic — the same
+     * tree stops in the same place every time — so a message telling the model to "retry, a
+     * sub-folder may have failed transiently" was advice that could not work for two of them,
+     * and the retryable classification meant each futile attempt re-walked the whole budget.
+     */
+    transientFailure: boolean;
+    /**
+     * The walk hit a deterministic bound — the folder-count ceiling or the wall clock.
+     *
+     * Not exclusive with `transientFailure`, and correlated with it: `withDriveRetry` spends
+     * budget on a transient failure, which makes the clock more likely to run out in the same
+     * walk. A walk with both must NOT advise a retry, because the bound will stop it in the same
+     * place next time — verified by probe: a transport failure on one child followed by the
+     * folder-count ceiling sets both flags.
+     */
+    boundedStop: boolean;
     truncated: boolean;
     folderNames: Map<string, string>;
   }> {
@@ -21756,12 +22917,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const queue: string[] = [rootFolderId];
     const restricted: Array<{ id: string; name: string }> = [];
     let rootRestricted = false;
+    let throttled = false;
+    let transientFailure = false;
+    let boundedStop = false;
     let truncated = false;
+    /*
+     * "The walk is incomplete" and "stop walking" are DIFFERENT facts, and conflating them cost
+     * the whole tree.
+     *
+     * `truncated` is what the caller is told; `stopWalk` is what ends the loop. Only two things
+     * genuinely mean there is no point continuing: the wall-clock deadline, and the maxFolders
+     * bound (both apply to the walk as a whole). A transient failure on ONE sub-folder applies
+     * to that sub-folder alone — the 403/401 branch below has always taken that view, skipping
+     * the folder and walking on. Setting `truncated` from the error branch made the loop
+     * condition `!truncated` abandon the entire BFS, so a single 502 on sub-folder 3 of 40 left
+     * the remaining 37 unvisited, with the same "incomplete" signal a much smaller gap produces.
+     */
+    let stopWalk = false;
     const deadline = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
 
-    while (queue.length > 0 && !truncated) {
+    while (queue.length > 0 && !stopWalk) {
       if (Date.now() >= deadline) {
         truncated = true;
+        boundedStop = true;
+        stopWalk = true;
         break;
       }
       const current = queue.shift()!;
@@ -21769,37 +22948,54 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       do {
         if (Date.now() >= deadline) {
           truncated = true;
+          boundedStop = true;
+          stopWalk = true;
           break;
         }
         let resp: any;
         try {
-          // A per-request timeout was considered here (the loop-level deadline
-          // check above only runs BEFORE a request starts, not while awaiting
-          // one, so it can't interrupt a single hung call — same reasoning as
-          // metaService.ts's withReadDeadline). googleapis' MethodOptions does
-          // support one (it extends gaxios' GaxiosOptions, which declares
-          // `timeout?: number`), but only as a SECOND argument to `.list()` —
-          // every existing test asserting this call's argument shape asserts a
-          // single-argument call, so adding one would require rewriting
-          // passing regression pins rather than fixing a bug. Left as a
-          // follow-up; the elapsed-time bound below is the hard requirement
-          // and doesn't need it.
-          resp = await drive.files.list({
+          // Each request carries its own deadline (see driveRequestTimeout): the loop-level
+          // check above only runs BEFORE a request starts, so it cannot interrupt one already
+          // in flight. A failure here is caught below and reported as an incomplete walk.
+          // Options built INSIDE the closure so a retry recomputes its timeout from the budget
+          // actually remaining, rather than reusing the first attempt's.
+          resp = await AgentModeService.withDriveRetry(deadline, () => drive.files.list({
             q: `'${current}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
             fields: 'nextPageToken, files(id, name)',
             pageSize: 1000,
             ...(pageToken && { pageToken }),
             supportsAllDrives: true,
             includeItemsFromAllDrives: true,
-          });
+          }, AgentModeService.driveRequestOptions(deadline)));
         } catch (err: any) {
-          const code = err?.code || err?.status;
-          if (code === 403 || code === 401) {
+          const code = AgentModeService.driveErrorCode(err);
+          /*
+           * A THROTTLED 403 is not an access decision, so it must not land in the permission
+           * buckets: `rootRestricted`/`restricted` are what produce "share it with the service
+           * account", and telling a rate-limited user to share an already-shared folder is a
+           * remedy that cannot work. Falls through to the incomplete-walk branch below, whose
+           * "the walk did not finish, retry" is the correct answer for a quota answer.
+           */
+          if (AgentModeService.isDriveThrottle(err)) throttled = true;
+          if ((code === 403 || code === 401) && !AgentModeService.isDriveThrottle(err)) {
             if (current === rootFolderId) {
               rootRestricted = true;
             } else {
               restricted.push({ id: current, name: folderNames.get(current) || current });
             }
+          } else {
+            /*
+             * Not a permission answer — a timeout or transport failure. The walk did not finish,
+             * so the tree is partial and every conclusion drawn from it is provisional. Without
+             * this, a fired per-request timeout left `truncated` false and a caller reported a
+             * definitive "file not found" from a search that never completed.
+             *
+             * Records the incompleteness WITHOUT ending the walk (see `stopWalk` above): the
+             * other 39 sub-folders can still be listed, and a partial tree covering 39 of 40 is
+             * worth far more than one covering 2.
+             */
+            truncated = true;
+            transientFailure = true;
           }
           console.log(`AgentMode: Could not list subfolders of Drive folder ${current}:`, err);
           break;
@@ -21809,6 +23005,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           if (!f.id || folderIdSet.has(f.id)) continue;
           if (folderIds.length >= maxFolders) {
             truncated = true;
+            boundedStop = true;
+            stopWalk = true;
             break;
           }
           folderIdSet.add(f.id);
@@ -21817,11 +23015,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           queue.push(f.id);
         }
 
-        pageToken = truncated ? undefined : (resp.data.nextPageToken || undefined);
+        pageToken = stopWalk ? undefined : (resp.data.nextPageToken || undefined);
       } while (pageToken);
     }
 
-    return { folderIds, restricted, rootRestricted, truncated, folderNames };
+    return { folderIds, restricted, rootRestricted, truncated, throttled, transientFailure, boundedStop, folderNames };
   }
 
   // ENG-1624: `'<id>' in parents` clauses joined with OR grow ~52 chars per Drive
@@ -21850,18 +23048,46 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     extraClause: string,
     fields: string,
     perBatchTarget: number,
-    orderBy?: string
-  ): Promise<{ files: Map<string, any>; capped: boolean }> {
+    orderBy?: string,
+    /**
+     * A budget SHARED with the caller, when the caller makes several of these calls in sequence.
+     *
+     * Without it each call opens its own `DRIVE_LIST_WALK_MAX_MS`, which composes badly: the
+     * knowledge-base listing runs one query per registered Drive source in a sequential loop, so
+     * six sources meant six full budgets — 6 x 90s = 540s on top of the tree walk, past the 600s
+     * nginx/ALB ceiling the budget was chosen to sit inside. At the old 15s that overrun was
+     * invisible (6 x 15s); raising the budget is what made it reachable.
+     */
+    sharedDeadlineAt?: number,
+  ): Promise<{ files: Map<string, any>; capped: boolean; incomplete: boolean; failed?: any }> {
     const merged = new Map<string, any>();
     let capped = false;
+    /*
+     * `capped` covers three stops and only two of them mean the read is INCOMPLETE.
+     *
+     * The third — "this batch hit offset+limit+1 and there is more" — is ordinary pagination,
+     * already reported exactly by `totalFilesIsLowerBound`, with `files` correct and `hasMore`
+     * exact. Folding it into the incompleteness signal made every routine paginated listing
+     * announce "some folders were too large to fully scan or could not be accessed": the
+     * wrong-cause sentence, on healthy reads, which is the failure this PR exists to remove.
+     */
+    let incomplete = false;
+    // Distinguished from `capped`: "we stopped at a bound" and "a request errored" are different
+    // facts and their callers need different things. The listing path reports a failed source as
+    // failed rather than merely short; the search path treats either as incomplete.
+    let failed: any;
     // ENG-1624: same time bound as getGoogleDriveFolderTreeIds, and for the same
     // reason — batches and pages here are walked sequentially with no overall
-    // bound otherwise. Crossing it sets `capped`, reusing the existing
+    // bound otherwise. Crossing it sets `capped`, which the listing maps into
+    // `folderScanIncomplete` — it did NOT until a starved source was found being
+    // reported as an empty folder; it was mapped only to a counting-precision
+    // flag. Reusing the existing
     // "incomplete, do not conclude absence" signal.
-    const deadline = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
+    const deadline = sharedDeadlineAt ?? (Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS);
     for (let i = 0; i < folderIds.length; i += AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE) {
       if (Date.now() >= deadline) {
         capped = true;
+        incomplete = true;
         break;
       }
       const batch = folderIds.slice(i, i + AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE);
@@ -21871,13 +23097,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       do {
         if (Date.now() >= deadline) {
           capped = true;
+          incomplete = true;
           pageToken = undefined;
           break;
         }
-        // See getGoogleDriveFolderTreeIds for why a per-request timeout isn't
-        // added here: it needs a second call argument, which would break every
-        // existing test asserting this call's (single-argument) shape.
-        const resp = await drive.files.list({
+        let resp: any;
+        try {
+          // Same budgeted single retry as the folder walk — see withDriveRetry.
+          resp = await AgentModeService.withDriveRetry(deadline, () => drive.files.list({
           q: `${parentClause} and ${extraClause}`,
           // nextPageToken must be requested explicitly — it isn't returned by
           // default, which is exactly why the old single-page fetch had no way
@@ -21888,7 +23115,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           ...(orderBy && { orderBy }),
           supportsAllDrives: true,
           includeItemsFromAllDrives: true,
-        });
+          }, AgentModeService.driveRequestOptions(deadline)));
+        } catch (err) {
+          /*
+           * A failed request — most likely the per-request timeout firing near the end of the
+           * budget — must degrade this read to INCOMPLETE, never discard it. Throwing here
+           * reaches callers that swallow it (searchKnowledgeBase logs and continues), so every
+           * row already merged would be dropped and the answer would present an empty result as
+           * a complete search: the exact defect this file is being changed to prevent, caused by
+           * the guard against it. `capped` is the signal the callers already surface.
+           */
+          console.log('AgentMode: Drive file query batch failed; reporting the read as incomplete:', err);
+          capped = true;
+          incomplete = true;
+          failed = err;
+          break;
+        }
         const files = resp.data.files || [];
         for (const f of files) {
           if (f.id) merged.set(f.id, f);
@@ -21904,7 +23146,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       } while (pageToken);
     }
-    return { files: merged, capped };
+    return { files: merged, capped, incomplete, failed };
   }
 
   private extractGoogleFileId(urlOrId: string): string {
@@ -22018,7 +23260,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             const { files: driveFilesMap, capped: driveQueryCapped } = await this.queryDriveFilesAcrossFolders(
               drive,
               allFolderIds,
-              `fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
+              `fullText contains '${escapeDriveQueryValue(query)}' and trashed = false`,
               'files(id, name, mimeType, parents)',
               limitedMaxResults
             );
@@ -22050,8 +23292,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             }
           }
         } catch (driveError) {
+          /*
+           * The whole Drive source dropped out of this search, so the result set is missing an
+           * entire source — the strongest form of incomplete there is here.
+           *
+           * Logging and continuing on its own let that be reported as a successful search that
+           * simply found nothing in Drive. The escaper's own refusal (escapeDriveQueryValue
+           * throws on a non-string) lands right here, so the guard added to stop a confidently
+           * wrong query could itself produce a confidently wrong ANSWER. `driveScanIncomplete`
+           * is the existing signal for "do not read absence into this result"; it belongs on
+           * this branch more than on any of the narrower ones that already set it.
+           */
           console.log('AgentMode: Error searching Google Drive shared folders:', driveError);
-          // Don't fail the whole search if Drive search fails
+          driveScanIncomplete = true;
+          // Don't fail the whole search if Drive search fails — but never report it as complete.
         }
       }
 
@@ -22173,10 +23427,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           ? `Showing the first ${boundedResults.length} knowledge base results for "${query}" — raise max_results to see more.`
           : `Found ${boundedResults.length} knowledge base results for "${query}"`) + scanIncompleteNote,
         query,
-        results: boundedResults,
+        // Completeness AHEAD of the payload, the same rule listKnowledgeBaseFiles and
+        // searchGoogleDrive follow. Ten results at ~5KB each clears the 8,000-char offload
+        // threshold comfortably, after which the model reads a sealed 20,000-char prefix and
+        // anything serialized after `results` is simply not there. The prose in `message` says
+        // the same thing and is first, so this was mitigated rather than broken — but the
+        // structured flags are what a future consumer will key on.
         returnedResults: boundedResults.length,
         hasMore,
-        ...(driveScanIncomplete && { scanIncomplete: true })
+        ...(driveScanIncomplete && { scanIncomplete: true }),
+        results: boundedResults,
       };
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
@@ -22209,6 +23469,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const queryLower = query.toLowerCase();
       const results: Array<{ content: string; source: string }> = [];
       let foreplayResultCount = 0;
+      // ENG-1300: swipefile/board-list failures below are caught and swallowed
+      // so a bad Foreplay board never sinks the whole search — but that meant an
+      // outright auth/rate-limit failure on EVERY source silently reported as
+      // "no ads found" (success:true), exactly the "run looks successful while
+      // operating on partial input" pattern ENG-1300 exists to catch. Track the
+      // top-level failures (not the deliberately-tolerated per-board ones) and
+      // only surface them as a real failure when there are zero results to show
+      // for it — a genuine empty match must still report success.
+      let topLevelError: any = null;
 
       // Search swipefile ads
       try {
@@ -22230,6 +23499,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       } catch (swipeErr) {
         console.log('AgentMode: Error searching Foreplay swipefile:', swipeErr);
+        topLevelError = swipeErr;
       }
 
       // Search board ads
@@ -22255,11 +23525,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               }
             }
           } catch (boardErr) {
+            // Deliberately tolerated — one bad board must not sink every other
+            // board's results, so this one is never promoted to topLevelError.
             console.log(`AgentMode: Error searching Foreplay board ${board.name}:`, boardErr);
           }
         }
       } catch (boardsErr) {
         console.log('AgentMode: Error listing Foreplay boards for search:', boardsErr);
+        topLevelError = topLevelError || boardsErr;
+      }
+
+      if (results.length === 0 && topLevelError) {
+        return {
+          success: false,
+          message: `Failed to search Foreplay ads: ${topLevelError?.message || 'Unknown error'}`,
+          error: topLevelError?.message || 'Unknown error',
+          code: topLevelError?.response?.status,
+          results: [],
+          totalResults: 0
+        };
       }
 
       if (results.length === 0) {
@@ -22284,7 +23568,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to search Foreplay ads. Please try again.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: plain axios error — Foreplay has no known business-code field.
+        code: (error as any)?.response?.status
       };
     }
   }
@@ -22372,7 +23658,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to search Foreplay discovery. Please try again.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        code: (error as any)?.response?.status
       };
     }
   }
@@ -22387,6 +23674,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }): Promise<any> {
     try {
       console.log('AgentMode: Listing knowledge base files for user:', userId, 'options:', options);
+
+      // Refuse a malformed date filter here, before any source is read, so the caller gets the
+      // expected format back instead of a per-folder Drive 400 buried in `listingFailed`.
+      try {
+        if (options?.modified_after) validateDriveDateFilter(options.modified_after, 'modified_after');
+        if (options?.modified_before) validateDriveDateFilter(options.modified_before, 'modified_before');
+      } catch (dateError: any) {
+        return { success: false, message: dateError?.message || 'Invalid date filter' };
+      }
 
       // Get user's private knowledge bases
       const userKnowledgeBaseTasks = await taskDb.getTasksWithKnowledgeBase(userId);
@@ -22499,7 +23795,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             )
           );
 
-          for (const { folder, folderIds, restricted, rootRestricted, truncated } of treeResults) {
+          /*
+           * ONE budget for the whole listing, not one per source.
+           *
+           * The file queries below run sequentially, one per registered Drive source, and each
+           * used to open a fresh DRIVE_LIST_WALK_MAX_MS. Six registered sources therefore meant
+           * six full budgets end to end — 540s at the current 90s — which blows past the 600s
+           * nginx/ALB ceiling that budget was picked to sit inside. Sharing a deadline keeps the
+           * whole listing inside one budget: sources still get read in order, and a listing that
+           * runs out reports the remaining sources as incomplete rather than silently costing
+           * the user a dropped request.
+           */
+          const listingDeadlineAt = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
+          for (const { folder, folderIds, restricted, rootRestricted, truncated, throttled } of treeResults) {
             try {
               // Structural, not name-based: a root only counts as nested
               // when its OWN id was actually discovered inside another
@@ -22517,11 +23825,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // Exclude folder entries themselves — previously these showed up as
               // 0-byte files instead of being descended into.
               let extraClause = `mimeType != 'application/vnd.google-apps.folder' and trashed = false`;
+              /*
+               * Escaped exactly like the `name`/`fullText` literals beside it. These two were
+               * missed when escapeDriveQueryValue was introduced, and they sit in the same `q`
+               * as the parent-folder clause that scopes this read to the caller's own folders —
+               * so an unescaped quote here reached past that scoping on a SHARED, read-all
+               * service account. Already validated to YYYY-MM-DD at the top of this method, so
+               * this is the second lock rather than the first.
+               */
               if (options?.modified_after) {
-                extraClause += ` and modifiedTime >= '${options.modified_after}T00:00:00'`;
+                extraClause += ` and modifiedTime >= '${escapeDriveQueryValue(options.modified_after)}T00:00:00'`;
               }
               if (options?.modified_before) {
-                extraClause += ` and modifiedTime <= '${options.modified_before}T23:59:59'`;
+                extraClause += ` and modifiedTime <= '${escapeDriveQueryValue(options.modified_before)}T23:59:59'`;
               }
 
               // ENG-1624: the tree can span more folders than fit in one `q` string
@@ -22538,13 +23854,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // min(trueTotal, K+1) files, so `allFiles.length > offset+limit` is
               // true exactly when more files really exist beyond this page.
               const perBatchTarget = driveOffset + driveLimit + 1;
-              const { files: filesMap, capped } = await this.queryDriveFilesAcrossFolders(
+              const { files: filesMap, capped, incomplete: queryIncomplete, failed: queryFailed } = await this.queryDriveFilesAcrossFolders(
                 drive,
                 folderIds,
                 extraClause,
                 'files(id, name, mimeType, size, modifiedTime)',
                 perBatchTarget,
-                'modifiedTime desc'
+                'modifiedTime desc',
+                listingDeadlineAt,
               );
 
               // Per-batch `orderBy` only sorts within its own batch; re-sort the
@@ -22565,24 +23882,55 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // ENG-1624: a scan that stopped early (folder-count bound or the root
               // itself being unreadable) must not present its partial file list as
               // complete.
-              const folderScanIncomplete = truncated || rootRestricted;
+              /*
+               * `capped` belongs here too.
+               *
+               * It means the file query stopped at a bound — including the shared listing
+               * deadline, which a slow FIRST source can exhaust before a later source is queried
+               * at all. Mapping it only to `totalFilesIsLowerBound` (a counting-precision flag)
+               * presented a source that was never read as an EMPTY FOLDER: totalFiles 0,
+               * hasMore false, no incompleteness, no "do not conclude absence". That is ENG-1584
+               * on the Drive side, and it was created by the fix that gave the listing one shared
+               * budget — the remedy for one composition bug producing a false absence instead.
+               */
+              // `queryIncomplete`, not `capped`: the latter also fires on ordinary pagination.
+              const folderScanIncomplete = truncated || rootRestricted || queryIncomplete;
+              // Same distinction the readers draw: a throttled scan is incomplete for a reason
+              // the user acts on differently (wait) than a large one (narrow).
+              const folderScanThrottled = throttled;
               // A batch that hit its per-batch target means `totalMatchingFiles`
               // wasn't fully counted — it's a floor, not an exact total. Getting an
               // exact total would mean fully paginating every batch, which isn't
               // worth the API cost just to render one page.
               const totalFilesIsLowerBound = capped;
 
+              /*
+               * ⚠ Field order is load-bearing: every completeness signal goes BEFORE `files`.
+               *
+               * A knowledge-base listing routinely clears the S3 offload threshold, after which
+               * the model is handed a SEALED fixed-length PREFIX of this JSON — anything
+               * serialized after the file array is simply not there. Measured at the default
+               * limit of 100 files, one Drive source alone reached ~20.5k chars with
+               * `listingFailed` landing past the 20k cut: the flag existed, was correct, and
+               * was unreadable on exactly the listings that need it. Same failure the
+               * `buildListResult` helper exists to prevent on the Meta side.
+               *
+               * `files` LAST, always. Anything appended after it is invisible.
+               */
               knowledgeBases.push({
                 identifier: `gdrive:${folder.folderId}`,
                 name: folder.name,
                 type: 'google-drive',
                 updatedAt: allFiles.length > 0 ? allFiles[0].modifiedTime : undefined,
-                files: driveFiles,
                 totalFiles: totalMatchingFiles,
                 hasMore: allFiles.length > driveOffset + driveLimit,
                 offset: driveOffset,
                 limit: driveLimit,
                 ...(totalFilesIsLowerBound && { totalFilesIsLowerBound: true }),
+                // A request that errored means this source is not merely short, it is unreliable
+                // — reported as failed even when some rows were already merged, so an empty or
+                // partial list is never mistaken for the folder's true contents.
+                ...(queryFailed ? { listingFailed: true, listingFailedReason: this.classifyDriveError(queryFailed) } : {}),
                 // ENG-1624: a sub-folder that couldn't be listed (e.g. an unshared
                 // shortcut target) previously shrank the listing with no signal to
                 // the caller. Name it so the caller can request access instead of
@@ -22590,12 +23938,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 ...(restricted.length > 0 && { inaccessibleFolders: restricted.map(r => r.name) }),
                 ...(rootRestricted && { inaccessibleRoot: true }),
                 ...(folderScanIncomplete && { folderScanIncomplete: true }),
+                ...(folderScanThrottled && { folderScanThrottled: true }),
                 // ENG-1624: this root's own id was found inside another
                 // registered root's resolved tree — its files are already
                 // counted there too. Kept as its own entry (never silently
                 // dropped), just labeled, so a saved gdrive:<this-id>
                 // reference still resolves exactly as it does today.
                 ...(ancestor && { nestedUnder: `gdrive:${ancestor.folder.folderId}` }),
+                files: driveFiles,
               });
             } catch (folderErr: any) {
               // ENG-1624: this used to just log and move on, which silently
@@ -22611,9 +23961,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 identifier: `gdrive:${folder.folderId}`,
                 name: folder.name,
                 type: 'google-drive',
-                files: [],
                 listingFailed: true,
                 listingFailedReason: this.classifyDriveError(folderErr),
+                // Same ordering rule as the success path above — `files` last.
+                files: [],
               });
             }
           }
@@ -22859,11 +24210,43 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // to paginate" — it means the listing itself may be incomplete, not just
       // capped.
       const hasIncompleteFolderScan = knowledgeBases.some((kb: any) => kb.folderScanIncomplete);
+      /*
+       * The third consumer of the throttle split, which was missed when the other two got it.
+       * A throttled walk sets `truncated` as well, so this listing said "too large to fully scan
+       * or could not be accessed" about a rate-limited read — the wrong-cause sentence, telling
+       * the user to narrow a search that will throttle identically.
+       */
+      /*
+       * Both sentences, when both are true.
+       *
+       * These are `.some()` over DIFFERENT sources, so suppressing the size/permission sentence
+       * whenever any source was throttled hid a real incompleteness on every other source. The
+       * two facts are independent and the model needs both: wait for the throttled one, narrow
+       * or share the others.
+       */
+      const hasThrottledFolderScan = knowledgeBases.some((kb: any) => kb.folderScanThrottled);
+      /*
+       * Only claim "too large or inaccessible" about a source that is NOT merely throttled.
+       *
+       * A throttled walk sets `throttled` AND `truncated` in the same branch, so for a single
+       * source both flags describe the same stop — and the two sentences then contradict each
+       * other outright: "a temporary quota answer, not a size or permissions problem" followed
+       * immediately by "too large to fully scan or could not be accessed". Suppressing the size
+       * sentence whenever ANY source was throttled was also wrong, because it hid a real
+       * incompleteness on the other sources. Per-source is the only reading that is right in
+       * both shapes.
+       */
+      const hasIncompleteFolderScanBeyondThrottle = knowledgeBases.some(
+        (kb: any) => kb.folderScanIncomplete && !kb.folderScanThrottled,
+      );
       // A Drive KB's file query hit its per-batch target — its `totalFiles` is a
       // floor, not an exact count, even though `files`/`hasMore` are still correct.
       const hasLowerBoundTotals = knowledgeBases.some((kb: any) => kb.totalFilesIsLowerBound);
-      // A Drive KB whose listing errored outright — shown with empty `files`, not
-      // dropped, but that empty array must not be mistaken for "no files exist."
+      // A Drive KB whose listing errored — shown rather than dropped, but its `files` must not
+      // be read as the folder's true contents. NOT necessarily empty: `queryDriveFilesAcrossFolders`
+      // sets `failed` after merging whatever batches did succeed, so a failed source can carry a
+      // PARTIAL list. Saying "shown as empty" there described a state that does not exist and
+      // invited the model to trust a short list as complete.
       const failedDriveCount = knowledgeBases.filter((kb: any) => kb.listingFailed).length;
       // A Drive KB nested inside another registered Drive KB's tree — its files
       // are already reflected in the parent's own listing (and in the
@@ -22873,16 +24256,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasIncompleteFolderScan ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be listed and are shown as empty — their contents are unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
-        knowledge_bases: knowledgeBases,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasThrottledFolderScan ? ' Google Drive rate-limited the scan of some folders — a temporary quota answer, not a size or permissions problem; wait a minute and retry rather than narrowing.' : ''}${hasIncompleteFolderScanBeyondThrottle ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be fully listed (see listingFailed) — their file lists may be empty OR partial, so treat any file missing from them as unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        // Same rule as the per-source objects: every completeness flag ahead of the payload,
+        // because `knowledge_bases` is what pushes this result past the offload threshold and
+        // anything after it falls outside the sealed prefix the model actually reads.
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles,
         ...(appliedFilters.length > 0 && { appliedFilters }),
         ...(hasMorePages && { hasMore: true }),
         ...(hasIncompleteFolderScan && { folderScanIncomplete: true }),
+        ...(hasThrottledFolderScan && { folderScanThrottled: true }),
         ...(hasLowerBoundTotals && { totalFilesIsLowerBound: true }),
         ...(failedDriveCount > 0 && { driveListingFailures: failedDriveCount }),
         ...(driveEnumerationFailed && { driveEnumerationFailed: true }),
+        knowledge_bases: knowledgeBases,
       };
     } catch (error) {
       console.error('AgentMode: Error listing knowledge base files:', error);
@@ -23193,6 +24580,49 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     };
   }
 
+  /**
+   * The two "the name search did not finish" refusals, kept in one place because they are one
+   * decision: whether the thing that stopped the read is worth trying again.
+   *
+   * `failed` — a request errored (5xx, a transport blip, the per-request timeout firing on one
+   * unlucky call). That is transient by nature, so "retry" is a remedy that can actually work.
+   *
+   * `capped` with no failure — the ONLY way to reach that here is
+   * `queryDriveFilesAcrossFolders` crossing DRIVE_LIST_WALK_MAX_MS. (Its other capping path,
+   * `batchCount >= perBatchTarget`, cannot fire on a zero-result search.) That bound is
+   * wall-clock, spent walking a folder tree whose size does not change between attempts, and it
+   * is a SECOND such budget after `getGoogleDriveFolderTreeIds` already spent up to the same
+   * amount enumerating the sub-folders. A tree big enough to exhaust it therefore exhausts it
+   * again, in the same place, on every retry.
+   *
+   * So the two branches must not share a remedy. Telling the model to "retry the read" on the
+   * capped branch is the ENG-1636 failure in miniature — naming a remedy that cannot work — and
+   * worse than useless here, because the retry is not free: each attempt burns up to two full
+   * DRIVE_LIST_WALK_MAX_MS budgets and the turn's own time, and a deterministic non-answer
+   * repeated is a loop. The
+   * capped branch is given remedies that change the SCOPE of the search, which is the only
+   * variable that can move the outcome.
+   */
+  private driveNameSearchIncompleteMessage(fileName: string, rootName: string, failed?: any): string {
+    const preamble =
+      `Could not determine whether "${fileName}" is in Google Drive folder "${rootName}" — `;
+    if (failed) {
+      return preamble
+        + `the file search itself failed (${this.classifyDriveError(failed)}). This is a FAILED read, not a `
+        + `confirmed absence: do not report the file as missing. Retry the read.`;
+    }
+    return preamble
+      + `the file search ran out of its time budget before it had covered the whole folder tree. `
+      + `This is an INCOMPLETE read, not a confirmed absence: do not report the file as missing. `
+      + `Do NOT retry this same call — the budget is a fixed wall-clock bound spent walking this `
+      + `folder's sub-folders, so a tree this large will stop in the same place every time. `
+      + `The only thing that changes the outcome is a SMALLER search scope: ask the user for the `
+      + `file's direct Google Drive link, or for the specific sub-folder it lives in so that `
+      + `sub-folder can be registered as its own knowledge base source. If neither is available, `
+      + `tell the user plainly that this folder exceeded the read budget for a single search — `
+      + `do not describe it as a temporary glitch and do not try again.`;
+  }
+
   // Helper: read a file from a Google Drive shared folder
   private async readGoogleDriveSharedFile(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
     const folderId = kbIdentifier.replace('gdrive:', '');
@@ -23211,24 +24641,77 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       // Find the file by name anywhere in the registered folder's tree (ENG-1624:
       // not just its direct children).
-      const { folderIds, restricted, rootRestricted, truncated: folderScanTruncated, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      const { folderIds, restricted, rootRestricted, truncated: folderScanTruncated, throttled: folderScanThrottled, transientFailure: folderScanTransient, boundedStop: folderScanBounded, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
       // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
       // lets an ambiguous name (same filename in two sub-folders) be detected and
       // reported instead of one candidate being picked arbitrarily.
-      const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
-        drive,
-        folderIds,
-        `name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
-        'files(id, name, mimeType, size, modifiedTime, parents)',
-        2
-      );
+      const { files: filesMap, capped: nameQueryCapped, failed: nameQueryFailed } =
+        await this.queryDriveFilesAcrossFolders(
+          drive,
+          folderIds,
+          `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
+          'files(id, name, mimeType, size, modifiedTime, parents)',
+          2
+        );
       const files = Array.from(filesMap.values());
 
       if (files.length === 0) {
+        /*
+         * "Searched and absent" versus "could not search" — the whole point of this branch.
+         *
+         * queryDriveFilesAcrossFolders swallows a request failure and reports it as
+         * `failed`/`capped` rather than throwing (throwing would discard rows it had already
+         * merged). Destructuring only `files` therefore turned a timeout or 5xx on the name
+         * query into a confident `File "X" not found in Google Drive folder "Y"` — a definitive
+         * absence claim from a read that errored. Before the helper caught the error the
+         * rejection reached the outer try and said the read failed, which was correct.
+         *
+         * Checked before the folder-scan signals below because it is the stronger fact: the
+         * name query is what would have found the file, so if IT did not complete, nothing here
+         * knows whether the file is there.
+         */
+        /*
+         * `rootRestricted` is checked BEFORE the incomplete-search branch, and the order is the
+         * point.
+         *
+         * Drive answers 403 for a permission denial AND for `userRateLimitExceeded`. The walk
+         * now separates the two (`isDriveThrottle`), so `rootRestricted` means a real access
+         * decision — but an unreadable root still very often makes the name query fail too, so
+         * both flags are set at once. Ranking the search failure first replaced the one remedy the user can act on —
+         * share the folder with the service account — with "retry the read", which cannot work
+         * while the folder stays unshared. Same "remedy that cannot work" shape as ENG-1636.
+         *
+         * The incomplete-search caveat is not lost: it is appended, so the message carries the
+         * actionable cause AND the fact that absence was never confirmed.
+         */
+        /*
+         * A quota answer is not a shape answer, and it outranks everything below.
+         *
+         * A throttled walk sets `truncated`, and the only branch that consumed it said "the
+         * folder tree is large enough that the scan stopped" — so a rate-limited user was told
+         * their folder was too big and invited to narrow a search that would throttle just the
+         * same. Every other branch here describes the folder; this one describes Drive.
+         */
+        if (folderScanThrottled) {
+          return {
+            success: false,
+            message: `File "${fileName}" was not found, but Google Drive rate-limited the scan of `
+              + `folder "${rootName}", so the search did not finish. This is a temporary quota answer, `
+              + `NOT a permissions or size problem — nothing needs to be shared and narrowing will not `
+              + `help. Wait a minute and try again. Do NOT report the file as absent.`,
+          };
+        }
         if (rootRestricted) {
           return {
             success: false,
             message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+              + (nameQueryFailed || nameQueryCapped ? ' The file search did not complete either, so this is not a confirmed absence.' : '')
+          };
+        }
+        if (nameQueryFailed || nameQueryCapped) {
+          return {
+            success: false,
+            message: this.driveNameSearchIncompleteMessage(fileName, rootName, nameQueryFailed)
           };
         }
         if (restricted.length > 0) {
@@ -23241,7 +24724,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (folderScanTruncated) {
           return {
             success: false,
-            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder tree is large enough that the scan stopped before covering it entirely, so this is not a confirmed absence.`
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree, so this is not a confirmed absence. `
+              // Deterministic bound checked FIRST: the causes are not exclusive, and a walk that
+              // hit both will hit the bound again next time, so a retry cannot help.
+              + (folderScanTransient && !folderScanBounded
+                ? `A sub-folder read failed part-way, so retrying may well complete the scan.`
+                : `It stopped at a fixed folder-count or time bound, so a tree this size will stop in the same place every time. Do NOT retry this same call — narrow to a specific sub-folder, or ask the user for a direct Google Drive link.`)
           };
         }
         return { success: false, message: `File "${fileName}" not found in Google Drive folder "${rootName}"` };
@@ -23292,9 +24780,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error) {
       console.error('AgentMode: Error reading Google Drive file:', error);
+      // ENG-1300: carry the real numeric HTTP status through so a clean
+      // 401/403/404 classifies as auth/not_found instead of the generic
+      // Error/bug fallback once toolResultError rebuilds an Error from the
+      // message alone.
+      const code = (error as any)?.code || (error as any)?.status;
       return {
         success: false,
-        message: `Failed to read Google Drive file "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read Google Drive file "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code,
       };
     }
   }
@@ -23343,24 +24837,67 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       // Search the whole folder tree rooted at the registered folder (ENG-1624),
       // not just its direct children.
-      const { folderIds, restricted, rootRestricted, truncated, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      const { folderIds, restricted, rootRestricted, truncated, throttled: folderScanThrottled, transientFailure: folderScanTransient, boundedStop: folderScanBounded, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
       // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
       // lets an ambiguous name (same filename in two sub-folders) be detected and
       // reported instead of one candidate being materialized arbitrarily.
-      const { files: filesMap } = await this.queryDriveFilesAcrossFolders(
-        drive,
-        folderIds,
-        `name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
-        'files(id, name, mimeType, size, parents)',
-        2
-      );
+      const { files: filesMap, capped: nameQueryCapped, failed: nameQueryFailed } =
+        await this.queryDriveFilesAcrossFolders(
+          drive,
+          folderIds,
+          `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
+          'files(id, name, mimeType, size, parents)',
+          2
+        );
       const files = Array.from(filesMap.values());
 
       if (files.length === 0) {
+        // Same distinction readGoogleDriveSharedFile draws, for the same reason: the helper
+        // reports a failed request as `failed`/`capped` instead of throwing, so ignoring both
+        // flags turned an errored search into a definitive "not found". Shared wording too, so
+        // the transient/deterministic split cannot drift between the two call sites.
+        /*
+         * `rootRestricted` is checked BEFORE the incomplete-search branch, and the order is the
+         * point.
+         *
+         * Drive answers 403 for a permission denial AND for `userRateLimitExceeded`. The walk
+         * now separates the two (`isDriveThrottle`), so `rootRestricted` means a real access
+         * decision — but an unreadable root still very often makes the name query fail too, so
+         * both flags are set at once. Ranking the search failure first replaced the one remedy the user can act on —
+         * share the folder with the service account — with "retry the read", which cannot work
+         * while the folder stays unshared. Same "remedy that cannot work" shape as ENG-1636.
+         *
+         * The incomplete-search caveat is not lost: it is appended, so the message carries the
+         * actionable cause AND the fact that absence was never confirmed.
+         */
+        /*
+         * A quota answer is not a shape answer, and it outranks everything below.
+         *
+         * A throttled walk sets `truncated`, and the only branch that consumed it said "the
+         * folder tree is large enough that the scan stopped" — so a rate-limited user was told
+         * their folder was too big and invited to narrow a search that would throttle just the
+         * same. Every other branch here describes the folder; this one describes Drive.
+         */
+        if (folderScanThrottled) {
+          return {
+            success: false,
+            message: `File "${fileName}" was not found, but Google Drive rate-limited the scan of `
+              + `folder "${rootName}", so the search did not finish. This is a temporary quota answer, `
+              + `NOT a permissions or size problem — nothing needs to be shared and narrowing will not `
+              + `help. Wait a minute and try again. Do NOT report the file as absent.`,
+          };
+        }
         if (rootRestricted) {
           return {
             success: false,
             message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+              + (nameQueryFailed || nameQueryCapped ? ' The file search did not complete either, so this is not a confirmed absence.' : '')
+          };
+        }
+        if (nameQueryFailed || nameQueryCapped) {
+          return {
+            success: false,
+            message: this.driveNameSearchIncompleteMessage(fileName, rootName, nameQueryFailed)
           };
         }
         if (restricted.length > 0) {
@@ -23373,7 +24910,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (truncated) {
           return {
             success: false,
-            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder tree is large enough that the scan stopped before covering it entirely, so this is not a confirmed absence.`
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree, so this is not a confirmed absence. `
+              // Deterministic bound checked FIRST: the causes are not exclusive, and a walk that
+              // hit both will hit the bound again next time, so a retry cannot help.
+              + (folderScanTransient && !folderScanBounded
+                ? `A sub-folder read failed part-way, so retrying may well complete the scan.`
+                : `It stopped at a fixed folder-count or time bound, so a tree this size will stop in the same place every time. Do NOT retry this same call — narrow to a specific sub-folder, or ask the user for a direct Google Drive link.`)
           };
         }
         return { success: false, message: `File "${fileName}" not found in Google Drive folder` };
@@ -23453,10 +24995,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error materializing knowledge base asset:', error);
-      const code = error?.code || error?.status;
+      const code = AgentModeService.driveErrorCode(error);
       if (code === 404) {
         return { success: false, message: `File "${fileName}" not found or not accessible` };
       }
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
         return { success: false, message: 'Access denied reading this Google Drive file' };
       }
@@ -23512,9 +25056,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error) {
       console.error('AgentMode: Error reading ClickUp doc:', error);
+      // ENG-1300: carry the real numeric HTTP status through so a clean
+      // 401/403/404 classifies as auth/not_found instead of the generic
+      // Error/bug fallback once toolResultError rebuilds an Error from the
+      // message alone.
+      const code = (error as any)?.response?.status || (error as any)?.code;
       return {
         success: false,
-        message: `Failed to read ClickUp document "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read ClickUp document "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code,
       };
     }
   }
@@ -23564,9 +25114,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error) {
       console.error('AgentMode: Error reading ClickUp task:', error);
+      // ENG-1300: carry the real numeric HTTP status through — see readClickUpSharedDoc above.
+      const code = (error as any)?.response?.status || (error as any)?.code;
       return {
         success: false,
-        message: `Failed to read ClickUp task "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read ClickUp task "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code,
       };
     }
   }
@@ -23578,7 +25131,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     content: string,
     userId: string,
     parentDocId?: string
-  ): Promise<{ success: boolean; message: string; docId?: string }> {
+  ): Promise<{ success: boolean; message: string; docId?: string; code?: number }> {
     try {
       const clickUpToken = await getClickUpAccessToken(userId);
       if (!clickUpToken) {
@@ -23639,9 +25192,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         errorMessage = `${clickUpError.err}${clickUpError.ECODE ? ` (ClickUp code: ${clickUpError.ECODE})` : ''}`;
       }
 
+      // ENG-1300: carry the real numeric HTTP status through — see readClickUpSharedDoc
+      // above. Deliberately NOT the ECODE extracted above, which is ClickUp's own
+      // business code (e.g. "OAUTH_019"), not an HTTP status.
+      const code = error?.response?.status;
+
       return {
         success: false,
-        message: `Failed to create ClickUp document "${name}": ${errorMessage}`
+        message: `Failed to create ClickUp document "${name}": ${errorMessage}`,
+        code,
       };
     }
   }
@@ -23695,18 +25254,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const saDrive = await this.getGoogleDriveClient();
           return await readWithDrive(saDrive);
         } catch (saErr: any) {
-          const is404 = saErr?.code === 404 || saErr?.status === 404;
+          // ENG-1300: carry the real numeric HTTP status through so a clean
+          // 401/403/404 classifies as auth/not_found instead of the generic
+          // Error/bug fallback once toolResultError rebuilds an Error from the
+          // message alone.
+          const code = saErr?.code || saErr?.status;
+          const is404 = code === 404;
           const msg = is404
             ? `File not found or not accessible. Share the file with the service account, or connect Google Drive in Settings for files you own.`
             : `Failed to read file: ${saErr instanceof Error ? saErr.message : 'Unknown error'}`;
-          return { success: false, message: msg };
+          return { success: false, message: msg, code };
         }
       }
-      const is404 = oauthErr?.code === 404 || oauthErr?.status === 404;
+      const code = oauthErr?.code || oauthErr?.status;
+      const is404 = code === 404;
       const msg = is404
         ? `File not found or you don't have access (fileId: ${fileId}).`
         : `Failed to read file: ${oauthErr instanceof Error ? oauthErr.message : 'Unknown error'}`;
-      return { success: false, message: msg };
+      return { success: false, message: msg, code };
     }
   }
 
@@ -23787,14 +25352,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         files: formatted,
       };
     } catch (err: any) {
-      const code = err?.code || err?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(err);
+      const throttled = AgentModeService.driveThrottleRefusal(err);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Google Drive access denied. Your Google Drive connection may have expired — reconnect in Settings → Connected Accounts.' };
+        return { success: false, message: 'Google Drive access denied. Your Google Drive connection may have expired — reconnect in Settings → Connected Accounts.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Folder not found. Check the URL or ID and try again.' };
+        return { success: false, message: 'Folder not found. Check the URL or ID and try again.', code };
       }
-      return { success: false, message: err?.message || 'Failed to list folder contents' };
+      return { success: false, message: err?.message || 'Failed to list folder contents', code };
     }
   }
 
@@ -23814,14 +25391,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return { success: true, folder_id: folderId, folder_url: folderUrl, name: resp.data.name };
     } catch (err: any) {
-      const code = err?.code || err?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(err);
+      const throttled = AgentModeService.driveThrottleRefusal(err);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot create folder in that location — Emma does not have access to the specified parent folder.' };
+        return { success: false, message: 'Cannot create folder in that location — Emma does not have access to the specified parent folder.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Parent folder not found. Check the folder ID and try again.' };
+        return { success: false, message: 'Parent folder not found. Check the folder ID and try again.', code };
       }
-      return { success: false, message: err?.message || 'Failed to create Google Drive folder' };
+      return { success: false, message: err?.message || 'Failed to create Google Drive folder', code };
     }
   }
 
@@ -23832,7 +25421,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const drive = google.drive({ version: 'v3', auth });
 
-      const namePart = `name contains '${query.replace(/'/g, "\\'")}'`;
+      const namePart = `name contains '${escapeDriveQueryValue(query)}'`;
       const typePart = type === 'folder'
         ? ` and mimeType = 'application/vnd.google-apps.folder'`
         : type === 'file'
@@ -23842,7 +25431,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       const resp = await drive.files.list({
         q,
-        fields: 'files(id,name,mimeType,webViewLink,parents)',
+        // `nextPageToken` is requested so this read can tell a complete result from a capped
+        // one. Without it the 20-row cap below was invisible and unknowable.
+        fields: 'nextPageToken, files(id,name,mimeType,webViewLink,parents)',
         orderBy: 'modifiedTime desc',
         pageSize: 20,
         supportsAllDrives: true,
@@ -23850,8 +25441,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       const files = resp.data.files || [];
+      /*
+       * ENG-1584, same sentence, different edge.
+       *
+       * `Found ${n} item(s) matching "x"` off a hard `pageSize: 20` with no `nextPageToken`
+       * requested reads as "these are all the matches" and means "these are the first 20". A
+       * model that searches for a file, sees it missing, and reports it absent is the exact
+       * failure that told a customer a protected ad did not exist. The sibling
+       * `listGoogleDriveFolder` already reports `hasMore`; this read did not.
+       *
+       * Deliberately NOT drained into full pagination: a name-substring search is an
+       * interactive lookup, not an inventory, and 20 newest-first matches is the right size.
+       * The bound is fine — going UNANNOUNCED was the defect.
+       */
+      const hasMore = !!resp.data.nextPageToken;
       if (files.length === 0) {
-        return { success: true, message: `No items found matching "${query}".`, results: [] };
+        return {
+          success: true,
+          complete: !hasMore,
+          message: hasMore
+            ? `No items found in the first page of matches for "${query}", but MORE PAGES EXIST — this is not evidence that nothing matches. Narrow the query and search again.`
+            : `No items found matching "${query}" (complete search).`,
+          results: [],
+        };
       }
 
       const results = files.map(f => ({
@@ -23862,13 +25474,36 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         parent_folder_ids: f.parents,
       }));
 
-      return { success: true, message: `Found ${results.length} item(s) matching "${query}".`, results };
+      // Completeness ahead of the payload — anything after `results` can fall outside the
+      // sealed prefix the model reads once this result is offloaded.
+      return {
+        success: true,
+        complete: !hasMore,
+        ...(hasMore && { hasMore: true }),
+        totalCount: results.length,
+        message: hasMore
+          ? `Found ${results.length} item(s) matching "${query}", but THIS LIST IS INCOMPLETE — Drive had more matches and the search stopped at its 20-item bound. Do NOT conclude a file is absent from Drive because it is not here. Narrow the query and search again.`
+          : `Found ${results.length} item(s) matching "${query}" (complete list).`,
+        results,
+      };
     } catch (err: any) {
-      const code = err?.code || err?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(err);
+      const throttled = AgentModeService.driveThrottleRefusal(err);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Google Drive access denied. Ensure Drive is connected in Settings → Connected Accounts.' };
+        return { success: false, message: 'Google Drive access denied. Ensure Drive is connected in Settings → Connected Accounts.', code };
       }
-      return { success: false, message: err?.message || 'Failed to search Google Drive' };
+      return { success: false, message: err?.message || 'Failed to search Google Drive', code };
     }
   }
 
@@ -24603,14 +26238,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error creating Google Doc:', error);
-      const code = error?.code || error?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(error);
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot create Doc in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
+        return { success: false, message: 'Cannot create Doc in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.' };
+        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.', code };
       }
-      return { success: false, message: `Failed to create Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to create Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -24638,14 +26285,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error updating Google Doc:', error);
-      const code = error?.code || error?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(error);
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot update this Google Doc — you may not have edit access to it, or it may have been deleted.' };
+        return { success: false, message: 'Cannot update this Google Doc — you may not have edit access to it, or it may have been deleted.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Google Doc not found. Check the URL or ID and try again.' };
+        return { success: false, message: 'Google Doc not found. Check the URL or ID and try again.', code };
       }
-      return { success: false, message: `Failed to update Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to update Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -24704,14 +26363,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         try { await drive.files.delete({ fileId: sheetId }); } catch {}
       }
       console.error('AgentMode: Error creating Google Sheet:', error);
-      const code = error?.code || error?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(error);
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot create Sheet in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
+        return { success: false, message: 'Cannot create Sheet in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.' };
+        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.', code };
       }
-      return { success: false, message: `Failed to create Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to create Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -24740,14 +26411,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error updating Google Sheet:', error);
-      const code = error?.code || error?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(error);
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot update this Google Sheet — it was not created by Emma. Emma can only edit Sheets she created.' };
+        return { success: false, message: 'Cannot update this Google Sheet — it was not created by Emma. Emma can only edit Sheets she created.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Google Sheet not found. Check the URL or ID and try again.' };
+        return { success: false, message: 'Google Sheet not found. Check the URL or ID and try again.', code };
       }
-      return { success: false, message: `Failed to update Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to update Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -24803,7 +26486,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       console.error('AgentMode: Error reading Foreplay ad:', error);
       return {
         success: false,
-        message: `Failed to read Foreplay ad "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read Foreplay ad "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code: (error as any)?.response?.status
       };
     }
   }
@@ -24813,7 +26497,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     query: string,
     maxResults: number = 10,
     freshness?: string,
-    includeDomains?: string[]
+    includeDomains?: string[],
+    userId?: string,
+    purpose: SearchPurpose = 'agent_research',
   ): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_web',
@@ -24822,20 +26508,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       resultSource: 'web',
       freshness,
       includeDomains,
+      userId,
+      purpose,
     });
   }
 
-  public async youSearchNews(query: string, maxResults: number = 10, freshness?: string): Promise<any> {
+  public async youSearchNews(query: string, maxResults: number = 10, freshness?: string, userId?: string): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_news',
       query,
       maxResults,
       resultSource: 'news',
       freshness: freshness || inferSearchFreshness(query) || 'week',
+      userId,
+      purpose: 'news',
     });
   }
 
-  public async googleSearchWeb(query: string, maxResults: number = 10): Promise<any> {
+  public async googleSearchWeb(query: string, maxResults: number = 10, userId?: string, purpose: SearchPurpose = 'agent_research'): Promise<any> {
     const toolName = 'google_search_web';
     const resultSource: SearchResultSource = 'web';
     try {
@@ -24844,6 +26534,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const searchResponse = await this.performGoogleSearch({
         query,
         maxResults: limitedMaxResults,
+        userId,
+        purpose,
       });
       const normalizedResults = searchResponse.results || [];
       const formattedContent = this.formatWebSearchResults({
@@ -24873,6 +26565,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         toolName,
         resultSource,
         error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: googleapis' customsearch client throws a GaxiosError, whose
+        // .status/.code are genuinely the numeric HTTP status (unlike Meta's
+        // business-code .code) — same convention already established for
+        // Drive/Calendar. .status checked first since GaxiosError's own docs
+        // treat it as canonical; .code and .response?.status are fallbacks
+        // for other error shapes that can reach this catch.
+        code: (error as any)?.status ?? (error as any)?.code ?? (error as any)?.response?.status,
       };
     }
   }
@@ -24884,6 +26583,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     resultSource: SearchResultSource;
     freshness?: string;
     includeDomains?: string[];
+    userId?: string;
+    purpose: SearchPurpose;
   }): Promise<any> {
     const { toolName, query, maxResults, resultSource } = params;
     try {
@@ -24905,6 +26606,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             resultSource,
             freshness: params.freshness,
             includeDomains: params.includeDomains,
+            userId: params.userId,
+            purpose: params.purpose,
           });
           break;
         } catch (error) {
@@ -25179,6 +26882,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     resultSource?: SearchResultSource;
     freshness?: string;
     includeDomains?: string[];
+    userId?: string;
+    purpose?: SearchPurpose;
   }) {
     const freshness = params.freshness || inferSearchFreshness(params.query);
     const provider = new YouSearchProvider();
@@ -25187,7 +26892,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       count: params.maxResults,
       freshness,
       resultSource: params.resultSource || 'all',
-      purpose: params.resultSource === 'news' ? 'news' : 'agent_research',
+      purpose: params.purpose || (params.resultSource === 'news' ? 'news' : 'agent_research'),
+      userId: params.userId,
       ...(params.includeDomains?.length ? { includeDomains: params.includeDomains } : {}),
     });
 
@@ -25204,13 +26910,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async performGoogleSearch(params: {
     query: string;
     maxResults: number;
+    userId?: string;
+    purpose?: SearchPurpose;
   }) {
     const provider = new GoogleSearchProvider();
     const response = await provider.search({
       query: params.query,
       count: params.maxResults,
       resultSource: 'web',
-      purpose: 'agent_research',
+      purpose: params.purpose || 'agent_research',
+      userId: params.userId,
     });
 
     console.log(`Google Custom Search returned ${response.results.length} web results for query: "${params.query}"`);
@@ -26302,7 +28011,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     imageModel?: string,
     logoImage?: string,
     confirm?: boolean,
-    category?: string
+    category?: string,
+    metricsVerified?: boolean
   ): Promise<any> {
     // ENG-343: the producing flow must self-declare the eval use case — Matt's
     // review feedback differs entirely between ads and organic posts, and a
@@ -26554,6 +28264,36 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           },
         });
 
+        // ENG-1027 data-fabrication backstop: the tool-description guidance alone is
+        // instruction-following-dependent, and live verification showed the image
+        // model can invent metrics even in prompts that never asked for real data
+        // (a bare "metrics preview" dashboard element is enough). For prompts shaped
+        // like a dashboard/table that Emma hasn't declared use verified real values
+        // (metricsVerified), run one bounded describe_image check against the actual
+        // output and surface a warning so Emma discloses rather than silently
+        // presenting invented numbers. Timeboxed tighter than describe_image's own
+        // 90s ENG-294 bound — this is an added, best-effort safety net the user never
+        // explicitly asked for, not worth spending that much turn budget on.
+        let dataReliabilityWarning: string | undefined;
+        if (promptRisksFabricatedMetrics(prompt, metricsVerified)) {
+          console.log(`AgentMode: generate_image data-fabrication check triggered (session ${sessionId})`);
+          try {
+            const visionCheck = await withTimeoutOrReject(
+              this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT),
+              FABRICATED_METRICS_CHECK_TIMEOUT_MS,
+              'generate_image data-fabrication check'
+            );
+            if (visionCheck?.success && describeImageReportsFabricatedMetrics(visionCheck.description)) {
+              dataReliabilityWarning = FABRICATED_METRICS_WARNING;
+              console.log(`AgentMode: generate_image data-fabrication check WARNED (session ${sessionId})`);
+            } else {
+              console.log(`AgentMode: generate_image data-fabrication check clear (session ${sessionId})`);
+            }
+          } catch (visionErr) {
+            console.warn('AgentMode: generate_image data-fabrication check failed/timed out (non-fatal):', visionErr);
+          }
+        }
+
         return {
           success: true,
           message: `✅ Image "${result.filename}" generated successfully!`,
@@ -26563,6 +28303,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           size: size,
           quality: quality,
           imageModel: imageModelUsed,
+          ...(dataReliabilityWarning ? { dataReliabilityWarning } : {}),
           ...(fallbackUsed ? { fallbackUsed: true, primaryError } : {})
         };
       } else {
@@ -27432,7 +29173,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        uploadErr.status = uploadResult.statusCode;
+        throw uploadErr;
       }
 
       const htmlUrl = uploadResult.url;
@@ -27461,7 +29204,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to create blog article',
-        error: error.message
+        error: error.message,
+        // ENG-1300: real HTTP status from the S3 upload, when the failure came
+        // from there (uploadFileToS3 exposes AWS SDK v2's numeric statusCode —
+        // never .code, a string error name on that SDK).
+        code: error?.status
       };
     }
   }
@@ -27668,10 +29415,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
+      // ENG-1300: carry the real HTTP status through when this catch is reached
+      // directly (Payload CMS publish errors and the initial HTML-fetch axios
+      // call) — WebflowBlogPublisher/WordPressBlogPublisher catch and return
+      // their own failures below this method and never throw here.
+      const code = error.response?.status;
+
       return {
         success: false,
         message: errorMessage,
-        error: error.message || 'Unknown error'
+        error: error.message || 'Unknown error',
+        code,
       };
     }
   }
@@ -28314,7 +30068,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        uploadErr.status = uploadResult.statusCode;
+        throw uploadErr;
       }
 
       const htmlUrl = uploadResult.url;
@@ -28333,7 +30089,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to create social media posts',
-        error: error.message
+        error: error.message,
+        // ENG-1300: this function never actually calls any per-platform social
+        // API — it's a local markdown-to-HTML preview generator, and the only
+        // external call is the S3 upload. Real HTTP status from there, when
+        // that's what failed (uploadFileToS3's numeric statusCode).
+        code: error?.status
       };
     }
   }
@@ -29544,11 +31305,13 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       if (!isEmail && isCompleteHtmlDocument(contentDraft)) {
         console.log('AgentMode: create_html_file — draft is already complete HTML, uploading directly (skipping render)');
         const { uploadFileToS3 } = await import('../utils/s3Utils');
-        const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+        const filename = buildHtmlArtifactFilename(title);
         const uploadableHtml = await this.inlinePrivateS3Images(contentDraft, documentType, userId);
         const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
         if (!uploadResult.success || !uploadResult.url) {
-          throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+          const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+          uploadErr.status = uploadResult.statusCode;
+          throw uploadErr;
         }
         return {
           success: true,
@@ -29778,12 +31541,14 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Upload to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
-      const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+      const filename = buildHtmlArtifactFilename(title);
       const uploadableHtml = await this.inlinePrivateS3Images(htmlContent, documentType, userId);
       const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
 
       if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        uploadErr.status = uploadResult.statusCode;
+        throw uploadErr;
       }
 
       const s3Url = uploadResult.url;
@@ -29802,7 +31567,9 @@ Please generate a complete, professional HTML document that properly formats and
       return {
         success: false,
         message: 'Failed to create HTML file',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: real HTTP status from the S3 upload, when that's what failed.
+        code: (error as any)?.status
       };
     }
   }
@@ -29947,7 +31714,7 @@ Return the HTML body fragment for this section only.`;
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const fallbackHtml = await renderMarkdownReportDocumentAsync(title, contentDraft);
       const uploadableHtml = await this.inlinePrivateS3Images(fallbackHtml, documentType, userId);
-      const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+      const filename = buildHtmlArtifactFilename(title);
       uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
@@ -31225,6 +32992,43 @@ ${strippedHtml}`;
       const nextInputStep = workPlan.steps
         .sort((a: any, b: any) => a.stepCount - b.stepCount)
         .find((s: any) => s.status === 'pending' && s.inputRequest);
+
+      // ENG-1682: a step's own pendingWorkPlanInput is only cleared by the
+      // structured WorkPlanInputCard submission (updateSessionWorkPlanInputRequest
+      // with a null value). A user who answers the step conversationally in chat
+      // instead -- the ordinary way people talk to Emma -- never hits that path,
+      // so the now-resolved step's request stays status:'awaiting' forever. The
+      // customer portal's Details surface (the default landing view) treats any
+      // 'awaiting' input as still-active and hides the entire message list --
+      // every later step's deliverable included -- behind that stale card for
+      // the rest of the session. Clear it the moment its own step resolves, the
+      // same instant we'd otherwise replace it with the next step's request.
+      const resolvedStepCounts = new Set(
+        updatedSteps
+          .filter(s => s.status === 'completed' || s.status === 'skipped')
+          .map(s => s.stepCount),
+      );
+      const staleInputForResolvedStep = Boolean(
+        session.pendingWorkPlanInput
+          && session.pendingWorkPlanInput.status === 'awaiting'
+          && resolvedStepCounts.has(session.pendingWorkPlanInput.stepCount),
+      );
+
+      // CodeRabbit (PR #2713): bypassing failIfAwaitingExists entirely for the write
+      // below would also skip its pendingUserQuestion check, letting a NEW work-plan
+      // input land while a genuinely concurrent ask_user_question is still awaiting --
+      // two simultaneous prompts, an invalid state neither surface expects. Clear the
+      // known-stale record as its OWN guarded step first (matched by requestId, so a
+      // race that already replaced it fails closed instead of clobbering the newer
+      // one), THEN let the write below keep its full, unmodified guard -- it now
+      // correctly finds pendingWorkPlanInput cleared while still enforcing the
+      // pendingUserQuestion half of the check.
+      if (staleInputForResolvedStep) {
+        await chatbotDb.updateSessionWorkPlanInputRequest(sessionId, null, {
+          requireStillAwaiting: session.pendingWorkPlanInput!.requestId,
+        });
+      }
+
       if (nextInputStep?.inputRequest) {
         await chatbotDb.updateSessionWorkPlanInputRequest(
           sessionId,
@@ -32468,7 +34272,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         ? 'Account token expired. Please reconnect the account in Settings.'
         : (error?.message ?? 'Unknown error');
       console.error('AgentMode: Error posting on account:', error);
-      return { success: false, message: `Failed to post: ${message}` };
+      // ENG-1300: the LinkedIn adapter (and X's mapListScopeError) attach the
+      // real HTTP status as .code on the thrown error — carry it through so a
+      // 401/403 classifies as auth/config instead of the generic bug fallback.
+      return { success: false, message: `Failed to post: ${message}`, code: error?.code };
     }
   }
 
@@ -32574,7 +34381,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (message.includes('access token expired')) {
         message = 'Account token expired. Please reconnect the account in Settings.';
       }
-      return { success: false, message: `Failed to repost: ${message}` };
+      return { success: false, message: `Failed to repost: ${message}`, code: error?.code };
     }
   }
 
@@ -32688,7 +34495,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         return {
           success: false,
-          message: `Failed to comment: ${message}`
+          message: `Failed to comment: ${message}`,
+          code: error?.code
         };
       }
 
@@ -32778,7 +34586,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
       return {
         success: false,
-        message: `Failed to list comments: ${message}`
+        message: `Failed to list comments: ${message}`,
+        code: error?.code
       };
     }
   }
@@ -32862,7 +34671,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         return {
           success: false,
-          message: `Failed to react: ${message}`
+          message: `Failed to react: ${message}`,
+          code: error?.code
         };
       }
 
@@ -32928,6 +34738,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           success: false,
           message: `Failed to load posts: ${accountResult.error}`,
           error: accountResult.error,
+          code: accountResult.code,
         };
       }
 
@@ -32997,7 +34808,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       } catch (error: any) {
         return {
           success: false,
-          message: `Failed to load metrics: ${error.message}`
+          message: `Failed to load metrics: ${error.message}`,
+          code: error?.code
         };
       }
 
@@ -33071,7 +34883,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return {
         success: false,
         message: 'Failed to get post analytics',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        code: (error as any)?.code
       };
     }
   }
@@ -34148,10 +35961,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const { list_id, lead_id } = args;
           if (!list_id || !lead_id) throw new Error('list_id and lead_id are required for update-conversation-history');
 
-          // Resolve the Unipile attendee/provider ID for this contact
+          // Resolve the Unipile attendee/provider ID for this contact. When a raw
+          // provider_id is supplied directly (not a profile_url), it has not been
+          // validated against Unipile yet — resolveProviderId only validates the
+          // profile_url path. getMessagesWithContact treats a 404 from Unipile's
+          // chat_attendee lookup as "never messaged" (ENG-1623), which is
+          // indistinguishable from a 404 caused by an invalid/nonexistent
+          // provider_id. Without this check, a bad provider_id would silently
+          // "succeed" with 0 messages instead of surfacing a clear error.
           const providerId = isUrl
             ? await linkedInOutreachService.resolveProviderId(target, true, account_id)
-            : target;
+            : await linkedInOutreachService.getProfile(target, account_id).then(() => target);
 
           // Load the lead to get the normalized LinkedIn URL used as the storage key
           const { crmDb } = await import('./db');
@@ -34351,10 +36171,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
 
+      // ENG-1300: LinkedInOutreachService.handleError already classifies the
+      // status into structuredError.status/.classification for its own
+      // reconnect-detection logic above — read the same field here so the
+      // generic fallback path also reaches the tool-error classifier as
+      // auth/rate_limit/etc. instead of a bare Error/bug.
       return {
         success: false,
         message: 'LinkedIn outreach action failed',
-        error: errorMessage
+        error: errorMessage,
+        code: (error as any)?.code ?? structuredError?.status
       };
     }
   }
@@ -34584,7 +36410,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // collapsing to a bare "Request failed with code 403" — see describeXApiError.
       const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_manage_post failed:', errorMessage);
-      return { success: false, message: 'Twitter action failed', error: errorMessage };
+      // ENG-1300: same gap as twitterOutreach's catch — this flattens every thrown
+      // error to a message string, which is all toolResultError has to reconstruct
+      // an Error from downstream, so the numeric HTTP status (twitter-api-v2 puts
+      // it on `.code`) must ride along on the result object or a write-path 401/403
+      // (e.g. a reply blocked by X's engagement-gate scope) never classifies as
+      // auth/config either.
+      const code = typeof (error as { code?: unknown })?.code === 'number' ? (error as { code: number }).code : undefined;
+      return { success: false, message: 'Twitter action failed', error: errorMessage, ...(code !== undefined ? { code } : {}) };
     }
   }
 
@@ -34793,7 +36626,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // collapsing to a bare "Request failed with code 403" — see describeXApiError.
       const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_outreach failed:', errorMessage);
-      return { success: false, message: 'Twitter outreach action failed', error: errorMessage };
+      // ENG-1300: this catch flattens every thrown error (including
+      // mapListScopeError's reconnect error) to a message string, which is all
+      // toolResultError has to reconstruct an Error from downstream — so the
+      // numeric HTTP status (twitter-api-v2's ApiResponseError, and our own
+      // mapListScopeError, both put it on `.code`) must ride along on the result
+      // object itself or classifyToolErrorClass never sees it and the whole
+      // auth/config classification this ticket exists for silently never fires.
+      const code = typeof (error as { code?: unknown })?.code === 'number' ? (error as { code: number }).code : undefined;
+      return { success: false, message: 'Twitter outreach action failed', error: errorMessage, ...(code !== undefined ? { code } : {}) };
     }
   }
 
@@ -36602,15 +38443,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };
     } catch (error: any) {
+      // ENG-1300: `code` here is the real numeric HTTP status (googleAdsService.
+      // callApi rethrows the SAME axios error, so error.response.status is
+      // intact) — NOT `gadsErrorCodes` below, which are Google Ads' own string
+      // enum names (e.g. "REQUEST_ERROR"), not HTTP statuses. Conflating the two
+      // would misclassify: a business code that happens to fall in 100-599
+      // would be read as if it were the transport status.
+      const code = error?.response?.status;
       if (error instanceof NegativeCampaignCriteriaValidationError) {
         return {
           success: false,
           errorType: error.errorType,
           errorCode: error.errorCode,
           error: error.message,
+          code,
         };
       }
-      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
+      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true, code };
       console.error('[AgentMode] handleCallGoogleAdsApi error:', error);
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
       const gadsErrorCodes = gadsErrors
@@ -36628,9 +38477,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           errorType: gadsError ? 'GOOGLE_ADS_API_ERROR' : 'INTERNAL_ERROR',
           errorCode: gadsErrorCodes[0] || 'UNKNOWN_GOOGLE_ADS_ERROR',
           error: gadsError || error.message || 'Unknown error',
+          code,
         };
       }
-      return { success: false, error: gadsError || error.message || 'Unknown error' };
+      return { success: false, error: gadsError || error.message || 'Unknown error', code };
     }
   }
 
@@ -36663,11 +38513,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       return { success: false, error: 'mode must be "raw" or "dashboard"' };
     } catch (error: any) {
-      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
+      // ENG-1300: see handleCallGoogleAdsApi's catch above for why `code` is
+      // error.response.status specifically, never a Google Ads business code.
+      const code = error?.response?.status;
+      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true, code };
       console.error('[AgentMode] handleCallGoogleAdsReportingApi error:', error);
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
       const gadsError = gadsErrors.length ? gadsErrors.map((e: any) => e.message).join('; ') : undefined;
-      return { success: false, error: gadsError || error.message || 'Unknown error' };
+      return { success: false, error: gadsError || error.message || 'Unknown error', code };
     }
   }
 

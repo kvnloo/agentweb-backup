@@ -16,6 +16,13 @@ jest.mock('../services/connectedAccountsDb', () => ({
   getAccountById: jest.fn(),
   getAccountByIdConsistent: jest.fn(),
   isTokenValid: jest.fn(),
+  // ENG-1616 extracted this as the one shared platform allowlist and
+  // postOnConnectedAccount now filters through it (agentModeService.ts). A
+  // jest.mock factory replaces the whole module, so an export missing here
+  // resolves undefined and .includes() throws inside the SUT's try/catch,
+  // silently downgrading every account lookup to 'not found'. Mirrors the
+  // same constant already mocked in scheduledPublishConsentGuard.test.ts.
+  SOCIAL_POSTING_PLATFORMS: ['twitter', 'linkedin', 'instagram', 'youtube'],
 }));
 
 jest.mock('../services/socialPlatformService', () => ({
@@ -336,6 +343,27 @@ describe('AgentModeService - Social Media Tools', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('Failed to post');
+    });
+
+    // ENG-1300: the LinkedIn adapter attaches the real HTTP status as .code on
+    // its rethrown errors (see linkedInAdapter.test.ts) — prove it survives all
+    // the way through postOnConnectedAccount's own catch to the returned result,
+    // so classifyToolErrorClass sees 'auth' instead of the generic Error/bug.
+    it('ENG-1300 — carries the adapter-attached .code through to the result', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
+      const codedError: any = new Error('LinkedIn access token expired. Please reconnect your account.');
+      codedError.code = 401;
+      mockAdapter.createPost.mockRejectedValue(codedError);
+
+      const result = await service.postOnConnectedAccount(
+        'user-123',
+        'urn:li:organization:123456',
+        'Test content'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(401);
     });
 
     it('does not create a LinkedIn post after its account disconnects', async () => {

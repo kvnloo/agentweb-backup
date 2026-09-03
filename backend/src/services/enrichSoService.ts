@@ -15,6 +15,13 @@
 import { enrichSoCacheKey, type EnrichSoEndpoint, type FindInput } from './enrichSoCacheKeys';
 import type { QuotaTracker } from './enrichSoQuota';
 
+// ENG-696: the $ ledger mirror lives in enrichSoServiceFactory.ts — that's
+// the module that actually reaches the vendor over HTTP, matching the
+// vendorMeteringCoverageGuard's per-file model (ENG-701). This module only
+// threads `opts.userId` down to the injected EnrichSoHttpClient so the
+// factory's real HTTP wrapper can record against the durable ledger right
+// at the point it reaches the vendor.
+
 // ─── Result types (what callers see) ─────────────────────────────────────────
 
 export type ValidationStatus = 'deliverable' | 'risky' | 'undeliverable' | 'unknown';
@@ -88,9 +95,12 @@ export interface CallOptions {
  * Callers that need typed access should go through the service's mapped result types.
  */
 export interface EnrichSoHttpClient {
-  validateEmail(email: string): Promise<any>;
-  findEmail(input: { firstName: string; lastName: string; domain: string }): Promise<any>;
-  reverseLookup(email: string): Promise<any>;
+  /** ENG-696: request owner, threaded through so the factory's HTTP wrapper
+   *  can mirror this call into the $ ledger right where it reaches the
+   *  vendor. Absent means platform/system (AC2). */
+  validateEmail(email: string, userId?: string): Promise<any>;
+  findEmail(input: { firstName: string; lastName: string; domain: string }, userId?: string): Promise<any>;
+  reverseLookup(email: string, userId?: string): Promise<any>;
 }
 
 export interface CacheRow {
@@ -329,7 +339,7 @@ export class EnrichSoService {
     const row = await this.runCachedCall(
       'validate',
       { email },
-      () => this.deps.http.validateEmail(email.trim()).then(r => r?.data ?? r),
+      () => this.deps.http.validateEmail(email.trim(), opts.userId).then(r => r?.data ?? r),
       opts,
     );
     return rowToValidate(row.row, row.fromCache);
@@ -350,7 +360,7 @@ export class EnrichSoService {
           firstName: (input.firstName ?? '').trim(),
           lastName: (input.lastName ?? '').trim(),
           domain: (input.domain ?? input.company ?? '').trim(),
-        });
+        }, opts.userId);
         return apiResp?.data ?? apiResp;
       },
       opts,
@@ -366,7 +376,7 @@ export class EnrichSoService {
       'reverse',
       { email },
       async () => {
-        const apiResp = await this.deps.http.reverseLookup(email.trim());
+        const apiResp = await this.deps.http.reverseLookup(email.trim(), opts.userId);
         // enrich.so signals not-found via either:
         //  (a) success:false envelope (rare, e.g. our 404 translator)
         //  (b) success:true + data.found === false (what they actually return for unknown emails)

@@ -203,7 +203,7 @@ describe('llmPricing', () => {
       // Models whose provider publishes an explicit cache rate that differs from the
       // 10%/125% convention (see the ModelPrice cache-price docs). gpt-4o's real
       // cached-input rate is $1.25 (50% of input), not the derived 10%.
-      const explicitCacheOverrides = new Set(['gpt-4o']);
+      const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1', 'gemini-3.8-flash']);
       for (const [model, price] of Object.entries(MODEL_PRICING)) {
         if (price.outPerM === 0) continue; // embeddings have no cache convention
         if (explicitCacheOverrides.has(model)) continue;

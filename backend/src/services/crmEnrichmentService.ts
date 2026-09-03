@@ -1250,7 +1250,7 @@ export class CrmEnrichmentService {
       const isPersonalDomain = domain ? CrmEnrichmentService.isPersonalDomain(domain) : false;
       if (domain && !isPersonalDomain) {
         try {
-          const orgResult = await getApolloService().matchOrg(domain);
+          const orgResult = await getApolloService().matchOrg(domain, { userId: spec.userId });
           const techStack = orgResult.organization?.techStack;
           if (techStack && techStack.length > 0) {
             apolloTechStackContext = `Apollo technology data for ${domain}:\n${techStack.join(', ')}`;

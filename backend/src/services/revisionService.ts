@@ -141,10 +141,14 @@ async function runAgentModeRevision(
       ? [{ functionName: 'generate_image', minCount: 1 }]
       : [{ functionName: 'update_html_file', minCount: 1 }];
 
-  const { runVerifiedChat } = await import('../controllers/agentModeController');
+  const { runVerifiedChat, isSessionBusyError } = await import('../controllers/agentModeController');
+  const { cronJobRegistry } = await import('../utils/cronJobRegistry');
 
   try {
-    const result = await runVerifiedChat({
+    // ENG-1189: this run's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener.
+    const result = await cronJobRegistry.track('revisionServiceVerifiedChat', runVerifiedChat({
       sessionId: agentSessionId,
       userId: session.userId,
       startingMessage: revisionMessage,
@@ -154,7 +158,7 @@ async function runAgentModeRevision(
       maxAttempts: 5,
       approvedRevisionImageSources:
         approval.assetType === 'image' ? [approval.assetUrl] : undefined,
-    });
+    }));
 
     console.log(`Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
 
@@ -292,6 +296,18 @@ async function runAgentModeRevision(
       }
     }
   } catch (error: any) {
+    // ENG-1719: the target session was already generating (a live chat turn, or another
+    // revision/schedule) when this run tried to claim it — expected, benign contention,
+    // not a failure of this revision. Paging on-call for it was the exact false-alarm this
+    // fix exists to stop. The revision is simply dropped here (no automatic retry exists
+    // for this path today); log clearly so it's traceable without a false page.
+    if (isSessionBusyError(error)) {
+      console.error(
+        `Agent Mode revision for session ${agentSessionId} skipped — session was busy with ` +
+        `another generation in progress. Not a failure; no automatic retry for this path.`
+      );
+      return;
+    }
     console.error('Error in Agent Mode verified-generate:', error);
     try {
       const isLimit = isSessionLimitError(error);

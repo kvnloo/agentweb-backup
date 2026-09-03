@@ -15,6 +15,8 @@ import {
   deleteSlackMessage,
   getSlackUserDisplayName,
   getSlackUserEmail,
+  getSlackUserTeamId,
+  getOwnSlackTeamId,
   resolveSlackMentionsInText,
   downloadSlackFile,
   resolveSlackFileUrl
@@ -41,6 +43,22 @@ function citeForSlack(response: any): string {
 }
 
 const router = express.Router();
+
+// ENG-1294: Slack Connect guests (e.g. Argusoft engineers, who work directly in this codebase)
+// can never share our own workspace's team_id — that's what Slack Connect means — so neither the
+// email-domain check nor the own-team_id fallback below can ever authorize them, even though
+// they're legitimately trusted. Slack reliably includes the author's home team on Connect-shared
+// app_mention events via user_team/source_team, delivered directly on the event payload — no
+// extra API call, and no dependency on users.info resolving anything (confirmed empirically:
+// Manan's own test in #agentweb-argusoft on 2026-09-03 got the profile-email field silently
+// omitted exactly as it did for Harsha/Fangfang, but user_team/source_team carried his real home
+// team, T093CUE1WGP, without incident). Comma-separated env override; defaults to Argusoft's team.
+const TRUSTED_EXTERNAL_SLACK_TEAM_IDS = new Set(
+  (process.env.AGENTWEB_TRUSTED_EXTERNAL_SLACK_TEAM_IDS || 'T093CUE1WGP') // Argusoft
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
 
 function userMatchesChannel(u: any, channel: string): boolean {
   // Skip tombstoned (deleted) users
@@ -184,6 +202,7 @@ async function handleSlackSessionResponse(params: {
   // Generate the response
   const { generateSessionResponse } = await import('../controllers/agentModeController');
   const { agentModeService } = await import('../services/agentModeService');
+  const { cronJobRegistry } = await import('../utils/cronJobRegistry');
 
   const llmModel = session.llmModel || await agentModeService.getDefaultModel();
   if (!session.llmModel) {
@@ -223,13 +242,16 @@ async function handleSlackSessionResponse(params: {
   }
 
   try {
-    const response = await generateSessionResponse(
+    // ENG-1189: this turn's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener.
+    const response = await cronJobRegistry.track('slackAgentTurn', generateSessionResponse(
       session.sessionId,
       userMessage,
       user.userId,
       llmModel,
       attachments
-    );
+    ));
 
     // Remove the thinking message
     if (thinkingTs) {
@@ -457,7 +479,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
       // Handle app mention events
       if (event.type === 'app_mention') {
-        const { text, user: slackUserId, channel, ts, files } = event;
+        const { text, user: slackUserId, channel, ts, files, user_team: userTeam, source_team: sourceTeam } = event;
 
         console.log('👋 Emma bot mentioned in Slack:', {
           channel,
@@ -513,7 +535,41 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           if (channelLinkIntent) {
             const requesterEmail = (await getSlackUserEmail(slackUserId))?.toLowerCase();
             const targetEmail = channelLinkIntent.targetEmail;
-            const canLinkChannel = requesterEmail === targetEmail || requesterEmail?.endsWith('@agentweb.pro');
+            let canLinkChannel = requesterEmail === targetEmail
+              || requesterEmail?.endsWith('@agentweb.pro')
+              || requesterEmail?.endsWith('@argusoft.com');
+
+            // ENG-1294: requesterEmail depends on Slack's profile.email resolving, which needs the
+            // users:read.email bot scope and has empirically failed for verified AgentWeb admins
+            // (ENG-1263 — Fangfang's own email failed to resolve even though the rest of her
+            // profile did). Without this, nobody whose email fails to resolve can ever use the
+            // remedy this very handler tells them to run. Fall back to team_id: it rides the same
+            // users.info response but doesn't need that scope. It only proves "this Slack user
+            // belongs to our own workspace" — never enough to pick which AgentWeb account a
+            // mention resolves to, but that's not the question here: targetEmail is typed
+            // explicitly by the requester, so this only decides whether an AgentWeb workspace
+            // member is allowed to run the link command at all — the same authorization the
+            // trusted-domain checks above already grant to any internal admin, just via a
+            // signal that doesn't depend on the broken field.
+            if (!canLinkChannel) {
+              const [senderTeamId, ownTeamId] = await Promise.all([
+                getSlackUserTeamId(slackUserId),
+                getOwnSlackTeamId(),
+              ]);
+              canLinkChannel = !!senderTeamId && !!ownTeamId && senderTeamId === ownTeamId;
+            }
+
+            // ENG-1294: the own-team_id check above only ever proves "same workspace as us" — a
+            // real Slack Connect guest can never pass it, no matter who they are. Trust a small,
+            // explicit allowlist of partner teams via user_team/source_team instead, which Slack
+            // hands us directly rather than requiring a lookup that may silently omit data for an
+            // external profile. Same authorization question as every check above (may this Slack
+            // user run the link command at all), never used to pick which AgentWeb account a
+            // mention resolves to.
+            if (!canLinkChannel) {
+              const externalTeamId = userTeam || sourceTeam;
+              canLinkChannel = !!externalTeamId && TRUSTED_EXTERNAL_SLACK_TEAM_IDS.has(externalTeamId);
+            }
 
             if (!canLinkChannel) {
               await slackClient.chat.postMessage({
@@ -768,6 +824,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             const { chatbotDb } = await import('../services/chatbotService');
             const { generateSessionResponse } = await import('../controllers/agentModeController');
             const { agentModeService } = await import('../services/agentModeService');
+            const { cronJobRegistry } = await import('../utils/cronJobRegistry');
 
             const session = await chatbotDb.getChatSession(sessionId);
             if (!session) {
@@ -823,7 +880,10 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             const llmModel = session.llmModel || await agentModeService.getDefaultModel();
 
             try {
-              const response = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments);
+              // ENG-1189: this turn's tool calls self-call back into this
+              // process via mcpFetch — tracked so a deploy mid-run waits for
+              // it instead of abandoning it against a closed listener.
+              const response = await cronJobRegistry.track('slackThreadAgentTurn', generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments));
               if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
               if (response.content) await postThreadResponse(channel, threadTs, citeForSlack(response));
             } catch (genError) {
@@ -1324,6 +1384,14 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                     }
                   }
                 }).catch(async (error) => {
+                  // ENG-1719: expected, benign lock contention (a live chat turn or another
+                  // revision on the same session), not a real failure — paging on-call for
+                  // it was the exact false alarm this fix exists to stop.
+                  const { isSessionBusyError } = await import('../controllers/agentModeController');
+                  if (isSessionBusyError(error)) {
+                    console.warn(`⏳ Agent Mode revision for session ${agentSessionId} skipped — session was busy with another generation in progress.`);
+                    return;
+                  }
                   console.error('❌ Error in Agent Mode verified-generate:', error);
                   try {
                     const isSessionLimit = isSessionLimitError(error);
@@ -1553,6 +1621,14 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         }
                       }
                     }).catch(async (error) => {
+                      // ENG-1719: expected, benign lock contention, not a real failure —
+                      // paging on-call for it was the exact false alarm this fix exists
+                      // to stop.
+                      const { isSessionBusyError } = await import('../controllers/agentModeController');
+                      if (isSessionBusyError(error)) {
+                        console.warn(`⏳ Agent Mode revision for session ${task.sessionId} skipped — session was busy with another generation in progress.`);
+                        return;
+                      }
                       console.error('❌ Error in Agent Mode verified-generate:', error);
                       try {
                         const isSessionLimit = isSessionLimitError(error);

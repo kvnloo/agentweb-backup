@@ -180,6 +180,22 @@ process.on('message', async (message: any) => {
     // Include partial usage messages if available (accumulated before the error)
     const partialUsageMessages = (error as any)?.partialUsageMessages;
     const originalMessage = (error as any)?.originalMessage;
+    // ENG-1670: generateMarketingResponse's catch block classifies the raw
+    // provider error (e.g. a 429) into a friendly-text Error and preserves
+    // .status/.code on it for downstream classifyZeroAssistantFailure — but
+    // that classification only survives if it crosses this IPC boundary too.
+    // Dropping it here made every wrapped error look like an unclassifiable
+    // 'system' failure once it reached agentModeController, regardless of the
+    // original cause (prod-verified: a rate-limited scheduled run reported
+    // "unexpected system error" instead of the correct transient-retry copy).
+    const status = (error as any)?.status;
+    const code = (error as any)?.code;
+    // ENG-1670: whether OpenRouter actually sent a Retry-After header is not
+    // guaranteed — forwarding the answer (not just the friendly message) means
+    // a future recurrence of this failure class is self-diagnosing from the
+    // durable session record instead of needing logs that expire in 14 days.
+    const retryAfterHeaderPresent = (error as any)?.retryAfterHeaderPresent;
+    const retryAfterMs = (error as any)?.retryAfterMs;
     process.send!({
       type: 'error',
       requestId,
@@ -190,7 +206,11 @@ process.on('message', async (message: any) => {
         llmModel: message.params?.llmModel,
       },
       ...(originalMessage ? { originalMessage } : {}),
-      ...(partialUsageMessages?.length ? { partialUsageMessages } : {})
+      ...(partialUsageMessages?.length ? { partialUsageMessages } : {}),
+      ...(status !== undefined ? { status } : {}),
+      ...(code !== undefined ? { code } : {}),
+      ...(retryAfterHeaderPresent !== undefined ? { retryAfterHeaderPresent } : {}),
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {})
     });
   }
 });

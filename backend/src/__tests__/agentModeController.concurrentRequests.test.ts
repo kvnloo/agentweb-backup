@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { agentModeController, activeSessionGenerations } from '../controllers/agentModeController';
+import { agentModeController, activeSessionGenerations, drainActiveSessionGenerations } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 
@@ -262,6 +262,46 @@ describe('AgentModeController - Concurrent Request Handling', () => {
 
       // Lock must be released even on error
       expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+    });
+  });
+
+  // ENG-1189: server.ts's graceful-shutdown drain must wait for in-flight
+  // interactive turns before closing the HTTP listener their MCP tool calls
+  // self-call back into. These tests cover the drain helper directly,
+  // mirroring cronJobRegistry's own drain tests (gracefulShutdown.test.ts).
+  describe('drainActiveSessionGenerations', () => {
+    it('resolves immediately when no turns are in flight', async () => {
+      const start = Date.now();
+      const result = await drainActiveSessionGenerations(5000, 20);
+      expect(Date.now() - start).toBeLessThan(500);
+      expect(result).toEqual({ drained: true, stuckCount: 0 });
+    });
+
+    it('blocks until the in-flight turn completes, then resolves', async () => {
+      activeSessionGenerations.add(mockSessionId);
+
+      let resolved = false;
+      const drainPromise = drainActiveSessionGenerations(5000, 20).then((r) => {
+        resolved = true;
+        return r;
+      });
+
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(resolved).toBe(false);
+
+      activeSessionGenerations.delete(mockSessionId);
+
+      const result = await drainPromise;
+      expect(resolved).toBe(true);
+      expect(result).toEqual({ drained: true, stuckCount: 0 });
+    });
+
+    it('reports the stuck count instead of hanging once the ceiling is reached', async () => {
+      activeSessionGenerations.add(mockSessionId);
+
+      const result = await drainActiveSessionGenerations(50, 10);
+
+      expect(result).toEqual({ drained: false, stuckCount: 1 });
     });
   });
 });

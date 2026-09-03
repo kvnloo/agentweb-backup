@@ -31,6 +31,7 @@ import { ToolResultPolicyBlockedError } from '../../../utils/toolResultError';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
 import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
+import { parseToolCallArguments, TruncatedToolCallArgumentsError } from './repairToolCallArguments';
 import {
   buildToolResponseS3Header,
   buildToolResponseUnavailableHeader,
@@ -681,7 +682,12 @@ export async function executePreparedTools(
 
   for (const toolCall of responseToolCalls) {
     try {
-      const functionArgs = JSON.parse(toolCall.function.arguments);
+      // ENG-1477: a large or quote-rich value (report titles with a quoted
+      // phrase, HTML content with attribute quotes) sometimes comes back with
+      // an inner `"` the model failed to escape, which JSON.parse reads as an
+      // early string terminator. Retry through a repair pass before failing —
+      // see repairToolCallArguments.ts for the observed failure signature.
+      const functionArgs = parseToolCallArguments(toolCall.function.arguments);
 
       // Enforce skill-based tool access; block admin-only tools without admin access,
       // block context-restricted/shared-session tools even if the LLM hallucinates them.
@@ -721,7 +727,20 @@ export async function executePreparedTools(
       }
 
       if (publishedSkillsCount > 0 && sessionAssociatedSkillIdsCount > 0 && !allowedToolNames.has(toolCall.function.name)) {
-        const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
+        /*
+         * The install directive alone left the model with no instruction for the case where the
+         * install ALSO fails (e.g. the skill is not on the user's plan). Observed in a live
+         * delegated session: the gate refused `audit_ad_utm_coverage`, `install_skills` was
+         * refused by subscription, and the model then ran an unrelated AD LIST and presented a
+         * confident "UTM Tagging Audit Summary — PASS, 6/6 tagged" table built from it. A
+         * downstream truthfulness guard appended a correction, but underneath the fabricated
+         * table — a correction is not a substitute for not fabricating.
+         *
+         * The prefix is unchanged: `classifyToolErrorClass` keys 'tool_unavailable' off it.
+         */
+        const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`
+          + ` If install_skills cannot install it — for example it is not available on this subscription — STOP and tell the user plainly that this capability is unavailable on their plan.`
+          + ` Do NOT run a different tool and present its output as this tool's result: reporting that a specific check ran, or passed, is a claim about THAT check, and substituting other data makes the claim false.`;
         appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
         continue;
       }
@@ -853,11 +872,17 @@ export async function executePreparedTools(
     } catch (error) {
       console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
       const errMsg = error instanceof Error ? error.message : String(error);
-      // ENG-124: unparseable args are never retryable as-is — emit the corrected-
-      // arguments verdict alongside the formatted error.
+      // ENG-124: unparseable args are never retryable as-is — EXCEPT when the
+      // arguments were genuinely truncated mid-stream (ENG-1477 follow-up):
+      // there is no bad argument to fix there, so "fix your args" is actively
+      // wrong guidance and just burns retries on cosmetic variations of an
+      // already-complete call. classifyToolErrorClass recognizes
+      // TruncatedToolCallArgumentsError by name and routes it to the
+      // retryable 'truncated_response' class instead of the hardcoded
+      // 'invalid_args' used for every other parse failure.
       const errorContent = appendRetryabilityGuidance(
         ports.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`),
-        'invalid_args',
+        error instanceof TruncatedToolCallArgumentsError ? classifyToolErrorClass(error) : 'invalid_args',
       );
       appendPreflightToolFailure(toolCall, undefined, `Failed to parse arguments: ${errMsg}`, errorContent);
     }

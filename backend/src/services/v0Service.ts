@@ -14,7 +14,8 @@ import { canEditItem } from "./orgShareService";
 import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
-import { guardedV0ChatCreate, guardedV0CorrectionMessage, clearV0UsageForPage, hashV0Prompt } from "./v0UsageGuard";
+import { guardedV0ChatCreate, guardedV0CorrectionMessage, guardedV0IterateMessage, clearV0UsageForPage, hashV0Prompt } from "./v0UsageGuard";
+import { meteredV0 } from "./v0Metering";
 // Type-only imports from durableLandingService live elsewhere; this constant import is
 // runtime-safe because durableLandingService only imports a TYPE from this module.
 import { STUCK_CEILING_MS } from "./durableLandingService";
@@ -1465,7 +1466,7 @@ async function generateFirstPage(
       // minting an orphan, credit-burning chat on every "timeout". Async returns the
       // chatId in seconds; waitForCompletedV0Version absorbs the generation time. (ENG-287)
       create: () => withRetry(
-        () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" }),
+        meteredV0({ userId, operation: "chat_create" }, () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" })),
         "v0 chat creation",
         // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
         // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
@@ -1851,7 +1852,7 @@ async function addPageToExistingRepo(
       // responseMode async — see the first-page call site for why sync mode cannot
       // survive the 300s attempt timeout. (ENG-287)
       create: () => withRetry(
-        () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" }),
+        meteredV0({ userId, operation: "chat_create" }, () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" })),
         "v0 chat creation (additional page)",
         // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
         // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
@@ -1955,7 +1956,7 @@ async function addPageToExistingRepo(
               chatId,
               attempt: validationAttempt,
               send: () => withRetry(
-                () => v0.chats.sendMessage({
+                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
                   chatId,
                   message:
                     "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
@@ -1963,7 +1964,7 @@ async function addPageToExistingRepo(
                     "fetch('/api/capture', ...) JSON body, and on a successful response call " +
                     "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
                     `Issue: ${pixelCheck.reason}`,
-                }),
+                })),
                 "v0 correction message (pixel lead event, additional page)",
                 undefined, undefined, undefined,
                 { retryOnTimeout: false }
@@ -2009,7 +2010,7 @@ async function addPageToExistingRepo(
               chatId: chatId!,
               attempt: validationAttempt,
               send: () => withRetry(
-                () => v0.chats.sendMessage({
+                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
                   chatId: chatId!,
                   message:
                     "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
@@ -2018,7 +2019,7 @@ async function addPageToExistingRepo(
                     "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
                     "shared root layout. " +
                     `Issue: ${adsCheck.reason}`,
-                }),
+                })),
                 "v0 correction message (google ads conversion, sub-page)",
                 undefined, undefined, undefined,
                 { retryOnTimeout: false }
@@ -2055,14 +2056,14 @@ async function addPageToExistingRepo(
               chatId,
               attempt: validationAttempt,
               send: () => withRetry(
-                () => v0.chats.sendMessage({
+                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
                   chatId,
                   message:
                     "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
                     `redirect the visitor via window.location.href to ${bridgeOutUrl} with the submitted email ` +
                     "appended as an email= query param (URL-encoded). " +
                     `Issue: ${bridgeCheck.reason}`,
-                }),
+                })),
                 "v0 correction message (bridge-out redirect, additional page)",
                 undefined, undefined, undefined,
                 { retryOnTimeout: false }
@@ -2103,14 +2104,14 @@ async function addPageToExistingRepo(
             // that was really 1. (ENG-287 residual)
             attempt: validationAttempt,
             send: () => withRetry(
-              () => v0.chats.sendMessage({
+              meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
                 chatId,
                 message:
                   "The previous output was not valid code. Please generate actual React/Next.js code — " +
                   "not markdown, not a prompt description, not empty files. " +
                   "Output must include .tsx files with real React components using export and function/const. " +
                   `Issue: ${valErr.reason}`,
-              }),
+              })),
               "v0 correction message (additional page)",
               // A correction that outlives the attempt timeout must fail once, not be
               // re-sent 3× — each retry could double-apply the correction at full cost. (ENG-287)
@@ -3101,7 +3102,7 @@ export async function deployLandingPage(
               chatId: record.v0ChatId!,
               attempt: validationAttempt,
               send: () => withRetry(
-                () => v0.chats.sendMessage({
+                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
                   chatId: record.v0ChatId!,
                   message:
                     "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
@@ -3109,7 +3110,7 @@ export async function deployLandingPage(
                     "fetch('/api/capture', ...) JSON body, and on a successful response call " +
                     "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
                     `Issue: ${pixelCheck.reason}`,
-                }),
+                })),
                 "v0 correction message (pixel lead event)",
                 undefined, undefined, undefined,
                 { retryOnTimeout: false }
@@ -3150,7 +3151,7 @@ export async function deployLandingPage(
               chatId: record.v0ChatId!,
               attempt: validationAttempt,
               send: () => withRetry(
-                () => v0.chats.sendMessage({
+                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
                   chatId: record.v0ChatId!,
                   message:
                     "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
@@ -3159,7 +3160,7 @@ export async function deployLandingPage(
                     "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
                     "root layout. " +
                     `Issue: ${adsCheck.reason}`,
-                }),
+                })),
                 "v0 correction message (google ads conversion)",
                 undefined, undefined, undefined,
                 { retryOnTimeout: false }
@@ -3198,14 +3199,14 @@ export async function deployLandingPage(
               chatId: record.v0ChatId!,
               attempt: validationAttempt,
               send: () => withRetry(
-                () => v0.chats.sendMessage({
+                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
                   chatId: record.v0ChatId!,
                   message:
                     "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
                     `redirect the visitor via window.location.href to ${record.bridgeOutUrl} with the submitted email ` +
                     "appended as an email= query param (URL-encoded). " +
                     `Issue: ${bridgeCheck.reason}`,
-                }),
+                })),
                 "v0 correction message (bridge-out redirect)",
                 undefined, undefined, undefined,
                 { retryOnTimeout: false }
@@ -3245,14 +3246,14 @@ export async function deployLandingPage(
             // skipped and we re-downloaded the same broken zip. (ENG-287 residual)
             attempt: validationAttempt,
             send: () => withRetry(
-              () => v0.chats.sendMessage({
+              meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
                 chatId: record.v0ChatId!,
                 message:
                   "The previous output was not valid code. Please generate actual React/Next.js code — " +
                   "not markdown, not a prompt description, not empty files. " +
                   "Output must include .tsx files with real React components using export and function/const. " +
                   `Issue: ${valErr.reason}`,
-              }),
+              })),
               "v0 correction message",
               // A correction that outlives the attempt timeout must fail once, not be
               // re-sent 3× — each retry could double-apply the correction at full cost. (ENG-287)
@@ -5741,7 +5742,19 @@ export async function deleteEnvVar(
 export async function iterateLandingPage(
   id: string,
   userId: string,
-  message: string
+  message: string,
+  /**
+   * ENG-694 AC5: the org member who triggered this, when that is not the page
+   * owner. The route authorizes with `authorizeLandingPageAccess(id, actor,
+   * "edit")` and then passes `auth.page.userId` — the OWNER — as `userId`, so
+   * the actor's identity was being discarded before this function saw it.
+   *
+   * It has to arrive as its own argument. `getLandingPage(id, userId)` returns
+   * null unless `item.userId === userId`, so deriving the actor from the record
+   * here can only ever reproduce the owner (CodeRabbit, #2721). Optional so
+   * every existing caller keeps today's behaviour: absent means actor = owner.
+   */
+  actingUserId?: string
 ): Promise<GeneratedLandingPage> {
   const record = await getLandingPage(id, userId);
   if (!record) {
@@ -5759,6 +5772,13 @@ export async function iterateLandingPage(
 
   const chatId = record.v0ChatId!;
   const deadline = Date.now() + V0_GENERATION_BUDGET_MS;
+
+  // ENG-694 AC5. `userId` is the page owner (the route passes auth.page.userId)
+  // and carries the spend; `actingUserId` is the member who triggered it, when
+  // the route supplies one. They are equal on every self-service call, so
+  // `onBehalfOf` stays absent unless a delegated edit genuinely happened.
+  const iterateOwnerUserId = record.userId || userId;
+  const iterateActorUserId = actingUserId || iterateOwnerUserId;
 
   try {
     const v0 = await getV0Client();
@@ -5792,12 +5812,18 @@ export async function iterateLandingPage(
       // refuses). Async returns in seconds; the version wait below absorbs the real time.
       // Safe now only because that wait is anchored to `afterVersionId` — without it, a deploy
       // could grab the PRE-iteration version and silently ship the page without the edit.
-      await withRetry(
-        () => v0.chats.sendMessage({ chatId, message, responseMode: "async" }),
-        "v0 chat iterate",
-        undefined, undefined, undefined,
-        { retryOnTimeout: false }
-      );
+      await guardedV0IterateMessage({
+        userId: iterateActorUserId,
+        scopeId: id,
+        chatId,
+        message,
+        send: () => withRetry(
+          meteredV0({ userId: iterateActorUserId, billingUserId: iterateOwnerUserId, ...(iterateActorUserId && iterateOwnerUserId && iterateActorUserId !== iterateOwnerUserId ? { onBehalfOf: iterateActorUserId } : {}), operation: "iterate_message" }, () => v0.chats.sendMessage({ chatId, message, responseMode: "async" })),
+          "v0 chat iterate",
+          undefined, undefined, undefined,
+          { retryOnTimeout: false }
+        ),
+      });
 
       // Record it the instant v0 accepts, BEFORE the wait — if the wait dies (timeout, crash,
       // lost response), the retry must know the message is already with v0.

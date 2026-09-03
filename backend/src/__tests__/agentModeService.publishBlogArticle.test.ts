@@ -1,6 +1,9 @@
 // Unit tests for publish_blog_article function in agentModeService
 
 import { AgentModeService } from '../services/agentModeService';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 // Mock axios
 const mockAxiosGet = jest.fn();
@@ -103,6 +106,12 @@ describe('AgentModeService - publish_blog_article function', () => {
         'post-summary': 'Test description'
       }
     }
+  };
+
+  const expectAuthConfig = (result: any) => {
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
   };
 
   describe('Webflow publishing with per-user config', () => {
@@ -275,6 +284,33 @@ describe('AgentModeService - publish_blog_article function', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Webflow API validation error');
+    });
+
+    // ENG-1300: WebflowBlogPublisher.publish already computed errorInfo.status
+    // from webflowError.response?.status but never returned it — a 403 there
+    // classified as generic Error/bug instead of auth/config.
+    it('ENG-1300 — Webflow 403 classifies as auth/config end-to-end', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'Webflow'
+      });
+      mockGetWebflowConfig.mockResolvedValue(mockWebflowConfig);
+      mockAxiosGet.mockResolvedValue({ data: mockHtmlContent });
+      mockAxiosPost.mockRejectedValueOnce({
+        response: { status: 403, statusText: 'Forbidden', data: {} }
+      });
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(false);
+      expectAuthConfig(result);
     });
 
     it('should extract content from HTML correctly', async () => {
@@ -1050,5 +1086,105 @@ describe('AgentModeService - publish_blog_article function', () => {
       expect(result.data.cmsType).toBe('Webflow');
     });
 
+    // ENG-1300: PayloadBlogPublisher.publish doesn't catch its own errors — they
+    // propagate to publishBlogArticle's outer catch, which extracted a friendly
+    // message but never carried the numeric status through.
+    it('ENG-1300 — Payload CMS 403 classifies as auth/config end-to-end', async () => {
+      // Reset — leftover queued mockResolvedValueOnce/mockRejectedValueOnce
+      // values from earlier tests in this file are NOT cleared by the
+      // top-level jest.clearAllMocks() (that only clears call history, not
+      // queued "once" implementations), so a stale entry could otherwise be
+      // dequeued ahead of the ones set up below.
+      mockAxiosGet.mockReset();
+      mockAxiosPost.mockReset();
+      mockAxiosGet.mockResolvedValueOnce({ data: mockHtmlContent });
+      mockAxiosPost.mockRejectedValueOnce({
+        message: 'Request failed with status code 403',
+        response: { status: 403, data: {} }
+      });
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(false);
+      expectAuthConfig(result);
+    });
+
+  });
+
+  describe('WordPress publishing', () => {
+    const mockWordPressConfig = {
+      siteUrl: 'https://example.com',
+      username: 'admin',
+      applicationPassword: 'app-pass-123',
+      categories: { Engineering: 5 },
+    };
+
+    beforeEach(() => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'WordPress'
+      });
+      mockGetWordPressConfig.mockResolvedValue(mockWordPressConfig);
+    });
+
+    it('should publish to WordPress successfully', async () => {
+      // Reset (see Payload 403 test above for why) and skip heroImageUrl —
+      // WordPress uploads a featured image via its own separate axios.get/post
+      // pair first, which would otherwise need its own mocking unrelated to
+      // what this test is proving.
+      mockAxiosGet.mockReset();
+      mockAxiosPost.mockReset();
+      mockAxiosGet.mockResolvedValueOnce({ data: mockHtmlContent });
+      mockAxiosPost.mockResolvedValueOnce({
+        data: { id: 42, link: 'https://example.com/test-blog-title' }
+      });
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        '',
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.data.cmsType).toBe('WordPress');
+    });
+
+    // ENG-1300: WordPressBlogPublisher.publish already computed errorInfo.status
+    // from wpError.response?.status but never returned it — deliberately not
+    // errorInfo.code, WordPress's own error slug (e.g. "rest_post_invalid_id").
+    it('ENG-1300 — WordPress 403 classifies as auth/config end-to-end', async () => {
+      mockAxiosGet.mockReset();
+      mockAxiosPost.mockReset();
+      mockAxiosGet.mockResolvedValueOnce({ data: mockHtmlContent });
+      mockAxiosPost.mockRejectedValueOnce({
+        response: {
+          status: 403,
+          statusText: 'Forbidden',
+          data: { code: 'rest_cannot_publish', message: 'Sorry, you are not allowed to publish this post.' }
+        }
+      });
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        '',
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(false);
+      expectAuthConfig(result);
+    });
   });
 });

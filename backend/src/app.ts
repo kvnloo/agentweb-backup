@@ -58,6 +58,7 @@ import googleAdsAuthRoutes from "./routes/googleAdsAuth";
 import fathomAuthRoutes from "./routes/fathomAuth";
 import fathomWebhookRoutes from "./routes/fathomWebhook";
 import calendlyWebhookRoutes from "./routes/calendlyWebhook";
+import unipileWebhookRoutes from "./routes/unipileWebhook";
 // ENG-926 §C: registers the CRM -> Meta conversion relay's queue processor at boot. The
 // poller leaves a job claimed-but-unprocessed when no processor is registered for its
 // source, so this cannot be deferred to the first status transition of a process's life —
@@ -67,6 +68,7 @@ import fathomOnboardingAdminRoutes from "./routes/fathomOnboardingAdmin";
 import hubspotAuthRoutes from "./routes/hubspotAuth";
 import attioAuthRoutes from "./routes/attioAuth";
 import crmSyncRoutes from "./routes/crmSync";
+import adsThresholdsRoutes from "./routes/adsThresholds";
 import crmWebhookRoutes from "./routes/crmWebhook";
 import mcpServersRoutes, { mcpOAuthPublicRouter } from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
@@ -327,6 +329,7 @@ app.use("/api/image-models", imageModelsRoutes);
 app.use("/api/webhooks", webhookRoutes);
 app.use("/api/webhooks/fathom", fathomWebhookRoutes);
 app.use("/api/webhooks/calendly", calendlyWebhookRoutes);
+app.use("/api/webhooks/unipile", unipileWebhookRoutes);
 registerConversionRelayProcessor();
 app.use("/api", devEnvRoutes);
 app.use("/api/benchmark", benchmarkRoutes);
@@ -343,6 +346,9 @@ app.use("/api/crm/webhooks/apollo", apolloWebhookRoutes);
 app.use("/api/crm/sequences", sequenceRoutes);
 app.use("/api/crm/companies", crmCompaniesRoutes);
 app.use("/api/crm", crmRoutes);
+// ENG-918 — per-account ads-detection thresholds. Every route authenticates and re-derives
+// ad-account ownership from the caller's own connected accounts; see the route file's header.
+app.use("/api/ads-thresholds", adsThresholdsRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
 app.use("/api/oauth/linkedin", linkedinAuthRoutes);
