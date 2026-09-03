@@ -24,6 +24,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { checkTokenUsage } from '../services/tokenUsageService';
+import { progressStore } from '../utils/sseProgress';
 
 jest.mock('../services/durableLandingService', () => ({
   findInFlightJobForSession: jest.fn().mockResolvedValue(null),
@@ -118,6 +119,10 @@ const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
 const mockSendOncallAlert = sendAgentModeOncallAlert as jest.Mock;
 const mockCheckTokenUsage = checkTokenUsage as jest.Mock;
+// markProgressComplete is a module-local helper in the controller, not an import, so it
+// can't be spied on directly — assert its two observable effects instead (it does exactly
+// `emitProgress(..., {status:'complete'})` then `progressStore.delete(sessionId)`).
+const mockProgressStoreDelete = (progressStore as any).delete as jest.Mock;
 
 describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1700/ENG-1699)', () => {
   const mockUserId = 'user-workplan-stall';
@@ -427,5 +432,116 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(3);
     expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
     expect(autoContinuationSessions.has(mockSessionId)).toBe(false);
+  });
+
+  /**
+   * ENG-1717 — live-found 2026-09-03 on production. A continuation round killed by
+   * withGenerationTimeout rejects instead of resolving, and BOTH the progress cleanup and
+   * the `stillStalled` assignment lived only in `.then()`. Observed consequence: a real
+   * session sat with the UI spinner running for 61 minutes on a turn the server had
+   * abandoned an hour earlier — only a manual page refresh cleared it — and the retry
+   * chain ended silently without consuming a round, so the exhaustion message and the
+   * on-call alert never fired either.
+   */
+  describe('ENG-1717: a continuation round killed by the generation timeout', () => {
+    const timeoutError = () => Object.assign(new Error('Generation timed out'), { isGenerationTimeout: true });
+
+    it('still clears the progress entry, so an open tab does not spin forever', async () => {
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockWorkerService.runInWorker
+        .mockResolvedValueOnce(workerResponse('Step 6 was interrupted.', [failedToolCall()]))
+        // The continuation round itself times out — the exact production shape. This is the
+        // ONLY continuation round: the post-timeout re-read below reports the plan finished,
+        // so nothing retries. That isolation matters — a later round that RESOLVES would run
+        // .then() and clear the progress entry itself, masking a regression in .finally().
+        .mockRejectedValueOnce(timeoutError());
+
+      (mockChatbotDb as any).getChatSessionRecord
+        .mockResolvedValueOnce(baseSession(stalledWorkPlan) as any)   // round 1's pre-fire recheck
+        .mockResolvedValue(baseSession(completedWorkPlan) as any);    // post-timeout re-read -> stop
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(), res);
+      mockProgressStoreDelete.mockClear();
+      await flush(60);
+
+      // Exactly one continuation round ran, and it rejected.
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+      // The whole point: cleanup ran on the REJECTED round too, not only on resolved ones.
+      // Without it the progress entry survives, hasActiveProgress keeps reporting
+      // "generating", and the browser spins forever (observed live: 61 minutes).
+      expect(mockProgressStoreDelete).toHaveBeenCalledWith(mockSessionId);
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+      expect(autoContinuationSessions.has(mockSessionId)).toBe(false);
+
+      consoleErrorSpy.mockRestore();
+    });
+
+    it('keeps the retry chain alive by re-reading the persisted plan instead of ending silently', async () => {
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockWorkerService.runInWorker
+        .mockResolvedValueOnce(workerResponse('Step 6 was interrupted.', [failedToolCall()]))
+        .mockRejectedValueOnce(timeoutError())
+        .mockImplementationOnce(async () => {
+          mockChatbotDb.getChatSession.mockResolvedValue(baseSession(completedWorkPlan) as any);
+          (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(completedWorkPlan) as any);
+          return workerResponse('Report generated.', []);
+        });
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(), res);
+      await flush(60);
+
+      // 1 customer turn + the timed-out round + the re-fired round. Before the fix the
+      // chain stopped at 2, leaving the plan permanently unfinished with nobody notified.
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(3);
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+
+      consoleErrorSpy.mockRestore();
+    });
+
+    it('fails CLOSED (stops retrying) when the post-timeout plan re-read also fails', async () => {
+      // An unknown plan state must not spin the chain — better to stop than to retry blind.
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockWorkerService.runInWorker
+        .mockResolvedValueOnce(workerResponse('Step 6 was interrupted.', [failedToolCall()]))
+        .mockRejectedValueOnce(timeoutError());
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(), res);
+      // Only the post-timeout re-read rejects; the pre-fire recheck of round 1 already ran.
+      (mockChatbotDb as any).getChatSessionRecord.mockRejectedValue(new Error('DynamoDB throttled'));
+      await flush(60);
+
+      // Customer turn + the timed-out round, then stop — no blind round 3.
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('could not re-read session'),
+        expect.any(Error),
+      );
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+
+      consoleErrorSpy.mockRestore();
+    });
+
+    it('does not re-read or retry for a non-timeout failure (unchanged behavior)', async () => {
+      // A genuine generation error is not a timeout — it must keep ending the chain, so the
+      // ENG-1717 re-read must be gated on isGenerationTimeout, not on "any rejection".
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockWorkerService.runInWorker
+        .mockResolvedValueOnce(workerResponse('Step 6 was interrupted.', [failedToolCall()]))
+        .mockRejectedValueOnce(new Error('LLM provider exploded'));
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(), res);
+      await flush(60);
+
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+      // Still cleaned up, even though it didn't retry.
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+      expect(autoContinuationSessions.has(mockSessionId)).toBe(false);
+
+      consoleErrorSpy.mockRestore();
+    });
   });
 });
