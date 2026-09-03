@@ -455,6 +455,24 @@ export async function runMetaTrackingGate(
   pendingCreativeIds: string[] = [],
 ): Promise<{ proceed: boolean; blockResult?: any }> {
   const { accountId, accessToken } = creds;
+  /*
+   * ONE launch budget for the whole gate, not one per read.
+   *
+   * This gate can issue TWO ad reads in a single call: the campaign-scoped one, and — when the
+   * named ad is not in that campaign — an account-wide fallback. Each was given its own
+   * META_LAUNCH_READ_MAX_MS, so the pair could spend 480s before creative resolution and the
+   * destination pre-flight had even started. Past the 600s nginx/ALB ceiling the request is
+   * killed mid-flight and the user gets a bare timeout with no message at all — strictly worse
+   * than the block this budget was raised to avoid.
+   *
+   * At the old 45s the same shape cost 90s and stayed clear, so raising the budget is what made
+   * the overrun reachable. Sharing a deadline keeps the gate's Meta reads inside one budget: the
+   * fallback gets whatever the first read left, and if that is nothing it reports truncated,
+   * which the block messages already handle.
+   */
+  const gateDeadlineAt = Date.now() + META_LAUNCH_READ_MAX_MS;
+  /** Budget still available to a Meta read in this gate call; floored so it is never <= 0. */
+  const remainingLaunchBudgetMs = () => Math.max(1_000, gateDeadlineAt - Date.now());
 
   /*
    * A CREATE that references an existing creative by id carries its destination nowhere in
@@ -554,7 +572,7 @@ export async function runMetaTrackingGate(
        * longer than a list call should, and for an action that spends the user's money and that
        * they are actively waiting on, that is the right trade.
        */
-      metaService.listAdsForUtmAudit(accountId, accessToken, campaignId, { maxMs: META_LAUNCH_READ_MAX_MS }),
+      metaService.listAdsForUtmAudit(accountId, accessToken, campaignId, { maxMs: remainingLaunchBudgetMs() }),
       metaService.listPixels(accountId, accessToken),
     ]);
     adsTruncated = !!adsListTruncated;
@@ -621,7 +639,7 @@ export async function runMetaTrackingGate(
      */
     try {
       const { items: accountWide, truncated: accountWideListTruncated } =
-        await metaService.listAdsForUtmAudit(accountId, accessToken, undefined as any, { maxMs: META_LAUNCH_READ_MAX_MS });
+        await metaService.listAdsForUtmAudit(accountId, accessToken, undefined as any, { maxMs: remainingLaunchBudgetMs() });
       accountWideTruncated = !!accountWideListTruncated;
       const named = (accountWide ?? []).filter((a: any) => String(a?.adId) === String(adId));
       const found = named.flatMap((a: any) => a?.destinationUrls ?? []).filter(Boolean);
