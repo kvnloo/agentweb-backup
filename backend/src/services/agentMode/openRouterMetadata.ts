@@ -16,7 +16,14 @@ interface OpenRouterMetadataSlot {
 }
 
 function extractProvider(openrouterMetadata: any): string | undefined {
-  const selected = openrouterMetadata?.endpoints?.selected ?? openrouterMetadata?.endpoints;
+  const endpoints = openrouterMetadata?.endpoints;
+  // Documented shape is `endpoints.available[]` with the winning candidate
+  // flagged `selected: true`; `endpoints.selected` (a bare object) is kept as
+  // a legacy fallback in case an older/alternate response shape uses it.
+  const fromAvailable = Array.isArray(endpoints?.available)
+    ? endpoints.available.find((candidate: any) => candidate?.selected === true)
+    : undefined;
+  const selected = fromAvailable ?? endpoints?.selected ?? endpoints;
   const providerName = selected?.provider_name ?? selected?.provider;
   return typeof providerName === 'string' ? providerName : undefined;
 }
