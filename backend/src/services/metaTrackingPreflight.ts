@@ -52,7 +52,7 @@ export interface MetaPreflightGateResult {
 
 export interface MetaPreflightDeps {
   /** Injectable fetch boundary. Must resolve to the served HTML or throw on failure. */
-  fetchHtml?: (url: string) => Promise<string>;
+  fetchHtml?: (url: string, deadlineAt?: number) => Promise<string>;
 }
 
 /** The measurement mechanisms this gate recognises (surfaced to users verbatim). */
@@ -470,9 +470,12 @@ function isTransientFetchFailure(err: any): boolean {
 }
 
 /* istanbul ignore next — network boundary; unit tests inject `fetchHtml` instead. */
-export async function defaultFetchHtml(url: string): Promise<string> {
+export async function defaultFetchHtml(url: string, deadlineAt?: number): Promise<string> {
   const MAX_HTML_BYTES = 5 * 1024 * 1024;
   return fetchHtmlFollowingRedirects(url, {
+    // The chain gets the same bound as the batch — six hops at 25s (50s with the retry) is 300s
+    // for ONE destination, which a between-batches check cannot see.
+    deadlineAt,
     // The retry sits INSIDE `get`, so `assertPublic` and the redirect follower stay in the path
     // on every attempt — a retry that bypassed them would quietly drop the SSRF guard.
     get: async (u: string) => {
@@ -550,8 +553,19 @@ export async function preflightMetaTrackingGate(
     }
     const settled = await Promise.all(
       batch.map(async (url): Promise<MetaUrlTrackingResult> => {
+        // Checked INSIDE the batch as well as between batches: a batch of five starting with 1ms
+        // left still ran all five to completion, up to 50s each.
+        if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+          return {
+            url,
+            status: 'unverifiable',
+            mechanisms: [],
+            checkedFor: META_TRACKING_MECHANISMS,
+            error: 'not checked — the launch pre-flight ran out of its time budget before reaching this destination',
+          };
+        }
         try {
-          const html = await fetchHtml(url);
+          const html = await fetchHtml(url, deadlineAt);
           const mechanisms = detectMetaPixels(html);
           const onPage = pixelIds(mechanisms);
           // Measured requires BOTH: a pixel is installed, and at least one installed pixel

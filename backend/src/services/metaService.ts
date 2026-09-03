@@ -2488,7 +2488,19 @@ export class MetaService {
         params.filtering = [{ field: 'campaign.id', operator: 'IN', value: [campaignId] }];
       }
       this.log(`Listing ads for UTM audit in account: ${adAccountId}`, { fields, campaignId });
-      const cursor = await MetaService.withReadDeadline(async () => account.getAds(fields, params), 'UTM audit ad list');
+      /*
+       * The FIRST page must honour the caller's budget too.
+       *
+       * `drainCursor` applies `maxMs` to the pages it walks, but this initial fetch went through
+       * the fixed per-call ceiling — so a caller arriving with its budget already spent still
+       * paid for one full read. The launch gate's `Math.max(1_000, …)` floor made that concrete:
+       * an exhausted wall still bought a 30s page. Capped to whatever the caller actually has.
+       */
+      const cursor = await MetaService.withReadDeadline(
+        async () => account.getAds(fields, params),
+        'UTM audit ad list',
+        options.maxMs,
+      );
       const { items: pages, truncated, pagesFetched } = await this.drainCursor(
         cursor,
         options.maxPages ?? META_LIST_MAX_PAGES,

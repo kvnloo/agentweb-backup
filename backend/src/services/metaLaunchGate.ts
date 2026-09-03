@@ -92,6 +92,15 @@ export const META_LAUNCH_READ_MAX_MS = 240_000;
  */
 export const META_LAUNCH_PREFLIGHT_MAX_MS = 240_000;
 
+/**
+ * Budget for the optional server-side-activity hint appended to a block.
+ *
+ * Deliberately small: it explains a decision that has already been made and can never change the
+ * outcome, so it is the first thing that should be given up. Keeps the gate's worst case at
+ * 240 + 240 + 60 = 540s, inside the 600s nginx/ALB ceiling.
+ */
+export const META_LAUNCH_HINT_MAX_MS = 60_000;
+
 const NO_EXISTING_ADS_ACTIONS = new Set([
   'CAMPAIGN_CREATE',
   'AD_SET_CREATE',
@@ -216,13 +225,29 @@ async function defaultPixelHasRecentActivity(pixelId: string, accessToken: strin
  * Also note `last_fired_time` is NOT usable here: verified 2026-08-14 that it tracks browser
  * fires only and does not move for Conversions API events, while `/stats` does capture them.
  */
+/**
+ * @param deadlineAt Wall-clock bound for the whole loop, not per probe.
+ *
+ * This is an EXPLANATION appended to a block that has already been decided — it can never
+ * approve a launch — so it must never be the reason a request dies. Each probe is bounded
+ * (30s, plus one retry on a transient failure = 60s) but the loop over `pixelIds` was not, and
+ * `pixelIds` is bounded only by `drainCursor`'s 2,500. It also runs AFTER both the read and
+ * pre-flight budgets, and only on the blocked path — where the pixels are by definition inactive,
+ * so it cannot exit early.
+ *
+ * ~270s of reads + 240s of pre-flight + three pixels at 60s = 690s, past the 600s nginx/ALB
+ * ceiling: a bare 504 instead of the block message this text was being added to. Bounding the
+ * loop costs only the hint, which is optional by construction.
+ */
 async function serverSideHint(
   pixelIds: string[],
   accessToken: string,
   deps: MetaGateDeps,
+  deadlineAt?: number,
 ): Promise<string> {
   const probe = deps.pixelHasRecentActivity ?? defaultPixelHasRecentActivity;
   for (const pixelId of pixelIds) {
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) return '';
     try {
       if (await probe(pixelId, accessToken)) {
         return (
@@ -809,7 +834,13 @@ export async function runMetaTrackingGate(
     return { proceed: true };
   }
   await record(sessionId, { accountId, campaignId, ...(adId && { adId }), action, outcome: 'blocked', urlResults, checkedAt: new Date().toISOString() });
-  const hint = await serverSideHint(pixelIds, accessToken, deps);
+  /*
+   * A small, explicit budget of its own — this is explanatory text on an already-decided block,
+   * and the request must reach the user with that block rather than dying while we embellish it.
+   * Sized so the gate's worst case stays inside the infra ceiling: 240s reads + 240s pre-flight
+   * + 60s hint = 540s, under 600s.
+   */
+  const hint = await serverSideHint(pixelIds, accessToken, deps, Date.now() + META_LAUNCH_HINT_MAX_MS);
   return {
     proceed: false,
     blockResult: {
