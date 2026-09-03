@@ -258,12 +258,23 @@ export async function assessClientHealth(
         const apiVersion = process.env.META_API_VERSION || 'v25.0';
         const adAccountId = client.adAccount || (metaAdAccounts[0]?.config as any)?.ad_account_id;
 
-        // Prior 14-day window immediately preceding the current `date_preset(last_14d)` window,
-        // used as the baseline for CTR-drop / CPM-rise fatigue checks.
-        const priorWindowEndDate = new Date();
-        priorWindowEndDate.setUTCDate(priorWindowEndDate.getUTCDate() - 14);
+        // Current 14-day window and the prior 14-day window immediately preceding it, used as
+        // the baseline for CTR-drop / CPM-rise fatigue checks. Fetched via the Graph API's
+        // `time_ranges` array param on a single `insights` edge — NOT via aliasing two separate
+        // `insights` sub-fields (e.g. `current:insights.date_preset(...)`), which the Graph API
+        // silently drops (confirmed live against a real ad account: the aliased field is simply
+        // absent from the response, no error). `time_ranges` returns one row per window in
+        // `insights.data`, distinguished by `date_start`/`date_stop`.
+        const currentWindowEndDate = new Date();
+        const currentWindowStartDate = new Date(currentWindowEndDate);
+        currentWindowStartDate.setUTCDate(currentWindowStartDate.getUTCDate() - 13);
+        const priorWindowEndDate = new Date(currentWindowStartDate);
+        priorWindowEndDate.setUTCDate(priorWindowEndDate.getUTCDate() - 1);
         const priorWindowStartDate = new Date(priorWindowEndDate);
         priorWindowStartDate.setUTCDate(priorWindowStartDate.getUTCDate() - 13);
+
+        const currentWindowStart = currentWindowStartDate.toISOString().slice(0, 10);
+        const currentWindowEnd = currentWindowEndDate.toISOString().slice(0, 10);
         const priorWindowStart = priorWindowStartDate.toISOString().slice(0, 10);
         const priorWindowEnd = priorWindowEndDate.toISOString().slice(0, 10);
 
@@ -276,20 +287,31 @@ export async function assessClientHealth(
             (c: any) => c.status === 'ACTIVE'
           );
 
-          // Fetch ad-level data for creative variety + fatigue analysis. `insights` requests
-          // both the current 14-day window and the prior 14-day window (as sibling fields with
-          // distinct aliases) so CTR-drop and CPM-rise can be measured against a real baseline —
-          // a single date_preset only gives a snapshot, not a delta.
+          // Fetch ad-level data for creative variety + fatigue analysis, requesting both the
+          // current and prior 14-day windows via `time_ranges` in one `insights` edge call —
+          // returns two rows per ad in `insights.data`, distinguished by `date_start`.
           if (activeCampaigns.length > 0) {
             const filtering = `[{"field":"campaign.id","operator":"IN","value":${JSON.stringify(activeCampaigns.map((c: any) => c.id))}}]`;
-            const insightsFields = 'spend,frequency,ctr,cpm';
+            const insightsFields = 'spend,frequency,ctr,cpm,date_start';
+            const timeRanges = JSON.stringify([
+              { since: currentWindowStart, until: currentWindowEnd },
+              { since: priorWindowStart, until: priorWindowEnd },
+            ]);
             const adData = await fetchWithRetryAndPaging(
               `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,creative{id,name},status,` +
-                `current_insights:insights.date_preset(last_14d){${insightsFields}},` +
-                `prior_insights:insights.time_range({"since":"${priorWindowStart}","until":"${priorWindowEnd}"}){${insightsFields}}` +
+                `insights.time_ranges(${encodeURIComponent(timeRanges)}){${insightsFields}}` +
                 `&filtering=${filtering}&access_token=${accessToken}`
             );
-            adLevelData = adData.data || [];
+            adLevelData = (adData.data || []).map((ad: any) => {
+              const rows: any[] = ad.insights?.data || [];
+              const current = rows.find((r: any) => r.date_start === currentWindowStart);
+              const prior = rows.find((r: any) => r.date_start === priorWindowStart);
+              return {
+                ...ad,
+                current_insights: current ? { data: [current] } : undefined,
+                prior_insights: prior ? { data: [prior] } : undefined,
+              };
+            });
           }
         }
       } catch (err) {

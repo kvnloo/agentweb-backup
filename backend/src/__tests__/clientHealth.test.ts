@@ -152,9 +152,9 @@ describe('Client Health - assessClientHealth', () => {
       })
       .mockResolvedValueOnce({
         data: [
-          { id: 'ad1', name: 'Ad 1', creative: { id: 'cr1' }, status: 'ACTIVE', current_insights: { data: [{ spend: '50' }] } },
-          { id: 'ad2', name: 'Ad 2', creative: { id: 'cr2' }, status: 'ACTIVE', current_insights: { data: [{ spend: '40' }] } },
-          { id: 'ad3', name: 'Ad 3', creative: { id: 'cr3' }, status: 'ACTIVE', current_insights: { data: [{ spend: '10' }] } },
+          { id: 'ad1', name: 'Ad 1', creative: { id: 'cr1' }, status: 'ACTIVE', insights: { data: [{ spend: '50' }] } },
+          { id: 'ad2', name: 'Ad 2', creative: { id: 'cr2' }, status: 'ACTIVE', insights: { data: [{ spend: '40' }] } },
+          { id: 'ad3', name: 'Ad 3', creative: { id: 'cr3' }, status: 'ACTIVE', insights: { data: [{ spend: '10' }] } },
         ],
       });
 
@@ -177,6 +177,23 @@ describe('Client Health - assessClientHealth', () => {
   // Fatigue detection: frequency ceiling (default 3.5), CTR-drop / CPM-rise vs prior-period
   // baseline (defaults 20% / 15%) — resolved from ENG-918's threshold store (mocked empty here,
   // so registry defaults apply).
+  //
+  // The service fetches BOTH windows in one Graph API `insights.time_ranges(...)` call and
+  // distinguishes the two resulting rows by `date_start` — NOT via separate aliased sub-fields
+  // (an alias like `current:insights.date_preset(...)` is silently dropped by the real Graph
+  // API, confirmed live against a real ad account during ENG-885 live-testing 2026-09-04). Mocks
+  // here replicate that same `insights.data` shape with matching `date_start` values.
+  function currentWindowDateStart(): string {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() - 13);
+    return d.toISOString().slice(0, 10);
+  }
+  function priorWindowDateStart(): string {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() - 13 - 1 - 13);
+    return d.toISOString().slice(0, 10);
+  }
+
   it('flags a creative fatigued by frequency alone (no prior-period data)', async () => {
     const adminUserId = 'admin-user';
     (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, isAdmin: true });
@@ -198,8 +215,12 @@ describe('Client Health - assessClientHealth', () => {
             name: 'Fatigued Ad',
             creative: { id: 'cr1' },
             status: 'ACTIVE',
-            current_insights: { data: [{ spend: '50', frequency: '4.2', ctr: '1.0', cpm: '10' }] },
-            // No prior_insights — newly launched, no baseline yet.
+            // Only the current-window row — newly launched, no prior-period baseline yet.
+            insights: {
+              data: [
+                { spend: '50', frequency: '4.2', ctr: '1.0', cpm: '10', date_start: currentWindowDateStart() },
+              ],
+            },
           },
         ],
       });
@@ -234,10 +255,14 @@ describe('Client Health - assessClientHealth', () => {
             name: 'Drifting Ad',
             creative: { id: 'cr1' },
             status: 'ACTIVE',
-            // frequency under the 3.5 default ceiling — should not trigger that reason.
-            current_insights: { data: [{ spend: '50', frequency: '2.0', ctr: '0.5', cpm: '15' }] },
-            // CTR dropped 50% (> 20% default), CPM rose 50% (> 15% default).
-            prior_insights: { data: [{ spend: '50', frequency: '2.0', ctr: '1.0', cpm: '10' }] },
+            insights: {
+              data: [
+                // frequency under the 3.5 default ceiling — should not trigger that reason.
+                { spend: '50', frequency: '2.0', ctr: '0.5', cpm: '15', date_start: currentWindowDateStart() },
+                // CTR dropped 50% (> 20% default), CPM rose 50% (> 15% default) vs this baseline.
+                { spend: '50', frequency: '2.0', ctr: '1.0', cpm: '10', date_start: priorWindowDateStart() },
+              ],
+            },
           },
         ],
       });
@@ -274,8 +299,12 @@ describe('Client Health - assessClientHealth', () => {
             name: 'Healthy Ad',
             creative: { id: 'cr1' },
             status: 'ACTIVE',
-            current_insights: { data: [{ spend: '50', frequency: '2.0', ctr: '0.95', cpm: '10.5' }] },
-            prior_insights: { data: [{ spend: '50', frequency: '2.0', ctr: '1.0', cpm: '10' }] },
+            insights: {
+              data: [
+                { spend: '50', frequency: '2.0', ctr: '0.95', cpm: '10.5', date_start: currentWindowDateStart() },
+                { spend: '50', frequency: '2.0', ctr: '1.0', cpm: '10', date_start: priorWindowDateStart() },
+              ],
+            },
           },
         ],
       });
