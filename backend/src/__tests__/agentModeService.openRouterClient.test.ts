@@ -590,6 +590,27 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(request).not.toHaveProperty('max_completion_tokens');
   });
 
+  it('skips the degraded BYOK "Google" provider slot for Gemini calls (ENG-1702)', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await service.callLLM(
+      'gemini-3.7-flash',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'interactive_chat' } as any,
+    );
+
+    const request = create.mock.calls[0][0];
+    expect(request.provider).toEqual({
+      allow_fallbacks: true,
+      require_parameters: true,
+      ignore: ['Google'],
+    });
+  });
+
   describe('Gemini tool schemas through OpenRouter', () => {
     const buildGatewayTools = () => [
       {

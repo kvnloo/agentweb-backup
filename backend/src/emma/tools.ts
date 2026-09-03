@@ -5411,7 +5411,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains);
+    return await agentModeService.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains, context?.userId);
   }
 });
 
@@ -5442,7 +5442,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchNews(args.query, args.max_results || 10, args.freshness);
+    return await agentModeService.youSearchNews(args.query, args.max_results || 10, args.freshness, context?.userId);
   }
 });
 
@@ -5468,7 +5468,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.googleSearchWeb(args.query, args.max_results || 10);
+    return await agentModeService.googleSearchWeb(args.query, args.max_results || 10, context?.userId);
   }
 });
 
@@ -7227,6 +7227,80 @@ mcpToolRegistry.register({
   },
 });
 
+const LINEAR_PRIORITY_BY_NAME: Record<string, number> = { Urgent: 1, High: 2, Medium: 3, Low: 4 };
+const LINEAR_STATE_TYPES_BY_BUCKET: Record<string, string[]> = {
+  open: ['triage', 'backlog', 'unstarted', 'started'],
+  completed: ['completed'],
+  canceled: ['canceled'],
+};
+
+mcpToolRegistry.register({
+  name: 'read_linear_issues',
+  definition: {
+    name: 'read_linear_issues',
+    description:
+      'Admin-only, read-only: list/search AgentWeb Linear issues by team, state, priority, label, and ' +
+      'assignee, or read one issue in full detail (description, comments, sub-issues, blocking ' +
+      'relationships). Never mutates Linear and never exposes Linear credentials.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'detail'],
+          description: '"list" to search/filter issues, "detail" to read one issue fully (description, comments, sub-issues, blocking relations).',
+        },
+        team_key: { type: 'string', description: 'Team key, e.g. ENG. Defaults to ENG.' },
+        state: {
+          type: 'string',
+          enum: ['open', 'completed', 'canceled'],
+          description: 'For action=list: "open" (triage/backlog/unstarted/started), "completed", or "canceled". Defaults to open.',
+        },
+        priorities: {
+          type: 'array',
+          items: { type: 'string', enum: ['Urgent', 'High', 'Medium', 'Low'] },
+          description: 'For action=list: filter to these priority levels.',
+        },
+        label_name: { type: 'string', description: 'For action=list: filter to issues carrying this exact label name.' },
+        assignee_email: { type: 'string', description: 'For action=list: filter to issues assigned to this email.' },
+        limit: { type: 'number', description: 'For action=list: max issues to return (default 50, max 100).' },
+        issue_ref: { type: 'string', description: 'For action=detail: issue identifier (e.g. ENG-42) or internal id.' },
+      },
+      required: ['action'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+    const user = await userDb.getUserById(userId);
+    const delegated = context?.isDelegatedAccess === true || context?.isDelegatedAdmin === true;
+    if (user?.isAdmin !== true && !delegated) {
+      throw new Error('Admin access required to read Linear issues');
+    }
+    const { searchIssues, getIssueFullDetail } = await import('../services/linearService');
+    if (args.action === 'detail') {
+      if (!args.issue_ref) throw new Error('issue_ref is required for action=detail');
+      return getIssueFullDetail(args.issue_ref);
+    }
+    if (args.action === 'list') {
+      const priorities = Array.isArray(args.priorities)
+        ? args.priorities.map((p: string) => LINEAR_PRIORITY_BY_NAME[p]).filter((p: number | undefined): p is number => typeof p === 'number')
+        : undefined;
+      const limit = Math.min(Math.max(Number(args.limit) || 50, 1), 100);
+      const issues = await searchIssues({
+        teamKey: args.team_key,
+        stateTypes: LINEAR_STATE_TYPES_BY_BUCKET[args.state || 'open'] || LINEAR_STATE_TYPES_BY_BUCKET.open,
+        priorities,
+        labelName: args.label_name,
+        assigneeEmail: args.assignee_email,
+        limit,
+      });
+      return { issues };
+    }
+    throw new Error(`Unknown action "${args.action}" — expected "list" or "detail"`);
+  },
+});
+
 const bridgedToolNames = [
   // Scheduled Chat tools
   'list_scheduled_chats',
@@ -7265,6 +7339,7 @@ const bridgedToolNames = [
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
 const adminToolNames = [
   'manage_linear_governance_label',
+  'read_linear_issues',
   'list_predefined_work_plans',
   'manage_predefined_work_plan',
   'list_skills',

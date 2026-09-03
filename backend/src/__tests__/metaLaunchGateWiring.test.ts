@@ -18,6 +18,9 @@ jest.mock('../services/metaLaunchGate', () => ({
   // Real: this is the signing primitive the override binding rests on. A stub would let the
   // binding test pass against a token nothing actually verified.
   computeTrackingOverrideDigest: jest.requireActual('../services/metaLaunchGate').computeTrackingOverrideDigest,
+  // Real: the manifest-consent digest (ENG-1642) — this test file also exercises
+  // callMetaMarketingApi's unconfirmed-write path, which now always computes it.
+  computeMetaWriteManifestDigest: jest.requireActual('../services/metaLaunchGate').computeMetaWriteManifestDigest,
   trackingOverrideTokenMatches: jest.requireActual('../services/metaLaunchGate').trackingOverrideTokenMatches,
 }));
 

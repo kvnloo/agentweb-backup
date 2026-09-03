@@ -238,6 +238,12 @@ export interface ChatSession {
   // carries typed values rather than an option selection; the write guard
   // still makes the two mutually exclusive while either is awaiting.
   pendingWorkPlanInput?: WorkPlanInputRequest;
+  // ENG-1642: canonical digests (computeMetaWriteManifestDigest) of manifest-
+  // approved Meta writes already executed confirmation-free in this session.
+  // A digest present here has been consumed — the SAME write may not execute
+  // again without a fresh confirmation. Map value is the consumption
+  // timestamp (kept, not just a boolean, purely for audit/debugging).
+  consumedMetaWriteManifestDigests?: Record<string, string>;
   // ENG-397: the structured, typed workflow run in flight for this session
   // (if any). Each mutating step's checkpoint (entity IDs + verified
   // end-state) is persisted here so a killed-and-restarted session resumes
@@ -3133,6 +3139,93 @@ export class ChatbotDB {
         return null;
       }
       console.error("Error updating session AskUserQuestion:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-1642: atomically claim a manifest-granted Meta write digest for
+   * confirmation-free execution, at most once. A digest already present in
+   * `consumedMetaWriteManifestDigests` means that exact write already ran
+   * under this manifest — the caller must fall back to a normal confirmation
+   * rather than executing again. Uses a single conditional DynamoDB update
+   * (attribute_not_exists on the specific map key) so two concurrent
+   * requests carrying the same digest cannot both win the claim — mirrors
+   * the claimPreviewToken conditional-put pattern in
+   * metaAudienceCampaignTokenStore.ts. Returns true only if THIS call
+   * claimed it.
+   */
+  async claimMetaWriteManifestDigest(sessionId: string, digest: string): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression:
+            'SET consumedMetaWriteManifestDigests.#digest = :consumedAt',
+          // attribute_exists(sessionId) is REQUIRED, not optional belt-and-
+          // braces (mirrors the identical guard on the workflowRun writer
+          // above): the attribute_not_exists(...) checks alone are satisfied
+          // identically whether the map/key is merely absent on an existing
+          // row or the whole session item doesn't exist at all — DynamoDB's
+          // conditional UpdateItem creates the item if missing. Without this,
+          // a session deleted before/during this claim would silently upsert
+          // a partial ChatSession row and let a retry return true, granting a
+          // confirmation-free Meta write on a session that no longer exists.
+          ConditionExpression:
+            'attribute_exists(sessionId) AND (attribute_not_exists(consumedMetaWriteManifestDigests) OR attribute_not_exists(consumedMetaWriteManifestDigests.#digest))',
+          ExpressionAttributeNames: { '#digest': digest },
+          ExpressionAttributeValues: { ':consumedAt': new Date().toISOString() },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      // A DynamoDB map SET against a session with no existing
+      // `consumedMetaWriteManifestDigests` attribute at all fails differently
+      // ("document path does not exist") rather than the map-key condition
+      // above — initialize the map on first use, then retry the claim once.
+      // Guarded the same way: only initialize on a session that still exists.
+      if (error?.code === 'ValidationException') {
+        try {
+          await dynamodb
+            .update({
+              TableName: this.tableName,
+              Key: { sessionId },
+              UpdateExpression:
+                'SET consumedMetaWriteManifestDigests = if_not_exists(consumedMetaWriteManifestDigests, :empty)',
+              ConditionExpression: 'attribute_exists(sessionId)',
+              ExpressionAttributeValues: { ':empty': {} },
+            })
+            .promise();
+        } catch (initError: any) {
+          if (initError?.code === 'ConditionalCheckFailedException') return false;
+          throw initError;
+        }
+        return this.claimMetaWriteManifestDigestRetry(sessionId, digest);
+      }
+      console.error('Error claiming Meta write manifest digest:', error);
+      throw error;
+    }
+  }
+
+  /** Single retry after map initialization — never recurses further. */
+  private async claimMetaWriteManifestDigestRetry(sessionId: string, digest: string): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET consumedMetaWriteManifestDigests.#digest = :consumedAt',
+          ConditionExpression: 'attribute_not_exists(consumedMetaWriteManifestDigests.#digest)',
+          ExpressionAttributeNames: { '#digest': digest },
+          ExpressionAttributeValues: { ':consumedAt': new Date().toISOString() },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      console.error('Error claiming Meta write manifest digest (retry):', error);
       throw error;
     }
   }

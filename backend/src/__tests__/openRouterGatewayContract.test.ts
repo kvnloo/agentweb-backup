@@ -64,6 +64,7 @@ describe('OpenRouter gateway migration resolver (ENG-1430)', () => {
 
   it('maps an AgentWeb Gemini logical id to OpenRouter provider/model form', () => {
     expect(resolveUpstreamModel('gemini-3.7-flash')).toBe('google/gemini-3.7-flash');
+    expect(resolveUpstreamModel('gemini-3.8-flash')).toBe('google/gemini-3.8-flash');
   });
 
   it('maps every registered Bedrock Claude logical id explicitly', () => {

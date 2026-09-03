@@ -26,6 +26,8 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
+  findWorkPlanStepByCount,
+  hadExhaustedTransientStepFailure,
   snapshotWorkPlanTurn,
   type WorkPlanTurnDisposition,
 } from './agentMode/core/workPlanTurnDisposition';
@@ -46,6 +48,10 @@ import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
+import {
+  normalizeOpenRouterResponseMetadata,
+  normalizeOpenRouterErrorMetadata,
+} from './agentMode/openRouterMetadata';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
@@ -142,7 +148,7 @@ import { enqueueAutoHumanEval } from './autoHumanEvalService';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
-import { SearchResultSource } from '../search/searchProvider';
+import { SearchPurpose, SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import {
@@ -158,7 +164,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -396,6 +402,7 @@ import {
   collectPendingDestinations,
   collectPendingCreativeIds,
   computeTrackingOverrideDigest,
+  computeMetaWriteManifestDigest,
   trackingOverrideTokenMatches,
 } from './metaLaunchGate';
 import { HubSpotService } from './hubspotService';
@@ -1343,9 +1350,15 @@ export class AgentModeService {
   // 2026-08-19 (Harsha, live picker review): Auto/default moved off Opus,
   // through GLM 5.2 and GPT-5.6 Luna, to Gemini 3.7 Flash — Google's newest
   // Flash-line model (GA 2026-08-13), cheap ($0.75/$3.75 per 1M, Google's own
-  // direct rate — not a multi-provider OpenRouter blend), and it dominates
+  // direct rate — not a multi-provider OpenRouter blend), and it dominated
   // every other model in the `gemini-flash` family band for band.
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.7-flash';
+  // 2026-09-02 (Harsha, in-session approval): moved again, from Gemini 3.7
+  // Flash to Gemini 3.8 Flash. Same family/tier/pricing, 3.8 dominates 3.7 on
+  // quality (59 vs 56) — the dominance system correctly auto-flagged 3.7
+  // legacy the moment 3.8 was added to the catalog, and leaving the default
+  // pinned to a legacy model would contradict AC2 of the acceptance suite
+  // this default has always carried (see agentModeService.defaultModel*.test.ts).
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.8-flash';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -2145,6 +2158,10 @@ export class AgentModeService {
           defaultHeaders: {
             'HTTP-Referer': 'https://app.agentweb.pro',
             'X-Title': 'AgentWeb',
+            // ENG-1712: opt in to OpenRouter's router-metadata block (resolved
+            // provider + is_byok) so the log-only normalizer below has real
+            // data to read instead of always logging undefined.
+            'X-OpenRouter-Metadata': 'enabled',
           },
         });
 
@@ -2306,6 +2323,7 @@ export class AgentModeService {
     // vs 3.5's 'medium') and higher quality (56 vs 52) than 3.5 Flash, so 3.5
     // Flash is now correctly auto-flagged legacy.
     'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
+    'gemini-3.8-flash': { name: 'Gemini 3.8 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 59, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-8-flash (high)" page, snapshot 2026-09-02' },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
@@ -2693,6 +2711,28 @@ export class AgentModeService {
     }
 
     params.provider = { allow_fallbacks: true, require_parameters: true };
+    if (upstreamModel.startsWith('google/gemini-')) {
+      // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
+      // a legacy Standard API key hitting Google's Sept 2026 Standard-key
+      // cutoff; OpenRouter's own health check showed the "Google" BYOK slot
+      // at 63-85% uptime over 30min vs 99.9%+ on the pooled "Google AI
+      // Studio" slot, and default routing lands on the degraded one. Skip it
+      // until ENG-753 rotates the key to an Auth key and the BYOK slot's
+      // uptime recovers — remove this then, since it forfeits the BYOK cost
+      // discount in exchange for reliability.
+      //
+      // DO NOT change this to 'google-ai-studio' or 'google-vertex' — those
+      // are the slugs OpenRouter's separate BYOK-credential-creation API
+      // uses, not what `provider.ignore` matches on here. This param matches
+      // against the `provider_name` string from GET /v1/models/{id}/endpoints
+      // ("Google" vs "Google AI Studio"), confirmed by 10 live A/B calls
+      // (PR #2732): ignore:['Google'] -> 5/5 landed on Google AI Studio
+      // (correct); ignore:['google-ai-studio'] -> 5/5 landed on Google, i.e.
+      // the DEGRADED slot (backwards). A doc-based static-analysis suggestion
+      // proposed the slug form once already and was reverted for this reason
+      // — verify empirically against live traffic before changing this line.
+      params.provider.ignore = ['Google'];
+    }
     // OpenRouter reports its own billed amount as zero for BYOK requests even
     // though the upstream provider still bills the inference. Request the
     // routing flag so metering can distinguish BYOK from a genuinely free call.
@@ -2827,6 +2867,15 @@ export class AgentModeService {
           params,
           { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
         );
+        // ENG-1712: resolved provider slot + BYOK flag, log-only (no routing
+        // impact) -- lets a production incident/verification tie a specific
+        // call to the provider it actually landed on without reading
+        // credential material out-of-band.
+        const resolvedMetadata = normalizeOpenRouterResponseMetadata(res);
+        console.log(`AgentMode: OpenRouter call succeeded for model "${model}"`, {
+          provider: resolvedMetadata.provider,
+          is_byok: resolvedMetadata.is_byok,
+        });
         // Fire-and-forget usage metering; it must never break an LLM call.
         try {
           const usage: any = (res as any)?.usage;
@@ -2866,6 +2915,9 @@ export class AgentModeService {
           const backoffMs = retryAfterMs ?? 1500 * Math.pow(2, attempt - 1);
           console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms${retryAfterMs !== undefined ? ' (honoring Retry-After)' : ''}`, {
             error: error instanceof Error ? error.message : String(error),
+            // ENG-1712: OpenRouter surfaces the attempted provider/BYOK slot on
+            // some error shapes too (varies by failure type); include when present.
+            ...normalizeOpenRouterErrorMetadata(error),
           });
           await this.sleep(backoffMs);
           continue;
@@ -2876,6 +2928,8 @@ export class AgentModeService {
     console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
       error: lastError instanceof Error ? lastError.message : String(lastError),
       stack: lastError instanceof Error ? lastError.stack : undefined,
+      // ENG-1712: same optional provider/BYOK metadata as the retry-warn path.
+      ...normalizeOpenRouterErrorMetadata(lastError),
     });
     throw lastError;
   }
@@ -4339,12 +4393,20 @@ export class AgentModeService {
 
           if (requireWorkPlanDisposition) {
             const latestSession = await chatbotDb.getChatSession(sessionId, true);
+            // ENG-828: the pending step's own required tool retried once (per the
+            // "Retrying a Transient Failure" carve-out) and failed both times — a
+            // legitimate exhausted-retry outcome, not a malformed turn. Without this,
+            // it falls through to `invalid` below and the generic "couldn't create
+            // the decision card" fallback overwrites the model's own honest
+            // explanation (reproduced live testing this ticket's fix).
+            const pendingStep = findWorkPlanStepByCount(latestSession, workPlanTurnBefore.pendingStepCount);
             workPlanTurnDisposition = decideWorkPlanTurnDisposition({
               before: workPlanTurnBefore,
               after: snapshotWorkPlanTurn(latestSession),
               failed: finishReason === 'content_filter'
                 || stopReason === 'guardrail_intervened'
-                || stopReason === 'content_filtered',
+                || stopReason === 'content_filtered'
+                || hadExhaustedTransientStepFailure(toolCalls, pendingStep?.requiredFunctionCalls),
             });
 
             if (workPlanTurnDisposition.kind === 'invalid') {
@@ -19271,6 +19333,59 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * ENG-1642: check whether this exact Meta write is authorized by an
+   * answered `meta_write_manifest` question in the session, and if so claim
+   * it (at-most-once). Returns true only when a fresh claim succeeds THIS
+   * call — a digest not in any manifest, an unanswered/non-human-attributed
+   * manifest, or a digest already consumed all return false, which falls
+   * through to the normal confirmation halt.
+   */
+  private async claimMetaWriteManifestGrant(
+    sessionId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any,
+  ): Promise<boolean> {
+    const digest = computeMetaWriteManifestDigest(getJwtSecret(), {
+      entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params,
+    });
+    const session = await chatbotDb.getChatSession(sessionId);
+    // A session can carry MULTIPLE answered `meta_write_manifest` questions
+    // (each roll-off archives the prior one) — a newer manifest must not
+    // hide an EARLIER manifest that still authorizes this call's digest, so
+    // scan every candidate of this kind rather than taking only the single
+    // match `findQuestionByKind` would return.
+    const manifestCandidates: any[] = [];
+    if (session?.pendingUserQuestion?.kind === 'meta_write_manifest') {
+      manifestCandidates.push(session.pendingUserQuestion);
+    }
+    if (session?.answeredQuestions) {
+      for (const q of Object.values(session.answeredQuestions)) {
+        if (q.kind === 'meta_write_manifest') manifestCandidates.push(q);
+      }
+    }
+    // Session already recorded this exact digest consumed — a repeat of the
+    // same call re-confirms rather than executing again (acceptance
+    // criterion 3).
+    if (session?.consumedMetaWriteManifestDigests?.[digest]) return false;
+    for (const manifestQuestion of manifestCandidates) {
+      const gate = checkQuestionGate(manifestQuestion);
+      if (!gate.allowed) continue;
+      // The card's approve-option payload carries the digests it authorizes
+      // (see the `meta_write_manifest` card producer) — the digest for THIS
+      // call must be one of them, not merely "some manifest was answered".
+      const grantedDigests: unknown = (gate.payload as any)?.digests;
+      if (!Array.isArray(grantedDigests) || !grantedDigests.includes(digest)) continue;
+      return chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
+    }
+    return false;
+  }
+
+  /**
    * Loop halt seam for the human-in-the-loop confirmation gate. Scans one iteration's
    * tool results and returns the user-facing prompt to surface (or null to continue).
    * Only tool results that set `awaitingUserConfirmation === true` halt the turn — this
@@ -19885,7 +20000,31 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       : '';
     const overrideApproved =
       overrideClaimed && trackingOverrideTokenMatches((params as any)?.tracking_override_token, overrideDigest);
-    if (AgentModeService.isMetaWriteAction(entity_type, action) && (!confirmed || (overrideClaimed && !overrideApproved))) {
+
+    // ENG-1642: an approved deployment manifest authorizes its exact writes
+    // without re-confirmation. `confirmed` from the model-controlled `confirm`
+    // flag is never itself trustworthy (that's the whole reason the gate
+    // below exists) — but a call whose canonical digest appears in a
+    // HUMAN-attributed, answered `meta_write_manifest` question, and has not
+    // already been consumed in this session, may execute once without the
+    // halt. Deliberately narrower than the tracking-override mechanism: this
+    // never implies `override_tracking_check` (acceptance criterion 5), so
+    // the tracking pre-flight below is unaffected either way.
+    let manifestGranted = false;
+    if (
+      !confirmed &&
+      AgentModeService.isMetaWriteAction(entity_type, action) &&
+      sessionId
+    ) {
+      manifestGranted = await this.claimMetaWriteManifestGrant(
+        sessionId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+      );
+    }
+
+    if (
+      AgentModeService.isMetaWriteAction(entity_type, action) &&
+      (!confirmed && !manifestGranted || (overrideClaimed && !overrideApproved))
+    ) {
       const { summary, target } = await this.buildMetaWriteConfirmation(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
@@ -25360,7 +25499,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     query: string,
     maxResults: number = 10,
     freshness?: string,
-    includeDomains?: string[]
+    includeDomains?: string[],
+    userId?: string,
+    purpose: SearchPurpose = 'agent_research',
   ): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_web',
@@ -25369,20 +25510,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       resultSource: 'web',
       freshness,
       includeDomains,
+      userId,
+      purpose,
     });
   }
 
-  public async youSearchNews(query: string, maxResults: number = 10, freshness?: string): Promise<any> {
+  public async youSearchNews(query: string, maxResults: number = 10, freshness?: string, userId?: string): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_news',
       query,
       maxResults,
       resultSource: 'news',
       freshness: freshness || inferSearchFreshness(query) || 'week',
+      userId,
+      purpose: 'news',
     });
   }
 
-  public async googleSearchWeb(query: string, maxResults: number = 10): Promise<any> {
+  public async googleSearchWeb(query: string, maxResults: number = 10, userId?: string, purpose: SearchPurpose = 'agent_research'): Promise<any> {
     const toolName = 'google_search_web';
     const resultSource: SearchResultSource = 'web';
     try {
@@ -25391,6 +25536,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const searchResponse = await this.performGoogleSearch({
         query,
         maxResults: limitedMaxResults,
+        userId,
+        purpose,
       });
       const normalizedResults = searchResponse.results || [];
       const formattedContent = this.formatWebSearchResults({
@@ -25438,6 +25585,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     resultSource: SearchResultSource;
     freshness?: string;
     includeDomains?: string[];
+    userId?: string;
+    purpose: SearchPurpose;
   }): Promise<any> {
     const { toolName, query, maxResults, resultSource } = params;
     try {
@@ -25459,6 +25608,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             resultSource,
             freshness: params.freshness,
             includeDomains: params.includeDomains,
+            userId: params.userId,
+            purpose: params.purpose,
           });
           break;
         } catch (error) {
@@ -25733,6 +25884,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     resultSource?: SearchResultSource;
     freshness?: string;
     includeDomains?: string[];
+    userId?: string;
+    purpose?: SearchPurpose;
   }) {
     const freshness = params.freshness || inferSearchFreshness(params.query);
     const provider = new YouSearchProvider();
@@ -25741,7 +25894,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       count: params.maxResults,
       freshness,
       resultSource: params.resultSource || 'all',
-      purpose: params.resultSource === 'news' ? 'news' : 'agent_research',
+      purpose: params.purpose || (params.resultSource === 'news' ? 'news' : 'agent_research'),
+      userId: params.userId,
       ...(params.includeDomains?.length ? { includeDomains: params.includeDomains } : {}),
     });
 
@@ -25758,13 +25912,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async performGoogleSearch(params: {
     query: string;
     maxResults: number;
+    userId?: string;
+    purpose?: SearchPurpose;
   }) {
     const provider = new GoogleSearchProvider();
     const response = await provider.search({
       query: params.query,
       count: params.maxResults,
       resultSource: 'web',
-      purpose: 'agent_research',
+      purpose: params.purpose || 'agent_research',
+      userId: params.userId,
     });
 
     console.log(`Google Custom Search returned ${response.results.length} web results for query: "${params.query}"`);
