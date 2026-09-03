@@ -17,14 +17,16 @@ import AccountCircle from '@mui/icons-material/AccountCircle';
 import { useAuth } from '../contexts/AuthContext';
 import logo from '../assets/logo.svg';
 import ChatSupport from './ChatSupport';
-import { getHeaderNavigation, getPortalRoute } from '../navigation/catalog';
+import { getGroupedHeaderNavigation, getPortalRoute } from '../navigation/catalog';
 
 export default function Layout() {
   const { user, logout, hasRole } = useAuth();
   const [anchorEl, setAnchorEl] = React.useState<null | HTMLElement>(null);
+  const [buildAnchor, setBuildAnchor] = React.useState<null | HTMLElement>(null);
+  const [operateAnchor, setOperateAnchor] = React.useState<null | HTMLElement>(null);
   const location = useLocation();
   const isHomePage = location.pathname === '/';
-  const headerNavigation = getHeaderNavigation({
+  const headerNavigation = getGroupedHeaderNavigation({
     authenticated: Boolean(user),
     isAdmin: Boolean(user?.isAdmin),
     isContractor: Boolean(user && hasRole('contractor')),
@@ -115,18 +117,39 @@ export default function Layout() {
                 }}
               />
             </Box>
-            <Box sx={{ flexGrow: 1, ml: 3 }}>
-              {headerNavigation.map((entry) => (
+            <Box sx={{ flexGrow: 1, ml: 3, display: 'flex', alignItems: 'center', flexWrap: 'nowrap', overflowX: 'auto' }}>
+              {headerNavigation.direct.map((entry) => (
                 <Button
                   key={entry.id}
                   color="primary"
                   component={RouterLink}
                   to={entry.destination}
                   variant={isActivePath(entry.destination) ? 'contained' : 'text'}
+                  sx={{ flexShrink: 0 }}
                 >
                   {entry.label}
                 </Button>
               ))}
+              {headerNavigation.build.length > 0 && (
+                <>
+                  <Button aria-controls={buildAnchor ? 'build-navigation-menu' : undefined} aria-haspopup="true" aria-expanded={buildAnchor ? 'true' : undefined} onClick={(event) => setBuildAnchor(event.currentTarget)} sx={{ flexShrink: 0 }}>Build</Button>
+                  <Menu id="build-navigation-menu" anchorEl={buildAnchor} open={Boolean(buildAnchor)} onClose={() => setBuildAnchor(null)}>
+                    {headerNavigation.build.map((entry) => (
+                      <MenuItem key={entry.id} component={RouterLink} to={entry.destination} onClick={() => setBuildAnchor(null)} selected={isActivePath(entry.destination)}>{entry.label}</MenuItem>
+                    ))}
+                  </Menu>
+                </>
+              )}
+              {headerNavigation.operate.length > 0 && (
+                <>
+                  <Button aria-controls={operateAnchor ? 'operate-navigation-menu' : undefined} aria-haspopup="true" aria-expanded={operateAnchor ? 'true' : undefined} onClick={(event) => setOperateAnchor(event.currentTarget)} sx={{ flexShrink: 0 }}>Operate</Button>
+                  <Menu id="operate-navigation-menu" anchorEl={operateAnchor} open={Boolean(operateAnchor)} onClose={() => setOperateAnchor(null)}>
+                    {headerNavigation.operate.map((entry) => (
+                      <MenuItem key={entry.id} component={RouterLink} to={entry.destination} onClick={() => setOperateAnchor(null)} selected={isActivePath(entry.destination)}>{entry.label}</MenuItem>
+                    ))}
+                  </Menu>
+                </>
+              )}
             </Box>
             {user ? (
               <div>
