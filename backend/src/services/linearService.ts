@@ -637,6 +637,12 @@ export interface LinearIssueDetail extends LinearIssueSummary {
   blocks: LinearRelatedIssue[];
   blockedBy: LinearRelatedIssue[];
   related: LinearRelatedIssue[];
+  /**
+   * Non-empty when one of the connections above hit its page cap and was cut off — the caller
+   * (an admin making a decision from this data) needs to know the view may be incomplete, not
+   * just find it in a server log (CodeRabbit ENG-789 review).
+   */
+  truncationWarnings: string[];
 }
 
 /**
@@ -714,17 +720,30 @@ export async function getIssueFullDetail(ref: string): Promise<LinearIssueDetail
         labels(first: 50) { nodes { name } }
         assignee { name email }
         comments(first: 250, orderBy: createdAt) { nodes { body createdAt } pageInfo { hasNextPage } }
-        children(first: 50) { nodes { identifier title state { name type } } }
-        relations(first: 50) { nodes { type relatedIssue { identifier title state { type } } } }
-        inverseRelations(first: 50) { nodes { type relatedIssue { identifier title state { type } } } }
+        children(first: 50) { nodes { identifier title state { name type } } pageInfo { hasNextPage } }
+        relations(first: 50) { nodes { type relatedIssue { identifier title state { type } } } pageInfo { hasNextPage } }
+        inverseRelations(first: 50) { nodes { type relatedIssue { identifier title state { type } } } pageInfo { hasNextPage } }
       }
     }`,
     { id: issueId },
   );
   const issue = data?.issue;
   if (!issue) throw new Error(`Linear issue "${ref}" not found`);
+  const truncationWarnings: string[] = [];
   if (issue.comments?.pageInfo?.hasNextPage) {
-    console.error(`[linear] issue ${ref} has >250 comments — read connector page is truncated`);
+    const msg = `issue has >250 comments — comment list is truncated, oldest comments are missing`;
+    console.error(`[linear] ${ref}: ${msg}`);
+    truncationWarnings.push(msg);
+  }
+  if (issue.children?.pageInfo?.hasNextPage) {
+    const msg = `issue has >50 sub-issues — sub-issue list is truncated, some sub-issues are missing`;
+    console.error(`[linear] ${ref}: ${msg}`);
+    truncationWarnings.push(msg);
+  }
+  if (issue.relations?.pageInfo?.hasNextPage || issue.inverseRelations?.pageInfo?.hasNextPage) {
+    const msg = `issue has >50 relations on one side — blocking/related issue list is truncated, some are missing`;
+    console.error(`[linear] ${ref}: ${msg}`);
+    truncationWarnings.push(msg);
   }
   const toRelated = (nodes: any[]): LinearRelatedIssue[] => nodes
     .filter((r) => r.relatedIssue)
@@ -758,6 +777,7 @@ export async function getIssueFullDetail(ref: string): Promise<LinearIssueDetail
     blocks: toRelated(outgoing.filter((r) => r.type === 'blocks')),
     blockedBy: toRelated(incoming.filter((r) => r.type === 'blocks')),
     related: toRelated([...outgoing, ...incoming].filter((r) => r.type === 'related')),
+    truncationWarnings,
   };
 }
 
