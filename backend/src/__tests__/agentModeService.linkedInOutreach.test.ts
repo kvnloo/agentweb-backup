@@ -2365,4 +2365,93 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
     });
 
   });
+
+  describe('multi-account routing (ENG-1614)', () => {
+    beforeEach(() => {
+      __resetWritePacerForTests();
+      process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX = '30';
+    });
+
+    afterEach(() => {
+      delete process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX;
+      __resetWritePacerForTests();
+    });
+
+    const routingInviteArgs = {
+      action: 'send-invite',
+      account_id: 'capped-account',
+      profile_url: 'https://www.linkedin.com/in/chang-liu/',
+      message: 'Great to connect!',
+    };
+
+    it('routes send-invite to an org-shared account with headroom when the requested account is at its daily cap (AC1) and reports the routing decision (AC3)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        {
+          platform: 'unipile',
+          account_id: 'capped-account',
+          userId: 'user-1',
+          config: { daily_invite_cap: 10, daily_volume: { invite: { count: 10, windowStartedAt: Date.now() } } },
+        },
+        {
+          platform: 'unipile',
+          account_id: 'headroom-account',
+          userId: 'teammate-2',
+          sharedWithOrg: true,
+          config: { daily_invite_cap: 30, daily_volume: { invite: { count: 1, windowStartedAt: Date.now() } } },
+        },
+      ]);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockSendInvitation.mockResolvedValue({ id: 'inv-routed' });
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(true);
+      // The whole write went through the account with headroom, not the capped one.
+      expect(mockSendInvitation.mock.calls[0][0]).toBe('headroom-account');
+      expect(mockGetSentInvitationByProfileUrlAndAccount.mock.calls[0][1]).toBe('headroom-account');
+      // AC3: routing must be visible/reported, never a silent fallback (ENG-1198).
+      expect(result.data.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('headroom-account'),
+      });
+    });
+
+    it('does not route (and fails normally) when no other connected account has headroom either', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        {
+          platform: 'unipile',
+          account_id: 'capped-account',
+          userId: 'user-1',
+          config: { daily_invite_cap: 10, daily_volume: { invite: { count: 10, windowStartedAt: Date.now() } } },
+        },
+      ]);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('LinkedIn daily volume limit reached');
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('does not route when the requested account already has headroom (AC5 — single/unconstrained-account behavior unchanged)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        {
+          platform: 'unipile',
+          account_id: 'capped-account',
+          userId: 'user-1',
+          config: { daily_invite_cap: 10, daily_volume: { invite: { count: 2, windowStartedAt: Date.now() } } },
+        },
+      ]);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockSendInvitation.mockResolvedValue({ id: 'inv-unrouted' });
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockSendInvitation.mock.calls[0][0]).toBe('capped-account');
+      expect(result.data).not.toHaveProperty('accountRouting');
+    });
+  });
 });
