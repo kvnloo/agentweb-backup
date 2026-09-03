@@ -44,6 +44,22 @@ function citeForSlack(response: any): string {
 
 const router = express.Router();
 
+// ENG-1294: Slack Connect guests (e.g. Argusoft engineers, who work directly in this codebase)
+// can never share our own workspace's team_id — that's what Slack Connect means — so neither the
+// email-domain check nor the own-team_id fallback below can ever authorize them, even though
+// they're legitimately trusted. Slack reliably includes the author's home team on Connect-shared
+// app_mention events via user_team/source_team, delivered directly on the event payload — no
+// extra API call, and no dependency on users.info resolving anything (confirmed empirically:
+// Manan's own test in #agentweb-argusoft on 2026-09-03 got the profile-email field silently
+// omitted exactly as it did for Harsha/Fangfang, but user_team/source_team carried his real home
+// team, T093CUE1WGP, without incident). Comma-separated env override; defaults to Argusoft's team.
+const TRUSTED_EXTERNAL_SLACK_TEAM_IDS = new Set(
+  (process.env.AGENTWEB_TRUSTED_EXTERNAL_SLACK_TEAM_IDS || 'T093CUE1WGP') // Argusoft
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
+
 function userMatchesChannel(u: any, channel: string): boolean {
   // Skip tombstoned (deleted) users
   if (u.userId?.startsWith('deleted_')) return false;
@@ -463,7 +479,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
       // Handle app mention events
       if (event.type === 'app_mention') {
-        const { text, user: slackUserId, channel, ts, files } = event;
+        const { text, user: slackUserId, channel, ts, files, user_team: userTeam, source_team: sourceTeam } = event;
 
         console.log('👋 Emma bot mentioned in Slack:', {
           channel,
@@ -541,6 +557,18 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                 getOwnSlackTeamId(),
               ]);
               canLinkChannel = !!senderTeamId && !!ownTeamId && senderTeamId === ownTeamId;
+            }
+
+            // ENG-1294: the own-team_id check above only ever proves "same workspace as us" — a
+            // real Slack Connect guest can never pass it, no matter who they are. Trust a small,
+            // explicit allowlist of partner teams via user_team/source_team instead, which Slack
+            // hands us directly rather than requiring a lookup that may silently omit data for an
+            // external profile. Same authorization question as every check above (may this Slack
+            // user run the link command at all), never used to pick which AgentWeb account a
+            // mention resolves to.
+            if (!canLinkChannel) {
+              const externalTeamId = userTeam || sourceTeam;
+              canLinkChannel = !!externalTeamId && TRUSTED_EXTERNAL_SLACK_TEAM_IDS.has(externalTeamId);
             }
 
             if (!canLinkChannel) {
