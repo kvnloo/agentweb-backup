@@ -20,6 +20,7 @@ jest.mock('../controllers/agentModeController', () => ({
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getChatSession: jest.fn(),
+    createOrReuseInteractiveShare: jest.fn().mockResolvedValue('https://example.com/ishare/token'),
   },
 }));
 
@@ -94,6 +95,32 @@ describe('triggerAutoRevision — session-busy contention (ENG-1719)', () => {
 
     expect(mockSendAgentModeOncallAlert).toHaveBeenCalledWith(
       expect.objectContaining({ subject: 'Agent Mode Verified Generate: Failed' }),
+    );
+  });
+
+  it('ENG-1745 follow-up: tells the reviewer directly in Slack on a genuine (non-busy) failure', async () => {
+    // Scoped review of the initial ENG-1745 fix found this branch (and the no-asset-extracted
+    // one below) were missed — only the isSessionBusyError branch got the Slack notice.
+    mockRunVerifiedChat.mockRejectedValueOnce(new Error('LLM provider exploded'));
+
+    await triggerAutoRevision(approval, 'make it pop');
+
+    expect(mockPostSlackMessage).toHaveBeenCalledWith(
+      approval.slackChannel,
+      expect.stringContaining("didn't go through"),
+      approval.slackMessageTs,
+    );
+  });
+
+  it('ENG-1745 follow-up: tells the reviewer directly in Slack when no asset was extracted', async () => {
+    mockRunVerifiedChat.mockResolvedValueOnce({ success: false, toolCalls: [] });
+
+    await triggerAutoRevision(approval, 'make it pop');
+
+    expect(mockPostSlackMessage).toHaveBeenCalledWith(
+      approval.slackChannel,
+      expect.stringContaining("didn't go through"),
+      approval.slackMessageTs,
     );
   });
 });
