@@ -2576,6 +2576,7 @@ const main = async () => {
     await createV0UsageTable();
     await createAgentRunsTable();
     await createMetaCapiKeyCoverageTable();
+    await createAdsThresholdsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -3234,6 +3235,44 @@ const createMetaCapiKeyCoverageTable = async () => {
     KeySchema: [
       { AttributeName: 'pixelId', KeyType: 'HASH' },
       { AttributeName: 'sk', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-918 — per-client detection thresholds with provenance, audit history and revert.
+//
+// Keyed on the AD ACCOUNT, not the user: one ad account can sit on several user records, so
+// per-user thresholds would resolve differently depending on which record happened to be read.
+// The composite `<platform>#<accountId>` matches `AW-AdsMetricsSnapshots`' `entityKey` convention
+// rather than inventing a second shape, and keeps a Meta ad-account id from colliding with a
+// numerically identical Google customer id.
+//
+// No GSI, deliberately: every read is "all parameters for one ad account" or "one parameter for
+// one ad account", both of which the primary key already serves. A few dozen items per account.
+const createAdsThresholdsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AdsThresholds`,
+    AttributeDefinitions: [
+      // `<platform>#<accountId>` — e.g. `meta#1842363582956923`.
+      { AttributeName: 'entityKey', AttributeType: 'S' },
+      // e.g. `creativeFatigue.frequencyCritical`.
+      { AttributeName: 'paramKey', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'entityKey', KeyType: 'HASH' },
+      { AttributeName: 'paramKey', KeyType: 'RANGE' },
     ],
     BillingMode: 'PAY_PER_REQUEST',
   };
