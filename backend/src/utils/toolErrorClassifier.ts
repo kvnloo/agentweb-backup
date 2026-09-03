@@ -158,7 +158,26 @@ function classFromMessage(message: string): string | null {
    * Keyed on the marker `assertOwnedByAccount` guarantees on every branch, and on the
    * unverifiable-lookup wording that deliberately does NOT carry it.
    */
-  if (/is not available in the selected ad account/.test(m)) return 'scope_refused';
+  /*
+   * Only the MISMATCH branch. `assertOwnedByAccount` deliberately varies its remedy across three
+   * branches, and collapsing them into one class attaches the mismatch verdict — "the object is
+   * not in the selected ad account, select the account that owns it" — to two states where that
+   * is factually untrue:
+   *
+   *   no owner reported  → "ownership could not be CONFIRMED … not a proven mismatch. Retry."
+   *   no account resolved → "a connection problem, not a permissions one — reconnect Meta."
+   *
+   * The second matters most: `account_id ?? ''` deliberately routes an unresolved credential
+   * into exactly that branch, so the two fixes composed into telling a user their own object
+   * belongs to someone else's ad account. Keyed on the remedy sentence, which only the mismatch
+   * branch emits.
+   */
+  if (/is not available in the selected ad account/.test(m)
+      && /belongs to a different ad account, select that account/.test(m)) {
+    return 'scope_refused';
+  }
+  // Could not confirm ownership — our failure or Meta's silence, not a statement about the node.
+  if (/is not available in the selected ad account/.test(m)) return 'upstream_5xx';
   if (/could not verify the requested .* against the selected ad account/.test(m)) return 'upstream_5xx';
 
   if (/not available with your current subscription|capability is not on their plan/.test(m)) return 'subscription_blocked';

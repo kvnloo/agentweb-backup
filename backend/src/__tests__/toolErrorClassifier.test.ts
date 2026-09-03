@@ -247,6 +247,26 @@ describe('classifyToolErrorClass', () => {
     ))).toBe('read_bounded');
   });
 
+  /*
+   * scope_refused must key on the MISMATCH branch only.
+   *
+   * assertOwnedByAccount deliberately varies its remedy across three branches, and the classifier
+   * collapsing them into one class would attach "select the account that owns it" to the two
+   * branches where that is false — including the branch account_id ?? '' deliberately routes an
+   * unresolved credential into, which would have told a user their OWN object belongs to someone
+   * else's ad account.
+   */
+  it('classifies the ownership MISMATCH branch as scope_refused, and the other two branches as upstream_5xx', () => {
+    const M = 'is not available in the selected ad account';
+    const mismatch = `The requested ad ${M}. If it belongs to a different ad account, select that account and try again.`;
+    const noOwner = `The requested ad ${M}. Meta did not report which ad account owns it, so ownership could not be CONFIRMED — this is a failed check, not a proven mismatch. Retry; if it persists, verify the object in Meta Ads Manager.`;
+    const noAccount = `The requested ad ${M}. No ad account could be determined for this request, so ownership could not be checked. This is a connection problem, not a permissions one — reconnect Meta in Settings.`;
+
+    expect(classifyToolErrorClass(err(mismatch))).toBe('scope_refused');
+    expect(classifyToolErrorClass(err(noOwner))).toBe('upstream_5xx');
+    expect(classifyToolErrorClass(err(noAccount))).toBe('upstream_5xx');
+  });
+
   it('main\'s "is too large" invalid_args rule no longer swallows a Drive capped read', () => {
     /*
      * Asserted against the REAL message, not a paraphrase.

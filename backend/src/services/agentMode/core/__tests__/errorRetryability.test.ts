@@ -118,6 +118,19 @@ describe('a refusal that forbids substitution is never handed a "use a different
   });
 });
 
+describe('a scope refusal never suggests widening the read it just refused', () => {
+  it('scope_refused forbids retry and forbids falling back to an unscoped/account-wide read', () => {
+    const line = retryabilityLine('scope_refused');
+    expect(line).toContain('Retryable: no');
+    expect(line.toLowerCase()).toContain('do not fall back');
+    expect(line.toLowerCase()).not.toContain('use a different tool');
+  });
+
+  it('is fast-tripped — an identical retry on a refused node is known-pointless', () => {
+    expect(isFastTripErrorClass('scope_refused')).toBe(true);
+  });
+});
+
 describe('an incomplete read is never told the target was not found', () => {
   it('read_incomplete is retryable and forbids reporting absence', () => {
     const line = retryabilityLine('read_incomplete');
