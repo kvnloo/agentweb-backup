@@ -96,6 +96,74 @@ export function priorTurnNeedsWorkPlanDispositionRetry(message: unknown): boolea
   return failure?.retryable === true;
 }
 
+// Mirrors the transient/infrastructure error shapes the "Retrying a Transient
+// Failure" system-prompt carve-out (ENG-828) names: v0 timeout codes, 5xx/
+// network errors, and a plain "timed out" (coding_agent's own message, which
+// carries no error code — only `result.retryable`).
+const TRANSIENT_ERROR_PATTERN =
+  /V0_CALL_TIMEOUT|V0_GENERATION_TIMEOUT|fetch failed|ECONNRESET|ENOTFOUND|network error|NetworkError|ETIMEDOUT|socket hang up|Connect Timeout|timed out|UND_ERR/i;
+
+/**
+ * ENG-828: true when the pending step's own tool was retried once per the
+ * "Retrying a Transient Failure" carve-out and failed BOTH times with a
+ * transient/infrastructure-shaped error. Without this, a turn that correctly
+ * leaves the step `pending` and explains the platform failure honestly still
+ * has `before.pendingStepCount === after.pendingStepCount` with no
+ * `awaitingAction` — indistinguishable, to decideWorkPlanTurnDisposition, from
+ * a turn that produced no structured outcome at all. That misclassifies a
+ * legitimate exhausted-retry outcome as `invalid`, which overwrites the
+ * model's own honest explanation with the generic "I couldn't create the
+ * decision card... Please retry" fallback (reproduced live testing ENG-828).
+ */
+/** Normalizes a ledger entry's `error` to a string, whether it's already one
+ * (the common shape — see toolDispatch.ts's `error.message`) or a structured
+ * object carrying `message`/`code` (a gateway error the minimizer didn't
+ * stringify). Never lets a non-string error silently disappear. */
+function errorText(error: unknown): string | undefined {
+  if (typeof error === 'string') return error;
+  const record = asRecord(error);
+  const message = record?.message;
+  const code = record?.code;
+  if (typeof message === 'string' || typeof code === 'string') {
+    return [code, message].filter((v) => typeof v === 'string').join(': ');
+  }
+  return undefined;
+}
+
+export function hadExhaustedTransientStepFailure(
+  toolCalls: Array<{ name?: unknown; error?: unknown; result?: unknown }> | undefined,
+  requiredFunctionCalls: unknown,
+): boolean {
+  if (!Array.isArray(toolCalls) || !Array.isArray(requiredFunctionCalls)) return false;
+  for (const toolName of requiredFunctionCalls) {
+    if (typeof toolName !== 'string') continue;
+    const callsForTool = toolCalls.filter((tc) => tc?.name === toolName);
+    // The carve-out allows exactly ONE retry — a legitimate exhausted-retry
+    // outcome means this tool was called at least twice this turn. A single
+    // failed attempt (the model hasn't retried, or gave up early) must NOT
+    // match here, or it would mask a genuine prompt-compliance regression by
+    // classifying it as a valid `failed` disposition instead of `invalid`
+    // (which nudges the model to actually retry). Not requiring identical
+    // arguments between attempts: live verification (ENG-828) showed a real
+    // model retry can differ by trivial rephrasing, not byte-for-byte reuse.
+    if (callsForTool.length < 2) continue;
+    const last = callsForTool[callsForTool.length - 1];
+    const lastErrorText = errorText(last.error);
+    const retryable = asRecord(last.result)?.retryable === true;
+    if (retryable || (lastErrorText && TRANSIENT_ERROR_PATTERN.test(lastErrorText))) return true;
+  }
+  return false;
+}
+
+/** Pure lookup: the pending step's own record from a session's `workPlan.steps`. */
+export function findWorkPlanStepByCount(session: unknown, stepCount: number | undefined): UnknownRecord | undefined {
+  if (stepCount === undefined) return undefined;
+  const workPlan = asRecord(asRecord(session)?.workPlan);
+  const steps = workPlan?.steps;
+  if (!Array.isArray(steps)) return undefined;
+  return steps.find((s) => asRecord(s)?.stepCount === stepCount) as UnknownRecord | undefined;
+}
+
 export function decideWorkPlanTurnDisposition({
   before,
   after,

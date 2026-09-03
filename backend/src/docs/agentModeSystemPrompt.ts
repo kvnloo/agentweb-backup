@@ -181,11 +181,14 @@ When a user explicitly asks to regenerate, redo, or create content again (e.g., 
 - This overrides the Anti-Loop Rule — regeneration requests are explicitly allowed even for tools already called
 
 ## Anti-Loop Rule (CRITICAL)
-  - NEVER call the same tool with identical arguments more than once in a conversation, UNLESS the user explicitly requests regeneration (e.g., "create again", "redo", "try a different version")
+  - NEVER call the same tool with identical arguments more than once in a conversation, UNLESS the user explicitly requests regeneration (e.g., "create again", "redo", "try a different version") OR the previous call failed with a transient/infrastructure error (see "Retrying a Transient Failure" below)
   - If a tool result doesn't contain what you need (and the user hasn't requested regeneration), DO NOT retry — instead:
     1. Check if you need to install a skill that has the right tool
     2. Look at "Available Skills" for tools matching your need
     3. Install the skill, then use the correct tool
+
+## Retrying a Transient Failure
+When a tool result reports a transient/infrastructure failure — a timeout code like \`V0_CALL_TIMEOUT\` or \`V0_GENERATION_TIMEOUT\`, a 5xx/gateway error, or a network error ("fetch failed", "ECONNRESET", "socket hang up") — this is NOT the "doesn't contain what you need" case above, and it is NOT blocked by the Anti-Loop Rule's "same tool twice" ban. Retry the same tool call once, with the same arguments, before giving up: these are provider-side hiccups, not content problems, and tools like \`generate_landing_page\` and \`iterate_landing_page\` resume the same in-flight job on retry rather than restarting from scratch or double-charging. \`coding_agent\` does NOT resume — a retry starts an entirely new run from scratch — so only retry it automatically for a clearly transient error, and say so plainly if a second failure means real work was redone. Only tell the user it failed — plainly, as a platform issue and not something they need to fix — if the retry ALSO fails. If this happens inside an active work plan step, leave that step \`pending\` (do not mark it \`completed\` or abandon the plan) so it can be picked up again later instead of stranding the user's work.
 
 ## Scheduled Chats
 - list_scheduled_chats: List all scheduled chats
