@@ -115,6 +115,21 @@ const TRANSIENT_ERROR_PATTERN =
  * model's own honest explanation with the generic "I couldn't create the
  * decision card... Please retry" fallback (reproduced live testing ENG-828).
  */
+/** Normalizes a ledger entry's `error` to a string, whether it's already one
+ * (the common shape — see toolDispatch.ts's `error.message`) or a structured
+ * object carrying `message`/`code` (a gateway error the minimizer didn't
+ * stringify). Never lets a non-string error silently disappear. */
+function errorText(error: unknown): string | undefined {
+  if (typeof error === 'string') return error;
+  const record = asRecord(error);
+  const message = record?.message;
+  const code = record?.code;
+  if (typeof message === 'string' || typeof code === 'string') {
+    return [code, message].filter((v) => typeof v === 'string').join(': ');
+  }
+  return undefined;
+}
+
 export function hadExhaustedTransientStepFailure(
   toolCalls: Array<{ name?: unknown; error?: unknown; result?: unknown }> | undefined,
   requiredFunctionCalls: unknown,
@@ -123,14 +138,30 @@ export function hadExhaustedTransientStepFailure(
   for (const toolName of requiredFunctionCalls) {
     if (typeof toolName !== 'string') continue;
     const callsForTool = toolCalls.filter((tc) => tc?.name === toolName);
-    if (callsForTool.length === 0) continue;
+    // The carve-out allows exactly ONE retry — a legitimate exhausted-retry
+    // outcome means this tool was called at least twice this turn. A single
+    // failed attempt (the model hasn't retried, or gave up early) must NOT
+    // match here, or it would mask a genuine prompt-compliance regression by
+    // classifying it as a valid `failed` disposition instead of `invalid`
+    // (which nudges the model to actually retry). Not requiring identical
+    // arguments between attempts: live verification (ENG-828) showed a real
+    // model retry can differ by trivial rephrasing, not byte-for-byte reuse.
+    if (callsForTool.length < 2) continue;
     const last = callsForTool[callsForTool.length - 1];
-    const errorText = typeof last.error === 'string' ? last.error : undefined;
-    if (!errorText) continue;
+    const lastErrorText = errorText(last.error);
     const retryable = asRecord(last.result)?.retryable === true;
-    if (retryable || TRANSIENT_ERROR_PATTERN.test(errorText)) return true;
+    if (retryable || (lastErrorText && TRANSIENT_ERROR_PATTERN.test(lastErrorText))) return true;
   }
   return false;
+}
+
+/** Pure lookup: the pending step's own record from a session's `workPlan.steps`. */
+export function findWorkPlanStepByCount(session: unknown, stepCount: number | undefined): UnknownRecord | undefined {
+  if (stepCount === undefined) return undefined;
+  const workPlan = asRecord(asRecord(session)?.workPlan);
+  const steps = workPlan?.steps;
+  if (!Array.isArray(steps)) return undefined;
+  return steps.find((s) => asRecord(s)?.stepCount === stepCount) as UnknownRecord | undefined;
 }
 
 export function decideWorkPlanTurnDisposition({

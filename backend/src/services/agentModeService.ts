@@ -26,6 +26,7 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
+  findWorkPlanStepByCount,
   hadExhaustedTransientStepFailure,
   snapshotWorkPlanTurn,
   type WorkPlanTurnDisposition,
@@ -4376,11 +4377,7 @@ export class AgentModeService {
             // it falls through to `invalid` below and the generic "couldn't create
             // the decision card" fallback overwrites the model's own honest
             // explanation (reproduced live testing this ticket's fix).
-            const pendingStep = workPlanTurnBefore.pendingStepCount !== undefined
-              ? (latestSession as any)?.workPlan?.steps?.find(
-                (s: any) => s?.stepCount === workPlanTurnBefore.pendingStepCount,
-              )
-              : undefined;
+            const pendingStep = findWorkPlanStepByCount(latestSession, workPlanTurnBefore.pendingStepCount);
             workPlanTurnDisposition = decideWorkPlanTurnDisposition({
               before: workPlanTurnBefore,
               after: snapshotWorkPlanTurn(latestSession),
