@@ -17,6 +17,7 @@ import { approvalDb } from '../services/approvalDb';
 import { chatbotDb } from '../services/chatbotService';
 import { runVerifiedChat, isSessionBusyError } from '../controllers/agentModeController';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { postSlackMessage } from '../services/slackService';
 import { taskDb } from '../services/db';
 
 jest.mock('../services/approvalDb');
@@ -72,6 +73,7 @@ const mockGetApproval = approvalDb.getApproval as jest.Mock;
 const mockUpdateApprovalStatus = approvalDb.updateApprovalStatus as jest.Mock;
 const mockGetTaskExecutionById = taskDb.getTaskExecutionById as jest.Mock;
 const mockGetTaskById = taskDb.getTaskById as jest.Mock;
+const mockPostSlackMessage = postSlackMessage as jest.Mock;
 
 // Fire-and-forget: the route responds before runVerifiedChat's promise chain settles,
 // so tests need to flush the microtask queue (mock rejection -> .catch -> dynamic
@@ -118,6 +120,7 @@ describe('Slack Agent Mode revision — session-busy contention (ENG-1719)', () 
     jest.clearAllMocks();
     mockIsSessionBusyError.mockImplementation((error: unknown) =>
       typeof error === 'object' && error !== null && (error as any).code === 'SESSION_BUSY');
+    mockPostSlackMessage.mockResolvedValue({ ts: '1', channel: 'C1' });
     app = buildApp();
   });
 
@@ -174,6 +177,62 @@ describe('Slack Agent Mode revision — session-busy contention (ENG-1719)', () 
         expect.objectContaining({ subject: 'Agent Mode Verified Generate: Failed' }),
       );
     });
+
+    it('ENG-1741: tells the reviewer directly in Slack when the session is busy', async () => {
+      mockRunVerifiedChat.mockRejectedValueOnce(
+        Object.assign(new Error('busy'), { code: 'SESSION_BUSY' }),
+      );
+
+      const res = await request(app)
+        .post('/api/slack/interactions')
+        .type('form')
+        .send({ payload: JSON.stringify(feedbackModalPayload(approval, 'make it pop')) });
+
+      expect(res.status).toBe(200);
+      await flushMicrotasks();
+
+      expect(mockPostSlackMessage).toHaveBeenCalledWith(
+        approval.slackChannel,
+        expect.stringContaining('busy'),
+        approval.slackMessageTs,
+      );
+    });
+
+    it('ENG-1741: tells the reviewer directly in Slack on a genuine (non-busy) failure', async () => {
+      mockRunVerifiedChat.mockRejectedValueOnce(new Error('LLM provider exploded'));
+
+      const res = await request(app)
+        .post('/api/slack/interactions')
+        .type('form')
+        .send({ payload: JSON.stringify(feedbackModalPayload(approval, 'make it pop')) });
+
+      expect(res.status).toBe(200);
+      await flushMicrotasks();
+
+      expect(mockPostSlackMessage).toHaveBeenCalledWith(
+        approval.slackChannel,
+        expect.stringContaining("didn't go through"),
+        approval.slackMessageTs,
+      );
+    });
+
+    it('ENG-1741: tells the reviewer directly in Slack when no asset was extracted', async () => {
+      mockRunVerifiedChat.mockResolvedValueOnce({ success: false, toolCalls: [] });
+
+      const res = await request(app)
+        .post('/api/slack/interactions')
+        .type('form')
+        .send({ payload: JSON.stringify(feedbackModalPayload(approval, 'make it pop')) });
+
+      expect(res.status).toBe(200);
+      await flushMicrotasks();
+
+      expect(mockPostSlackMessage).toHaveBeenCalledWith(
+        approval.slackChannel,
+        expect.stringContaining("didn't go through"),
+        approval.slackMessageTs,
+      );
+    });
   });
 
   describe('task-based Agent Mode session (task.sessionId branch)', () => {
@@ -225,6 +284,62 @@ describe('Slack Agent Mode revision — session-busy contention (ENG-1719)', () 
 
       expect(mockSendAgentModeOncallAlert).toHaveBeenCalledWith(
         expect.objectContaining({ subject: 'Agent Mode Verified Generate: Failed' }),
+      );
+    });
+
+    it('ENG-1741: tells the reviewer directly in Slack when the session is busy', async () => {
+      mockRunVerifiedChat.mockRejectedValueOnce(
+        Object.assign(new Error('busy'), { code: 'SESSION_BUSY' }),
+      );
+
+      const res = await request(app)
+        .post('/api/slack/interactions')
+        .type('form')
+        .send({ payload: JSON.stringify(feedbackModalPayload(approval, 'make it pop')) });
+
+      expect(res.status).toBe(200);
+      await flushMicrotasks();
+
+      expect(mockPostSlackMessage).toHaveBeenCalledWith(
+        approval.slackChannel,
+        expect.stringContaining('busy'),
+        approval.slackMessageTs,
+      );
+    });
+
+    it('ENG-1741: tells the reviewer directly in Slack on a genuine (non-busy) failure', async () => {
+      mockRunVerifiedChat.mockRejectedValueOnce(new Error('LLM provider exploded'));
+
+      const res = await request(app)
+        .post('/api/slack/interactions')
+        .type('form')
+        .send({ payload: JSON.stringify(feedbackModalPayload(approval, 'make it pop')) });
+
+      expect(res.status).toBe(200);
+      await flushMicrotasks();
+
+      expect(mockPostSlackMessage).toHaveBeenCalledWith(
+        approval.slackChannel,
+        expect.stringContaining("didn't go through"),
+        approval.slackMessageTs,
+      );
+    });
+
+    it('ENG-1741: tells the reviewer directly in Slack when no asset was extracted', async () => {
+      mockRunVerifiedChat.mockResolvedValueOnce({ success: false, toolCalls: [] });
+
+      const res = await request(app)
+        .post('/api/slack/interactions')
+        .type('form')
+        .send({ payload: JSON.stringify(feedbackModalPayload(approval, 'make it pop')) });
+
+      expect(res.status).toBe(200);
+      await flushMicrotasks();
+
+      expect(mockPostSlackMessage).toHaveBeenCalledWith(
+        approval.slackChannel,
+        expect.stringContaining("didn't go through"),
+        approval.slackMessageTs,
       );
     });
   });

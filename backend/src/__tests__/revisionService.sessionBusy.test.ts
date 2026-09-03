@@ -27,15 +27,21 @@ jest.mock('../utils/agentModeAlerts', () => ({
   sendAgentModeOncallAlert: jest.fn().mockResolvedValue(undefined),
 }));
 
+jest.mock('../services/slackService', () => ({
+  postSlackMessage: jest.fn().mockResolvedValue({ ts: '1', channel: 'C1' }),
+}));
+
 import { runVerifiedChat } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { postSlackMessage } from '../services/slackService';
 import { triggerAutoRevision } from '../services/revisionService';
 import type { AssetApproval } from '../services/approvalDb';
 
 const mockRunVerifiedChat = runVerifiedChat as jest.Mock;
 const mockGetChatSession = chatbotDb.getChatSession as jest.Mock;
 const mockSendAgentModeOncallAlert = sendAgentModeOncallAlert as jest.Mock;
+const mockPostSlackMessage = postSlackMessage as jest.Mock;
 
 const approval: AssetApproval = {
   assetUrl: 'https://example.com/original.png',
@@ -65,6 +71,20 @@ describe('triggerAutoRevision — session-busy contention (ENG-1719)', () => {
     await expect(triggerAutoRevision(approval, 'make it pop')).resolves.toBeUndefined();
 
     expect(mockSendAgentModeOncallAlert).not.toHaveBeenCalled();
+  });
+
+  it('ENG-1745: tells the reviewer directly in Slack when the session is busy', async () => {
+    mockRunVerifiedChat.mockRejectedValueOnce(
+      Object.assign(new Error('busy'), { code: 'SESSION_BUSY' }),
+    );
+
+    await triggerAutoRevision(approval, 'make it pop');
+
+    expect(mockPostSlackMessage).toHaveBeenCalledWith(
+      approval.slackChannel,
+      expect.stringContaining('busy'),
+      approval.slackMessageTs,
+    );
   });
 
   it('still pages on-call for a genuine (non-busy) failure', async () => {
