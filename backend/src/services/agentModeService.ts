@@ -22977,7 +22977,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     extraClause: string,
     fields: string,
     perBatchTarget: number,
-    orderBy?: string
+    orderBy?: string,
+    /**
+     * A budget SHARED with the caller, when the caller makes several of these calls in sequence.
+     *
+     * Without it each call opens its own `DRIVE_LIST_WALK_MAX_MS`, which composes badly: the
+     * knowledge-base listing runs one query per registered Drive source in a sequential loop, so
+     * six sources meant six full budgets — 6 x 90s = 540s on top of the tree walk, past the 600s
+     * nginx/ALB ceiling the budget was chosen to sit inside. At the old 15s that overrun was
+     * invisible (6 x 15s); raising the budget is what made it reachable.
+     */
+    sharedDeadlineAt?: number,
   ): Promise<{ files: Map<string, any>; capped: boolean; failed?: any }> {
     const merged = new Map<string, any>();
     let capped = false;
@@ -22989,7 +22999,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // reason — batches and pages here are walked sequentially with no overall
     // bound otherwise. Crossing it sets `capped`, reusing the existing
     // "incomplete, do not conclude absence" signal.
-    const deadline = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
+    const deadline = sharedDeadlineAt ?? (Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS);
     for (let i = 0; i < folderIds.length; i += AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE) {
       if (Date.now() >= deadline) {
         capped = true;
@@ -23692,6 +23702,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             )
           );
 
+          /*
+           * ONE budget for the whole listing, not one per source.
+           *
+           * The file queries below run sequentially, one per registered Drive source, and each
+           * used to open a fresh DRIVE_LIST_WALK_MAX_MS. Six registered sources therefore meant
+           * six full budgets end to end — 540s at the current 90s — which blows past the 600s
+           * nginx/ALB ceiling that budget was picked to sit inside. Sharing a deadline keeps the
+           * whole listing inside one budget: sources still get read in order, and a listing that
+           * runs out reports the remaining sources as incomplete rather than silently costing
+           * the user a dropped request.
+           */
+          const listingDeadlineAt = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
           for (const { folder, folderIds, restricted, rootRestricted, truncated, throttled } of treeResults) {
             try {
               // Structural, not name-based: a root only counts as nested
@@ -23745,7 +23767,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
                 extraClause,
                 'files(id, name, mimeType, size, modifiedTime)',
                 perBatchTarget,
-                'modifiedTime desc'
+                'modifiedTime desc',
+                listingDeadlineAt,
               );
 
               // Per-batch `orderBy` only sorts within its own batch; re-sort the
@@ -24447,8 +24470,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    *
    * So the two branches must not share a remedy. Telling the model to "retry the read" on the
    * capped branch is the ENG-1636 failure in miniature — naming a remedy that cannot work — and
-   * worse than useless here, because the retry is not free: each attempt burns up to two 15s
-   * budgets and the turn's own time, and a deterministic non-answer repeated is a loop. The
+   * worse than useless here, because the retry is not free: each attempt burns up to two full
+   * DRIVE_LIST_WALK_MAX_MS budgets and the turn's own time, and a deterministic non-answer
+   * repeated is a loop. The
    * capped branch is given remedies that change the SCOPE of the search, which is the only
    * variable that can move the outcome.
    */
