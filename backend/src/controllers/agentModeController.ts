@@ -6499,6 +6499,24 @@ export async function runScheduledChat(
       return busyResult;
     }
 
+    // ENG-1719 follow-up: runVerifiedChat only just gained a wall-clock timeout
+    // (RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS) — before that fix, this catch could never receive
+    // an isGenerationTimeout error from it at all, so this exposure is new. Per
+    // withGenerationTimeout's own documented contract, the underlying generateSessionResponse
+    // call is NOT cancelled when it times out — it keeps running in the background. Below,
+    // the zero-output detection can misread a merely-slow (not actually dead) run as
+    // producing no output and schedule an automatic RESUME on this SAME sessionId
+    // (`pendingResumeSessionId`) as little as 15 minutes later. Without cancelling the
+    // orphan first, that resume can start generating while the orphan is still writing to
+    // the same session — the identical concurrent-write race this PR exists to close,
+    // self-inflicted by the schedule's own retry machinery instead of an external caller.
+    // Unlike the busy branch above, a genuine timeout is NOT benign — fall through to the
+    // existing zero-output/error handling below after cancelling, don't return early.
+    if ((error as any)?.isGenerationTimeout && sessionId) {
+      requestCancel(sessionId);
+      generateMarketingResponseWorkerService.cancelSession(sessionId);
+    }
+
     console.error(`Error in runScheduledChat for ${schedule.scheduleName}:`, error);
     console.error('Full error details:', {
       message: error instanceof Error ? error.message : String(error),
