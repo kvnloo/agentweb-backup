@@ -479,8 +479,19 @@ export async function defaultFetchHtml(url: string, deadlineAt?: number): Promis
     // The retry sits INSIDE `get`, so `assertPublic` and the redirect follower stay in the path
     // on every attempt — a retry that bypassed them would quietly drop the SSRF guard.
     get: async (u: string) => {
+      /*
+       * Same shape as the gate's per-pixel probe (defaultPixelHasRecentActivity): a flat
+       * FETCH_TIMEOUT_MS plus an unconditional retry meant one hop, entered near the deadline,
+       * could still run for the FULL 25s + a FULL 25s retry — up to 50s past a budget that had
+       * almost nothing left. Clamping the timeout to what remains, and skipping the retry unless
+       * a full second attempt still fits, bounds a single hop by the caller's actual budget
+       * rather than by this function's own constant.
+       */
+      const timeout = deadlineAt !== undefined
+        ? Math.max(1_000, Math.min(FETCH_TIMEOUT_MS, deadlineAt - Date.now()))
+        : FETCH_TIMEOUT_MS;
       const attempt = () => (axios as any).get(u, {
-        timeout: FETCH_TIMEOUT_MS,
+        timeout,
         maxRedirects: 0,
         maxContentLength: MAX_HTML_BYTES,
         validateStatus: (s: number) => s >= 200 && s < 400,
@@ -491,6 +502,7 @@ export async function defaultFetchHtml(url: string, deadlineAt?: number): Promis
         return await attempt();
       } catch (err: any) {
         if (!isTransientFetchFailure(err)) throw err;
+        if (deadlineAt !== undefined && Date.now() + FETCH_TIMEOUT_MS >= deadlineAt) throw err;
         console.log('[META PREFLIGHT] retrying a transient destination fetch once:', u, err?.message);
         return await attempt();
       }

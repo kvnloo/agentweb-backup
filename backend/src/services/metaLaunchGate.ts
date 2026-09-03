@@ -121,7 +121,7 @@ export interface MetaGateDeps {
    * Does this pixel show recent activity in Meta's own stats? Injectable for tests.
    * Used ONLY to explain a block, never to lift one — see serverSideHint below.
    */
-  pixelHasRecentActivity?: (pixelId: string, accessToken: string) => Promise<boolean>;
+  pixelHasRecentActivity?: (pixelId: string, accessToken: string, deadlineAt?: number) => Promise<boolean>;
   /**
    * Read the click destinations off an existing ad creative. Injectable for tests.
    * Must throw (never return empty) when the creative cannot be read — an unreadable
@@ -176,11 +176,13 @@ function isTransientGraphFailure(err: any): boolean {
  * difference between "we could not see this destination" (a real reason to block a launch) and
  * "the network hiccuped" (not a reason to block anything).
  */
-async function withOneTransientRetry<T>(run: () => Promise<T>): Promise<T> {
+async function withOneTransientRetry<T>(run: () => Promise<T>, deadlineAt?: number): Promise<T> {
   try {
     return await run();
   } catch (err: any) {
     if (!isTransientGraphFailure(err)) throw err;
+    // Same discipline as withDriveRetry: a retry only if a full second attempt still fits.
+    if (deadlineAt !== undefined && Date.now() + GATE_GRAPH_CALL_TIMEOUT_MS >= deadlineAt) throw err;
     console.log('[META GATE] retrying a transient Graph failure once:', err?.message);
     return await run();
   }
@@ -204,14 +206,26 @@ async function defaultResolveCreativeDestinations(creativeId: string, accessToke
 }
 
 /* istanbul ignore next — network boundary; tests inject pixelHasRecentActivity. */
-async function defaultPixelHasRecentActivity(pixelId: string, accessToken: string): Promise<boolean> {
+async function defaultPixelHasRecentActivity(pixelId: string, accessToken: string, deadlineAt?: number): Promise<boolean> {
   const axios = (await import('axios')).default;
   const apiVersion = process.env.META_API_VERSION || 'v25.0';
   const since = Math.floor(Date.now() / 1000) - ACTIVITY_WINDOW_DAYS * 86400;
   const url =
     `https://graph.facebook.com/${apiVersion}/${pixelId}/stats` +
     `?aggregation=event&start_time=${since}&access_token=${encodeURIComponent(accessToken)}`;
-  const res = await withOneTransientRetry(async () => axios.get<{ data?: unknown[] }>(url, { timeout: GATE_GRAPH_CALL_TIMEOUT_MS }));
+  /*
+   * Clamped to whatever remains of the CALLER's budget, not the flat GATE_GRAPH_CALL_TIMEOUT_MS.
+   * This is optional explanatory text on a launch that has already been blocked — it must never
+   * be the reason the request overruns the loop's own deadline. Without this, a probe starting
+   * 1ms inside the deadline still ran to its own full 30s (60s with a retry).
+   */
+  const timeout = deadlineAt !== undefined
+    ? Math.max(1_000, Math.min(GATE_GRAPH_CALL_TIMEOUT_MS, deadlineAt - Date.now()))
+    : GATE_GRAPH_CALL_TIMEOUT_MS;
+  const res = await withOneTransientRetry(
+    async () => axios.get<{ data?: unknown[] }>(url, { timeout }),
+    deadlineAt,
+  );
   return Array.isArray(res.data?.data) && res.data.data.length > 0;
 }
 
@@ -252,7 +266,7 @@ async function serverSideHint(
   for (const pixelId of pixelIds) {
     if (deadlineAt !== undefined && Date.now() >= deadlineAt) return '';
     try {
-      if (await probe(pixelId, accessToken)) {
+      if (await probe(pixelId, accessToken, deadlineAt)) {
         return (
           `\nNote: this account's pixel ${pixelId} IS receiving events server-side within the last ` +
           `${ACTIVITY_WINDOW_DAYS} days. If this destination is measured through the Conversions API rather than a ` +
