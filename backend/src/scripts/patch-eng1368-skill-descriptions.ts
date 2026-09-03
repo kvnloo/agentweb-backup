@@ -31,7 +31,50 @@ export const SKILL_DESCRIPTION_UPDATES: Record<string, string> = {
     "LinkedIn Ads performance audit and monthly report — generates a polished, brand-styled HTML report for any brand with a connected LinkedIn Ads account. Seven sections: Executive Summary, Campaign Performance, Ad Set Breakdown, Audience Insights, Trend & Benchmark Comparison, Optimization Recommendations, and Next Steps. Use when asked \"how are my LinkedIn ads doing\", \"LinkedIn ads audit\", \"LinkedIn performance report\", or for scheduled monthly reviews.",
 };
 
-async function main() {
+export type PatchOutcome = 'patched' | 'skipped' | 'not_found';
+
+/**
+ * Patches a single skill's description and verifies the persisted result via
+ * a read-back — a successful updateSkill() call alone doesn't prove the write
+ * landed as expected (ENG-1368 AC1 requires read-back verification).
+ */
+export async function patchSkillDescription(
+  skillService: import('../services/skillService').SkillService,
+  skillId: string,
+  newDescription: string
+): Promise<PatchOutcome> {
+  const skill = await skillService.getSkill(skillId);
+  if (!skill) {
+    console.warn(`Skill ${skillId} not found — skipping.`);
+    return 'not_found';
+  }
+
+  if (skill.description === newDescription) {
+    console.log(`Skill ${skillId} ("${skill.name}") already has the target description — skipping.`);
+    return 'skipped';
+  }
+
+  const previousTriggerMode = skill.triggerMode;
+  skill.description = newDescription;
+  await skillService.updateSkill(skill);
+
+  const verified = await skillService.getSkill(skillId);
+  if (!verified || verified.description !== newDescription || verified.triggerMode !== previousTriggerMode) {
+    throw new Error(
+      `Read-back verification failed for skill ${skillId} ("${skill.name}"): ` +
+      `expected description="${newDescription}" triggerMode=${previousTriggerMode}, ` +
+      `got description="${verified?.description}" triggerMode=${verified?.triggerMode}.`
+    );
+  }
+
+  console.log(
+    `Patched skill ${skillId} ("${skill.name}"): description updated and verified ` +
+    `(triggerMode unchanged: ${previousTriggerMode}).`
+  );
+  return 'patched';
+}
+
+export async function main() {
   const { SkillService } = await import('../services/skillService');
   const skillService = new SkillService();
 
@@ -39,26 +82,9 @@ async function main() {
   let skipped = 0;
 
   for (const [skillId, newDescription] of Object.entries(SKILL_DESCRIPTION_UPDATES)) {
-    const skill = await skillService.getSkill(skillId);
-    if (!skill) {
-      console.warn(`Skill ${skillId} not found — skipping.`);
-      continue;
-    }
-
-    if (skill.description === newDescription) {
-      console.log(`Skill ${skillId} ("${skill.name}") already has the target description — skipping.`);
-      skipped++;
-      continue;
-    }
-
-    const previousTriggerMode = skill.triggerMode;
-    skill.description = newDescription;
-    await skillService.updateSkill(skill);
-    patched++;
-    console.log(
-      `Patched skill ${skillId} ("${skill.name}"): description updated ` +
-      `(triggerMode unchanged: ${previousTriggerMode}).`
-    );
+    const outcome = await patchSkillDescription(skillService, skillId, newDescription);
+    if (outcome === 'patched') patched++;
+    if (outcome === 'skipped') skipped++;
   }
 
   console.log(
