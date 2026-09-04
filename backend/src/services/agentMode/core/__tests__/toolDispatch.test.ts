@@ -209,6 +209,11 @@ describe('executePreparedTools', () => {
         message: 'Successfully installed 1 skill(s). 1 skill(s) were not available with your subscription.',
         installedSkills: ['Some Other Skill'],
         rejectedSkillIds: ['utm-audit'],
+        // The tool names installSkills resolved rejectedSkillIds to (agentModeService.ts) —
+        // what buildUnavailableCapabilityNotice's per-tool scoping keys off. Included here so
+        // this test proves it reaches the ledger through the actual dispatch boundary, not
+        // just through extractMinimalToolResult called directly.
+        rejectedToolNames: ['audit_ad_utm_coverage'],
       };
       const ports = makePorts({
         toolResultError: realToolResultError,
@@ -220,6 +225,7 @@ describe('executePreparedTools', () => {
 
       const entry = input.toolCallsLedger[0];
       expect(entry.error).toBeUndefined();
+      expect(entry.result.rejectedToolNames).toEqual(['audit_ad_utm_coverage']);
       // makePorts' minimizer is identity, so this asserts the FIELD survives to the minimizer.
       // agentModeService.skills.test.ts pins that the real minimizer keeps it.
       expect(entry.result.rejectedSkillIds).toEqual(['utm-audit']);

@@ -21,6 +21,9 @@ interface AdsLayerHealth {
   ad_account_id?: string;
   active_campaigns: number;
   campaigns?: Array<{ id: string; name: string; status: string; objective: string }>;
+  // ENG-1584 sibling: fetchWithRetryAndPaging is bounded and reports pagingTruncated when a
+  // read stops short. false here means active_campaigns undercounts the real total.
+  campaigns_complete?: boolean;
 }
 
 interface LanderLayerHealth {
@@ -248,6 +251,16 @@ export async function assessClientHealth(
 
     let activeCampaigns: any[] = [];
     let adLevelData: any[] = [];
+    /*
+     * Defaults to "complete" only when there is nothing to check (`!hasAds`) — `active_campaigns:
+     * 0` is genuinely the true count there. When `hasAds`, this starts false and only flips true
+     * after a campaigns read actually succeeds without truncation, below. Before this fix it
+     * defaulted to true unconditionally and only flipped FALSE on a truncated success — a fetch
+     * that THREW (network error, expired token) fell through to the catch block below, which
+     * only logs, leaving activeCampaigns empty and campaignsComplete still true: a fetch that
+     * read NOTHING reported as "confirmed zero campaigns, complete."
+     */
+    let campaignsComplete = !hasAds;
 
     if (hasAds) {
       try {
@@ -286,6 +299,7 @@ export async function assessClientHealth(
           activeCampaigns = (campaignsData.data || []).filter(
             (c: any) => c.status === 'ACTIVE'
           );
+          campaignsComplete = campaignsData.pagingTruncated !== true;
 
           // Fetch ad-level data for creative variety + fatigue analysis, requesting both the
           // current and prior 14-day windows via `time_ranges` in one `insights` edge call —
@@ -341,6 +355,7 @@ export async function assessClientHealth(
         status: c.status,
         objective: c.objective,
       })),
+      campaigns_complete: campaignsComplete,
     };
 
     // --- Lander Layer ---

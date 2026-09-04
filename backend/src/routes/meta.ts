@@ -142,7 +142,15 @@ router.get("/ad-performance", async (req, res) => {
 
     // Import Meta API fetch utilities with retry and pagination support
     const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
-    
+
+    /*
+     * ENG-1584 sibling: fetchWithRetryAndPaging is bounded (META_PAGING_MAX_PAGES) and none of
+     * these six reads set a `limit`, so a dashboard for an account past the default page-size
+     * bound was silently short with no signal at all. The helper already reports
+     * `pagingTruncated` for exactly this; this route just never read it.
+     */
+    const truncatedSections: string[] = [];
+
     // Get campaigns using Graph API
     console.log("Fetching campaigns for timeframe:", timeframe);
     let campaigns;
@@ -152,12 +160,13 @@ router.get("/ad-performance", async (req, res) => {
       console.log("Fetching campaigns for act_%s", adAccountId);
 
       const campaignsData = await fetchWithRetryAndPaging(campaignsUrl);
-      
+
       if (campaignsData.error) {
         throw new Error(`Graph API Error: ${campaignsData.error.message}`);
       }
-      
+
       campaigns = campaignsData.data || [];
+      if (campaignsData.pagingTruncated === true) truncatedSections.push('Campaigns');
       console.log("Campaigns fetched successfully:", campaigns.length);
     } catch (campaignError: any) {
       console.error("Error fetching campaigns:", campaignError);
@@ -172,12 +181,13 @@ router.get("/ad-performance", async (req, res) => {
       console.log("Fetching ad sets for act_%s", adAccountId);
       
       const adSetsData = await fetchWithRetryAndPaging(adSetsUrl);
-      
+
       if (adSetsData.error) {
         throw new Error(`Graph API Error: ${adSetsData.error.message}`);
       }
-      
+
       adSets = adSetsData.data || [];
+      if (adSetsData.pagingTruncated === true) truncatedSections.push('Ad Sets');
       console.log("Ad Sets fetched successfully:", adSets.length);
     } catch (adSetsError: any) {
       console.error("Error fetching ad sets:", adSetsError);
@@ -192,12 +202,13 @@ router.get("/ad-performance", async (req, res) => {
       console.log("Fetching ads for act_%s", adAccountId);
       
       const adsData = await fetchWithRetryAndPaging(adsUrl);
-      
+
       if (adsData.error) {
         throw new Error(`Graph API Error: ${adsData.error.message}`);
       }
-      
+
       ads = adsData.data || [];
+      if (adsData.pagingTruncated === true) truncatedSections.push('Ads');
       console.log("Ads fetched successfully:", ads.length);
     } catch (adsError: any) {
       console.error("Error fetching ads:", adsError);
@@ -218,6 +229,7 @@ router.get("/ad-performance", async (req, res) => {
       }
       
       insights = adInsightsData.data || [];
+      if (adInsightsData.pagingTruncated === true) truncatedSections.push('Ad-level Insights');
       console.log("Ad-level insights fetched successfully:", insights.length);
 
       // Fetch adset-level insights for ad sets processing
@@ -230,6 +242,7 @@ router.get("/ad-performance", async (req, res) => {
       }
       
       adSetInsights = adSetInsightsData.data || [];
+      if (adSetInsightsData.pagingTruncated === true) truncatedSections.push('Adset-level Insights');
       console.log("Adset-level insights fetched successfully:", adSetInsights.length);
 
       // Fetch campaign-level insights for campaigns processing
@@ -242,6 +255,7 @@ router.get("/ad-performance", async (req, res) => {
       }
       
       campaignInsights = campaignInsightsData.data || [];
+      if (campaignInsightsData.pagingTruncated === true) truncatedSections.push('Campaign-level Insights');
       console.log("Campaign-level insights fetched successfully:", campaignInsights.length);
     } catch (insightsError: any) {
       console.error("Error fetching insights:", insightsError);
@@ -267,7 +281,10 @@ router.get("/ad-performance", async (req, res) => {
       adsData,
       campaignSummary,
       timeframe,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      // Empty when every read was complete — present and non-empty when the dashboard is
+      // short some rows, so a caller does not read a truncated read as the whole account.
+      ...(truncatedSections.length > 0 ? { truncatedSections, complete: false } : { complete: true })
     });
   } catch (error: any) {
     console.error("Error fetching ad performance:", error);

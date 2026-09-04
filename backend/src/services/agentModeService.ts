@@ -52,7 +52,7 @@ import {
   normalizeOpenRouterResponseMetadata,
   normalizeOpenRouterErrorMetadata,
 } from './agentMode/openRouterMetadata';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoAssetUrl,
@@ -3794,6 +3794,15 @@ export class AgentModeService {
       // standing down one guard silently disables the other.
       const falseClaimGuardEnabled = process.env.AGENT_FALSE_CLAIM_GUARD !== 'false';
 
+      // Kill switch for the unavailable-capability notice below — ON by default; set
+      // AGENT_UNAVAILABLE_CAPABILITY_NOTICE=false to stand it down. Its two sibling guards in
+      // the same block each have one and this did not, which is the difference between a bad
+      // banner being a config change and a bad banner being a revert-and-redeploy. It is also
+      // the guard that most needs one: it is UNCONDITIONAL, so a false positive prepends a
+      // scary warning to an otherwise correct answer on every affected turn.
+      const unavailableCapabilityNoticeEnabled =
+        process.env.AGENT_UNAVAILABLE_CAPABILITY_NOTICE !== 'false';
+
       let wasCancelled = false;
       // ENG-244: set true when the loop exits because the step budget (maxIterations)
       // was exhausted. This is the deterministic signal a long data-gathering
@@ -4451,6 +4460,31 @@ export class AgentModeService {
               if (responseMessage) responseMessage.content = content;
             }
           }
+
+          /*
+           * A capability the skill gate refused, and which never afterwards succeeded, is
+           * stated ABOVE the answer — unconditionally, not gated on detecting a false claim.
+           *
+           * The false-claim guard above already existed when a live delegated session produced
+           * a fabricated "UTM Tagging Audit Summary — PASS, 6/6 ads tagged" table after
+           * `audit_ad_utm_coverage` was gated and `install_skills` was refused by subscription.
+           * It caught that one only because the claim carried a checkable number, and it put the
+           * correction BELOW the fabricated table. Both are why this is prepended and why it
+           * does not try to decide whether the prose claims the tool ran: that a tool was
+           * refused and never succeeded is a fact in the ledger, so this cannot false-positive.
+           */
+          if (unavailableCapabilityNoticeEnabled && content) {
+            const unavailableNotice = buildUnavailableCapabilityNotice(toolCalls);
+            if (unavailableNotice) {
+              console.warn(
+                `AgentMode: a gated tool never succeeded in session ${sessionId} — prepending an ` +
+                `unavailable-capability notice so the answer cannot read as that tool's output`
+              );
+              content = `${unavailableNotice}\n\n${content}`;
+              if (responseMessage) responseMessage.content = content;
+            }
+          }
+
 
           if (requireWorkPlanDisposition) {
             const latestSession = await chatbotDb.getChatSession(sessionId, true);
@@ -6325,6 +6359,43 @@ export class AgentModeService {
          * and not any future guard, which would be reduced to string-matching prose.
          */
         result.rejectedSkillIds = rejectedSkillIds;
+        /*
+         * ENG-1188-follow-up (unavailable-capability notice, per-tool scoping): a rejected skill
+         * id alone does not tell a PURE ledger-only reader (buildUnavailableCapabilityNotice)
+         * which tool names it would have unlocked, so that reader could only ever ask "did SOME
+         * install fail this turn" — arming the notice for every gated tool in the turn, including
+         * ones whose skill installed fine. Resolving the ids to actual tool names here, once,
+         * where the skill catalog is in scope, lets that reader ask the precise question instead:
+         * "was THIS tool's skill among the ones refused".
+         *
+         * `availableById` is NOT the right catalog to resolve these against: it comes from
+         * `getSkillsForDisplay` -> `getSkillsAvailableToUser`, already filtered to this user's
+         * subscription tier. A skill rejected FOR being outside that tier — the exact shape the
+         * live incident's `install_skills` refusal was — was excluded from that map before
+         * `rejectedSkillIds` was even computed, so looking it up there always resolves to
+         * nothing. The full published catalog (unfiltered by tier) is what still knows the
+         * toolNames of a skill the user's plan does not allow.
+         */
+        const fullCatalog = await skillService.getPublishedSkills();
+        const fullCatalogById = new Map(fullCatalog.map((skill) => [skill.skillId, skill]));
+        /*
+         * The virtual skill ids (`__admin_tools__`, `__other_skills__`) are synthesized
+         * in-memory and never appear in either catalog map, so they always resolve to `[]` here.
+         * A rejection mixing a real id with one of these — `['skill-1', '__admin_tools__']` —
+         * would otherwise resolve to skill-1's tool names only, a NON-empty array that reads as
+         * a fully scoped rejection while silently dropping every admin/other_skills tool from it.
+         * A gated tool needing the virtual skill would then wrongly read as available. Better to
+         * emit nothing at all than a partial list that looks complete: any id this can't resolve
+         * makes the whole call unscoped, so the reader falls back to arming every gated tool.
+         */
+        const resolvedPerId = rejectedSkillIds.map(
+          (id) => availableById.get(id)?.toolNames || fullCatalogById.get(id)?.toolNames || [],
+        );
+        const allResolved = resolvedPerId.every((names) => names.length > 0);
+        if (allResolved) {
+          const rejectedToolNames = Array.from(new Set(resolvedPerId.flat()));
+          if (rejectedToolNames.length > 0) result.rejectedToolNames = rejectedToolNames;
+        }
       }
 
       return result;
@@ -7018,6 +7089,12 @@ export class AgentModeService {
         ...(Array.isArray(a.installedSkills) ? { installedSkills: a.installedSkills } : {}),
         ...(Array.isArray(a.rejectedSkillIds) && a.rejectedSkillIds.length > 0
           ? { rejectedSkillIds: a.rejectedSkillIds }
+          : {}),
+        // Same reasoning as rejectedSkillIds above: this is what lets a ledger-only reader
+        // scope "was THIS gated tool's skill among the ones refused" instead of "did any
+        // install fail this turn" (buildUnavailableCapabilityNotice, synthesisResidue.ts).
+        ...(Array.isArray(a.rejectedToolNames) && a.rejectedToolNames.length > 0
+          ? { rejectedToolNames: a.rejectedToolNames }
           : {}),
       };
     }
@@ -19269,6 +19346,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       ]);
 
 
+      /*
+       * ENG-1584 sibling: `fetchWithRetryAndPaging` is bounded (META_PAGING_MAX_PAGES) and
+       * these URLs set no `limit`, so an account past the default page-size bound got a
+       * dashboard silently missing rows with no signal at all — the helper already reports
+       * `pagingTruncated` for exactly this (see the checked sibling in listMetaAdsCampaigns
+       * above), it was just never read here across any of the 9 parallel fetches.
+       */
+      const truncatedSections = ([
+        ['Campaigns', campaignsData],
+        ['Ad Sets', adSetsData],
+        ['Ads', adsData],
+        ['Ad-level Insights', adInsightsData],
+        ['Adset-level Insights', adSetInsightsData],
+        ['Campaign-level Insights', campaignInsightsData],
+        ['Demographics Breakdown', insightsDemographicsData],
+        ['Placement Breakdown', insightsPlacementData],
+        ['Device Breakdown', insightsDeviceData],
+      ] as const)
+        .filter(([, response]) => (response as any)?.pagingTruncated === true)
+        .map(([section]) => section);
+
       // Keep connection lookup, permission, and query failures distinct so Emma
       // can prompt for the right remedy instead of always asking for reconnect.
       for (const [section, response] of [
@@ -19354,11 +19452,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         timeframe
       }, userId);
 
+      const truncationNote = truncatedSections.length > 0
+        ? ` THIS DATA IS INCOMPLETE for: ${truncatedSections.join(', ')} — the read stopped before the end of the account. Do not conclude an ad/campaign is absent based on these sections.`
+        : '';
       const result = {
         success: true,
-        message: breakdownStatus.partialFailure
+        message: (breakdownStatus.partialFailure
           ? `Meta ads metrics loaded for ${timeframe} timeframe (some breakdown sections unavailable: ${breakdownStatus.unavailableSections.join(', ')})`
-          : `Meta ads metrics loaded for ${timeframe} timeframe`,
+          : `Meta ads metrics loaded for ${timeframe} timeframe`) + truncationNote,
         timeframe,
         attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays },
         campaignSummary,
@@ -19369,6 +19470,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         sections: breakdownStatus.sections,
         partialFailure: breakdownStatus.partialFailure,
         unavailableSections: breakdownStatus.unavailableSections,
+        // ENG-1584 sibling: which sections hit the page-count bound, so a caller cannot mistake
+        // a short list for the whole account (see truncatedSections above).
+        ...(truncatedSections.length > 0 ? { truncatedSections, complete: false } : { complete: true }),
       };
 
       return result;
