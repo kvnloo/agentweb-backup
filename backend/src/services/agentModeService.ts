@@ -17945,33 +17945,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // LIFETIME budget for scheduled delivery — a daily-budget ad set (or one
       // with no budget at all) ignores the schedule and runs 24/7, which is
       // exactly the Open Future Forum failure mode (#2244/ENG-838) this slice
-      // closes. Reject the combination before it can ship silently.
+      // closes.
       //
-      // This runs BEFORE getMetaCredentials deliberately (unchanged from the
-      // #2244 fail-loud guard this replaces). Credential resolution can refresh
-      // a token against Meta and can throw its own auth error, so resolving
-      // first would both make a network call for a request we may be certain to
-      // reject and mask a deterministic validation answer behind an unrelated
-      // credential failure. A rejection that is knowable from the arguments
-      // alone must not depend on account state.
-      if (args.adset_schedule !== undefined || args.pacing_type !== undefined) {
-        if (args.daily_budget !== undefined || args.lifetime_budget === undefined) {
-          throw new Error(
-            `Dayparting (adset_schedule/pacing_type) requires a lifetime_budget, not a daily_budget. ` +
-            `Meta ignores the schedule on a daily-budget ad set and delivers 24/7 against a schedule ` +
-            `nobody chose. Provide lifetime_budget (and end_time) instead. Tracked as ENG-842.`
-          );
-        }
-        if (!args.end_time) {
-          throw new Error(
-            `end_time is required when using adset_schedule with a lifetime_budget. Tracked as ENG-842.`
-          );
-        }
-        // Meta ignores adset_schedule unless pacing_type explicitly requests
-        // day-parting delivery — an explicit caller value always wins.
-        if (args.adset_schedule !== undefined && args.pacing_type === undefined) {
-          args.pacing_type = ['day_parting'];
-        }
+      // Only the pacing_type default can be decided from args alone before
+      // credential resolution — an explicit caller value always wins. The
+      // lifetime-budget/daily-budget rejection CANNOT run here (CodeRabbit
+      // finding, PR #2755): under Advantage Campaign Budget (CBO) the
+      // ad-set-level args.daily_budget/lifetime_budget are irrelevant and get
+      // stripped below once campaignHasBudget is known — the budget that
+      // actually controls delivery is the CAMPAIGN's. Gating on the raw args
+      // here would let a CBO ad set with a real daily-budget campaign sail
+      // through with a dummy lifetime_budget, silently reproducing ENG-838
+      // through the CBO path. The real gate runs after campaignHasBudget is
+      // resolved, below.
+      const requestsDaypartingSchedule = args.adset_schedule !== undefined || args.pacing_type !== undefined;
+      if (requestsDaypartingSchedule && args.adset_schedule !== undefined && args.pacing_type === undefined) {
+        args.pacing_type = ['day_parting'];
       }
 
       const { accountId, accessToken } = await this.getMetaCredentials(userId, args.account_id);
@@ -17982,6 +17971,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const campaign = await metaService.getCampaign(accountId, accessToken, args.campaign_id);
       const objective = args.campaign_objective || campaign.objective;
       const campaignHasBudget = !!(campaign.daily_budget || campaign.lifetime_budget);
+
+      // ENG-842 dayparting gate (moved here per CodeRabbit finding on #2755):
+      // validate against the EFFECTIVE budget source — the campaign's own
+      // budget under CBO, otherwise the ad set's own args — not the raw args,
+      // which are meaningless under CBO once stripped below.
+      if (requestsDaypartingSchedule) {
+        const effectiveLifetimeBudget = campaignHasBudget ? campaign.lifetime_budget : args.lifetime_budget;
+        const effectiveDailyBudget = campaignHasBudget ? campaign.daily_budget : args.daily_budget;
+        if (effectiveDailyBudget !== undefined || effectiveLifetimeBudget === undefined) {
+          throw new Error(
+            `Dayparting (adset_schedule/pacing_type) requires a lifetime_budget, not a daily_budget. ` +
+            `Meta ignores the schedule on a daily-budget ad set (or campaign, under Advantage Campaign ` +
+            `Budget) and delivers 24/7 against a schedule nobody chose. Provide lifetime_budget (and ` +
+            `end_time) instead — for a CBO campaign this means the CAMPAIGN's budget must be a lifetime ` +
+            `budget. Tracked as ENG-842.`
+          );
+        }
+        if (!args.end_time) {
+          throw new Error(
+            `end_time is required when using adset_schedule with a lifetime_budget. Tracked as ENG-842.`
+          );
+        }
+      }
 
       // 1. Budget Validation — depends on whether campaign has ACB/CBO
       const dailyBudget = args.daily_budget;

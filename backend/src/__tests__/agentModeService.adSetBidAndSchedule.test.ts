@@ -161,25 +161,75 @@ describe('ENG-838/ENG-842 — ad set bid strategy and dayparting must not silent
       expect(metaService.createAdSet).not.toHaveBeenCalled();
     });
 
-    it('rejects an invalid dayparting request before touching credentials, so no Meta call is made and no auth error masks it', async () => {
-      // The account is NOT connected, so getMetaCredentials would throw its own
-      // auth error. A rejection knowable from the arguments alone must not depend
-      // on account state, and must not cost a token refresh against Meta for a
-      // request we are certain to reject.
-      (userDb.getUserById as jest.Mock).mockResolvedValue({ id: 'user123', connected_accounts: [] });
-
+    it('still rejects an invalid daily-budget dayparting request when the account is connected', async () => {
+      // Superseded by the CBO fix below (CodeRabbit finding on PR #2755): the
+      // lifetime-vs-daily rejection can no longer run before credential
+      // resolution, because under Advantage Campaign Budget (CBO) the
+      // ad-set-level args are irrelevant and the real answer depends on the
+      // CAMPAIGN's budget, which is only knowable after fetching the campaign
+      // (which itself requires credentials). A dummy lifetime_budget on a CBO
+      // ad set backed by a real daily-budget campaign must still be rejected —
+      // see the CBO describe block below — this case just confirms the
+      // ordinary (non-CBO) rejection is unchanged when credentials resolve fine.
       const result = await service.createMetaAdsAdSet('user123', {
         ...baseAdSetParams,
         adset_schedule: [{ start_minute: 540, end_minute: 1020, days: [1, 2, 3, 4, 5] }]
       });
 
       expect(result.success).toBe(false);
-      // The dayparting answer, not "Meta Ads account is not connected".
       expect(String(result.error)).toMatch(/lifetime_budget/i);
-      expect(String(result.error)).not.toMatch(/not connected/i);
-      // And nothing downstream ran at all.
-      expect(metaService.getCampaign).not.toHaveBeenCalled();
       expect(metaService.createAdSet).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('B — dayparting under Advantage Campaign Budget (CBO) validates the CAMPAIGN budget, not the ad set args (CodeRabbit finding, PR #2755)', () => {
+    it('rejects dayparting on a CBO campaign whose own budget is a daily_budget, even with a dummy ad-set lifetime_budget', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({
+        id: 'camp_123',
+        objective: 'OUTCOME_TRAFFIC',
+        daily_budget: 5000
+      });
+
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...baseAdSetParams,
+        daily_budget: undefined,
+        lifetime_budget: 500, // dummy — irrelevant under CBO, stripped before send
+        end_time: '2026-10-01T00:00:00+0000',
+        adset_schedule: [{ start_minute: 540, end_minute: 1020, days: [1, 2, 3, 4, 5] }]
+      });
+
+      // Before this fix this reached Meta with the schedule silently ignored
+      // (24/7 delivery against a daily-budget campaign) — exactly the ENG-838
+      // failure mode through the CBO path.
+      expect(result.success).toBe(false);
+      expect(String(result.error)).toMatch(/lifetime_budget/i);
+      expect(metaService.createAdSet).not.toHaveBeenCalled();
+    });
+
+    it('accepts dayparting on a CBO campaign whose own budget is a lifetime_budget', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({
+        id: 'camp_123',
+        objective: 'OUTCOME_TRAFFIC',
+        lifetime_budget: 5000
+      });
+
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...baseAdSetParams,
+        daily_budget: undefined,
+        end_time: '2026-10-01T00:00:00+0000',
+        adset_schedule: [{ start_minute: 540, end_minute: 1020, days: [1, 2, 3, 4, 5] }]
+      });
+
+      expect(result.success).toBe(true);
+      expect(metaService.createAdSet).toHaveBeenCalled();
+      const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
+      // CBO strips ad-set-level budget regardless.
+      expect(calledWith.daily_budget).toBeUndefined();
+      expect(calledWith.lifetime_budget).toBeUndefined();
+      expect(calledWith.adset_schedule).toEqual([
+        { start_minute: 540, end_minute: 1020, days: [1, 2, 3, 4, 5] }
+      ]);
+      expect(calledWith.pacing_type).toEqual(['day_parting']);
     });
   });
 
