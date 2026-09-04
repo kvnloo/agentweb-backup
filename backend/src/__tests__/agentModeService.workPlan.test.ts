@@ -774,6 +774,7 @@ describe('AgentModeService - Work Plan', () => {
         ]);
         // The step was not completed, so its credits must be untouched.
         expect(chatbotDb.updateCalledFunctions).not.toHaveBeenCalled();
+        expect(chatbotDb.decrementCalledFunctionsClamped).not.toHaveBeenCalled();
         expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
       });
 
@@ -1952,7 +1953,7 @@ describe('AgentModeService - Work Plan', () => {
 
         (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
         (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
-        (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.decrementCalledFunctionsClamped as jest.Mock).mockResolvedValue(mockSession);
 
         const result = await (agentModeService as any).setWorkPlanStatus(
           [{ stepCount: 1, status: 'completed' }],
@@ -1961,9 +1962,11 @@ describe('AgentModeService - Work Plan', () => {
 
         expect(result.success).toBe(true);
         expect(result.message).toContain('Step 1 status updated to completed');
-        expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(
+        // ENG-1698: applied as a delta against a fresh read, not an absolute
+        // value computed from this call's local snapshot.
+        expect(chatbotDb.decrementCalledFunctionsClamped).toHaveBeenCalledWith(
           mockSessionId,
-          { you_search_web: 0 }
+          { you_search_web: 1 }
         );
       });
 
@@ -2027,7 +2030,7 @@ describe('AgentModeService - Work Plan', () => {
 
         (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
         (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
-        (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.decrementCalledFunctionsClamped as jest.Mock).mockResolvedValue(mockSession);
 
         const result = await (agentModeService as any).setWorkPlanStatus(
           [{ stepCount: 1, status: 'completed' }],
@@ -2035,9 +2038,9 @@ describe('AgentModeService - Work Plan', () => {
         );
 
         expect(result.success).toBe(true);
-        expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(
+        expect(chatbotDb.decrementCalledFunctionsClamped).toHaveBeenCalledWith(
           mockSessionId,
-          { create_blog_article: 2 } // Should decrement by 3
+          { create_blog_article: 3 } // Delta: decrement by 3
         );
       });
 
@@ -2116,6 +2119,7 @@ describe('AgentModeService - Work Plan', () => {
         expect(result.message).toContain('Step 1 status updated to skipped');
         // Should not try to update calledFunctions when skipping
         expect(chatbotDb.updateCalledFunctions).not.toHaveBeenCalled();
+        expect(chatbotDb.decrementCalledFunctionsClamped).not.toHaveBeenCalled();
       });
 
       it('ENG-1698: decrements calledFunctions when skipping a step that already made its calls', async () => {
@@ -2152,7 +2156,7 @@ describe('AgentModeService - Work Plan', () => {
 
         (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
         (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
-        (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.decrementCalledFunctionsClamped as jest.Mock).mockResolvedValue(mockSession);
 
         const result = await (agentModeService as any).setWorkPlanStatus(
           [{ stepCount: 1, status: 'skipped', notes: 'Not needed' }],
@@ -2160,9 +2164,9 @@ describe('AgentModeService - Work Plan', () => {
         );
 
         expect(result.success).toBe(true);
-        expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(
+        expect(chatbotDb.decrementCalledFunctionsClamped).toHaveBeenCalledWith(
           mockSessionId,
-          { generate_image: 0 }
+          { generate_image: 1 }
         );
       });
 
@@ -2200,6 +2204,7 @@ describe('AgentModeService - Work Plan', () => {
         expect(result.success).toBe(true);
         // Clamped at 0 -- must not persist a negative count for a later step to inherit.
         expect(chatbotDb.updateCalledFunctions).not.toHaveBeenCalled();
+        expect(chatbotDb.decrementCalledFunctionsClamped).not.toHaveBeenCalled();
       });
     });
   });
