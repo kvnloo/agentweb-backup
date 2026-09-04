@@ -90,6 +90,15 @@ export function itemToRecommendation(item: AWS.DynamoDB.DocumentClient.Attribute
         `verdict (${String(item.verdict)})`,
     );
   }
+  // Same finiteness guard as predictedMagnitudePct above: an Infinity written by a caller that
+  // skipped the route's own guard (or by any other future writer) would otherwise read back
+  // silently rather than being caught here, the one place every reader passes through.
+  if (item.actualMagnitudePct != null && !Number.isFinite(Number(item.actualMagnitudePct))) {
+    throw new OutcomeLedgerCorruptionError(
+      `${OUTCOME_LEDGER_TABLE} item '${item.entityKey}'/'${item.recommendationId}' has a non-finite ` +
+        `actualMagnitudePct (${String(item.actualMagnitudePct)})`,
+    );
+  }
 
   return {
     accountId: parsed.accountId,

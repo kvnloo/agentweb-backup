@@ -137,6 +137,10 @@ router.post('/:platform/:accountId/:recommendationId/score', authenticateToken, 
     if (typeof adopted !== 'boolean') {
       return res.status(400).json({ error: 'adopted must be a boolean' });
     }
+    // No NaN/Infinity guard needed here: JSON cannot represent either (both serialize to `null`),
+    // so an HTTP caller can never produce a non-finite `typeof 'number'` value in `req.body` — the
+    // finiteness guard belongs in `scoreRecommendation` itself, which is reachable by any future
+    // non-HTTP caller too, not duplicated here where it could never actually fire.
 
     const score = scoreRecommendation({
       recommendation: existing,
@@ -150,6 +154,13 @@ router.post('/:platform/:accountId/:recommendationId/score', authenticateToken, 
     await putScoredRecommendation(scored);
     res.json(scored);
   } catch (error: any) {
+    // A concurrent second scorer can race past the pending-status pre-check above; the DB layer's
+    // own condition expression still rejects it, but as a bare Error rather than the friendly 409
+    // the pre-check path returns for the identical logical situation. Recognised here so both
+    // paths through "this was already scored" produce the same status code.
+    if (error instanceof Error && error.message.includes('is not pending')) {
+      return res.status(409).json({ error: error.message, reason: 'already_scored' });
+    }
     console.error('[ENG-1550] score recommendation failed:', error);
     res.status(500).json({ error: 'Failed to score recommendation' });
   }

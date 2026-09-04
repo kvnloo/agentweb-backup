@@ -108,8 +108,21 @@ export function createRecommendation(input: CreateRecommendationInput): Recommen
   if (!input.hypothesis.trim()) {
     throw new Error('outcomeLedger: hypothesis must not be empty — an unscoreable-by-design prediction is not a prediction');
   }
+  if (!input.predictedMetric || !String(input.predictedMetric).trim()) {
+    throw new Error('outcomeLedger: predictedMetric must not be empty');
+  }
+  if (input.predictedDirection !== 'increase' && input.predictedDirection !== 'decrease') {
+    throw new Error(`outcomeLedger: predictedDirection must be 'increase' or 'decrease' (got ${String(input.predictedDirection)})`);
+  }
   if (!Number.isFinite(input.predictedMagnitudePct) || input.predictedMagnitudePct < 0) {
     throw new Error(`outcomeLedger: predictedMagnitudePct must be a finite, non-negative number (got ${input.predictedMagnitudePct})`);
+  }
+  // Validated here, not left to `scoreRecommendation`'s Date arithmetic: `new Date(badString)` is
+  // an Invalid Date, and every comparison against one (`x < invalidDate`) evaluates to `false` —
+  // so a garbage evaluationDate would silently fall THROUGH the settling-window guard instead of
+  // being blocked by it, defeating the one guarantee that guard exists to provide.
+  if (Number.isNaN(new Date(input.evaluationDate).getTime())) {
+    throw new Error(`outcomeLedger: evaluationDate must be a valid ISO date (got ${String(input.evaluationDate)})`);
   }
 
   return {
@@ -188,7 +201,15 @@ export function scoreRecommendation(input: ScoreInput): ScoreResult {
     };
   }
 
-  if (actualValue == null || baselineValue == null || baselineValue === 0) {
+  // Guarded here, not only at the HTTP route: JSON cannot represent NaN/Infinity (they serialize
+  // to `null`), so an HTTP caller can never actually trigger this — but a future direct,
+  // non-HTTP caller (e.g. a loop calling this function programmatically once one exists) could.
+  // NaN would otherwise silently satisfy neither `> 0` comparison below and fall through to
+  // 'decrease' — a wrong verdict, not an obviously-failed one — and Infinity would produce an
+  // 'increase' verdict with an infinite, unreviewable magnitude.
+  const actualUnusable = actualValue == null || !Number.isFinite(actualValue);
+  const baselineUnusable = baselineValue == null || !Number.isFinite(baselineValue);
+  if (actualUnusable || baselineUnusable || baselineValue === 0) {
     return {
       scoredAt: now,
       adopted,
