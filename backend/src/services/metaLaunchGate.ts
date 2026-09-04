@@ -564,7 +564,31 @@ export async function runMetaTrackingGate(
         try {
           urls = (await resolve(creativeId, accessToken)) ?? [];
         } catch (err: any) {
-          failure = err?.message || String(err);
+          /*
+           * ENG-1742: `err.message` on a raw axios failure is Axios's own generic text
+           * ("Request failed with status code 400") — never Meta's actual reason. Meta's real
+           * error body lives at `err.response.data.error` (message/code/error_subcode/
+           * error_user_msg), and nothing here ever read it: neither the user-facing block
+           * message nor the server log. A creative that reads back fine through every other
+           * path but 400s here was, at investigation time, undiagnosable — even server-side.
+           * Log the full body so a future occurrence is diagnosable, and prefer Meta's own
+           * words for the user-facing reason when it has any to give.
+           */
+          const metaErr = err?.response?.data?.error;
+          if (metaErr) {
+            console.error(`[META GATE] creative destination resolve failed for ${creativeId}:`, {
+              status: err?.response?.status,
+              message: metaErr.message,
+              type: metaErr.type,
+              code: metaErr.code,
+              error_subcode: metaErr.error_subcode,
+              error_user_msg: metaErr.error_user_msg,
+              fbtrace_id: metaErr.fbtrace_id,
+            });
+          } else {
+            console.error(`[META GATE] creative destination resolve failed for ${creativeId}:`, err?.message || err);
+          }
+          failure = metaErr?.error_user_msg || metaErr?.message || err?.message || String(err);
         }
       }
       if (failure || urls.length === 0) {
