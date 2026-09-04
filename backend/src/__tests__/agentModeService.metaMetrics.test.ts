@@ -259,6 +259,49 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
       expect(deviceUrl).not.toContain('level=ad');
     });
 
+    it('requests the ads creative sub-selector URL-encoded, not raw braces (ENG-1742 follow-up)', async () => {
+      // Confirmed live 2026-09-04 against a real ad account: an unencoded `creative{...}`
+      // selector doesn't error on this `ads` edge — Graph silently drops the whole `creative`
+      // field from every result instead, with no error anywhere to reveal it. getMetaAdsMetrics
+      // would report success with every ad's thumbnail/title/body/image silently missing.
+      const mockUser = {
+        id: 'user123',
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
+      };
+
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      let capturedUrls: string[] = [];
+
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        capturedUrls.push(url);
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ data: [] })
+        });
+      }) as jest.Mock;
+
+      await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
+
+      const adsUrl = capturedUrls.find(url => url.includes('/ads?'));
+      expect(adsUrl).toBeDefined();
+      expect(adsUrl).toContain('creative%7Bthumbnail_url');
+      expect(adsUrl).not.toContain('creative{thumbnail_url');
+    });
+
     it('should not include adset_id and ad_id in breakdown API calls', async () => {
       const mockUser = {
         id: 'user123',
