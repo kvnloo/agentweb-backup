@@ -97,6 +97,32 @@ describe('Meta launch gate — real creative-destination Graph read (ENG-1742)',
     expect(out.proceed).toBe(true);
   });
 
+  it('follows object_story_id back to the referenced page post when the creative carries no inline destination', async () => {
+    // Creative built purely by referencing an existing page post — no link_url, no
+    // object_story_spec.link_data.link, nothing inline. Only object_story_id points anywhere.
+    mockAxiosGet.mockImplementation((url: string) => {
+      if (url.includes(CREATIVE_ID)) {
+        return Promise.resolve({ data: { object_story_id: '123456_987654' } });
+      }
+      if (url.includes('123456_987654')) {
+        return Promise.resolve({ data: { link: 'https://site.example/referenced-post' } });
+      }
+      throw new Error(`unexpected axios.get call: ${url}`);
+    });
+
+    const out = await _runMetaTrackingGateForTest(
+      creds, CAMPAIGN, 'AD_CREATE', false, 'sess-1',
+      {}, undefined, [], [CREATIVE_ID],
+    );
+
+    expect(mockAxiosGet).toHaveBeenCalledTimes(2);
+    const postCallUrl = mockAxiosGet.mock.calls[1][0] as string;
+    expect(postCallUrl).toContain('123456_987654');
+    expect(mockPreflight).toHaveBeenCalledTimes(1);
+    expect(mockPreflight.mock.calls[0][0]).toContain('https://site.example/referenced-post');
+    expect(out.proceed).toBe(true);
+  });
+
   it('still blocks (as unverifiable, not silently) when Meta genuinely refuses the request', async () => {
     // Confirms the fix didn't just swallow the failure mode — a real Graph error on this
     // specific call still surfaces as a block, same as before.

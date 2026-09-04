@@ -211,12 +211,40 @@ async function defaultResolveCreativeDestinations(creativeId: string, accessToke
    * behind it), but it is equally absent from that known-working list, and this function has no
    * documented reason of its own to need it.
    */
-  const fields = 'link_url,object_story_spec,asset_feed_spec,url_tags';
+  /*
+   * `object_story_id` requested alongside the inline shapes: a creative built by REFERENCING an
+   * existing page post (as opposed to carrying `object_story_spec` inline) has no destination
+   * anywhere in the fields above — the post itself, not the creative, carries the link. Without
+   * following that reference this read a real creative as having no destination at all, which
+   * the gate then blocked exactly like an unreadable one: correct behavior on wrong information.
+   */
+  const fields = 'link_url,object_story_spec,object_story_id,asset_feed_spec,url_tags';
   const url =
     `https://graph.facebook.com/${apiVersion}/${creativeId}` +
     `?fields=${fields}&access_token=${encodeURIComponent(accessToken)}`;
   const res = await withOneTransientRetry(async () => axios.get(url, { timeout: GATE_GRAPH_CALL_TIMEOUT_MS }));
-  return [...new Set(extractDestinationUrls(res.data))];
+  const urls = extractDestinationUrls(res.data);
+  if (urls.length > 0) return [...new Set(urls)];
+
+  /*
+   * No destination found inline, but the creative points at an existing post (format
+   * "{page_id}_{post_id}") — follow it. A page post's own `link` field is where a link-type
+   * post's destination actually lives; the creative referencing it never gets a copy.
+   *
+   * Not a fallback for every unreadable creative: only fires when `object_story_id` is present,
+   * so a creative that truly has no destination (or genuinely fails the primary read — that
+   * throws above, never reaches here) is not silently retried against the wrong node.
+   */
+  const objectStoryId = (res.data as any)?.object_story_id;
+  if (typeof objectStoryId === 'string' && objectStoryId.trim()) {
+    const postUrl =
+      `https://graph.facebook.com/${apiVersion}/${objectStoryId}` +
+      `?fields=link&access_token=${encodeURIComponent(accessToken)}`;
+    const postRes = await withOneTransientRetry(async () => axios.get(postUrl, { timeout: GATE_GRAPH_CALL_TIMEOUT_MS }));
+    return [...new Set(extractDestinationUrls(postRes.data))];
+  }
+
+  return [];
 }
 
 /* istanbul ignore next — network boundary; tests inject pixelHasRecentActivity. */
