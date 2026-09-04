@@ -174,4 +174,41 @@ describe('buildMetaWriteConfirmation scopes to the resolved ad account', () => {
 
     expect(result.tenancyRefused).toBe(true);
   });
+
+  /*
+   * ENG-842 / CodeRabbit P1: the confirmation prompt must show the exact dayparting
+   * schedule the write will apply, not just that "something" changed. Before this,
+   * `adset_schedule`/`pacing_type` were silently omitted from the change-key allowlist,
+   * so a user could approve an AD_SET UPDATE without ever seeing the delivery hours or
+   * pacing mode being set — the same class of "approved without seeing it" gap the
+   * ENG-941 tracking-override warning was added to close.
+   */
+  it('surfaces adset_schedule and pacing_type in the confirmation summary and target.changes', async () => {
+    getCampaignSpy.mockRestore();
+    const adSetSpy = jest.spyOn(metaService, 'getAdSet').mockResolvedValue({
+      id: 'set_1',
+      name: 'Evening Push',
+      campaign_id: 'camp_1',
+    } as never);
+    const campaignSpy = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({
+      id: 'camp_1',
+      name: 'Summer Sale',
+    } as never);
+    const schedule = [{ days: [1, 2, 3, 4, 5], start_minute: 540, end_minute: 1020 }];
+
+    try {
+      const result: any = await (agentModeService as any).buildMetaWriteConfirmation(
+        USER, 'AD_SET', 'UPDATE', RESOLVED_ACCOUNT, undefined, 'set_1', undefined,
+        { adset_schedule: schedule, pacing_type: ['day_parting'] },
+      );
+
+      expect(result.summary).toContain('adset_schedule');
+      expect(result.summary).toContain('pacing_type');
+      expect(result.target.changes.adset_schedule).toEqual(schedule);
+      expect(result.target.changes.pacing_type).toEqual(['day_parting']);
+    } finally {
+      adSetSpy.mockRestore();
+      campaignSpy.mockRestore();
+    }
+  });
 });

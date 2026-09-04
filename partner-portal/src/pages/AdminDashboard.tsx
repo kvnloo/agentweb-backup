@@ -3,8 +3,6 @@ import { useAdmin } from "../contexts/AdminContext";
 import { Link as RouterLink, useSearchParams } from "react-router-dom";
 import {
   Box,
-  Tabs,
-  Tab,
   Typography,
   Paper,
   Table,
@@ -45,6 +43,7 @@ import {
   Divider,
   Switch,
 } from "@mui/material";
+import { ADMIN_NAVIGATION_SECTIONS, ADMIN_TAB_MAP } from "./adminNavigation";
 import { format } from "date-fns";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
@@ -765,35 +764,8 @@ const ChatDialog = ({
 export default function AdminDashboard() {
   const [searchParams, setSearchParams] = useSearchParams();
   
-  // Tab mapping for URL parameters
-  const TAB_MAP = {
-    overview: 0,
-    announcements: 1,
-    users: 2,
-    waitlist: 3,
-    tasks: 4,
-    workflows: 5,
-    'chat-history': 6,
-    'knowledge-base': 7,
-    'agent-mode': 8,
-    'image-models': 9,
-    'default-prompts': 10,
-    'benchmarks': 11,
-    'subscriptions': 12,
-    'mcp-servers': 13,
-    'result-endpoints': 14,
-    'scoring-judges': 15,
-    'crm': 16,
-    'revenue': 17,
-    'funnel': 18,
-    'alert-emails': 19,
-    'onboarding': 20,
-    'connected-accounts': 21,
-    'contractors': 22,
-    'emma-mcp': 23,
-    'costs': 24,
-    'usage-cost': 25,
-  };
+  // Stable deep-link mapping; presentation groups live in adminNavigation.ts.
+  const TAB_MAP = ADMIN_TAB_MAP;
   
   // Get initial tab value from URL or default to Users
   const getInitialTabValue = () => {
@@ -3375,43 +3347,44 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
         Admin Dashboard
       </Typography>
 
-      <Paper sx={{ width: "100%", mt: 3 }}>
-        <Box sx={{ borderBottom: 1, borderColor: "divider" }}>
-          <Tabs
-            value={tabValue}
-            onChange={handleTabChange}
-            aria-label="admin tabs"
-            variant="scrollable"
-            scrollButtons="auto"
-          >
-            <Tab label="Overview" {...a11yProps(0)} />
-            <Tab label="Announcements" {...a11yProps(1)} />
-            <Tab label="Users" {...a11yProps(2)} />
-            <Tab label="Waitlist" {...a11yProps(3)} />
-            <Tab label="Tasks" {...a11yProps(4)} />
-            <Tab label="Workflows" {...a11yProps(5)} />
-            <Tab label="Chat History" {...a11yProps(6)} />
-            <Tab label="Knowledge Base" {...a11yProps(7)} />
-            <Tab label="Agent Mode" {...a11yProps(8)} />
-            <Tab label="Image Models (Legacy)" {...a11yProps(9)} />
-            <Tab label="Default Prompts" {...a11yProps(10)} />
-            <Tab label="Benchmarks" {...a11yProps(11)} />
-            <Tab label="Subscriptions" {...a11yProps(12)} />
-            <Tab label="MCP Servers" {...a11yProps(13)} />
-            <Tab label="Result Endpoints" {...a11yProps(14)} />
-            <Tab label="Scoring Judges" {...a11yProps(15)} />
-            <Tab label="CRM" {...a11yProps(17)} />
-            <Tab label="Revenue" {...a11yProps(18)} />
-            <Tab label="Funnel" {...a11yProps(19)} />
-            <Tab label="Alert Emails" {...a11yProps(18)} />
-            <Tab label="Onboarding" {...a11yProps(20)} />
-            <Tab label="Connected Accounts" {...a11yProps(21)} />
-            <Tab label="Contractors" {...a11yProps(22)} />
-            <Tab label="Emma MCP" {...a11yProps(23)} />
-            <Tab label="LLM Costs" {...a11yProps(24)} />
-            <Tab label="Usage & Cost" {...a11yProps(25)} />
-          </Tabs>
+      <Paper sx={{ width: "100%", mt: 3, display: { md: "flex" }, alignItems: "stretch" }}>
+        <Box
+          component="nav"
+          aria-label="Admin sections"
+          sx={{
+            width: { xs: "100%", md: 224 },
+            flexShrink: 0,
+            borderRight: { md: 1 },
+            borderBottom: { xs: 1, md: 0 },
+            borderColor: "divider",
+            p: 1.5,
+            maxHeight: { xs: 320, md: "calc(100vh - 180px)" },
+            overflowY: "auto",
+          }}
+        >
+          {ADMIN_NAVIGATION_SECTIONS.map((section) => (
+            <Box key={section.label} sx={{ mb: 1.5 }}>
+              <Typography variant="overline" color="text.secondary" sx={{ px: 1, display: "block", fontSize: "0.65rem", lineHeight: 2 }}>
+                {section.label}
+              </Typography>
+              {section.tabs.map((adminTab) => (
+                <Button
+                  key={adminTab.slug}
+                  role="tab"
+                  aria-selected={tabValue === adminTab.value}
+                  {...a11yProps(adminTab.value)}
+                  onClick={(event) => handleTabChange(event, adminTab.value)}
+                  variant={tabValue === adminTab.value ? "contained" : "text"}
+                  fullWidth
+                  sx={{ justifyContent: "flex-start", mb: 0.25, py: 0.75 }}
+                >
+                  {adminTab.label}
+                </Button>
+              ))}
+            </Box>
+          ))}
         </Box>
+        <Box sx={{ minWidth: 0, flexGrow: 1 }}>
 
         <TabPanel value={tabValue} index={0}>
           <Box sx={{ mb: 3 }}>
@@ -6638,6 +6611,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
         <TabPanel value={tabValue} index={25}>
           <UsageCostByUserTab />
         </TabPanel>
+        </Box>
 
       </Paper>
 
