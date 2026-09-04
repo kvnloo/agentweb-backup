@@ -1391,11 +1391,20 @@ export class MetaService {
 
   /**
    * Update campaign
+   *
+   * ENG-1724: a campaign id is a GLOBAL node id, so without this check the write reached any
+   * campaign the token could touch, not just one in the caller's selected ad account — the
+   * write-side counterpart to the read-side gap `getCampaign` already closed. Required (not
+   * optional like the read-side scoping on `getAdSet`/`getAd`): a read has legitimate unscoped
+   * callers reading their own back-reference; a write does not.
    */
-  public async updateCampaign(accessToken: string, campaignId: string, params: any) {
+  public async updateCampaign(accessToken: string, campaignId: string, params: any, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
+      const owner = await campaign.get(MetaService.withOwnershipField([]));
+      const ownerData = { ...((owner as any)?._data ?? {}) };
+      MetaService.assertOwnedByAccount(ownerData.account_id, campaignId, 'Campaign', adAccountId);
       this.log(`Updating campaign ${campaignId} with params:`, params);
       await campaign.update([], params);
       return { success: true };
@@ -1406,11 +1415,17 @@ export class MetaService {
 
   /**
    * Delete a campaign
+   *
+   * ENG-1724: same reasoning as `updateCampaign` above — a delete is the write this guard
+   * matters most for, since it is irreversible.
    */
-  public async deleteCampaign(accessToken: string, campaignId: string) {
+  public async deleteCampaign(accessToken: string, campaignId: string, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
+      const owner = await campaign.get(MetaService.withOwnershipField([]));
+      const ownerData = { ...((owner as any)?._data ?? {}) };
+      MetaService.assertOwnedByAccount(ownerData.account_id, campaignId, 'Campaign', adAccountId);
       this.log(`Deleting campaign ${campaignId}`);
       await campaign.delete([], {});
       return { success: true };
@@ -1613,11 +1628,17 @@ export class MetaService {
 
   /**
    * Update ad set
+   *
+   * ENG-1724: see `updateCampaign` above — same global-node-id gap, write-side counterpart to
+   * the read-side scoping `getAdSet` already has.
    */
-  public async updateAdSet(accessToken: string, adSetId: string, params: any) {
+  public async updateAdSet(accessToken: string, adSetId: string, params: any, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
+      const owner = await adSet.get(MetaService.withOwnershipField([]));
+      const ownerData = { ...((owner as any)?._data ?? {}) };
+      MetaService.assertOwnedByAccount(ownerData.account_id, adSetId, 'Ad set', adAccountId);
       this.log(`Updating ad set ${adSetId} with params:`, params);
       await adSet.update([], params);
       return { success: true };
@@ -1628,11 +1649,16 @@ export class MetaService {
 
   /**
    * Delete an ad set
+   *
+   * ENG-1724: same reasoning as `updateAdSet` above.
    */
-  public async deleteAdSet(accessToken: string, adSetId: string) {
+  public async deleteAdSet(accessToken: string, adSetId: string, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
+      const owner = await adSet.get(MetaService.withOwnershipField([]));
+      const ownerData = { ...((owner as any)?._data ?? {}) };
+      MetaService.assertOwnedByAccount(ownerData.account_id, adSetId, 'Ad set', adAccountId);
       this.log(`Deleting ad set ${adSetId}`);
       await adSet.delete([], {});
       return { success: true };
@@ -2660,11 +2686,17 @@ export class MetaService {
 
   /**
    * Update ad
+   *
+   * ENG-1724: see `updateCampaign` above — same global-node-id gap, write-side counterpart to
+   * the read-side scoping `getAd` already has.
    */
-  public async updateAd(accessToken: string, adId: string, params: any) {
+  public async updateAd(accessToken: string, adId: string, params: any, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
+      const owner = await ad.get(MetaService.withOwnershipField([]));
+      const ownerData = { ...((owner as any)?._data ?? {}) };
+      MetaService.assertOwnedByAccount(ownerData.account_id, adId, 'Ad', adAccountId);
       this.log(`Updating ad ${adId} with params:`, params);
       await ad.update([], params);
       return { success: true };
@@ -2675,11 +2707,16 @@ export class MetaService {
 
   /**
    * Delete an ad
+   *
+   * ENG-1724: same reasoning as `updateAd` above.
    */
-  public async deleteAd(accessToken: string, adId: string) {
+  public async deleteAd(accessToken: string, adId: string, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
+      const owner = await ad.get(MetaService.withOwnershipField([]));
+      const ownerData = { ...((owner as any)?._data ?? {}) };
+      MetaService.assertOwnedByAccount(ownerData.account_id, adId, 'Ad', adAccountId);
       this.log(`Deleting ad ${adId}`);
       await ad.delete([], {});
       return { success: true };
