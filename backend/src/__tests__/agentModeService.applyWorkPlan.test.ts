@@ -143,7 +143,8 @@ describe('AgentModeService - predefined work plan templates', () => {
 
       expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenCalledWith(
         sessionId,
-        expect.objectContaining({ stepCount: 1 })
+        expect.objectContaining({ stepCount: 1 }),
+        { failIfAwaitingExists: true }
       );
     });
 
@@ -155,6 +156,42 @@ describe('AgentModeService - predefined work plan templates', () => {
       await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
 
       expect(chatbotDb.updateSessionWorkPlanInputRequest).not.toHaveBeenCalled();
+    });
+
+    it('ENG-1765: a guard failure (a genuinely still-awaiting prior input request) does not fail the launch', async () => {
+      // chatbotService returns null (not a throw) when failIfAwaitingExists guards
+      // the write off -- the launch must not surface a new card in that case, but
+      // must still succeed rather than clobbering the still-active prior request.
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+      (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockResolvedValue(null);
+
+      const result = await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(result.success).toBe(true);
+      expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ stepCount: 1 }),
+        { failIfAwaitingExists: true }
+      );
+    });
+
+    it('ENG-1765: a real error surfacing the input request is logged and swallowed, not thrown', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+      (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockRejectedValue(new Error('transient dynamo error'));
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      const result = await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(result.success).toBe(true);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        'AgentMode: Error surfacing input request for launched work plan:',
+        expect.any(Error)
+      );
+      consoleErrorSpy.mockRestore();
     });
 
     it('auto-installs the union of all step skills upfront', async () => {
