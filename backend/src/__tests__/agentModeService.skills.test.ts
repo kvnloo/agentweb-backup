@@ -189,6 +189,47 @@ describe('AgentModeService - Skills', () => {
       expect(ledgerResult.rejectedSkillIds).toEqual(['utm-audit']);
     });
 
+    /*
+     * The real incident shape, and the one the earlier version of this fix quietly did not
+     * cover: `installSkills` resolves rejected ids against `getSkillsForDisplay` ->
+     * `getSkillsAvailableToUser`, which is ALREADY filtered to this user's subscription tier. A
+     * skill rejected FOR being outside that tier was excluded from that map before
+     * `rejectedSkillIds` was even computed, so resolving `rejectedToolNames` against it always
+     * found nothing — the exact skill the notice most needs to name resolved to an empty array,
+     * silently falling back to the unscoped (turn-global) path every time. `utm-audit` here is a
+     * real, published skill (present in the FULL catalog, `getPublishedSkills`) that this user's
+     * tier does not include (absent from `getSkillsAvailableToUser`) — the live incident's shape,
+     * not a skill that simply does not exist.
+     */
+    it('resolves rejectedToolNames for a skill excluded by subscription tier, not just an unknown id', async () => {
+      const fullCatalog = [
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+        {
+          skillId: 'utm-audit',
+          name: 'UTM Audit',
+          description: 'Desc',
+          toolNames: ['audit_ad_utm_coverage'],
+          isPublished: true,
+        },
+      ];
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(fullCatalog);
+      // Tier-filtered: only skill-1 is on this user's plan, matching how a subscription refusal
+      // actually reaches installSkills in production.
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([fullCatalog[0]]);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      const partial = await agentModeService.installSkills(
+        ['skill-1', 'utm-audit'],
+        'user-123',
+        'session-123',
+      );
+      expect(partial.rejectedSkillIds).toEqual(['utm-audit']);
+      expect(partial.rejectedToolNames).toEqual(['audit_ad_utm_coverage']);
+
+      const ledgerResult = (agentModeService as any).extractMinimalToolResult(partial, 'install_skills');
+      expect(ledgerResult.rejectedToolNames).toEqual(['audit_ad_utm_coverage']);
+    });
+
     it('should filter out unpublished skills', async () => {
       const skills = [
         { skillId: 'skill-1', name: 'Published', description: 'Desc', toolNames: ['tool1'], isPublished: true },

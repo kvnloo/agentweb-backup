@@ -6367,10 +6367,22 @@ export class AgentModeService {
          * ones whose skill installed fine. Resolving the ids to actual tool names here, once,
          * where the skill catalog is in scope, lets that reader ask the precise question instead:
          * "was THIS tool's skill among the ones refused".
+         *
+         * `availableById` is NOT the right catalog to resolve these against: it comes from
+         * `getSkillsForDisplay` -> `getSkillsAvailableToUser`, already filtered to this user's
+         * subscription tier. A skill rejected FOR being outside that tier — the exact shape the
+         * live incident's `install_skills` refusal was — was excluded from that map before
+         * `rejectedSkillIds` was even computed, so looking it up there always resolves to
+         * nothing. The full published catalog (unfiltered by tier) is what still knows the
+         * toolNames of a skill the user's plan does not allow.
          */
+        const fullCatalog = await skillService.getPublishedSkills();
+        const fullCatalogById = new Map(fullCatalog.map((skill) => [skill.skillId, skill]));
         const rejectedToolNames = Array.from(
           new Set(
-            rejectedSkillIds.flatMap((id) => availableById.get(id)?.toolNames || []),
+            rejectedSkillIds.flatMap(
+              (id) => availableById.get(id)?.toolNames || fullCatalogById.get(id)?.toolNames || [],
+            ),
           ),
         );
         if (rejectedToolNames.length > 0) result.rejectedToolNames = rejectedToolNames;
