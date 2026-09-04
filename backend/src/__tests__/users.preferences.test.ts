@@ -2,8 +2,9 @@
  * ENG-1085 — the portal Settings page's `handleSavePreferences` was a
  * synchronous no-op: fired a success toast, made no API call at all.
  * `displayName` was actually just a local email-derived string, never read
- * from or written to the backend. ENG-1124 is the bounded display-name
- * persistence slice; notification policy remains on ENG-1085.
+ * from or written to the backend. ENG-1124 fixed the display-name slice.
+ * ENG-1316 closes the remaining gap: emailNotificationsEnabled is now a
+ * real persisted field on PATCH /api/users/me/profile.
  */
 import request from 'supertest';
 import express from 'express';
@@ -32,7 +33,7 @@ app.use('/api/users', usersRoutes);
 describe('PATCH /api/users/me/profile', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it('does not persist an unsupported notification field alongside displayName', async () => {
+  it('persists emailNotificationsEnabled alongside displayName', async () => {
     userDb.updateUser.mockResolvedValue({});
     const res = await request(app)
       .patch('/api/users/me/profile')
@@ -41,6 +42,7 @@ describe('PATCH /api/users/me/profile', () => {
     expect(res.body).toEqual({ ok: true });
     expect(userDb.updateUser).toHaveBeenCalledWith('user-1', {
       displayName: 'Grace Hopper',
+      emailNotificationsEnabled: false,
     });
   });
 
@@ -53,10 +55,20 @@ describe('PATCH /api/users/me/profile', () => {
     expect(userDb.updateUser).toHaveBeenCalledWith('user-1', { displayName: 'Margaret Hamilton' });
   });
 
-  it('rejects an unsupported notification-only payload without writing', async () => {
+  it('persists emailNotificationsEnabled alone when displayName omitted', async () => {
+    userDb.updateUser.mockResolvedValue({});
     const res = await request(app)
       .patch('/api/users/me/profile')
       .send({ emailNotificationsEnabled: true });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+    expect(userDb.updateUser).toHaveBeenCalledWith('user-1', { emailNotificationsEnabled: true });
+  });
+
+  it('rejects a non-boolean emailNotificationsEnabled without writing', async () => {
+    const res = await request(app)
+      .patch('/api/users/me/profile')
+      .send({ emailNotificationsEnabled: 'yes' });
     expect(res.status).toBe(400);
     expect(userDb.updateUser).not.toHaveBeenCalled();
   });
