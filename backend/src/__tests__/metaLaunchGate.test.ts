@@ -196,7 +196,7 @@ describe('Meta launch gate (ENG-941)', () => {
     );
     expect(out.blockResult.error).toContain('Launch blocked');
     expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'blocked' }));
-  }, 15000);
+  });
 
   it('proceeds on an explicit override and persists it as overridden, not passed', async () => {
     mockPreflight.mockResolvedValue({ ok: false, results: [], blockedUrls: [{}], message: 'blocked' });
