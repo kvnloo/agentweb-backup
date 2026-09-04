@@ -32351,6 +32351,19 @@ ${strippedHtml}`;
       // Update the session with the work plan
       await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
 
+      // ENG-1698: session.calledFunctions accumulates for the life of the session with
+      // no per-plan scoping. Without this reset, a brand new plan on an existing session
+      // inherits whatever tool-call credit is left over from a completely unrelated
+      // earlier plan (or an earlier attempt at this same plan) — a later step can be
+      // marked completed via stale credit without the model calling the tool again for
+      // it. Reset on every genuinely NEW plan start; modifyWorkPlan (steps added
+      // mid-run) deliberately does NOT reset this, since that's still the same run.
+      try {
+        await chatbotDb.updateCalledFunctions(sessionId, {});
+      } catch (resetError) {
+        console.error('AgentMode: Error resetting calledFunctions for new work plan:', resetError);
+      }
+
       return {
         success: true,
         message: `Work plan "${title}" created with ${steps.length} steps`,
@@ -32449,6 +32462,15 @@ ${strippedHtml}`;
         templatePlanId: predefinedPlan.planId,
       };
       await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      // ENG-1698: same reset as createWorkPlan — see that call site's comment. A
+      // predefined-plan launch on an existing session (including a force=true
+      // relaunch of the same plan) must not inherit tool-call credit from before.
+      try {
+        await chatbotDb.updateCalledFunctions(sessionId, {});
+      } catch (resetError) {
+        console.error('AgentMode: Error resetting calledFunctions for new predefined work plan:', resetError);
+      }
 
       // Auto-install ALL skills from ALL steps upfront so their tools are available
       // from the next message (tool filtering is computed at the start of each message).
@@ -32911,6 +32933,25 @@ ${strippedHtml}`;
         for (const fn of step.requiredFunctionCalls) {
           calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
           countsModified = true;
+        }
+      }
+
+      // ENG-1698: a skipped step never reaches the 'completed' branch above, so any
+      // calls it DID make toward its own requiredFunctionCalls (before being skipped)
+      // were never decremented — that credit stays in the shared pool, available to
+      // silently satisfy ANY later step requiring the same tool name without the model
+      // calling it again for that step's own purpose. Mirror the completed-branch
+      // decrement here, clamped at 0 (not gated on availability like completed's is,
+      // since a step can be skipped without ever having made its required calls at
+      // all — clamping avoids driving the count negative and over-penalizing a later
+      // step that makes a genuinely fresh call).
+      if (update.status === 'skipped' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+        for (const fn of step.requiredFunctionCalls) {
+          const current = calledFunctionCounts[fn] || 0;
+          if (current > 0) {
+            calledFunctionCounts[fn] = current - 1;
+            countsModified = true;
+          }
         }
       }
 
