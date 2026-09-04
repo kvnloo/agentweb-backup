@@ -5557,9 +5557,17 @@ export class AgentModeService {
         workPlanContent += `   Required assets: ${step.expectedAssetCount} (this step cannot be completed until ${step.expectedAssetCount} images/assets have actually been generated this session)\n`;
       }
 
-      // Include skill IDs if available (for awareness)
+      // Include skill IDs if available (for awareness). ENG-1697: this used to
+      // unconditionally claim "(auto-installed when this step becomes active)",
+      // but that's only true for a predefined-template launch (which installs
+      // the union of all step skills upfront) — an ad-hoc plan's first step, or
+      // any step that becomes active because an earlier step was SKIPPED rather
+      // than completed, never goes through that upfront install. Rather than
+      // track actual install state here, tell the model the truth: these are
+      // the intended skills, and it must call install_skills itself if they
+      // aren't already available (a no-op if they're already installed).
       if (step.skillIds && step.skillIds.length > 0) {
-        workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
+        workPlanContent += `   Skills for this step: ${step.skillIds.join(', ')} (call install_skills for any of these you don't already have before using them)\n`;
       }
 
       workPlanContent += '\n';
