@@ -19816,7 +19816,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     // Surface content/destination changes so the user can catch a wrong-asset edit.
     const contentChanges: Record<string, any> = {};
-    for (const key of ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'creative_id', 'placement_assets']) {
+    for (const key of ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type']) {
       if (params[key] !== undefined) contentChanges[key] = params[key];
     }
     if (Object.keys(contentChanges).length > 0) {
