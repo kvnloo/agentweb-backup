@@ -17419,7 +17419,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
       // Step 1: Fetch the source ad (now includes creative sub-fields)
-      const sourceAd = await metaService.getAd(accessToken, sourceAdId);
+      const sourceAd = await metaService.getAd(accessToken, sourceAdId, accountId);
       const creativeRef = sourceAd?.creative;
       const oldCreativeId = creativeRef?.id || creativeRef?.creative_id;
       if (!oldCreativeId) {
@@ -18513,7 +18513,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         normalizedParams.daily_budget = Math.round(normalizedParams.budget_amount * 100);
         delete normalizedParams.budget_amount;
       }
-      await metaService.updateCampaign(accessToken, campaignId, normalizedParams);
+      await metaService.updateCampaign(accessToken, campaignId, normalizedParams, accountId);
 
       if (normalizedParams.spend_cap === undefined || normalizedParams.spend_cap === null) {
         return {
@@ -18569,8 +18569,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async deleteMetaAdsCampaign(userId: string, campaignId: string, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
-      await metaService.deleteCampaign(accessToken, campaignId);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.deleteCampaign(accessToken, campaignId, accountId);
       return {
         success: true,
         message: `Campaign deleted successfully`
@@ -18590,7 +18590,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async updateMetaAdsAdSet(userId: string, adSetId: string, params: any, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const toCents = (val?: number) => val !== undefined ? Math.round(val * 100) : undefined;
       const normalizedParams = {
         ...params,
@@ -18598,7 +18598,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(params.lifetime_budget !== undefined && { lifetime_budget: toCents(params.lifetime_budget) }),
         ...(params.bid_amount !== undefined && { bid_amount: toCents(params.bid_amount) }),
       };
-      await metaService.updateAdSet(accessToken, adSetId, normalizedParams);
+      await metaService.updateAdSet(accessToken, adSetId, normalizedParams, accountId);
       return {
         success: true,
         message: `Ad set updated successfully`
@@ -18618,8 +18618,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async deleteMetaAdsAdSet(userId: string, adSetId: string, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
-      await metaService.deleteAdSet(accessToken, adSetId);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.deleteAdSet(accessToken, adSetId, accountId);
       return {
         success: true,
         message: `Ad set deleted successfully`
@@ -18656,7 +18656,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // but the ad keeps its old creative), so handle it explicitly before any other branch.
       if (params.creative_id) {
         const newCreativeId = params.creative_id;
-        await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
+        await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } }, accountId);
 
         // Apply any other ad-level params (status, name, etc.) in a separate update
         const adLevelParams: any = {};
@@ -18664,12 +18664,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           if (key !== 'creative_id') adLevelParams[key] = params[key];
         }
         if (Object.keys(adLevelParams).length > 0) {
-          await metaService.updateAd(accessToken, adId, adLevelParams);
+          await metaService.updateAd(accessToken, adId, adLevelParams, accountId);
         }
 
         // The same silent-success trap applies here: POST /{ad-id} can return 200 while the
         // ad keeps its old creative. Read back the ad to confirm the swap actually took.
-        const verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId);
+        const verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, accountId);
         if (!verification.attached) {
           return {
             success: false,
@@ -18700,7 +18700,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       // Standard ad-level update (status, name, etc.)
-      await metaService.updateAd(accessToken, adId, params);
+      await metaService.updateAd(accessToken, adId, params, accountId);
       return {
         success: true,
         message: `Ad updated successfully`
@@ -18736,7 +18736,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     console.log(`AgentMode: Detected creative content update for ad ${adId}. Keys: ${creativeKeys.join(', ')}. Using creative swap approach.`);
 
     // Step 1: Fetch the ad to get its creative_id
-    const adData = await metaService.getAd(accessToken, adId);
+    const adData = await metaService.getAd(accessToken, adId, accountId);
     const oldCreativeId = adData?.creative?.creative_id || adData?.creative?.id;
     if (!oldCreativeId) {
       return {
@@ -18874,7 +18874,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
     }
     if (Object.keys(adLevelParams).length > 0) {
-      await metaService.updateAd(accessToken, adId, adLevelParams);
+      await metaService.updateAd(accessToken, adId, adLevelParams, accountId);
     }
 
     // Step 5: Attach the new creative, then read back to VERIFY it took effect. Meta's POST /{ad-id}
@@ -18887,8 +18887,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     let verification: Awaited<ReturnType<AgentModeService['verifyCreativeSwap']>> | undefined;
 
     for (let attempt = 1; attempt <= SWAP_VERIFY_ATTEMPTS; attempt++) {
-      await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
-      verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, newLinkUrl);
+      await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } }, accountId);
+      verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, accountId, newLinkUrl);
 
       const destinationOk = !newLinkUrl || !verification.liveLinkUrl
         || this.linkUrlMatches(verification.liveLinkUrl, newLinkUrl);
@@ -18990,10 +18990,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     accessToken: string,
     adId: string,
     newCreativeId: string,
+    accountId: string,
     expectedLinkUrl?: string
   ): Promise<{ attached: boolean; verified: boolean; liveCreativeId?: string; liveLinkUrl?: string; effectiveStatus?: string; reviewFeedback?: string }> {
     try {
-      const ad = await metaService.getAd(accessToken, adId);
+      const ad = await metaService.getAd(accessToken, adId, accountId);
       const liveCreativeId = ad?.creative?.creative_id || ad?.creative?.id;
       const attached = String(liveCreativeId) === String(newCreativeId);
 
@@ -19074,8 +19075,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async deleteMetaAdsAd(userId: string, adId: string, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
-      await metaService.deleteAd(accessToken, adId);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.deleteAd(accessToken, adId, accountId);
       return {
         success: true,
         message: `Ad deleted successfully`
@@ -19110,9 +19111,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    */
   public async retagMetaAdUtm(userId: string, adId: string, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
-      const adData = await metaService.getAd(accessToken, adId);
+      const adData = await metaService.getAd(accessToken, adId, accountId);
       const creativeId = adData?.creative?.creative_id || adData?.creative?.id;
       if (!creativeId) {
         return {

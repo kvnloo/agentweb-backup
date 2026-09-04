@@ -205,14 +205,16 @@ describe('MetaService', () => {
 
         it('should update a campaign', async () => {
             const mockUpdate = jest.fn().mockResolvedValue({});
+            const mockGet = jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } });
             (Campaign as unknown as jest.Mock).mockImplementation(() => ({
+                get: mockGet,
                 update: mockUpdate,
             }));
 
             const campaignId = 'camp_123';
             const params = { name: 'Updated Campaign Name' };
 
-            const result = await service.updateCampaign(mockAccessToken, campaignId, params);
+            const result = await service.updateCampaign(mockAccessToken, campaignId, params, mockAdAccountId);
 
             expect(Campaign).toHaveBeenCalledWith(campaignId);
             expect(mockUpdate).toHaveBeenCalledWith([], params);
@@ -221,13 +223,15 @@ describe('MetaService', () => {
 
         it('should delete a campaign', async () => {
             const mockDelete = jest.fn().mockResolvedValue({});
+            const mockGet = jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } });
             (Campaign as unknown as jest.Mock).mockImplementation(() => ({
+                get: mockGet,
                 delete: mockDelete,
             }));
 
             const campaignId = 'camp_123';
 
-            const result = await service.deleteCampaign(mockAccessToken, campaignId);
+            const result = await service.deleteCampaign(mockAccessToken, campaignId, mockAdAccountId);
 
             expect(Campaign).toHaveBeenCalledWith(campaignId);
             expect(mockDelete).toHaveBeenCalledWith([], {});
@@ -327,14 +331,16 @@ describe('MetaService', () => {
 
         it('should update an ad set', async () => {
             const mockUpdate = jest.fn().mockResolvedValue({});
+            const mockGet = jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } });
             (AdSet as unknown as jest.Mock).mockImplementation(() => ({
+                get: mockGet,
                 update: mockUpdate,
             }));
 
             const adSetId = 'adset_123';
             const params = { daily_budget: 2000 };
 
-            const result = await service.updateAdSet(mockAccessToken, adSetId, params);
+            const result = await service.updateAdSet(mockAccessToken, adSetId, params, mockAdAccountId);
 
             expect(AdSet).toHaveBeenCalledWith(adSetId);
             expect(mockUpdate).toHaveBeenCalledWith([], params);
@@ -343,13 +349,15 @@ describe('MetaService', () => {
 
         it('should delete an ad set', async () => {
             const mockDelete = jest.fn().mockResolvedValue({});
+            const mockGet = jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } });
             (AdSet as unknown as jest.Mock).mockImplementation(() => ({
+                get: mockGet,
                 delete: mockDelete,
             }));
 
             const adSetId = 'adset_123';
 
-            const result = await service.deleteAdSet(mockAccessToken, adSetId);
+            const result = await service.deleteAdSet(mockAccessToken, adSetId, mockAdAccountId);
 
             expect(AdSet).toHaveBeenCalledWith(adSetId);
             expect(mockDelete).toHaveBeenCalledWith([], {});
@@ -624,14 +632,16 @@ describe('MetaService', () => {
 
         it('should update an ad', async () => {
             const mockUpdate = jest.fn().mockResolvedValue({});
+            const mockGet = jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } });
             (Ad as unknown as jest.Mock).mockImplementation(() => ({
+                get: mockGet,
                 update: mockUpdate,
             }));
 
             const adId = 'ad_123';
             const params = { name: 'Updated Ad Name' };
 
-            const result = await service.updateAd(mockAccessToken, adId, params);
+            const result = await service.updateAd(mockAccessToken, adId, params, mockAdAccountId);
 
             expect(Ad).toHaveBeenCalledWith(adId);
             expect(mockUpdate).toHaveBeenCalledWith([], params);
@@ -640,13 +650,15 @@ describe('MetaService', () => {
 
         it('should delete an ad', async () => {
             const mockDelete = jest.fn().mockResolvedValue({});
+            const mockGet = jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } });
             (Ad as unknown as jest.Mock).mockImplementation(() => ({
+                get: mockGet,
                 delete: mockDelete,
             }));
 
             const adId = 'ad_123';
 
-            const result = await service.deleteAd(mockAccessToken, adId);
+            const result = await service.deleteAd(mockAccessToken, adId, mockAdAccountId);
 
             expect(Ad).toHaveBeenCalledWith(adId);
             expect(mockDelete).toHaveBeenCalledWith([], {});

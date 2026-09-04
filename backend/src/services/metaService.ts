@@ -1391,11 +1391,18 @@ export class MetaService {
 
   /**
    * Update campaign
+   *
+   * ENG-1724: a campaign id is a GLOBAL node id, so without this check the write reached any
+   * campaign the token could touch, not just one in the caller's selected ad account — the
+   * write-side counterpart to the read-side gap `getCampaign` already closed. Required (not
+   * optional like the read-side scoping on `getAdSet`/`getAd`): a read has legitimate unscoped
+   * callers reading their own back-reference; a write does not.
    */
-  public async updateCampaign(accessToken: string, campaignId: string, params: any) {
+  public async updateCampaign(accessToken: string, campaignId: string, params: any, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
+      await MetaService.verifyWriteOwnership(campaign, campaignId, 'Campaign', adAccountId);
       this.log(`Updating campaign ${campaignId} with params:`, params);
       await campaign.update([], params);
       return { success: true };
@@ -1406,11 +1413,15 @@ export class MetaService {
 
   /**
    * Delete a campaign
+   *
+   * ENG-1724: same reasoning as `updateCampaign` above — a delete is the write this guard
+   * matters most for, since it is irreversible.
    */
-  public async deleteCampaign(accessToken: string, campaignId: string) {
+  public async deleteCampaign(accessToken: string, campaignId: string, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
+      await MetaService.verifyWriteOwnership(campaign, campaignId, 'Campaign', adAccountId);
       this.log(`Deleting campaign ${campaignId}`);
       await campaign.delete([], {});
       return { success: true };
@@ -1613,11 +1624,15 @@ export class MetaService {
 
   /**
    * Update ad set
+   *
+   * ENG-1724: see `updateCampaign` above — same global-node-id gap, write-side counterpart to
+   * the read-side scoping `getAdSet` already has.
    */
-  public async updateAdSet(accessToken: string, adSetId: string, params: any) {
+  public async updateAdSet(accessToken: string, adSetId: string, params: any, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
+      await MetaService.verifyWriteOwnership(adSet, adSetId, 'Ad set', adAccountId);
       this.log(`Updating ad set ${adSetId} with params:`, params);
       await adSet.update([], params);
       return { success: true };
@@ -1628,11 +1643,14 @@ export class MetaService {
 
   /**
    * Delete an ad set
+   *
+   * ENG-1724: same reasoning as `updateAdSet` above.
    */
-  public async deleteAdSet(accessToken: string, adSetId: string) {
+  public async deleteAdSet(accessToken: string, adSetId: string, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
+      await MetaService.verifyWriteOwnership(adSet, adSetId, 'Ad set', adAccountId);
       this.log(`Deleting ad set ${adSetId}`);
       await adSet.delete([], {});
       return { success: true };
@@ -2143,6 +2161,42 @@ export class MetaService {
   /** Add `account_id` to a field selection so a single-entity read can verify its own ownership. */
   private static withOwnershipField(fields: string[]): string[] {
     return fields.includes('account_id') ? fields : [...fields, 'account_id'];
+  }
+
+  /**
+   * Fetch a node's own `account_id` and verify it against `adAccountId` via `assertOwnedByAccount`
+   * — the shared pre-write ownership check for `updateCampaign`/`deleteCampaign`/`updateAdSet`/
+   * `deleteAdSet`/`updateAd`/`deleteAd` (ENG-1724).
+   *
+   * The Graph `.get()` call here has its OWN try/catch, deliberately separate from each write
+   * method's outer one. Without it, a Graph failure DURING this ownership check (a transient
+   * 5xx, a malformed response — anything short of an actual ownership mismatch) fell through to
+   * the write's generic `catch (error) { return this.handleError(error, ...); }`, and
+   * `handleError` copies `error.response?.data`/`error_user_msg`/etc. into the thrown error
+   * largely unsanitized — correct for a failed WRITE (the caller needs Meta's real reason), but
+   * this failure never reached the write at all. `assertOwnedByAccount`'s own refusal is
+   * provably marker-only (see its doc comment); this closes the one path beside it that could
+   * still carry raw Graph content — a Graph error message can embed account/business/page names,
+   * which is exactly what the ownership check exists to keep from leaking. `refuse()` below
+   * throws a fixed, generic message instead, same anti-oracle bar as the check it guards.
+   */
+  private static async verifyWriteOwnership(
+    node: { get: (fields: string[]) => Promise<any> },
+    nodeId: string,
+    nodeLabel: string,
+    adAccountId: string,
+  ): Promise<void> {
+    let ownerData: Record<string, any>;
+    try {
+      const owner = await node.get(MetaService.withOwnershipField([]));
+      ownerData = { ...((owner as any)?._data ?? {}) };
+    } catch (error) {
+      console.error(`[MetaService] ownership check failed for ${nodeLabel} ${nodeId}:`, error);
+      throw new Error(
+        `Could not verify ownership of the requested ${nodeLabel.toLowerCase()} before this write. Retry; if it persists, verify the object in Meta Ads Manager.`,
+      );
+    }
+    MetaService.assertOwnedByAccount(ownerData.account_id, nodeId, nodeLabel, adAccountId);
   }
 
   /**
@@ -2660,11 +2714,15 @@ export class MetaService {
 
   /**
    * Update ad
+   *
+   * ENG-1724: see `updateCampaign` above — same global-node-id gap, write-side counterpart to
+   * the read-side scoping `getAd` already has.
    */
-  public async updateAd(accessToken: string, adId: string, params: any) {
+  public async updateAd(accessToken: string, adId: string, params: any, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
+      await MetaService.verifyWriteOwnership(ad, adId, 'Ad', adAccountId);
       this.log(`Updating ad ${adId} with params:`, params);
       await ad.update([], params);
       return { success: true };
@@ -2675,11 +2733,14 @@ export class MetaService {
 
   /**
    * Delete an ad
+   *
+   * ENG-1724: same reasoning as `updateAd` above.
    */
-  public async deleteAd(accessToken: string, adId: string) {
+  public async deleteAd(accessToken: string, adId: string, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
+      await MetaService.verifyWriteOwnership(ad, adId, 'Ad', adAccountId);
       this.log(`Deleting ad ${adId}`);
       await ad.delete([], {});
       return { success: true };
