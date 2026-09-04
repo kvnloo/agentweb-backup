@@ -1402,9 +1402,7 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
-      const owner = await campaign.get(MetaService.withOwnershipField([]));
-      const ownerData = { ...((owner as any)?._data ?? {}) };
-      MetaService.assertOwnedByAccount(ownerData.account_id, campaignId, 'Campaign', adAccountId);
+      await MetaService.verifyWriteOwnership(campaign, campaignId, 'Campaign', adAccountId);
       this.log(`Updating campaign ${campaignId} with params:`, params);
       await campaign.update([], params);
       return { success: true };
@@ -1423,9 +1421,7 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
-      const owner = await campaign.get(MetaService.withOwnershipField([]));
-      const ownerData = { ...((owner as any)?._data ?? {}) };
-      MetaService.assertOwnedByAccount(ownerData.account_id, campaignId, 'Campaign', adAccountId);
+      await MetaService.verifyWriteOwnership(campaign, campaignId, 'Campaign', adAccountId);
       this.log(`Deleting campaign ${campaignId}`);
       await campaign.delete([], {});
       return { success: true };
@@ -1636,9 +1632,7 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
-      const owner = await adSet.get(MetaService.withOwnershipField([]));
-      const ownerData = { ...((owner as any)?._data ?? {}) };
-      MetaService.assertOwnedByAccount(ownerData.account_id, adSetId, 'Ad set', adAccountId);
+      await MetaService.verifyWriteOwnership(adSet, adSetId, 'Ad set', adAccountId);
       this.log(`Updating ad set ${adSetId} with params:`, params);
       await adSet.update([], params);
       return { success: true };
@@ -1656,9 +1650,7 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
-      const owner = await adSet.get(MetaService.withOwnershipField([]));
-      const ownerData = { ...((owner as any)?._data ?? {}) };
-      MetaService.assertOwnedByAccount(ownerData.account_id, adSetId, 'Ad set', adAccountId);
+      await MetaService.verifyWriteOwnership(adSet, adSetId, 'Ad set', adAccountId);
       this.log(`Deleting ad set ${adSetId}`);
       await adSet.delete([], {});
       return { success: true };
@@ -2169,6 +2161,42 @@ export class MetaService {
   /** Add `account_id` to a field selection so a single-entity read can verify its own ownership. */
   private static withOwnershipField(fields: string[]): string[] {
     return fields.includes('account_id') ? fields : [...fields, 'account_id'];
+  }
+
+  /**
+   * Fetch a node's own `account_id` and verify it against `adAccountId` via `assertOwnedByAccount`
+   * — the shared pre-write ownership check for `updateCampaign`/`deleteCampaign`/`updateAdSet`/
+   * `deleteAdSet`/`updateAd`/`deleteAd` (ENG-1724).
+   *
+   * The Graph `.get()` call here has its OWN try/catch, deliberately separate from each write
+   * method's outer one. Without it, a Graph failure DURING this ownership check (a transient
+   * 5xx, a malformed response — anything short of an actual ownership mismatch) fell through to
+   * the write's generic `catch (error) { return this.handleError(error, ...); }`, and
+   * `handleError` copies `error.response?.data`/`error_user_msg`/etc. into the thrown error
+   * largely unsanitized — correct for a failed WRITE (the caller needs Meta's real reason), but
+   * this failure never reached the write at all. `assertOwnedByAccount`'s own refusal is
+   * provably marker-only (see its doc comment); this closes the one path beside it that could
+   * still carry raw Graph content — a Graph error message can embed account/business/page names,
+   * which is exactly what the ownership check exists to keep from leaking. `refuse()` below
+   * throws a fixed, generic message instead, same anti-oracle bar as the check it guards.
+   */
+  private static async verifyWriteOwnership(
+    node: { get: (fields: string[]) => Promise<any> },
+    nodeId: string,
+    nodeLabel: string,
+    adAccountId: string,
+  ): Promise<void> {
+    let ownerData: Record<string, any>;
+    try {
+      const owner = await node.get(MetaService.withOwnershipField([]));
+      ownerData = { ...((owner as any)?._data ?? {}) };
+    } catch (error) {
+      console.error(`[MetaService] ownership check failed for ${nodeLabel} ${nodeId}:`, error);
+      throw new Error(
+        `Could not verify ownership of the requested ${nodeLabel.toLowerCase()} before this write. Retry; if it persists, verify the object in Meta Ads Manager.`,
+      );
+    }
+    MetaService.assertOwnedByAccount(ownerData.account_id, nodeId, nodeLabel, adAccountId);
   }
 
   /**
@@ -2694,9 +2722,7 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
-      const owner = await ad.get(MetaService.withOwnershipField([]));
-      const ownerData = { ...((owner as any)?._data ?? {}) };
-      MetaService.assertOwnedByAccount(ownerData.account_id, adId, 'Ad', adAccountId);
+      await MetaService.verifyWriteOwnership(ad, adId, 'Ad', adAccountId);
       this.log(`Updating ad ${adId} with params:`, params);
       await ad.update([], params);
       return { success: true };
@@ -2714,9 +2740,7 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
-      const owner = await ad.get(MetaService.withOwnershipField([]));
-      const ownerData = { ...((owner as any)?._data ?? {}) };
-      MetaService.assertOwnedByAccount(ownerData.account_id, adId, 'Ad', adAccountId);
+      await MetaService.verifyWriteOwnership(ad, adId, 'Ad', adAccountId);
       this.log(`Deleting ad ${adId}`);
       await ad.delete([], {});
       return { success: true };

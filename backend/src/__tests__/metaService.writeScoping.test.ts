@@ -207,4 +207,91 @@ describe('Meta write methods are bounded by the selected ad account (ENG-1724)',
       expect(update).not.toHaveBeenCalled();
     });
   });
+
+  /*
+   * A Graph failure DURING the ownership check itself — not a mismatch, an actual API error —
+   * is a different case from everything above. `assertOwnedByAccount`'s own refusal is
+   * provably marker-only, but a raw Graph error thrown by the `.get()` call it depends on is
+   * not: Meta's own error text can embed account/business/page names, and the write methods'
+   * generic `catch (error) { return this.handleError(error, ...) }` does not sanitize that
+   * content before it reaches the caller — correct for a failed WRITE, wrong for a failed
+   * ownership PRE-check that never let the write happen at all. These pin that this specific
+   * step produces the same generic, no-content message across all 6 write methods instead.
+   */
+  describe('a Graph failure during the ownership check itself does not leak raw error content', () => {
+    const GRAPH_ERROR_MESSAGE = 'Object with ID act_9998887776 does not exist';
+
+    it('updateCampaign: sanitizes a Graph error from the ownership-check read', async () => {
+      const get = jest.fn().mockRejectedValue(new Error(GRAPH_ERROR_MESSAGE));
+      const update = jest.fn();
+      (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get, update }));
+
+      const message = await refusalMessage(
+        service.updateCampaign(token, 'camp_9', { name: 'renamed' }, SELECTED),
+      );
+      expect(message).not.toContain(GRAPH_ERROR_MESSAGE);
+      expect(message).not.toContain(OTHER_TENANT);
+      expect(message).toMatch(/could not verify ownership/i);
+      expect(update).not.toHaveBeenCalled();
+    });
+
+    it('deleteCampaign: sanitizes a Graph error from the ownership-check read', async () => {
+      const get = jest.fn().mockRejectedValue(new Error(GRAPH_ERROR_MESSAGE));
+      const del = jest.fn();
+      (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get, delete: del }));
+
+      const message = await refusalMessage(service.deleteCampaign(token, 'camp_9', SELECTED));
+      expect(message).not.toContain(GRAPH_ERROR_MESSAGE);
+      expect(message).toMatch(/could not verify ownership/i);
+      expect(del).not.toHaveBeenCalled();
+    });
+
+    it('updateAdSet: sanitizes a Graph error from the ownership-check read', async () => {
+      const get = jest.fn().mockRejectedValue(new Error(GRAPH_ERROR_MESSAGE));
+      const update = jest.fn();
+      (AdSet as unknown as jest.Mock).mockImplementation(() => ({ get, update }));
+
+      const message = await refusalMessage(
+        service.updateAdSet(token, 'adset_9', { daily_budget: 2000 }, SELECTED),
+      );
+      expect(message).not.toContain(GRAPH_ERROR_MESSAGE);
+      expect(message).toMatch(/could not verify ownership/i);
+      expect(update).not.toHaveBeenCalled();
+    });
+
+    it('deleteAdSet: sanitizes a Graph error from the ownership-check read', async () => {
+      const get = jest.fn().mockRejectedValue(new Error(GRAPH_ERROR_MESSAGE));
+      const del = jest.fn();
+      (AdSet as unknown as jest.Mock).mockImplementation(() => ({ get, delete: del }));
+
+      const message = await refusalMessage(service.deleteAdSet(token, 'adset_9', SELECTED));
+      expect(message).not.toContain(GRAPH_ERROR_MESSAGE);
+      expect(message).toMatch(/could not verify ownership/i);
+      expect(del).not.toHaveBeenCalled();
+    });
+
+    it('updateAd: sanitizes a Graph error from the ownership-check read', async () => {
+      const get = jest.fn().mockRejectedValue(new Error(GRAPH_ERROR_MESSAGE));
+      const update = jest.fn();
+      (Ad as unknown as jest.Mock).mockImplementation(() => ({ get, update }));
+
+      const message = await refusalMessage(
+        service.updateAd(token, 'ad_9', { status: 'PAUSED' }, SELECTED),
+      );
+      expect(message).not.toContain(GRAPH_ERROR_MESSAGE);
+      expect(message).toMatch(/could not verify ownership/i);
+      expect(update).not.toHaveBeenCalled();
+    });
+
+    it('deleteAd: sanitizes a Graph error from the ownership-check read', async () => {
+      const get = jest.fn().mockRejectedValue(new Error(GRAPH_ERROR_MESSAGE));
+      const del = jest.fn();
+      (Ad as unknown as jest.Mock).mockImplementation(() => ({ get, delete: del }));
+
+      const message = await refusalMessage(service.deleteAd(token, 'ad_9', SELECTED));
+      expect(message).not.toContain(GRAPH_ERROR_MESSAGE);
+      expect(message).toMatch(/could not verify ownership/i);
+      expect(del).not.toHaveBeenCalled();
+    });
+  });
 });
