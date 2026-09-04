@@ -49,6 +49,24 @@ describe('AgentModeService - predefined work plan templates', () => {
     ],
   };
 
+  const templateWithInputRequest: any = {
+    ...systemTemplate,
+    planId: 'plan-input',
+    title: 'Prospect Decode',
+    steps: [
+      {
+        stepCount: 1,
+        title: 'Intake',
+        inputRequest: {
+          title: 'Who and why',
+          prompt: 'Tell us who to decode.',
+          fields: [{ id: 'prospect', label: 'Prospect', type: 'text', required: true }],
+        },
+      },
+      { stepCount: 2, title: 'Research' },
+    ],
+  };
+
   beforeEach(() => {
     service = new AgentModeService();
     jest.clearAllMocks();
@@ -60,6 +78,7 @@ describe('AgentModeService - predefined work plan templates', () => {
     (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue({});
     (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
     (chatbotDb.updateSessionLlmModel as jest.Mock).mockResolvedValue(undefined);
+    (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockResolvedValue(undefined);
     // Avoid real model registry/secret lookups.
     jest.spyOn(service, 'getSupportedModels').mockResolvedValue(['anthropic.claude-sonnet-4-6']);
   });
@@ -90,6 +109,52 @@ describe('AgentModeService - predefined work plan templates', () => {
           ]),
         })
       );
+    });
+
+    it('ENG-1765: copies inputRequest onto the instantiated step instead of dropping it', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({
+          steps: expect.arrayContaining([
+            expect.objectContaining({
+              stepCount: 1,
+              inputRequest: expect.objectContaining({
+                title: 'Who and why',
+                fields: expect.arrayContaining([expect.objectContaining({ id: 'prospect' })]),
+              }),
+            }),
+          ]),
+        })
+      );
+    });
+
+    it('ENG-1765: surfaces the launched plan\'s first pending inputRequest step immediately, not just reactively', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ stepCount: 1 })
+      );
+    });
+
+    it('ENG-1765: does not call updateSessionWorkPlanInputRequest when no step has an inputRequest', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemTemplate] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlanInputRequest).not.toHaveBeenCalled();
     });
 
     it('auto-installs the union of all step skills upfront', async () => {
