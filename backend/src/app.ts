@@ -69,6 +69,7 @@ import hubspotAuthRoutes from "./routes/hubspotAuth";
 import attioAuthRoutes from "./routes/attioAuth";
 import crmSyncRoutes from "./routes/crmSync";
 import adsThresholdsRoutes from "./routes/adsThresholds";
+import outcomeLedgerRoutes from "./routes/outcomeLedger";
 import crmWebhookRoutes from "./routes/crmWebhook";
 import mcpServersRoutes, { mcpOAuthPublicRouter } from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
@@ -349,6 +350,10 @@ app.use("/api/crm", crmRoutes);
 // ENG-918 — per-account ads-detection thresholds. Every route authenticates and re-derives
 // ad-account ownership from the caller's own connected accounts; see the route file's header.
 app.use("/api/ads-thresholds", adsThresholdsRoutes);
+// ENG-1550 — outcome ledger. Read is owner-scoped like ads-thresholds; record/score are
+// admin-only — a recommendation is the agent's own prediction, not a customer-set value. See the
+// route file's header.
+app.use("/api/outcome-ledger", outcomeLedgerRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
 app.use("/api/oauth/linkedin", linkedinAuthRoutes);
