@@ -235,6 +235,43 @@ describe('Client Health - assessClientHealth', () => {
     ]);
   });
 
+  it('requests the ads creative and insights.time_ranges selectors URL-encoded (ENG-1742 follow-up)', async () => {
+    // Confirmed live 2026-09-04 against a real ad account: unencoded `creative{id,name}` on
+    // this `ads` edge silently drops the whole `creative` field (no error, just missing data —
+    // same as the sibling fix in meta.ts/agentModeService.ts). The `insights.time_ranges(...){...}`
+    // selector is worse: unencoded, it hard-errors on EVERY call ("Syntax error \"Expected end
+    // of string...\""), so this feature has never returned ad-level insights at all. Every
+    // existing test in this file mocks the ad objects directly (e.g. `creative: { id: 'cr1' }`)
+    // rather than a real fetch response keyed to a real URL, so none of them could have caught
+    // this — this is the first test that inspects the actual URL built.
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client User',
+      adAccount: '123456',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({ data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }] })
+      .mockResolvedValueOnce({ data: [] });
+
+    await assessClientHealth(adminUserId, 'client@example.com');
+
+    const adsCallUrl = (fetchWithRetryAndPaging as jest.Mock).mock.calls.find(
+      (call: any[]) => call[0].includes('/ads?')
+    )?.[0];
+    expect(adsCallUrl).toBeDefined();
+    expect(adsCallUrl).toContain('creative%7Bid%2Cname%7D');
+    expect(adsCallUrl).not.toContain('creative{id,name}');
+    expect(adsCallUrl).toContain(encodeURIComponent('insights.time_ranges('));
+    expect(adsCallUrl).not.toContain('insights.time_ranges([');
+    expect(adsCallUrl).not.toContain('{spend,frequency,ctr,cpm,date_start}');
+  });
+
   it('flags a creative fatigued by CTR drop and CPM rise vs the prior period, not by frequency', async () => {
     const adminUserId = 'admin-user';
     (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, isAdmin: true });

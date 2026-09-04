@@ -311,9 +311,28 @@ export async function assessClientHealth(
               { since: currentWindowStart, until: currentWindowEnd },
               { since: priorWindowStart, until: priorWindowEnd },
             ]);
+            /*
+             * ENG-1742 follow-up: unencoded `{...}` in a nested field selector is silently
+             * mangled by Graph, and the failure mode depends on the edge/syntax involved —
+             * confirmed live 2026-09-04 against a real ad account:
+             *   - `creative{id,name}` on this `ads` edge doesn't error, it silently drops the
+             *     whole `creative` field from every result (same as the sibling fix in
+             *     meta.ts/agentModeService.ts).
+             *   - `insights.time_ranges(...){...}` is worse: it hard-errors on EVERY call
+             *     ("Syntax error \"Expected end of string...\""), so this feature has never
+             *     returned ad-level insights at all, not just missing creative names.
+             * `encodeURIComponent` each selector independently — the field-call argument
+             * (`time_ranges(...)`) was already correctly encoded; only the two `{...}` sub-field
+             * blocks around it needed the same treatment.
+             */
+            const creativeSelector = encodeURIComponent('creative{id,name}');
+            const insightsSelector =
+              encodeURIComponent('insights.time_ranges(') +
+              encodeURIComponent(timeRanges) +
+              encodeURIComponent(`){${insightsFields}}`);
             const adData = await fetchWithRetryAndPaging(
-              `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,creative{id,name},status,` +
-                `insights.time_ranges(${encodeURIComponent(timeRanges)}){${insightsFields}}` +
+              `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,${creativeSelector},status,` +
+                `${insightsSelector}` +
                 `&filtering=${filtering}&access_token=${accessToken}`
             );
             adLevelData = (adData.data || []).map((ad: any) => {
