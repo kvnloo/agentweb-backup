@@ -5562,12 +5562,16 @@ export class AgentModeService {
       // but that's only true for a predefined-template launch (which installs
       // the union of all step skills upfront) — an ad-hoc plan's first step, or
       // any step that becomes active because an earlier step was SKIPPED rather
-      // than completed, never goes through that upfront install. Rather than
-      // track actual install state here, tell the model the truth: these are
-      // the intended skills, and it must call install_skills itself if they
-      // aren't already available (a no-op if they're already installed).
+      // than completed, never goes through that upfront install. Deliberately
+      // NOT telling the model to proactively call install_skills here: toolDispatch's
+      // gate (search "is not available. You must install the required skill
+      // first") already catches any tool call gated on a missing skill and
+      // instructs recovery at that exact point, reactively and only when truly
+      // needed — restating it here would just invite redundant defensive
+      // install_skills calls on the already-working template-launch path where
+      // skills are already installed. Just drop the false claim.
       if (step.skillIds && step.skillIds.length > 0) {
-        workPlanContent += `   Skills for this step: ${step.skillIds.join(', ')} (call install_skills for any of these you don't already have before using them)\n`;
+        workPlanContent += `   Skills for this step: ${step.skillIds.join(', ')}\n`;
       }
 
       workPlanContent += '\n';
