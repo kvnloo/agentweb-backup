@@ -198,7 +198,13 @@ router.get("/ad-performance", async (req, res) => {
     console.log("Fetching ads for timeframe:", timeframe);
     let ads;
     try {
-      const adsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}&access_token=${accessToken}`;
+      // ENG-1742 follow-up: unencoded `{...}` in a nested field selector is silently mangled
+      // by Graph — on this `ads` edge it doesn't hard-error, it just drops the `creative` field
+      // from every result with no indication anything is missing. Confirmed live 2026-09-04:
+      // this exact string returned every ad with `creative` entirely absent; the encoded form
+      // (`encodeURIComponent('creative{...}')`) returns real thumbnail_url/title/body/image_url.
+      const creativeFields = encodeURIComponent('creative{thumbnail_url,title,body,image_url}');
+      const adsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,status,adset_id,campaign_id,${creativeFields}&access_token=${accessToken}`;
       console.log("Fetching ads for act_%s", adAccountId);
       
       const adsData = await fetchWithRetryAndPaging(adsUrl);
