@@ -251,7 +251,16 @@ export async function assessClientHealth(
 
     let activeCampaigns: any[] = [];
     let adLevelData: any[] = [];
-    let campaignsComplete = true;
+    /*
+     * Defaults to "complete" only when there is nothing to check (`!hasAds`) — `active_campaigns:
+     * 0` is genuinely the true count there. When `hasAds`, this starts false and only flips true
+     * after a campaigns read actually succeeds without truncation, below. Before this fix it
+     * defaulted to true unconditionally and only flipped FALSE on a truncated success — a fetch
+     * that THREW (network error, expired token) fell through to the catch block below, which
+     * only logs, leaving activeCampaigns empty and campaignsComplete still true: a fetch that
+     * read NOTHING reported as "confirmed zero campaigns, complete."
+     */
+    let campaignsComplete = !hasAds;
 
     if (hasAds) {
       try {

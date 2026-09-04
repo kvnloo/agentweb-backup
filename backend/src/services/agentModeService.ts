@@ -6378,14 +6378,24 @@ export class AgentModeService {
          */
         const fullCatalog = await skillService.getPublishedSkills();
         const fullCatalogById = new Map(fullCatalog.map((skill) => [skill.skillId, skill]));
-        const rejectedToolNames = Array.from(
-          new Set(
-            rejectedSkillIds.flatMap(
-              (id) => availableById.get(id)?.toolNames || fullCatalogById.get(id)?.toolNames || [],
-            ),
-          ),
+        /*
+         * The virtual skill ids (`__admin_tools__`, `__other_skills__`) are synthesized
+         * in-memory and never appear in either catalog map, so they always resolve to `[]` here.
+         * A rejection mixing a real id with one of these — `['skill-1', '__admin_tools__']` —
+         * would otherwise resolve to skill-1's tool names only, a NON-empty array that reads as
+         * a fully scoped rejection while silently dropping every admin/other_skills tool from it.
+         * A gated tool needing the virtual skill would then wrongly read as available. Better to
+         * emit nothing at all than a partial list that looks complete: any id this can't resolve
+         * makes the whole call unscoped, so the reader falls back to arming every gated tool.
+         */
+        const resolvedPerId = rejectedSkillIds.map(
+          (id) => availableById.get(id)?.toolNames || fullCatalogById.get(id)?.toolNames || [],
         );
-        if (rejectedToolNames.length > 0) result.rejectedToolNames = rejectedToolNames;
+        const allResolved = resolvedPerId.every((names) => names.length > 0);
+        if (allResolved) {
+          const rejectedToolNames = Array.from(new Set(resolvedPerId.flat()));
+          if (rejectedToolNames.length > 0) result.rejectedToolNames = rejectedToolNames;
+        }
       }
 
       return result;

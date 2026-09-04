@@ -230,6 +230,52 @@ describe('AgentModeService - Skills', () => {
       expect(ledgerResult.rejectedToolNames).toEqual(['audit_ad_utm_coverage']);
     });
 
+    /*
+     * Regression: a rejection mixing a real skill id with a virtual one (`__admin_tools__`,
+     * `__other_skills__`) used to resolve rejectedToolNames from the real id ONLY — a non-empty
+     * array that reads as a fully scoped rejection while silently dropping every admin/other
+     * tool from it. A gated admin tool refused the same turn would then wrongly read as
+     * available, since its name is absent from a rejectedToolNames that looks complete. The
+     * field must be omitted entirely rather than partially populated, so the notice's per-tool
+     * scoping falls back to its safe (unscoped) path instead of a falsely precise one.
+     */
+    it('omits rejectedToolNames entirely when one of the rejected ids cannot be resolved (mixed real + virtual id)', async () => {
+      const fullCatalog = [
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+        {
+          skillId: 'utm-audit',
+          name: 'UTM Audit',
+          description: 'Desc',
+          toolNames: ['audit_ad_utm_coverage'],
+          isPublished: true,
+        },
+      ];
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(fullCatalog);
+      // Tier-filtered: only skill-1 is on this user's plan — utm-audit resolves via the full
+      // catalog fallback, same as the subscription-tier test above.
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([fullCatalog[0]]);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      // Both utm-audit AND __admin_tools__ are rejected together in the SAME call. utm-audit
+      // resolves fine (via the full-catalog fallback); __admin_tools__ never enters availableById
+      // (non-admin, non-delegated caller) and never appears in getPublishedSkills (it is
+      // synthesized, not a real published skill), so it cannot resolve in either catalog. The old
+      // code read this as a fully-scoped rejection naming only utm-audit's tool — silently
+      // dropping every admin tool from it.
+      const partial = await agentModeService.installSkills(
+        ['skill-1', 'utm-audit', '__admin_tools__'],
+        'user-123',
+        'session-123',
+        false,
+      );
+
+      expect(partial.rejectedSkillIds).toEqual(['utm-audit', '__admin_tools__']);
+      expect(partial.rejectedToolNames).toBeUndefined();
+
+      const ledgerResult = (agentModeService as any).extractMinimalToolResult(partial, 'install_skills');
+      expect(ledgerResult.rejectedToolNames).toBeUndefined();
+    });
+
     it('should filter out unpublished skills', async () => {
       const skills = [
         { skillId: 'skill-1', name: 'Published', description: 'Desc', toolNames: ['tool1'], isPublished: true },
