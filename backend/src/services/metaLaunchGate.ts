@@ -193,11 +193,25 @@ async function defaultResolveCreativeDestinations(creativeId: string, accessToke
   const axios = (await import('axios')).default;
   const apiVersion = process.env.META_API_VERSION || 'v25.0';
   /*
-   * `effective_object_story_spec` is requested alongside the raw spec because a creative
-   * built from a page post carries its link only on the effective view. `asset_feed_spec`
-   * covers dynamic creatives, whose destinations are a list rather than a single link.
+   * ENG-1742: `effective_object_story_spec` is NOT a valid field on an AdCreative node — it is
+   * an Ad-level concept (the object story spec as actually delivered, accounting for ad-level
+   * overrides), and Meta refuses the whole request with a hard error when it's asked for here:
+   * "(#100) Tried accessing nonexisting field (effective_object_story_spec)" — confirmed live
+   * against a real production creative and ad account on 2026-09-04. That is a REQUEST failure,
+   * not a "field absent from the response" one: Graph rejects the entire fields= list, so every
+   * other field this call needed (including the ones that DO carry the real destination) was
+   * lost with it. A creative built from a page post carrying its link only on the effective view
+   * is a real case (see `object_story_spec` below), but the fix for it is not requesting a field
+   * this node type does not have.
+   *
+   * `getAdCreative` (metaService.ts) reads this exact node type successfully with `link_url` +
+   * `object_story_spec` + `asset_feed_spec` + `url_tags` — no `effective_object_story_spec`, no
+   * `template_url`. Dropped both here to match: `template_url` was never separately confirmed
+   * bad (Graph reports only the first invalid field in a request, so a second one can hide
+   * behind it), but it is equally absent from that known-working list, and this function has no
+   * documented reason of its own to need it.
    */
-  const fields = 'link_url,object_story_spec,effective_object_story_spec,asset_feed_spec,template_url,url_tags';
+  const fields = 'link_url,object_story_spec,asset_feed_spec,url_tags';
   const url =
     `https://graph.facebook.com/${apiVersion}/${creativeId}` +
     `?fields=${fields}&access_token=${encodeURIComponent(accessToken)}`;
