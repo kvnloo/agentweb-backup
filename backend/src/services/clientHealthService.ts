@@ -303,9 +303,20 @@ export async function assessClientHealth(
                 `&filtering=${filtering}&access_token=${accessToken}`
             );
             adLevelData = (adData.data || []).map((ad: any) => {
-              const rows: any[] = ad.insights?.data || [];
-              const current = rows.find((r: any) => r.date_start === currentWindowStart);
-              const prior = rows.find((r: any) => r.date_start === priorWindowStart);
+              // Matched by RELATIVE ORDER (newest date_start = current, oldest = prior), not by
+              // exact string equality against our own UTC-computed date strings. Meta buckets
+              // insights `date_start` in the AD ACCOUNT's own timezone, not UTC — this codebase
+              // has been burned by that exact mismatch before (see ENG-926's "Windows and
+              // timing" notes). An exact-match `.find()` would silently return undefined for
+              // every ad on any non-UTC account, degrading fatigue detection with no error. We
+              // requested exactly two non-overlapping 13-day windows with a 1-day gap between
+              // them, so even a several-hour timezone shift cannot reorder them — "later window"
+              // is a safe, timezone-agnostic way to identify "current" that exact-string matching
+              // is not.
+              const rows: any[] = (ad.insights?.data || [])
+                .filter((r: any) => typeof r.date_start === 'string')
+                .sort((a: any, b: any) => (a.date_start < b.date_start ? 1 : -1)); // newest first
+              const [current, prior] = rows;
               return {
                 ...ad,
                 current_insights: current ? { data: [current] } : undefined,
