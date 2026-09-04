@@ -1,5 +1,5 @@
 import { approvalDb, getAssetTypeFromFilename, AssetApproval } from './approvalDb';
-import { sendApprovalRequestWithTracking } from './slackService';
+import { sendApprovalRequestWithTracking, postSlackMessage } from './slackService';
 import { batchReviewDb } from './batchReviewDb';
 import { isSessionLimitError } from '../utils/agentModeErrors';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
@@ -294,6 +294,17 @@ async function runAgentModeRevision(
       } catch (alertError) {
         console.error('Error sending oncall alert:', alertError);
       }
+      // ENG-1745 follow-up: this branch only ever alerted internal oncall — the reviewer
+      // waiting on the revision got zero signal. Notify them directly too.
+      if (approval.slackChannel) {
+        await postSlackMessage(
+          approval.slackChannel,
+          ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+          approval.slackMessageTs || undefined,
+        ).catch((slackErr: any) =>
+          console.warn('[revisionService] failed to post revision-failure notice:', slackErr?.message || slackErr),
+        );
+      }
     }
   } catch (error: any) {
     // ENG-1719: the target session was already generating (a live chat turn, or another
@@ -306,6 +317,19 @@ async function runAgentModeRevision(
         `Agent Mode revision for session ${agentSessionId} skipped — session was busy with ` +
         `another generation in progress. Not a failure; no automatic retry for this path.`
       );
+      // ENG-1745: this used to end here with only a log line — the reviewer who requested
+      // the change got zero signal that it never happened. Tell them explicitly, mirroring
+      // humanEvalActionService's identical fix for the same class of contention.
+      if (approval.slackChannel) {
+        await postSlackMessage(
+          approval.slackChannel,
+          ':hourglass_flowing_sand: This session was busy with another generation in progress, ' +
+          'so the auto-revision couldn\'t run just now. Please retry the feedback in a moment.',
+          approval.slackMessageTs || undefined,
+        ).catch((slackErr: any) =>
+          console.warn('[revisionService] failed to post session-busy notice:', slackErr?.message || slackErr),
+        );
+      }
       return;
     }
     console.error('Error in Agent Mode verified-generate:', error);
@@ -332,6 +356,16 @@ async function runAgentModeRevision(
       });
     } catch (alertError) {
       console.error('Error sending oncall alert:', alertError);
+    }
+    // ENG-1745 follow-up: notify the reviewer directly too, in addition to oncall.
+    if (approval.slackChannel) {
+      await postSlackMessage(
+        approval.slackChannel,
+        ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+        approval.slackMessageTs || undefined,
+      ).catch((slackErr: any) =>
+        console.warn('[revisionService] failed to post revision-failure notice:', slackErr?.message || slackErr),
+      );
     }
   }
 }
