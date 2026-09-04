@@ -130,4 +130,24 @@ describe('chatbotService - calledFunctions optimistic locking (ENG-1698)', () =>
 
     expect(updatePromiseMock).toHaveBeenCalledTimes(3);
   });
+
+  it('backs off between conflict retries instead of retrying in lockstep', async () => {
+    getPromiseMock.mockResolvedValue({
+      Item: { sessionId: mockSessionId, calledFunctions: {}, calledFunctionsVersion: 1 },
+    });
+    updatePromiseMock
+      .mockRejectedValueOnce(conditionalCheckFailedError())
+      .mockResolvedValueOnce({
+        Attributes: { sessionId: mockSessionId, calledFunctions: { x: 1 }, calledFunctionsVersion: 2 },
+      });
+
+    const start = Date.now();
+    await chatbotDb.mutateCalledFunctions(mockSessionId, (current) => ({ ...current, x: 1 }));
+    const elapsedMs = Date.now() - start;
+
+    // First attempt's backoff is 20 * 2^0 + up to 20ms jitter = 20-40ms.
+    // A generous floor (10ms) avoids flakiness while still failing if the
+    // retry happens with no delay at all.
+    expect(elapsedMs).toBeGreaterThanOrEqual(10);
+  });
 });
