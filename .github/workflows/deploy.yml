@@ -211,6 +211,10 @@ jobs:
           EB_SETTLE_TIMEOUT_SECONDS: '1200'
           # '1' only on a manual run that asked for it (ENG-878).
           EB_HEALTH_PROBE_DRYRUN: ${{ inputs.probe_dryrun && '1' || '0' }}
+          # ENG-823: `.ebextensions` silently failed to apply this twice, so
+          # it is set directly against the live target group instead — see
+          # ensure_deregistration_delay() in eb-deploy.sh.
+          EB_DEREGISTRATION_DELAY_SECONDS: '600'
         run: bash .github/scripts/eb-deploy.sh
 
       - name: Backend Deployment Status

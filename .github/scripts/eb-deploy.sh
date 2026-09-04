@@ -778,6 +778,90 @@ verify_deployment() {
   done
 }
 
+# Re-asserts the ALB deregistration delay directly against the live target
+# group(s) after a verified deploy (ENG-823 AC4).
+#
+# Two straight `.ebextensions` fixes for this value (5029dfadb 2026-07-01,
+# 1becd3956 2026-09-04) both deployed clean per EB's own event log and still
+# left `deregistration_delay.timeout_seconds` at the AWS default of 20 on
+# both environments, confirmed via `aws elbv2 describe-target-group-attributes`
+# — EB accepted and silently dropped the declared option both times. So this
+# value is no longer declared in `.ebextensions` at all; this function is the
+# real mechanism, applied straight against the ALB API on every deploy so a
+# manual/console change can't silently drift it back, either.
+#
+# Skipped entirely when EB_DEREGISTRATION_DELAY_SECONDS is unset, so a caller
+# that hasn't opted in (e.g. the partner-portal deploy, which has no such
+# requirement) makes zero extra AWS calls.
+ensure_deregistration_delay() {
+  local desired="${EB_DEREGISTRATION_DELAY_SECONDS:-}"
+  [ -z "${desired}" ] && return 0
+
+  local lb_arns lb tg_arns arn current out
+
+  if ! lb_arns=$(aws elasticbeanstalk describe-environment-resources \
+    --environment-name "${EB_ENVIRONMENT_NAME}" \
+    --query 'EnvironmentResources.LoadBalancers[*].Name' \
+    --output text 2>&1); then
+    fail "could not resolve the load balancer for '${EB_ENVIRONMENT_NAME}' to set DeregistrationDelay. AWS reported: ${lb_arns}"
+  fi
+
+  lb_arns=$(printf '%s' "${lb_arns}" | tr '\t' '\n' | grep '^arn:' || true)
+  if [ -z "${lb_arns}" ]; then
+    fail "environment '${EB_ENVIRONMENT_NAME}' has no Application Load Balancer ARN; cannot set DeregistrationDelay via elbv2 (classic ELB is not supported by this path)."
+  fi
+
+  while IFS= read -r lb; do
+    [ -z "${lb}" ] && continue
+    if ! tg_arns=$(aws elbv2 describe-target-groups \
+      --load-balancer-arn "${lb}" \
+      --query 'TargetGroups[*].TargetGroupArn' \
+      --output text 2>&1); then
+      fail "describe-target-groups failed for load balancer ${lb}. AWS reported: ${tg_arns}"
+    fi
+
+    tg_arns=$(printf '%s' "${tg_arns}" | tr '\t' '\n' | grep '^arn:' || true)
+    if [ -z "${tg_arns}" ]; then
+      fail "load balancer ${lb} has no target groups; cannot set DeregistrationDelay."
+    fi
+
+    for arn in ${tg_arns}; do
+      if ! current=$(aws elbv2 describe-target-group-attributes \
+        --target-group-arn "${arn}" \
+        --query "Attributes[?Key=='deregistration_delay.timeout_seconds'].Value | [0]" \
+        --output text 2>&1); then
+        fail "describe-target-group-attributes failed for ${arn}. AWS reported: ${current}"
+      fi
+
+      if [ "${current}" = "${desired}" ]; then
+        log "DeregistrationDelay already ${desired}s on target group ${arn##*/}; no change needed."
+        continue
+      fi
+
+      log "Setting DeregistrationDelay on target group ${arn##*/}: ${current}s -> ${desired}s."
+      if ! out=$(aws elbv2 modify-target-group-attributes \
+        --target-group-arn "${arn}" \
+        --attributes "Key=deregistration_delay.timeout_seconds,Value=${desired}" 2>&1); then
+        fail "modify-target-group-attributes failed for ${arn} (desired ${desired}s). AWS reported: ${out}"
+      fi
+
+      # Re-read rather than trust the mutation call succeeded silently — this
+      # is the exact class of bug (.ebextensions accepted the value and
+      # dropped it) that made this function necessary in the first place.
+      if ! current=$(aws elbv2 describe-target-group-attributes \
+        --target-group-arn "${arn}" \
+        --query "Attributes[?Key=='deregistration_delay.timeout_seconds'].Value | [0]" \
+        --output text 2>&1); then
+        fail "describe-target-group-attributes (post-verify) failed for ${arn}. AWS reported: ${current}"
+      fi
+      if [ "${current}" != "${desired}" ]; then
+        fail "modify-target-group-attributes reported success for ${arn} but the target group still reads ${current}s, not the desired ${desired}s. Refusing to report the deploy as fully applied."
+      fi
+      log "Confirmed DeregistrationDelay=${desired}s on target group ${arn##*/}."
+    done
+  done <<<"${lb_arns}"
+}
+
 main() {
   require_env EB_APPLICATION_NAME
   require_env EB_ENVIRONMENT_NAME
@@ -809,6 +893,8 @@ main() {
   done
 
   log "Deployment of '${EB_VERSION_LABEL}' to '${EB_ENVIRONMENT_NAME}' is complete and verified."
+
+  ensure_deregistration_delay
 }
 
 main "$@"
