@@ -30,6 +30,13 @@ jest.mock('aws-sdk', () => ({
     put: () => ({ promise: () => Promise.resolve({}) }),
     get: () => ({ promise: () => Promise.resolve({}) }),
   })) },
+  // This file's import chain transitively pulls in s3Utils.ts (via chatbotService.ts ->
+  // agentModeService.ts -> crmEnrichmentService.ts -> enrichmentIdentityResolver.ts ->
+  // routes/crmEnrichSo.ts -> enrichSoServiceFactory.ts), which constructs `new AWS.S3(...)` at
+  // module load time. Without this, that throws "AWS.S3 is not a constructor" before any test
+  // in this file runs, unrelated to anything this file actually tests. Matches the S3 stub
+  // convention already used elsewhere (accountMemory.test.ts, accountSummary.test.ts, etc.).
+  S3: jest.fn(() => ({})),
 }));
 
 jest.mock('../services/db', () => ({
