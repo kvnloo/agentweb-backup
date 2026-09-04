@@ -3711,6 +3711,10 @@ export class ChatbotDB {
         return result.Attributes as ChatSession;
       } catch (error: any) {
         if (error?.code === "ConditionalCheckFailedException" && attempt < maxAttempts - 1) {
+          // Jittered backoff so multiple writers that just conflicted don't
+          // immediately retry in lockstep and re-collide.
+          const backoffMs = 20 * Math.pow(2, attempt) + Math.random() * 20;
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
           continue;
         }
         console.error("Error mutating called functions:", error);
