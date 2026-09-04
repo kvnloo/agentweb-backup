@@ -3372,8 +3372,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                   key={adminTab.slug}
                   role="tab"
                   aria-selected={tabValue === adminTab.value}
-                  aria-controls={`simple-tabpanel-${adminTab.value}`}
-                  id={`simple-tab-${adminTab.value}`}
+                  {...a11yProps(adminTab.value)}
                   onClick={(event) => handleTabChange(event, adminTab.value)}
                   variant={tabValue === adminTab.value ? "contained" : "text"}
                   fullWidth
