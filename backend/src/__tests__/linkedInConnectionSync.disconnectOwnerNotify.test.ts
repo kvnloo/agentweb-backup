@@ -38,8 +38,21 @@ jest.mock('../services/dripSequenceDb', () => ({
   dripSequenceDb: { getAllSequencesByTriggerType: jest.fn().mockResolvedValue([]) },
 }));
 
+/*
+ * `userDb` is required, not optional: ENG-1197 (7954cb266) changed
+ * `getAllUnipileAccountIds` to also scan per-user connected_accounts via
+ * `userDb.scanWithFilter`, and deliberately left that call OUTSIDE a try/catch so a real DB
+ * failure propagates. That commit updated linkedInConnectionSyncCron.walkPacing.test.ts but not
+ * this suite, so every test here died on `Cannot read properties of undefined (reading
+ * 'scanWithFilter')` before reaching its assertion.
+ *
+ * Resolving to `[]` keeps this suite's subject intact: the account under test (`acct-disc`)
+ * comes from the site-wide settings source, and having no per-user record is what makes its
+ * owner `undefined` in the notify assertion below. Same stub the sibling suites use.
+ */
 jest.mock('../services/db', () => ({
   crmDb: {},
+  userDb: { scanWithFilter: jest.fn().mockResolvedValue([]) },
 }));
 
 jest.mock('../services/leadListAlertService', () => ({

@@ -5,6 +5,7 @@ import {
   canReuseChat,
   guardedV0ChatCreate,
   guardedV0CorrectionMessage,
+  guardedV0IterateMessage,
   getV0UsageCountForScope,
   clearV0UsageForPage,
   type V0UsageRecord,
@@ -372,6 +373,74 @@ describe('v0UsageGuard', () => {
 
       expect(second).toMatchObject({ id: 'chat_fresh' });
       expect(create).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('guardedV0IterateMessage — content-keyed reservation (ENG-1694)', () => {
+    // The obvious wrap (reusing guardedV0CorrectionMessage's key shape, which omits the
+    // message content) collided two DIFFERENT edits into one identity, so edit B silently
+    // skipped instead of reaching v0. Keying on hashV0Prompt(message) fixes that while
+    // keeping a genuine re-send of the SAME edit deduped exactly as before.
+    const base = { userId: 'user_1', scopeId: 'page_1', chatId: 'chat_1' };
+
+    test('two different edits to the same page BOTH reach v0 — no silent skip', async () => {
+      const send = jest.fn().mockResolvedValue({ ok: true });
+
+      const first = await guardedV0IterateMessage({ ...base, message: 'Add testimonials', send });
+      const second = await guardedV0IterateMessage({ ...base, message: 'Now make the hero blue', send });
+
+      expect(first).toEqual({ ok: true });
+      expect(second).toEqual({ ok: true });
+      expect(send).toHaveBeenCalledTimes(2);
+    });
+
+    test('the SAME edit re-sent after a crash or timeout dedupes, exactly as today', async () => {
+      const send = jest.fn().mockResolvedValue({ ok: true });
+      const args = { ...base, message: 'Add testimonials', send };
+
+      const first = await guardedV0IterateMessage(args);
+      const second = await guardedV0IterateMessage(args);
+
+      expect(first).toEqual({ ok: true });
+      expect(second).toEqual({ skipped: true });
+      expect(send).toHaveBeenCalledTimes(1);
+    });
+
+    test('a FAILED send does not skip the retry of that same edit', async () => {
+      const send = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('v0 iterate timed out after 300s'))
+        .mockResolvedValueOnce({ ok: true });
+
+      await expect(
+        guardedV0IterateMessage({ ...base, message: 'Add testimonials', send }),
+      ).rejects.toThrow(/timed out/);
+
+      const retry = await guardedV0IterateMessage({ ...base, message: 'Add testimonials', send });
+
+      expect(retry).toEqual({ ok: true });
+      expect(send).toHaveBeenCalledTimes(2);
+    });
+
+    test('chat-create, correction-message, and existing iterate keys stay byte-identical (no orphaned in-flight reservation)', () => {
+      // Regression guard for AC3: adding contentHash must not change any key that does not
+      // supply one.
+      const chatCreateKey = buildV0IdempotencyKey({
+        userId: 'u1',
+        operation: 'additional_page_chat_create',
+        scopeId: 'site_1',
+        slug: 'book-a-demo',
+      });
+      expect(chatCreateKey).toBe('additional_page_chat_create#u1#site_1#book-a-demo#');
+
+      const correctionKey = buildV0IdempotencyKey({
+        userId: 'u1',
+        operation: 'correction_message',
+        scopeId: 'page_1',
+        chatId: 'chat_1',
+        attempt: 0,
+      });
+      expect(correctionKey).toBe('correction_message#u1#page_1##chat_1#0');
     });
   });
 
