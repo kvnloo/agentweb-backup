@@ -193,16 +193,58 @@ async function defaultResolveCreativeDestinations(creativeId: string, accessToke
   const axios = (await import('axios')).default;
   const apiVersion = process.env.META_API_VERSION || 'v25.0';
   /*
-   * `effective_object_story_spec` is requested alongside the raw spec because a creative
-   * built from a page post carries its link only on the effective view. `asset_feed_spec`
-   * covers dynamic creatives, whose destinations are a list rather than a single link.
+   * ENG-1742: `effective_object_story_spec` is NOT a valid field on an AdCreative node — it is
+   * an Ad-level concept (the object story spec as actually delivered, accounting for ad-level
+   * overrides), and Meta refuses the whole request with a hard error when it's asked for here:
+   * "(#100) Tried accessing nonexisting field (effective_object_story_spec)" — confirmed live
+   * against a real production creative and ad account on 2026-09-04. That is a REQUEST failure,
+   * not a "field absent from the response" one: Graph rejects the entire fields= list, so every
+   * other field this call needed (including the ones that DO carry the real destination) was
+   * lost with it. A creative built from a page post carrying its link only on the effective view
+   * is a real case (see `object_story_spec` below), but the fix for it is not requesting a field
+   * this node type does not have.
+   *
+   * `getAdCreative` (metaService.ts) reads this exact node type successfully with `link_url` +
+   * `object_story_spec` + `asset_feed_spec` + `url_tags` — no `effective_object_story_spec`, no
+   * `template_url`. Dropped both here to match: `template_url` was never separately confirmed
+   * bad (Graph reports only the first invalid field in a request, so a second one can hide
+   * behind it), but it is equally absent from that known-working list, and this function has no
+   * documented reason of its own to need it.
    */
-  const fields = 'link_url,object_story_spec,effective_object_story_spec,asset_feed_spec,template_url,url_tags';
+  /*
+   * `object_story_id` requested alongside the inline shapes: a creative built by REFERENCING an
+   * existing page post (as opposed to carrying `object_story_spec` inline) has no destination
+   * anywhere in the fields above — the post itself, not the creative, carries the link. Without
+   * following that reference this read a real creative as having no destination at all, which
+   * the gate then blocked exactly like an unreadable one: correct behavior on wrong information.
+   */
+  const fields = 'link_url,object_story_spec,object_story_id,asset_feed_spec,url_tags';
   const url =
     `https://graph.facebook.com/${apiVersion}/${creativeId}` +
     `?fields=${fields}&access_token=${encodeURIComponent(accessToken)}`;
   const res = await withOneTransientRetry(async () => axios.get(url, { timeout: GATE_GRAPH_CALL_TIMEOUT_MS }));
-  return [...new Set(extractDestinationUrls(res.data))];
+  const urls = extractDestinationUrls(res.data);
+  if (urls.length > 0) return [...new Set(urls)];
+
+  /*
+   * No destination found inline, but the creative points at an existing post (format
+   * "{page_id}_{post_id}") — follow it. A page post's own `link` field is where a link-type
+   * post's destination actually lives; the creative referencing it never gets a copy.
+   *
+   * Not a fallback for every unreadable creative: only fires when `object_story_id` is present,
+   * so a creative that truly has no destination (or genuinely fails the primary read — that
+   * throws above, never reaches here) is not silently retried against the wrong node.
+   */
+  const objectStoryId = (res.data as any)?.object_story_id;
+  if (typeof objectStoryId === 'string' && objectStoryId.trim()) {
+    const postUrl =
+      `https://graph.facebook.com/${apiVersion}/${objectStoryId}` +
+      `?fields=link&access_token=${encodeURIComponent(accessToken)}`;
+    const postRes = await withOneTransientRetry(async () => axios.get(postUrl, { timeout: GATE_GRAPH_CALL_TIMEOUT_MS }));
+    return [...new Set(extractDestinationUrls(postRes.data))];
+  }
+
+  return [];
 }
 
 /* istanbul ignore next — network boundary; tests inject pixelHasRecentActivity. */
@@ -564,7 +606,31 @@ export async function runMetaTrackingGate(
         try {
           urls = (await resolve(creativeId, accessToken)) ?? [];
         } catch (err: any) {
-          failure = err?.message || String(err);
+          /*
+           * ENG-1742: `err.message` on a raw axios failure is Axios's own generic text
+           * ("Request failed with status code 400") — never Meta's actual reason. Meta's real
+           * error body lives at `err.response.data.error` (message/code/error_subcode/
+           * error_user_msg), and nothing here ever read it: neither the user-facing block
+           * message nor the server log. A creative that reads back fine through every other
+           * path but 400s here was, at investigation time, undiagnosable — even server-side.
+           * Log the full body so a future occurrence is diagnosable, and prefer Meta's own
+           * words for the user-facing reason when it has any to give.
+           */
+          const metaErr = err?.response?.data?.error;
+          if (metaErr) {
+            console.error(`[META GATE] creative destination resolve failed for ${creativeId}:`, {
+              status: err?.response?.status,
+              message: metaErr.message,
+              type: metaErr.type,
+              code: metaErr.code,
+              error_subcode: metaErr.error_subcode,
+              error_user_msg: metaErr.error_user_msg,
+              fbtrace_id: metaErr.fbtrace_id,
+            });
+          } else {
+            console.error(`[META GATE] creative destination resolve failed for ${creativeId}:`, err?.message || err);
+          }
+          failure = metaErr?.error_user_msg || metaErr?.message || err?.message || String(err);
         }
       }
       if (failure || urls.length === 0) {
