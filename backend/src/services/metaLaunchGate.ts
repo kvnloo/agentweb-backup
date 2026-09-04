@@ -242,9 +242,15 @@ async function defaultResolveCreativeDestinations(creativeId: string, accessToke
    */
   const objectStoryId = (res.data as any)?.object_story_id;
   if (typeof objectStoryId === 'string' && objectStoryId.trim()) {
+    /*
+     * The unencoded `{url}` sub-field selector is silently mangled by Graph into a flat
+     * "attachmentsurl" field name and rejected — confirmed live 2026-09-04. Every other fields=
+     * value in this file is a flat comma list with no braces, so this is the first place that
+     * needed encoding; encodeURIComponent the whole selector rather than hand-escaping braces.
+     */
     const postUrl =
       `https://graph.facebook.com/${apiVersion}/${objectStoryId}` +
-      `?fields=attachments{url}&access_token=${encodeURIComponent(accessToken)}`;
+      `?fields=${encodeURIComponent('attachments{url}')}&access_token=${encodeURIComponent(accessToken)}`;
     const postRes = await withOneTransientRetry(async () => axios.get(postUrl, { timeout: GATE_GRAPH_CALL_TIMEOUT_MS }));
     const attachmentUrls: string[] = ((postRes.data as any)?.attachments?.data ?? [])
       .map((a: any) => a?.url)

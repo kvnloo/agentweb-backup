@@ -112,7 +112,11 @@ describe('Meta launch gate — real creative-destination Graph read (ENG-1742)',
       }
       if (url.includes('123456_987654')) {
         expect(url).not.toContain('fields=link&');
-        expect(url).toContain('attachments');
+        // Pins the URL-encoding too: unencoded {url} is silently mangled by Graph into a flat
+        // "attachmentsurl" field and rejected — confirmed live 2026-09-04. A regression back to
+        // raw braces must fail this test, not just "toContain('attachments')".
+        expect(url).toContain('fields=attachments%7Burl%7D');
+        expect(url).not.toContain('attachments{url}');
         return Promise.resolve({
           data: {
             attachments: {
