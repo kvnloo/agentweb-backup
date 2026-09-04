@@ -41,6 +41,12 @@ export interface MetaAdsAdSetParams {
   // in Ads Manager (ENG-415). agentModeService.createMetaAdsAdSet defaults this to 'WEBSITE' for
   // website optimization goals.
   destination_type?: string;
+  // Dayparting (ENG-842). Meta requires a lifetime_budget (and therefore end_time) for this to take
+  // effect — agentModeService.createMetaAdsAdSet enforces that rule and defaults pacing_type to
+  // ['day_parting'] whenever adset_schedule is present and pacing_type was not explicitly set,
+  // because Meta silently ignores adset_schedule without it.
+  adset_schedule?: Array<{ start_minute: number; end_minute: number; days: number[]; timezone_type?: string }>;
+  pacing_type?: string[];
 }
 
 export interface MetaPlacementAsset {
@@ -1532,6 +1538,10 @@ export class MetaService {
       // is not guaranteed to exist on the SDK's AdSet.Fields enum across versions. Emitted only when
       // present so the payload is byte-identical to before when the caller passes nothing.
       if (params.destination_type !== undefined) adSetParams['destination_type'] = params.destination_type;
+      // Dayparting (ENG-842). Emitted only when present so the payload is byte-identical to before
+      // for every existing caller that never sends a schedule.
+      if (params.adset_schedule !== undefined) adSetParams[AdSet.Fields.adset_schedule] = params.adset_schedule;
+      if (params.pacing_type !== undefined) adSetParams[AdSet.Fields.pacing_type] = params.pacing_type;
 
       // Defensive: Ensure no 'id' or other accidental fields
       delete adSetParams.id;

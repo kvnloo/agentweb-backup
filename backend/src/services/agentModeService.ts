@@ -17941,29 +17941,37 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async createMetaAdsAdSet(userId: string, args: any): Promise<any> {
     try {
-      // ENG-838: dayparting is not implemented. `MetaAdsAdSetParams` has no
-      // `adset_schedule` and nothing in this codebase ever sends one, so a
-      // scheduled-delivery request used to be dropped in silence and the ad set
-      // shipped 24/7. That is how Open Future Forum spent $1,000 for 2 sign-ups
-      // on 3am impressions. Fail loudly instead: a caller who asked for a
-      // schedule must not receive an always-on ad set and a success message.
-      // Note `start_time`/`end_time` are the flight window, not dayparting, and
-      // stay supported.
+      // ENG-842: dayparting (adset_schedule / pacing_type). Meta requires a
+      // LIFETIME budget for scheduled delivery — a daily-budget ad set (or one
+      // with no budget at all) ignores the schedule and runs 24/7, which is
+      // exactly the Open Future Forum failure mode (#2244/ENG-838) this slice
+      // closes. Reject the combination before it can ship silently.
       //
-      // This runs BEFORE getMetaCredentials deliberately. Credential resolution
-      // can refresh a token against Meta and can throw its own auth error, so
-      // resolving first would both make a network call for a request we are
-      // certain to reject and mask a deterministic "not supported" answer behind
-      // an unrelated credential failure. A rejection that is knowable from the
-      // arguments alone should never depend on account state.
+      // This runs BEFORE getMetaCredentials deliberately (unchanged from the
+      // #2244 fail-loud guard this replaces). Credential resolution can refresh
+      // a token against Meta and can throw its own auth error, so resolving
+      // first would both make a network call for a request we may be certain to
+      // reject and mask a deterministic validation answer behind an unrelated
+      // credential failure. A rejection that is knowable from the arguments
+      // alone must not depend on account state.
       if (args.adset_schedule !== undefined || args.pacing_type !== undefined) {
-        const requested = args.adset_schedule !== undefined ? 'adset_schedule' : 'pacing_type';
-        throw new Error(
-          `Dayparting is not supported yet, so "${requested}" cannot be honored and this ad set was NOT created. ` +
-          `Creating it anyway would deliver 24/7 against a schedule you did not choose. ` +
-          `Either remove ${requested} and accept continuous delivery, or set the schedule manually in Ads Manager after creation. ` +
-          `Tracked as ENG-838.`
-        );
+        if (args.daily_budget !== undefined || args.lifetime_budget === undefined) {
+          throw new Error(
+            `Dayparting (adset_schedule/pacing_type) requires a lifetime_budget, not a daily_budget. ` +
+            `Meta ignores the schedule on a daily-budget ad set and delivers 24/7 against a schedule ` +
+            `nobody chose. Provide lifetime_budget (and end_time) instead. Tracked as ENG-842.`
+          );
+        }
+        if (!args.end_time) {
+          throw new Error(
+            `end_time is required when using adset_schedule with a lifetime_budget. Tracked as ENG-842.`
+          );
+        }
+        // Meta ignores adset_schedule unless pacing_type explicitly requests
+        // day-parting delivery — an explicit caller value always wins.
+        if (args.adset_schedule !== undefined && args.pacing_type === undefined) {
+          args.pacing_type = ['day_parting'];
+        }
       }
 
       const { accountId, accessToken } = await this.getMetaCredentials(userId, args.account_id);
