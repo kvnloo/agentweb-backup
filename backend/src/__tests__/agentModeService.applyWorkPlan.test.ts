@@ -114,6 +114,23 @@ describe('AgentModeService - predefined work plan templates', () => {
       expect(chatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-sonnet-4-6');
     });
 
+    it('ENG-1698: resets calledFunctions so a predefined-plan launch does not inherit stale tool-call credit', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemTemplate] : []
+      );
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId,
+        messages: [],
+        // Leftover credit from a completely unrelated earlier plan/run on this session.
+        calledFunctions: { read_brand_guidelines: 3 },
+      });
+      (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(undefined);
+
+      await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+      expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(sessionId, {});
+    });
+
     it('does not change the model when the plan default is unsupported', async () => {
       const planWithBadModel = { ...systemTemplate, defaultModel: 'not-a-real-model' };
       mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>

@@ -156,6 +156,28 @@ describe('AgentModeService - Work Plan', () => {
       expect(result.success).toBe(true);
       expect(result.message).toContain('Work plan "New Plan" created');
     });
+
+    it('ENG-1698: resets calledFunctions so a new plan does not inherit stale tool-call credit', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        messages: [],
+        // Leftover credit from a completely unrelated earlier plan in this session.
+        calledFunctions: { generate_image: 5 },
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).createWorkPlan(
+        'Fresh Plan',
+        [{ stepCount: 1, title: 'Step 1' }],
+        mockSessionId
+      );
+
+      expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(mockSessionId, {});
+    });
   });
 
   describe('modifyWorkPlan', () => {
@@ -752,6 +774,7 @@ describe('AgentModeService - Work Plan', () => {
         ]);
         // The step was not completed, so its credits must be untouched.
         expect(chatbotDb.updateCalledFunctions).not.toHaveBeenCalled();
+        expect(chatbotDb.decrementCalledFunctionsClamped).not.toHaveBeenCalled();
         expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
       });
 
@@ -1930,7 +1953,7 @@ describe('AgentModeService - Work Plan', () => {
 
         (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
         (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
-        (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.decrementCalledFunctionsClamped as jest.Mock).mockResolvedValue(mockSession);
 
         const result = await (agentModeService as any).setWorkPlanStatus(
           [{ stepCount: 1, status: 'completed' }],
@@ -1939,9 +1962,11 @@ describe('AgentModeService - Work Plan', () => {
 
         expect(result.success).toBe(true);
         expect(result.message).toContain('Step 1 status updated to completed');
-        expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(
+        // ENG-1698: applied as a delta against a fresh read, not an absolute
+        // value computed from this call's local snapshot.
+        expect(chatbotDb.decrementCalledFunctionsClamped).toHaveBeenCalledWith(
           mockSessionId,
-          { you_search_web: 0 }
+          { you_search_web: 1 }
         );
       });
 
@@ -2005,7 +2030,7 @@ describe('AgentModeService - Work Plan', () => {
 
         (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
         (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
-        (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.decrementCalledFunctionsClamped as jest.Mock).mockResolvedValue(mockSession);
 
         const result = await (agentModeService as any).setWorkPlanStatus(
           [{ stepCount: 1, status: 'completed' }],
@@ -2013,9 +2038,9 @@ describe('AgentModeService - Work Plan', () => {
         );
 
         expect(result.success).toBe(true);
-        expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(
+        expect(chatbotDb.decrementCalledFunctionsClamped).toHaveBeenCalledWith(
           mockSessionId,
-          { create_blog_article: 2 } // Should decrement by 3
+          { create_blog_article: 3 } // Delta: decrement by 3
         );
       });
 
@@ -2094,6 +2119,92 @@ describe('AgentModeService - Work Plan', () => {
         expect(result.message).toContain('Step 1 status updated to skipped');
         // Should not try to update calledFunctions when skipping
         expect(chatbotDb.updateCalledFunctions).not.toHaveBeenCalled();
+        expect(chatbotDb.decrementCalledFunctionsClamped).not.toHaveBeenCalled();
+      });
+
+      it('ENG-1698: decrements calledFunctions when skipping a step that already made its calls', async () => {
+        // Step 1 called generate_image once (required) before being skipped. Without
+        // decrementing, that credit stays in the pool and could silently satisfy step
+        // 2's own generate_image requirement without step 2 ever calling it.
+        const workPlan = {
+          title: 'Project Plan',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Draft hero image',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['generate_image'],
+            },
+            {
+              stepCount: 2,
+              title: 'Draft banner image',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['generate_image'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: { generate_image: 1 },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.decrementCalledFunctionsClamped as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'skipped', notes: 'Not needed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.decrementCalledFunctionsClamped).toHaveBeenCalledWith(
+          mockSessionId,
+          { generate_image: 1 }
+        );
+      });
+
+      it('ENG-1698: skipping a step that never made its calls does not drive the count negative', async () => {
+        const workPlan = {
+          title: 'Project Plan',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Draft hero image',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['generate_image'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {}, // never called
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'skipped' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        // Clamped at 0 -- must not persist a negative count for a later step to inherit.
+        expect(chatbotDb.updateCalledFunctions).not.toHaveBeenCalled();
+        expect(chatbotDb.decrementCalledFunctionsClamped).not.toHaveBeenCalled();
       });
     });
   });
