@@ -5557,9 +5557,21 @@ export class AgentModeService {
         workPlanContent += `   Required assets: ${step.expectedAssetCount} (this step cannot be completed until ${step.expectedAssetCount} images/assets have actually been generated this session)\n`;
       }
 
-      // Include skill IDs if available (for awareness)
+      // Include skill IDs if available (for awareness). ENG-1697: this used to
+      // unconditionally claim "(auto-installed when this step becomes active)",
+      // but that's only true for a predefined-template launch (which installs
+      // the union of all step skills upfront) — an ad-hoc plan's first step, or
+      // any step that becomes active because an earlier step was SKIPPED rather
+      // than completed, never goes through that upfront install. Deliberately
+      // NOT telling the model to proactively call install_skills here: toolDispatch's
+      // gate (search "is not available. You must install the required skill
+      // first") already catches any tool call gated on a missing skill and
+      // instructs recovery at that exact point, reactively and only when truly
+      // needed — restating it here would just invite redundant defensive
+      // install_skills calls on the already-working template-launch path where
+      // skills are already installed. Just drop the false claim.
       if (step.skillIds && step.skillIds.length > 0) {
-        workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
+        workPlanContent += `   Skills for this step: ${step.skillIds.join(', ')}\n`;
       }
 
       workPlanContent += '\n';
