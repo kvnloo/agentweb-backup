@@ -32850,9 +32850,15 @@ ${strippedHtml}`;
     const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
     const outOfOrderSteps: Array<{ stepCount: number; title: string; pendingSteps: string[] }> = [];
 
-    // Get function call counts from session (make a copy to modify)
+    // Get function call counts from session (make a copy to modify). This local
+    // copy drives this call's own gating decisions (does THIS step have enough
+    // available calls) and is inherently a single-request snapshot. The actual
+    // persisted decrement (see countsModified below) is applied as a delta
+    // against a fresh read at write time, not this snapshot, to avoid clobbering
+    // a concurrent writer (ENG-1698).
     const calledFunctionCounts = { ...(session.calledFunctions || {}) };
     let countsModified = false;
+    const pendingCalledFunctionDecrements: Record<string, number> = {};
 
     const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
 
@@ -32932,6 +32938,7 @@ ${strippedHtml}`;
         // If validation passed and marking as completed, decrement the function counts
         for (const fn of step.requiredFunctionCalls) {
           calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
+          pendingCalledFunctionDecrements[fn] = (pendingCalledFunctionDecrements[fn] || 0) + 1;
           countsModified = true;
         }
       }
@@ -32950,6 +32957,7 @@ ${strippedHtml}`;
           const current = calledFunctionCounts[fn] || 0;
           if (current > 0) {
             calledFunctionCounts[fn] = current - 1;
+            pendingCalledFunctionDecrements[fn] = (pendingCalledFunctionDecrements[fn] || 0) + 1;
             countsModified = true;
           }
         }
@@ -33206,9 +33214,12 @@ ${strippedHtml}`;
         );
       }
 
-      // Update function counts if they were modified
+      // Update function counts if they were modified. Applied as a clamped delta
+      // against a fresh read (ENG-1698) rather than this call's local snapshot,
+      // so it can't clobber a concurrent writer (e.g. a new plan's reset, or
+      // another in-flight tool-dispatch increment).
       if (countsModified) {
-        await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
+        await chatbotDb.decrementCalledFunctionsClamped(sessionId, pendingCalledFunctionDecrements);
       }
 
       // Auto-install skills for the next pending step
