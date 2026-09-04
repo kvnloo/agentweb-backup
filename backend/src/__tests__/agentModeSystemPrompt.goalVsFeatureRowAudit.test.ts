@@ -11,8 +11,13 @@ import { AGENT_MODE_SYSTEM_PROMPT } from '../docs/agentModeSystemPrompt';
  * live for paid social/ads, landing pages, research/reports, and blog; images,
  * videos, and newsletter included on the same catalog-agnostic reasoning —
  * the mechanism no-ops harmlessly when no plan matches). GTM plan and
- * Tasks/automations rows were examined and NOT patched — different bug shape,
- * not this one (see dev.md).
+ * Tasks/automations rows were examined and NOT patched at the time — different
+ * bug shape, not this one (see dev.md): GTM plan's row had no creation tool at
+ * all then, so there was no creation tool on the row to lose the race in the
+ * first place. ENG-1492 (follow-up) added a create_gtm_plan cross-reference to
+ * that row, which reintroduced the exact precedence risk this audit exists
+ * for (real matching predefined work plans confirmed live: GTM_planning,
+ * GTM_discovery) — patched with the same substitution framing as the other 7.
  *
  * These assertions pin: (a) each row's exception uses the proven substitution
  * framing ("INSTEAD of ... in this same turn"), never the weaker "before
@@ -28,6 +33,7 @@ describe('AgentMode system prompt - goal-vs-feature row audit (ENG-1490 follow-u
     { label: 'research/reports', keywordFragment: '"research", "reports", "research reports"', primaryTool: 'calling **perform_deep_research**', replacesPhrase: 'the recommendation card replaces the freeform report' },
     { label: 'newsletter', keywordFragment: '"newsletter", "newsletter page", "email campaign"', primaryTool: 'calling **create_html_from_template**', replacesPhrase: 'the recommendation card replaces drafting' },
     { label: 'blog', keywordFragment: '"blog", "blog articles", "blog page"', primaryTool: 'calling **create_blog_article**', replacesPhrase: 'the recommendation card replaces drafting' },
+    { label: 'GTM plan (ENG-1492 follow-up)', keywordFragment: '"GTM plan", "go-to-market", "launch plan", "GTM page"', primaryTool: 'calling **create_gtm_plan**', replacesPhrase: 'the recommendation card replaces the freeform build' },
   ];
 
   it.each(rows)('$label row: exception uses substitution framing, not "before drafting" sequencing', ({ keywordFragment, primaryTool, replacesPhrase }) => {

@@ -17,7 +17,14 @@ describe('AgentMode system prompt - GTM plan row references create_gtm_plan (ENG
   it('now also routes to create_gtm_plan for creating a new plan', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('**create_gtm_plan**');
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
-      'To CREATE a new GTM plan (e.g. "I want a go-to-market plan", "build me a launch plan") → **create_gtm_plan**.'
+      'To CREATE a new GTM plan when the user is asking to view/manage what already exists → **create_gtm_plan**.'
+    );
+  });
+
+  it('ENG-1492 follow-up: a GOAL-shaped GTM request checks predefined work plans first, matching the sibling-row pattern', () => {
+    // real matching predefined system plans confirmed live: GTM_planning, GTM_discovery
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'check for a matching predefined work plan first per the Work Plan Capabilities section. If one clearly fits, propose it via **recommend_predefined_work_plan** INSTEAD of calling **create_gtm_plan** in this same turn'
     );
   });
 });
