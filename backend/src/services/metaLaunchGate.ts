@@ -228,8 +228,13 @@ async function defaultResolveCreativeDestinations(creativeId: string, accessToke
 
   /*
    * No destination found inline, but the creative points at an existing post (format
-   * "{page_id}_{post_id}") — follow it. A page post's own `link` field is where a link-type
-   * post's destination actually lives; the creative referencing it never gets a copy.
+   * "{page_id}_{post_id}") — follow it. A link-type post's destination lives on its
+   * `attachments` edge, not the `link` field: `link` is deprecated for post reads —
+   * confirmed live on 2026-09-04, Graph refuses it outright with
+   * "(#12) deprecate_post_aggregated_fields_for_attachement" on every post, not just
+   * malformed ones. `attachments{url}` is the field Meta's own News Feed / Ads rendering
+   * uses for this, and it returns the real target (wrapped in an l.facebook.com redirect,
+   * same shape Meta already uses elsewhere — confirmed live against a real page post).
    *
    * Not a fallback for every unreadable creative: only fires when `object_story_id` is present,
    * so a creative that truly has no destination (or genuinely fails the primary read — that
@@ -239,9 +244,12 @@ async function defaultResolveCreativeDestinations(creativeId: string, accessToke
   if (typeof objectStoryId === 'string' && objectStoryId.trim()) {
     const postUrl =
       `https://graph.facebook.com/${apiVersion}/${objectStoryId}` +
-      `?fields=link&access_token=${encodeURIComponent(accessToken)}`;
+      `?fields=attachments{url}&access_token=${encodeURIComponent(accessToken)}`;
     const postRes = await withOneTransientRetry(async () => axios.get(postUrl, { timeout: GATE_GRAPH_CALL_TIMEOUT_MS }));
-    return [...new Set(extractDestinationUrls(postRes.data))];
+    const attachmentUrls: string[] = ((postRes.data as any)?.attachments?.data ?? [])
+      .map((a: any) => a?.url)
+      .filter((u: any): u is string => typeof u === 'string' && u.trim().length > 0);
+    return [...new Set(attachmentUrls)];
   }
 
   return [];

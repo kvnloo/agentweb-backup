@@ -100,12 +100,26 @@ describe('Meta launch gate — real creative-destination Graph read (ENG-1742)',
   it('follows object_story_id back to the referenced page post when the creative carries no inline destination', async () => {
     // Creative built purely by referencing an existing page post — no link_url, no
     // object_story_spec.link_data.link, nothing inline. Only object_story_id points anywhere.
+    //
+    // `link` was requested here in an earlier version of this fix and always failed live —
+    // Meta rejects it outright with "(#12) deprecate_post_aggregated_fields_for_attachement"
+    // on every post read, confirmed 2026-09-04 against a real page post. The real destination
+    // comes back on the `attachments` edge instead, wrapped in an l.facebook.com redirect —
+    // this mock mirrors that actual shape, not the field this fix no longer requests.
     mockAxiosGet.mockImplementation((url: string) => {
       if (url.includes(CREATIVE_ID)) {
         return Promise.resolve({ data: { object_story_id: '123456_987654' } });
       }
       if (url.includes('123456_987654')) {
-        return Promise.resolve({ data: { link: 'https://site.example/referenced-post' } });
+        expect(url).not.toContain('fields=link&');
+        expect(url).toContain('attachments');
+        return Promise.resolve({
+          data: {
+            attachments: {
+              data: [{ url: 'https://l.facebook.com/l.php?u=https%3A%2F%2Fsite.example%2Freferenced-post' }],
+            },
+          },
+        });
       }
       throw new Error(`unexpected axios.get call: ${url}`);
     });
@@ -119,7 +133,7 @@ describe('Meta launch gate — real creative-destination Graph read (ENG-1742)',
     const postCallUrl = mockAxiosGet.mock.calls[1][0] as string;
     expect(postCallUrl).toContain('123456_987654');
     expect(mockPreflight).toHaveBeenCalledTimes(1);
-    expect(mockPreflight.mock.calls[0][0]).toContain('https://site.example/referenced-post');
+    expect(mockPreflight.mock.calls[0][0]).toContain('https://l.facebook.com/l.php?u=https%3A%2F%2Fsite.example%2Freferenced-post');
     expect(out.proceed).toBe(true);
   });
 
