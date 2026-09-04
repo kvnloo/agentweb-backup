@@ -402,7 +402,20 @@ router.get('/meta-ads/campaigns', async (req: Request, res: Response) => {
 
 router.post('/meta-ads/marketing-api', async (req: Request, res: Response) => {
   try {
-    const { entity_type, action, account_id, parent_id, entity_id, fields, params, session_id } = req.body;
+    /*
+     * ENG-1725: this used to destructure parent_id/entity_id/fields and pass them positionally
+     * into callMetaMarketingApi's (campaign_id, ad_set_id, ad_id) slots — none of those names
+     * exist anywhere in this tool's own published schema (emma/tools.ts's call_meta_marketing_api
+     * definition), which documents campaign_id/ad_set_id/ad_id as the actual field names, and
+     * whose `execute()` handler (the path every LLM/agent tool call actually takes) already
+     * passes args.campaign_id/args.ad_set_id/args.ad_id straight through correctly. Only this
+     * raw REST route was out of sync with its own spec — `fields` in particular was never an id
+     * at all, so it could end up silently occupying the ad_id slot. Reading the documented names
+     * here instead makes this route consistent with the one path (agent tool-calling) that was
+     * already correct, and with anyone who followed the published schema rather than the
+     * previously-undocumented parent_id/entity_id/fields shape.
+     */
+    const { entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, session_id } = req.body;
     // Greptile P1/security ("Session does not bind authorization"): session_id
     // feeds the objective gate's confirmation check (a prior answer, or the
     // transcript for an explicit-statement quote) — an authenticated caller
@@ -415,7 +428,7 @@ router.post('/meta-ads/marketing-api', async (req: Request, res: Response) => {
       }
     }
     const svc = await getAgentModeService();
-    const result = await svc.callMetaMarketingApi(userId(req), entity_type, action, account_id, parent_id, entity_id, fields, params, session_id);
+    const result = await svc.callMetaMarketingApi(userId(req), entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, session_id);
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
