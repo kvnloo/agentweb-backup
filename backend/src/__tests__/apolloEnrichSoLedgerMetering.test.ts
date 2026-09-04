@@ -21,7 +21,13 @@
 const mockAxiosPost = jest.fn();
 const mockAxiosGet = jest.fn();
 jest.mock('axios', () => ({
-  create: () => ({ post: (...a: any[]) => mockAxiosPost(...a), get: (...a: any[]) => mockAxiosGet(...a) }),
+  create: () => ({
+    post: (...a: any[]) => mockAxiosPost(...a),
+    get: (...a: any[]) => mockAxiosGet(...a),
+    // The same import chain (see the aws-sdk mock above) also pulls in hubspotService.ts, which
+    // registers a response interceptor on its module-level axios instance at load time.
+    interceptors: { response: { use: jest.fn() } },
+  }),
 }));
 
 jest.mock('aws-sdk', () => ({
