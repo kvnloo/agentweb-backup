@@ -203,4 +203,34 @@ describe('buildUnavailableCapabilityNotice', () => {
 
     expect(notice).toContain('audit_ad_utm_coverage');
   });
+
+  it('does not arm an unrelated gated tool whose own skill was never touched by the failure', () => {
+    /*
+     * Per-tool scoping: two gated tools in one turn, `audit_ad_utm_coverage` (skill refused) and
+     * `read_brand_guidelines` (a different skill, never mentioned by the refusal). A turn-global
+     * installFailed flag would arm the notice for BOTH just because SOME install failed — this
+     * pins that `rejectedToolNames` (resolved by installSkills, agentModeService.ts) narrows it
+     * to only the tool whose own skill was actually refused.
+     */
+    const notice = buildUnavailableCapabilityNotice([
+      { name: 'audit_ad_utm_coverage', error: gateError('audit_ad_utm_coverage') },
+      // read_brand_guidelines' own skill installs cleanly, and the model does not re-run it —
+      // it never appears in `succeeded`, so the only thing that can keep this silent for it is
+      // the per-tool scoping itself.
+      { name: 'read_brand_guidelines', error: gateError('read_brand_guidelines') },
+      {
+        name: 'install_skills',
+        result: {
+          success: true,
+          message: 'Successfully installed 1 skill(s). 1 skill(s) were not available with your subscription.',
+          installedSkills: ['Brand Guidelines'],
+          rejectedSkillIds: ['utm-audit'],
+          rejectedToolNames: ['audit_ad_utm_coverage'],
+        },
+      },
+    ] as any);
+
+    expect(notice).toContain('audit_ad_utm_coverage');
+    expect(notice).not.toContain('read_brand_guidelines');
+  });
 });

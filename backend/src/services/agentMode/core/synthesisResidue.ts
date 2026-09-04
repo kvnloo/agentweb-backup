@@ -290,6 +290,17 @@ function isPartialInstall(call: ExecutedToolCall): boolean {
   return Array.isArray(rejected) && rejected.length > 0;
 }
 
+/**
+ * The tool names a rejected skill would have unlocked, per `installSkills` (agentModeService.ts)
+ * resolving `rejectedSkillIds` before this reader ever sees them. Empty for any call that did
+ * not carry the field — an unscoped throw, a legacy result shape, or a full subscription refusal
+ * that never got as far as knowing which ids to look up.
+ */
+function getRejectedToolNames(call: ExecutedToolCall): string[] {
+  const names = (call.result as { rejectedToolNames?: unknown } | null | undefined)?.rejectedToolNames;
+  return Array.isArray(names) ? names.filter((n): n is string => typeof n === 'string') : [];
+}
+
 
 /**
  * ENG-1188 root-cause fix recommendation #2: a ledger of tool NAMES and counts
@@ -756,20 +767,35 @@ export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]):
    * install_skills call, failed or not) it would only ever suppress the notice, never correctly
    * arm it — including when the turn also contains an install failure that is the actual cause.
    *
-   * A per-tool "did the skill THIS tool needed actually arrive" check would be the precise fix,
-   * but that requires tracking which install call served which gated tool, which this function
-   * does not yet do (tracked separately). Until then, when the turn contains both a success and
-   * a failure the notice fires — a redundant banner on a turn that in fact recovered is the
-   * cheap direction to be wrong; silently hiding a real gap is not.
+   * A per-tool "did the skill THIS tool needed actually arrive" check is possible on a PARTIAL
+   * install: `installSkills` resolves its `rejectedSkillIds` to the tool names they would have
+   * unlocked (`rejectedToolNames`, agentModeService.ts) precisely so this reader does not have
+   * to guess. When that field is present, only a gated tool whose name is actually in it counts
+   * as still unavailable — a failure over here does not arm the notice for an unrelated tool B
+   * whose own skill installed fine.
+   *
+   * A full refusal (subscription-blocked, no valid ids at all) carries no such mapping — nothing
+   * in the ledger says which tool names the model was after. For that shape only, this falls
+   * back to turn-global: any install failure with no name info arms the notice for every gated
+   * tool in the turn. A redundant banner on a turn that in fact recovered is the cheap direction
+   * to be wrong; silently hiding a real gap is not.
    */
   let installAttempted = false;
   let installFailed = false;
+  let unscopedInstallFailure = false;
+  const rejectedToolNames = new Set<string>();
   calls.forEach((call) => {
     if (call?.name !== 'install_skills') return;
     installAttempted = true;
     const threw = call?.error !== undefined && call?.error !== null;
     if (threw || isReportedFailure(call) || isPartialInstall(call)) {
       installFailed = true;
+      const names = getRejectedToolNames(call);
+      if (names.length > 0) {
+        names.forEach((n) => rejectedToolNames.add(n));
+      } else {
+        unscopedInstallFailure = true;
+      }
     }
   });
 
@@ -794,6 +820,10 @@ export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]):
     // Every install this turn came back clean, so nothing stopped the model from getting what
     // it asked for. Only an install that could NOT deliver means a capability was missing.
     if (!installFailed) return;
+    // A failure this turn was scoped to specific tool names (a partial install) and THIS tool
+    // is not among them — some other skill was refused, not the one this tool needed. Only an
+    // unscoped failure (no name info at all) falls back to arming every gated tool.
+    if (rejectedToolNames.size > 0 && !rejectedToolNames.has(name) && !unscopedInstallFailure) return;
     unavailable.add(name);
   });
 

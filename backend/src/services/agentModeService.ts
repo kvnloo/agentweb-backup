@@ -6359,6 +6359,21 @@ export class AgentModeService {
          * and not any future guard, which would be reduced to string-matching prose.
          */
         result.rejectedSkillIds = rejectedSkillIds;
+        /*
+         * ENG-1188-follow-up (unavailable-capability notice, per-tool scoping): a rejected skill
+         * id alone does not tell a PURE ledger-only reader (buildUnavailableCapabilityNotice)
+         * which tool names it would have unlocked, so that reader could only ever ask "did SOME
+         * install fail this turn" — arming the notice for every gated tool in the turn, including
+         * ones whose skill installed fine. Resolving the ids to actual tool names here, once,
+         * where the skill catalog is in scope, lets that reader ask the precise question instead:
+         * "was THIS tool's skill among the ones refused".
+         */
+        const rejectedToolNames = Array.from(
+          new Set(
+            rejectedSkillIds.flatMap((id) => availableById.get(id)?.toolNames || []),
+          ),
+        );
+        if (rejectedToolNames.length > 0) result.rejectedToolNames = rejectedToolNames;
       }
 
       return result;
@@ -7052,6 +7067,12 @@ export class AgentModeService {
         ...(Array.isArray(a.installedSkills) ? { installedSkills: a.installedSkills } : {}),
         ...(Array.isArray(a.rejectedSkillIds) && a.rejectedSkillIds.length > 0
           ? { rejectedSkillIds: a.rejectedSkillIds }
+          : {}),
+        // Same reasoning as rejectedSkillIds above: this is what lets a ledger-only reader
+        // scope "was THIS gated tool's skill among the ones refused" instead of "did any
+        // install fail this turn" (buildUnavailableCapabilityNotice, synthesisResidue.ts).
+        ...(Array.isArray(a.rejectedToolNames) && a.rejectedToolNames.length > 0
+          ? { rejectedToolNames: a.rejectedToolNames }
           : {}),
       };
     }
