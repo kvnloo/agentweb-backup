@@ -99,6 +99,7 @@ import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
 import batchReviewRoutes, { batchReviewPublicRouter } from "./routes/batchReview";
 import imageReportsRoutes from "./routes/imageReports";
 import clientHealthRoutes from "./routes/clientHealth";
+import leadVolumeMonitorRoutes from "./routes/leadVolumeMonitor";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
 import orgMemoryRoutes from "./routes/orgMemory";
@@ -380,6 +381,9 @@ app.use("/api/admin/onboarding-loop", authenticateToken, isAdmin, onboardingLoop
 app.use("/api/admin/loops", authenticateToken, isAdmin, loopHealthRoutes);
 app.use("/api/admin/agent-runs", authenticateToken, isAdmin, agentRunsRoutes);
 app.use("/api/client-health", authenticateToken, isAdmin, clientHealthRoutes);
+// ENG-1551 — lead volume drought monitor. Same double-gate as client-health: middleware +
+// service-layer admin check.
+app.use("/api/lead-volume-monitor", authenticateToken, isAdmin, leadVolumeMonitorRoutes);
 app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/user-skills", authenticateToken, userSkillRoutes);
 app.use("/api/user-work-plans", authenticateToken, userWorkPlanRoutes);

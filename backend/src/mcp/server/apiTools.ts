@@ -2948,6 +2948,52 @@ Use this to quickly diagnose a client's marketing funnel completeness.`,
   }
 });
 
+mcpToolRegistry.register({
+  name: 'monitor_lead_volume',
+  definition: {
+    name: 'monitor_lead_volume',
+    description: `Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool.
+
+Trigger is distribution-aware, not a fixed day count: a campaign is flagged only when its trailing 7-day lead average falls below its OWN 5th-percentile historical floor. A campaign needs at least 14 days of baseline history (excluding the trailing window) before it can be flagged at all — with less, status is 'insufficient_history', not 'normal' or 'drought'.
+
+⚠ A flagged campaign ('status': 'drought') is NOT a confirmed drought — 'requiresTrackingValidation' is always true on that verdict, and you MUST run Conversion Tracking Validator on the same client before reporting it as a real issue. Pixel/CAPI breakage produces the same signal as a genuine lead collapse, and this tool cannot distinguish them.
+
+⚠ The response also includes 'unattributedContext' and 'totalUnattributedLeads' at the ACCOUNT level, separate from every campaign's own totals. A nonzero unattributed count is normal (not every ad carries a matchable UTM) — NEVER read it as evidence any specific campaign's volume collapsed, and never subtract it from a campaign's lead total.
+
+Returns one report per connected Meta ad account for the client.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        },
+        since: {
+          type: 'string',
+          description: 'Optional window start, YYYY-MM-DD. Defaults to 60 days before `until`.'
+        },
+        until: {
+          type: 'string',
+          description: 'Optional window end, YYYY-MM-DD. Defaults to today.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const query = new URLSearchParams();
+    if (args.since) query.set('since', args.since);
+    if (args.until) query.set('until', args.until);
+    const qs = query.toString();
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/lead-volume-monitor/${encodeURIComponent(args.client_name_or_email)}${qs ? `?${qs}` : ''}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
 // ─── Admin landing-page discovery/reassociation (ENG-721, admin-only) ───────
 
 mcpToolRegistry.register({
