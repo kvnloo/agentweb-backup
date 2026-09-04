@@ -65,6 +65,7 @@ describe('Meta write methods are bounded by the selected ad account (ENG-1724)',
       );
       expect(message).toMatch(/not available in the selected ad account/i);
       expect(message).not.toContain(OTHER_TENANT);
+      expect(message).not.toContain(`act_${OTHER_TENANT}`);
       expect(isMetaAccountScopeRefusal(new Error(message))).toBe(true);
       // The write must not have been attempted at all.
       expect(update).not.toHaveBeenCalled();
@@ -105,6 +106,7 @@ describe('Meta write methods are bounded by the selected ad account (ENG-1724)',
       );
       expect(message).toMatch(/not available in the selected ad account/i);
       expect(message).not.toContain(OTHER_TENANT);
+      expect(message).not.toContain(`act_${OTHER_TENANT}`);
       expect(isMetaAccountScopeRefusal(new Error(message))).toBe(true);
       expect(update).not.toHaveBeenCalled();
     });
@@ -117,6 +119,7 @@ describe('Meta write methods are bounded by the selected ad account (ENG-1724)',
       const message = await refusalMessage(service.deleteAdSet(token, 'adset_9', SELECTED));
       expect(message).toMatch(/not available in the selected ad account/i);
       expect(message).not.toContain(OTHER_TENANT);
+      expect(message).not.toContain(`act_${OTHER_TENANT}`);
       expect(isMetaAccountScopeRefusal(new Error(message))).toBe(true);
       expect(del).not.toHaveBeenCalled();
     });
@@ -143,6 +146,7 @@ describe('Meta write methods are bounded by the selected ad account (ENG-1724)',
       );
       expect(message).toMatch(/not available in the selected ad account/i);
       expect(message).not.toContain(OTHER_TENANT);
+      expect(message).not.toContain(`act_${OTHER_TENANT}`);
       expect(isMetaAccountScopeRefusal(new Error(message))).toBe(true);
       expect(update).not.toHaveBeenCalled();
     });
