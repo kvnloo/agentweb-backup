@@ -32491,6 +32491,17 @@ ${strippedHtml}`;
       // never surface even after restoring the field above. Surface it here too,
       // the same way, so a launch's own first pending input-requesting step is
       // never silently skipped.
+      //
+      // Reviewer finding: this write must use the same failIfAwaitingExists
+      // guard as the reactive block. Without it, updateSessionWorkPlanInputRequest
+      // attaches no ConditionExpression at all and blindly overwrites
+      // pendingWorkPlanInput — a force=true relaunch could silently clobber a
+      // genuinely still-awaiting card from whatever was active before, leaving
+      // it orphaned (pointing at a step that's no longer in the active plan)
+      // instead of failing closed. On a guard failure this just logs and skips
+      // surfacing the new step's card rather than blocking the launch — the
+      // plan itself is still valid without it, and the model can still recover
+      // by asking conversationally like it already does today.
       const launchInputStep = workPlan.steps
         .slice()
         .sort((a, b) => a.stepCount - b.stepCount)
@@ -32504,6 +32515,7 @@ ${strippedHtml}`;
               requestId: uuidv4(),
               stepCount: launchInputStep.stepCount,
             }),
+            { failIfAwaitingExists: true },
           );
         } catch (inputRequestError) {
           console.error('AgentMode: Error surfacing input request for launched work plan:', inputRequestError);
