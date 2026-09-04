@@ -716,6 +716,52 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
       expect(result.unavailableSections).toEqual([]);
       expect(result.message).toBe('Meta ads metrics loaded for 7d timeframe');
     });
+
+    /*
+     * ENG-1584 sibling: fetchWithRetryAndPaging is bounded (META_PAGING_MAX_PAGES) and none of
+     * these 9 parallel reads set a `limit`, so a dashboard for an account past the default
+     * page-size bound was silently short with no signal in the tool result at all. This drives
+     * a real multi-page campaigns fetch through the actual helper (a paging.next page that comes
+     * back unreadable) rather than asserting on a hand-built pagingTruncated literal, so it
+     * proves the flag survives all the way out of getMetaAdsMetrics, not just that the helper
+     * itself can set it.
+     */
+    it('flags truncatedSections when a paged read stops before the end of the account', async () => {
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      let campaignsCallCount = 0;
+
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        if (url.includes('/campaigns?')) {
+          campaignsCallCount++;
+          if (campaignsCallCount === 1) {
+            return Promise.resolve({
+              ok: true,
+              json: () => Promise.resolve({
+                data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+                paging: { next: 'https://graph.facebook.com/v25.0/act_123456789/campaigns?after=X' },
+              }),
+            });
+          }
+          // The second page comes back unreadable — no `data`, no `paging` — the shape
+          // fetchWithRetryAndPaging cannot merge, so it must report the read as truncated
+          // rather than silently returning only page 1's row as the whole account.
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ error: { message: 'Please reduce the amount of data' } }),
+          });
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ data: [] }) });
+      }) as jest.Mock;
+
+      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
+
+      expect(result.success).toBe(true);
+      expect(result.complete).toBe(false);
+      expect(result.truncatedSections).toContain('Campaigns');
+      expect(result.message).toMatch(/INCOMPLETE/);
+    });
   });
 
   describe('Integration - Date, Parameters, and Retry', () => {

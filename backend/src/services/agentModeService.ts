@@ -19336,6 +19336,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       ]);
 
 
+      /*
+       * ENG-1584 sibling: `fetchWithRetryAndPaging` is bounded (META_PAGING_MAX_PAGES) and
+       * these URLs set no `limit`, so an account past the default page-size bound got a
+       * dashboard silently missing rows with no signal at all — the helper already reports
+       * `pagingTruncated` for exactly this (see the checked sibling in listMetaAdsCampaigns
+       * above), it was just never read here across any of the 9 parallel fetches.
+       */
+      const truncatedSections = ([
+        ['Campaigns', campaignsData],
+        ['Ad Sets', adSetsData],
+        ['Ads', adsData],
+        ['Ad-level Insights', adInsightsData],
+        ['Adset-level Insights', adSetInsightsData],
+        ['Campaign-level Insights', campaignInsightsData],
+        ['Demographics Breakdown', insightsDemographicsData],
+        ['Placement Breakdown', insightsPlacementData],
+        ['Device Breakdown', insightsDeviceData],
+      ] as const)
+        .filter(([, response]) => (response as any)?.pagingTruncated === true)
+        .map(([section]) => section);
+
       // Keep connection lookup, permission, and query failures distinct so Emma
       // can prompt for the right remedy instead of always asking for reconnect.
       for (const [section, response] of [
@@ -19421,11 +19442,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         timeframe
       }, userId);
 
+      const truncationNote = truncatedSections.length > 0
+        ? ` THIS DATA IS INCOMPLETE for: ${truncatedSections.join(', ')} — the read stopped before the end of the account. Do not conclude an ad/campaign is absent based on these sections.`
+        : '';
       const result = {
         success: true,
-        message: breakdownStatus.partialFailure
+        message: (breakdownStatus.partialFailure
           ? `Meta ads metrics loaded for ${timeframe} timeframe (some breakdown sections unavailable: ${breakdownStatus.unavailableSections.join(', ')})`
-          : `Meta ads metrics loaded for ${timeframe} timeframe`,
+          : `Meta ads metrics loaded for ${timeframe} timeframe`) + truncationNote,
         timeframe,
         attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays },
         campaignSummary,
@@ -19436,6 +19460,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         sections: breakdownStatus.sections,
         partialFailure: breakdownStatus.partialFailure,
         unavailableSections: breakdownStatus.unavailableSections,
+        // ENG-1584 sibling: which sections hit the page-count bound, so a caller cannot mistake
+        // a short list for the whole account (see truncatedSections above).
+        ...(truncatedSections.length > 0 ? { truncatedSections, complete: false } : { complete: true }),
       };
 
       return result;

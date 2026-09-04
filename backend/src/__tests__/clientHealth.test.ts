@@ -169,6 +169,7 @@ describe('Client Health - assessClientHealth', () => {
     });
     expect(result.health.ads_layer.connected).toBe(true);
     expect(result.health.ads_layer.active_campaigns).toBe(2);
+    expect(result.health.ads_layer.campaigns_complete).toBe(true);
     expect(result.health.creative_variety.distinct_creatives).toBe(3);
     expect(result.health.status).toBeDefined();
     expect(['healthy', 'mediocre', 'at-risk', 'blocked']).toContain(result.health.status);
@@ -363,6 +364,99 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.success).toBe(true);
     expect(result.health.creative_variety.fatigue_warning).toBe(true);
     expect(result.health.creative_variety.fatigued_creatives[0].reasons).toContain('frequency');
+  });
+
+  /*
+   * ENG-1584 sibling: fetchWithRetryAndPaging is bounded and reports `pagingTruncated` when a
+   * read stops short of the account's full campaign list. active_campaigns is a bare count with
+   * no other signal that it might be an undercount — this pins that the truncation flag survives
+   * into ads_layer instead of being silently dropped, the gap this whole PR started from.
+   */
+  it('flags active_campaigns as incomplete when the campaigns read was truncated', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({
+        data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+        pagingTruncated: true,
+      })
+      .mockResolvedValueOnce({ data: [] });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.health.ads_layer.active_campaigns).toBe(1);
+    expect(result.health.ads_layer.campaigns_complete).toBe(false);
+  });
+
+  /*
+   * Fail-open regression: campaigns_complete used to default to `true` and only flip to `false`
+   * on a TRUNCATED success — a fetch that THREW (network error, expired token) fell straight to
+   * the catch block below (log-only), leaving active_campaigns at 0 and campaigns_complete still
+   * true. That reads as "confirmed zero campaigns, complete" when nothing was actually read.
+   */
+  it('does not report campaigns_complete:true when the campaigns fetch itself throws', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock).mockRejectedValueOnce(new Error('Meta access token expired'));
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.health.ads_layer.active_campaigns).toBe(0);
+    expect(result.health.ads_layer.campaigns_complete).toBe(false);
   });
 
   it('should detect a deployed landing page owned by another member of the client org', async () => {
