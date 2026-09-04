@@ -170,3 +170,56 @@ describe('write authorisation', () => {
     expect(mockDb.putScoredRecommendation).not.toHaveBeenCalled();
   });
 });
+
+describe('score input validation', () => {
+  const PENDING = {
+    accountId: OWNED,
+    platform: 'meta',
+    recommendationId: 'rec_1',
+    hypothesis: 'h',
+    predictedMetric: 'ctr',
+    predictedDirection: 'increase',
+    predictedMagnitudePct: 5,
+    evaluationDate: '2026-01-01',
+    createdAt: '2025-12-01T00:00:00.000Z',
+    createdBy: 'agent',
+    adopted: null,
+    status: 'pending',
+    scoredAt: null,
+    actualDirection: null,
+    actualMagnitudePct: null,
+    verdict: null,
+    verdictReason: null,
+  };
+
+  beforeEach(() => {
+    CALLER_IS_ADMIN = true;
+    (mockDb.getRecommendation as jest.Mock).mockResolvedValue(PENDING);
+  });
+
+  // NaN/Infinity are not representable in JSON (both serialize to `null`), so an HTTP caller can
+  // never actually produce a non-finite `typeof 'number'` value here — that guard belongs to, and
+  // is tested against, `scoreRecommendation` itself (`eng1550.outcomeLedger.test.ts`), which is
+  // reachable by any future non-HTTP caller too.
+
+  it('accepts a well-formed score', async () => {
+    const res = await request(app())
+      .post(`/api/outcome-ledger/meta/${OWNED}/rec_1/score`)
+      .send({ adopted: true, actualValue: 5, baselineValue: 4 });
+    expect(res.status).toBe(200);
+    expect(mockDb.putScoredRecommendation).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns 409, not 500, when the DB layer loses a concurrent double-score race', async () => {
+    // Simulates two requests racing past the route's own pending-status pre-check: the DB layer's
+    // condition expression is what actually catches this, and its rejection must produce the same
+    // status code as the pre-check path above, not a generic server error.
+    (mockDb.putScoredRecommendation as jest.Mock).mockRejectedValue(
+      new Error(`outcomeLedgerDb: recommendation 'rec_1' is not pending (already scored, or does not exist)`),
+    );
+    const res = await request(app())
+      .post(`/api/outcome-ledger/meta/${OWNED}/rec_1/score`)
+      .send({ adopted: true, actualValue: 5, baselineValue: 4 });
+    expect(res.status).toBe(409);
+  });
+});

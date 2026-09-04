@@ -68,6 +68,28 @@ describe('createRecommendation', () => {
   it('throws on a non-finite predictedMagnitudePct', () => {
     expect(() => createRecommendation({ ...baseInput, predictedMagnitudePct: NaN })).toThrow(/predictedMagnitudePct/);
   });
+
+  it('throws on an empty predictedMetric', () => {
+    expect(() => createRecommendation({ ...baseInput, predictedMetric: '' })).toThrow(/predictedMetric/);
+  });
+
+  it.each(['sideways', '', 'INCREASE'])(
+    'throws on an invalid predictedDirection %p',
+    badDirection => {
+      expect(() => createRecommendation({ ...baseInput, predictedDirection: badDirection as any })).toThrow(/predictedDirection/);
+    },
+  );
+
+  it.each(['not-a-date', '', 'February 30th'])(
+    'throws on an unparseable evaluationDate %p — a bad date must not silently bypass the settling-window guard',
+    badDate => {
+      expect(() => createRecommendation({ ...baseInput, evaluationDate: badDate })).toThrow(/evaluationDate/);
+    },
+  );
+
+  it('accepts a plain YYYY-MM-DD evaluationDate', () => {
+    expect(() => createRecommendation({ ...baseInput, evaluationDate: '2026-03-15' })).not.toThrow();
+  });
 });
 
 describe('scoreRecommendation', () => {
@@ -130,6 +152,44 @@ describe('scoreRecommendation', () => {
     });
     expect(result.verdict).toBe('unscoreable');
     expect(result.verdictReason).toMatch(/zero/);
+  });
+
+  it('is unscoreable, not silently misclassified as decrease, when actualValue is NaN', () => {
+    // A direct (non-HTTP) caller could pass NaN even though JSON can't carry it over the route —
+    // without this guard, NaN fails both `> 0` comparisons and falls through to 'decrease', a
+    // wrong verdict rather than an obviously-failed one.
+    const result = scoreRecommendation({
+      recommendation: pending,
+      now: '2026-06-01T00:00:00.000Z',
+      adopted: true,
+      actualValue: NaN,
+      baselineValue: 4,
+    });
+    expect(result.verdict).toBe('unscoreable');
+    expect(result.actualDirection).toBeNull();
+  });
+
+  it('is unscoreable, not a spurious increase, when actualValue is Infinity', () => {
+    const result = scoreRecommendation({
+      recommendation: pending,
+      now: '2026-06-01T00:00:00.000Z',
+      adopted: true,
+      actualValue: Infinity,
+      baselineValue: 4,
+    });
+    expect(result.verdict).toBe('unscoreable');
+    expect(result.actualMagnitudePct).toBeNull();
+  });
+
+  it('is unscoreable when baselineValue is NaN', () => {
+    const result = scoreRecommendation({
+      recommendation: pending,
+      now: '2026-06-01T00:00:00.000Z',
+      adopted: true,
+      actualValue: 5,
+      baselineValue: NaN,
+    });
+    expect(result.verdict).toBe('unscoreable');
   });
 
   it('is unscoreable and reports flat when the change is within the flat band', () => {
