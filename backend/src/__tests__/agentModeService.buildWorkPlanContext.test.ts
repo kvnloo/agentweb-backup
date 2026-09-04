@@ -81,8 +81,9 @@ describe('AgentModeService.buildWorkPlanContextMessages', () => {
     expect(content).toContain('Description: Gather business information');
     expect(content).toContain('Required Functions: update_brand_guidelines');
     // ENG-1697: no longer claims unconditional auto-install (false for ad-hoc
-    // plans/skip-advanced steps) -- tells the model to call install_skills itself.
-    expect(content).toContain('Skills for this step: brand-skill (call install_skills for any of these you don\'t already have before using them)');
+    // plans/skip-advanced steps) -- the reactive toolDispatch gate already
+    // handles missing-skill recovery, so this doesn't need to restate it.
+    expect(content).toContain('Skills for this step: brand-skill');
 
     // Not in autocomplete mode -> no autocomplete instruction
     expect(content).not.toContain('AUTOCOMPLETE MODE');
@@ -116,7 +117,7 @@ describe('AgentModeService.buildWorkPlanContextMessages', () => {
     const content: string = messages[0].content;
 
     expect(content).not.toContain('auto-installed');
-    expect(content).toContain('Skills for this step: brand-skill (call install_skills for any of these you don\'t already have before using them)');
+    expect(content).toContain('Skills for this step: brand-skill');
   });
 
   it('includes the autocomplete instruction when autocomplete is enabled', () => {
