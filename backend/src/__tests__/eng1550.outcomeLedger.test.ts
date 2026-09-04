@@ -61,6 +61,14 @@ describe('createRecommendation', () => {
     expect(() => createRecommendation({ ...baseInput, hypothesis: '   ' })).toThrow(/hypothesis/);
   });
 
+  it('throws the clean validation message, not a raw TypeError, when hypothesis is entirely absent', () => {
+    // Live-tested against a real admin request missing the field entirely (not an empty string):
+    // `undefined.trim()` threw "Cannot read properties of undefined (reading 'trim')" instead of
+    // this message, before the falsy-check could run.
+    const { hypothesis, ...rest } = baseInput;
+    expect(() => createRecommendation(rest as any)).toThrow(/hypothesis must not be empty/);
+  });
+
   it('throws on a negative predictedMagnitudePct', () => {
     expect(() => createRecommendation({ ...baseInput, predictedMagnitudePct: -1 })).toThrow(/predictedMagnitudePct/);
   });

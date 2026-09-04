@@ -105,7 +105,7 @@ export interface CreateRecommendationInput {
 /** Builds a new pending recommendation record. Adoption is unknown at creation time — it is set
  * later, by whatever surface acts on (or ignores) the recommendation. */
 export function createRecommendation(input: CreateRecommendationInput): Recommendation {
-  if (!input.hypothesis.trim()) {
+  if (!input.hypothesis || !input.hypothesis.trim()) {
     throw new Error('outcomeLedger: hypothesis must not be empty — an unscoreable-by-design prediction is not a prediction');
   }
   if (!input.predictedMetric || !String(input.predictedMetric).trim()) {
