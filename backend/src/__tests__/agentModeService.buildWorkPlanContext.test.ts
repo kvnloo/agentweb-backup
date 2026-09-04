@@ -80,10 +80,43 @@ describe('AgentModeService.buildWorkPlanContextMessages', () => {
     // Optional per-step details
     expect(content).toContain('Description: Gather business information');
     expect(content).toContain('Required Functions: update_brand_guidelines');
-    expect(content).toContain('Skills (auto-installed when this step becomes active): brand-skill');
+    // ENG-1697: no longer claims unconditional auto-install (false for ad-hoc
+    // plans/skip-advanced steps) -- tells the model to call install_skills itself.
+    expect(content).toContain('Skills for this step: brand-skill (call install_skills for any of these you don\'t already have before using them)');
 
     // Not in autocomplete mode -> no autocomplete instruction
     expect(content).not.toContain('AUTOCOMPLETE MODE');
+  });
+
+  it('ENG-1697: never claims a skipped-past step\'s skills were auto-installed', () => {
+    // Step 1 was SKIPPED (not completed) -- the completion-triggered
+    // auto-install block never fires for a skip, so step 2's skills were
+    // never installed even though it's now the active step. The rendered
+    // text must not promise otherwise.
+    const planWithSkippedFirstStep = {
+      title: 'Client Onboarding',
+      steps: [
+        {
+          stepCount: 1,
+          title: 'Analyze website',
+          status: 'skipped' as const,
+        },
+        {
+          stepCount: 2,
+          title: 'Update brand guidelines',
+          status: 'pending' as const,
+          skillIds: ['brand-skill'],
+        },
+      ],
+      createdAt: '2025-01-15T09:00:00.000Z',
+      updatedAt: '2025-01-15T10:00:00.000Z',
+    };
+
+    const messages = AgentModeService.buildWorkPlanContextMessages(planWithSkippedFirstStep);
+    const content: string = messages[0].content;
+
+    expect(content).not.toContain('auto-installed');
+    expect(content).toContain('Skills for this step: brand-skill (call install_skills for any of these you don\'t already have before using them)');
   });
 
   it('includes the autocomplete instruction when autocomplete is enabled', () => {
