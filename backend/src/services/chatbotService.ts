@@ -3678,7 +3678,10 @@ export class ChatbotDB {
     maxAttempts = 5
   ): Promise<ChatSession> {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const session = await this.getChatSession(sessionId);
+      // Record-only read: this loop only needs calledFunctions/calledFunctionsVersion,
+      // so avoid getChatSession's AW-ChatMessages query (and possible one-time
+      // migration write) on every retry attempt.
+      const session = await this.getChatSessionRecord(sessionId);
       if (!session) {
         throw new Error(`Session ${sessionId} not found`);
       }
