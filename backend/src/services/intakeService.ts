@@ -695,11 +695,34 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     // (escalateIssue is raise-only and a distinct, intentional ENG-358 behavior); routing is not.
     return { pageId: match.identifier, url: `${LINEAR_ISSUE_BASE}/${match.identifier}`, deduped: true, tracker: 'Linear' };
   }
+
+  // No LIVE canonical matched (none, or the only match(es) were archived — listOpenIssuesByLabel
+  // never returns an archived row, see linearService). ENG-730: archival is otherwise a SILENT
+  // dedupe-breaking event — the occurrence history for this alert class goes cold with no trace.
+  // Best-effort look up the most recently archived issue of the same class/idempotency-key/title
+  // so the fresh canonical records what it replaces (AC3). Never blocks filing: any failure here
+  // just means the new canonical carries no predecessor line, exactly like before this change.
+  let archivedPredecessorLine = '';
+  try {
+    const { findMostRecentArchivedIssueByLabel } = await import('./linearService');
+    const archived = await findMostRecentArchivedIssueByLabel('Auto', (i) => {
+      if (classNeedle && classNeedle.test(i.description || '')) return true;
+      if (idKeys.length && idKeys.some((k) => (i.description || '').includes(k))) return true;
+      return norm(i.title) === norm(p.title);
+    });
+    if (archived) {
+      archivedPredecessorLine = `Predecessor (archived): ${archived.identifier} — that canonical was archived, so this occurrence could not be attached to it and a new canonical was filed instead.`;
+    }
+  } catch (e) {
+    console.warn('[intake] archived-predecessor lookup failed:', e instanceof Error ? e.message : e);
+  }
+
   const body = [
     p.description,
     '',
     '---',
     `Source: ${p.source} — auto-identified by the system.`,
+    ...(archivedPredecessorLine ? [archivedPredecessorLine] : []),
     ...contextLines(p.notionContext),
   ].join('\n');
   const li = await createInternalLinearIssue({
