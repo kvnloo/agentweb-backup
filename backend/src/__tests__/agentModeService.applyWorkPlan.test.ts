@@ -175,9 +175,13 @@ describe('AgentModeService - predefined work plan templates', () => {
         expect.objectContaining({ stepCount: 1 }),
         { failIfAwaitingExists: true }
       );
+      // ENG-1765 follow-up: a silent server log isn't enough -- the model must
+      // be told so it can ask conversationally instead of nobody ever asking.
+      expect(result.message).toContain('Who and why');
+      expect(result.message).toContain('ask the user for this information directly');
     });
 
-    it('ENG-1765: a real error surfacing the input request is logged and swallowed, not thrown', async () => {
+    it('ENG-1765: a real error surfacing the input request is logged and swallowed, not thrown, and the model is told', async () => {
       mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
         v === 'system' ? [templateWithInputRequest] : []
       );
@@ -191,7 +195,19 @@ describe('AgentModeService - predefined work plan templates', () => {
         'AgentMode: Error surfacing input request for launched work plan:',
         expect.any(Error)
       );
+      expect(result.message).toContain('ask the user for this information directly');
       consoleErrorSpy.mockRestore();
+    });
+
+    it('ENG-1765: does not add the not-surfaced note when the input request surfaces successfully', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+      (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockResolvedValue({ sessionId });
+
+      const result = await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(result.message).not.toContain('ask the user for this information directly');
     });
 
     it('auto-installs the union of all step skills upfront', async () => {
