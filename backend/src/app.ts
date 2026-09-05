@@ -185,10 +185,22 @@ const corsOptions = {
       "https://agentweb-user-files.s3.us-west-2.amazonaws.com", // S3 bucket for user files
       process.env.FRONTEND_URL || "http://localhost:5173", // Partner Portal (Deployed or Local)
       process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174", // Customer Portal (Deployed or Local)
-      process.env.GROWTH_GENIUS_CHAT_URL || "http://localhost:8080", // Growth Genius Chat (Deployed or Local)
-      /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
-      /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/, // Allow any ngrok.io subdomain
     ];
+
+    // ngrok tunnels are a local-dev convenience (exposing a laptop's backend to a
+    // webhook sender, a mobile device, etc.) and must never be a credentialed
+    // origin in production — any ngrok tenant on the internet would otherwise be
+    // allowed (ENG-1751). Opt back in explicitly via CORS_ALLOW_NGROK=1 if a
+    // production ngrok use case is ever needed.
+    if (
+      process.env.NODE_ENV !== "production" ||
+      process.env.CORS_ALLOW_NGROK === "1"
+    ) {
+      allowedOrigins.push(
+        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
+        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/ // Allow any ngrok.io subdomain
+      );
+    }
 
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);

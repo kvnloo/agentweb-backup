@@ -198,6 +198,68 @@ describe('CORS Access-Control-Allow-Methods', () => {
     expect(headers).toContain('pragma');
   });
 
+  // ENG-1751: ngrok origins are a local-dev convenience and must never be a
+  // credentialed CORS origin in production.
+  describe('ngrok origin production gate (ENG-1751)', () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    const originalAllowNgrok = process.env.CORS_ALLOW_NGROK;
+
+    afterEach(() => {
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+      if (originalAllowNgrok === undefined) delete process.env.CORS_ALLOW_NGROK;
+      else process.env.CORS_ALLOW_NGROK = originalAllowNgrok;
+    });
+
+    it('rejects a ngrok-free.app origin when NODE_ENV=production', async () => {
+      process.env.NODE_ENV = 'production';
+      delete process.env.CORS_ALLOW_NGROK;
+
+      const res = await request(app)
+        .options('/api/loop-events')
+        .set('Origin', 'https://anything.ngrok-free.app')
+        .set('Access-Control-Request-Method', 'POST');
+
+      expect(res.headers['access-control-allow-origin']).toBeUndefined();
+    });
+
+    it('rejects a ngrok.io origin when NODE_ENV=production', async () => {
+      process.env.NODE_ENV = 'production';
+      delete process.env.CORS_ALLOW_NGROK;
+
+      const res = await request(app)
+        .options('/api/loop-events')
+        .set('Origin', 'https://anything.ngrok.io')
+        .set('Access-Control-Request-Method', 'POST');
+
+      expect(res.headers['access-control-allow-origin']).toBeUndefined();
+    });
+
+    it('still allows a ngrok-free.app origin outside production', async () => {
+      process.env.NODE_ENV = 'test';
+      delete process.env.CORS_ALLOW_NGROK;
+
+      const res = await request(app)
+        .options('/api/loop-events')
+        .set('Origin', 'https://anything.ngrok-free.app')
+        .set('Access-Control-Request-Method', 'POST');
+
+      expect(res.headers['access-control-allow-origin']).toBe('https://anything.ngrok-free.app');
+    });
+
+    it('allows a ngrok origin in production only with the explicit CORS_ALLOW_NGROK=1 opt-in', async () => {
+      process.env.NODE_ENV = 'production';
+      process.env.CORS_ALLOW_NGROK = '1';
+
+      const res = await request(app)
+        .options('/api/loop-events')
+        .set('Origin', 'https://anything.ngrok-free.app')
+        .set('Access-Control-Request-Method', 'POST');
+
+      expect(res.headers['access-control-allow-origin']).toBe('https://anything.ngrok-free.app');
+    });
+  });
+
   it('public endpoints should only advertise GET, POST, OPTIONS methods', async () => {
     const res = await request(app)
       .options('/api/lead-magnet/test')
