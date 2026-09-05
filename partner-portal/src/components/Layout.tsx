@@ -10,8 +10,7 @@ import {
   Menu,
   MenuItem,
   Toolbar,
-  Typography,
-  Alert
+  Typography
 } from '@mui/material';
 import ExpandMoreRoundedIcon from '@mui/icons-material/ExpandMoreRounded';
 import { useAuth } from '../contexts/AuthContext';
@@ -281,23 +280,6 @@ export default function Layout() {
             )}
           </Toolbar>
         </AppBar>
-      )}
-      {user && location.pathname !== '/' && (
-        <Alert
-          severity="info"
-          sx={{
-            borderRadius: 0,
-            '& .MuiAlert-message': {
-              width: '100%',
-              textAlign: 'center'
-            }
-          }}
-        >
-          🚧 Private Beta: This is a beta version - bugs and issues may arise. Please report them to{' '}
-          <a href="mailto:support@agentweb.pro" style={{ color: 'inherit', fontWeight: 'bold' }}>
-            support@agentweb.pro
-          </a>
-        </Alert>
       )}
       {isFullBleedRoute ? (
         <Box component="main" sx={{ flexGrow: 1, display: 'flex', flexDirection: 'column' }}>
