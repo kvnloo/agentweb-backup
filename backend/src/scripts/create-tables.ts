@@ -2577,6 +2577,11 @@ const main = async () => {
     await createAgentRunsTable();
     await createMetaCapiKeyCoverageTable();
     await createAdsThresholdsTable();
+    await createContactEventsTable();
+    await createCustomDomainsTable();
+    await createLeadMagnetConfigsTable();
+    await createOnboardingLoopRunsTable();
+    await createPromptSignalsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -3273,6 +3278,165 @@ const createAdsThresholdsTable = async () => {
     KeySchema: [
       { AttributeName: 'entityKey', KeyType: 'HASH' },
       { AttributeName: 'paramKey', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-1758 AC3 — services/contactEventsDb.ts: contact timeline and webhook replay lookup.
+const createContactEventsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-ContactEvents`,
+    AttributeDefinitions: [
+      { AttributeName: 'contactId', AttributeType: 'S' },
+      { AttributeName: 'eventTimestamp', AttributeType: 'S' },
+      { AttributeName: 'sourceRecordId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'contactId', KeyType: 'HASH' },
+      { AttributeName: 'eventTimestamp', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'sourceRecordId-index',
+        KeySchema: [
+          { AttributeName: 'sourceRecordId', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-1758 AC3 — services/customDomainService.ts: get/delete by id; list by userId.
+const createCustomDomainsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-CustomDomains`,
+    AttributeDefinitions: [
+      { AttributeName: 'id', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'id', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'userId-index',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-1758 AC3 — services/leadMagnetConfigDb.ts: CRUD by configId; slug/enabled reads are scans.
+const createLeadMagnetConfigsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-LeadMagnetConfigs`,
+    AttributeDefinitions: [
+      { AttributeName: 'configId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'configId', KeyType: 'HASH' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-1758 AC3 — cron/onboardingLoop.ts: one log item per generated runId.
+const createOnboardingLoopRunsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-OnboardingLoopRuns`,
+    AttributeDefinitions: [
+      { AttributeName: 'runId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'runId', KeyType: 'HASH' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-1758 AC3 — services/promptSignalsService.ts: signals by UUID; recent signals by prompt version.
+const createPromptSignalsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-PromptSignals`,
+    AttributeDefinitions: [
+      { AttributeName: 'signalId', AttributeType: 'S' },
+      { AttributeName: 'promptVersion', AttributeType: 'S' },
+      { AttributeName: 'ts', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'signalId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'PromptVersionIndex',
+        KeySchema: [
+          { AttributeName: 'promptVersion', KeyType: 'HASH' },
+          { AttributeName: 'ts', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
     ],
     BillingMode: 'PAY_PER_REQUEST',
   };
