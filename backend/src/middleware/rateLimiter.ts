@@ -12,9 +12,14 @@ export class RateLimiter {
   private entries: Map<string, RateLimitEntry> = new Map();
   private cleanupInterval: ReturnType<typeof setInterval> | null = null;
   private windowMs = 60000; // 1 minute
+  // Bounds in-memory growth against a flood of distinct keys (e.g. many
+  // source IPs hitting a public endpoint). Cap chosen generously above any
+  // realistic legitimate per-minute unique-caller count for this process.
+  private maxEntries: number;
 
-  constructor(cleanupIntervalMs: number = 60000) {
+  constructor(cleanupIntervalMs: number = 60000, maxEntries: number = 50000) {
     this.cleanupInterval = setInterval(() => this.cleanup(), cleanupIntervalMs);
+    this.maxEntries = maxEntries;
   }
 
   check(key: string, maxPerMinute: number): RateLimitResult {
@@ -23,6 +28,17 @@ export class RateLimiter {
 
     let entry = this.entries.get(key);
     if (!entry) {
+      if (this.entries.size >= this.maxEntries) {
+        // At capacity: evict the oldest tracked key (Map preserves insertion
+        // order) rather than let the table grow unbounded. Worst case this
+        // lets one additional request through for an evicted key sooner than
+        // its window would normally allow — acceptable relative to unbounded
+        // memory growth from a distinct-IP flood.
+        const oldestKey = this.entries.keys().next().value;
+        if (oldestKey !== undefined) {
+          this.entries.delete(oldestKey);
+        }
+      }
       entry = { timestamps: [] };
       this.entries.set(key, entry);
     }
