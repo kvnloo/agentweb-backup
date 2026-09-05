@@ -281,10 +281,10 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       // "cost-band tier derivation" below), not read off this static field —
       // these three still carry the pre-derivation literal so a model with
       // no MODEL_PRICING entry has a sane fallback, but it is no longer what
-      // the picker actually shows. The real, cost-derived tiers are pro
-      // (since ENG-1784 moved the Flagship floor to 72 — Sol scores 71),
-      // medium, and cheap respectively (Luna landed in 'cheap' once its
-      // Azure BYOK rate replaced OpenRouter's promo price, 6cbfecfa4).
+      // the picker actually shows. With ENG-1784's bands (Frontier ≥64,
+      // Pro 58–63, Medium 53–57, Cheap 31–52) the real, cost-derived tiers
+      // are ultra_premium (Sol, 71), pro (Terra, 62) and cheap (Luna, 50)
+      // respectively — see the ENG-1784 block for the pinned outcomes.
       it('carries a static tier as a no-price fallback, distinct from its real cost-derived tier', () => {
         const llmModels = (agentModeService as any).llmModels;
         expect(llmModels['openrouter/openai/gpt-5.6-sol'].tier).toBe('pro');
@@ -417,30 +417,42 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     });
 
     /*
-     * ENG-1784 (2026-09-05) — Harsha moved the Flagship (ultra_premium) floor
-     * from cost score 71 to 72: "not let 'flagship' cost be 71 and over, and
-     * instead 72 and over ... so Sol and Opus 5 can be on the same tier."
-     * Live scores that day: Fable 5.1 / Astra 79, Sol 71, GPT-5.5 71
-     * (legacy), Opus 5 / Opus 4.8 70. Nothing sits between 71 and 72.
+     * ENG-1784 (2026-09-05) — Harsha re-cut the picker's cost bands: "low
+     * should have everything 52 and below (very low is fine as it is now),
+     * then medium should be 57-53, then pro should be 63-58, frontier is
+     * everything above" — and, from the same conversation, "so Sol and Opus 5
+     * can be on the same tier". Live cost scores that day: Fable 5.1 / Astra
+     * 79, Sol 71, GPT-5.5 71 (legacy), Opus 5 / Opus 4.8 70, Sonnet 5 63,
+     * Terra 62, Kimi K3 61, Grok 4.6 / Qwen3.8 Max 54, Luna 50, Haiku 4.5 49,
+     * GPT-5.4 Nano 29. Only models whose prices are not known to be stale are
+     * pinned below (Terra/Luna are being re-priced under ENG-1781).
      */
-    describe('ENG-1784 — Flagship floor 72: Sol and Opus 5 share the Pro tier', () => {
-      it('puts GPT-5.6 Sol and Claude Opus 5 in the same tier, and it is pro (AC2)', async () => {
+    describe('ENG-1784 — cost bands re-cut: Frontier ≥64, Pro 58–63, Medium 53–57, Cheap 31–52', () => {
+      const tierOf = async (id: string) => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
-        const sol = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!;
-        const opus5 = models.find((m) => m.id === 'anthropic.claude-opus-5')!;
-        expect(sol.tier).toBe('pro');
-        expect(opus5.tier).toBe(sol.tier);
+        return models.find((m) => m.id === id)!.tier;
+      };
+
+      it('puts GPT-5.6 Sol and Claude Opus 5 in the same tier — the Flagship/frontier band (AC2)', async () => {
+        const sol = await tierOf('openrouter/openai/gpt-5.6-sol');
+        expect(sol).toBe('ultra_premium');
+        expect(await tierOf('anthropic.claude-opus-5')).toBe(sol);
       });
 
-      it('keeps GPT-6 Astra and Claude Fable 5.1 in ultra_premium (AC3)', async () => {
-        const models = await agentModeService.getSupportedModelsWithMetadata(true);
-        expect(models.find((m) => m.id === 'openrouter/openai/gpt-6-astra')!.tier).toBe('ultra_premium');
-        expect(models.find((m) => m.id === 'openrouter/anthropic/claude-fable-5.1')!.tier).toBe('ultra_premium');
+      it('keeps GPT-6 Astra and Claude Fable 5.1 in the Flagship band (AC3)', async () => {
+        expect(await tierOf('openrouter/openai/gpt-6-astra')).toBe('ultra_premium');
+        expect(await tierOf('openrouter/anthropic/claude-fable-5.1')).toBe('ultra_premium');
       });
 
-      // Dominance is band-rank based; moving GPT-5.5 (71) from ultra_premium
-      // to pro must not rescue it — Terra (medium) is still cheaper and at
-      // least as good — and must not touch Sol (no family).
+      it('places the band edges where Harsha drew them: Sonnet 5 (63) pro, Haiku 4.5 (49) cheap, GPT-5.4 Nano (29) very cheap', async () => {
+        expect(await tierOf('anthropic.claude-sonnet-5')).toBe('pro');
+        expect(await tierOf('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe('cheap');
+        expect(await tierOf('gpt-5.4-nano')).toBe('ultra_cheap');
+      });
+
+      // Dominance is band-rank based; re-cutting the bands must not rescue
+      // GPT-5.5 (Terra is still a cheaper band and at least as good) and must
+      // not touch Sol (no family).
       it('leaves dominance outcomes unchanged: GPT-5.5 still legacy, Sol still not (AC4)', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         expect(models.find((m) => m.id === 'gpt-5.5')!.legacy).toBe(true);
