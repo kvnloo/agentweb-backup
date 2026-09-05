@@ -1,5 +1,10 @@
 interface RateLimitEntry {
   timestamps: number[];
+  // The maxPerMinute this key was last checked against — needed at eviction
+  // time to tell whether a key is currently *blocked* (at/over its own
+  // limit) vs merely active, since eviction must never free up a blocked
+  // key's slot (that would let it bypass its window early).
+  lastMax: number;
 }
 
 export interface RateLimitResult {
@@ -19,7 +24,49 @@ export class RateLimiter {
 
   constructor(cleanupIntervalMs: number = 60000, maxEntries: number = 50000) {
     this.cleanupInterval = setInterval(() => this.cleanup(), cleanupIntervalMs);
-    this.maxEntries = maxEntries;
+    // Only enable bounded storage for a valid positive integer cap; an
+    // invalid value (non-finite, non-integer, <= 0) falls back to the
+    // default rather than silently disabling or corrupting eviction.
+    this.maxEntries =
+      Number.isInteger(maxEntries) && maxEntries > 0 ? maxEntries : 50000;
+  }
+
+  /**
+   * Picks a key safe to evict at capacity, in priority order:
+   *   1. A key with no timestamps left in the window (fully idle) — freeing
+   *      it changes nothing observable.
+   *   2. A key that is tracked but NOT currently at/over its own limit
+   *      (i.e. not blocked) — evicting it just means its next request looks
+   *      "fresh", which is the same relaxation the old oldest-insertion
+   *      eviction already accepted for non-blocked keys.
+   *   3. Only if every single tracked key is currently blocked, fall back to
+   *      the oldest insertion — still bounds memory, and this case requires
+   *      >= maxEntries simultaneously-blocked distinct keys, an extreme
+   *      flood scenario where evicting one blocked key slightly early is an
+   *      acceptable trade against unbounded growth.
+   */
+  private findEvictionCandidate(now: number): string | undefined {
+    const windowStart = now - this.windowMs;
+    let blockedFallback: string | undefined;
+
+    for (const [key, entry] of this.entries.entries()) {
+      const activeCount = entry.timestamps.filter((t) => t > windowStart).length;
+
+      if (activeCount === 0) {
+        return key; // fully idle — safe to evict immediately
+      }
+
+      const isBlocked = activeCount >= entry.lastMax;
+      if (!isBlocked) {
+        return key; // active but under its own limit — safe to evict
+      }
+
+      if (blockedFallback === undefined) {
+        blockedFallback = key;
+      }
+    }
+
+    return blockedFallback;
   }
 
   check(key: string, maxPerMinute: number): RateLimitResult {
@@ -29,19 +76,18 @@ export class RateLimiter {
     let entry = this.entries.get(key);
     if (!entry) {
       if (this.entries.size >= this.maxEntries) {
-        // At capacity: evict the oldest tracked key (Map preserves insertion
-        // order) rather than let the table grow unbounded. Worst case this
-        // lets one additional request through for an evicted key sooner than
-        // its window would normally allow — acceptable relative to unbounded
-        // memory growth from a distinct-IP flood.
-        const oldestKey = this.entries.keys().next().value;
-        if (oldestKey !== undefined) {
-          this.entries.delete(oldestKey);
+        // At capacity: evict a safe key (see findEvictionCandidate) rather
+        // than let the table grow unbounded.
+        const evictKey = this.findEvictionCandidate(now);
+        if (evictKey !== undefined) {
+          this.entries.delete(evictKey);
         }
       }
-      entry = { timestamps: [] };
+      entry = { timestamps: [], lastMax: maxPerMinute };
       this.entries.set(key, entry);
     }
+
+    entry.lastMax = maxPerMinute;
 
     // Remove timestamps outside the window
     entry.timestamps = entry.timestamps.filter((t) => t > windowStart);
