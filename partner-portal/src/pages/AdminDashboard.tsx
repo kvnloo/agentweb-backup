@@ -19,7 +19,6 @@ import {
   CardContent,
   TextField,
   Chip,
-  Container,
   Dialog,
   DialogTitle,
   DialogContent,
@@ -43,7 +42,12 @@ import {
   Divider,
   Switch,
 } from "@mui/material";
-import { ADMIN_NAVIGATION_SECTIONS, ADMIN_TAB_MAP } from "./adminNavigation";
+import { ADMIN_NAVIGATION_SECTIONS, ADMIN_TAB_MAP, ADMIN_TABS } from "./adminNavigation";
+
+// One-line descriptions shown under the page title (copy from the approved ENG-1707 mock).
+const ADMIN_TAB_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  users: "Manage access, status, and account health.",
+};
 import { format } from "date-fns";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
@@ -3337,54 +3341,133 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
     "Other",
   ];
 
+  const currentAdminTab = ADMIN_TABS.find((adminTab) => adminTab.value === tabValue);
+
   if (adminError) {
     return <Alert severity="error">{adminError}</Alert>;
   }
 
   return (
-    <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
-      <Typography variant="h4" component="h1" gutterBottom>
-        Admin Dashboard
-      </Typography>
-
-      <Paper sx={{ width: "100%", mt: 3, display: { md: "flex" }, alignItems: "stretch" }}>
-        <Box
-          component="nav"
-          aria-label="Admin sections"
-          sx={{
-            width: { xs: "100%", md: 224 },
-            flexShrink: 0,
-            borderRight: { md: 1 },
-            borderBottom: { xs: 1, md: 0 },
-            borderColor: "divider",
-            p: 1.5,
-            maxHeight: { xs: 320, md: "calc(100vh - 180px)" },
-            overflowY: "auto",
-          }}
-        >
-          {ADMIN_NAVIGATION_SECTIONS.map((section) => (
-            <Box key={section.label} sx={{ mb: 1.5 }}>
-              <Typography variant="overline" color="text.secondary" sx={{ px: 1, display: "block", fontSize: "0.65rem", lineHeight: 2 }}>
-                {section.label}
-              </Typography>
-              {section.tabs.map((adminTab) => (
+    <>
+    <Box
+      sx={{
+        display: "flex",
+        flexDirection: { xs: "column", md: "row" },
+        alignItems: "stretch",
+        flexGrow: 1,
+        minHeight: { md: "calc(100vh - 58px)" },
+        bgcolor: "background.default",
+      }}
+    >
+      {/* Admin sidebar — seven named sections (ENG-1707 round 2). Grouping is presentational; ?tab= deep links are unchanged. */}
+      <Box
+        component="nav"
+        aria-label="Admin sections"
+        sx={{
+          width: { xs: "100%", md: 232 },
+          flexShrink: 0,
+          bgcolor: "background.paper",
+          borderRight: { md: "1px solid" },
+          borderBottom: { xs: "1px solid", md: 0 },
+          borderColor: "divider",
+          px: 1.25,
+          py: 1.5,
+          position: { md: "sticky" },
+          top: 0,
+          alignSelf: { md: "flex-start" },
+          maxHeight: { xs: 280, md: "100vh" },
+          overflowY: "auto",
+          scrollbarWidth: "thin",
+          scrollbarColor: "#e2e8f0 transparent",
+          "&::-webkit-scrollbar": { width: 6 },
+          "&::-webkit-scrollbar-thumb": { bgcolor: "#e2e8f0", borderRadius: 3 },
+        }}
+      >
+        {ADMIN_NAVIGATION_SECTIONS.map((section, sectionIndex) => (
+          <Box key={section.label} sx={{ mb: 0.75 }}>
+            <Typography
+              component="div"
+              sx={{
+                px: 1.25,
+                pt: sectionIndex === 0 ? 0.5 : 1.5,
+                pb: 0.5,
+                fontSize: "0.625rem",
+                fontWeight: 700,
+                letterSpacing: "0.07em",
+                textTransform: "uppercase",
+                color: "#94a3b8",
+              }}
+            >
+              {section.label}
+            </Typography>
+            {section.tabs.map((adminTab) => {
+              const selected = tabValue === adminTab.value;
+              return (
                 <Button
                   key={adminTab.slug}
                   role="tab"
-                  aria-selected={tabValue === adminTab.value}
+                  aria-selected={selected}
                   {...a11yProps(adminTab.value)}
                   onClick={(event) => handleTabChange(event, adminTab.value)}
-                  variant={tabValue === adminTab.value ? "contained" : "text"}
                   fullWidth
-                  sx={{ justifyContent: "flex-start", mb: 0.25, py: 0.75 }}
+                  disableElevation
+                  sx={{
+                    justifyContent: "flex-start",
+                    textAlign: "left",
+                    my: "1px",
+                    px: 1.25,
+                    py: 0.875,
+                    minHeight: 0,
+                    borderRadius: "6px",
+                    fontSize: "0.8125rem",
+                    lineHeight: 1.35,
+                    fontWeight: selected ? 700 : 500,
+                    color: selected ? "primary.dark" : "#475569",
+                    bgcolor: selected ? "#eff6ff" : "transparent",
+                    "&:hover": { bgcolor: selected ? "#eff6ff" : "background.default", color: selected ? "primary.dark" : "text.primary" },
+                    "&.Mui-focusVisible": { boxShadow: "0 0 0 2px #bfdbfe" },
+                  }}
                 >
                   {adminTab.label}
                 </Button>
-              ))}
+              );
+            })}
+          </Box>
+        ))}
+      </Box>
+      <Box sx={{ minWidth: 0, flexGrow: 1, display: "flex", flexDirection: "column" }}>
+        {/* Page header for the selected admin surface: title, optional description, and surface-level actions. */}
+        <Box
+          sx={{
+            px: 3,
+            pt: 3,
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "flex-start",
+            gap: 1.5,
+          }}
+        >
+          <Box sx={{ flexGrow: 1, minWidth: 200 }}>
+            <Typography component="h1" sx={{ fontSize: "1.25rem", fontWeight: 700, lineHeight: 1.3, letterSpacing: "-0.01em" }}>
+              {currentAdminTab?.label ?? "Admin"}
+            </Typography>
+            {currentAdminTab && ADMIN_TAB_DESCRIPTIONS[currentAdminTab.slug] && (
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.25 }}>
+                {ADMIN_TAB_DESCRIPTIONS[currentAdminTab.slug]}
+              </Typography>
+            )}
+          </Box>
+          {tabValue === ADMIN_TAB_MAP.users && (
+            <Box sx={{ display: "flex", gap: 1, flexShrink: 0, flexWrap: "wrap" }}>
+              <Button variant="outlined" size="small" startIcon={resyncPaymentsLoading ? <CircularProgress size={14} /> : <SyncIcon />} onClick={handleResyncPayments} disabled={resyncPaymentsLoading}>
+                Resync Payments
+              </Button>
+              <Button variant="contained" size="small" disableElevation startIcon={<SyncIcon />} onClick={() => handleOpenCrmSyncDialog("users")}>
+                Sync to CRM
+              </Button>
             </Box>
-          ))}
+          )}
         </Box>
-        <Box sx={{ minWidth: 0, flexGrow: 1 }}>
 
         <TabPanel value={tabValue} index={0}>
           <Box sx={{ mb: 3 }}>
@@ -4119,9 +4202,9 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
             const hasAttention = pastDue.length > 0 || trialEnding.length > 0 || trialExpired.length > 0 || subscriptionExpired.length > 0;
             if (!hasAttention) return null;
             return (
-              <Paper variant="outlined" sx={{ mb: 3, p: 2, borderColor: "error.light", bgcolor: "error.50" }}>
+              <Paper variant="outlined" sx={{ mb: 3, p: 2, borderRadius: 2, boxShadow: "none", borderColor: "#fecaca", bgcolor: "#fef2f2" }}>
                 <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5, color: "error.main" }}>
-                  ⚠️ Attention Needed
+                  Attention needed
                 </Typography>
                 {pastDue.length > 0 && (
                   <Box sx={{ mb: 1.5 }}>
@@ -4174,8 +4257,8 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
               </Paper>
             );
           })()}
-          {/* Summary cards - Stripe-style muted design */}
-          <Box sx={{ display: "flex", gap: 2, mb: 3, flexWrap: "wrap" }}>
+          {/* Summary cards — one even row on desktop, wraps to a grid on narrower widths */}
+          <Box sx={{ display: "grid", gridTemplateColumns: { xs: "repeat(2, minmax(0, 1fr))", sm: "repeat(3, minmax(0, 1fr))", md: "repeat(4, minmax(0, 1fr))", lg: "repeat(7, minmax(0, 1fr))" }, gap: 1.25, mb: 2.5 }}>
             {(() => {
               const active = contextUsers.filter(u => u.isActive !== false);
               const paying = contextUsers.filter(u => u.subscription_status === "active");
@@ -4201,15 +4284,15 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                 { label: "Showing", value: sortedUsers.length, sub: undefined },
               ];
             })().map((stat) => (
-              <Paper key={stat.label} variant="outlined" sx={{ px: 2.5, py: 1.5, minWidth: 100, borderColor: stat.warn ? "error.main" : undefined }}>
-                <Typography variant="h5" sx={{ fontWeight: 600, lineHeight: 1.2, color: stat.warn ? "error.main" : undefined }}>
-                  {stat.value}
-                </Typography>
-                <Typography variant="caption" color="text.secondary">
+              <Paper key={stat.label} variant="outlined" sx={{ px: 1.75, py: 1.5, minWidth: 0, borderRadius: 2, boxShadow: "none", borderColor: stat.warn ? "#fecaca" : "divider", bgcolor: stat.warn ? "#fef2f2" : "background.paper" }}>
+                <Typography variant="caption" sx={{ display: "block", color: "text.secondary", fontSize: "0.6875rem", lineHeight: 1.4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                   {stat.label}
                 </Typography>
+                <Typography sx={{ fontSize: "1.25rem", fontWeight: 700, lineHeight: 1.3, mt: 0.25, color: stat.warn ? "error.main" : "text.primary" }}>
+                  {stat.value}
+                </Typography>
                 {stat.sub && (
-                  <Typography variant="caption" display="block" color="text.disabled" sx={{ fontSize: "0.65rem", mt: 0.25 }}>
+                  <Typography variant="caption" display="block" color="text.disabled" sx={{ fontSize: "0.6875rem", mt: 0.25, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                     {stat.sub}
                   </Typography>
                 )}
@@ -4217,13 +4300,13 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
             ))}
           </Box>
           {/* Filter bar */}
-          <Box sx={{ display: "flex", gap: 1.5, mb: 2, alignItems: "center" }}>
+          <Box sx={{ display: "flex", gap: 1.25, mb: 2, alignItems: "center", flexWrap: "wrap" }}>
             <TextField
               size="small"
               placeholder="Search users..."
               value={userSearchQuery}
               onChange={(e) => setUserSearchQuery(e.target.value)}
-              sx={{ minWidth: 240 }}
+              sx={{ flex: "1 1 220px", maxWidth: 360 }}
               InputProps={{
                 startAdornment: (
                   <InputAdornment position="start">
@@ -4268,7 +4351,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                 />
               }
               label={<Typography variant="body2">Has usage</Typography>}
-              sx={{ ml: 0 }}
+              sx={{ ml: 0, mr: 0, whiteSpace: "nowrap" }}
             />
             <FormControlLabel
               control={
@@ -4282,35 +4365,18 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                 />
               }
               label={<Typography variant="body2">Hide bots</Typography>}
-              sx={{ ml: 0 }}
+              sx={{ ml: 0, mr: 0, whiteSpace: "nowrap" }}
             />
             {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterHasUsage || !userFilterHideBotLike) && (
               <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterHasUsage(false); setUserFilterHideBotLike(true); loadUsers(true); }}>
                 Clear
               </Button>
             )}
-            <Box sx={{ flexGrow: 1 }} />
-            <Button variant="outlined" size="small" startIcon={resyncPaymentsLoading ? <CircularProgress size={14} /> : <SyncIcon />} onClick={handleResyncPayments} disabled={resyncPaymentsLoading}>
-              Resync Payments
-            </Button>
-            <Button variant="contained" size="small" startIcon={<SyncIcon />} onClick={() => handleOpenCrmSyncDialog("users")}>
-              Sync to CRM
-            </Button>
           </Box>
-          <Box sx={{ mb: 2, p: 2, bgcolor: 'background.paper', borderRadius: 1, border: '1px solid', borderColor: 'divider' }}>
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-              <Typography variant="subtitle2" sx={{ minWidth: 160, whiteSpace: 'nowrap' }}>Admin Slack Channels:</Typography>
-              <Button
-                variant="contained"
-                size="small"
-                onClick={handleSaveAdminSlackChannel}
-                disabled={adminSlackChannelLoading}
-              >
-                {adminSlackChannelLoading ? <CircularProgress size={20} /> : 'Save'}
-              </Button>
-              {adminSlackChannelSaved && (
-                <Typography variant="caption" color="success.main">Saved!</Typography>
-              )}
+          <Box sx={{ mb: 2, px: 1.75, py: 1.25, display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1.5, bgcolor: 'background.default', borderRadius: 2, border: '1px solid', borderColor: 'divider' }}>
+            <Box sx={{ minWidth: 150 }}>
+              <Typography variant="subtitle2" sx={{ fontWeight: 600, lineHeight: 1.3 }}>Admin Slack channels</Typography>
+              <Typography variant="caption" color="text.secondary">Where admin alerts are posted</Typography>
             </Box>
             <Autocomplete
               multiple
@@ -4339,11 +4405,24 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                   />
                 ))
               }
-              sx={{ maxWidth: 560 }}
+              sx={{ flex: '1 1 280px', maxWidth: 560, bgcolor: 'background.paper', borderRadius: 2 }}
               noOptionsText={availableSlackChannelsLoading ? "Loading channels…" : "No channels found — make sure the bot is added to the channels"}
             />
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={handleSaveAdminSlackChannel}
+                disabled={adminSlackChannelLoading}
+              >
+                {adminSlackChannelLoading ? <CircularProgress size={16} /> : 'Save'}
+              </Button>
+              {adminSlackChannelSaved && (
+                <Typography variant="caption" color="success.main">Saved</Typography>
+              )}
+            </Box>
             {adminSlackChannels.length > 0 && (
-              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mt: 1 }}>
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, flexBasis: '100%' }}>
                 {adminSlackChannels.map((id) => {
                   const ch = availableSlackChannels.find((c) => c.id === id);
                   return (
@@ -4361,7 +4440,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
               </Box>
             )}
           </Box>
-          <TableContainer component={Paper} variant="outlined">
+          <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, boxShadow: "none" }}>
             <Table size="small">
               <TableHead>
                 <TableRow sx={{ "& th": { fontWeight: 600, fontSize: "0.75rem", color: "text.secondary", textTransform: "uppercase", letterSpacing: "0.05em", py: 1.5 } }}>
@@ -6612,8 +6691,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
           <UsageCostByUserTab />
         </TabPanel>
         </Box>
-
-      </Paper>
+      </Box>
 
       {/* Satisfaction Score Override Popover */}
       <Popover
@@ -8360,7 +8438,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
           </Button>
         </DialogActions>
       </Dialog>
-    </Container>
+    </>
   );
 }
 
