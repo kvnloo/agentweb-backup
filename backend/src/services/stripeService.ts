@@ -1,10 +1,11 @@
 import Stripe from 'stripe';
 import { createStripeClient } from './stripeClientFactory';
 import dotenv from 'dotenv';
-import { userDb } from './db';
+import { userDb, User } from './db';
 import { getTierConfig, DEFAULT_PAGES } from './subscriptionService';
 import { paymentHistoryDb } from './paymentHistoryDb';
 import { syncUserUpdateToLeadList } from './crmAutoSyncService';
+import { waitlistDb, WaitlistEntry } from './waitlistDb';
 
 dotenv.config();
 
@@ -38,6 +39,152 @@ export function getSubscriptionPeriodEndIso(sub: any): string | undefined {
     sub?.items?.data?.[0]?.current_period_end ?? sub?.current_period_end;
   if (raw == null) return undefined;
   return new Date(typeof raw === 'number' ? raw * 1000 : raw).toISOString();
+}
+
+/**
+ * Extract the two custom checkout fields ("companyname" and
+ * "howdoyouplantousethisproduct") from a Stripe Checkout Session's
+ * `custom_fields` array. Shared by the authenticated webhook handler
+ * (source of truth) so the profile-enrichment side effects that used to
+ * live in the public, unauthenticated `GET /api/stripe/session/:sessionId`
+ * route (ENG-1756) still happen — just from a signature-verified event.
+ */
+export function extractCheckoutCustomFields(session: any): {
+  companyName?: string;
+  productUsageLabel?: string;
+} {
+  let companyName: string | undefined;
+  let productUsageLabel: string | undefined;
+
+  if (session?.custom_fields && Array.isArray(session.custom_fields)) {
+    for (const field of session.custom_fields) {
+      if (
+        field.key === 'companyname' &&
+        field.text &&
+        typeof field.text.value === 'string'
+      ) {
+        companyName = field.text.value;
+      }
+      if (
+        field.key === 'howdoyouplantousethisproduct' &&
+        field.dropdown &&
+        typeof field.dropdown.value === 'string'
+      ) {
+        const selectedValue = field.dropdown.value;
+        const selectedOption = field.dropdown.options?.find(
+          (opt: any) => opt.value === selectedValue
+        );
+        productUsageLabel =
+          selectedOption && typeof selectedOption.label === 'string'
+            ? selectedOption.label
+            : selectedValue;
+      }
+    }
+  }
+
+  return { companyName, productUsageLabel };
+}
+
+/**
+ * Sync companyName / useCaseCategories from a Checkout Session's custom
+ * fields onto the matching user (or waitlist entry) record. Only ever
+ * called from the signature-verified webhook handler — this is the write
+ * path formerly reachable from the public GET session-lookup route
+ * (ENG-1756).
+ */
+async function syncCheckoutProfileFields(session: any): Promise<void> {
+  const { companyName, productUsageLabel } = extractCheckoutCustomFields(session);
+  if (!companyName && !productUsageLabel) return;
+
+  let email: string | undefined;
+  if (
+    session.customer &&
+    typeof session.customer === 'object' &&
+    !session.customer.deleted &&
+    session.customer.email
+  ) {
+    email = session.customer.email;
+  } else if (session.customer_details?.email) {
+    email = session.customer_details.email;
+  }
+  if (!email) return;
+  email = email.toLowerCase();
+
+  let stripeCustomerId: string | undefined;
+  if (session.customer) {
+    if (typeof session.customer === 'string') {
+      stripeCustomerId = session.customer;
+    } else if (session.customer.id && !session.customer.deleted) {
+      stripeCustomerId = session.customer.id;
+    }
+  }
+
+  try {
+    const existingUser = await userDb.getUserByEmail(email);
+
+    if (existingUser && existingUser.userId) {
+      const userUpdates: Partial<User> = {};
+      if (stripeCustomerId && existingUser.stripe_customer_id !== stripeCustomerId) {
+        userUpdates.stripe_customer_id = stripeCustomerId;
+      }
+      if (companyName && existingUser.companyName !== companyName) {
+        userUpdates.companyName = companyName;
+      }
+      if (
+        productUsageLabel &&
+        (!existingUser.useCaseCategories ||
+          existingUser.useCaseCategories.length !== 1 ||
+          existingUser.useCaseCategories[0] !== productUsageLabel)
+      ) {
+        userUpdates.useCaseCategories = [productUsageLabel];
+      }
+      if (Object.keys(userUpdates).length > 0) {
+        await userDb.updateUser(existingUser.userId, userUpdates);
+      }
+
+      const waitlistUpdates: Partial<WaitlistEntry> = {};
+      if (stripeCustomerId) waitlistUpdates.stripe_customer_id = stripeCustomerId;
+      if (companyName) waitlistUpdates.companyName = companyName;
+      if (productUsageLabel) waitlistUpdates.useCaseCategories = [productUsageLabel];
+      if (Object.keys(waitlistUpdates).length > 0) {
+        const waitlistEntry = await waitlistDb.getByEmail(email);
+        if (waitlistEntry) {
+          const changesExist = Object.keys(waitlistUpdates).some(
+            (key) =>
+              waitlistUpdates[key as keyof typeof waitlistUpdates] !==
+              waitlistEntry[key as keyof typeof waitlistEntry]
+          );
+          if (changesExist) {
+            await waitlistDb.updateDetails(email, waitlistUpdates);
+          }
+        }
+      }
+    } else {
+      const existingWaitlistEntry = await waitlistDb.getByEmail(email);
+      const waitlistData: Partial<WaitlistEntry> & { email: string } = {
+        email,
+        companyName: companyName || existingWaitlistEntry?.companyName || 'Freelancer',
+        useCaseCategories: productUsageLabel
+          ? [productUsageLabel]
+          : existingWaitlistEntry?.useCaseCategories || [],
+        stripe_customer_id: stripeCustomerId,
+        supportNote: existingWaitlistEntry?.supportNote || 'Joined/Updated from Stripe',
+        joinedAt: existingWaitlistEntry?.joinedAt || new Date().toISOString(),
+        status: 'invited',
+        invitedAt: new Date().toISOString(),
+      };
+      if (existingWaitlistEntry) {
+        await waitlistDb.updateDetails(email, waitlistData);
+      } else {
+        await waitlistDb.add(waitlistData as WaitlistEntry);
+      }
+    }
+  } catch (err: any) {
+    console.error(
+      `[STRIPE] Failed to sync checkout profile fields for ${email}:`,
+      err.message
+    );
+  }
 }
 
 /**
@@ -518,6 +665,11 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
     subscription_status: updateData.subscription_status,
     stripe_customer_id: updateData.stripe_customer_id,
   });
+
+  // Sync companyName/useCaseCategories from custom checkout fields — this
+  // used to happen from the public, unauthenticated GET session-lookup
+  // route (ENG-1756); moved here since this handler is signature-verified.
+  void syncCheckoutProfileFields(session);
 
   // Cancel any duplicate subscriptions for this customer (keep only the latest)
   if (stripeCustomerId && stripeSubscriptionId) {
