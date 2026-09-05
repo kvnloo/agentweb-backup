@@ -215,12 +215,22 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // live 2026-08-19 with gpt-5.6-sol/terra/luna deployed & Running). OpenRouter's own
   // marketplace promo pricing does NOT apply to BYOK traffic — we're billed Azure's real
   // GlobalStandard list rate. Prices below = Azure's official "Global", short-context
-  // GPT-5.6 Series rate (azure.microsoft.com/pricing/details/cognitive-services/azure-openai),
-  // verified live 2026-08-19. (Cached/write rates already match our 10%/125% derived-cache
-  // convention exactly against Azure's own published cache rates for all three.)
+  // GPT-5.6 Series rate (azure.microsoft.com/pricing/details/cognitive-services/azure-openai).
+  // (Cached/write rates already match our 10%/125% derived-cache convention exactly against
+  // Azure's own published cache rates for all three.)
+  //
+  // 2026-09-05 (ENG-1781): Terra and Luna re-verified stale — Azure cut both on 2026-07-30
+  // mirroring OpenAI's direct-API cut (Terra -20%, Luna -80%) and this table was never
+  // updated, so BYOK Terra/Luna calls were over-metered against the customer's usage cap
+  // (Luna ~5x, Terra ~1.25x). Re-verified against Azure's official published GlobalStandard
+  // rate via azurespeed.com/AzureAiModelPricing (Models.dev Azure catalog snapshot, meter
+  // effective date 2026-07-01) and independently corroborated by cloudzero.com's 2026 Azure
+  // OpenAI pricing guide and a LiteLLM maintainer issue (BerriAI/litellm#36192) documenting
+  // the identical Azure-meter-vs-cost-map drift on the same two models. Sol unchanged — Azure
+  // did not cut it. OpenRouter's per-endpoint listing corroborates but is not the source.
   'openrouter/openai/gpt-5.6-sol': withDerivedCache(5.0, 30.0),
-  'openrouter/openai/gpt-5.6-terra': withDerivedCache(2.5, 15.0),
-  'openrouter/openai/gpt-5.6-luna': withDerivedCache(1.0, 6.0),
+  'openrouter/openai/gpt-5.6-terra': withDerivedCache(2.0, 12.0),
+  'openrouter/openai/gpt-5.6-luna': withDerivedCache(0.2, 1.2),
   // ENG-199/ENG-1685: Claude Fable 5.1 (Anthropic, released 2026-09-01),
   // routed through OpenRouter per the ENG-9/ENG-1414 gateway convention —
   // same as every other OpenRouter entry in this block, NOT the direct
