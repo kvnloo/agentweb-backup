@@ -1,11 +1,27 @@
 import express from "express";
 import { waitlistDb } from "../services/waitlistDb";
 import { validateEmail } from "../utils/validation";
+import { authenticateToken } from "../middleware/auth";
+import { isAdmin } from "../middleware/admin";
+import { rateLimiter } from "../middleware/rateLimiter";
 
 const router = express.Router();
 
+// Public signup path (ENG-1753 AC3): no auth, but rate-limited per IP so it
+// can't be used to spam the waitlist table or the downstream email sends.
+const WAITLIST_SIGNUP_MAX_PER_MINUTE = 5;
+
 router.post("/", async (req, res) => {
   try {
+    const rateLimitKey = `waitlist-signup:${req.ip}`;
+    const rateLimitResult = rateLimiter.check(rateLimitKey, WAITLIST_SIGNUP_MAX_PER_MINUTE);
+    if (!rateLimitResult.allowed) {
+      return res.status(429).json({
+        message: "Too many requests. Please try again later.",
+        retryAfterMs: rateLimitResult.resetInMs,
+      });
+    }
+
     const {
       email,
       fullName,
@@ -55,7 +71,11 @@ router.post("/", async (req, res) => {
   }
 });
 
-router.get("/", async (req, res) => {
+// ENG-1753: these leaked full waitlist PII (phone, spend) and allowed anyone
+// to flip a status to "invited" with no auth at all. No portal/partner-portal
+// client calls these public paths (the partner portal uses /api/admin/waitlist),
+// so they are now admin-only, matching the rest of the admin surface.
+router.get("/", authenticateToken, isAdmin, async (req, res) => {
   try {
     const { lastEvaluatedKey } = req.query;
     const result = await waitlistDb.list(lastEvaluatedKey as any);
@@ -66,7 +86,7 @@ router.get("/", async (req, res) => {
   }
 });
 
-router.put("/:email/status", async (req, res) => {
+router.put("/:email/status", authenticateToken, isAdmin, async (req, res) => {
   try {
     const { email } = req.params;
     const { status } = req.body;
