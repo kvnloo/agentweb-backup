@@ -2523,24 +2523,42 @@ export class AgentModeService {
     // on the fresh deployment took ~67s (cold start); steady state ~2s, on par
     // with Sol on the same path.
     // Quality: Artificial Analysis Intelligence Index 61 (v4.1.1, max effort)
-    // — the SAME score GPT-5.6 Sol posted at launch, at 2x the price. (AA's
-    // newer v4.2 index puts it at 55, #2 of 202; recorded here on the v4.1.1
-    // scale every other row in this registry uses, for comparability.)
+    // — equal to GPT-5.6 Sol's CURRENT 61 on the same index, at 2x the price
+    // (AA's own launch article: "scores equal to GPT-5.6 Sol in the Index at
+    // 61"; Sol itself launched at 59 on v4.1 and has since moved to 61 — so
+    // this is "equal to Sol today", not "equal to Sol at launch"). AA's newer
+    // v4.2 index puts Astra at 55, #2 of 202, behind Fable 5.1 at 57;
+    // recorded here on the v4.1.1 scale every other row in this registry
+    // uses, for comparability.
     // Deliberately NO `family`: equal quality at double the price means
     // neither Astra nor Sol dominates the other, and sharing a family would
     // let a future price move auto-flag whichever loses on cost alone — the
     // exact Terra false-positive the Sol comment above documents. Same
     // treatment as Sol itself and Kimi K3.
-    // supportsVision per OpenRouter's live architecture (file+image+text
-    // input), the same basis Fable 5.1 used. supportsTemperature false: a
-    // reasoning model — `temperature` is not in its supported_parameters.
-    // maxTools 128: it is served by Azure OpenAI, whose gpt-5.x deployments
-    // cap tools at 128 (see the direct gpt-5.x rows); the GPT-5.6 trio above
-    // omit it and have run since 2026-08-19, but the cap is Azure's, so the
-    // safe default for a brand-new deployment is to honor it. `tier` is the
-    // no-price fallback only; the picker derives ultra_premium live from
-    // MODEL_PRICING.
-    'openrouter/openai/gpt-6-astra': { name: 'GPT-6 Astra', provider: 'openai', tier: 'ultra_premium', description: 'OpenAI\'s frontier model for coding and agentic work', client: null, supportsTemperature: false, supportsVision: true, maxTools: 128, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1 (max effort), snapshot 2026-09-05 — same score as GPT-5.6 Sol at launch; 55 on AA\'s v4.2 index' },
+    // supportsVision: verified EMPIRICALLY 2026-09-05 against the exact shape
+    // describeImage sends (a `data:image/png;base64,…` image_url, ~8 KB PNG)
+    // through this OpenRouter→Azure BYOK path: correct answer, and the same
+    // image via an https URL also correct — the bar LLMModelConfig.supportsVision
+    // sets, not just OpenRouter's architecture metadata (which also lists
+    // file+image+text). Curiosity recorded, not a blocker: a 64x64 two-color
+    // synthetic PNG was misread by Astra ("can't see the image" / wrong
+    // colors) while GPT-5.5 and Sol read it correctly on the same path — real
+    // images are what describe_image sends. supportsTemperature false: a
+    // reasoning model — `temperature` is not in its supported_parameters
+    // (Azure's reasoning-models doc says the same).
+    // maxTools 128: the upstream is Azure OpenAI (live-confirmed above), and
+    // Azure's 128-tool cap is a recorded production failure in this repo, not a
+    // doc claim — ce154d09c / dev.md 2026-04-26: gpt-5.4 returned HTTP 400
+    // "Invalid 'tools': array too long. Expected an array with maximum length
+    // 128, but got an array with length 143" once skills pushed the registry
+    // past 128, which is what introduced maxTools + callLLM's truncation. The
+    // OpenRouter block header omits maxTools because OpenRouter's APIs expose
+    // no limit for ARBITRARY upstreams; that rationale does not apply when the
+    // upstream is known to be Azure. (The GPT-5.6 trio above omit it and have
+    // run since 2026-08-19 — the same gap, not evidence of a higher cap.)
+    // `tier` is the no-price fallback only; the picker derives ultra_premium
+    // live from MODEL_PRICING.
+    'openrouter/openai/gpt-6-astra': { name: 'GPT-6 Astra', provider: 'openai', tier: 'ultra_premium', description: 'OpenAI\'s frontier model for coding and agentic work', client: null, supportsTemperature: false, supportsVision: true, maxTools: 128, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1 (max effort), snapshot 2026-09-05 — equal to GPT-5.6 Sol\'s current 61; 55 on AA\'s v4.2 index' },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     // 2026-08-19: all four below are `legacy` (picker-grouping only, see
     // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still

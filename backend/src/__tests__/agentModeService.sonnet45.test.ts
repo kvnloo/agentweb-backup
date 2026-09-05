@@ -416,23 +416,6 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     });
 
     /*
-     * 2026-08-19 — same-family dominance auto-legacy. Harsha: "anything that
-     * is band for band worse in the same model family should be put into
-     * legacy — GPT-5.6 Luna is strictly better than GPT-5.4 Nano." A model
-     * gets legacy: true when a same-`family`, originally-non-legacy sibling
-     * is at least as cheap (cost band) AND at least as good (quality score),
-     * strictly so in one dimension — see deriveDominanceLegacyIds and each
-     * model's `family` tag in the registry.
-     *
-     * `family` is deliberately narrower than `provider`: an earlier
-     * provider-wide version of this check falsely flagged Claude Sonnet 5
-     * as dominated by Claude Opus 5, and Gemini 3.1 Pro as dominated by
-     * Gemini 3.5 Flash — different product tiers serving different jobs,
-     * not generations of the same model. The tests below pin both the real
-     * positive case and that specific false-positive class as a regression
-     * guard.
-     */
-    /*
      * ENG-1769 (2026-09-05) — GPT-6 Astra, OpenAI's frontier release of
      * 2026-09-03, routed through OpenRouter and BYOK-served by our own Azure
      * resource (agentweb-openrouter-byok, deployment `gpt-6-astra`; live-
@@ -455,7 +438,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(config.legacy).toBeUndefined();
       });
 
-      it('is a reasoning model: temperature unsupported, image input supported (OpenRouter architecture + Azure model card)', () => {
+      it('is a reasoning model: temperature unsupported, image input supported (live image call via the describe_image base64 data-URL shape, 2026-09-05)', () => {
         const config = (agentModeService as any).llmModels[ASTRA];
         expect(config.supportsTemperature).toBe(false);
         expect(config.supportsVision).toBe(true);
@@ -480,8 +463,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(astra.costScore!).toBeGreaterThan(sol.costScore!);
       });
 
-      // Same AA Intelligence Index score as Sol (61) at twice the price:
-      // neither dominates the other, so neither may be auto-flagged legacy.
+      // Same AA Intelligence Index score as Sol's current 61 (v4.1.1) at twice
+      // the price: neither dominates the other, so neither may be auto-flagged
+      // legacy.
       // Enforced structurally — Astra carries no `family` (same treatment as
       // Sol itself and Kimi K3), so the dominance rule never compares them.
       it('does not flip GPT-5.6 Sol to legacy, and is not legacy itself (AC3)', async () => {
@@ -493,6 +477,23 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       });
     });
 
+    /*
+     * 2026-08-19 — same-family dominance auto-legacy. Harsha: "anything that
+     * is band for band worse in the same model family should be put into
+     * legacy — GPT-5.6 Luna is strictly better than GPT-5.4 Nano." A model
+     * gets legacy: true when a same-`family`, originally-non-legacy sibling
+     * is at least as cheap (cost band) AND at least as good (quality score),
+     * strictly so in one dimension — see deriveDominanceLegacyIds and each
+     * model's `family` tag in the registry.
+     *
+     * `family` is deliberately narrower than `provider`: an earlier
+     * provider-wide version of this check falsely flagged Claude Sonnet 5
+     * as dominated by Claude Opus 5, and Gemini 3.1 Pro as dominated by
+     * Gemini 3.5 Flash — different product tiers serving different jobs,
+     * not generations of the same model. The tests below pin both the real
+     * positive case and that specific false-positive class as a regression
+     * guard.
+     */
     describe('2026-08-19 — same-family dominance auto-legacy', () => {
       // Originally this asserted Luna dominates Nano (same cost band, higher
       // quality) — that used OpenRouter's own marketplace price for Luna.
