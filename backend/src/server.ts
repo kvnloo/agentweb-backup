@@ -61,11 +61,14 @@ const io = new Server(server, {
         process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174',
       ];
 
-      // Same production gate as the HTTP CORS config in app.ts (ENG-1751): ngrok
-      // tunnels are a local-dev convenience and must not be a credentialed
-      // origin in production.
+      // Same fail-closed production gate as the HTTP CORS config in app.ts
+      // (ENG-1751): ngrok tunnels are a local-dev convenience and must not be
+      // a credentialed origin in production. `NODE_ENV !== 'production'` was
+      // fail-open (no tracked EB config sets NODE_ENV=production explicitly);
+      // require an explicit NODE_ENV=development or the CORS_ALLOW_NGROK=1
+      // opt-in instead.
       if (
-        process.env.NODE_ENV !== 'production' ||
+        process.env.NODE_ENV === 'development' ||
         process.env.CORS_ALLOW_NGROK === '1'
       ) {
         allowedOrigins.push(

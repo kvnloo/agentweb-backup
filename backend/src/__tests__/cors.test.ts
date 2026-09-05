@@ -235,8 +235,8 @@ describe('CORS Access-Control-Allow-Methods', () => {
       expect(res.headers['access-control-allow-origin']).toBeUndefined();
     });
 
-    it('still allows a ngrok-free.app origin outside production', async () => {
-      process.env.NODE_ENV = 'test';
+    it('still allows a ngrok-free.app origin in explicit development', async () => {
+      process.env.NODE_ENV = 'development';
       delete process.env.CORS_ALLOW_NGROK;
 
       const res = await request(app)
@@ -245,6 +245,35 @@ describe('CORS Access-Control-Allow-Methods', () => {
         .set('Access-Control-Request-Method', 'POST');
 
       expect(res.headers['access-control-allow-origin']).toBe('https://anything.ngrok-free.app');
+    });
+
+    // CodeRabbit (PR #2770): production deploys `node dist/server.js` and
+    // neither package.json nor tracked EB config sets NODE_ENV=production
+    // explicitly, so gating on `!== "production"` was fail-open for the real
+    // deployed environment (unset NODE_ENV fell through as "allow"). Gating on
+    // `=== "development"` instead must reject unset/staging/mistyped values too.
+    it('rejects a ngrok-free.app origin when NODE_ENV is unset (matches real prod)', async () => {
+      delete process.env.NODE_ENV;
+      delete process.env.CORS_ALLOW_NGROK;
+
+      const res = await request(app)
+        .options('/api/loop-events')
+        .set('Origin', 'https://anything.ngrok-free.app')
+        .set('Access-Control-Request-Method', 'POST');
+
+      expect(res.headers['access-control-allow-origin']).toBeUndefined();
+    });
+
+    it('rejects a ngrok-free.app origin for a non-development, non-production NODE_ENV (e.g. staging)', async () => {
+      process.env.NODE_ENV = 'staging';
+      delete process.env.CORS_ALLOW_NGROK;
+
+      const res = await request(app)
+        .options('/api/loop-events')
+        .set('Origin', 'https://anything.ngrok-free.app')
+        .set('Access-Control-Request-Method', 'POST');
+
+      expect(res.headers['access-control-allow-origin']).toBeUndefined();
     });
 
     it('allows a ngrok origin in production only with the explicit CORS_ALLOW_NGROK=1 opt-in', async () => {

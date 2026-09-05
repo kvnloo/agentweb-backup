@@ -190,10 +190,14 @@ const corsOptions = {
     // ngrok tunnels are a local-dev convenience (exposing a laptop's backend to a
     // webhook sender, a mobile device, etc.) and must never be a credentialed
     // origin in production — any ngrok tenant on the internet would otherwise be
-    // allowed (ENG-1751). Opt back in explicitly via CORS_ALLOW_NGROK=1 if a
-    // production ngrok use case is ever needed.
+    // allowed (ENG-1751). Fail closed on NODE_ENV: neither tracked EB config nor
+    // package.json sets NODE_ENV=production explicitly, so `!== "production"`
+    // was fail-open (unset/mistyped/staging all fell through as "allow"), the
+    // exact class of bug already fixed in webhooks.ts's Attio isDev check. Only
+    // an explicit NODE_ENV=development, or the CORS_ALLOW_NGROK=1 opt-in, allows
+    // ngrok origins.
     if (
-      process.env.NODE_ENV !== "production" ||
+      process.env.NODE_ENV === "development" ||
       process.env.CORS_ALLOW_NGROK === "1"
     ) {
       allowedOrigins.push(
