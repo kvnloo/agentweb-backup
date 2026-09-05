@@ -6,6 +6,7 @@ import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import dotenv from 'dotenv';
 import { getJwtSecret, assertJwtSecretAtBoot } from './config/jwt';
+import { logServiceSecretResolutionAtBoot } from './middleware/serviceAuth';
 import bcrypt from 'bcryptjs';
 import http from 'http';
 import { Server, Socket } from 'socket.io';
@@ -44,6 +45,11 @@ registerFathomLinearPort(createFathomLinearPort());
 // Fail fast at boot (before binding the port) if the JWT secret is missing, rather than
 // letting tokens be signed/verified with a fallback secret or erroring on first request.
 assertJwtSecretAtBoot();
+
+// Best-effort visibility only (ENG-1754 AC3) — never blocks/delays binding the port.
+logServiceSecretResolutionAtBoot().catch((err) =>
+  console.error('[serviceAuth] boot-time secret resolution check failed:', err)
+);
 
 const port = process.env.PORT || 3001;
 const server = http.createServer(app);
