@@ -95,6 +95,15 @@ describe('PATCH /api/users/me/profile', () => {
     expect(res.status).toBe(400);
   });
 
+  it('accepts a 100-char displayName padded with surrounding whitespace, persisting the trimmed value', async () => {
+    userDb.updateUser.mockResolvedValue({});
+    const res = await request(app)
+      .patch('/api/users/me/profile')
+      .send({ displayName: `  ${'x'.repeat(100)}  ` });
+    expect(res.status).toBe(200);
+    expect(userDb.updateUser).toHaveBeenCalledWith('user-1', { displayName: 'x'.repeat(100) });
+  });
+
   it('returns 400 when no valid fields provided', async () => {
     const res = await request(app).patch('/api/users/me/profile').send({});
     expect(res.status).toBe(400);

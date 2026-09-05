@@ -33,7 +33,8 @@ router.patch('/me/profile', authenticateToken, async (req, res) => {
 
     const { displayName, emailNotificationsEnabled } = req.body ?? {};
 
-    if (displayName !== undefined && (typeof displayName !== 'string' || !displayName.trim() || displayName.length > 100)) {
+    const trimmedDisplayName = typeof displayName === 'string' ? displayName.trim() : displayName;
+    if (displayName !== undefined && (typeof trimmedDisplayName !== 'string' || !trimmedDisplayName || trimmedDisplayName.length > 100)) {
       return res.status(400).json({ message: 'displayName must be 1–100 characters' });
     }
     if (emailNotificationsEnabled !== undefined && typeof emailNotificationsEnabled !== 'boolean') {
@@ -41,7 +42,7 @@ router.patch('/me/profile', authenticateToken, async (req, res) => {
     }
 
     const updates: Record<string, unknown> = {};
-    if (displayName !== undefined) updates.displayName = displayName.trim();
+    if (displayName !== undefined) updates.displayName = trimmedDisplayName;
     if (emailNotificationsEnabled !== undefined) updates.emailNotificationsEnabled = emailNotificationsEnabled;
 
     if (Object.keys(updates).length === 0) {
