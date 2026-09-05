@@ -2509,6 +2509,38 @@ export class AgentModeService {
     'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: false, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: false, qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // ENG-1769 (2026-09-05): GPT-6 Astra — OpenAI's frontier release of
+    // 2026-09-03, added the day Harsha asked ("is it possible to launch astra
+    // on agentweb now? ... go ahead"). Same one-line OpenRouter convention as
+    // the GPT-5.6 trio above and Fable 5.1 (ENG-199): id =
+    // openrouter/<upstream-provider>/<upstream-model>, no new routing code.
+    // Transport: OpenRouter BYOK → our own Azure resource
+    // (agentweb-openrouter-byok, westus3, deployment `gpt-6-astra` version
+    // 2026-09-03, GlobalStandard, created 2026-09-05). Live-confirmed the same
+    // day: response provider "Azure", usage.is_byok true, upstream cost exactly
+    // Azure's $10/$50 list rate — which is what llmPricing.ts bills, because
+    // the OpenRouter usage.cost override is skipped for BYOK calls. First call
+    // on the fresh deployment took ~67s (cold start); steady state ~2s, on par
+    // with Sol on the same path.
+    // Quality: Artificial Analysis Intelligence Index 61 (v4.1.1, max effort)
+    // — the SAME score GPT-5.6 Sol posted at launch, at 2x the price. (AA's
+    // newer v4.2 index puts it at 55, #2 of 202; recorded here on the v4.1.1
+    // scale every other row in this registry uses, for comparability.)
+    // Deliberately NO `family`: equal quality at double the price means
+    // neither Astra nor Sol dominates the other, and sharing a family would
+    // let a future price move auto-flag whichever loses on cost alone — the
+    // exact Terra false-positive the Sol comment above documents. Same
+    // treatment as Sol itself and Kimi K3.
+    // supportsVision per OpenRouter's live architecture (file+image+text
+    // input), the same basis Fable 5.1 used. supportsTemperature false: a
+    // reasoning model — `temperature` is not in its supported_parameters.
+    // maxTools 128: it is served by Azure OpenAI, whose gpt-5.x deployments
+    // cap tools at 128 (see the direct gpt-5.x rows); the GPT-5.6 trio above
+    // omit it and have run since 2026-08-19, but the cap is Azure's, so the
+    // safe default for a brand-new deployment is to honor it. `tier` is the
+    // no-price fallback only; the picker derives ultra_premium live from
+    // MODEL_PRICING.
+    'openrouter/openai/gpt-6-astra': { name: 'GPT-6 Astra', provider: 'openai', tier: 'ultra_premium', description: 'OpenAI\'s frontier model for coding and agentic work', client: null, supportsTemperature: false, supportsVision: true, maxTools: 128, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1 (max effort), snapshot 2026-09-05 — same score as GPT-5.6 Sol at launch; 55 on AA\'s v4.2 index' },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     // 2026-08-19: all four below are `legacy` (picker-grouping only, see
     // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still

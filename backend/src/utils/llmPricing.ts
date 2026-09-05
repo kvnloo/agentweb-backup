@@ -221,6 +221,20 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'openrouter/openai/gpt-5.6-sol': withDerivedCache(5.0, 30.0),
   'openrouter/openai/gpt-5.6-terra': withDerivedCache(2.5, 15.0),
   'openrouter/openai/gpt-5.6-luna': withDerivedCache(1.0, 6.0),
+  // ENG-1769 (2026-09-05): GPT-6 Astra — BYOK-routed to the same Azure
+  // resource as the GPT-5.6 trio (deployment `gpt-6-astra`, GlobalStandard),
+  // so Azure's GlobalStandard list rate applies, not OpenRouter's marketplace
+  // price (identical today, but that is a coincidence, not the reason).
+  // Live-confirmed 2026-09-05 from the BYOK generation record: 13 prompt +
+  // 5 completion tokens billed $0.00013 + $0.00025 upstream = exactly $10 /
+  // $50 per 1M. Cache read $1.00 / write $12.50 per 1M match OpenRouter's
+  // listed input_cache_read / input_cache_write for this model, i.e. the
+  // standard 10% / 125% derivation — no override needed.
+  // NOT modeled: Azure/OpenAI reprice the WHOLE request to $20/$75 once the
+  // prompt exceeds 272k tokens (OpenRouter `pricing.overrides`). No row in
+  // this table models long-context tiers, and the BYOK path bills from this
+  // table, so a >272k-token Astra call under-bills ~2x — see ENG-1774.
+  'openrouter/openai/gpt-6-astra': withDerivedCache(10.0, 50.0),
   // ENG-199/ENG-1685: Claude Fable 5.1 (Anthropic, released 2026-09-01),
   // routed through OpenRouter per the ENG-9/ENG-1414 gateway convention —
   // same as every other OpenRouter entry in this block, NOT the direct
