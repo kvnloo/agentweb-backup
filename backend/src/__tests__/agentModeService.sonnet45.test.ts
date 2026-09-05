@@ -390,7 +390,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         const info = models.find((m) => m.id === 'anthropic.claude-opus-5')!;
         expect(info.qualityScore).toBe(63);
         expect(info.costScore).toBe(70); // $5/$25 blended 75:25 -> $10.00/1M, log-normalized
-        expect(info.tier).toBe('pro'); // 70 falls in the 51-70 "pro" cost band
+        // 70 was the top of the old 64–70 "pro" band; ENG-1784 (2026-09-05)
+        // re-cut Flagship to ≥64 precisely so Opus 5 sits with GPT-5.6 Sol.
+        expect(info.tier).toBe('ultra_premium');
       });
 
       it('pins GPT-4o Mini (the cheapest, weakest scored model) at the real values', async () => {
