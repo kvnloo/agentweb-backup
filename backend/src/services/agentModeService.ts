@@ -994,7 +994,14 @@ export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_ch
 
 /**
  * Cost-score band boundaries backing the picker's tier buckets (Harsha's
- * exact thresholds, revised 2026-08-19 after reviewing the live numbers) —
+ * exact thresholds, revised 2026-08-19 after reviewing the live numbers, and
+ * re-cut 2026-09-05 (ENG-1784): "low should have everything 52 and below
+ * (very low is fine as it is now), then medium should be 57-53, then pro
+ * should be 63-58, frontier is everything above" — so Flagship/"frontier"
+ * (≥64) holds Fable 5.1 and GPT-6 Astra (79), GPT-5.6 Sol (71) and Claude
+ * Opus 5 (70) together, Pro (58–63) starts at Sonnet 5 / Terra / Kimi K3,
+ * Medium (53–57) is Grok 4.6 / Qwen3.8 Max, Cheap (31–52) Luna / Haiku /
+ * the Gemini Flash line, Very Cheap (≤30) unchanged) —
  * inclusive lower bound, ordered highest band first. costScore is 0-100 and
  * higher = more expensive (see costScoreFromPrice), so a model's tier is
  * simply whichever band its own cost score falls in. Tier IDs (ultra_premium/
@@ -1003,9 +1010,9 @@ export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_ch
  * modelTiers.ts TIER_LABELS); no backend API contract change.
  */
 export const TIER_COST_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minCostScore: number }> = [
-  { tier: 'ultra_premium', minCostScore: 71 },
-  { tier: 'pro', minCostScore: 64 },
-  { tier: 'medium', minCostScore: 51 },
+  { tier: 'ultra_premium', minCostScore: 64 },
+  { tier: 'pro', minCostScore: 58 },
+  { tier: 'medium', minCostScore: 53 },
   { tier: 'cheap', minCostScore: 31 },
   { tier: 'ultra_cheap', minCostScore: 0 },
 ];

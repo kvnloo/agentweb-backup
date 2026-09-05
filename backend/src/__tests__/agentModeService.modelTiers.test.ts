@@ -3,16 +3,21 @@ import * as llmPricing from '../utils/llmPricing';
 
 // Pins the exact band boundaries (revised 2026-08-19, three times in one
 // session — this is why a direct unit test exists now instead of only
-// being covered incidentally through registry-level tests).
+// being covered incidentally through registry-level tests). Re-cut
+// 2026-09-05 (ENG-1784), Harsha: Flagship ("frontier") is everything 64 and
+// up — so GPT-5.6 Sol (71) and Claude Opus 5 (70) share it — Pro 58–63,
+// Medium 53–57, Cheap 31–52, Very Cheap unchanged (≤30).
 describe('tierFromCostScore', () => {
-  it('matches the documented thresholds: 71/64/51/31/0', () => {
+  it('matches the documented thresholds: 64/58/53/31/0', () => {
     expect(tierFromCostScore(100)).toBe('ultra_premium');
-    expect(tierFromCostScore(71)).toBe('ultra_premium');
-    expect(tierFromCostScore(70)).toBe('pro');
-    expect(tierFromCostScore(64)).toBe('pro');
-    expect(tierFromCostScore(63)).toBe('medium');
-    expect(tierFromCostScore(51)).toBe('medium');
-    expect(tierFromCostScore(50)).toBe('cheap');
+    expect(tierFromCostScore(71)).toBe('ultra_premium'); // GPT-5.6 Sol
+    expect(tierFromCostScore(70)).toBe('ultra_premium'); // Claude Opus 5
+    expect(tierFromCostScore(64)).toBe('ultra_premium');
+    expect(tierFromCostScore(63)).toBe('pro');
+    expect(tierFromCostScore(58)).toBe('pro');
+    expect(tierFromCostScore(57)).toBe('medium');
+    expect(tierFromCostScore(53)).toBe('medium');
+    expect(tierFromCostScore(52)).toBe('cheap');
     expect(tierFromCostScore(31)).toBe('cheap');
     expect(tierFromCostScore(30)).toBe('ultra_cheap');
     expect(tierFromCostScore(0)).toBe('ultra_cheap');
@@ -143,7 +148,7 @@ describe('AgentModeService.getSupportedModelsWithMetadata', () => {
     expect(scored).toEqual({
       // tier is 'ultra_premium', not the fixture's static 'pro' — once a
       // price is available, tier is derived from the real costScore, and
-      // this fixture's price computes to 95 (>=71 -> ultra_premium).
+      // this fixture's price computes to 95 (>=64 -> ultra_premium).
       id: 'scored-model', name: 'Scored Model', tier: 'ultra_premium', description: 'Scored', provider: 'anthropic',
       qualityScore: 96, qualityScoreSource: 'AA Intelligence Index, 2026-08-19',
       costScore: expectedCostScore,
