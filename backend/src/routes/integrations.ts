@@ -40,7 +40,7 @@ router.post('/linear/webhook', async (req, res) => {
   try {
     const raw: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body || {}));
 
-    const secret = process.env.LINEAR_WEBHOOK_SECRET || '';
+    const secret = (process.env.LINEAR_WEBHOOK_SECRET || '').trim();
     if (!secret) {
       console.error(
         '[linear-webhook] LINEAR_WEBHOOK_SECRET is not set — refusing to process the payload (fail-closed, ENG-1754)',

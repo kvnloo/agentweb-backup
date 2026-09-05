@@ -187,7 +187,7 @@ export function requireScheduledChatsServiceSecret(
 ) {
   // (a) Env override wins and resolves synchronously — preserves the original
   //     behavior exactly (tests / local set the env var).
-  const fromEnv = process.env[SCHEDULED_CHATS_SERVICE_SECRET_ENV];
+  const fromEnv = process.env[SCHEDULED_CHATS_SERVICE_SECRET_ENV]?.trim();
   if (fromEnv) {
     return enforceServiceSecret(req, res, next, fromEnv);
   }
@@ -223,13 +223,13 @@ export async function logServiceSecretResolutionAtBoot(): Promise<void> {
   const results: string[] = [];
 
   const scheduledChatsResolved =
-    Boolean(process.env[SCHEDULED_CHATS_SERVICE_SECRET_ENV]) ||
+    Boolean(process.env[SCHEDULED_CHATS_SERVICE_SECRET_ENV]?.trim()) ||
     Boolean(await resolveSecretFromSecretsManager().catch(() => undefined));
   results.push(
     `${SCHEDULED_CHATS_SERVICE_SECRET_ENV}: ${scheduledChatsResolved ? 'resolved' : 'UNRESOLVED (endpoint will 503)'}`
   );
 
-  const linearWebhookResolved = Boolean(process.env.LINEAR_WEBHOOK_SECRET);
+  const linearWebhookResolved = Boolean(process.env.LINEAR_WEBHOOK_SECRET?.trim());
   results.push(
     `LINEAR_WEBHOOK_SECRET: ${linearWebhookResolved ? 'resolved' : 'UNRESOLVED (endpoint will 503)'}`
   );
