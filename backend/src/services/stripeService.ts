@@ -181,7 +181,7 @@ async function syncCheckoutProfileFields(session: any): Promise<void> {
     }
   } catch (err: any) {
     console.error(
-      `[STRIPE] Failed to sync checkout profile fields for ${email}:`,
+      `[STRIPE] Failed to sync checkout profile fields for session ${session?.id}:`,
       err.message
     );
   }
@@ -669,7 +669,10 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
   // Sync companyName/useCaseCategories from custom checkout fields — this
   // used to happen from the public, unauthenticated GET session-lookup
   // route (ENG-1756); moved here since this handler is signature-verified.
-  void syncCheckoutProfileFields(session);
+  // Awaited (not fire-and-forget): this function already catches its own
+  // errors internally, so awaiting only ensures the work completes before
+  // the webhook handler returns — it cannot make this handler throw.
+  await syncCheckoutProfileFields(session);
 
   // Cancel any duplicate subscriptions for this customer (keep only the latest)
   if (stripeCustomerId && stripeSubscriptionId) {
