@@ -994,7 +994,11 @@ export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_ch
 
 /**
  * Cost-score band boundaries backing the picker's tier buckets (Harsha's
- * exact thresholds, revised 2026-08-19 after reviewing the live numbers) —
+ * exact thresholds, revised 2026-08-19 after reviewing the live numbers;
+ * ultra_premium floor 71 → 72 on 2026-09-05, ENG-1784: "not let 'flagship'
+ * cost be 71 and over, and instead 72 and over ... so Sol and Opus 5 can be
+ * on the same tier" — GPT-5.6 Sol scores 71, Claude Opus 5 70, so Flagship
+ * is now Fable 5.1 + GPT-6 Astra at 79 and nothing sits between 71 and 72) —
  * inclusive lower bound, ordered highest band first. costScore is 0-100 and
  * higher = more expensive (see costScoreFromPrice), so a model's tier is
  * simply whichever band its own cost score falls in. Tier IDs (ultra_premium/
@@ -1003,7 +1007,7 @@ export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_ch
  * modelTiers.ts TIER_LABELS); no backend API contract change.
  */
 export const TIER_COST_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minCostScore: number }> = [
-  { tier: 'ultra_premium', minCostScore: 71 },
+  { tier: 'ultra_premium', minCostScore: 72 },
   { tier: 'pro', minCostScore: 64 },
   { tier: 'medium', minCostScore: 51 },
   { tier: 'cheap', minCostScore: 31 },
