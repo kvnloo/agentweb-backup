@@ -320,6 +320,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         'openrouter/openai/gpt-5.6-sol',
         'openrouter/openai/gpt-5.6-terra',
         'openrouter/openai/gpt-5.6-luna',
+        'openrouter/openai/gpt-6-astra', // ENG-1769
       ];
 
       it.each(OPENROUTER_IDS)('%s carries no adminOnly flag', (id) => {
@@ -362,6 +363,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         'openrouter/moonshotai/kimi-k3', 'openrouter/moonshotai/kimi-k2.7-code',
         'openrouter/z-ai/glm-5.2', 'openrouter/z-ai/glm-4.7-flash',
         'openrouter/openai/gpt-5.6-sol', 'openrouter/openai/gpt-5.6-terra', 'openrouter/openai/gpt-5.6-luna',
+        'openrouter/openai/gpt-6-astra', // ENG-1769
       ];
 
       it.each(SCORED_IDS)('%s has an in-range (0-100) qualityScore and costScore, each with a source note', async (id) => {
@@ -430,6 +432,67 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * positive case and that specific false-positive class as a regression
      * guard.
      */
+    /*
+     * ENG-1769 (2026-09-05) — GPT-6 Astra, OpenAI's frontier release of
+     * 2026-09-03, routed through OpenRouter and BYOK-served by our own Azure
+     * resource (agentweb-openrouter-byok, deployment `gpt-6-astra`; live-
+     * confirmed provider=Azure / is_byok=true before these tests were written).
+     * Harsha: "is it possible to launch astra on agentweb now? ... go ahead".
+     * These assert the acceptance contract on the Linear issue, not the
+     * implementation: selectable by everyone, priced at Azure's rate (see
+     * llmPricing.test.ts), and NOT entangled with GPT-5.6 Sol's legacy state.
+     */
+    describe('ENG-1769 — GPT-6 Astra via Azure BYOK', () => {
+      const ASTRA = 'openrouter/openai/gpt-6-astra';
+
+      it('is registered with a clean name, the openai provider, and no access gate', () => {
+        const config = (agentModeService as any).llmModels[ASTRA];
+        expect(config).toBeDefined();
+        expect(config.name).toBe('GPT-6 Astra');
+        expect(config.provider).toBe('openai');
+        expect(config.adminOnly).toBeUndefined();
+        expect(config.internalOnly).toBeUndefined();
+        expect(config.legacy).toBeUndefined();
+      });
+
+      it('is a reasoning model: temperature unsupported, image input supported (OpenRouter architecture + Azure model card)', () => {
+        const config = (agentModeService as any).llmModels[ASTRA];
+        expect(config.supportsTemperature).toBe(false);
+        expect(config.supportsVision).toBe(true);
+      });
+
+      it('carries a sourced Artificial Analysis quality score', () => {
+        const config = (agentModeService as any).llmModels[ASTRA];
+        expect(config.qualityScore).toBe(61);
+        expect(config.qualityScoreSource).toMatch(/Artificial Analysis/);
+      });
+
+      it('is offered to a non-admin caller (AC1)', async () => {
+        const models = await agentModeService.getSupportedModels(false);
+        expect(models).toContain(ASTRA);
+      });
+
+      it('lands in the ultra_premium cost band, above GPT-5.6 Sol, from the $10/$50 Azure rate (AC2)', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const astra = models.find((m) => m.id === ASTRA)!;
+        const sol = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!;
+        expect(astra.tier).toBe('ultra_premium');
+        expect(astra.costScore!).toBeGreaterThan(sol.costScore!);
+      });
+
+      // Same AA Intelligence Index score as Sol (61) at twice the price:
+      // neither dominates the other, so neither may be auto-flagged legacy.
+      // Enforced structurally — Astra carries no `family` (same treatment as
+      // Sol itself and Kimi K3), so the dominance rule never compares them.
+      it('does not flip GPT-5.6 Sol to legacy, and is not legacy itself (AC3)', async () => {
+        const config = (agentModeService as any).llmModels[ASTRA];
+        expect(config.family).toBeUndefined();
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        expect(models.find((m) => m.id === ASTRA)!.legacy).toBeUndefined();
+        expect(models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!.legacy).toBeUndefined();
+      });
+    });
+
     describe('2026-08-19 — same-family dominance auto-legacy', () => {
       // Originally this asserted Luna dominates Nano (same cost band, higher
       // quality) — that used OpenRouter's own marketplace price for Luna.

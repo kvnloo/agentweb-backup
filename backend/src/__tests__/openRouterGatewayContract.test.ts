@@ -58,6 +58,10 @@ describe('OpenRouter gateway migration resolver (ENG-1430)', () => {
     expect(normalizeOpenRouterModelId('openrouter/openai/gpt-4o-mini')).toBe('openai/gpt-4o-mini');
   });
 
+  it('resolves the GPT-6 Astra registry id to its OpenRouter upstream id (ENG-1769)', () => {
+    expect(resolveUpstreamModel('openrouter/openai/gpt-6-astra')).toBe('openai/gpt-6-astra');
+  });
+
   it('maps an AgentWeb GPT logical id to OpenRouter provider/model form', () => {
     expect(resolveUpstreamModel('gpt-5.5')).toBe('openai/gpt-5.5');
   });
