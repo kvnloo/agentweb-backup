@@ -3,11 +3,14 @@ import * as llmPricing from '../utils/llmPricing';
 
 // Pins the exact band boundaries (revised 2026-08-19, three times in one
 // session — this is why a direct unit test exists now instead of only
-// being covered incidentally through registry-level tests).
+// being covered incidentally through registry-level tests). Revised again
+// 2026-09-05 (ENG-1784): ultra_premium floor 71 → 72, so GPT-5.6 Sol (71)
+// shares the Pro tier with Claude Opus 5 (70) — Harsha's call.
 describe('tierFromCostScore', () => {
-  it('matches the documented thresholds: 71/64/51/31/0', () => {
+  it('matches the documented thresholds: 72/64/51/31/0', () => {
     expect(tierFromCostScore(100)).toBe('ultra_premium');
-    expect(tierFromCostScore(71)).toBe('ultra_premium');
+    expect(tierFromCostScore(72)).toBe('ultra_premium');
+    expect(tierFromCostScore(71)).toBe('pro'); // was ultra_premium until ENG-1784
     expect(tierFromCostScore(70)).toBe('pro');
     expect(tierFromCostScore(64)).toBe('pro');
     expect(tierFromCostScore(63)).toBe('medium');
@@ -143,7 +146,7 @@ describe('AgentModeService.getSupportedModelsWithMetadata', () => {
     expect(scored).toEqual({
       // tier is 'ultra_premium', not the fixture's static 'pro' — once a
       // price is available, tier is derived from the real costScore, and
-      // this fixture's price computes to 95 (>=71 -> ultra_premium).
+      // this fixture's price computes to 95 (>=72 -> ultra_premium).
       id: 'scored-model', name: 'Scored Model', tier: 'ultra_premium', description: 'Scored', provider: 'anthropic',
       qualityScore: 96, qualityScoreSource: 'AA Intelligence Index, 2026-08-19',
       costScore: expectedCostScore,
