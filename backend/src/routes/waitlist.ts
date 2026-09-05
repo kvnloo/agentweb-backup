@@ -75,10 +75,40 @@ router.post("/", async (req, res) => {
 // to flip a status to "invited" with no auth at all. No portal/partner-portal
 // client calls these public paths (the partner portal uses /api/admin/waitlist),
 // so they are now admin-only, matching the rest of the admin surface.
+// The Dynamo pagination cursor is an opaque object we only ever hand back
+// verbatim to DynamoDB — but it arrives as untrusted query-string JSON, so
+// reject anything that isn't the plain key-shape ExclusiveStartKey expects
+// before it reaches waitlistDb.list.
+const parseLastEvaluatedKey = (raw: unknown): Record<string, unknown> | undefined => {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    throw new Error("lastEvaluatedKey must be a JSON-encoded object");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("lastEvaluatedKey must be valid JSON");
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed)
+  ) {
+    throw new Error("lastEvaluatedKey must be a JSON object");
+  }
+  return parsed as Record<string, unknown>;
+};
+
 router.get("/", authenticateToken, isAdmin, async (req, res) => {
   try {
-    const { lastEvaluatedKey } = req.query;
-    const result = await waitlistDb.list(lastEvaluatedKey as any);
+    let lastEvaluatedKey: Record<string, unknown> | undefined;
+    try {
+      lastEvaluatedKey = parseLastEvaluatedKey(req.query.lastEvaluatedKey);
+    } catch (validationError: any) {
+      return res.status(400).json({ message: validationError.message });
+    }
+    const result = await waitlistDb.list(lastEvaluatedKey);
     res.json(result);
   } catch (error) {
     console.error("Error listing waitlist:", error);
@@ -93,6 +123,10 @@ router.put("/:email/status", authenticateToken, isAdmin, async (req, res) => {
 
     if (!email || !status) {
       return res.status(400).json({ message: "Email and status are required" });
+    }
+
+    if (!validateEmail(email)) {
+      return res.status(400).json({ message: "Invalid email" });
     }
 
     const entry = await waitlistDb.updateStatus(

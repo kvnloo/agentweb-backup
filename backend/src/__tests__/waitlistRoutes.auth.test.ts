@@ -14,11 +14,26 @@ jest.mock('../services/waitlistDb', () => ({
   },
 }));
 
+jest.mock('../services/db', () => ({
+  userDb: {
+    getUserById: jest.fn(),
+  },
+}));
+
 import express from 'express';
 import request from 'supertest';
+import jwt from 'jsonwebtoken';
 
 const { waitlistDb } = require('../services/waitlistDb');
 const mockWaitlistDb = waitlistDb as jest.Mocked<typeof waitlistDb>;
+const { userDb } = require('../services/db');
+const mockUserDb = userDb as jest.Mocked<typeof userDb>;
+
+const JWT_SECRET = 'test-jwt-secret-for-waitlist-route-tests';
+
+function makeAdminToken(userId = 'admin-1') {
+  return jwt.sign({ userId, email: 'admin@example.com', isAdmin: true }, JWT_SECRET);
+}
 
 function createApp() {
   const app = express();
@@ -33,9 +48,21 @@ function createApp() {
 describe('Waitlist routes auth (ENG-1753)', () => {
   let app: express.Express;
 
+  const originalJwtSecret = process.env.JWT_SECRET;
+
   beforeEach(() => {
     jest.clearAllMocks();
+    process.env.JWT_SECRET = JWT_SECRET;
+    mockUserDb.getUserById.mockResolvedValue({
+      userId: 'admin-1',
+      email: 'admin@example.com',
+      isAdmin: true,
+    } as any);
     app = createApp();
+  });
+
+  afterAll(() => {
+    process.env.JWT_SECRET = originalJwtSecret;
   });
 
   describe('GET /api/waitlist — admin-only', () => {
@@ -43,6 +70,34 @@ describe('Waitlist routes auth (ENG-1753)', () => {
       const res = await request(app).get('/api/waitlist');
       expect(res.status).toBe(401);
       expect(mockWaitlistDb.list).not.toHaveBeenCalled();
+    });
+
+    it('rejects a non-object lastEvaluatedKey before calling waitlistDb.list (ENG-1753 CodeRabbit)', async () => {
+      const res = await request(app)
+        .get('/api/waitlist')
+        .query({ lastEvaluatedKey: '["not", "an", "object"]' })
+        .set('Authorization', `Bearer ${makeAdminToken()}`);
+      expect(res.status).toBe(400);
+      expect(mockWaitlistDb.list).not.toHaveBeenCalled();
+    });
+
+    it('rejects a non-JSON lastEvaluatedKey before calling waitlistDb.list', async () => {
+      const res = await request(app)
+        .get('/api/waitlist')
+        .query({ lastEvaluatedKey: 'not-json' })
+        .set('Authorization', `Bearer ${makeAdminToken()}`);
+      expect(res.status).toBe(400);
+      expect(mockWaitlistDb.list).not.toHaveBeenCalled();
+    });
+
+    it('accepts a well-formed JSON object lastEvaluatedKey', async () => {
+      mockWaitlistDb.list.mockResolvedValue({ items: [], lastEvaluatedKey: undefined } as any);
+      const res = await request(app)
+        .get('/api/waitlist')
+        .query({ lastEvaluatedKey: JSON.stringify({ email: 'a@b.com' }) })
+        .set('Authorization', `Bearer ${makeAdminToken()}`);
+      expect(res.status).toBe(200);
+      expect(mockWaitlistDb.list).toHaveBeenCalledWith({ email: 'a@b.com' });
     });
   });
 
@@ -52,6 +107,15 @@ describe('Waitlist routes auth (ENG-1753)', () => {
         .put('/api/waitlist/someone@example.com/status')
         .send({ status: 'invited' });
       expect(res.status).toBe(401);
+      expect(mockWaitlistDb.updateStatus).not.toHaveBeenCalled();
+    });
+
+    it('rejects an invalid email path param before calling waitlistDb.updateStatus (ENG-1753 CodeRabbit)', async () => {
+      const res = await request(app)
+        .put('/api/waitlist/not-an-email/status')
+        .send({ status: 'invited' })
+        .set('Authorization', `Bearer ${makeAdminToken()}`);
+      expect(res.status).toBe(400);
       expect(mockWaitlistDb.updateStatus).not.toHaveBeenCalled();
     });
   });
