@@ -5557,9 +5557,21 @@ export class AgentModeService {
         workPlanContent += `   Required assets: ${step.expectedAssetCount} (this step cannot be completed until ${step.expectedAssetCount} images/assets have actually been generated this session)\n`;
       }
 
-      // Include skill IDs if available (for awareness)
+      // Include skill IDs if available (for awareness). ENG-1697: this used to
+      // unconditionally claim "(auto-installed when this step becomes active)",
+      // but that's only true for a predefined-template launch (which installs
+      // the union of all step skills upfront) — an ad-hoc plan's first step, or
+      // any step that becomes active because an earlier step was SKIPPED rather
+      // than completed, never goes through that upfront install. Deliberately
+      // NOT telling the model to proactively call install_skills here: toolDispatch's
+      // gate (search "is not available. You must install the required skill
+      // first") already catches any tool call gated on a missing skill and
+      // instructs recovery at that exact point, reactively and only when truly
+      // needed — restating it here would just invite redundant defensive
+      // install_skills calls on the already-working template-launch path where
+      // skills are already installed. Just drop the false claim.
       if (step.skillIds && step.skillIds.length > 0) {
-        workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
+        workPlanContent += `   Skills for this step: ${step.skillIds.join(', ')}\n`;
       }
 
       workPlanContent += '\n';
@@ -19331,7 +19343,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
         fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
         fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
+        // ENG-1742 follow-up: unencoded `{...}` in a nested field selector is silently
+        // mangled by Graph — on this `ads` edge it doesn't hard-error, it just drops the
+        // `creative` field from every result with no indication anything is missing.
+        // Confirmed live 2026-09-04: this exact string returned every ad with `creative`
+        // entirely absent; the encoded form returns real thumbnail_url/title/body/image_url.
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/ads?fields=id,name,status,adset_id,campaign_id,${encodeURIComponent('creative{thumbnail_url,title,body,image_url}')}${filteringParam}&access_token=${accessToken}`),
         // Ad-level insights for ads processing
         fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
         // Adset-level insights for ad sets processing
@@ -32451,6 +32468,13 @@ ${strippedHtml}`;
           skillIds: step.skillIds,
           ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
           ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
+          // ENG-1765: this whitelist previously omitted inputRequest, silently
+          // dropping every predefined template's authored guided-input-card data
+          // on launch -- the only code that reads step.inputRequest (below, in
+          // setWorkPlanStatusAttempt) could therefore never fire for any
+          // predefined-plan launch, live-confirmed dead against 26 of 28 real
+          // production templates.
+          ...(step.inputRequest !== undefined && { inputRequest: step.inputRequest }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
         autocomplete: predefinedPlan.autocomplete || false,
@@ -32463,6 +32487,57 @@ ${strippedHtml}`;
         templatePlanId: predefinedPlan.planId,
       };
       await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      // ENG-1765: the reactive "surface the next pending step's inputRequest"
+      // check in setWorkPlanStatusAttempt only runs after a set_work_plan_status
+      // call — it never runs on a fresh launch. Most predefined templates put
+      // their inputRequest on step 1 itself, which starts pending with nothing
+      // before it to trigger that reactive scan, so without this it would still
+      // never surface even after restoring the field above. Surface it here too,
+      // the same way, so a launch's own first pending input-requesting step is
+      // never silently skipped.
+      //
+      // Reviewer finding: this write must use the same failIfAwaitingExists
+      // guard as the reactive block. Without it, updateSessionWorkPlanInputRequest
+      // attaches no ConditionExpression at all and blindly overwrites
+      // pendingWorkPlanInput — a force=true relaunch could silently clobber a
+      // genuinely still-awaiting card from whatever was active before, leaving
+      // it orphaned (pointing at a step that's no longer in the active plan)
+      // instead of failing closed. On a guard failure this just logs and skips
+      // surfacing the new step's card rather than blocking the launch — the
+      // plan itself is still valid without it, and the model can still recover
+      // by asking conversationally like it already does today.
+      // User-facing signal (not just a server log) when this doesn't surface:
+      // the model is told via the returned message so it can ask for the same
+      // information conversationally instead of the user silently never seeing
+      // a card and the model never knowing to ask.
+      let inputRequestNotSurfaced: { title: string; prompt?: string } | null = null;
+      const launchInputStep = workPlan.steps
+        .slice()
+        .sort((a, b) => a.stepCount - b.stepCount)
+        .find((s) => s.status === 'pending' && (s as any).inputRequest);
+      if (launchInputStep) {
+        const req = (launchInputStep as any).inputRequest;
+        try {
+          const written = await chatbotDb.updateSessionWorkPlanInputRequest(
+            sessionId,
+            buildWorkPlanInputRequest({
+              ...req,
+              requestId: uuidv4(),
+              stepCount: launchInputStep.stepCount,
+            }),
+            { failIfAwaitingExists: true },
+          );
+          if (!written) {
+            // Guarded off: a genuinely still-awaiting request from before this
+            // launch won the race, per design (see comment above) — not an error.
+            inputRequestNotSurfaced = { title: req.title, prompt: req.prompt };
+          }
+        } catch (inputRequestError) {
+          console.error('AgentMode: Error surfacing input request for launched work plan:', inputRequestError);
+          inputRequestNotSurfaced = { title: req.title, prompt: req.prompt };
+        }
+      }
 
       // ENG-1698: same reset as createWorkPlan — see that call site's comment. A
       // predefined-plan launch on an existing session (including a force=true
@@ -32503,9 +32578,16 @@ ${strippedHtml}`;
         }
       }
 
+      // ENG-1765: tell the model when step 1's input card didn't surface, so it
+      // asks for the same information conversationally instead of the session
+      // silently sitting on a step whose required input nobody was ever asked for.
+      const inputRequestNote = inputRequestNotSurfaced
+        ? ` Note: this plan's first step normally asks "${inputRequestNotSurfaced.title}" via a structured card, but that card could not be shown right now — ask the user for this information directly instead: ${inputRequestNotSurfaced.prompt || inputRequestNotSurfaced.title}`
+        : '';
+
       return {
         success: true,
-        message: `Started work plan "${predefinedPlan.title}" with ${workPlan.steps.length} steps`,
+        message: `Started work plan "${predefinedPlan.title}" with ${workPlan.steps.length} steps${inputRequestNote}`,
         workPlan,
         welcomeMessage: workPlan.welcomeMessage,
         formattedContent: `Started work plan "${predefinedPlan.title}":\n${workPlan.steps.map((s: any) => `${s.stepCount}. ${s.title}`).join('\n')}`,

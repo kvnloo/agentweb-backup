@@ -49,6 +49,24 @@ describe('AgentModeService - predefined work plan templates', () => {
     ],
   };
 
+  const templateWithInputRequest: any = {
+    ...systemTemplate,
+    planId: 'plan-input',
+    title: 'Prospect Decode',
+    steps: [
+      {
+        stepCount: 1,
+        title: 'Intake',
+        inputRequest: {
+          title: 'Who and why',
+          prompt: 'Tell us who to decode.',
+          fields: [{ id: 'prospect', label: 'Prospect', type: 'text', required: true }],
+        },
+      },
+      { stepCount: 2, title: 'Research' },
+    ],
+  };
+
   beforeEach(() => {
     service = new AgentModeService();
     jest.clearAllMocks();
@@ -60,6 +78,7 @@ describe('AgentModeService - predefined work plan templates', () => {
     (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue({});
     (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
     (chatbotDb.updateSessionLlmModel as jest.Mock).mockResolvedValue(undefined);
+    (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockResolvedValue(undefined);
     // Avoid real model registry/secret lookups.
     jest.spyOn(service, 'getSupportedModels').mockResolvedValue(['anthropic.claude-sonnet-4-6']);
   });
@@ -90,6 +109,105 @@ describe('AgentModeService - predefined work plan templates', () => {
           ]),
         })
       );
+    });
+
+    it('ENG-1765: copies inputRequest onto the instantiated step instead of dropping it', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({
+          steps: expect.arrayContaining([
+            expect.objectContaining({
+              stepCount: 1,
+              inputRequest: expect.objectContaining({
+                title: 'Who and why',
+                fields: expect.arrayContaining([expect.objectContaining({ id: 'prospect' })]),
+              }),
+            }),
+          ]),
+        })
+      );
+    });
+
+    it('ENG-1765: surfaces the launched plan\'s first pending inputRequest step immediately, not just reactively', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ stepCount: 1 }),
+        { failIfAwaitingExists: true }
+      );
+    });
+
+    it('ENG-1765: does not call updateSessionWorkPlanInputRequest when no step has an inputRequest', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemTemplate] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlanInputRequest).not.toHaveBeenCalled();
+    });
+
+    it('ENG-1765: a guard failure (a genuinely still-awaiting prior input request) does not fail the launch', async () => {
+      // chatbotService returns null (not a throw) when failIfAwaitingExists guards
+      // the write off -- the launch must not surface a new card in that case, but
+      // must still succeed rather than clobbering the still-active prior request.
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+      (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockResolvedValue(null);
+
+      const result = await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(result.success).toBe(true);
+      expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ stepCount: 1 }),
+        { failIfAwaitingExists: true }
+      );
+      // ENG-1765 follow-up: a silent server log isn't enough -- the model must
+      // be told so it can ask conversationally instead of nobody ever asking.
+      expect(result.message).toContain('Who and why');
+      expect(result.message).toContain('ask the user for this information directly');
+    });
+
+    it('ENG-1765: a real error surfacing the input request is logged and swallowed, not thrown, and the model is told', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+      (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockRejectedValue(new Error('transient dynamo error'));
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      const result = await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(result.success).toBe(true);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        'AgentMode: Error surfacing input request for launched work plan:',
+        expect.any(Error)
+      );
+      expect(result.message).toContain('ask the user for this information directly');
+      consoleErrorSpy.mockRestore();
+    });
+
+    it('ENG-1765: does not add the not-surfaced note when the input request surfaces successfully', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+      (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockResolvedValue({ sessionId });
+
+      const result = await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(result.message).not.toContain('ask the user for this information directly');
     });
 
     it('auto-installs the union of all step skills upfront', async () => {
