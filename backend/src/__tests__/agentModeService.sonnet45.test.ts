@@ -495,21 +495,21 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * guard.
      */
     describe('2026-08-19 — same-family dominance auto-legacy', () => {
-      // Originally this asserted Luna dominates Nano (same cost band, higher
-      // quality) — that used OpenRouter's own marketplace price for Luna.
-      // Luna is BYOK-routed to our Azure resource (agentweb-openrouter-byok,
-      // confirmed live), so we're actually billed Azure's list rate
-      // ($1.00/$6.00), not OpenRouter's. At that real price Luna's cost band
-      // moves up from 'ultra_cheap' to 'cheap' — no longer the same band as
-      // Nano, so dominance correctly no longer fires. Higher quality alone
-      // doesn't dominate; it has to be same-or-cheaper too.
-      it('does NOT flag GPT-5.4 Nano as legacy — GPT-5.6 Luna is pricier at Azure BYOK rates, not the same cost band', async () => {
+      // 2026-09-05 (ENG-1781): re-flipped back. The Azure BYOK price used
+      // above ($1.00/$6.00) was itself stale — Azure cut Luna 80% on
+      // 2026-07-30 and the pricing table was never updated. At the
+      // corrected Azure rate ($0.20/$1.20) Luna's cost score drops to 29,
+      // landing back in the same 'ultra_cheap' band as Nano (29) — this is
+      // Harsha's original 2026-08-19 intent restored on real numbers: Luna
+      // is genuinely real GPT-5.6 reasoning at Nano's price, so Nano is
+      // correctly dominated again.
+      it('flags GPT-5.4 Nano as legacy — GPT-5.6 Luna is same cost band at the corrected Azure BYOK rate and strictly higher quality', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         const nano = models.find((m) => m.id === 'gpt-5.4-nano')!;
         const luna = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-luna')!;
-        expect(nano.tier).not.toBe(luna.tier);
+        expect(nano.tier).toBe(luna.tier);
         expect(luna.qualityScore).toBeGreaterThan(nano.qualityScore!);
-        expect(nano.legacy).toBeUndefined();
+        expect(nano.legacy).toBe(true);
       });
 
       it('flags the far-weaker, same-band GPT-4o Mini as legacy too (dominated by GPT-5.4 Nano)', async () => {
