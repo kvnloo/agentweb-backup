@@ -23,6 +23,7 @@ jest.mock('facebook-nodejs-business-sdk', () => {
             createCustomAudience: jest.fn(),
             getTargetingSearch: jest.fn(),
             getInsights: jest.fn(),
+            getAdsPixels: jest.fn(),
         })),
         Campaign: jest.fn().mockImplementation(() => ({
             get: jest.fn(),
@@ -108,8 +109,12 @@ describe('MetaService', () => {
 
     describe('Campaign Operations', () => {
         it('should get a single campaign', async () => {
+             // Graph returns `account_id` because getCampaign now asks for it in the same call
+             // to verify ownership; it is stripped before the caller sees the payload.
              const mockCampaignData = { id: 'camp_1', name: 'Campaign 1' };
-             const mockGet = jest.fn().mockResolvedValue({ _data: mockCampaignData });
+             const mockGet = jest.fn().mockResolvedValue({
+                 _data: { ...mockCampaignData, account_id: mockAdAccountId },
+             });
              (Campaign as unknown as jest.Mock).mockImplementation(() => ({
                  get: mockGet,
              }));
@@ -119,6 +124,42 @@ describe('MetaService', () => {
              expect(Campaign).toHaveBeenCalledWith('camp_1');
              expect(mockGet).toHaveBeenCalled();
              expect(result).toEqual(mockCampaignData);
+        });
+
+        /*
+         * getCampaign accepted `adAccountId` and never used it. A node id is global, so it
+         * returned any campaign the token could reach — and one caller renders the result's NAME
+         * into the confirmation prompt a user approves, so an id from another ad account
+         * disclosed that account's campaign name to this user.
+         */
+        it('refuses a campaign owned by a different ad account, without naming the owner', async () => {
+             const mockGet = jest.fn().mockResolvedValue({
+                 _data: { id: 'camp_1', name: "Other tenant's campaign", account_id: '9998887776' },
+             });
+             (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get: mockGet }));
+
+             await expect(
+                 service.getCampaign(mockAdAccountId, mockAccessToken, 'camp_1'),
+             ).rejects.toThrow(/not available in the selected ad account/i);
+
+             /*
+              * Asserted on the MESSAGE. `rejects.toThrow(expect.not.stringContaining(x))` reads
+              * like a check on the text and is not one: jest hands `toThrow` the Error OBJECT,
+              * so `stringContaining` is false for every error and its negation is
+              * unconditionally true. An error whose message literally contained '9998887776'
+              * passed it, so the no-oracle property — the whole reason this guard refuses
+              * generically instead of explaining itself — pinned nothing.
+              */
+             let refusal = '';
+             try {
+                 await service.getCampaign(mockAdAccountId, mockAccessToken, 'camp_1');
+                 throw new Error('expected the cross-account read to be refused');
+             } catch (err: any) {
+                 refusal = String(err?.message ?? err);
+             }
+             expect(refusal).toMatch(/not available in the selected ad account/i);
+             expect(refusal).not.toContain('9998887776');
+             expect(refusal).not.toContain('act_9998887776');
         });
 
         it('should list campaigns', async () => {
@@ -133,7 +174,10 @@ describe('MetaService', () => {
             expect(FacebookAdsApi.init).toHaveBeenCalledWith(mockAccessToken);
             expect(AdAccount).toHaveBeenCalledWith(`act_${mockAdAccountId}`);
             expect(mockGetCampaigns).toHaveBeenCalled();
-            expect(result).toEqual([{ id: 'camp_1', name: 'Campaign 1' }]);
+            // ENG-1625: LIST now paginates and returns completeness metadata rather than a
+            // bare array.
+            expect(result.campaigns).toEqual([{ id: 'camp_1', name: 'Campaign 1' }]);
+            expect(result.truncated).toBe(false);
         });
 
         it('should create a campaign', async () => {
@@ -161,14 +205,16 @@ describe('MetaService', () => {
 
         it('should update a campaign', async () => {
             const mockUpdate = jest.fn().mockResolvedValue({});
+            const mockGet = jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } });
             (Campaign as unknown as jest.Mock).mockImplementation(() => ({
+                get: mockGet,
                 update: mockUpdate,
             }));
 
             const campaignId = 'camp_123';
             const params = { name: 'Updated Campaign Name' };
 
-            const result = await service.updateCampaign(mockAccessToken, campaignId, params);
+            const result = await service.updateCampaign(mockAccessToken, campaignId, params, mockAdAccountId);
 
             expect(Campaign).toHaveBeenCalledWith(campaignId);
             expect(mockUpdate).toHaveBeenCalledWith([], params);
@@ -177,13 +223,15 @@ describe('MetaService', () => {
 
         it('should delete a campaign', async () => {
             const mockDelete = jest.fn().mockResolvedValue({});
+            const mockGet = jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } });
             (Campaign as unknown as jest.Mock).mockImplementation(() => ({
+                get: mockGet,
                 delete: mockDelete,
             }));
 
             const campaignId = 'camp_123';
 
-            const result = await service.deleteCampaign(mockAccessToken, campaignId);
+            const result = await service.deleteCampaign(mockAccessToken, campaignId, mockAdAccountId);
 
             expect(Campaign).toHaveBeenCalledWith(campaignId);
             expect(mockDelete).toHaveBeenCalledWith([], {});
@@ -202,7 +250,10 @@ describe('MetaService', () => {
             const result = await service.listAdSets(mockAdAccountId, mockAccessToken);
 
             expect(mockGetAdSets).toHaveBeenCalled();
-            expect(result).toEqual([{ id: 'adset_1', name: 'Ad Set 1' }]);
+            // ENG-1625: LIST now paginates and returns completeness metadata rather than a
+            // bare array.
+            expect(result.adSets).toEqual([{ id: 'adset_1', name: 'Ad Set 1' }]);
+            expect(result.truncated).toBe(false);
         });
 
         it('should create an ad set', async () => {
@@ -280,14 +331,16 @@ describe('MetaService', () => {
 
         it('should update an ad set', async () => {
             const mockUpdate = jest.fn().mockResolvedValue({});
+            const mockGet = jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } });
             (AdSet as unknown as jest.Mock).mockImplementation(() => ({
+                get: mockGet,
                 update: mockUpdate,
             }));
 
             const adSetId = 'adset_123';
             const params = { daily_budget: 2000 };
 
-            const result = await service.updateAdSet(mockAccessToken, adSetId, params);
+            const result = await service.updateAdSet(mockAccessToken, adSetId, params, mockAdAccountId);
 
             expect(AdSet).toHaveBeenCalledWith(adSetId);
             expect(mockUpdate).toHaveBeenCalledWith([], params);
@@ -296,13 +349,15 @@ describe('MetaService', () => {
 
         it('should delete an ad set', async () => {
             const mockDelete = jest.fn().mockResolvedValue({});
+            const mockGet = jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } });
             (AdSet as unknown as jest.Mock).mockImplementation(() => ({
+                get: mockGet,
                 delete: mockDelete,
             }));
 
             const adSetId = 'adset_123';
 
-            const result = await service.deleteAdSet(mockAccessToken, adSetId);
+            const result = await service.deleteAdSet(mockAccessToken, adSetId, mockAdAccountId);
 
             expect(AdSet).toHaveBeenCalledWith(adSetId);
             expect(mockDelete).toHaveBeenCalledWith([], {});
@@ -321,7 +376,8 @@ describe('MetaService', () => {
             const result = await service.listAdCreatives(mockAdAccountId, mockAccessToken);
 
             expect(mockGetCreatives).toHaveBeenCalled();
-            expect(result).toEqual([{ id: 'creative_1', name: 'Creative 1' }]);
+            expect(result.creatives).toEqual([{ id: 'creative_1', name: 'Creative 1' }]);
+            expect(result.truncated).toBe(false);
         });
 
         it('should create an ad creative', async () => {
@@ -497,7 +553,10 @@ describe('MetaService', () => {
                     effective_status: expect.arrayContaining(['ACTIVE', 'PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED'])
                 })
             );
-            expect(result).toEqual([{ id: 'ad_1', name: 'Ad 1', effective_status: 'ACTIVE' }]);
+            expect(result.ads).toEqual([{ id: 'ad_1', name: 'Ad 1', effective_status: 'ACTIVE' }]);
+            // Unscoped, single page, nothing left behind (ENG-1476).
+            expect(result.truncated).toBe(false);
+            expect(result.scope).toEqual({});
         });
 
         it('should include CAMPAIGN_PAUSED and ADSET_PAUSED ads when listing', async () => {
@@ -513,25 +572,38 @@ describe('MetaService', () => {
 
             const result = await service.listAds(mockAdAccountId, mockAccessToken);
 
-            expect(result).toHaveLength(3);
-            expect(result.map((a: any) => a.effective_status)).toEqual(
+            expect(result.ads).toHaveLength(3);
+            expect(result.ads.map((a: any) => a.effective_status)).toEqual(
                 expect.arrayContaining(['ACTIVE', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED'])
             );
         });
 
-        it('should filter by adset_id when provided', async () => {
+        /**
+         * ENG-1476: this test previously asserted `params.adset_id` was sent — i.e. it PINNED the
+         * defect. Meta silently ignores `adset_id` as a bare param on the /act_X/ads edge and
+         * returns the whole account, so the filter looked applied and never was. Scoping now goes
+         * through the ad set NODE (/{adset_id}/ads), where it cannot be ignored.
+         */
+        it('scopes to the ad set NODE, never a bare adset_id param', async () => {
             const mockAds = [{ _data: { id: 'ad_1', name: 'Ad 1', effective_status: 'PAUSED' } }];
-            const mockGetAds = jest.fn().mockResolvedValue(mockAds);
-            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
-                getAds: mockGetAds,
+            const adSetGetAds = jest.fn().mockResolvedValue(mockAds);
+            const accountGetAds = jest.fn().mockResolvedValue([]);
+            (AdSet as unknown as jest.Mock).mockImplementation(() => ({
+                getAds: adSetGetAds,
+                // The tenancy guard reads the node's owning account before listing through it:
+                // an ad-set id is global and one Meta token can reach several ad accounts.
+                get: jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } }),
             }));
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getAds: accountGetAds }));
 
-            await service.listAds(mockAdAccountId, mockAccessToken, 'adset_999');
+            const result = await service.listAds(mockAdAccountId, mockAccessToken, 'adset_999');
 
-            expect(mockGetAds).toHaveBeenCalledWith(
-                expect.any(Array),
-                expect.objectContaining({ adset_id: 'adset_999' })
-            );
+            expect(AdSet).toHaveBeenCalledWith('adset_999');
+            expect(adSetGetAds).toHaveBeenCalled();
+            // The account edge must not be touched at all — that was the account-wide leak.
+            expect(accountGetAds).not.toHaveBeenCalled();
+            expect(adSetGetAds.mock.calls[0][1]).not.toHaveProperty('adset_id');
+            expect(result.scope).toEqual({ adSetId: 'adset_999' });
         });
 
         it('should create an ad', async () => {
@@ -560,14 +632,16 @@ describe('MetaService', () => {
 
         it('should update an ad', async () => {
             const mockUpdate = jest.fn().mockResolvedValue({});
+            const mockGet = jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } });
             (Ad as unknown as jest.Mock).mockImplementation(() => ({
+                get: mockGet,
                 update: mockUpdate,
             }));
 
             const adId = 'ad_123';
             const params = { name: 'Updated Ad Name' };
 
-            const result = await service.updateAd(mockAccessToken, adId, params);
+            const result = await service.updateAd(mockAccessToken, adId, params, mockAdAccountId);
 
             expect(Ad).toHaveBeenCalledWith(adId);
             expect(mockUpdate).toHaveBeenCalledWith([], params);
@@ -576,13 +650,15 @@ describe('MetaService', () => {
 
         it('should delete an ad', async () => {
             const mockDelete = jest.fn().mockResolvedValue({});
+            const mockGet = jest.fn().mockResolvedValue({ _data: { account_id: mockAdAccountId } });
             (Ad as unknown as jest.Mock).mockImplementation(() => ({
+                get: mockGet,
                 delete: mockDelete,
             }));
 
             const adId = 'ad_123';
 
-            const result = await service.deleteAd(mockAccessToken, adId);
+            const result = await service.deleteAd(mockAccessToken, adId, mockAdAccountId);
 
             expect(Ad).toHaveBeenCalledWith(adId);
             expect(mockDelete).toHaveBeenCalledWith([], {});
@@ -683,14 +759,17 @@ describe('MetaService', () => {
             const result = await service.listCustomAudiences(mockAdAccountId, mockAccessToken);
 
             expect(AdAccount).toHaveBeenCalledWith(`act_${mockAdAccountId}`);
+            // ENG-1625: the old hard 50-record cap is gone — LIST now paginates like every
+            // other list edge, using the same page-size limit.
             expect(mockGetCustomAudiences).toHaveBeenCalledWith(
                 expect.arrayContaining(['id', 'name', 'description']),
-                { limit: 50 }
+                { limit: 100 }
             );
-            expect(result).toEqual([
+            expect(result.audiences).toEqual([
                 { id: 'audience_1', name: 'Audience 1', subtype: 'CUSTOM' },
                 { id: 'audience_2', name: 'Audience 2', subtype: 'LOOKALIKE' }
             ]);
+            expect(result.truncated).toBe(false);
         });
 
         it('should create a custom audience with CUSTOM subtype', async () => {
@@ -1520,7 +1599,9 @@ describe('MetaService', () => {
     });
 
     describe('Pixel & Dataset Operations', () => {
-        // These methods use dynamic import of fetchWithRetry, so we mock at global fetch level
+        // getDatasetEventStats still uses dynamic import of fetchWithRetry, so it alone is
+        // mocked at global fetch level. listPixels (ENG-1625) now goes through the SDK's
+        // AdAccount.getAdsPixels Cursor, like every other list edge in this file.
         let mockFetch: jest.SpyInstance;
 
         beforeEach(() => {
@@ -1532,30 +1613,29 @@ describe('MetaService', () => {
         });
 
         it('should list pixels for an ad account', async () => {
-            const mockPixels = [{ id: 'pixel_1', name: 'Pixel 1' }];
-            mockFetch.mockResolvedValue({
-                ok: true,
-                json: jest.fn().mockResolvedValue({ data: mockPixels })
-            });
+            const mockPixels = [{ _data: { id: 'pixel_1', name: 'Pixel 1' } }];
+            const mockGetAdsPixels = jest.fn().mockResolvedValue(mockPixels);
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                getAdsPixels: mockGetAdsPixels,
+            }));
 
             const result = await service.listPixels(mockAdAccountId, mockAccessToken);
-            expect(result).toEqual(mockPixels);
-            expect(mockFetch).toHaveBeenCalledWith(
-                expect.stringContaining(`act_${mockAdAccountId}/adspixels`)
-            );
+            expect(result.pixels).toEqual([{ id: 'pixel_1', name: 'Pixel 1' }]);
+            expect(result.truncated).toBe(false);
+            expect(AdAccount).toHaveBeenCalledWith(`act_${mockAdAccountId}`);
         });
 
         // ENG-399: `last_fired_time` is what tells a user whether a pixel is actually
         // firing — the discovery step this tool exists to serve.
         it('should request last_fired_time when listing pixels', async () => {
-            mockFetch.mockResolvedValue({
-                ok: true,
-                json: jest.fn().mockResolvedValue({ data: [] })
-            });
+            const mockGetAdsPixels = jest.fn().mockResolvedValue([]);
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                getAdsPixels: mockGetAdsPixels,
+            }));
 
             await service.listPixels(mockAdAccountId, mockAccessToken);
-            expect(mockFetch).toHaveBeenCalledWith(
-                expect.stringContaining('last_fired_time')
+            expect(mockGetAdsPixels.mock.calls[0][0]).toEqual(
+                expect.arrayContaining(['last_fired_time'])
             );
         });
 
@@ -1583,22 +1663,22 @@ describe('MetaService', () => {
         });
 
         it('should handle API errors in listPixels', async () => {
-            mockFetch.mockResolvedValue({
-                ok: true,
-                json: jest.fn().mockResolvedValue({ error: { message: 'Permission denied' } })
-            });
+            const mockGetAdsPixels = jest.fn().mockRejectedValue(new Error('Permission denied'));
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                getAdsPixels: mockGetAdsPixels,
+            }));
 
             await expect(service.listPixels(mockAdAccountId, mockAccessToken)).rejects.toThrow('Permission denied');
         });
 
         it('should return empty array when no pixel data', async () => {
-            mockFetch.mockResolvedValue({
-                ok: true,
-                json: jest.fn().mockResolvedValue({})
-            });
+            const mockGetAdsPixels = jest.fn().mockResolvedValue([]);
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                getAdsPixels: mockGetAdsPixels,
+            }));
 
             const result = await service.listPixels(mockAdAccountId, mockAccessToken);
-            expect(result).toEqual([]);
+            expect(result.pixels).toEqual([]);
         });
     });
 

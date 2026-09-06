@@ -761,9 +761,12 @@ describe('Predefined Work Plan MCP Tools', () => {
       const payload = JSON.parse(result.content[0].text);
       expect(payload.error).toMatch(/would blank/i);
       expect(payload.stepsWouldBeRemoved).toBe(0);
+      // `kind` separates a step that came back with fields emptied from one that
+      // did not come back recognisably at all — both refuse, but only the first
+      // is honestly described as blanking (ENG-1221, Greptile round 2).
       expect(payload.stepContentLoss).toEqual([
-        { stepCount: 1, title: 'Step 1: Scope', fields: ['requiredFunctionCalls', 'skillIds'] },
-        { stepCount: 2, title: 'Step 2: Inventory', fields: ['requiredFunctionCalls', 'skillIds', 'userInstructions', 'expectedAssetCount'] },
+        { stepCount: 1, title: 'Step 1: Scope', fields: ['requiredFunctionCalls', 'skillIds'], kind: 'blanked' },
+        { stepCount: 2, title: 'Step 2: Inventory', fields: ['requiredFunctionCalls', 'skillIds', 'userInstructions', 'expectedAssetCount'], kind: 'blanked' },
       ]);
     });
 
@@ -783,7 +786,7 @@ describe('Predefined Work Plan MCP Tools', () => {
       const payload = JSON.parse(result.content[0].text);
       // Step 1 kept its contents under its new position; only step 2 lost any.
       expect(payload.stepContentLoss).toEqual([
-        { stepCount: 2, title: 'Step 2: Inventory', fields: ['requiredFunctionCalls', 'skillIds', 'userInstructions', 'expectedAssetCount'] },
+        { stepCount: 2, title: 'Step 2: Inventory', fields: ['requiredFunctionCalls', 'skillIds', 'userInstructions', 'expectedAssetCount'], kind: 'blanked' },
       ]);
     });
 
@@ -806,7 +809,17 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(payload.stepsChange.stepContentLoss).toHaveLength(2);
     });
 
-    it('does NOT refuse a deliberate rewrite whose steps are all new', async () => {
+    it('refuses a deliberate rewrite whose steps are all new, until it is confirmed', async () => {
+      // Reversed on 2026-08-18 (Anurag's call, ENG-1221). This used to pass the
+      // write through: nothing was kept, so it read as "replace this plan" and
+      // droppedStepTitles was considered notice enough. The carve-out leaked
+      // three separate ways under review — a hollow replacement step, a renumber
+      // that kept the prose and dropped the skillIds, then an all-new rewrite
+      // dropping them on a silent 200 — and each patch only narrowed it.
+      //
+      // Replacing a plan is still supported; it now costs one explicit
+      // confirm_step_removal, which is the difference between doing it and doing
+      // it by accident.
       mockPlanFetches();
 
       const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
@@ -818,11 +831,29 @@ describe('Predefined Work Plan MCP Tools', () => {
         ],
       }, context);
 
-      // Nothing was kept, so there is no step the caller plainly meant to
-      // preserve — the dropped titles in stepsChange already say what happened.
+      expect(putCalls()).toHaveLength(0);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.stepContentLoss).toHaveLength(2);
+      expect(payload.stepContentLoss.every((l: any) => l.kind === 'unpaired')).toBe(true);
+    });
+
+    it('performs that same all-new rewrite once confirm_step_removal is set', async () => {
+      // The refusal must be a speed bump, not a wall — the capability has to
+      // survive, or plans become unreplaceable through the tool.
+      mockPlanFetches();
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        confirm_step_removal: true,
+        steps: [
+          { title: 'Brand new step A', description: 'a' },
+          { title: 'Brand new step B', description: 'b' },
+        ],
+      }, context);
+
       expect(putCalls()).toHaveLength(1);
       const payload = JSON.parse(result.content[0].text);
-      expect(payload.stepsChange.stepContentLoss).toBeUndefined();
       expect(payload.stepsChange.droppedStepTitles).toEqual(['Step 1: Scope', 'Step 2: Inventory']);
     });
 
@@ -1027,7 +1058,7 @@ describe('Predefined Work Plan MCP Tools', () => {
         // Only step 2 lost its requiredFunctionCalls. Matching on the shared
         // title would have paired both against step 1 and reported nothing.
         expect(payload.stepContentLoss).toEqual([
-          { stepCount: 2, title: 'Review', fields: ['requiredFunctionCalls'] },
+          { stepCount: 2, title: 'Review', fields: ['requiredFunctionCalls'], kind: 'blanked' },
         ]);
       });
     });

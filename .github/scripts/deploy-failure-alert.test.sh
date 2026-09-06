@@ -286,7 +286,9 @@ check() {
     return
   fi
 
-  if [ -n "${needle}" ] && ! printf '%s' "${LAST_OUTPUT}" | grep -qF "${needle}"; then
+  # ENG-1277: a here-string, not a pipe — see grep_effective's comment below
+  # for the SIGPIPE-under-pipefail race this avoids.
+  if [ -n "${needle}" ] && ! grep -qF "${needle}" <<<"${LAST_OUTPUT}"; then
     printf '  FAIL %s\n       output did not contain: %s\n       output:\n%s\n' \
       "${desc}" "${needle}" "${LAST_OUTPUT}"
     TESTS_FAILED=$(( TESTS_FAILED + 1 ))
@@ -307,7 +309,8 @@ check_posted() {
   fi
 
   text="$(jq -r '.text' "${LAST_MOCK_DIR}/payload_seen.json")"
-  if ! printf '%s' "${text}" | grep -qF "${needle}"; then
+  # ENG-1277: here-string, same reason as check() above.
+  if ! grep -qF "${needle}" <<<"${text}"; then
     record_fail "${desc}" "the Slack message did not contain: ${needle}" "message was:" "${text}"
     return
   fi
@@ -523,7 +526,11 @@ fix(infra): stagger agent-mode timeout layers (ENG-818)'
 check 'AC1: a multi-line commit message still delivers' 0 'alert delivered'
 check_posted 'AC1: only the commit subject line is used' 'Merge pull request #2237'
 TESTS_RUN=$(( TESTS_RUN + 1 ))
-if jq -r '.text' "${M}/payload_seen.json" | grep -qF 'stagger agent-mode timeout layers'; then
+# ENG-1277: plain grep (no -q) redirected to /dev/null, not `grep -q` — same
+# SIGPIPE-under-pipefail race as grep_effective() above, this time against
+# jq's output rather than sed's. Plain grep reads its input to EOF instead of
+# closing early on the first match, so jq never sees a closed pipe.
+if jq -r '.text' "${M}/payload_seen.json" | grep -F 'stagger agent-mode timeout layers' >/dev/null; then
   record_fail 'AC1: the commit body is not pasted into the alert' \
     'the full multi-line commit message leaked into the Slack text'
 else
@@ -767,7 +774,8 @@ fi
 # since every alert redacts its reason. Parameter expansion runs in-process.
 TESTS_RUN=$(( TESTS_RUN + 1 ))
 REDACT_BODY="$(awk '/^redact\(\)/,/^}/' "${ALERT_SCRIPT}")"
-if printf '%s' "${REDACT_BODY}" | grep -qE '\b(sed|awk|perl|tr|python3?)\b'; then
+# ENG-1277: here-string, not a pipe — see grep_effective's comment above.
+if grep -qE '\b(sed|awk|perl|tr|python3?)\b' <<<"${REDACT_BODY}"; then
   record_fail 'redact() never passes the token to a subprocess' \
     'redact() invokes an external command; the token would land in its argv'
 else
@@ -838,7 +846,8 @@ NOTIFY_IF="$(awk '
   in_if { print }
   in_if && /^    runs-on:/ { exit }
 ' "${DEPLOY_WORKFLOW}")"
-if printf '%s' "${NOTIFY_IF}" | grep -q 'detect-changes'; then
+# ENG-1277: here-string, not a pipe — see grep_effective's comment above.
+if grep -q 'detect-changes' <<<"${NOTIFY_IF}"; then
   record_fail 'it does NOT fire on detect-changes, which deploys nothing' \
     'the notify job if: condition references detect-changes'
 else

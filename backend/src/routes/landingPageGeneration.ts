@@ -35,6 +35,7 @@ import {
   updateLandingPageContext,
   updateLandingPageLeadList,
   syncLeadCaptureFilesToRepo,
+  NO_CAPTURE_LAYER,
   recordLandingPagePublish,
   markLandingPagePublishReverted,
   INTEGRATIONS,
@@ -43,12 +44,15 @@ import {
   resolveLandingPageLiveUrl,
   canUserEditLandingPage,
   updateLandingPageTrackingInstalled,
+  updateLandingPageGoogleAds,
+  updateLandingPageGoogleAdsInstalled,
   updateLandingPageMetaPixel,
   updateLandingPageMetaTrackingInstalled,
   buildCaptureRoute,
   commitFilesToRepoMain,
 } from "../services/v0Service";
 import { injectGtmIntoLayout, verifyGtmInjection } from "../utils/gtmInjection";
+import { injectGoogleAdsIntoLayout, verifyGoogleAdsInjection } from "../utils/googleAdsInjection";
 import { injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
@@ -150,6 +154,56 @@ async function resolveOrCreateDefaultLeadList(
     inFlight.finally(() => inFlightDefaultListResolutions.delete(key)).catch(() => {});
   }
   return inFlight;
+}
+
+/**
+ * ENG-967: a lead list a landing page is bound to MUST be able to RECEIVE that page's
+ * submissions. The generated capture route posts to /api/webhooks/forward-lead, which
+ * rejects any list with `publicAccessEnabled !== true` with a 403 — and the visitor is
+ * still shown a success screen. Binding a private list therefore produces a page that
+ * reports "saving leads to X" while silently dropping every submission, forever.
+ *
+ * /generate has enabled public access on the list it binds since ENG-449, but the two
+ * OTHER paths that bind a list did not: PATCH /generated/:id/lead-list (the portal's
+ * lead-list picker and the agent's MCP equivalent) and /generated/:id/duplicate. A list
+ * created anywhere else — crmDb.createLeadList defaults publicAccessEnabled to false,
+ * including the auto-provisioned default list — stayed private, so those two paths wired
+ * up a page whose form could never save a lead.
+ *
+ * Idempotent (no write when the list is already public) and never throws: it returns a
+ * warning string instead, so a caller can tell the user the truth rather than report a
+ * clean save.
+ *
+ * A MISSING list is a warning, not a success. `getLeadListById` returns null for a record
+ * that no longer exists, and a page bound to one POSTs into a 404 at forward-lead — the same
+ * silent drop, one step further along. This is not hypothetical: a read of all 167
+ * AW-LandingPages records on 2026-08-21 found three bound lists absent from AW-LeadLists.
+ * Nothing here can repair that (repointing a page at a different list is a judgement call),
+ * so it is reported rather than guessed at.
+ *
+ * @returns undefined when the list accepts public submissions, else a warning message.
+ */
+async function ensureLeadListAcceptsPublicSubmissions(leadListId: string): Promise<string | undefined> {
+  try {
+    const list = await crmDb.getLeadListById(leadListId);
+    if (!list) {
+      console.warn(`[LP GENERATION] Bound lead list ${leadListId} does not exist`);
+      return (
+        `Lead list ${leadListId} no longer exists, so this page's form has nowhere to save a ` +
+        "lead and every submission will be rejected. Attach an existing list to this page in CRM."
+      );
+    }
+    if (list.publicAccessEnabled) return undefined;
+    await crmDb.updateLeadList(leadListId, { publicAccessEnabled: true });
+    console.log(`[LP GENERATION] Auto-enabled public access on lead list ${leadListId}`);
+    return undefined;
+  } catch (err) {
+    console.warn(`[LP GENERATION] Could not auto-enable public access on lead list ${leadListId}:`, err);
+    return (
+      "Lead list saved, but public form submissions could not be enabled on it, so this page's " +
+      "form will keep rejecting every lead. Enable public access on the list in CRM settings."
+    );
+  }
 }
 
 function validateBranchName(branch: string): boolean {
@@ -354,6 +408,27 @@ router.get("/site", async (req: Request, res: Response) => {
       vercelProjectId: site.vercelProjectId,
       githubRepoUrl: site.githubRepoUrl,
       gtmContainerId: site.gtmContainerId,
+      /*
+       * ENG-1527. The site's Google Ads conversion tag, alongside the GTM container it
+       * sits next to on the record.
+       *
+       * The record has carried these since the tag work landed; this endpoint projected a
+       * fixed five fields and dropped them, so the only way to see whether a site's
+       * conversion tag exists was to read DynamoDB. That is the same class of gap as a
+       * warning computed and discarded: the data is right there and nobody can see it.
+       *
+       * `googleAdsTrackingInstalled` is the one that matters most and is deliberately
+       * normalised to a boolean rather than passed through as possibly-undefined. Undefined
+       * means "we never recorded an outcome", which a UI would render the same as `false`
+       * anyway; collapsing it here keeps every consumer from having to decide. It carries
+       * more weight than its Meta sibling because Google has no server-side leg until
+       * ENG-1325 — false means the lander shipped with NO Google measurement at all, which
+       * is exactly what RULE 7.5 refuses a launch over.
+       */
+      googleAdsConversionId: site.googleAdsConversionId,
+      googleAdsConversionLabel: site.googleAdsConversionLabel,
+      googleAdsCustomerId: site.googleAdsCustomerId,
+      googleAdsTrackingInstalled: site.googleAdsTrackingInstalled === true,
       deployStatus,
     });
   } catch (err) {
@@ -389,7 +464,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       }
     }
 
-    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id, site_id, originating_session_id, mode: requestedMode, bridge_out_url, meta_pixel_override } = req.body;
+    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id, site_id, originating_session_id, mode: requestedMode, bridge_out_url, meta_pixel_override, google_ads } = req.body;
     // Condense uploaded HTML to avoid exceeding v0 prompt size limits
     let template_html: string | undefined = rawTemplateHtml
       ? extractTemplateOutline(rawTemplateHtml)
@@ -447,6 +522,51 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
         );
         metaPixelOverride = undefined;
       }
+    }
+
+    /*
+     * ENG-1328 AC1: the site's Google Ads conversion action, supplied at creation so the
+     * base gtag ships in the FIRST commit rather than needing a follow-up call to the
+     * manual endpoint. Without this the parameter threaded through
+     * GenerateLandingPageOptions was unreachable — every generated lander shipped
+     * untagged and AC1 could not happen at all.
+     *
+     * Never trusts the client, same stance as meta_pixel_override: the customer id has to
+     * be one of the caller's own connected Google Ads accounts, or a request could point a
+     * lander's conversions at an account the caller does not own.
+     *
+     * Both halves or neither. An id without its label fires a conversion that matches no
+     * conversion action — reported as fired, attributing nothing.
+     */
+    let googleAds: { conversionId: string; conversionLabel: string; customerId?: string } | undefined;
+    if (google_ads !== undefined && google_ads !== null) {
+      if (
+        typeof google_ads !== "object" ||
+        typeof google_ads.conversionId !== "string" || !google_ads.conversionId.trim() ||
+        typeof google_ads.conversionLabel !== "string" || !google_ads.conversionLabel.trim()
+      ) {
+        return res.status(400).json({ error: "google_ads must be an object with conversionId and conversionLabel" });
+      }
+      const conversionId = google_ads.conversionId.trim();
+      // Same shape RULE 7.5's detector looks for, so a tag we install is a tag the
+      // pre-flight gate will recognise on the served page.
+      if (!/^AW-[0-9]{6,}$/.test(conversionId)) {
+        return res.status(400).json({ error: "google_ads.conversionId must look like AW-123456789" });
+      }
+      let customerId: string | undefined;
+      if (google_ads.customerId !== undefined && google_ads.customerId !== null) {
+        if (typeof google_ads.customerId !== "string" || !google_ads.customerId.trim()) {
+          return res.status(400).json({ error: "google_ads.customerId must be a string" });
+        }
+        customerId = google_ads.customerId.trim();
+        const { getAccountsWithOwnerIncludingOrgShared } = await import("../services/connectedAccountsDb");
+        const owned = (await getAccountsWithOwnerIncludingOrgShared(userId))
+          .some((a: any) => a.platform === "google_ads" && a.config?.customer_id === customerId);
+        if (!owned) {
+          return res.status(400).json({ error: "google_ads.customerId is not one of your connected Google Ads accounts" });
+        }
+      }
+      googleAds = { conversionId, conversionLabel: google_ads.conversionLabel.trim(), customerId };
     }
 
     // If template_id provided (user picked a template), look it up from DynamoDB
@@ -544,16 +664,10 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
 
     // Auto-enable public access on the lead list so the landing page form works.
     // Only the enabling WRITE is best-effort here: a transient DB hiccup on this side
-    // effect shouldn't block generation (unlike a genuinely missing explicit list).
-    try {
-      const boundLeadList = await crmDb.getLeadListById(effectiveLeadListId);
-      if (boundLeadList && !boundLeadList.publicAccessEnabled) {
-        await crmDb.updateLeadList(effectiveLeadListId, { publicAccessEnabled: true });
-        console.log(`[LP GENERATION] Auto-enabled public access on lead list ${effectiveLeadListId}`);
-      }
-    } catch (err) {
-      console.warn(`[LP GENERATION] Could not auto-enable public access on lead list:`, err);
-    }
+    // effect shouldn't block generation (unlike a genuinely missing explicit list) — but
+    // it is REPORTED rather than discarded, or a page whose form cannot save a lead is
+    // handed back as an unqualified success.
+    const leadListWarning = await ensureLeadListAcceptsPublicSubmissions(effectiveLeadListId);
 
     // Effective site mode, WRITE-ONCE locked. A saved mode is immutable (switching
     // single<->multi would re-home deployed pages across repos/domains); the first
@@ -571,9 +685,10 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       mode: effectiveMode,
       bridgeOutUrl: typeof bridge_out_url === "string" ? bridge_out_url : undefined,
       metaPixelOverride,
+      googleAds,
     });
     void emitLanderLifecycle("created", { pageId: (result as any)?.id || "unknown", userId, channel: landerChannelFromRequest(req), mode: "cold_start", outcome: (result as any)?.status === "failed" ? "failed" : "ok" });
-    res.status(201).json(result);
+    res.status(201).json(leadListWarning ? { ...result, warnings: [leadListWarning] } : result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error generating landing page:", {
       userId: (req as unknown as AuthenticatedRequest).user?.userId,
@@ -634,7 +749,10 @@ router.post("/generated/:id/iterate", rateLimiter, async (req, res: Response) =>
     const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
 
-    const result = await iterateLandingPage(auth.page.id, auth.page.userId, message);
+    // ENG-694 AC5: pass the acting member alongside the owner. `auth.page.userId`
+    // stays the billing subject; `userId` is whoever actually asked for the edit,
+    // and authorizeLandingPageAccess has already proven they may.
+    const result = await iterateLandingPage(auth.page.id, auth.page.userId, message, userId);
     void emitLanderLifecycle("iterated", { pageId: auth.page.id, userId, channel: landerChannelFromRequest(req), mode: "incremental" });
     res.json(result);
   } catch (error: any) {
@@ -911,8 +1029,20 @@ router.post("/generated/:id/duplicate", rateLimiter, async (req, res: Response) 
     // request field, consistent with the "no page is ever generated unbound" intent.
     const leadListId = original.leadListId || (await resolveOrCreateDefaultLeadList(userId, user?.orgId)).id;
 
+    // ENG-967: same as /generate — a bound list that isn't publicly submittable makes the
+    // copy's form drop every lead. The carried-over list is not necessarily public (the
+    // original may predate ENG-449), and a freshly provisioned default list never is.
+    //
+    // Deliberately NOT repeating the list-level canEditItem check PATCH /lead-list runs: this
+    // list is not caller-supplied. It is either the original page's own list — and ENG-449
+    // already binds it to the copy on the strength of the "edit" authorization above — or one
+    // this caller just had provisioned. Enabling submissions on a list we are binding anyway
+    // is strictly smaller than the bind itself, so a check here would reject nothing the bind
+    // permits.
+    const leadListWarning = await ensureLeadListAcceptsPublicSubmissions(leadListId);
+
     const result = await generateLandingPage(userId, original.prompt, newName, brandContext, leadListId);
-    res.status(201).json(result);
+    res.status(201).json(leadListWarning ? { ...result, warnings: [leadListWarning] } : result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error duplicating:", error);
     res.status(500).json({ error: "Failed to duplicate landing page" });
@@ -1654,6 +1784,91 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       return true;
     };
 
+    // A generated branch has no CI of its own: the landing-page repository runs
+    // Tests for pull requests. Open (or reuse) that repository-supported review
+    // path, then inspect the exact draft SHA before any write can advance main.
+    // The route deliberately returns a retryable, non-500 result while GitHub is
+    // still running the check; it never treats a branch-level result as proof for
+    // a different commit.
+    if (await refuseIfConsentWithdrawn()) return;
+
+    const draftRefRes = await axios.get<any>(
+      `${repoBase}/git/ref/heads/${encodeURIComponent(branch)}`,
+      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+    );
+    const draftSha: string = draftRefRes.data.object.sha;
+    const findOpenDraftPr = () => axios.get<any[]>(`${repoBase}/pulls`, {
+      headers: ghHeaders,
+      timeout: GITHUB_TIMEOUT_MS,
+      params: { state: "open", head: `${owner}:${branch}`, base: "main" },
+    });
+    const existingPrRes = await findOpenDraftPr();
+
+    if (existingPrRes.data.length === 0) {
+      try {
+        await axios.post(
+          `${repoBase}/pulls`,
+          {
+            title: `Publish landing page changes from ${branch}`,
+            head: branch,
+            base: "main",
+            body: "Automated publish check for the generated landing-page draft.",
+          },
+          { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+        );
+      } catch (createPrErr: any) {
+        // Another publish request can create the same PR after our lookup. GitHub
+        // returns 422 for that benign race; prove the PR now exists before reuse.
+        const createPrMessages = [
+          createPrErr.response?.data?.message,
+          ...(Array.isArray(createPrErr.response?.data?.errors)
+            ? createPrErr.response.data.errors.map((error: { message?: string }) => error.message)
+            : []),
+        ].filter((message): message is string => typeof message === "string");
+        const isDuplicatePr = createPrMessages.some((message) => /pull request already exists/i.test(message));
+        if (createPrErr.response?.status !== 422 || !isDuplicatePr) throw createPrErr;
+        const racedPrRes = await findOpenDraftPr();
+        if (racedPrRes.data.length === 0) throw createPrErr;
+      }
+    }
+
+    const checksRes = await axios.get<any>(
+      `${repoBase}/commits/${draftSha}/check-runs`,
+      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+    );
+    const testsCheck = (checksRes.data.check_runs || []).find(
+      (check: { name?: string }) => check.name === "Tests"
+    );
+
+    if (!testsCheck || testsCheck.status !== "completed" || testsCheck.conclusion === "cancelled") {
+      const message = !testsCheck
+        ? "Required Tests check has not started for this draft yet. Keep the draft and retry publish after GitHub starts it."
+        : testsCheck.conclusion === "cancelled"
+          ? "Required Tests check was cancelled for this draft. Keep the draft and retry publish after Tests runs again."
+        : "Required Tests check is still running for this draft. Keep the draft and retry publish when it completes."
+      return res.status(409).json({ error: "required_tests_pending", message });
+    }
+    if (testsCheck.conclusion !== "success") {
+      return res.status(409).json({
+        error: "required_tests_failed",
+        message: "Required Tests check failed for this draft. Fix the draft and retry publish after Tests passes.",
+      });
+    }
+
+    // A Tests result belongs only to the SHA inspected above. Pin every later
+    // main-advancing operation to that SHA and refuse if the draft moved while
+    // the check was running; the newer commit needs its own Tests result.
+    const checkedDraftRefRes = await axios.get<any>(
+      `${repoBase}/git/ref/heads/${encodeURIComponent(branch)}`,
+      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+    );
+    if (checkedDraftRefRes.data.object.sha !== draftSha) {
+      return res.status(409).json({
+        error: "draft_changed_after_tests",
+        message: "The draft changed after its Tests check ran. Keep the newer draft and retry publish after Tests passes for its new commit.",
+      });
+    }
+
     if (await refuseIfConsentWithdrawn()) return;
 
     try {
@@ -1661,7 +1876,7 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
         `${repoBase}/merges`,
         {
           base: "main",
-          head: branch,
+          head: draftSha,
           commit_message: `Publish landing page changes from ${branch}`,
         },
         { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
@@ -1673,19 +1888,11 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
 
       console.warn(`[LP GENERATION] Standard merge returned 409; force-advancing main to draft branch tip`);
 
-      // Get the current SHA of the draft branch tip
-      const branchRes = await axios.get<any>(
-        `${repoBase}/git/ref/heads/${encodeURIComponent(branch)}`,
-        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
-      );
-      const draftSha: string = branchRes.data.object.sha;
-
-      // The branch lookup above is a second 30s window on top of the failed merge,
-      // so re-check here too: this force-update is what makes the page public on
-      // this path, and it must not run on consent read before either of them.
+      // The post-Tests ref read above proved that this exact SHA is still the
+      // draft tip. Use that immutable SHA here, never a newer untested branch tip.
       if (await refuseIfConsentWithdrawn()) return;
 
-      // Force-update main to point at the draft branch tip
+      // Force-update main to the tested draft SHA.
       await axios.patch<any>(
         `${repoBase}/git/refs/heads/main`,
         { sha: draftSha, force: true },
@@ -1697,10 +1904,18 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
 
     // Delete the draft branch
     try {
-      await axios.delete(`${repoBase}/git/refs/heads/${branch}`, {
-        headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
-      });
-      console.log(`[LP GENERATION] Deleted branch ${branch}`);
+      const deleteRefRes = await axios.get<any>(
+        `${repoBase}/git/ref/heads/${encodeURIComponent(branch)}`,
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+      if (deleteRefRes.data.object.sha !== draftSha) {
+        console.warn(`[LP GENERATION] Preserved newer draft branch ${branch} after publish`);
+      } else {
+        await axios.delete(`${repoBase}/git/refs/heads/${branch}`, {
+          headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
+        });
+        console.log(`[LP GENERATION] Deleted branch ${branch}`);
+      }
     } catch (delErr: any) {
       console.warn(`[LP GENERATION] Could not delete branch ${branch}: ${delErr.message}`);
     }
@@ -2225,6 +2440,225 @@ async function saveGtmForPage(
   }
 }
 
+/**
+ * Install (or remove) the Google Ads base tag in a page's shared root layout, persist the
+ * conversion config, and redeploy. Mirrors `saveGtmForPage` step for step, including the
+ * 409-retry loop around GitHub's SHA race and the sibling sync.
+ *
+ * The sibling sync is not optional bookkeeping. The base tag lives in the SHARED root
+ * layout, so this one commit changes the answer for every page on the site. Leaving the
+ * other records stale would have RULE 7.5 refuse a launch on a page that is, in fact,
+ * measurable — which trains people to reach for override_tracking_check.
+ */
+async function saveGoogleAdsForPage(
+  page: GeneratedLandingPage,
+  conversionId: string,
+  conversionLabel?: string,
+  customerId?: string,
+): Promise<void> {
+  if (!page.githubRepoUrl) throw new Error("Landing page has no GitHub repository");
+
+  const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+  if (!repoMatch) throw new Error("Invalid GitHub repo URL");
+  const [, owner, repoRaw] = repoMatch;
+  const repo = repoRaw.replace(".git", "");
+
+  const { getGitHubOrgToken } = await import("../utils/secretsManager");
+  const { token } = await getGitHubOrgToken();
+  const ghHeaders = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" };
+  const GITHUB_TIMEOUT_MS = 30_000;
+  const repoBase = `https://api.github.com/repos/${owner}/${repo}`;
+  const layoutPath = "app/layout.tsx";
+  const MAX_ATTEMPTS = 3;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      // Fetched inside the loop so each retry gets a fresh SHA.
+      const fileRes = await axios.get<any>(`${repoBase}/contents/${layoutPath}`, {
+        headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
+      });
+      const currentContent = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
+      const fileSha = fileRes.data.sha;
+
+      // Already exactly right? Then there is nothing to commit. Check this SEMANTICALLY,
+      // not by comparing bytes before and after: strip-then-reinject is idempotent in
+      // effect but not byte-for-byte — when the block sits flush against the next tag a
+      // newline shifts on the second pass — so a byte compare would push a pointless
+      // commit and a full Vercel rebuild on every repeat click.
+      if (conversionId && verifyGoogleAdsInjection(currentContent, conversionId)) {
+        break;
+      }
+
+      const updatedContent = injectGoogleAdsIntoLayout(currentContent, conversionId);
+
+      // Fail loud, not silent: a layout with no <head>/<body> anchor leaves the insertion a
+      // no-op, and without this we would commit unchanged content and still report success
+      // for a tag that was never installed.
+      if (!verifyGoogleAdsInjection(updatedContent, conversionId)) {
+        console.error(
+          `[LP GENERATION] Google Ads ${conversionId ? "injection" : "removal"} verification failed ` +
+          `for page ${page.id}: layout.tsx has no <head> or <body> tag to anchor on.`,
+        );
+        // The technical reason is logged, never surfaced: a marketer cannot act on
+        // "<head>", and it is not anything they did wrong.
+        throw Object.assign(
+          new Error(
+            conversionId
+              ? "We couldn't add Google Ads tracking to this page automatically. Try regenerating the page, or contact support if this keeps happening."
+              : "We couldn't remove Google Ads tracking from this page automatically. Try regenerating the page, or contact support if this keeps happening.",
+          ),
+          { httpStatus: 422 },
+        );
+      }
+
+      // Nothing to commit when the layout already says exactly this. Saves a pointless
+      // Vercel rebuild on a repeat click, which the idempotent injection makes common.
+      if (updatedContent !== currentContent) {
+        await axios.put<any>(
+          `${repoBase}/contents/${layoutPath}`,
+          {
+            message: conversionId
+              ? `chore: install Google Ads tag ${conversionId}`
+              : "chore: remove Google Ads tag",
+            content: Buffer.from(updatedContent, "utf-8").toString("base64"),
+            sha: fileSha,
+          },
+          { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+        );
+      }
+      break;
+    } catch (err: any) {
+      const status = err?.response?.status;
+      if (status === 404) {
+        throw Object.assign(new Error("app/layout.tsx not found in the repository"), { httpStatus: 400 });
+      }
+      if (status === 409 && attempt < MAX_ATTEMPTS) continue;
+      throw err;
+    }
+  }
+
+  /*
+   * Write the config to EVERY page of the site, not just the one named in the request.
+   *
+   * A conversion is site-wide by construction — the base tag lives in the shared root
+   * layout we just committed — so one commit changed the answer for every page. Writing
+   * only to `page` breaks in both directions: a manual install targeting a SUB-page would
+   * leave the ROOT blank, and addSubPage reads the pair off the root, so every later
+   * sub-page would inherit nothing and capture leads that fire no conversion. Writing to
+   * all of them also keeps each record self-describing, which is what lets RULE 7.5 and
+   * the offline import (ENG-1325) read the config off ANY page without walking to a root.
+   *
+   * Best-effort per page — a sync failure must never undo the GitHub commit that already
+   * succeeded. The root is written first and NOT swallowed: it is the record addSubPage
+   * inherits from, so losing it silently is the one failure that propagates.
+   */
+  const siteId = page.siteId ?? page.id;
+  await updateLandingPageGoogleAds(siteId, page.userId, conversionId, conversionLabel, customerId);
+
+  try {
+    const siblings = await listLandingPages(page.userId);
+    await Promise.all(
+      siblings
+        .filter((p) => (p.siteId ?? p.id) === siteId)
+        .map(async (p) => {
+          try {
+            if (p.id !== siteId) {
+              await updateLandingPageGoogleAds(p.id, p.userId, conversionId, conversionLabel, customerId);
+            }
+            await updateLandingPageGoogleAdsInstalled(p.id, !!conversionId);
+          } catch (err: any) {
+            console.error(`[LP GENERATION] Failed to sync Google Ads config for page ${p.id}: ${err.message}`);
+          }
+        }),
+    );
+  } catch (err: any) {
+    console.error(`[LP GENERATION] Failed to list sibling pages for Google Ads sync: ${err.message}`);
+  }
+
+  const vercelProjectId = await resolveVercelProjectId(page);
+  if (vercelProjectId) {
+    try {
+      await triggerVercelDeployment(vercelProjectId, `${owner}/${repo}`);
+    } catch (deployErr: any) {
+      console.warn(`[LP GENERATION] Could not trigger Vercel re-deploy after Google Ads inject: ${deployErr.message}`);
+    }
+  }
+}
+
+/**
+ * POST /api/landing-pages/v0/generated/:id/google-ads
+ * Install the Google Ads base tag in the root layout.tsx of the page's GitHub repo and
+ * persist the conversion config. The manual counterpart to /gtm and /meta-pixel, and the
+ * third seam ENG-1328 needs — this is the path a customer uses when the conversion action
+ * is created after the site was generated.
+ *
+ * Body: { googleAdsConversionId: string, googleAdsConversionLabel?: string,
+ *         googleAdsCustomerId?: string }
+ *
+ * Send an empty googleAdsConversionId to REMOVE the tag — the injection strips before it
+ * inserts, so removal is the same code path.
+ */
+router.post("/generated/:id/google-ads", editRateLimiter, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
+    if (!page.githubRepoUrl) return res.status(400).json({ error: "Landing page has no GitHub repository" });
+
+    const { googleAdsConversionId, googleAdsConversionLabel, googleAdsCustomerId } = req.body as {
+      googleAdsConversionId?: string; googleAdsConversionLabel?: string; googleAdsCustomerId?: string;
+    };
+    if (typeof googleAdsConversionId !== "string") {
+      return res.status(400).json({ error: "googleAdsConversionId is required (send an empty string to remove)" });
+    }
+    const conversionId = googleAdsConversionId.trim();
+    // Same shape RULE 7.5's detector looks for, so a tag we install is a tag the
+    // pre-flight gate will actually recognise on the served page.
+    if (conversionId && !/^AW-[0-9]{6,}$/.test(conversionId)) {
+      return res.status(400).json({ error: "Invalid Google Ads conversion ID. Expected format: AW-123456789" });
+    }
+    // Rejected, not coerced. A non-string label silently became `undefined`, which
+    // updateLandingPageGoogleAds reads as "clear the stored label" — so a malformed
+    // request would strip a working conversion pair and leave an id that attributes
+    // nothing. A non-string customer id reached .trim() and 500'd.
+    if (googleAdsConversionLabel !== undefined && typeof googleAdsConversionLabel !== "string") {
+      return res.status(400).json({ error: "googleAdsConversionLabel must be a string" });
+    }
+    if (googleAdsCustomerId !== undefined && typeof googleAdsCustomerId !== "string") {
+      return res.status(400).json({ error: "googleAdsCustomerId must be a string" });
+    }
+    const label = typeof googleAdsConversionLabel === "string" ? googleAdsConversionLabel.trim() : undefined;
+    // The label is not needed to INSTALL the base tag, but without it no conversion can
+    // ever be attributed — so this is a warning on the response, not a refusal.
+    const warning = conversionId && !label
+      ? "Base tag installed, but no conversion label was provided — conversions cannot be attributed until one is set."
+      : undefined;
+
+    // ENG-1525: `|| undefined` collapsed an explicit `""` (clear this) into "not
+    // mentioned", which is the distinction updateLandingPageGoogleAds now relies on.
+    // Same shape as `label` two lines up.
+    const customerId = typeof googleAdsCustomerId === "string" ? googleAdsCustomerId.trim() : undefined;
+    await saveGoogleAdsForPage(page, conversionId, label, customerId);
+
+    res.json({
+      success: true,
+      googleAdsConversionId: conversionId,
+      ...(label ? { googleAdsConversionLabel: label } : {}),
+      ...(warning ? { warning } : {}),
+      message: conversionId
+        ? `Google Ads tag ${conversionId} installed. Your site will redeploy shortly.`
+        : "Google Ads tag removed. Your site will redeploy shortly.",
+    });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error installing Google Ads tag:", error);
+    const httpStatus = error?.httpStatus ?? 500;
+    res.status(httpStatus).json({ error: error.response?.data?.message || error.message || "Failed to install Google Ads tag" });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Helper: inject a Meta pixel into a page's layout.tsx + regenerate its capture
 // route with the pixel/account id baked in, and persist the pixel id.
@@ -2237,7 +2671,7 @@ async function saveMetaPixelForPage(
   page: GeneratedLandingPage,
   pixelId: string,
   accountId?: string,
-): Promise<void> {
+): Promise<string | undefined> {
   if (!page.githubRepoUrl) throw new Error("Landing page has no GitHub repository");
 
   const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
@@ -2320,7 +2754,35 @@ async function saveMetaPixelForPage(
     }
     return listByPath;
   };
-  await syncLeadCaptureFilesToRepo(repoFullName, buildListByPath, pixelId || undefined, pixelId ? accountId : undefined);
+  const captureSync = await syncLeadCaptureFilesToRepo(
+    repoFullName,
+    buildListByPath,
+    pixelId || undefined,
+    pixelId ? accountId : undefined,
+  );
+  // The base pixel snippet goes into the layout regardless, but the SERVER-side half lives in
+  // the capture route — and on a repo the platform does not own we refuse to write it. Saying
+  // "Meta Pixel injected" here would report full tracking while CAPI was never configured.
+  // ⚠ `!committed &&` is load-bearing, not defensive noise: a successful sync carries
+  // `reason: undefined`, and in any suite that mocks v0Service with an object literal the
+  // imported NO_CAPTURE_LAYER is ALSO undefined — so a bare equality would fire this warning
+  // on every successful pixel install under test.
+  // ⚠ Two distinct silent-partials, and `committed` alone catches neither:
+  //   - the floor refused the repo outright (NO_CAPTURE_LAYER, committed:false)
+  //   - the commit landed but deliberately EXCLUDED the capture route (captureRouteSkipped)
+  // Either way the requested pixel is not in the capture route, so "Meta Pixel injected" on
+  // its own would claim server-side tracking that does not exist.
+  const verb = pixelId ? "updated" : "removed";
+  const captureWarning =
+    !captureSync.committed && captureSync.reason === NO_CAPTURE_LAYER
+      ? `The browser pixel was ${verb}, but this site does not use the platform's lead-capture ` +
+        "code, so server-side conversion tracking was not configured for it. Wire it in the " +
+        "site's own repository."
+      : captureSync.captureRouteSkipped
+        ? `The browser pixel was ${verb}, but this site's lead-capture route could not be read, ` +
+          "so it was left exactly as deployed and does not carry this change. Fix the route in " +
+          "the site's repository."
+        : undefined;
 
   // 3. Persist metaPixelId/metaAdAccountId on this record.
   await updateLandingPageMetaPixel(page.id, page.userId, pixelId, accountId);
@@ -2355,6 +2817,8 @@ async function saveMetaPixelForPage(
       console.warn(`[LP GENERATION] Could not trigger Vercel re-deploy after Meta Pixel inject: ${deployErr.message}`);
     }
   }
+
+  return captureWarning;
 }
 
 // ---------------------------------------------------------------------------
@@ -2380,7 +2844,7 @@ router.post("/generated/:id/meta-pixel", editRateLimiter, async (req, res: Respo
       return res.status(400).json({ error: "Invalid Meta pixel id. Expected a numeric id." });
     }
 
-    await saveMetaPixelForPage(page, trimmed, accountId);
+    const captureWarning = await saveMetaPixelForPage(page, trimmed, accountId);
 
     res.json({
       success: true,
@@ -2388,6 +2852,7 @@ router.post("/generated/:id/meta-pixel", editRateLimiter, async (req, res: Respo
       message: trimmed
         ? `Meta Pixel ${trimmed} injected. Your site will redeploy shortly.`
         : "Meta Pixel removed. Your site will redeploy shortly.",
+      ...(captureWarning ? { warnings: [captureWarning] } : {}),
     });
   } catch (error: any) {
     console.error("[LP GENERATION] Error injecting Meta Pixel:", error);
@@ -2557,13 +3022,30 @@ router.patch("/generated/:id/lead-list", async (req, res: Response) => {
       throw err;
     }
 
+    // ENG-967: wiring the page to a list the platform will not accept public submissions
+    // for is the same class of silent drop ENG-310 closed one step later in the chain —
+    // the repo gets a correct capture route, and forward-lead 403s every lead it sends.
+    // Done BEFORE the repo sync so the list is ready by the time the redeploy goes live.
+    const warnings: string[] = [];
+    if (leadListId !== null) {
+      const publicAccessWarning = await ensureLeadListAcceptsPublicSubmissions(leadListId);
+      if (publicAccessWarning) warnings.push(publicAccessWarning);
+    }
+
     // ENG-310: the DB write alone means nothing. The capture route lives in the page's
     // GitHub repo, so the repo has to be told too — otherwise the site keeps 404ing on
     // /api/capture while the record cheerfully claims a lead list.
     const captureSyncWarning = await syncLeadCaptureForPage(authz.page, leadListId);
+    if (captureSyncWarning) warnings.push(captureSyncWarning);
 
     const updated = await getLandingPageById(id);
-    return res.json(captureSyncWarning ? { ...updated, captureSyncWarning } : updated);
+    if (!warnings.length) return res.json(updated);
+    // `captureSyncWarning` is the field the portal's lead-list picker already reads and shows
+    // verbatim (PageLeadListPicker.tsx), so it keeps carrying every warning — each entry is a
+    // complete sentence, so joining stays readable. `warnings` is added alongside it so a
+    // caller can tell the two failures apart instead of parsing one blob; nothing depends on
+    // it yet, and dropping the joined field would silently mute the toast.
+    return res.json({ ...updated, captureSyncWarning: warnings.join(" "), warnings });
   } catch (err) {
     console.error("PATCH /lead-list failed:", err);
     return res.status(500).json({ error: "Failed to update lead list" });
@@ -2646,7 +3128,17 @@ async function syncLeadCaptureForPage(
       rootRecord?.metaAdAccountId,
     );
     if (result.committed || result.reason === "up-to-date") return undefined;
-    return `Lead list saved, but the live site was not updated (${result.reason}). It will be applied on the next deploy or retry.`;
+    // Attaching and DETACHING both come through here; "saved" is wrong for a removal.
+    const lead = leadListId === null ? "Lead list removed" : "Lead list saved";
+    // Not transient: no retry or redeploy installs a capture layer we refuse to install, so
+    // this must not borrow the "applied on the next deploy" wording below.
+    if (result.reason === NO_CAPTURE_LAYER) {
+      return (
+        `${lead}, but this page's site does not use the platform's lead-capture code, ` +
+        "so its form was not changed. Wire the form up in the site's own repository."
+      );
+    }
+    return `${lead}, but the live site was not updated (${result.reason}). It will be applied on the next deploy or retry.`;
   } catch (err: any) {
     // syncLeadCaptureFilesToRepo does not throw, so this is a sibling-fetch failure.
     console.error(`[LP GENERATION] ENG-310: lead-capture sync failed for page ${page.id}:`, err?.message || err);

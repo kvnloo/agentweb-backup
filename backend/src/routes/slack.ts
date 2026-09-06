@@ -15,9 +15,12 @@ import {
   deleteSlackMessage,
   getSlackUserDisplayName,
   getSlackUserEmail,
+  getSlackUserTeamId,
+  getOwnSlackTeamId,
   resolveSlackMentionsInText,
   downloadSlackFile,
-  resolveSlackFileUrl
+  resolveSlackFileUrl,
+  postSlackMessage
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 import { taskDb, subscriberDb } from "../services/db";
@@ -27,6 +30,7 @@ import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
 import { getEmmaBotUserId, handleLoopApprovalReaction } from "../services/loopSlackApprovalDispatcher";
 import { renderCitationMarkers } from "../utils/citations";
+import { agentModeService } from '../services/agentModeService';
 
 // ENG-351: resolve Emma's {{cite:N}} markers to Slack-clickable source links. The citation metadata
 // rides on the response's last assistant message; render as markdown links, which postThreadResponse's
@@ -40,6 +44,22 @@ function citeForSlack(response: any): string {
 }
 
 const router = express.Router();
+
+// ENG-1294: Slack Connect guests (e.g. Argusoft engineers, who work directly in this codebase)
+// can never share our own workspace's team_id — that's what Slack Connect means — so neither the
+// email-domain check nor the own-team_id fallback below can ever authorize them, even though
+// they're legitimately trusted. Slack reliably includes the author's home team on Connect-shared
+// app_mention events via user_team/source_team, delivered directly on the event payload — no
+// extra API call, and no dependency on users.info resolving anything (confirmed empirically:
+// Manan's own test in #agentweb-argusoft on 2026-09-03 got the profile-email field silently
+// omitted exactly as it did for Harsha/Fangfang, but user_team/source_team carried his real home
+// team, T093CUE1WGP, without incident). Comma-separated env override; defaults to Argusoft's team.
+const TRUSTED_EXTERNAL_SLACK_TEAM_IDS = new Set(
+  (process.env.AGENTWEB_TRUSTED_EXTERNAL_SLACK_TEAM_IDS || 'T093CUE1WGP') // Argusoft
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
 
 function userMatchesChannel(u: any, channel: string): boolean {
   // Skip tombstoned (deleted) users
@@ -70,18 +90,6 @@ async function extractAdminMessageIntent(
   rawMessage: string
 ): Promise<{ targetEmail: string; taskMessage: string } | null> {
   try {
-    const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-    const apiKey = process.env.GEMINI_API_KEY || (await getSecret(`${environment}/AgentWeb/GeminiAPIKey`));
-    if (!apiKey?.trim()) {
-      console.warn('⚠️ Gemini API key not available, falling back to regex for admin channel parsing');
-      return null;
-    }
-
-    // Metered factory client (shadow usage metering). System context — admin
-    // channel parsing has no single attributable user, so no userId is passed.
-    const { getGeminiClient } = await import('../utils/llmClients');
-    const ai = await getGeminiClient({ feature: 'other' }, apiKey);
-
     const prompt = `Extract the target user email address and task description from this admin Slack message.
 
 Message: "${rawMessage}"
@@ -95,15 +103,15 @@ Respond with JSON only, no explanation:
 or if no email found:
 {"targetEmail": null, "taskMessage": null}`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.1-flash-lite',
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: {
-        responseMimeType: 'application/json',
-      },
+    const response = await agentModeService.callLLM('gemini-3.1-flash-lite', [
+      { role: 'user', content: prompt },
+    ], {
+      response_format: { type: 'json_object' },
+      usageContext: { feature: 'other' },
+      taskClass: 'mcp_api',
     });
 
-    const text = response.text?.trim();
+    const text = response.choices?.[0]?.message?.content?.trim();
     if (!text) return null;
 
     const parsed = JSON.parse(text);
@@ -116,156 +124,6 @@ or if no email found:
   } catch (err) {
     console.error('⚠️ Failed to extract admin message intent via LLM:', err);
     return null;
-  }
-}
-
-/**
- * Helper: handles the full slack triggered session flow for non-Emma messages.
- * Triages message, creates session, generates Emma response, emails founders.
- * Does NOT post to Slack — email only, so the team can decide how to respond.
- * @param ts For top-level messages: the message's own ts. For thread replies: the thread_ts (root).
- */
-async function handleSlackTriggeredSession(params: {
-  text: string;
-  slackUserId: string;
-  channel: string;
-  ts: string;
-}) {
-  const { text, slackUserId, channel, ts } = params;
-  try {
-    const { userDb } = await import('../services/db');
-    const { chatbotDb } = await import('../services/chatbotService');
-    const { agentModeService } = await import('../services/agentModeService');
-    const { settingsService } = await import('../services/settingsService');
-
-    // Normalize Slack formatting and resolve user mentions to display names
-    const rawMessage = (await resolveSlackMentionsInText(text))
-      .replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1')
-      .replace(/<mailto:([^|>]+)>/g, '$1')
-      .trim();
-
-    if (!rawMessage) return;
-
-    // Skip messages from AgentWeb team members — no need to suggest replies for our own team's comments
-    const senderEmail = await getSlackUserEmail(slackUserId);
-    if (senderEmail && senderEmail.endsWith('@agentweb.pro')) {
-      console.log(`📨 [slack-triggered] skipping message from AgentWeb team member (${senderEmail})`);
-      return;
-    }
-
-    // Look up user by slackChannel field (with cache)
-    const mappingKey = `slack_channel_mapping_${channel}`;
-    let user = null;
-
-    const cachedMapping = await settingsService.getSetting(mappingKey);
-    if (cachedMapping?.settingValue) {
-      const cachedUser = await userDb.getUserById(cachedMapping.settingValue);
-      // Skip tombstoned (deleted) users — their userId starts with "deleted_"
-      if (cachedUser && !cachedUser.userId?.startsWith('deleted_')) {
-        user = cachedUser;
-      }
-    }
-
-    if (!user) {
-      const allUsers = await userDb.getAllUsers();
-      user = allUsers.find((u: any) => userMatchesChannel(u, channel));
-      if (user) {
-        await settingsService.setSetting(
-          mappingKey,
-          user.userId,
-          `Slack channel to userId mapping for channel ${channel}`,
-          'system'
-        );
-      }
-    }
-
-    if (!user) {
-      console.log(`📨 [slack-triggered] channel ${channel} not connected to any user, ignoring`);
-      return;
-    }
-
-    // Respect the per-user opt-out: when suggested replies are disabled, skip the whole flow
-    // (no triage, no session, no email) so we don't generate suggestions for this customer.
-    if (user.slackSuggestedRepliesDisabled) {
-      console.log(`📨 [slack-triggered] suggested replies disabled for user ${user.userId}, skipping`);
-      return;
-    }
-
-    // Triage: does this message need handling?
-    console.log(`📨 [slack-triggered] user found (${user.email}), starting triage...`);
-    const needsHandling = await agentModeService.triageSlackMessage(rawMessage);
-    if (!needsHandling) {
-      console.log(`📨 [slack-triggered] triage: skipping message in channel ${channel}`);
-      return;
-    }
-
-    console.log(`📨 [slack-triggered] triage passed, creating session for user ${user.userId}`);
-
-    const displayName = await getSlackUserDisplayName(slackUserId);
-    const userMessage = `${displayName}: ${rawMessage}`;
-
-    const session = await chatbotDb.createChatSession(
-      user.userId,
-      undefined,
-      'agent',
-      'slack-triggered',
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      'regular'
-    );
-
-    const sessionTitle = rawMessage.length > 50 ? rawMessage.substring(0, 47) + '...' : rawMessage;
-    await chatbotDb.updateSessionTitle(session.sessionId, sessionTitle);
-
-    // Save thread-to-session mapping so thread replies continue the session
-    const threadMappingKey = `slack_thread_${channel}_${ts}`;
-    await settingsService.setSetting(
-      threadMappingKey,
-      JSON.stringify({ sessionId: session.sessionId, userId: user.userId, type: 'triggered' }),
-      `Slack thread to session mapping`,
-      'system'
-    );
-    await chatbotDb.updateSessionSlackThread(session.sessionId, { channel, threadTs: ts });
-
-    // Generate Emma's response
-    const { generateSessionResponse } = await import('../controllers/agentModeController');
-    const llmModel = session.llmModel || await agentModeService.getDefaultModel();
-    if (!session.llmModel) {
-      await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel);
-    }
-    let emmaResponse = '';
-    try {
-      const result = await generateSessionResponse(session.sessionId, userMessage, user.userId, llmModel);
-      emmaResponse = result.content;
-    } catch (genError) {
-      console.error('❌ Error generating Emma response for slack triggered session:', genError);
-      emmaResponse = '(Emma was unable to generate a response for this message.)';
-    }
-
-    // Resolve channel name
-    let channelName = channel;
-    try {
-      const { WebClient } = await import('@slack/web-api');
-      const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-      const info = await slackClient.conversations.info({ channel });
-      channelName = (info.channel as any)?.name || channel;
-    } catch { /* non-blocking */ }
-
-    await emailService.sendSlackTriggeredSessionEmail('founders@agentweb.pro', {
-      sessionId: session.sessionId,
-      userEmail: user.email,
-      channelName,
-      originalMessage: rawMessage,
-      emmaResponse,
-      receivedAt: new Date().toISOString(),
-      senderDisplayName: displayName,
-    });
-
-    console.log(`✅ [slack-triggered] session handled: ${session.sessionId}`);
-  } catch (error) {
-    console.error('❌ Error in handleSlackTriggeredSession:', error);
   }
 }
 
@@ -345,6 +203,7 @@ async function handleSlackSessionResponse(params: {
   // Generate the response
   const { generateSessionResponse } = await import('../controllers/agentModeController');
   const { agentModeService } = await import('../services/agentModeService');
+  const { cronJobRegistry } = await import('../utils/cronJobRegistry');
 
   const llmModel = session.llmModel || await agentModeService.getDefaultModel();
   if (!session.llmModel) {
@@ -384,13 +243,16 @@ async function handleSlackSessionResponse(params: {
   }
 
   try {
-    const response = await generateSessionResponse(
+    // ENG-1189: this turn's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener.
+    const response = await cronJobRegistry.track('slackAgentTurn', generateSessionResponse(
       session.sessionId,
       userMessage,
       user.userId,
       llmModel,
       attachments
-    );
+    ));
 
     // Remove the thinking message
     if (thinkingTs) {
@@ -618,7 +480,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
       // Handle app mention events
       if (event.type === 'app_mention') {
-        const { text, user: slackUserId, channel, ts, files } = event;
+        const { text, user: slackUserId, channel, ts, files, user_team: userTeam, source_team: sourceTeam } = event;
 
         console.log('👋 Emma bot mentioned in Slack:', {
           channel,
@@ -674,7 +536,41 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           if (channelLinkIntent) {
             const requesterEmail = (await getSlackUserEmail(slackUserId))?.toLowerCase();
             const targetEmail = channelLinkIntent.targetEmail;
-            const canLinkChannel = requesterEmail === targetEmail || requesterEmail?.endsWith('@agentweb.pro');
+            let canLinkChannel = requesterEmail === targetEmail
+              || requesterEmail?.endsWith('@agentweb.pro')
+              || requesterEmail?.endsWith('@argusoft.com');
+
+            // ENG-1294: requesterEmail depends on Slack's profile.email resolving, which needs the
+            // users:read.email bot scope and has empirically failed for verified AgentWeb admins
+            // (ENG-1263 — Fangfang's own email failed to resolve even though the rest of her
+            // profile did). Without this, nobody whose email fails to resolve can ever use the
+            // remedy this very handler tells them to run. Fall back to team_id: it rides the same
+            // users.info response but doesn't need that scope. It only proves "this Slack user
+            // belongs to our own workspace" — never enough to pick which AgentWeb account a
+            // mention resolves to, but that's not the question here: targetEmail is typed
+            // explicitly by the requester, so this only decides whether an AgentWeb workspace
+            // member is allowed to run the link command at all — the same authorization the
+            // trusted-domain checks above already grant to any internal admin, just via a
+            // signal that doesn't depend on the broken field.
+            if (!canLinkChannel) {
+              const [senderTeamId, ownTeamId] = await Promise.all([
+                getSlackUserTeamId(slackUserId),
+                getOwnSlackTeamId(),
+              ]);
+              canLinkChannel = !!senderTeamId && !!ownTeamId && senderTeamId === ownTeamId;
+            }
+
+            // ENG-1294: the own-team_id check above only ever proves "same workspace as us" — a
+            // real Slack Connect guest can never pass it, no matter who they are. Trust a small,
+            // explicit allowlist of partner teams via user_team/source_team instead, which Slack
+            // hands us directly rather than requiring a lookup that may silently omit data for an
+            // external profile. Same authorization question as every check above (may this Slack
+            // user run the link command at all), never used to pick which AgentWeb account a
+            // mention resolves to.
+            if (!canLinkChannel) {
+              const externalTeamId = userTeam || sourceTeam;
+              canLinkChannel = !!externalTeamId && TRUSTED_EXTERNAL_SLACK_TEAM_IDS.has(externalTeamId);
+            }
 
             if (!canLinkChannel) {
               await slackClient.chat.postMessage({
@@ -787,10 +683,39 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               }
             }
 
+            // ENG-1292: no channel binding — fall back to the mentioning Slack
+            // user's own verified identity instead of failing outright. Only
+            // an exact match on Slack's verified profile email resolves a
+            // user (never a fuzzy/partial match), so a Slack user with no
+            // matching AgentWeb account can never resolve to someone else's
+            // account (no cross-tenant leak). Deliberately NOT cached as a
+            // channel mapping: an internal channel can have several different
+            // AgentWeb users mention Emma, and caching the first one would
+            // silently misroute everyone else who mentions Emma there.
+            let requesterEmail: string | null = null;
             if (!user) {
+              requesterEmail = await getSlackUserEmail(slackUserId);
+              if (requesterEmail) {
+                const identityUser = await userDb.getUserByEmail(requesterEmail);
+                // Skip tombstoned (deleted) users — mirrors the explicit guard on every
+                // other resolution path above, even though getUserByEmail already filters
+                // deleted_* userIds at the DB layer (belt-and-suspenders, not load-bearing).
+                if (identityUser && !identityUser.userId?.startsWith('deleted_')) {
+                  user = identityUser;
+                  console.log(`📝 [app-mention] no channel binding for ${channel}, resolved via Slack identity (${requesterEmail})`);
+                }
+              }
+            }
+
+            if (!user) {
+              const remedy = 'An AgentWeb admin or the account owner can link it by posting ' +
+                '`@Emma for user <their-agentweb-email> link this channel` in this channel.';
+              const text = requesterEmail
+                ? `❌ Sorry, this channel isn't linked to an AgentWeb account, and there's no AgentWeb user with the email ${requesterEmail}. ${remedy}`
+                : `❌ Sorry, this channel isn't linked to an AgentWeb account, and I couldn't verify a Slack email for you to match one. ${remedy}`;
               await slackClient.chat.postMessage({
                 channel,
-                text: '❌ Sorry, I couldn\'t find a user account linked to this Slack channel. Please contact support.',
+                text,
                 thread_ts: ts
               });
               return;
@@ -849,25 +774,11 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
         }
       }
 
-      // Handle top-level message events in user-connected Slack channels (slack triggered session)
-      // Filter: plain message, NOT a thread reply, NOT a bot message, NOT a message_changed/deleted event
-      // Skip messages that @mention Emma — those trigger an app_mention event that Emma handles
-      // directly, so generating a "suggest" email would be redundant. Other @mentions (e.g.
-      // @john) should still go through the suggest flow.
-      if (event.type === 'message' && !event.thread_ts && !event.bot_id && !event.subtype) {
-        const { text, user: slackUserId, channel, ts } = event;
-        if (text) {
-          const botId = await getEmmaBotUserId();
-          const mentionsEmma = !!(botId && text.includes(`<@${botId}>`));
-          if (mentionsEmma) {
-            console.log('📨 Skipping slack suggest for Emma @mention (already handled by app_mention handler):', { channel, user: slackUserId });
-          } else {
-            console.log('📨 Top-level Slack message received:', { channel, user: slackUserId });
-            // Fire-and-forget: triage + session + email
-            handleSlackTriggeredSession({ text, slackUserId, channel, ts });
-          }
-        }
-      }
+      // ENG-1613: top-level untagged messages no longer trigger anything. The auto-listen pipeline
+      // (handleSlackTriggeredSession) was removed entirely — Emma's Slack behavior is exclusively
+      // tag-gated via the app_mention handler above. A customer never saw the auto-drafted reply
+      // (it only emailed founders@, never posted to Slack), so an account-level opt-in still left
+      // them with no visibility that their message had triggered an LLM session at all.
 
       // Handle message events in threads (follow-up messages to Emma sessions, or non-Emma threads)
       // Filter: must be a plain message in a thread, not a bot message or message_changed/deleted event
@@ -908,158 +819,97 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           try {
             const parsed = JSON.parse(mapping.settingValue);
             const { sessionId, userId } = parsed;
-            const isTriggered = parsed.type === 'triggered';
 
-            if (isTriggered) {
-              // Monitored (email-only) session — continue it and send email, do NOT post to Slack
-              if (text) {
-                // Skip replies from AgentWeb team members — no suggest needed for our own team's comments
-                const replySenderEmail = await getSlackUserEmail(slackUserId);
-                if (replySenderEmail && replySenderEmail.endsWith('@agentweb.pro')) {
-                  console.log(`📨 [slack-triggered] skipping thread reply from AgentWeb team member (${replySenderEmail})`);
-                  return;
-                }
+            // Emma @mention session — existing behavior: post response directly to Slack
+            console.log('💬 Thread reply in Emma session:', { channel, threadTs, slackUserId });
+            const { chatbotDb } = await import('../services/chatbotService');
+            const { generateSessionResponse } = await import('../controllers/agentModeController');
+            const { agentModeService } = await import('../services/agentModeService');
+            const { cronJobRegistry } = await import('../utils/cronJobRegistry');
 
-                console.log('📨 Thread reply in monitored session (email-only):', { channel, threadTs, slackUserId });
-                const { chatbotDb } = await import('../services/chatbotService');
-                const { generateSessionResponse } = await import('../controllers/agentModeController');
-                const { agentModeService } = await import('../services/agentModeService');
-                const { userDb } = await import('../services/db');
+            const session = await chatbotDb.getChatSession(sessionId);
+            if (!session) {
+              console.log('❌ Session not found for Slack thread:', sessionId);
+              return;
+            }
 
-                const session = await chatbotDb.getChatSession(sessionId);
-                if (!session) {
-                  console.log('❌ Session not found for monitored Slack thread:', sessionId);
-                  return;
-                }
+            const displayName = await getSlackUserDisplayName(slackUserId);
 
-                // Respect the per-user opt-out before generating a response or sending email.
-                const user = await userDb.getUserById(userId);
-                if (user?.slackSuggestedRepliesDisabled) {
-                  console.log(`📨 [slack-triggered] suggested replies disabled for user ${userId}, skipping thread reply`);
-                  return;
-                }
-
-                const displayName = await getSlackUserDisplayName(slackUserId);
-                const formattedMessage = `${displayName}: ${text}`.trim();
-
-                const llmModel = session.llmModel || await agentModeService.getDefaultModel();
-                let emmaResponse = '';
+            const attachments: any[] = [];
+            if (files && files.length > 0) {
+              for (const file of files) {
                 try {
-                  const result = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel);
-                  emmaResponse = result.content;
-                } catch (genError) {
-                  console.error('❌ Error generating response for monitored thread:', genError);
-                  emmaResponse = '(Emma was unable to generate a response for this message.)';
-                }
-
-                let channelName = channel;
-                try {
-                  const { WebClient } = await import('@slack/web-api');
-                  const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-                  const info = await slackClient.conversations.info({ channel });
-                  channelName = (info.channel as any)?.name || channel;
-                } catch { /* non-blocking */ }
-
-                await emailService.sendSlackTriggeredSessionEmail('founders@agentweb.pro', {
-                  sessionId,
-                  userEmail: user?.email || userId,
-                  channelName,
-                  originalMessage: text,
-                  emmaResponse,
-                  receivedAt: new Date().toISOString(),
-                });
-              }
-            } else {
-              // Emma @mention session — existing behavior: post response directly to Slack
-              console.log('💬 Thread reply in Emma session:', { channel, threadTs, slackUserId });
-              const { chatbotDb } = await import('../services/chatbotService');
-              const { generateSessionResponse } = await import('../controllers/agentModeController');
-              const { agentModeService } = await import('../services/agentModeService');
-
-              const session = await chatbotDb.getChatSession(sessionId);
-              if (!session) {
-                console.log('❌ Session not found for Slack thread:', sessionId);
-                return;
-              }
-
-              const displayName = await getSlackUserDisplayName(slackUserId);
-
-              const attachments: any[] = [];
-              if (files && files.length > 0) {
-                for (const file of files) {
-                  try {
-                    // Slack Connect / ext-shared channels omit url_private and send a stub
-                    // (file_access: 'check_file_info') — hydrate it via files.info first (ENG-323).
-                    const fileUrl = await resolveSlackFileUrl(file);
-                    const fileBuffer = await downloadSlackFile(fileUrl);
-                    const { uploadFileToS3 } = await import('../utils/s3Utils');
-                    const uploadResult = await uploadFileToS3(
-                      fileBuffer,
-                      file.name || 'attachment',
-                      userId,
-                      file.mimetype || 'application/octet-stream'
-                    );
-                    if (!uploadResult.success || !uploadResult.url) {
-                      console.error('❌ Failed to upload Slack file to S3');
-                      continue;
-                    }
-                    attachments.push({
-                      url: uploadResult.url,
-                      filename: file.name || 'attachment',
-                      size: file.size,
-                      mimetype: file.mimetype || 'application/octet-stream',
-                    });
-                  } catch (fileError) {
-                    console.error('❌ Error downloading Slack file:', fileError);
+                  // Slack Connect / ext-shared channels omit url_private and send a stub
+                  // (file_access: 'check_file_info') — hydrate it via files.info first (ENG-323).
+                  const fileUrl = await resolveSlackFileUrl(file);
+                  const fileBuffer = await downloadSlackFile(fileUrl);
+                  const { uploadFileToS3 } = await import('../utils/s3Utils');
+                  const uploadResult = await uploadFileToS3(
+                    fileBuffer,
+                    file.name || 'attachment',
+                    userId,
+                    file.mimetype || 'application/octet-stream'
+                  );
+                  if (!uploadResult.success || !uploadResult.url) {
+                    console.error('❌ Failed to upload Slack file to S3');
+                    continue;
                   }
-                }
-              }
-
-              // When the user sent only a file (no text), give Emma a placeholder so it knows
-              // a file was shared — but only claim '[attached file]' if an attachment actually
-              // reached the agent. If ingestion failed and attachments is empty, an honest
-              // marker keeps the model from calling read_file_content('[attached file]') on a
-              // non-URL and returning 'Invalid URL format' to the user (ENG-323).
-              let messageText = text;
-              if (!messageText && files && files.length > 0) {
-                messageText = attachments.length > 0 ? '[attached file]' : '[attachment could not be read]';
-              }
-              const formattedMessage = `${displayName}: ${messageText || ''}`.trim();
-
-              const thinkingTs = await postThinkingMessage(channel, threadTs);
-              const llmModel = session.llmModel || await agentModeService.getDefaultModel();
-
-              try {
-                const response = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments);
-                if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
-                if (response.content) await postThreadResponse(channel, threadTs, citeForSlack(response));
-              } catch (genError) {
-                console.error('❌ Error generating thread response:', genError);
-                if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
-                await postThreadResponse(channel, threadTs, 'Sorry, I encountered an error. Please try again.');
-                // Save error message to session so ishare viewers see the failure rather than an orphaned user message
-                try {
-                  const { chatbotDb: chatbotDbForError } = await import('../services/chatbotService');
-                  await chatbotDbForError.addMessageToSession(sessionId, {
-                    role: 'assistant',
-                    content: 'Sorry, I encountered an error processing your request. Please try again.',
-                    timestamp: new Date().toISOString(),
-                    metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
+                  attachments.push({
+                    url: uploadResult.url,
+                    filename: file.name || 'attachment',
+                    size: file.size,
+                    mimetype: file.mimetype || 'application/octet-stream',
                   });
-                } catch (saveError) {
-                  console.error('❌ Error saving error message to session:', saveError);
+                } catch (fileError) {
+                  console.error('❌ Error downloading Slack file:', fileError);
                 }
+              }
+            }
+
+            // When the user sent only a file (no text), give Emma a placeholder so it knows
+            // a file was shared — but only claim '[attached file]' if an attachment actually
+            // reached the agent. If ingestion failed and attachments is empty, an honest
+            // marker keeps the model from calling read_file_content('[attached file]') on a
+            // non-URL and returning 'Invalid URL format' to the user (ENG-323).
+            let messageText = text;
+            if (!messageText && files && files.length > 0) {
+              messageText = attachments.length > 0 ? '[attached file]' : '[attachment could not be read]';
+            }
+            const formattedMessage = `${displayName}: ${messageText || ''}`.trim();
+
+            const thinkingTs = await postThinkingMessage(channel, threadTs);
+            const llmModel = session.llmModel || await agentModeService.getDefaultModel();
+
+            try {
+              // ENG-1189: this turn's tool calls self-call back into this
+              // process via mcpFetch — tracked so a deploy mid-run waits for
+              // it instead of abandoning it against a closed listener.
+              const response = await cronJobRegistry.track('slackThreadAgentTurn', generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments));
+              if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
+              if (response.content) await postThreadResponse(channel, threadTs, citeForSlack(response));
+            } catch (genError) {
+              console.error('❌ Error generating thread response:', genError);
+              if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
+              await postThreadResponse(channel, threadTs, 'Sorry, I encountered an error. Please try again.');
+              // Save error message to session so ishare viewers see the failure rather than an orphaned user message
+              try {
+                const { chatbotDb: chatbotDbForError } = await import('../services/chatbotService');
+                await chatbotDbForError.addMessageToSession(sessionId, {
+                  role: 'assistant',
+                  content: 'Sorry, I encountered an error processing your request. Please try again.',
+                  timestamp: new Date().toISOString(),
+                  metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
+                });
+              } catch (saveError) {
+                console.error('❌ Error saving error message to session:', saveError);
               }
             }
           } catch (parseError) {
             console.error('❌ Error processing thread reply:', parseError);
           }
-        } else if (text) {
-          // Thread not mapped to anything — treat as a new monitored conversation.
-          // Pass thread_ts as ts so subsequent replies in this thread continue the same session.
-          console.log('📨 Thread reply in untracked thread, triggering monitoring:', { channel, threadTs, slackUserId });
-          handleSlackTriggeredSession({ text, slackUserId, channel, ts: threadTs });
         }
+        // ENG-1613: an untracked thread (no mapping) no longer starts a new monitored
+        // conversation — only an explicit @-mention (app_mention) starts anything.
       }
 
       return;
@@ -1533,8 +1383,39 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                     } catch (alertError) {
                       console.error('❌ Error sending oncall alert:', alertError);
                     }
+                    // ENG-1741: the internal oncall alert above told nobody the reviewer is
+                    // actually waiting on — from their side, the revision just never came
+                    // back. Tell them directly, in addition to (not instead of) oncall.
+                    if (originalApproval.slackChannel) {
+                      await postSlackMessage(
+                        originalApproval.slackChannel,
+                        ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+                        originalApproval.slackMessageTs || undefined,
+                      ).catch((slackErr: any) =>
+                        console.warn('❌ Failed to post revision-failure notice to Slack:', slackErr?.message || slackErr),
+                      );
+                    }
                   }
                 }).catch(async (error) => {
+                  // ENG-1719: expected, benign lock contention (a live chat turn or another
+                  // revision on the same session), not a real failure — paging on-call for
+                  // it was the exact false alarm this fix exists to stop.
+                  const { isSessionBusyError } = await import('../controllers/agentModeController');
+                  if (isSessionBusyError(error)) {
+                    console.warn(`⏳ Agent Mode revision for session ${agentSessionId} skipped — session was busy with another generation in progress.`);
+                    // ENG-1741: previously silent to the reviewer — only this log line existed.
+                    if (originalApproval.slackChannel) {
+                      await postSlackMessage(
+                        originalApproval.slackChannel,
+                        ':hourglass_flowing_sand: This session was busy with another generation in progress, ' +
+                        'so the auto-revision couldn\'t run just now. Please retry the feedback in a moment.',
+                        originalApproval.slackMessageTs || undefined,
+                      ).catch((slackErr: any) =>
+                        console.warn('❌ Failed to post session-busy notice to Slack:', slackErr?.message || slackErr),
+                      );
+                    }
+                    return;
+                  }
                   console.error('❌ Error in Agent Mode verified-generate:', error);
                   try {
                     const isSessionLimit = isSessionLimitError(error);
@@ -1560,8 +1441,18 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   } catch (alertError) {
                     console.error('❌ Error sending oncall alert:', alertError);
                   }
+                  // ENG-1741: notify the reviewer directly too, in addition to oncall.
+                  if (originalApproval.slackChannel) {
+                    await postSlackMessage(
+                      originalApproval.slackChannel,
+                      ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+                      originalApproval.slackMessageTs || undefined,
+                    ).catch((slackErr: any) =>
+                      console.warn('❌ Failed to post revision-failure notice to Slack:', slackErr?.message || slackErr),
+                    );
+                  }
                 });
-                
+
                 console.log(`✅ Submitted feedback to Agent Mode session via verified-generate: ${agentSessionId}`);
               } catch (agentModeError) {
                 console.error('❌ Error submitting feedback to Agent Mode session:', agentModeError);
@@ -1762,8 +1653,37 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         } catch (alertError) {
                           console.error('❌ Error sending oncall alert:', alertError);
                         }
+                        // ENG-1741: notify the reviewer directly too, not just internal oncall.
+                        if (originalApproval.slackChannel) {
+                          await postSlackMessage(
+                            originalApproval.slackChannel,
+                            ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+                            originalApproval.slackMessageTs || undefined,
+                          ).catch((slackErr: any) =>
+                            console.warn('❌ Failed to post revision-failure notice to Slack:', slackErr?.message || slackErr),
+                          );
+                        }
                       }
                     }).catch(async (error) => {
+                      // ENG-1719: expected, benign lock contention, not a real failure —
+                      // paging on-call for it was the exact false alarm this fix exists
+                      // to stop.
+                      const { isSessionBusyError } = await import('../controllers/agentModeController');
+                      if (isSessionBusyError(error)) {
+                        console.warn(`⏳ Agent Mode revision for session ${task.sessionId} skipped — session was busy with another generation in progress.`);
+                        // ENG-1741: previously silent to the reviewer — only this log line existed.
+                        if (originalApproval.slackChannel) {
+                          await postSlackMessage(
+                            originalApproval.slackChannel,
+                            ':hourglass_flowing_sand: This session was busy with another generation in progress, ' +
+                            'so the auto-revision couldn\'t run just now. Please retry the feedback in a moment.',
+                            originalApproval.slackMessageTs || undefined,
+                          ).catch((slackErr: any) =>
+                            console.warn('❌ Failed to post session-busy notice to Slack:', slackErr?.message || slackErr),
+                          );
+                        }
+                        return;
+                      }
                       console.error('❌ Error in Agent Mode verified-generate:', error);
                       try {
                         const isSessionLimit = isSessionLimitError(error);
@@ -1790,8 +1710,18 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       } catch (alertError) {
                         console.error('❌ Error sending oncall alert:', alertError);
                       }
+                      // ENG-1741: notify the reviewer directly too, in addition to oncall.
+                      if (originalApproval.slackChannel) {
+                        await postSlackMessage(
+                          originalApproval.slackChannel,
+                          ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+                          originalApproval.slackMessageTs || undefined,
+                        ).catch((slackErr: any) =>
+                          console.warn('❌ Failed to post revision-failure notice to Slack:', slackErr?.message || slackErr),
+                        );
+                      }
                     });
-                    
+
                     console.log(`✅ Submitted feedback to Agent Mode session via verified-generate: ${task.sessionId}`);
                   } catch (agentModeError) {
                     console.error('❌ Error submitting feedback to Agent Mode session:', agentModeError);

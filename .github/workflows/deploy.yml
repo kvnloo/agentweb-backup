@@ -37,26 +37,54 @@ env:
 jobs:
   detect-changes:
     name: Detect changed projects
-    runs-on: ubuntu-latest
+    # ENG-1277: ubuntu-slim ($0.002/min vs $0.006) — a checkout + paths-filter
+    # read (or a two-line manual-trigger step), no docker, no build.
+    runs-on: ubuntu-slim
     outputs:
       backend: ${{ steps.filter.outputs.backend || steps.manual.outputs.backend }}
       partner: ${{ steps.filter.outputs.partner || steps.manual.outputs.partner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Check changes (push)
         if: github.event_name == 'push'
         id: filter
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
+          # ENG-1658/ENG-743: what gates a deploy has to gate its own changes.
+          # `eb-deploy.sh` IS the deploy — it applies the version and decides
+          # whether the environment took it — and `deploy.yml` is what runs it,
+          # so a change to either is a change to the deploy. With `backend/**`
+          # alone neither triggered one: 21 commits touched these two files in
+          # the 34 days to 2026-08-31 and not one of them deployed. Each first
+          # executed on some later, unrelated PR, which is where a mistake in it
+          # would surface and be attributed. The ENG-878 chain is what that
+          # costs — five commits, three of them same-day fixes to the one
+          # before.
+          #
+          # Both filters list both paths on purpose. `partner-deploy` runs the
+          # same script under its own budgets, so the rule is uniform rather
+          # than backend-only; partner deploys take ~2 min. tests.yml has
+          # carried `.github/scripts/eb-deploy.sh` in its own backend filter
+          # since ENG-743 — deploy.yml was the outlier.
+          #
+          # Measured cost: +21 backend deploys per 34 days on a baseline of
+          # ~9.5/day (+6.5%), with 88 of the last 88 green.
+          #
+          # paths-filter-hygiene.test.sh asserts this both ways, so the gap
+          # cannot reopen quietly.
           filters: |
             backend:
               - 'backend/**'
+              - '.github/workflows/deploy.yml'
+              - '.github/scripts/eb-deploy.sh'
             partner:
               - 'partner-portal/**'
+              - '.github/workflows/deploy.yml'
+              - '.github/scripts/eb-deploy.sh'
 
       - name: Deploy all (manual trigger)
         if: github.event_name == 'workflow_dispatch'
@@ -73,12 +101,12 @@ jobs:
     environment: prod
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
@@ -157,8 +185,36 @@ jobs:
           EB_SOURCE_BUNDLE_S3_BUCKET: elasticbeanstalk-${{ env.AWS_REGION }}-992382574572
           EB_SOURCE_BUNDLE_S3_KEY: builds/${{ steps.version.outputs.version_label }}.zip
           EB_TOTAL_TIMEOUT_SECONDS: '2700'
+          # ENG-1183: the settle cap is how long we wait for an update that was
+          # already running when we arrived. eb-deploy.sh defaults it to 600s,
+          # a Rolling-era number: back then an environment freed up in 3-5 min.
+          # This environment has been Immutable since 2026-07-01
+          # (backend/.ebextensions/rolling.config), which launches a parallel
+          # fleet, health-checks it, swaps, then drains the old one. Measured
+          # over 24 consecutive production deploys: median ~535s, max 1352s.
+          # An update in flight for longer than 600s is therefore normal, and
+          # on expiry the script does not shrug and proceed — it fails the
+          # deploy with "Version was NOT applied".
+          #
+          # Nothing in GitHub Actions can start such an update (deploy.yml is
+          # serialised by `concurrency: deploy-production`), but EB can and
+          # does: 05-instance-recycling.config enables managed platform updates
+          # with InstanceRefreshEnabled every Sun 10:00 UTC. A deploy landing
+          # in that window is failed today for an environment that is healthy.
+          #
+          # 1200s is bounded on both sides, and eb-deploy.test.sh asserts both:
+          #   floor   >= 900s, the EB command Timeout in rolling.config. Giving
+          #           up before EB's own timeout means failing a deploy while
+          #           EB still considers the in-flight command live.
+          #   ceiling  2700 - 1200 = 1500s left to run our own deploy, above
+          #           the 1352s worst case measured above.
+          EB_SETTLE_TIMEOUT_SECONDS: '1200'
           # '1' only on a manual run that asked for it (ENG-878).
           EB_HEALTH_PROBE_DRYRUN: ${{ inputs.probe_dryrun && '1' || '0' }}
+          # ENG-823: `.ebextensions` silently failed to apply this twice, so
+          # it is set directly against the live target group instead — see
+          # ensure_deregistration_delay() in eb-deploy.sh.
+          EB_DEREGISTRATION_DELAY_SECONDS: '600'
         run: bash .github/scripts/eb-deploy.sh
 
       - name: Backend Deployment Status
@@ -179,12 +235,12 @@ jobs:
     environment: prod
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: 'npm'
           cache-dependency-path: partner-portal/package-lock.json
@@ -348,7 +404,7 @@ jobs:
       checks: read
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3

@@ -3,6 +3,7 @@ import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
+import { computeSessionModelAttribution } from '../utils/sessionModelAttribution';
 import { scheduleDb, userDb, taskDb, scheduleTemplateDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
@@ -11,9 +12,13 @@ import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
+import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
+import { resolveInboundAnswer, resolveTypedTextAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
+import { buildWorkPlanInputRequest, resolveWorkPlanInputAnswer, WorkPlanInputRequestError } from '../services/agentMode/core/workPlanInputRequest';
+import type { WorkPlanTurnDisposition } from '../services/agentMode/core/workPlanTurnDisposition';
+import { priorTurnNeedsWorkPlanDispositionRetry } from '../services/agentMode/core/workPlanTurnDisposition';
 import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
@@ -22,12 +27,19 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
-import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, classifyPublishStall } from '../utils/publishPressCircuitBreaker';
+import { cronJobRegistry } from '../utils/cronJobRegistry';
+import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
+import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, hasUnmetPublishRequirement, classifyPublishStall } from '../utils/publishPressCircuitBreaker';
+import { MAX_READ_ONLY_PRESS_ATTEMPTS, isReadOnlyOnlyUnmet, shouldStopPressingForReadOnly } from '../utils/readOnlyPressCircuitBreaker';
+import { isReadOnlyToolName, isWriteToolCall } from '../utils/toolWriteClassification';
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
-import { toolCallSucceeded, requirementEvidenceNames } from '../utils/toolCallOutcome';
+import { toolCallSucceeded } from '../utils/toolCallOutcome';
+import { countCallsSatisfyingRequirement, RequiredCallLedgerEntry } from '../utils/requiredCallSatisfaction';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
+import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
+import { ACCOUNT_DISCONNECTED_STATUS, MAX_CONSECUTIVE_ACCOUNT_SKIPS, AccountGateResult, buildAccountSkipReason, countTrailingAccountSkips, evaluateAccountGate } from '../utils/scheduledRunAccountGate';
 import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
@@ -50,7 +62,11 @@ import {
   buildTimeoutContinuationMessage,
   collectTurnWorkSince,
   buildTimeoutPartialWorkMessage,
+  hasDeferredMediaBudgetToolCall,
+  hasPersistedMediaBudgetDeferral,
+  hasUnresolvedMediaDeferral,
 } from '../utils/timeoutContinuation';
+import { MEDIA_GEN_TOOLS, mediaGenProducedAsset } from '../services/agentMode/core/toolDispatch';
 import {
   reconcileFalseFailureReport,
   ledgerFromSucceededFunctions,
@@ -61,18 +77,25 @@ import {
   stripUnfoundedEntityCounts,
   reconcileFalseDataWriteFailure,
   appendConfirmedDataWriteNotice,
+  reconcileFalseArtifactFailure,
+  appendConfirmedArtifactNotice,
+  collectConfirmedArtifactUrls,
   FalseFailureLedgerEntry,
+  ConfirmedArtifactRef,
 } from '../utils/falseFailureReport';
 import { collectLeadImportTotals, describeLeadImportTotals } from '../utils/leadImportLedger';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
+import { validateNewChatHeroGreeting } from '../utils/newChatHeroGreeting';
 import { normalizeEmailList } from '../utils/validation';
 import {
   MAX_ATOMIC_RUN_RESULT_REMOVALS,
+  PROMPT_REVISIONS_BUDGET_BYTES,
   SCHEDULE_ITEM_BUDGET_BYTES,
   estimateDynamoItemBytes,
+  getScheduleStorageDiagnostics,
   isDynamoItemSizeError,
   trimListToItemBudget,
 } from '../utils/dynamoItemBudget';
@@ -82,6 +105,8 @@ import {
   type SubscriptionFeatureId,
 } from '../services/subscriptionService';
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
+import { resetSentence } from "../utils/usageCycle";
+import { buildUsageBlockCopy } from "../utils/usageBlockCopy";
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
@@ -158,14 +183,20 @@ async function applyScheduleEditWithConsentNarrowing(
   // history is never deleted for an edit that then fails, and bound to the history the
   // count was measured against so it cannot take a second prefix off a list another
   // writer already shortened.
-  shedRunResults?: { count: number; expectedLength: number; expectedLast?: any }
+  shedRunResults?: { count: number; expectedLength: number; expectedLast?: any },
+  // ENG-1365: attributes to REMOVE as part of THIS write. Restoring inheritance is a
+  // removal, not a value, and it has to ride the same write as the edit that asked
+  // for it -- a second call could leave the rename applied with the model still
+  // pinned, or the reverse, with nothing to say which landed.
+  removeAttributes?: string[]
 ): Promise<void> {
+  const removals = removeAttributes && removeAttributes.length ? removeAttributes : undefined;
   // Pass only the arguments this write actually needs, so an ordinary edit stays an
   // ordinary two-argument update.
   const write = async (payload: any, expectation?: Record<string, any>) => {
     if (shedRunResults && shedRunResults.count > 0) {
       try {
-        await scheduleDb.updateSchedule(scheduleId, payload, expectation, shedRunResults);
+        await scheduleDb.updateSchedule(scheduleId, payload, expectation, shedRunResults, removals);
       } catch (writeError: any) {
         // The shed count belongs to the history it was measured against; it cannot be
         // replayed against a different one. Hand back a conflict instead of retrying.
@@ -181,8 +212,8 @@ async function applyScheduleEditWithConsentNarrowing(
       }
       return;
     }
-    if (expectation) {
-      await scheduleDb.updateSchedule(scheduleId, payload, expectation);
+    if (expectation || removals) {
+      await scheduleDb.updateSchedule(scheduleId, payload, expectation, undefined, removals);
       return;
     }
     await scheduleDb.updateSchedule(scheduleId, payload);
@@ -268,10 +299,6 @@ async function applyScheduleEditWithConsentNarrowing(
 type EffectiveModelPolicyDecision = PolicyModelDecision & {
   usageMode: 'full_choice' | 'optimized' | 'paused';
   usagePolicyVersion: string | null;
-  // undefined keeps unrestricted requests on the global backup behavior; optimized
-  // requests always carry string|null so provider retries cannot escape the catalog.
-  transientFallbackModel?: string | null;
-  transientFallbackSource?: ModelBackupSource | null;
 };
 
 function toStoredModelPolicyDecision(decision: EffectiveModelPolicyDecision) {
@@ -286,6 +313,31 @@ function toStoredModelPolicyDecision(decision: EffectiveModelPolicyDecision) {
     usagePolicyVersion: decision.usagePolicyVersion,
     recordedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * Is this user an admin? Read lazily and never allowed to fail a request.
+ *
+ * ENG-1205: `resolveEffectiveModelForUser` passed a hardcoded `false` to
+ * `getSupportedModels`, so an admin-only model — one the picker itself offers an
+ * admin, because `getModelOptions` passes the REAL flag — was absent from the
+ * supported set at dispatch and got silently rewritten to the system default
+ * with `modelSelection: 'corrected'`. The admin picked Claude Opus 4.6 and the
+ * turn ran on the default with no error and, until portal #1030, no visible
+ * badge change either.
+ *
+ * The subject is the SESSION OWNER, not the caller: a delegated admin session
+ * (ftan acting for founders, ENG-1200) must not widen the owner's entitlement.
+ * A failed read degrades to non-admin — the pre-existing behavior exactly.
+ */
+async function isUserAdmin(userId: string): Promise<boolean> {
+  try {
+    if (typeof userDb?.getUserById !== 'function') return false;
+    return (await userDb.getUserById(userId))?.isAdmin === true;
+  } catch (adminLookupError) {
+    console.error(`AgentMode: failed to resolve admin status for ${userId}; treating as non-admin:`, adminLookupError);
+    return false;
+  }
 }
 
 /**
@@ -306,7 +358,7 @@ async function resolveEffectiveModelForUser(input: {
   // Older controller unit tests intentionally use partial service doubles.
   // The runtime service always has these methods; the identity fallbacks keep
   // unrelated legacy contracts on their original full-choice behavior.
-  const supportedModelIds = typeof agentModeService.getSupportedModels === 'function'
+  let supportedModelIds = typeof agentModeService.getSupportedModels === 'function'
     ? await agentModeService.getSupportedModels(false)
     : [input.requestedModel, input.backupModel, systemDefaultModel].filter((model): model is string => Boolean(model));
   const requestedResolution = input.requestedModel
@@ -319,6 +371,24 @@ async function resolveEffectiveModelForUser(input: {
         ? agentModeService.resolveGenerationModel(input.backupModel)
         : { model: input.backupModel, fellBack: false, requestedModel: input.backupModel })
     : null;
+  // ENG-1205: widen to the admin catalog ONLY when the resolved request is
+  // missing from the non-admin set but present in the admin one — i.e. exactly
+  // when the hardcoded `false` above would have caused a silent correction.
+  // Keyed on the CANONICAL id, because that is what `selectPolicyModel` compares
+  // against `supportedModelIds`; testing the raw request would miss a legacy
+  // alias and re-open the same silent correction it is here to close. On every
+  // other turn this costs nothing: no extra read, no behavior change.
+  const canonicalRequestedModel = requestedResolution?.model || input.requestedModel;
+  if (
+    canonicalRequestedModel
+    && !supportedModelIds.includes(canonicalRequestedModel)
+    && typeof agentModeService.getSupportedModels === 'function'
+  ) {
+    const adminModelIds = await agentModeService.getSupportedModels(true);
+    if (adminModelIds.includes(canonicalRequestedModel) && await isUserAdmin(input.userId)) {
+      supportedModelIds = adminModelIds;
+    }
+  }
   const decision = selectPolicyModel({
     usageMode: usage.mode.usageMode,
     requestedModel: requestedResolution?.model || input.requestedModel,
@@ -328,40 +398,17 @@ async function resolveEffectiveModelForUser(input: {
     supportedModelIds,
     policy: usage.policy,
   });
-  let transientFallbackModel: string | null | undefined;
-  let transientFallbackSource: ModelBackupSource | null | undefined;
-  if (usage.mode.usageMode === 'optimized') {
-    const optimizedModels = new Set(usage.policy?.optimizedModelIds || []);
-    const fallback = [
-      decision.backupModel
-        ? { model: decision.backupModel, source: (decision.backupSource || 'system') as ModelBackupSource }
-        : null,
-      usage.policy?.optimizedDefaultModel
-        ? { model: usage.policy.optimizedDefaultModel, source: 'system' as ModelBackupSource }
-        : null,
-      ...[...optimizedModels].map((model) => ({ model, source: 'system' as ModelBackupSource })),
-    ].find((candidate): candidate is { model: string; source: ModelBackupSource } => Boolean(
-      candidate &&
-      candidate.model !== decision.effectiveModel &&
-      optimizedModels.has(candidate.model) &&
-      supportedModelIds.includes(candidate.model)
-    ));
-    transientFallbackModel = fallback?.model || null;
-    transientFallbackSource = fallback?.source || null;
-  }
   return {
     ...decision,
     usageMode: usage.mode.usageMode,
     usagePolicyVersion: usage.policy?.version || null,
-    transientFallbackModel,
-    transientFallbackSource,
   };
 }
 
 async function resolveScheduleBackup(input: {
   userId: string;
   requestedBackupModel?: string | null;
-}): Promise<{ llmBackupModel: string; llmBackupSource: ModelBackupSource; llmBackupNeedsConfirmation: boolean }> {
+}): Promise<{ llmBackupModel: string; llmBackupSource: ModelBackupSource | null; llmBackupNeedsConfirmation: boolean }> {
   const usage = await getEffectiveLlmUsagePolicy(input.userId);
   const scheduledDefault = typeof agentModeService.getScheduledChatsDefaultModel === 'function'
     ? await agentModeService.getScheduledChatsDefaultModel()
@@ -372,28 +419,43 @@ async function resolveScheduleBackup(input: {
     : [input.requestedBackupModel, systemDefaultModel].filter((model): model is string => Boolean(model));
   const supported = new Set(supportedModelIds);
   const requested = input.requestedBackupModel?.trim();
-  const optimized = new Set(usage.policy?.optimizedModelIds || []);
-  if (requested && supported.has(requested) && (!usage.policy || optimized.has(requested))) {
-    return { llmBackupModel: requested, llmBackupSource: 'user', llmBackupNeedsConfirmation: false };
+  // ENG-1205: same hardcoded-`false` defect as the model resolver above, on the
+  // schedule-backup path. Here it surfaces as a loud InvalidScheduledBackupModelError
+  // rather than a silent rewrite, but it still rejects a model the picker itself
+  // offered this admin. Widen only when that is what actually happened.
+  if (
+    requested
+    && !supported.has(requested)
+    && typeof agentModeService.getSupportedModels === 'function'
+  ) {
+    const adminModelIds = await agentModeService.getSupportedModels(true);
+    if (adminModelIds.includes(requested) && await isUserAdmin(input.userId)) {
+      adminModelIds.forEach((id) => supported.add(id));
+    }
   }
-  if (requested) {
-    const error = new Error('Backup model is not available for optimized usage');
+
+  // ENG-1211: a backup is now only ever a user's explicit preference, and nothing
+  // below the hard cap consults it. Two behaviors are therefore deleted:
+  //
+  //  1. Inventing a system default when none was asked for. That is what
+  //     stamped `gemini-3.1-flash-lite` + `needsConfirmation: true` onto 177
+  //     rows, and leaving it in would keep manufacturing dead artifacts and
+  //     corrupting ENG-1209's inventory with rows nobody chose.
+  //  2. Rejecting a requested backup for not being in the optimized catalog.
+  //     Restricting which models a user may pick, below the hard cap, is exactly
+  //     the class of behavior AC1 removes — the catalog no longer gates anything.
+  //
+  // A requested model is still validated against the supported registry, because
+  // an unknown id would fail at dispatch rather than at configuration time.
+  if (!requested) {
+    return { llmBackupModel: '', llmBackupSource: null, llmBackupNeedsConfirmation: false };
+  }
+  if (!supported.has(requested)) {
+    const error = new Error(`Backup model '${requested}' is not a supported model`);
     error.name = 'InvalidScheduledBackupModelError';
     throw error;
   }
-  const configuredDefault = usage.policy?.optimizedDefaultModel || systemDefaultModel;
-  if (
-    !configuredDefault ||
-    !supported.has(configuredDefault) ||
-    (usage.policy && !optimized.has(configuredDefault))
-  ) {
-    throw new Error('No valid optimized backup model is configured for this account');
-  }
-  return {
-    llmBackupModel: configuredDefault,
-    llmBackupSource: 'system',
-    llmBackupNeedsConfirmation: true,
-  };
+  return { llmBackupModel: requested, llmBackupSource: 'user', llmBackupNeedsConfirmation: false };
 }
 
 // ENG-324: durable in-flight lease + reconciliation. The graceful-shutdown drain
@@ -548,18 +610,205 @@ export function zeroAssistantIncompleteMessage(error: unknown): string {
 // run-history panel. getScheduledChats deliberately strips the full runResults array
 // for payload size, so the client can't derive this itself; we compute it server-side.
 export interface ScheduleRunHealth {
-  lastRunStatus: 'success' | 'failure' | 'pending_user_input' | null;
+  // Widened to the statuses runScheduledChat can actually store: computeScheduleRunHealth
+  // forwards `last.status` verbatim, so any status the run path writes can appear here.
+  // 'skipped_no_content' (ENG-1259) already exceeded the old union; 'skipped_account_disconnected'
+  // (ENG-1197) would have been the second.
+  lastRunStatus:
+    | 'success'
+    | 'failure'
+    | 'pending_user_input'
+    | 'skipped_no_content'
+    | 'skipped_account_disconnected'
+    | null;
   lastRunAt: string | null;
   // Failures counted back from the MOST RECENT run, stopping at the first non-failure.
   // A 'success' or a 'pending_user_input' (parked, awaiting a human) breaks the streak —
   // a park is not a failure. So this reflects an ongoing, unresolved failure run only.
   consecutiveFailures: number;
+  // ENG-1131: why the most recent run could not do its real work, when it could
+  // not. Distinct from `lastRunStatus` on purpose: a prospecting run blocked by
+  // the LinkedIn people-search outage still writes a report and still records
+  // `status: 'success'`, so the owner's card is green while sourcing is down.
+  // Null when the last run was unblocked.
+  lastRunBlockedBy: string | null;
+}
+
+// ENG-1131: defined in ./utils/scheduleRunBlockedReason (not here) so
+// emailService.ts can also import it without a circular dependency — this
+// controller already imports emailService. Re-exported below (as a normal
+// import + export, not `export ... from`, so detectRunBlockedReason further
+// down can still reference it as a local binding) so existing importers of
+// this constant from this file keep working.
+export { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON };
+
+/**
+ * ENG-1131: read the run's tool ledger for proof that its sourcing path was down.
+ *
+ * The ENG-975 guard stamps `searchUnavailable: true` on the tool result once a
+ * maximally broad control query has confirmed the account cannot search — so this
+ * can never fire on a search that genuinely matched nobody. `linkedin_outreach`
+ * raises it with `success: false` (the dispatcher downgrades that entry to an
+ * error but still stores its minimal result), `find_leads` raises it on a
+ * `success: true` response; both are read the same way here.
+ */
+// The only tools the ENG-975 guard is wired into. Checked by name, not just by
+// the presence of `searchUnavailable`, so an unrelated tool whose result
+// object happens to carry a field with that exact name can never be
+// misattributed as a LinkedIn search outage (CodeRabbit, PR #2383).
+const LINKEDIN_SOURCING_TOOL_NAMES = new Set(['linkedin_outreach', 'find_leads']);
+
+export function detectRunBlockedReason(toolCalls: any[] | undefined | null): string | null {
+  if (!Array.isArray(toolCalls)) return null;
+  const blocked = toolCalls.some(
+    (call: any) => call && typeof call === 'object'
+      && LINKEDIN_SOURCING_TOOL_NAMES.has(call.name)
+      && call.result?.searchUnavailable === true,
+  );
+  return blocked ? LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON : null;
+}
+
+const LINKEDIN_INVITE_CAP_BLOCK_RE =
+  /cannot resend yet|account[ -]level invitation (?:cooldown|cap|limit)|linkedin (?:daily volume limit reached|write actions are being paced)|daily (?:invite|volume).*(?:cap|limit)|(?:pacing|paced).*(?:cap|limit|refus|reach)/i;
+
+type LinkedInInviteSendBlock = {
+  notice: string;
+  successfulInviteSends: number;
+  // ENG-1657 (AC3): the Unipile account the blocked send-invite call targeted, when
+  // the tool arguments carried one. Used only to key the internal oncall alert's
+  // per-account/day dedupe — never surfaced to the customer.
+  accountId?: string;
+};
+
+function linkedInOutreachArgs(call: any): Record<string, any> | null {
+  const args = call?.arguments;
+  if (args && typeof args === 'object') return args;
+  if (typeof args !== 'string') return null;
+  try {
+    const parsed = JSON.parse(args);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function linkedInOutreachAction(call: any): string {
+  const args = linkedInOutreachArgs(call);
+  return args ? String(args.action || '').toLowerCase() : '';
+}
+
+/**
+ * Detect a schedule-wide LinkedIn invitation block from the executed tool ledger.
+ *
+ * A `Cannot resend yet` response and our daily/hourly pacing refusals apply to the
+ * sending account, not just the recipient. Treating an attempted send as a clean
+ * required-function match therefore reports a run as underway while every later
+ * invite is guaranteed to fail (ENG-1132).
+ */
+function detectLinkedInInviteSendBlock(toolCalls: any[] | undefined | null): LinkedInInviteSendBlock | null {
+  if (!Array.isArray(toolCalls)) return null;
+  const inviteCalls = toolCalls.filter(
+    (call: any) => call?.name === 'linkedin_outreach' && linkedInOutreachAction(call) === 'send-invite',
+  );
+  const blockedCall = inviteCalls.find((call: any) => {
+    if (toolCallSucceeded(call)) return false;
+    const detail = [call?.error, call?.result?.error, call?.result?.message]
+      .filter((value) => typeof value === 'string')
+      .join('\n');
+    return LINKEDIN_INVITE_CAP_BLOCK_RE.test(detail);
+  });
+  if (!blockedCall) return null;
+
+  const detail = [blockedCall.error, blockedCall.result?.error, blockedCall.result?.message]
+    .filter((value) => typeof value === 'string')
+    .join(' ');
+  const internalPacing = /daily (?:invite|volume).*(?:cap|limit)|write actions are being paced|pacing|paced/i.test(detail);
+  const reason = internalPacing ? 'our internal pacing cap' : "LinkedIn's account-level invitation cooldown";
+  const blockedArgs = linkedInOutreachArgs(blockedCall);
+  const accountId = blockedArgs && typeof blockedArgs.account_id === 'string' ? blockedArgs.account_id : undefined;
+  return {
+    accountId,
+    notice:
+      `LinkedIn send-invite was blocked by ${reason}. ` +
+      'No further send-invite actions will succeed until it clears; the remaining invitations were not sent.',
+    successfulInviteSends: inviteCalls.filter(toolCallSucceeded).length,
+  };
+}
+
+// ENG-1131 follow-up: minimum real time since the schedule's last observed
+// blocked-state transition before alerting on a new one. Guards against a
+// borderline account whose search-capability probe oscillates right at its
+// pass/fail boundary (or a burst of manual re-tests) firing an alert on every
+// toggle. Short enough that a genuine new/distinct outage is still reported
+// promptly (worst case: delayed by less than this window).
+const DEFAULT_SOURCING_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
+
+/**
+ * ENG-1131 follow-up: true when this run's blocked-state differs from the
+ * IMMEDIATELY PRECEDING run's — i.e. an edge, not a level. `priorRunResults`
+ * is the schedule's history from BEFORE this run (its last element is the
+ * previous run); `currentBlockedBy` is this run's own `detectRunBlockedReason`
+ * result.
+ *
+ * Deliberately edge-triggered so a schedule can proactively alert its owner
+ * the moment sourcing breaks or recovers, without alerting again on every
+ * subsequent run of a multi-day outage — that would just be spam once the
+ * owner already knows. A schedule's very first run counts as a transition
+ * into the blocked state (no prior run = treated as previously healthy), but
+ * not a transition if its first run is healthy.
+ *
+ * Anti-flap cooldown: an edge is only reported if the schedule's most recent
+ * PRIOR transition (found by scanning the full history, not just the last
+ * run) happened at least `cooldownMs` ago. This deliberately does NOT require
+ * N consecutive consistent prior runs — a genuinely settled "broke, fully
+ * recovered, broke again" sequence separated by real time must still alert;
+ * only rapid back-to-back toggling is dampened. No known prior-transition
+ * timestamp (old fixtures with no `createdAt`, or nothing found) never
+ * suppresses — cooldown can only apply against a timestamp we actually have.
+ */
+export function didSourcingBlockStateChange(
+  priorRunResults: any[] | undefined | null,
+  currentBlockedBy: string | null,
+  options: { now?: string | number | Date; cooldownMs?: number } = {},
+): boolean {
+  const results = Array.isArray(priorRunResults) ? priorRunResults : [];
+  if (results.length === 0) {
+    return Boolean(currentBlockedBy);
+  }
+  const last = results[results.length - 1];
+  const previousBlockedBy = last && typeof last === 'object' ? last.blockedBy : undefined;
+  if (Boolean(currentBlockedBy) === Boolean(previousBlockedBy)) {
+    return false;
+  }
+
+  // Scan the WHOLE history once for the most recent point where blocked-state
+  // itself changed run-over-run, to find when the state we're about to leave
+  // actually began.
+  let priorState: boolean | undefined;
+  let lastTransitionAt: number | null = null;
+  for (const run of results) {
+    const state = Boolean(run && typeof run === 'object' ? run.blockedBy : undefined);
+    if (priorState !== undefined && state !== priorState) {
+      const parsed = run && typeof run === 'object' ? Date.parse(run.createdAt) : NaN;
+      if (!Number.isNaN(parsed)) lastTransitionAt = parsed;
+    }
+    priorState = state;
+  }
+
+  if (lastTransitionAt !== null) {
+    const cooldownMs = options.cooldownMs ?? DEFAULT_SOURCING_ALERT_COOLDOWN_MS;
+    const now = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+    if (!Number.isNaN(now) && now - lastTransitionAt < cooldownMs) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function computeScheduleRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth {
   const results = Array.isArray(runResults) ? runResults : [];
   if (results.length === 0) {
-    return { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0 };
+    return { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null };
   }
   const last = results[results.length - 1] || {};
   let consecutiveFailures = 0;
@@ -571,6 +820,7 @@ export function computeScheduleRunHealth(runResults: any[] | undefined | null): 
     lastRunStatus: last.status ?? null,
     lastRunAt: last.createdAt ?? null,
     consecutiveFailures,
+    lastRunBlockedBy: last.blockedBy ?? null,
   };
 }
 
@@ -585,6 +835,67 @@ const SCHEDULED_RUN_RESUME_MESSAGE =
   "human present. Do NOT start over and do NOT repeat any tool call whose result is " +
   "already visible in the history above. Continue from exactly where you left off, using " +
   "the data already gathered, and produce the final deliverable the task asked for.";
+
+// ENG-1684: cap on consecutive automatic continuations for one stalled autocomplete work
+// plan, mirroring AUTO_MEDIA_CONTINUATION_MAX_ROUNDS — a model that keeps refusing to
+// progress despite the resume instruction must not turn one request into an unbounded
+// background retry loop.
+//
+// ENG-1700 follow-up: lowered from 3 to 2. The ENG-1700 fix means every occurrence of a
+// still-open upstream bug (ENG-1477, create_html_file failing ~25% of the time) now costs up
+// to MAX_ROUNDS auto-continuation LLM calls instead of zero — deliberately trading some cost
+// for auto-recovery, but 2 rounds captures most of that recovery value at 2/3 the spend of 3,
+// until ENG-1477 itself is fixed.
+export const AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS = 2;
+
+// ENG-1684: fired by the SERVER when an autocomplete=true work plan's turn ends with no
+// tool calls and at least one step still not completed/skipped — the exact stall pattern
+// from session 7a9772f6 (Smart Water Heater GTM audit), where the model told the user
+// "please retry the research, scoring, and reporting step" instead of just continuing, and
+// the plan then sat idle for 3+ hours until a human happened to say "go ahead". Marked
+// [SYSTEM] (same convention as SCHEDULED_RUN_RESUME_MESSAGE / AUTO_MEDIA_CONTINUATION_MESSAGE)
+// so the model treats it as an automated instruction, not a real user turn.
+const AUTO_WORK_PLAN_CONTINUATION_MESSAGE =
+  '[SYSTEM] This is an automatic continuation, not a message from the user — the previous ' +
+  'turn ended without completing this autocomplete work plan. Autocomplete plans must never ' +
+  'pause to wait for a human: continue immediately using whatever you already gathered above, ' +
+  'do NOT repeat any tool call whose result is already visible in the history, do NOT ask the ' +
+  'user to confirm or retry, and call set_work_plan_status the moment a step\'s work is ' +
+  'actually done.';
+
+/**
+ * ENG-1684/ENG-1700: true when this turn's own settled response left an autocomplete work
+ * plan stalled, and nothing else already owns resuming it. A stall is either zero tool calls
+ * at all, or one or more tool calls that ALL failed (ENG-1700: e.g. create_html_file rejecting
+ * its payload repeatedly) — either shape leaves the plan making no forward progress. Deferred
+ * media-budget calls are excluded: scheduleAutoMediaContinuation already owns resuming that
+ * turn, and firing both continuations would race for the same session lock.
+ * Scoped tightly to autocomplete plans: an INTERACTIVE plan pausing on a real question is
+ * correct behavior (a human can answer it), so this must never fire there — only autocomplete
+ * plans carry the "never wait on the user" contract that makes an unanswered pause a bug
+ * rather than a feature.
+ */
+export function hasStalledAutocompleteWorkPlan(
+  workPlan: { autocomplete?: boolean; steps?: Array<{ status?: string }> } | undefined | null,
+  toolCalls: unknown[] | undefined | null,
+): boolean {
+  if (!workPlan?.autocomplete) return false;
+  const calls = Array.isArray(toolCalls) ? toolCalls : [];
+  if (hasDeferredMediaBudgetToolCall(calls as any[])) return false;
+  if (calls.some((tc) => toolCallSucceeded(tc))) return false;
+  return workPlanHasPendingStep(workPlan);
+}
+
+/** ENG-1699: whether an autocomplete work plan still has unfinished work, independent of any
+ * specific turn's tool-call history. Shared by hasStalledAutocompleteWorkPlan (which also asks
+ * "did this turn make progress") and scheduleAutoWorkPlanContinuation's pre-fire re-check
+ * (which only needs "is there still something to do"). */
+function workPlanHasPendingStep(
+  workPlan: { steps?: Array<{ status?: string }> } | undefined | null,
+): boolean {
+  const steps = Array.isArray(workPlan?.steps) ? workPlan!.steps : [];
+  return steps.some((s) => s?.status !== 'completed' && s?.status !== 'skipped');
+}
 
 /**
  * In-memory set of session IDs that are currently generating a response.
@@ -623,6 +934,125 @@ export function releaseSessionGeneration(sessionId: string): void {
 }
 
 /**
+ * ENG-1696: thrown when a caller could not claim a session's generation lock
+ * even after claimSessionGenerationWithRetry's bounded wait — i.e. the session
+ * was continuously busy for the whole retry window. `code` mirrors the shape
+ * of /generate's own busy rejection so callers can render the same message.
+ */
+export class SessionBusyError extends Error {
+  code = 'SESSION_BUSY';
+  constructor(sessionId: string) {
+    super(`Session ${sessionId} is busy — a generation is already in progress.`);
+    this.name = 'SessionBusyError';
+  }
+}
+
+export function isSessionBusyError(error: unknown): boolean {
+  return error instanceof SessionBusyError
+    || (typeof error === 'object' && error !== null && (error as any).code === 'SESSION_BUSY');
+}
+
+/**
+ * ENG-1696: claim the generation lock, retrying with a short backoff if it's
+ * currently held, instead of failing on the first collision. /generate and
+ * /verified-generate can legitimately be triggered on the same session close
+ * together (e.g. a live chat turn and an Images/Videos/ResearchReports report
+ * generation) — a brief wait absorbs that overlap instead of instantly
+ * rejecting (or, before this fix, silently letting both write `workPlan`
+ * unguarded and corrupting whichever wrote second). Exported so tests can
+ * override the timing.
+ */
+export async function claimSessionGenerationWithRetry(
+  sessionId: string,
+  { retries = 6, delayMs = 2000 }: { retries?: number; delayMs?: number } = {},
+): Promise<boolean> {
+  const startedAt = Date.now();
+  for (let i = 0; i <= retries; i++) {
+    if (tryClaimSessionGeneration(sessionId)) {
+      return true;
+    }
+    if (i < retries) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  // ENG-1719: this was previously silent, so every exhausted retry looked identical to an
+  // operator in the logs — no way to tell "brief, expected overlap absorbed nothing unusual"
+  // from "this session's lock has been wedged for the last hour." Log the elapsed wait so a
+  // pattern of these for the SAME sessionId over minutes/hours is visibly distinguishable
+  // from an isolated one-off.
+  console.error(
+    `AgentMode: claimSessionGenerationWithRetry gave up on session ${sessionId} after ` +
+    `${retries + 1} attempts over ${Date.now() - startedAt}ms — session generation lock still held.`
+  );
+  return false;
+}
+
+/**
+ * ENG-1189: waits for every in-flight interactive Agent Mode turn (tracked by
+ * activeSessionGenerations, held for the full turn including its tool-call
+ * loop) to finish, up to the same drain ceiling used for cron/worker
+ * shutdown. server.ts's runDrain() awaits this BEFORE closing the HTTP
+ * listener — every MCP tool self-call (mcpFetch) reaches this same process
+ * via http://localhost:${PORT}, so closing the listener first left an
+ * in-flight turn's tool calls permanently failing (not transiently) for the
+ * rest of the process's life, since server.close() stops accepting the new
+ * loopback connection each retry needs.
+ */
+export async function drainActiveSessionGenerations(
+  ceilingMs: number = DRAIN_CEILING_MS,
+  pollIntervalMs: number = DRAIN_POLL_INTERVAL_MS
+): Promise<{ drained: boolean; stuckCount: number }> {
+  const deadline = Date.now() + ceilingMs;
+  while (activeSessionGenerations.size > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+  if (activeSessionGenerations.size > 0) {
+    return { drained: false, stuckCount: activeSessionGenerations.size };
+  }
+  return { drained: true, stuckCount: 0 };
+}
+
+/**
+ * ENG-1239: subset of activeSessionGenerations sessions whose lock is currently held by
+ * a background media auto-continuation (scheduleAutoMediaContinuation) rather than a real
+ * customer request. Before this existed, a genuine customer message that happened to
+ * arrive while an auto-continuation was running just got a flat 409 SESSION_BUSY — for a
+ * request the customer had every right to make, caused by background work they never
+ * asked for or knew was happening. Exported so tests can inspect/reset it.
+ */
+export const autoContinuationSessions = new Set<string>();
+
+/** Bounded window a real customer request waits for a preempted auto-continuation to
+ * actually release the lock. Cancellation is cooperative (the worker only notices between
+ * steps, same as the existing manual-stop path), so this can't be instant, but it must
+ * stay short enough that the customer's own request doesn't feel hung. Env-overridable
+ * (mirrors AGENT_MODE_MEDIA_BUDGET_MS) so tests aren't forced into multi-second waits. */
+const AUTO_CONTINUATION_PREEMPT_WAIT_MS = parseInt(process.env.AUTO_CONTINUATION_PREEMPT_WAIT_MS || '4000', 10);
+const AUTO_CONTINUATION_PREEMPT_POLL_MS = parseInt(process.env.AUTO_CONTINUATION_PREEMPT_POLL_MS || '150', 10);
+
+/**
+ * ENG-1239: called when a real customer request collides with the generation lock. If the
+ * lock is held by a background auto-continuation (not another real request), a genuine
+ * customer message takes priority — cancel it (the same requestCancel + cancelSession
+ * primitives already used to stop an orphaned timed-out generation) and give it a bounded
+ * window to actually release before falling back to the existing 409. Never proceeds
+ * without actually re-claiming the lock, so this can never race a second concurrent write
+ * into the same session — worst case, it behaves exactly like before this fix existed.
+ * Exported so tests can drive it directly instead of racing real generation timing.
+ */
+export async function preemptAutoContinuationAndWait(sessionId: string): Promise<boolean> {
+  if (!autoContinuationSessions.has(sessionId)) return false;
+  requestCancel(sessionId);
+  generateMarketingResponseWorkerService.cancelSession(sessionId);
+  const deadline = Date.now() + AUTO_CONTINUATION_PREEMPT_WAIT_MS;
+  while (Date.now() < deadline) {
+    if (tryClaimSessionGeneration(sessionId)) return true;
+    await new Promise((resolve) => setTimeout(resolve, AUTO_CONTINUATION_PREEMPT_POLL_MS));
+  }
+  return tryClaimSessionGeneration(sessionId);
+}
+
+/**
  * Wall-clock timeout for a single agent-mode generation. Without this, a hung
  * LLM call (stuck await, runaway tool loop, never-resolving upstream) keeps
  * the activeSessionGenerations lock held indefinitely — every subsequent
@@ -641,22 +1071,68 @@ const GENERATION_TIMEOUT_MS = parseInt(
   10
 ); // 10 minutes default — long-running browser/research tasks need > 5 min
 
+// ENG-1719: runVerifiedChat holds activeSessionGenerations for its ENTIRE multi-attempt run
+// (up to ~20 attempts), unlike a single /generate turn — GENERATION_TIMEOUT_MS's 10-minute
+// budget is sized for one turn and would abort a legitimate multi-attempt run partway
+// through. This is a separate, more generous ceiling whose only job is making sure the LOCK
+// can't be held forever if the run hangs — not tuned to cut off normal completion.
+//
+// A single hung attempt is already caught, independently, one layer down:
+// generateMarketingResponseWorkerService's runInWorker rejects after 45 minutes of
+// INACTIVITY (resets on every progress event, so a genuinely active call is never
+// falsely killed), and ensureWorker has its own 2-minute init timeout. This outer
+// bound's only remaining job is capping AGGREGATE time across an already
+// individually-bounded multi-attempt run, not hang detection.
+//
+// Two tiers, sized off real production data (2026-09-03), not guesswork:
+// - SHORT (default): the callers where a human or Slack reviewer is actively
+//   waiting (interactive /verified-generate, imageReports, revisionService,
+//   humanEvalActionService, both routes/slack.ts revision sites) — all pass
+//   maxAttempts: 5 except the interactive endpoint, which takes an
+//   unvalidated maxAttempts from the request body (owner-authenticated, no
+//   upper bound enforced) but still gets this default; it was capped at the
+//   old flat 30 minutes regardless of maxAttempts before this change, so this
+//   is strictly more headroom either way, not a new exposure. A scan of
+//   AW-AssetApprovals' revision chains showed real completions
+//   almost entirely under 10 minutes, with one credible legitimate case at 69
+//   minutes and nothing credible above that (a 1041-minute outlier turned out to
+//   be a measurement artifact — two unrelated Slack threads sharing an
+//   executionId — not a real run; confirmed via the session's own message log).
+//   90 minutes gives real margin without leaving a stuck interactive/Slack
+//   session locked for hours.
+// - LONG: the headless, maxAttempts:20 callers with nobody blocked waiting
+//   (runScheduledChat, resultEndpointController). A scan of 8,955 real scheduled
+//   runs (AW-TaskSchedules) found the longest legitimate, confirmed-successful
+//   run took 272 minutes — a 30-minute cap would have killed 3.48% of ALL real
+//   runs historically, including confirmed non-hang successes. 6 hours clears
+//   the observed max with ~30% margin.
+const RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS = parseInt(
+  process.env.AGENT_MODE_VERIFIED_CHAT_LOCK_TIMEOUT_MS || String(90 * 60 * 1000),
+  10
+); // 90 minutes default — callers where a human is actively waiting
+
+export const RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS = parseInt(
+  process.env.AGENT_MODE_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS || String(6 * 60 * 60 * 1000),
+  10
+); // 6 hours — headless, maxAttempts:20 callers only (runScheduledChat, resultEndpointController)
+
 async function withGenerationTimeout<T>(
   promise: Promise<T>,
-  sessionId: string
+  sessionId: string,
+  timeoutMs: number = GENERATION_TIMEOUT_MS,
 ): Promise<T> {
   let timeoutHandle: NodeJS.Timeout | undefined;
   const timeoutPromise = new Promise<T>((_, reject) => {
     timeoutHandle = setTimeout(() => {
       const err: any = new Error(
-        `Generation timed out after ${GENERATION_TIMEOUT_MS}ms for session ${sessionId}. ` +
+        `Generation timed out after ${timeoutMs}ms for session ${sessionId}. ` +
         `The lock has been released; the orphaned generation may still complete in the background.`
       );
       // Tag so the durable-execution path can distinguish a run-timeout (where the
       // detached work may still finish) from a genuine generation error.
       err.isGenerationTimeout = true;
       reject(err);
-    }, GENERATION_TIMEOUT_MS);
+    }, timeoutMs);
   });
   try {
     return await Promise.race([promise, timeoutPromise]);
@@ -703,6 +1179,454 @@ function attachInProcessCompletion(
     .catch((err: any) =>
       console.error(`AgentMode: in-process completion hook failed for page ${pageId}:`, err)
     );
+}
+
+// ENG-1239: cap on consecutive automatic continuations for one deferred media batch, so a
+// persistently slow/broken provider can't turn one request into an unbounded background
+// retry loop. Comfortably covers the reported case (one deferral, one resume) with headroom
+// for a larger batch that defers more than once.
+const AUTO_MEDIA_CONTINUATION_MAX_ROUNDS = 4;
+
+// ENG-1239 (rework): how old an unresolved media-batch pause may be before getSession's
+// durability backstop stops treating it as resumable on a passive reopen. Matches the
+// idempotency dedupe window (seedMediaCallKeysFromHistory) for consistency — both exist to
+// bound how far back "this is still the same in-progress batch" is a safe assumption to
+// make. Env-overridable so tests aren't forced into real-time waits.
+const BACKSTOP_STALENESS_MS = parseInt(process.env.AUTO_MEDIA_CONTINUATION_STALENESS_MS || String(60 * 60 * 1000), 10);
+
+// ENG-1239: the turn that hit the per-turn media budget already told the user (via the
+// model's own reply) that some assets are still missing and invited "continue" — this
+// message is that continuation, fired by the SERVER instead of waiting for the customer to
+// notice and retype it. Marked [SYSTEM] (same convention as SCHEDULED_RUN_RESUME_MESSAGE) so
+// the model treats it as an automated instruction, not a real user turn. The ENG-510
+// already-generated-assets awareness block makes replaying this safe: only the assets still
+// missing from the original request are (re)generated.
+const AUTO_MEDIA_CONTINUATION_MESSAGE =
+  '[SYSTEM] This is an automatic continuation, not a message from the user — the previous ' +
+  'turn paused only because it was approaching its per-response time limit, not because ' +
+  'anything failed. Do NOT re-generate any asset already shown as done above and do NOT ' +
+  'ask the user to reply "continue" again. Generate ONLY the assets still missing from the ' +
+  'original request, then confirm the batch is complete.';
+
+/**
+ * ENG-1239: when a media-heavy interactive turn defers a generate_image/video call because
+ * the per-turn soft time budget is running out (see hasDeferredMediaBudgetToolCall), the
+ * images already done ARE saved, but the turn ends by asking the user to reply "continue".
+ * Left alone, that shifts the recovery work onto the customer — the reported bug had three
+ * of four requested images delivered and the fourth silently left for the user to notice.
+ *
+ * Fire the continuation ourselves instead, detached from the request that just returned —
+ * reusing generateSessionResponse exactly as a real "continue" reply would, so the existing
+ * ENG-510 asset-dedup (already-generated-assets awareness) makes this idempotent: no asset
+ * is ever regenerated. Best-effort and fire-and-forget by design (mirrors
+ * attachInProcessCompletion above) — any failure here just leaves the manual "continue"
+ * prompt as the fallback, exactly like today.
+ */
+async function scheduleAutoMediaContinuation(
+  sessionId: string,
+  userId: string,
+  llmModel: string,
+  round: number
+): Promise<void> {
+  if (round > AUTO_MEDIA_CONTINUATION_MAX_ROUNDS) {
+    console.error(
+      `AgentMode: media auto-continuation for session ${sessionId} still deferred after ` +
+      `${AUTO_MEDIA_CONTINUATION_MAX_ROUNDS} rounds — leaving the manual "continue" prompt in place.`
+    );
+    // ENG-1239: a persistently slow/broken provider must not fail SILENTLY. Two things
+    // were missing until now: (1) the customer's last visible signal was indistinguishable
+    // from an ordinary single deferral — nothing told them automatic retries had actually
+    // been exhausted; (2) nobody but this console.error would ever know a provider was
+    // this degraded. Fix both: leave an explicit, distinct closing message (also doubles
+    // as the durability backstop's stop signal — see hasUnresolvedMediaDeferral, which
+    // does NOT match `kind: 'auto-continuation-exhausted'`, so a later session touch does
+    // not retry forever) and page on-call.
+    const exhaustedMsg =
+      `⚠️ I wasn't able to finish this batch automatically after several attempts — the ` +
+      `remaining asset(s) may be taking longer than usual. Reply here whenever you're ` +
+      `ready and I'll pick up where I left off; nothing already generated is lost.`;
+    await chatbotDb.addMessageToSession(sessionId, {
+      role: 'assistant',
+      content: exhaustedMsg,
+      timestamp: new Date().toISOString(),
+      metadata: { timestamp: new Date().toISOString(), kind: 'auto-continuation-exhausted' },
+    }).catch((persistErr) =>
+      console.error('AgentMode: failed to persist auto-continuation-exhausted message:', persistErr),
+    );
+    // CodeRabbit (PR #2479): this ran unguarded — scheduleAutoMediaContinuation must
+    // never reject (it's always invoked as a floating promise; see the .catch below
+    // and every setImmediate kickoff site), but an emit failure here would reject it
+    // anyway, and an unhandled rejection on a fire-and-forget call crashes the whole
+    // backend process under Node's default --unhandled-rejections=throw, not just this
+    // one session's turn.
+    try {
+      const { io } = await import('../server');
+      io.to(`user:${userId}`).emit('session-message-appended', {
+        sessionId,
+        message: { role: 'assistant', content: exhaustedMsg },
+      });
+    } catch (emitErr) {
+      console.error(`AgentMode: failed to emit auto-continuation-exhausted message for session ${sessionId}:`, emitErr);
+    }
+    await sendAgentModeOncallAlert({
+      subject: 'Media auto-continuation exhausted its retry cap',
+      message:
+        `Session ${sessionId} still had a deferred media-gen call after ` +
+        `${AUTO_MEDIA_CONTINUATION_MAX_ROUNDS} automatic continuation rounds — likely a ` +
+        `persistently slow/broken image or video provider. The customer was left an ` +
+        `explicit closing message; automatic retries have stopped.`,
+      context: { sessionId, userId, rounds: AUTO_MEDIA_CONTINUATION_MAX_ROUNDS },
+      sessionId,
+      dedupeKey: `media_auto_continuation_exhausted:${sessionId}`,
+      dedupeWindowMs: 60 * 60 * 1000,
+    }).catch((alertErr) =>
+      console.error('AgentMode: failed to send media auto-continuation-exhausted alert:', alertErr),
+    );
+    return;
+  }
+
+  // ENG-1239: every other generateSessionResponse call site gates on the customer's
+  // token/cost allowance before generating — this background entry point bypassed
+  // that gate entirely, letting an auto-continuation bill (and generate) an image for
+  // a customer whose allowance is already exhausted. Fail closed on a lookup error
+  // too, since this call is unawaited fire-and-forget and must never reject.
+  let usageStatus;
+  try {
+    usageStatus = await checkTokenUsage(userId);
+  } catch (usageErr) {
+    console.error(`AgentMode: media auto-continuation usage check failed for session ${sessionId}:`, usageErr);
+    return;
+  }
+  if (!usageStatus.allowed) {
+    console.error(
+      `AgentMode: media auto-continuation for session ${sessionId} skipped — usage limit ` +
+      `reached; leaving the manual "continue" prompt in place.`
+    );
+    return;
+  }
+
+  // A real user request may already be running for this session (e.g. they replied
+  // manually while we were about to auto-continue) — don't fight it. If that turn still
+  // leaves the batch incomplete, its own response re-triggers this path.
+  if (!tryClaimSessionGeneration(sessionId)) return;
+  // ENG-1239: mark the lock as continuation-held so a real customer request that collides
+  // with it (the OTHER direction from the check above) can preempt instead of just
+  // 409ing — see preemptAutoContinuationAndWait.
+  autoContinuationSessions.add(sessionId);
+
+  let stillDeferred = false;
+  const roundStartMs = Date.now();
+  withGenerationTimeout(
+    generateSessionResponse(
+      sessionId,
+      AUTO_MEDIA_CONTINUATION_MESSAGE,
+      userId,
+      llmModel,
+      undefined, // attachments
+      undefined, // isInteractiveShare
+      undefined, // pageContext
+      undefined, // isDelegatedAccess
+      undefined, // ishareSenderInfo
+      undefined, // answerAck
+      undefined, // answeredQuestionMeta
+      undefined, // turnStartMs — no whole-turn deadline for this background continuation
+      undefined, // publishAuthorizationOverride
+      undefined, // approvedRevisionImageSources
+      'auto-continuation', // ENG-1239: hide this server-authored turn in the chat UI
+    ),
+    sessionId
+  )
+    .then(async (resolved) => {
+      stillDeferred = hasDeferredMediaBudgetToolCall(resolved?.toolCalls);
+      if (resolved?.content) {
+        const { io } = await import('../server');
+        io.to(`user:${userId}`).emit('session-message-appended', {
+          sessionId,
+          message: { role: 'assistant', content: resolved.content },
+        });
+      } else if (resolved?.cancelled) {
+        // ENG-1239 (rework, found live): a continuation preempted by a genuine customer
+        // message (preemptAutoContinuationAndWait) sends a cooperative cancel, but an
+        // already-dispatched provider call can't be aborted — the image finishes and is
+        // correctly saved regardless. The loop then stops before composing a closing
+        // reply, so `content` comes back empty even though a new asset landed, leaving a
+        // bare, unexplained image-generated marker with no "batch complete" narration.
+        const newAssets = (resolved?.toolCalls || []).filter(
+          (tc: any) => tc?.name && MEDIA_GEN_TOOLS.has(tc.name)
+            && !tc?.error && tc?.result?.deferred !== true && tc?.result?.success !== false
+            && mediaGenProducedAsset(tc.name, tc.result),
+        );
+        if (newAssets.length > 0) {
+          const closingMsg = newAssets.length === 1
+            ? '✅ One more asset finished after all — your batch is complete.'
+            : `✅ ${newAssets.length} more assets finished after all — your batch is complete.`;
+          await chatbotDb.addMessageToSession(sessionId, {
+            role: 'assistant',
+            content: closingMsg,
+            timestamp: new Date().toISOString(),
+            metadata: { timestamp: new Date().toISOString() },
+          }).catch((persistErr) =>
+            console.error(`AgentMode: failed to persist preempted-continuation closing note for session ${sessionId}:`, persistErr),
+          );
+          const { io } = await import('../server');
+          io.to(`user:${userId}`).emit('session-message-appended', {
+            sessionId,
+            message: { role: 'assistant', content: closingMsg },
+          });
+        }
+      }
+    })
+    .catch(async (err: any) => {
+      console.error(`AgentMode: media auto-continuation failed for session ${sessionId}:`, err);
+      // ENG-1719: mirrors the work-plan continuation's identical fix. Left as a plain
+      // console.error before, a timed-out media round silently ended the retry chain
+      // without consuming a round — the exhaustion message/alert (:1200-1239) never fired
+      // and an unresolved media batch died with no notice, the same "silent unresolved
+      // batch" failure ENG-1717 fixed for work plans, just still open here. Re-read the
+      // PERSISTED deferral marker (the resolved value doesn't exist on this path) and fail
+      // closed if that re-read fails. Cancel the orphan first — same reasoning as the
+      // work-plan fix: recursing into round+1 while round N's orphan may still be running
+      // would otherwise race it for the same session.
+      if (err?.isGenerationTimeout) {
+        requestCancel(sessionId);
+        generateMarketingResponseWorkerService.cancelSession(sessionId);
+        try {
+          const timedOutSession = await chatbotDb.getChatSessionRecord(sessionId);
+          stillDeferred = hasPersistedMediaBudgetDeferral(timedOutSession?.messages, roundStartMs);
+        } catch (rereadErr) {
+          console.error(
+            `AgentMode: media auto-continuation could not re-read session ${sessionId} after a ` +
+            `generation timeout — ending the retry chain rather than continuing blind:`,
+            rereadErr,
+          );
+        }
+      }
+    })
+    .finally(() => {
+      // ENG-1717: must run on EVERY exit, not just the resolved one. When the generation
+      // timed out, leaving the progress entry behind keeps hasActiveProgress reporting
+      // "still generating" forever, so an open tab spins indefinitely on work the server
+      // already abandoned — only a manual page refresh clears it.
+      markProgressComplete(sessionId);
+      // Release BEFORE recursing — the next round's tryClaimSessionGeneration would
+      // otherwise always lose to this round's still-held lock.
+      autoContinuationSessions.delete(sessionId);
+      releaseSessionGeneration(sessionId);
+      if (stillDeferred) {
+        // CodeRabbit (PR #2479): defense-in-depth — the function should never reject
+        // (the try/catch above now guards its one known throw point), but every
+        // fire-and-forget call site catches defensively anyway, so a future,
+        // unanticipated throw logs instead of becoming an unhandled rejection.
+        scheduleAutoMediaContinuation(sessionId, userId, llmModel, round + 1).catch((chainErr) =>
+          console.error(`AgentMode: media auto-continuation chain failed for session ${sessionId}:`, chainErr),
+        );
+      }
+    });
+}
+
+/**
+ * ENG-1684: the autocomplete-work-plan analogue of scheduleAutoMediaContinuation above —
+ * same shape (usage-gated, lock-claimed so it never fights a real concurrent user turn,
+ * bounded retry with an exhaustion backstop that alerts on-call rather than failing
+ * silently), applied to a different stall: an autocomplete plan whose turn ended with no
+ * tool calls while steps remain pending, instead of a deferred media batch.
+ *
+ * setImmediate at every call site defers the kickoff past the triggering request's own
+ * `finally`, so this claims the generation lock only after that request released it.
+ */
+async function scheduleAutoWorkPlanContinuation(
+  sessionId: string,
+  userId: string,
+  llmModel: string,
+  round: number
+): Promise<void> {
+  if (round > AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS) {
+    console.error(
+      `AgentMode: work-plan auto-continuation for session ${sessionId} still stalled after ` +
+      `${AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS} rounds — leaving the last reply in place.`
+    );
+    const exhaustedMsg =
+      `⚠️ I wasn't able to finish this plan automatically after several attempts — one of ` +
+      `its steps may need something only you can provide. Reply here whenever you're ready ` +
+      `and I'll pick up where I left off; nothing already done is lost.`;
+    await chatbotDb.addMessageToSession(sessionId, {
+      role: 'assistant',
+      content: exhaustedMsg,
+      timestamp: new Date().toISOString(),
+      metadata: { timestamp: new Date().toISOString(), kind: 'work-plan-auto-continuation-exhausted' },
+    }).catch((persistErr) =>
+      console.error('AgentMode: failed to persist work-plan-auto-continuation-exhausted message:', persistErr),
+    );
+    try {
+      const { io } = await import('../server');
+      io.to(`user:${userId}`).emit('session-message-appended', {
+        sessionId,
+        message: { role: 'assistant', content: exhaustedMsg },
+      });
+    } catch (emitErr) {
+      console.error(`AgentMode: failed to emit work-plan-auto-continuation-exhausted message for session ${sessionId}:`, emitErr);
+    }
+    await sendAgentModeOncallAlert({
+      subject: 'Work-plan auto-continuation exhausted its retry cap',
+      message:
+        `Session ${sessionId}'s autocomplete work plan still had a pending step after ` +
+        `${AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS} automatic continuation rounds — the model ` +
+        `kept ending its turn without progressing the plan. The customer was left an explicit ` +
+        `closing message; automatic retries have stopped.`,
+      context: { sessionId, userId, rounds: AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS },
+      sessionId,
+      dedupeKey: `work_plan_auto_continuation_exhausted:${sessionId}`,
+      dedupeWindowMs: 60 * 60 * 1000,
+    }).catch((alertErr) =>
+      console.error('AgentMode: failed to send work-plan auto-continuation-exhausted alert:', alertErr),
+    );
+    return;
+  }
+
+  // Same allowance gate as media auto-continuation: never generate more against a
+  // customer's usage on their behalf, unattended, after their allowance is exhausted.
+  let usageStatus;
+  try {
+    usageStatus = await checkTokenUsage(userId);
+  } catch (usageErr) {
+    console.error(`AgentMode: work-plan auto-continuation usage check failed for session ${sessionId}:`, usageErr);
+    return;
+  }
+  if (!usageStatus.allowed) {
+    console.error(
+      `AgentMode: work-plan auto-continuation for session ${sessionId} skipped — usage limit ` +
+      `reached; leaving the last reply in place.`
+    );
+    return;
+  }
+
+  // A real user request may already be running for this session — don't fight it. If that
+  // turn still leaves the plan stalled, its own response re-triggers this path.
+  if (!tryClaimSessionGeneration(sessionId)) return;
+  autoContinuationSessions.add(sessionId);
+
+  // ENG-1699: this callback was scheduled via setImmediate after a stall was detected — a
+  // human's own turn may have already resolved it (or the plan itself) in that gap, since we
+  // only re-checked the stall condition AFTER a round used to fire, never immediately before.
+  // Re-verify against the session's current state before spending a turn on a continuation
+  // nobody needs anymore.
+  //
+  // Plain (non-consistent) read — NOT because eventual consistency doesn't matter here (it
+  // does), but because `getChatSession`'s `consistentRead` param never actually reaches the
+  // base session record `workPlan` lives on: it's threaded only into getMessagesFromMessagesTable
+  // (see getChatSession's own implementation), so passing `true` the way ENG-510's
+  // getChatSession(sessionId, true) does at the timeout-handling call site above (which reads
+  // .messages, not .workPlan) would be no-op rigor here, not a real fix. Ordinary DynamoDB
+  // read-after-write lag on a single-item read is normally sub-second in-region; worst case on a
+  // stale read is one extra harmless turn, the same failure mode this whole function replaces.
+  //
+  // On a lookup failure (not "resolved", genuinely couldn't check): fail OPEN — proceed to
+  // generate anyway, same as this function's pre-ENG-1699 behavior — rather than silently
+  // treating "couldn't check" as "already resolved" and dropping the entire stall backstop with
+  // no operator visibility. Every other failure branch in this function logs; this one must too.
+  // Cheap base-record read only (no message-table fetch/migration) — workPlan lives on the
+  // base record, same pattern already used by chatSocketHandler.ts/liveVoiceService.ts for
+  // exactly this reason.
+  let currentSessionLookupFailed = false;
+  const currentSession = await chatbotDb.getChatSessionRecord(sessionId).catch((lookupErr) => {
+    console.error(
+      `AgentMode: work-plan auto-continuation pre-fire recheck failed to read session ${sessionId} ` +
+      `— proceeding to generate anyway (fail open) rather than silently skipping the backstop:`,
+      lookupErr,
+    );
+    currentSessionLookupFailed = true;
+    return null;
+  });
+  if (
+    !currentSessionLookupFailed &&
+    (!currentSession?.workPlan?.autocomplete || !workPlanHasPendingStep(currentSession.workPlan))
+  ) {
+    autoContinuationSessions.delete(sessionId);
+    releaseSessionGeneration(sessionId);
+    return;
+  }
+
+  let stillStalled = false;
+  withGenerationTimeout(
+    generateSessionResponse(
+      sessionId,
+      AUTO_WORK_PLAN_CONTINUATION_MESSAGE,
+      userId,
+      llmModel,
+      undefined, // attachments
+      undefined, // isInteractiveShare
+      undefined, // pageContext
+      undefined, // isDelegatedAccess
+      undefined, // ishareSenderInfo
+      undefined, // answerAck
+      undefined, // answeredQuestionMeta
+      undefined, // turnStartMs — no whole-turn deadline for this background continuation
+      undefined, // publishAuthorizationOverride
+      undefined, // approvedRevisionImageSources
+      'auto-continuation', // ENG-1684: hide this server-authored turn in the chat UI
+    ),
+    sessionId
+  )
+    .then(async (resolved) => {
+      stillStalled = hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls);
+      if (resolved?.content) {
+        const { io } = await import('../server');
+        io.to(`user:${userId}`).emit('session-message-appended', {
+          sessionId,
+          message: { role: 'assistant', content: resolved.content },
+        });
+      }
+    })
+    .catch(async (err: any) => {
+      console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err);
+      // ENG-1717: a round killed by withGenerationTimeout rejects here, and `stillStalled`
+      // (assigned only in .then) would stay false — silently ending the retry chain without
+      // consuming a round, so the exhaustion message and on-call alert above never fire and
+      // nobody learns the plan was abandoned. Re-read the PERSISTED plan instead: the
+      // resolved value doesn't exist on this path, but the work plan on the base record is
+      // exactly what the next round would act on anyway. Fail closed (leave stillStalled
+      // false) if the re-read itself fails — better to stop than to spin on an unknown.
+      if (err?.isGenerationTimeout) {
+        // ENG-1719: withGenerationTimeout's own contract is that it does NOT cancel the
+        // underlying generation — the orphaned round keeps running in the background. If
+        // `stillStalled` below comes back true, we're about to release the lock and
+        // immediately recurse into round+1's own generateSessionResponse call for the SAME
+        // session while round N's orphan may still be executing — reopening exactly the
+        // concurrent-write race against `workPlan` that ENG-1696 exists to prevent, just
+        // self-inflicted by this retry chain instead of an external caller. Mirror the
+        // interactive timeout path (:8382) and cancel the orphan before recursing.
+        requestCancel(sessionId);
+        generateMarketingResponseWorkerService.cancelSession(sessionId);
+        try {
+          const timedOutSession = await chatbotDb.getChatSessionRecord(sessionId);
+          stillStalled =
+            timedOutSession?.workPlan?.autocomplete === true &&
+            workPlanHasPendingStep(timedOutSession.workPlan);
+        } catch (rereadErr) {
+          console.error(
+            `AgentMode: work-plan auto-continuation could not re-read session ${sessionId} after a ` +
+            `generation timeout — ending the retry chain rather than continuing blind:`,
+            rereadErr,
+          );
+        }
+      }
+    })
+    .finally(() => {
+      // ENG-1717: must run on EVERY exit, not just the resolved one. When the generation
+      // timed out, leaving the progress entry behind keeps hasActiveProgress reporting
+      // "still generating" forever, so an open tab spins indefinitely on work the server
+      // already abandoned — only a manual page refresh clears it.
+      markProgressComplete(sessionId);
+      // Release BEFORE recursing — the next round's tryClaimSessionGeneration would
+      // otherwise always lose to this round's still-held lock.
+      autoContinuationSessions.delete(sessionId);
+      releaseSessionGeneration(sessionId);
+      if (stillStalled) {
+        scheduleAutoWorkPlanContinuation(sessionId, userId, llmModel, round + 1).catch((chainErr) =>
+          console.error(`AgentMode: work-plan auto-continuation chain failed for session ${sessionId}:`, chainErr),
+        );
+      }
+    });
 }
 
 /**
@@ -802,6 +1726,8 @@ interface DiagnosisResult {
   message: string | null;
   /** Publish/deploy calls this run is confirmed to have completed. */
   publishLedger: FalseFailureLedgerEntry[];
+  /** ENG-1224: HTML preview URLs a confirmed create/update_html_file call produced this turn. */
+  artifactUrls: ConfirmedArtifactRef[];
 }
 
 /**
@@ -842,6 +1768,32 @@ async function loadPublishLedger(
   }
 }
 
+/**
+ * ENG-1224: HTML preview URLs (create_html_file / update_html_file /
+ * create_html_from_template) this turn is confirmed to have produced. Same
+ * retry contract as `loadPublishLedger` — a single transient DynamoDB blip must
+ * not silently drop a link the user is relying on — but an unreadable session
+ * degrades to "nothing to show" rather than UNKNOWN: unlike the publish ledger,
+ * nothing downstream treats an empty result here as license to re-run work.
+ */
+async function loadConfirmedArtifactUrls(
+  sessionId: string,
+  turnStartMs?: number | null,
+): Promise<ConfirmedArtifactRef[]> {
+  if (typeof turnStartMs !== 'number') return [];
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const session = await chatbotDb.getChatSession(sessionId);
+      return collectConfirmedArtifactUrls(session?.messages as any, turnStartMs);
+    } catch (readError) {
+      if (attempt === 3) {
+        console.error(`loadConfirmedArtifactUrls: session ${sessionId} unreadable after 3 attempts:`, readError);
+      }
+    }
+  }
+  return [];
+}
+
 async function getDiagnosticErrorMessage(
   error: unknown,
   sessionId: string,
@@ -864,6 +1816,12 @@ async function getDiagnosticErrorMessage(
     const importTotals = typeof turnStartMs === 'number'
       ? collectLeadImportTotals(session?.messages as any, turnStartMs)
       : null;
+    // ENG-1224: read straight off the transcript, same reasoning as importTotals —
+    // the in-loop toolCalls[] ledger (with its result.s3_url) does not survive the
+    // throw, but the persisted tool message does.
+    const artifactUrls = typeof turnStartMs === 'number'
+      ? collectConfirmedArtifactUrls(session?.messages as any, turnStartMs)
+      : [];
     const context: DiagnosisContext = {
       errorType: classifyErrorType(error),
       errorMessage: error instanceof Error ? error.message : String(error),
@@ -899,15 +1857,19 @@ async function getDiagnosticErrorMessage(
       //      Last because both share CORRECTION_MARKER and first-writer wins; a
       //      landed publish is the more expensive thing to have re-run.
       message: message
-        ? reconcileFalseDataWriteFailure(
-            reconcileFalseFailureReport(stripUnfoundedEntityCounts(message, foundedCounts), publishLedger),
-            publishLedger,
+        ? reconcileFalseArtifactFailure(
+            reconcileFalseDataWriteFailure(
+              reconcileFalseFailureReport(stripUnfoundedEntityCounts(message, foundedCounts), publishLedger),
+              publishLedger,
+            ),
+            artifactUrls,
           )
         : null,
       publishLedger,
+      artifactUrls,
     };
   } catch {
-    return { message: null, publishLedger: [] };
+    return { message: null, publishLedger: [], artifactUrls: [] };
   }
 }
 
@@ -1529,11 +2491,23 @@ const WEEKDAY_WORD_TO_INDEX: Record<string, number> = {
   friday: 5, fri: 5,
   saturday: 6, sat: 6,
 };
-// Whole-token weekday matcher — full names or the exact accepted abbreviations,
-// never an arbitrary word that merely starts with those three letters.
-const WEEKDAY_TOKEN = /\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b/gi;
-// A range like "Mon-Fri" / "Monday to Friday" / "Monday through Friday".
-const WEEKDAY_RANGE = /\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b\s*(?:-|–|—|to|through|thru|till|until)\s*\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b/gi;
+// Whole-token weekday matcher — full names (singular OR plural — "publishes on
+// Wednesdays" is the single most natural way an owner phrases a recurring
+// cadence, and a fresh production live-verification for ENG-1276 found the
+// singular-only regex parsed that clause to zero days, silently dropping the
+// cadence and sending the run into the full 20-attempt retry press this ticket
+// exists to prevent) or the exact accepted abbreviations — never an arbitrary
+// word that merely starts with those three letters.
+const WEEKDAY_TOKEN = /\b(sundays?|saturdays?|mondays?|tuesdays?|wednesdays?|thursdays?|fridays?|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b/gi;
+// A range like "Mon-Fri" / "Monday to Friday" / "Mondays through Fridays".
+const WEEKDAY_RANGE = /\b(sundays?|saturdays?|mondays?|tuesdays?|wednesdays?|thursdays?|fridays?|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b\s*(?:-|–|—|to|through|thru|till|until)\s*\b(sundays?|saturdays?|mondays?|tuesdays?|wednesdays?|thursdays?|fridays?|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b/gi;
+// Look up a matched weekday token's index, falling back to stripping a trailing
+// plural "s" when the exact token (e.g. "wednesdays") isn't itself a map key.
+function weekdayIndexFromToken(token: string): number | undefined {
+  const key = token.toLowerCase();
+  if (WEEKDAY_WORD_TO_INDEX[key] !== undefined) return WEEKDAY_WORD_TO_INDEX[key];
+  return key.endsWith('s') ? WEEKDAY_WORD_TO_INDEX[key.slice(0, -1)] : undefined;
+}
 
 // A singleton weekday counts as a cadence day only if what immediately follows it
 // marks it as a LIST ITEM — end of clause, a separator/connective, or a cadence
@@ -1565,8 +2539,8 @@ function weekdaysInFragment(fragment: string): number[] {
   const out: number[] = [];
   const followsHere = (matchEnd: number) => followsAsCadenceDay(fragment.slice(matchEnd));
   for (const m of fragment.matchAll(WEEKDAY_RANGE)) {
-    const a = WEEKDAY_WORD_TO_INDEX[m[1].toLowerCase()];
-    const b = WEEKDAY_WORD_TO_INDEX[m[2].toLowerCase()];
+    const a = weekdayIndexFromToken(m[1]);
+    const b = weekdayIndexFromToken(m[2]);
     if (a === undefined || b === undefined) continue;
     if (!followsHere((m.index ?? 0) + m[0].length)) continue;
     for (let i = a, steps = 0; steps < 7; i = (i + 1) % 7, steps++) {
@@ -1575,7 +2549,7 @@ function weekdaysInFragment(fragment: string): number[] {
     }
   }
   for (const m of fragment.matchAll(WEEKDAY_TOKEN)) {
-    const idx = WEEKDAY_WORD_TO_INDEX[m[1].toLowerCase()];
+    const idx = weekdayIndexFromToken(m[1]);
     if (idx === undefined) continue;
     if (!followsHere((m.index ?? 0) + m[0].length)) continue;
     out.push(idx);
@@ -1672,24 +2646,10 @@ function weekdayInTimeZone(when: Date, timeZone?: string): number {
 // save_*, set_*, …); any such call means the run was not a clean no-op and must
 // not be laundered into a successful skip (Greptile P1, ENG-844).
 //
-// Detection is fail-SAFE: rather than enumerate write verbs (an allowlist that
-// leaks — `email`, `add_*`, `assign_*`, `manage_*`, `freeze_*` all slipped past an
-// earlier verb list), we allowlist READ/CONTEXT tools and treat EVERYTHING ELSE as
-// a side effect. A new or unrecognized tool therefore counts as a write until
-// proven read-only, so no write can be silently concealed.
-// Reads are named verb-FIRST (get_*, read_*, list_*, describe_*, analyze_*), so
-// anchor to the leading token — otherwise a write like `add_leads_to_list` or
-// `create_lead_list` would be mistaken for a read because it merely CONTAINS a read
-// word. Irregular read names that don't lead with a read verb are listed exactly.
-const READ_ONLY_TOOL = /^(?:get|read|list|fetch|search|describe|analy[sz]e|ask|audit|lookup|view|show|load|query|count|retrieve|summari[sz]e|inspect)(?:_|$)/i;
-const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_search']);
-function isReadOnlyToolName(name: string): boolean {
-  return READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name);
-}
-function isWriteToolCall(toolCall: any): boolean {
-  const name = typeof toolCall?.name === 'string' ? toolCall.name : '';
-  return name.length > 0 && !isReadOnlyToolName(name);
-}
+// isReadOnlyToolName/isWriteToolCall live in utils/toolWriteClassification.ts
+// (shared with the ENG-1297 read-only press circuit breaker below, which needs
+// the SAME classifier so a tool can never be read-only for one check and a write
+// for the other).
 
 // Reconstruct the tool calls an abandoned session already made, for an ENG-657
 // resume. A message can carry BOTH the request-only assistant `tool_calls` and the
@@ -1698,21 +2658,96 @@ function isWriteToolCall(toolCall: any): boolean {
 // drop a FAILED abandoned call's error, which the conditional-skip error-veto needs
 // to reject a failed run (Greptile P1, ENG-844). Falls back to the request list
 // only for a message that has no executed ledger. Each returned entry keeps the
-// name and, when the call failed, its error.
-export function reconstructPriorToolCalls(messages: any[]): Array<{ name: string; error?: any }> {
+// name, the call's arguments, and — when the call failed — its error.
+//
+// ENG-1045: the arguments matter as much as the name. The publish-outcome check
+// reads `arguments.action` to recognise that a `twitter_manage_post` /
+// `post_thread` satisfied a mandated `post_on_connected_account`. Dropping the
+// arguments here made that route unreachable on the ENG-657 resume path, so a run
+// that published a thread and was then abandoned came back to the nudge loop —
+// and its pressure to publish a duplicate — all over again.
+function reconstructedToolCallArguments(tc: any): any {
+  // Executed-ledger entries carry parsed `arguments`; a request-list entry carries
+  // `function.arguments` as a JSON string (and the ledger falls back to that raw
+  // string when parsing failed at dispatch time).
+  const raw = tc?.arguments ?? tc?.function?.arguments;
+  if (raw == null) return undefined;
+  if (typeof raw === 'object') return raw;
+  if (typeof raw !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : undefined;
+  } catch {
+    // Unparseable arguments are simply unknown — the entry still counts by name.
+    return undefined;
+  }
+}
+
+// The executed ledger is persisted on the message that CLOSES a turn and it is
+// CUMULATIVE for that whole turn, while each intermediate assistant message keeps
+// its own request-only `tool_calls`. So the per-message preference above is not
+// enough on its own: walking the messages emits every call of the turn TWICE —
+// once from the intermediate message that requested it, once from the closing
+// message's ledger. (Verified on the ENG-1045 session 555bb0a4: 26 real calls,
+// 52 reconstructed entries.) Since these entries seed the required-call COUNTS,
+// the doubling lets one real call satisfy a `minCount: 2` requirement — on a
+// publishing schedule that silently waives a post the owner is paying for.
+//
+// Both sources carry the SAME provider tool-call `id`, so identity is exact.
+// Where an id appears in both, the executed-ledger entry wins for the reason
+// above (only it carries the result/error markers). Entries with no id are never
+// collapsed — an unknown identity is not evidence of sameness.
+//
+// ENG-1045/ENG-947: `result` and `duplicateOf` are carried through too, not just
+// `error`. toolCallSucceeded (which callSatisfiesRequirement's exact-name-match
+// branch now calls for every publish requirement, per ENG-947) also fails a call
+// on `result.success === false` and on `duplicateOf`/`result.deferred` — a
+// preflight rejection commonly comes back this way, with NO top-level `error` at
+// all (see agentModeService's per-tool result extraction, e.g. publish_blog_article).
+// Dropping `result` here made that failure mode invisible on an ENG-657 resume: a
+// publish that failed in the abandoned portion reconstructed as a bare
+// `{name, arguments}` entry, which toolCallSucceeded reads as success — crediting a
+// publish that never happened, the exact false-success ENG-947 exists to prevent.
+export function reconstructPriorToolCalls(messages: any[]): RequiredCallLedgerEntry[] {
   if (!Array.isArray(messages)) return [];
-  return messages.flatMap((m: any) => {
+  const out: RequiredCallLedgerEntry[] = [];
+  const positionById = new Map<string, number>();
+
+  for (const m of messages) {
     const executed = Array.isArray(m?.metadata?.toolCalls) ? m.metadata.toolCalls : [];
     const requested = Array.isArray(m?.tool_calls) ? m.tool_calls : [];
-    const calls = executed.length ? executed : requested;
-    return calls
-      .map((tc: any) => {
-        const name = tc?.function?.name || tc?.name;
-        if (!name) return null;
-        return (tc && typeof tc === 'object' && tc.error != null) ? { name, error: tc.error } : { name };
-      })
-      .filter(Boolean);
-  }) as Array<{ name: string; error?: any }>;
+    const fromExecutedLedger = executed.length > 0;
+    const calls = fromExecutedLedger ? executed : requested;
+
+    for (const tc of calls) {
+      const name = tc?.function?.name || tc?.name;
+      if (!name) continue;
+      const args = reconstructedToolCallArguments(tc);
+      const entry: RequiredCallLedgerEntry = {
+        name,
+        ...(args !== undefined ? { arguments: args } : {}),
+        ...(tc && typeof tc === 'object' && tc.error != null ? { error: tc.error } : {}),
+        ...(tc && typeof tc === 'object' && tc.result !== undefined ? { result: tc.result } : {}),
+        ...(tc && typeof tc === 'object' && tc.duplicateOf != null ? { duplicateOf: tc.duplicateOf } : {}),
+      };
+
+      const id = typeof tc?.id === 'string' && tc.id ? tc.id : '';
+      if (!id) {
+        out.push(entry);
+        continue;
+      }
+      const seenAt = positionById.get(id);
+      if (seenAt === undefined) {
+        positionById.set(id, out.length);
+        out.push(entry);
+      } else if (fromExecutedLedger) {
+        // Same call, now seen with its execution markers — upgrade in place rather
+        // than appending, so the count stays at one and the error is not lost.
+        out[seenAt] = entry;
+      }
+    }
+  }
+  return out;
 }
 
 export function scheduledRunSignalsConditionalSkip(
@@ -1807,10 +2842,115 @@ export function scheduledRunSignalsConditionalSkip(
   // Widening the class is strictly fail-CLOSED — it can only make the veto fire more
   // often, never less — and the real production ledger is unaffected because every
   // count after "0 failed" there is itself a zero ("0 failed / 0 queued").
+  // A NEGATED failure/error mention — "not by failure", "no errors", "without any
+  // failure", "not a single failure", "never any failure" — DENIES a failure
+  // happened; it is not evidence of one. HARD_FAILURE_PATTERNS below matches
+  // these words ANYWHERE in the turn with no negation awareness, so a clean skip
+  // that merely denies a failure ("Posts published: 0 (by design, not by
+  // failure)") tripped the veto exactly like a real failure would (real prod
+  // regression, session 7f95530d, 2026-08-15 — the run made ZERO tool calls and
+  // still hit the 20-attempt nudge cap, ENG-1276 follow-up).
+  //
+  // A tempered greedy token, not a fixed adjacency pattern: the negation cue,
+  // then any run of text that does NOT cross a clause boundary, then the
+  // failure/error word. An earlier version only matched the cue landing
+  // DIRECTLY on the noun (an optional article/"by", nothing else), which caught
+  // "not by failure" but missed equally natural phrasings like "not a SINGLE
+  // failure" or "no REAL error" — the same underlying bug, just a wording the
+  // model hadn't happened to use yet (ENG-1276 follow-up #2).
+  //
+  // The clause-boundary exclusion is what keeps this fail-CLOSED as the span
+  // widens: a negation cue must never reach ACROSS a semicolon/sentence break or
+  // a contrastive conjunction ("but"/"however"/"though"/"yet"/"except") to
+  // neutralize an unrelated, genuine failure on the far side — "not a great day,
+  // BUT the post failed to publish" and "no post today; auth failed" both stop
+  // the match before reaching "failed", so it stays intact and still vetoes.
+  // Matching is also non-overlapping and left-to-right, so once a match
+  // consumes up to its NEAREST failure word, a later, un-negated failure word in
+  // the same sentence (no cue of its own) is untouched — "not a failure of the
+  // schedule, but image generation failed" neutralizes only the first mention.
+  //
+  // Two more guards, found on a fresh adversarial re-audit (ENG-1276 follow-up
+  // #3) of the widening above — NOT a production incident, but a real gap in
+  // the same direction as the one that already broke twice:
+  //   (1) A BARE "no" immediately followed by a comma is grammatically an
+  //       INTERJECTION introducing an independent clause ("the answer is no;
+  //       separately, X happened"), not a negator of whatever follows it.
+  //       Without this, "No, unfortunately, today's run failed for unknown
+  //       reasons." bridged clean across the comma (no "but"/semicolon in the
+  //       way) and wrongly neutralized a genuine, unrelated failure.
+  //       Deliberately scoped to "no" ONLY, not "not"/"never"/"without" — an
+  //       independent review (ENG-1276 follow-up, not a production incident)
+  //       found that those three keep negating ACROSS a comma-set-off
+  //       parenthetical ("Without, admittedly, any failure occurring..." still
+  //       means no failure happened), so excluding the comma there wrongly
+  //       reverted legitimate cases to vetoing.
+  //   (2) The span is capped at 20 characters — every legitimate case here
+  //       needs at most ~9 ("a single ") — as an independent backstop. This
+  //       is a DELIBERATE trade-off, not just a safety margin: the same review
+  //       found the cap also blocks a long parenthetical after "never"/"not"
+  //       ("Never, in this case, did we see a failure" — 28 characters to the
+  //       failure word), which stays un-neutralized (an unusual phrasing still
+  //       causes a retry — safe direction). Widening the cap to accommodate
+  //       that would reopen a MORE realistic and MORE dangerous gap in the
+  //       other direction: "Not entirely sure why the deployment failed
+  //       today" is a genuine failure report (the hedge is about the CAUSE,
+  //       not a denial it happened) that must NOT get silently waived.
+  //
+  // DOUBLE NEGATION (found on the same review, not a production incident):
+  // "It is not true that there was no failure today" re-asserts a real
+  // failure, but a single-pass regex only sees the INNER "no failure" and has
+  // no concept of the OUTER negation flipping it back. Properly PARSING this
+  // would mean tracking negation-of-negation depth — a materially bigger,
+  // riskier change bolted onto an already-layered pattern, for phrasing that
+  // doesn't match any real production transcript behind this function's other
+  // tests (every one is direct: "Sunday. No.", "not by failure"). Instead this
+  // FAILS CLOSED: neutralizeNegatedFailureMentions() below skips any SENTENCE
+  // that itself negates a truth claim ("it is not true that...", "that's
+  // false...") entirely — a failure word inside such a sentence is left
+  // untouched and still vetoes via the normal HARD_FAILURE_PATTERNS check.
+  // Safe because it doesn't need to understand the sentence, only recognize
+  // the shape and decline to be clever about it — the dangerous direction
+  // (silently waiving a real failure) is closed even without real parsing.
+  //
+  // UNCERTAINTY HEDGE (independent CodeRabbit review finding, ENG-1276): "not
+  // sure it failed" / "not certain there was an error" express UNCERTAINTY
+  // about whether a failure happened — fundamentally different from "not by
+  // failure" (a confident DENIAL). Without excluding these, a cadence response
+  // with NO tool calls could get accepted as a clean skip even though the
+  // actual outcome is unresolved — the dangerous direction again. The 20-char
+  // span cap only accidentally blocked the one longer example already covered
+  // ("Not entirely sure why the deployment failed today" — coincidence of word
+  // count, not real understanding), so a shorter phrasing like "not sure it
+  // failed" needed its own explicit guard: reject the cue when immediately
+  // followed by an uncertainty word.
+  const NEGATED_FAILURE_MENTION =
+    /\b(?:no(?!\s*,)|not|never|without)\b(?!\s+(?:sure|certain|confident|convinced|clear)\b)(?:(?!\b(?:but|however|though|yet|except|excluding)\b)[^.;!?\n—–:]){0,20}?\b(?:failed|failures?|errors?|errored)\b/gi;
+  // "not" is REQUIRED before true/the case/accurate/correct — self-caught on a
+  // fresh re-audit before shipping: an earlier version made it optional
+  // ((?:not\s+)?), so a plain, non-negated "it is true that there was no
+  // failure" also matched this meta-negation shape and wrongly suppressed
+  // neutralization for a legitimate, single-negation denial. Over-cautious
+  // (still vetoes when it could safely waive) rather than dangerous, but still
+  // a real behavior change from what the earlier negation audits establish —
+  // "isn't/wasn't" already carry the negation in the contraction, so they get
+  // their own branch with no separate "not" required.
+  const META_NEGATION_OF_TRUTH =
+    /\b(?:is|was)\s+not\s+(?:true|the\s+case|accurate|correct)\s+that\b|\b(?:isn['’]?t|wasn['’]?t)\s+(?:true|the\s+case|accurate|correct)\s+that\b|\b(?:that['’]?s|that\s+is|it['’]?s|it\s+is)\s+false\b|\bfalse\s+that\b/i;
+  function neutralizeNegatedFailureMentions(input: string): string {
+    return input
+      .split(/([.;!?\n]+)/)
+      .map((segment, i) =>
+        i % 2 === 1 || META_NEGATION_OF_TRUTH.test(segment) ? segment : segment.replace(NEGATED_FAILURE_MENTION, ' ')
+      )
+      .join('');
+  }
   const failureScan = expandContractions(
-    text
-      .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
-      .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
+    neutralizeNegatedFailureMentions(
+      text
+        .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
+        .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
+    )
   );
   // (2a) Hard failure evidence vetoes anywhere in the turn.
   if (HARD_FAILURE_PATTERNS.some((re) => re.test(failureScan))) return false;
@@ -1973,13 +3113,34 @@ const AWAITING_CONFIRMATION_PATTERNS: RegExp[] = [
   // "Awaiting/wait for your confirmation/approval/go-ahead/sign-off/response before proceeding"
   /\b(?:await(?:ing)?|wait\s+for)\b[^\n.?!]*\b(?:confirmation|approval|sign-?off|go-?ahead|your\s+(?:go|response|reply|input|approval))\b/i,
   // "confirm to proceed" / "confirm before I continue/generate/build/send/deliver"
-  // (an explicit confirm-gate ahead of the deliverable action, not just "proceed")
-  /\bconfirm\b[^\n.?!]*\b(?:to|before)\b[^\n.?!]*\b(?:proceed|continu|generat|build|start|begin|send|creat|draft|deliver|run\b)/i,
+  // (an explicit confirm-gate ahead of the deliverable action, not just "proceed").
+  // ENG-1256: each bridge is bounded to a handful of WORDS, not an unbounded
+  // run of any character. Excluding only the em dash (an earlier version of
+  // this pattern) fixed the exact live repro string but not the underlying
+  // flaw: "confirm ... before ... <action>" bridging across an ENTIRELY
+  // separate clause is just as wrong when that clause is introduced by a
+  // comma ("... before merge, since #2414 creates ...") or any other
+  // separator — the dash was never the real signal, clause distance was. A
+  // genuine confirm-gate ("confirm before I proceed", "confirm to continue
+  // and I'll generate...") always has its gate verb within a couple of
+  // words; bounding the gap keeps those matching while rejecting a
+  // recommendation that merely mentions "confirm" and a verb from that list
+  // several clauses apart.
+  /\bconfirm\b\s+(?:[^\s.?!\n]+\s+){0,6}\b(?:to|before)\b\s+(?:[^\s.?!\n]+\s+){0,4}\b(?:proceed|continu|generat|build|start|begin|send|creat|draft|deliver|run\b)/i,
   // Numbered/lettered option prompt: "Reply 1 (…) or 2 (…)", "reply with option 2".
   // Opus emitted this exact form ("Reply 1 … or 2 …") instead of "Reply go" (ENG-369).
   /\breply\s+(?:with\s+)?(?:option\s+)?["'“]?\d\b/i,
-  // "please confirm one of these / the following / which option / your choice below"
-  /\bconfirm\b[^\n.?!]*\b(?:one of|which\b|the following|your\s+(?:choice|preference|selection)|these\b|option\b)/i,
+  // "please confirm one of these / the following / your choice below"
+  /\bconfirm\b[^\n.?!—–]*\b(?:one of|the following|your\s+(?:choice|preference|selection)|these\b|option\b)/i,
+  // "confirm which (option/approach) ... you'd like" — split out from the
+  // pattern above and scoped to require "you" in the same clause. ENG-1256:
+  // a bare "confirm ... which" (no "you" anchor) matched a finished report's
+  // "...confirm which of the two pixels the ads are actually configured
+  // against" (live repro) — a third party fact-check, not a question to the
+  // user. Requiring "you" distinguishes an actual human-directed choice
+  // ("confirm which of these you'd like") from prose that merely uses
+  // "which" to refer to something else entirely.
+  /\bconfirm\b[^\n.?!—–]*\bwhich\b[^\n.?!—–]*\byou\b/i,
   // "get/need/require/request your confirmation", "awaiting your confirmation"
   /\b(?:get|need|needs|require[sd]?|request(?:ing)?|await(?:ing)?)\s+(?:your\s+)?confirmation\b/i,
   // "need you to confirm/decide/choose/pick/select …" (asks the human to make the call)
@@ -2027,9 +3188,58 @@ function stripMarkdownEmphasis(content: string): string {
   return content.replace(/[*_`~]+/g, '').replace(/[^\S\n]+/g, ' ');
 }
 
+// ENG-1256: the system prompt (agentModeSystemPrompt.ts) MANDATES that every
+// single message — finished or not — end with "👉 Next Step: [1 recommended
+// action]". That line is a recommendation the model is addressing to whoever
+// acts on it next (often a THIRD PARTY, e.g. "Ask Harsha to confirm…", "Have
+// someone verify…"), not a question the model is asking the user to unblock
+// itself. Its wording is otherwise unconstrained prose, so it can innocently
+// contain words like "confirm" or "approval" and trip a keyword-shaped pattern
+// meant to catch the model halting for a reply (live repro: "confirm which of
+// the two pixels…" matched the "confirm one of/which/these/option" pattern).
+// A genuine mid-run halt asks its actual question in the message BODY, before
+// this trailer (see the ENG-480 scope-clarification tests), so excluding the
+// trailer from detection does not blind it to a real confirmation request.
+//
+// The mandated trailer is required to be the FINAL line of every message, but
+// live transcripts don't reliably preserve a literal newline before it (see
+// the ENG-1256 repro strings below), so this can't anchor on "^|\n". Instead
+// the trailing `(?:(?!👉?\s*next\s*steps?\s*:)[\s\S])*$` clause forbids the
+// matched suffix from containing another "next step(s):" occurrence, which
+// forces the regex engine to land on the LAST occurrence in the string (a
+// standard "match the final instance" technique for a non-global pattern).
+// Without it, a message that quotes/echoes an earlier "👉 Next Step:" line
+// before its real halt question would match at that EARLIER occurrence and
+// strip everything from there to end-of-string — silently deleting the
+// genuine halt question that follows it. The /u flag makes `👉?` optional as
+// a whole code point (👉 is a surrogate pair); without /u, only the trailing
+// low-surrogate code unit is optional and the high surrogate is a mandatory
+// literal, so a trailer without the emoji would fail to strip at all.
+// `steps?` tolerates plural drift ("👉 Next Steps:") — the mandated wording is
+// singular, but a model that pluralizes it would otherwise skip this pattern
+// entirely (verified live: bypasses stripping, so the trailer's prose reaches
+// the confirmation detector completely unstripped).
+//
+// ENG-1256: the label separator accepts a colon OR a dash (em/en/hyphen), not
+// just the mandated literal ":". "👉 Next Step — Ask Harsha to confirm..." is
+// at least as idiomatic an LLM label style as the colon the system prompt
+// specifies, and a colon-only regex left it completely unstripped (proven via
+// the same extracted-regex harness used for the dash/plural gaps above: a
+// short-bridge "confirm ... before ... continu[es]" recommendation inside a
+// "👉 Next Step — ..." trailer matched the confirmation-halt patterns exactly
+// like the colon case is designed NOT to). A bare period or no punctuation at
+// all is deliberately NOT included — those are far weaker signals that a line
+// is the boilerplate label rather than "next step" used as an ordinary noun
+// phrase in prose, and would risk stripping real message content.
+const NEXT_STEP_TRAILER = /👉?\s*next\s*steps?\s*[:\-–—]\s*(?:(?!👉?\s*next\s*steps?\s*[:\-–—])[\s\S])*$/iu;
+
+function stripNextStepTrailer(content: string): string {
+  return content.replace(NEXT_STEP_TRAILER, '');
+}
+
 export function scheduledRunAwaitsConfirmation(content: string): boolean {
   if (!content || typeof content !== 'string') return false;
-  const normalized = stripMarkdownEmphasis(content);
+  const normalized = stripMarkdownEmphasis(stripNextStepTrailer(content));
   return AWAITING_CONFIRMATION_PATTERNS.some((re) => re.test(normalized));
 }
 
@@ -2070,7 +3280,18 @@ export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmat
 // asked it NOT to publish, which is the ~21-turn nudge loop this whole area exists to
 // avoid. The marker is emitted only on the withheld branch, so it distinguishes a
 // deliberate, complete withhold from a genuine mid-run halt.
-const PUBLISH_WITHHELD_MARKER = /PUBLISH WITHHELD:\s*this schedule requires approval before publishing/i;
+//
+// ENG-1245: three variants, not one. getScheduledSessionOverride's withheld branch
+// used to always end on the same sentence regardless of WHY the run is withheld —
+// which meant a schedule that was simply never granted standing publish
+// authorization (or had a prior grant revoked) still had its own terminal marker
+// assert "requires approval before publishing", even though that specific owner
+// setting is off and uninvolved. The marker's JOB (end the run, suppress the
+// confirmation-halt classifier) doesn't depend on which is true, so all three
+// variants get the same infra treatment — only their wording differs, matching
+// whichever explanation the model actually gave immediately above it.
+const PUBLISH_WITHHELD_MARKER =
+  /PUBLISH WITHHELD:\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))/i;
 
 // NOTE: this matches MODEL-AUTHORED text, so on its own it proves nothing. Callers
 // must confirm the run was actually withheld before honouring it — see the
@@ -2159,15 +3380,25 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
   if (!content || typeof content !== 'string') return false;
   // Fast path: the regex catches the common forms with zero LLM cost/latency.
   if (scheduledRunAwaitsConfirmation(content)) return true;
+  // ENG-1256: same exclusion as the regex path — the mandated "👉 Next Step:"
+  // trailer is USUALLY a recommendation, not a question to the user. But the
+  // system prompt's own scheduling-suggestion example (agentModeSystemPrompt.ts
+  // ~183-184) shows a genuine user-directed question CAN live entirely inside
+  // that line ("👉 Next Step: Want this to run automatically every week?...").
+  // So when stripping the trailer leaves nothing, any halt in this message can
+  // only be inside the trailer itself — judge the ORIGINAL unstripped content
+  // instead of short-circuiting to "no halt", or that whole class of halt goes
+  // permanently undetected by both the regex and this judge fallback.
+  const judgeableContent = stripNextStepTrailer(content).trim() || content;
   try {
     const llmPromise = agentModeService.callLLM(
       CONFIRMATION_JUDGE_MODEL,
       [
         { role: 'system', content: CONFIRMATION_JUDGE_SYSTEM },
         // The closing of the message is where a halt lives; cap input for cost.
-        { role: 'user', content: content.slice(-2500) },
+        { role: 'user', content: judgeableContent.slice(-2500) },
       ],
-      { temperature: 0, max_completion_tokens: 3 }
+      { temperature: 0, max_completion_tokens: 3, taskClass: 'scheduled_background' }
     );
     const timeoutPromise = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error('confirmation judge timed out')), CONFIRMATION_JUDGE_TIMEOUT_MS)
@@ -2287,11 +3518,17 @@ type RunVerifiedChatResult = {
   publishHeldForApproval?: boolean;
   publishRequirementMismatch?: boolean;
   publishToolFailing?: boolean;
+  // ENG-1297: set when the run spent its read-only-press budget with only a
+  // read-only requirement (e.g. you_search_web) still unmet, and stopped instead
+  // of re-pressing to maxAttempts. Unlike the publish case, the run SUCCEEDED —
+  // a read-only tool carries no external write, so a schedule's own deliverable
+  // can be complete and correct even though this one minimum stayed unmet.
+  readOnlyRequirementWaived?: boolean;
 };
 
 // Common function to run verified chat with work plan, keywords, and function call verification
 // Used by both scheduled chat and verified-generate
-export async function runVerifiedChat(
+async function runVerifiedChatInner(
   params: {
     sessionId: string;
     userId: string;
@@ -2337,8 +3574,11 @@ export async function runVerifiedChat(
     // retry loop could re-prompt the model into re-running a completed side-effect.
     // `error` is preserved (ENG-844) so the conditional-skip error-veto can reject a
     // resumed run whose ABANDONED portion had a failed tool call — reconstructing only
-    // names would hide that failure and let it be recorded as a clean skip.
-    priorToolCalls?: Array<{ name: string; error?: any }>;
+    // names would hide that failure and let it be recorded as a clean skip. `result`
+    // is preserved (ENG-947/ENG-1045) so toolCallSucceeded can also catch a publish
+    // that failed WITHOUT a top-level error (a `result.success: false` preflight
+    // rejection) — otherwise a resumed failed publish reads as a bare success.
+    priorToolCalls?: RequiredCallLedgerEntry[];
     // Injectable clock for the conditional-skip run-date cross-check (ENG-844).
     // Production leaves it undefined (the detector uses `new Date()`); tests pin it
     // so the cadence-vs-today check is deterministic regardless of the day CI runs.
@@ -2366,9 +3606,26 @@ export async function runVerifiedChat(
      * required-function list together, so they still cannot disagree.
      */
     refreshPublishAuthorization?: () => Promise<SchedulePublishAuthorization | null>;
-    // Already resolved by the cost policy. Optimized scheduled runs pass string|null
-    // so a transient retry remains inside the approved optimized catalog.
-    transientFallbackModel?: string | null;
+    // ENG-930: the schedule's OWN requiredFunctionCalls, publish-capable names
+    // only (via getRequiredPublishTools) — i.e. BEFORE
+    // `filterRequiredFunctionsToAuthorizedScope` (ENG-827) may have removed one
+    // from `requiredFunctions` because this run is not authorized to publish.
+    // Once excluded, the tool can never again appear in `functionCallMisses`,
+    // so the publish-press breaker's normal `hasUnmetPublishRequirement` check
+    // — which only looks at what's currently unmet — can never see it either.
+    // A co-required non-publish prep call for that same excluded publish (e.g.
+    // generate_image) would otherwise press to the full `maxAttempts` budget
+    // on its own, reproducing this ticket's loop through a second door. See
+    // publishPressCircuitBreaker's `publishExcludedFromScope` doc comment.
+    //
+    // CodeRabbit review: this MUST be recomputed against the CURRENT
+    // `requiredFunctions` inside the loop, not resolved once into a boolean
+    // by the caller — `requiredFunctions` narrows again mid-run if the owner
+    // revokes consent (see the `refreshPublishAuthorization` handling above),
+    // and a run that started authorized then got revoked needs the exclusion
+    // to become true THAT turn, not stay stuck at a stale `false` from
+    // admission time.
+    originalPublishTools?: string[];
     // ENG-936: approval-bound source URLs for `generate_image` revisions in
     // this run. Passed through to the tool dispatcher so confirm=true edits of
     // the wrong source are rejected before execution.
@@ -2393,6 +3650,7 @@ export async function runVerifiedChat(
     publishAuthorization,
     refreshPublishAuthorization,
     publishAuthorized,
+    originalPublishTools = [],
     approvedRevisionImageSources,
   } = params;
 
@@ -2447,6 +3705,11 @@ export async function runVerifiedChat(
   // auto-take continuations also consume: counting those would trip the breaker
   // on a run that was never actually asked to publish.
   let publishPressAttempts = 0;
+  // ENG-1297: sibling counter for the read-only press circuit breaker — same
+  // reasoning as publishPressAttempts above, counted separately per requirement
+  // TYPE because a run can pass through the publish-only-unmet state and the
+  // read-only-only-unmet state at different points as requirements clear.
+  let readOnlyPressAttempts = 0;
   let allContent = '';
   const allToolCalls: any[] = [];
   const sessionForModel = await chatbotDb.getChatSession(sessionId);
@@ -2531,10 +3794,35 @@ export async function runVerifiedChat(
     }
   }
 
-  // Count how many times a required function was called.
-  const countCallsForRequirement = (functionName: string, calls: string[]): number => {
-    return calls.filter(c => c === functionName).length;
-  };
+  // Count how many times a required function's OUTCOME was achieved.
+  //
+  // ENG-1045: this used to compare tool NAMES only, which made the requirement
+  // unsatisfiable for any schedule whose mandated publish had to route through a
+  // different tool. A 2+ tweet thread can only go out via twitter_manage_post
+  // (post_on_connected_account is single-tweet; the backend rejects a 1-item
+  // thread), so after a successful thread the count stayed at 0 and the loop
+  // re-sent "Make sure to post_on_connected_account (1 more time needed)" on every
+  // remaining attempt — with a SECOND, irreversible post to a live timeline as the
+  // only way to clear it. countCallsSatisfyingRequirement keeps exact-name matching
+  // and additionally credits a SUCCESSFUL equivalent publish route.
+  //
+  // ENG-1276 (CodeRabbit): a schedule that requires BOTH names of an equivalence
+  // pair (e.g. post_on_connected_account AND twitter_manage_post, or email AND
+  // send_email_from_sender) as separate line items wants two distinct actions, not
+  // one call silently satisfying both — requiredFunctionNames lets
+  // countCallsSatisfyingRequirement suppress the equivalence credit in exactly that
+  // case; the exact-name match still credits the call toward its own requirement.
+  // Captured ONCE here and does not shrink if consent narrows mid-run — investigated
+  // and left as-is (ENG-1276): the FINAL persisted record re-derives its own held-to
+  // list fresh from `effectivePublishAuthorization` (see `heldToFunctionNames` in
+  // runScheduledChat), so THAT value — the one the owner actually sees — is never
+  // stale. This list only feeds the double-credit suppression, and a stale (wider)
+  // list there can only make suppression MORE conservative, never double-credit.
+  const requiredFunctionNames = new Set(requiredFunctions.map((reqFunc) => reqFunc.functionName));
+  const countCallsForRequirement = (
+    functionName: string,
+    calls: RequiredCallLedgerEntry[]
+  ): number => countCallsSatisfyingRequirement(functionName, calls, requiredFunctionNames);
 
   // Track remaining keywords and function calls
   let remainingKeywords = [...keywords];
@@ -2543,11 +3831,20 @@ export async function runVerifiedChat(
     remainingFunctionCallCounts[reqFunc.functionName] = reqFunc.minCount;
   });
 
-  // Track all function calls across attempts. ENG-657: on a resume, seed with the
+  // Track all tool calls across attempts. ENG-657: on a resume, seed with the
   // tool calls the abandoned portion already made so requiredFunctionCalls counts
   // the whole task — otherwise a resumed run is falsely marked incomplete and the
   // verify loop could re-prompt the model into re-running a completed side effect.
-  const allActualFunctionCallsForReporting: string[] = requirementEvidenceNames(params.priorToolCalls ?? []);
+  // ENG-1045: kept as ENTRIES rather than bare names — the outcome check needs each
+  // call's action argument and its success/error marker, which a name list discards.
+  // Resumed entries carry name/arguments/error (see reconstructPriorToolCalls), so a
+  // thread published before the abandonment credits the mandated publish on resume
+  // instead of restarting the nudge loop. callSatisfiesRequirement (ENG-947) applies
+  // the same success gate to these entries that requirementEvidenceNames used to
+  // apply here, so a failed resumed publish still isn't credited.
+  const allActualFunctionCallsForReporting: RequiredCallLedgerEntry[] = Array.isArray(params.priorToolCalls)
+    ? params.priorToolCalls.filter((c) => c && c.name)
+    : [];
 
   // Set when the completion gate asks for one more continuation turn; the next
   // iteration uses a "finish the unfinished entities" continuation message.
@@ -2756,9 +4053,12 @@ export async function runVerifiedChat(
               'drafts) and produce the final report.'
           : completionGateReason === 'budget'
             ? 'The previous run was cut short because it exhausted its processing-step ' +
-              'budget before it could produce the final deliverable. Using the data ' +
-              'already gathered, produce the final consolidated report now. Surface any ' +
-              'entities you could not fully research as actionable next steps.'
+              'budget before it could produce the final deliverable. Resume the requested ' +
+              'workflow from its first unfinished step and complete all unfinished steps ' +
+              'and entities, using tools as needed. Use the data already gathered, but do ' +
+              'not repeat completed writes or actions. Only after the remaining work is ' +
+              'complete, produce the final consolidated report. Surface any genuinely ' +
+              'blocked entities as actionable next steps.'
           : completionGateReason === 'confirmation'
             ? 'Your previous response paused to ask for confirmation or approval before ' +
               'proceeding, but this is an automated run with no human present to reply. ' +
@@ -2782,8 +4082,6 @@ export async function runVerifiedChat(
           undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
           livePublishAuthorization,
-          params.transientFallbackModel,
-          params.modelPolicyDecisionForAudit,
           approvedRevisionImageSources
         );
         if (continuationResponse.content) {
@@ -2792,7 +4090,7 @@ export async function runVerifiedChat(
         const continuationToolCalls = continuationResponse.toolCalls || [];
         allToolCalls.push(...continuationToolCalls);
         allActualFunctionCallsForReporting.push(
-          ...requirementEvidenceNames(continuationToolCalls)
+          ...continuationToolCalls.filter((call: any) => call?.name)
         );
         // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
         // AskUserQuestion. Route it through the same park/auto-take handler as the
@@ -2915,8 +4213,6 @@ export async function runVerifiedChat(
         undefined, undefined, undefined, undefined, undefined, undefined,
         undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
         livePublishAuthorization,
-        params.transientFallbackModel,
-        params.modelPolicyDecisionForAudit,
         approvedRevisionImageSources
       );
 
@@ -2934,7 +4230,8 @@ export async function runVerifiedChat(
       // Extract function calls from the response
       const toolCalls = response.toolCalls || [];
       allToolCalls.push(...toolCalls);
-      allActualFunctionCallsForReporting.push(...requirementEvidenceNames(toolCalls));
+
+      allActualFunctionCallsForReporting.push(...toolCalls.filter((call: any) => call?.name));
 
       // ENG-396: this MAIN turn may have left an unanswered blocking
       // AskUserQuestion — auto-take (full autonomy) or park before doing anything
@@ -3080,14 +4377,61 @@ export async function runVerifiedChat(
       // having never been asked to publish once. So increment only on the attempts
       // that actually reached the publish-only-unmet state, which is exactly the
       // state whose next retry message carries the publish ask.
+      //
+      // ENG-930: `isPublishOnlyUnmet` alone never fires for a schedule whose
+      // requiredFunctionCalls pair a publish tool with a non-publish PREP call for
+      // it (e.g. ['post_on_connected_account', 'generate_image']) — a run that
+      // holds the publish has no reason to spend a generation call on an image for
+      // content that will never post, so that prep call stays unmet forever and the
+      // set is never PURELY publish-shaped. Confirmed live: a production schedule
+      // pressed 19 identical times (68 messages, $8.07), three days after ENG-947
+      // shipped, because of exactly this. `withholdIsGenuine` is the
+      // SAME verified (not just model-claimed) signal ENG-803's completion gate
+      // already trusts below (classifyScheduledContinuationAsync) — reused here so
+      // a schedule that pairs a publish call with a prep call gets the identical
+      // one-and-done treatment as a pure publish-only schedule, instead of pressing
+      // to the full 20-attempt cap on the one detail ENG-947 didn't cover.
+      //
+      // Resolved LAZILY, same as classifyScheduledContinuationAsync below: `publishAuthorized`
+      // here is the RESOLVER (`() => Promise<boolean | undefined>`), not a boolean —
+      // only await it when the content actually looks like it carries the marker, so
+      // a turn without one never pays for a schedule read.
+      const responseContentForWithhold = response?.content || '';
+      const genuinelyWithheldPublish = scheduledRunWithheldPublish(responseContentForWithhold)
+        ? withholdIsGenuine(responseContentForWithhold, await publishAuthorized?.())
+        : false;
+      // Recomputed EVERY attempt against the CURRENT `requiredFunctions`, not
+      // resolved once by the caller — `requiredFunctions` narrows again above
+      // (ENG-827) if the owner revokes consent mid-run, so a run that started
+      // authorized and lost it partway through must see the exclusion become
+      // true THAT turn (CodeRabbit review).
+      const requiredFunctionNamesInScope = new Set(requiredFunctions.map((reqFunc) => reqFunc.functionName));
+      const publishRequirementExcludedFromScope = originalPublishTools.some(
+        (name) => !requiredFunctionNamesInScope.has(name)
+      );
       const publishIsTheOnlyThingLeft =
         completionGate &&
         !allFunctionCallsMet &&
         allKeywordsMet &&
         (!workPlan || workPlanCompleted) &&
-        isPublishOnlyUnmet(functionCallMisses);
+        (isPublishOnlyUnmet(functionCallMisses) ||
+          (genuinelyWithheldPublish &&
+            (hasUnmetPublishRequirement(functionCallMisses) || publishRequirementExcludedFromScope)));
       if (publishIsTheOnlyThingLeft) {
         publishPressAttempts++;
+      }
+      // ENG-1297: sibling gate for a stalled READ-ONLY requirement (e.g.
+      // you_search_web) — same shape as publishIsTheOnlyThingLeft, mutually
+      // exclusive with it (a name is never both publish and read-only), so at
+      // most one of the two press counters increments per attempt.
+      const readOnlyIsTheOnlyThingLeft =
+        completionGate &&
+        !allFunctionCallsMet &&
+        allKeywordsMet &&
+        (!workPlan || workPlanCompleted) &&
+        isReadOnlyOnlyUnmet(functionCallMisses);
+      if (readOnlyIsTheOnlyThingLeft) {
+        readOnlyPressAttempts++;
       }
       // A stalled publish requirement has three causes and they need different
       // things from the owner, so the marker must not conflate them. Only
@@ -3095,13 +4439,27 @@ export async function runVerifiedChat(
       // publish wrote nothing. But a failed publish is not silence either: it
       // means the model DID reach for the tool and the integration is broken, so
       // the attempted-but-unsuccessful names are reported separately.
+      //
+      // ENG-1599 review: kept as full ledger entries (name + arguments), not
+      // bare names — classifyPublishStall's route match needs each call's
+      // action/platform, not just its tool name, or an unrelated call (a
+      // twitter_manage_post REPLY, a post_on_connected_account to a different
+      // platform) could be mistaken for the specific outcome a route documents.
+      //
+      // ENG-1599 review: includes params.priorToolCalls, same as
+      // allActualFunctionCallsForReporting and skipLedgerToolCalls above — a
+      // resumed run's earlier segment can already have made the qualifying
+      // write (e.g. the consentOnly post_on_connected_account call this ticket
+      // is about), and allToolCalls alone only holds calls made AFTER the
+      // resume. Missing that write here would press the resumed segment to
+      // publish again, which is exactly the duplicate this breaker exists to
+      // prevent.
+      const ledgerCallsForThisTurn = [...(params.priorToolCalls ?? []), ...allToolCalls];
       const externalWritesSucceeded = publishIsTheOnlyThingLeft
-        ? allToolCalls
-            .filter((tc: any) => tc && typeof tc.name === 'string' && toolCallSucceeded(tc))
-            .map((tc: any) => tc.name as string)
+        ? ledgerCallsForThisTurn.filter((tc: any) => tc && typeof tc.name === 'string' && toolCallSucceeded(tc))
         : [];
       const publishToolsAttempted = publishIsTheOnlyThingLeft
-        ? allToolCalls
+        ? ledgerCallsForThisTurn
             .filter((tc: any) => tc && typeof tc.name === 'string' && !toolCallSucceeded(tc))
             .map((tc: any) => tc.name as string)
         : [];
@@ -3111,13 +4469,42 @@ export async function runVerifiedChat(
             unmetRequiredFunctions: functionCallMisses,
             externalWritesSucceeded,
             publishToolsAttempted,
+            // ENG-1599 review: the FULL held-to requirement set, not just the
+            // still-unmet subset — a schedule that requires BOTH names of an
+            // equivalence pair separately (e.g. post_on_connected_account AND
+            // twitter_manage_post) wants two distinct actions. Without this, a
+            // succeeded post_on_connected_account call (which already satisfies
+            // ITS OWN requirement, so it drops out of functionCallMisses) would
+            // be misread as "wrote something else" for the still-unmet
+            // twitter_manage_post requirement via the same reverse route, and
+            // stop the run before twitter_manage_post was ever attempted.
+            //
+            // Built fresh from the CURRENT requiredFunctions here, deliberately
+            // NOT the stale requiredFunctionNames const captured before the
+            // retry loop (narrowed by authorization revocation via the
+            // reassignments above) — unlike that const's own use in
+            // countCallsForRequirement, staleness is UNSAFE in this direction.
+            // There, a stale/wider set only ever WITHHOLDS completion credit
+            // more conservatively. Here, suppression means "keep pressing", so
+            // a stale/wider set would suppress a genuine mismatch and press a
+            // requirement whose sibling was since narrowed OUT — risking a
+            // second live publish through the tool that's still required.
+            heldToFunctionNames: new Set(requiredFunctions.map((reqFunc) => reqFunc.functionName)),
+            explicitlyWithheld: genuinelyWithheldPublish,
+            publishExcludedFromScope: publishRequirementExcludedFromScope,
           })
         : null;
       if (publishStall) {
         const heldForApproval = publishStall === 'held-for-approval';
         const toolFailing = publishStall === 'publish-tool-failing';
+        const mismatch = publishStall === 'requirement-names-unused-publish-tool';
         console.warn(
-          `AgentMode runVerifiedChat: session ${sessionId} spent its publish-press budget ` +
+          `AgentMode runVerifiedChat: session ${sessionId} ` +
+          (mismatch
+            // ENG-1599: this cause fires as soon as it is detected, not once the
+            // press budget is spent — see classifyPublishStall.
+            ? `already published via a tool its requiredFunctionCalls does not name `
+            : `spent its publish-press budget `) +
           `(${publishPressAttempts}/${MAX_PUBLISH_PRESS_ATTEMPTS} press attempts, ${attempt} attempts overall) ` +
           `with [${functionCallMisses.join(', ')}] still unmet. ` +
           `Ending the run instead of re-pressing to ${maxAttempts} attempts — ` +
@@ -3127,7 +4514,7 @@ export async function runVerifiedChat(
             : toolFailing
             ? `the run DID call [${functionCallMisses.join(', ')}] and every call failed, so the ` +
               `integration is broken and pressing an erroring tool again cannot succeed`
-            : `the run already wrote externally via [${externalWritesSucceeded.join(', ')}], so the ` +
+            : `the run already wrote externally via [${externalWritesSucceeded.map((tc: any) => tc.name).join(', ')}], so the ` +
               `schedule's requiredFunctionCalls names a tool this run does not use and pressing cannot ` +
               `succeed`) +
           ` (ENG-947).`
@@ -3139,6 +4526,45 @@ export async function runVerifiedChat(
             : toolFailing
             ? { publishToolFailing: true }
             : { publishRequirementMismatch: true }),
+          content: allContent,
+          toolCalls: allToolCalls,
+          keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+          keywordMisses: remainingKeywords,
+          functionCallMatches,
+          functionCallMisses,
+          functionStatus: requiredFunctions.map((reqFunc) => {
+            const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
+            return {
+              functionName: reqFunc.functionName,
+              requiredCount: reqFunc.minCount,
+              actualCount,
+              met: actualCount >= reqFunc.minCount,
+            };
+          }),
+          attempts: attempt,
+          workPlanCompleted: workPlanCompleted || !workPlan,
+        };
+      }
+
+      // ENG-1297: the read-only press circuit breaker. Unlike a stalled publish,
+      // there is no "why" to classify here — the tool has no external write to
+      // reason about, so a read-only-only-unmet stall has exactly one outcome
+      // (stop) once the (much smaller) press budget is spent.
+      if (
+        readOnlyIsTheOnlyThingLeft &&
+        shouldStopPressingForReadOnly({ pressAttempt: readOnlyPressAttempts, unmetRequiredFunctions: functionCallMisses })
+      ) {
+        console.warn(
+          `AgentMode runVerifiedChat: session ${sessionId} spent its read-only-press budget ` +
+          `(${readOnlyPressAttempts}/${MAX_READ_ONLY_PRESS_ATTEMPTS} press attempts, ${attempt} attempts overall) ` +
+          `with [${functionCallMisses.join(', ')}] still unmet. Ending the run instead of re-pressing to ` +
+          `${maxAttempts} attempts — a read-only tool the model has already declined to call has no ` +
+          `approval queue or flaky integration a further press could unstick, so repeating an identical ` +
+          `press only burns prompt-cache writes (ENG-1297).`
+        );
+        return {
+          success: true,
+          readOnlyRequirementWaived: true,
           content: allContent,
           toolCalls: allToolCalls,
           keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
@@ -3272,6 +4698,77 @@ export async function runVerifiedChat(
   };
 }
 
+/**
+ * ENG-1696: public entry point. Wraps runVerifiedChatInner with the same
+ * per-session generation lock /generate uses (activeSessionGenerations), so a
+ * live chat turn and a verified-generate run (interactive or scheduled) on the
+ * SAME PROCESS can't write `session.workPlan` concurrently — chatbotService.
+ * updateSessionWorkPlan is a plain unconditional overwrite with no version/
+ * condition check, so an unguarded race silently discards whichever side wrote
+ * second. One claim per invocation, held for the whole multi-attempt run
+ * (mirroring how /generate holds its own claim across generateSessionResponse's
+ * internal continuation rounds) — not one claim per attempt, since this is one
+ * logical unit of work.
+ *
+ * Scope, precisely: activeSessionGenerations is an in-memory Set, per-process,
+ * with no cross-instance mutual exclusion — a pre-existing limitation of this
+ * lock, not something this fix changes. In the deployed multi-instance EB
+ * topology (no ALB session stickiness configured), the SAME race this fix
+ * closes within one process can still occur if the two colliding calls land on
+ * different instances. This fix eliminates the common single-process case; it
+ * does not make the race structurally impossible.
+ *
+ * ENG-1719: unlike /generate, runVerifiedChatInner's own attempt loop has no
+ * whole-turn deadline on its generateSessionResponse calls (ENG-907 deliberately
+ * exempted this path — deep-research attempts legitimately run long). Without an
+ * outer bound, a single hung attempt would hold this lock indefinitely: nothing
+ * releases it short of a process restart, and every other /generate or
+ * verified-generate call on that session 409s the whole time. Race the ENTIRE
+ * run through withGenerationTimeout at a separate, more generous ceiling than a
+ * single turn's budget, so the lock is guaranteed to release even if the run
+ * itself hangs.
+ *
+ * `options.lockTimeoutMs` lets a caller opt into a longer ceiling than the
+ * RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS default (see that constant's comment for the
+ * production-data-backed reasoning). Only runScheduledChat and
+ * resultEndpointController — the two headless, maxAttempts:20 callers with no
+ * human waiting — pass RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS explicitly. Every
+ * other caller has a human or Slack reviewer actively waiting, so it keeps the
+ * short default.
+ *
+ * On failure to claim within the retry window, throws SessionBusyError. This is
+ * caller-facing, not just for the interactive endpoint: EVERY caller of this
+ * function (interactive /verified-generate, scheduled runs, Slack revisions,
+ * human-eval actions, image reports, result endpoints) can receive it on
+ * ordinary, expected lock contention and must treat it as retryable/benign —
+ * NOT as a generic failure. An earlier version of this fix only handled it at
+ * the interactive endpoint, and this exact claim about the scheduled-run path
+ * was false — verified by grepping runScheduledChat's actual catch block,
+ * which paged on-call and auto-filed a Linear ticket for what is expected
+ * contention. All five call sites (runScheduledChat, both routes/slack.ts
+ * sites, revisionService, humanEvalActionService, resultEndpointController)
+ * now check isSessionBusyError explicitly before their generic error handling.
+ */
+export async function runVerifiedChat(
+  params: Parameters<typeof runVerifiedChatInner>[0],
+  options?: { lockTimeoutMs?: number },
+): Promise<RunVerifiedChatResult> {
+  const { sessionId } = params;
+  const claimed = await claimSessionGenerationWithRetry(sessionId);
+  if (!claimed) {
+    throw new SessionBusyError(sessionId);
+  }
+  try {
+    return await withGenerationTimeout(
+      runVerifiedChatInner(params),
+      sessionId,
+      options?.lockTimeoutMs ?? RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS,
+    );
+  } finally {
+    releaseSessionGeneration(sessionId);
+  }
+}
+
 class ZeroAssistantOutputError extends Error {
   code = 'ZERO_ASSISTANT_OUTPUT';
 
@@ -3364,6 +4861,168 @@ async function notifyScheduleOwnerOfFailure(
   }
 }
 
+/**
+ * Wiring only — the decision lives in `scheduledRunAccountGate.evaluateAccountGate`
+ * so it can be tested without standing up a scheduled run (ENG-1197). Same split as
+ * the ENG-1259 pre-check gate.
+ */
+async function evaluateLinkedInAccountGate(
+  schedule: any,
+  userId: string,
+): Promise<AccountGateResult> {
+  return evaluateAccountGate(schedule?.startingMessage, userId, {
+    listUnipileAccounts: async (uid) => {
+      const { getAccountsByUserId } = await import('../services/connectedAccountsDb');
+      return (await getAccountsByUserId(uid)).filter((acc: any) => acc.platform === 'unipile') as any;
+    },
+    probeSession: async (accountId) => {
+      const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+      return linkedInOutreachService.probeAccountSession(accountId);
+    },
+  });
+}
+
+/**
+ * Stop a schedule that has now been skipped for a disconnected account this many
+ * times in a row. Best-effort and loudly logged: failing to pause leaves the
+ * schedule skipping cheaply, which is a tolerable end state, so this must never
+ * break the run path.
+ */
+async function pauseScheduleForDisconnectedAccount(
+  schedule: any,
+  userId: string,
+  consecutiveSkips: number,
+  gate: AccountGateResult,
+): Promise<void> {
+  try {
+    await scheduleDb.updateSchedule(schedule.scheduleId, {
+      status: 'paused',
+      // Marks WHY, so a later reconnect can resume exactly the schedules this gate
+      // stopped and nothing a human paused deliberately (ENG-1197).
+      pausedReason: 'linkedin_disconnected',
+      updatedAt: new Date().toISOString(),
+    } as any);
+    console.error(
+      `runScheduledChat: PAUSED schedule ${schedule.scheduleId} — ${consecutiveSkips} consecutive runs `
+      + `skipped for disconnected LinkedIn Outreach account(s) ${gate.accountIds.join(', ')}.`,
+    );
+    // Unlike the per-run skip, a pause is a state change the owner cannot infer
+    // from anything they already received, so it gets its own message.
+    //
+    // Deliberately NOT notifyScheduleOwnerOfFailure: that sends the generic
+    // run-failed email, which says the schedule "will not be retried until its next
+    // scheduled run" and, for the 'system' class, to contact support. Both are wrong
+    // here — a paused schedule has no next run, and the remedy is a reconnect plus
+    // re-enabling it, not support.
+    try {
+      const recipients: string[] = Array.isArray(schedule.emailNotifications)
+        ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+        : [];
+      // The owner is UNIONED in, not used as a fallback. Only the account owner can
+      // re-authenticate and re-enable the schedule, so a schedule configured to
+      // report to, say, marketing@company.com would otherwise stop permanently
+      // without the one person who can restart it ever being told.
+      const { userDb } = await import('../services/db');
+      const owner = await userDb.getUserById(userId).catch(() => null);
+      const notifyEmails = Array.from(new Set(
+        [...recipients, owner?.email].filter((e): e is string => typeof e === 'string' && !!e.trim()),
+      ));
+      if (notifyEmails.length > 0) {
+        const { emailService } = await import('../services/emailService');
+        // Read the real disconnect time rather than stamping "now": the account has
+        // typically been dead for several runs by the time a pause fires, and telling
+        // the customer it just dropped is both wrong and unhelpful for diagnosis.
+        const { getUnipileHealth } = await import('../services/linkedInConnectionHealth');
+        const health = gate.accountIds[0]
+          ? await getUnipileHealth(gate.accountIds[0], userId).catch(() => null)
+          : null;
+        // Falling back to "now" would say the account dropped this instant, which is
+        // the opposite of true by the time five runs have been skipped — and is
+        // exactly what the comment above says this email must not do. The oldest
+        // trailing skip is a real lower bound on how long this has been broken.
+        const trailingSkipResults = Array.isArray(schedule.runResults)
+          ? schedule.runResults.filter((r: any) => r?.status === ACCOUNT_DISCONNECTED_STATUS)
+          : [];
+        const oldestSkipAt = trailingSkipResults.length > 0
+          ? trailingSkipResults[0]?.createdAt
+          : undefined;
+        const disconnectedAt = health?.disconnected_at || oldestSkipAt || undefined;
+        const since = disconnectedAt ? Date.parse(disconnectedAt) : NaN;
+        const daysDisconnected = Number.isFinite(since)
+          ? Math.max(0, Math.floor((Date.now() - since) / (24 * 60 * 60 * 1000)))
+          : 0;
+        await emailService.sendLinkedInAccountDisconnectedEmail(notifyEmails, {
+          accountName: gate.accountNames[0] || 'your LinkedIn Outreach account',
+          disconnectedAt,  // may be undefined — the email omits the line rather than inventing one
+          isReminder: true,
+          // These are different units and were previously conflated: the copy read
+          // "N days of skipped runs" off a RUN count. A schedule firing every 3 days
+          // understated it threefold; one firing twice a day overstated it.
+          daysDisconnected,
+          skippedRunCount: consecutiveSkips,
+          pausedScheduleName: schedule.scheduleName,
+        });
+      }
+    } catch (notifyError) {
+      console.error(`Failed to send pause notification for ${schedule.scheduleId}:`, notifyError);
+    }
+    await sendAgentModeOncallAlert({
+      subject: `Schedule paused — LinkedIn Outreach account disconnected: ${schedule.scheduleName}`,
+      message:
+        `Schedule ${schedule.scheduleId} was paused after ${consecutiveSkips} consecutive runs skipped `
+        + `because its pinned Unipile account(s) ${gate.accountIds.join(', ')} have no live LinkedIn `
+        + `session. It will not resume until someone reactivates it, so a reconnect alone is no longer enough.`,
+      context: { scheduleId: schedule.scheduleId, userId, accountIds: gate.accountIds },
+      dedupeKey: `schedule_paused_unipile:${schedule.scheduleId}`,
+      dedupeWindowMs: 24 * 60 * 60 * 1000,
+    });
+  } catch (error) {
+    console.error(`Failed to pause schedule ${schedule.scheduleId} for disconnected account:`, error);
+  }
+}
+
+/**
+ * ENG-1131 follow-up: tell the schedule owner the MOMENT their prospecting
+ * schedule's LinkedIn sourcing capability changes state — call only when
+ * `didSourcingBlockStateChange` is true, so this fires once per transition,
+ * not once per run of a multi-day outage. Recipients: the schedule's
+ * configured notification list, else the owner's account email. Best-effort
+ * by design — a notification failure must never break the run.
+ *
+ * Respects `schedule.disableSourcingBlockAlerts` — an owner opt-out for this
+ * specific alert. Does NOT affect the schedule-card badge, per-run emails, or
+ * run history, which stay on regardless (those are informational surfaces on
+ * data the owner is already looking at; this is the one that reaches into
+ * their inbox unprompted).
+ */
+async function notifyScheduleOwnerOfSourcingBlockTransition(
+  schedule: any,
+  userId: string,
+  detail: { isNowBlocked: boolean }
+): Promise<void> {
+  if (schedule.disableSourcingBlockAlerts === true) return;
+  try {
+    let recipients: string[] = Array.isArray(schedule.emailNotifications)
+      ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+      : [];
+    if (recipients.length === 0) {
+      const owner = await userDb.getUserById(userId);
+      if (owner?.email) recipients = [owner.email];
+    }
+    if (recipients.length > 0) {
+      await emailService.sendScheduleSourcingBlockTransitionEmail(
+        recipients, schedule.scheduleName, schedule.scheduleId, detail.isNowBlocked
+      );
+    } else {
+      console.error(
+        `No notification recipients for schedule ${schedule.scheduleId}; sourcing-block transition alert skipped.`
+      );
+    }
+  } catch (notifyError) {
+    console.error(`Failed to send sourcing-block transition alert for schedule ${schedule.scheduleId}:`, notifyError);
+  }
+}
+
 function getZeroAssistantRequeueDelayMs(retryCount: number): number {
   const exponent = Math.max(0, retryCount - 1);
   return Math.min(ZERO_ASSISTANT_REQUEUE_MAX_MS, ZERO_ASSISTANT_REQUEUE_BASE_MS * Math.pow(2, exponent));
@@ -3391,7 +5050,12 @@ export async function runScheduledChat(
   // invoking the primary generation model — distinct from 'failure' (which means
   // the full flow ran and did not meet its requirements) so cost/waste analysis
   // can tell the two apart without re-deriving it from message counts.
-  status: 'success' | 'failure' | 'pending_user_input' | 'skipped_no_content';
+  // ENG-1197: 'skipped_account_disconnected' likewise exits before the model, but
+  // for an external precondition rather than a judgement about content — the
+  // LinkedIn account the schedule pins has no live session, so the run cannot do
+  // the thing it exists to do. Kept separate from 'skipped_no_content' because the
+  // remedy is a customer reconnect, not a prompt or cadence change.
+  status: 'success' | 'failure' | 'pending_user_input' | 'skipped_no_content' | 'skipped_account_disconnected';
   passed: boolean;
   actualResponse: string;
   actualFunctionCalls: string[];
@@ -3399,6 +5063,11 @@ export async function runScheduledChat(
   keywordMisses: string[];
   functionCallMatches: string[];
   functionCallMisses: string[];
+  // Pre-existing at runtime (finalFunctionCallDetails, ENG-947) but missing from
+  // this type until a test needed to assert on it directly (CodeRabbit review,
+  // ENG-1276) — declaring it changes no behavior, only lets TS see a field the
+  // object has always returned.
+  functionCallDetails?: { [functionName: string]: { actual: number; required: number } };
   executionTime: number;
   sessionId: string;
   attempt: number;
@@ -3411,6 +5080,10 @@ export async function runScheduledChat(
   publishHeldForApproval?: boolean;
   publishRequirementMismatch?: boolean;
   publishToolFailing?: boolean;
+  // ENG-1297: present only when the run stopped early on the read-only-press
+  // budget with a read-only tool still uncalled. Unlike the publish markers
+  // above, this is a SUCCESSFUL run — no external write was left undone.
+  readOnlyRequirementWaived?: boolean;
 }> {
   const now = new Date();
   let sessionId: string = '';
@@ -3648,15 +5321,27 @@ export async function runScheduledChat(
       }
 
       // A block can be caused by either the token-count cap or the dollar cost
-      // cap (ENG-200). When the cost cap is the trigger — which is the only reason
-      // a user with an unlimited token allowance can be blocked — render a
-      // cost-based message so it doesn't misleadingly read "0 tokens used".
+      // cap (ENG-200). Which dimension gated only picks which percentage to read —
+      // never the wording: the raw figures and the "cost" vs "token" dimension
+      // name are never surfaced to the customer, matching the in-app UsageMeter
+      // policy of a percentage of "monthly usage" only (ENG-1566).
       const { blockedByCost } = deriveBlockedByCost(usageStatus);
-      const blockMessage = usageStatus.usageMode === 'paused'
-        ? 'Scheduled chat cannot run: AI usage is paused until the next reset or additional usage is added.'
-        : blockedByCost
-        ? `Scheduled chat cannot run: Monthly cost limit reached ($${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month).`
-        : `Scheduled chat cannot run: Monthly token limit reached (${usageStatus.used?.toLocaleString() ?? 0} / ${usageStatus.allowance?.toLocaleString() ?? 0} tokens used).`;
+      const limitPercent = Math.round(
+        blockedByCost ? (usageStatus.costPercentUsed ?? 100) : (usageStatus.percentUsed ?? 100)
+      );
+      // ENG-1344: both branches used to end at the word "reset" with no date. The
+      // reset sentence is appended rather than interpolated so the percentage
+      // branch keeps its own leading clause, and so a month we cannot parse drops
+      // the sentence instead of rendering "resets on null".
+      const blockMessage = [
+        usageStatus.usageMode === 'paused'
+          ? 'Scheduled chat cannot run: AI usage is paused.'
+          : `Scheduled chat cannot run: you've reached your monthly usage limit (${limitPercent}% used).`,
+        resetSentence(usageStatus.month),
+        'Add usage or upgrade your plan to keep working before then.',
+      ]
+        .filter(Boolean)
+        .join(' ');
 
       const tokenLimitResult = {
         scheduleId: schedule.scheduleId,
@@ -3794,6 +5479,93 @@ export async function runScheduledChat(
       };
     }
 
+    // ENG-1197: don't spend a run on an account that cannot act.
+    //
+    // This schedule fired daily against a LinkedIn account whose session LinkedIn
+    // had revoked. Each fire loaded skills, paged the CRM, ran discovery against a
+    // borrowed shared account, and sent nothing — ~$5 of model spend for a
+    // guaranteed no-op, recorded as a SUCCESS so no failure path ever fired.
+    //
+    // Placed AFTER the in-flight lease deliberately. Both prod instances dispatch
+    // the same schedule, and `addRunResult` is a blind `list_append` with no runId
+    // dedupe — so a gate sitting before the lease had BOTH dispatchers writing a
+    // skip row and both computing the same streak. That doubled every skip in
+    // `runResults` and made MAX_CONSECUTIVE_ACCOUNT_SKIPS arrive in about three
+    // fires instead of five, with two identical pause emails at the end of it. The
+    // lease already answers "who owns this run"; the loser has returned above
+    // without writing anything, so gating here needs no CAS of its own. Skipping
+    // returns through the outer `finally`, which clears the lease and the
+    // heartbeat, leaving the schedule free for its next fire.
+    //
+    // Still ahead of session creation, skill loading and the CRM paging, which is
+    // where the ~$5 actually goes.
+    //
+    // Never gates a test run or a resume. The ENG-1259 pre-check makes the same
+    // exclusion for the same reason: a human is waiting on a manual test and must
+    // see the flow exercised, not a silent no-op — and worse, a test skip would be
+    // written into runResults and inflate the very streak that triggers the
+    // auto-pause, so repeatedly testing a schedule could pause it. A resume is
+    // excluded because its session is already parked mid-flight; withholding it
+    // strands that session rather than saving anything.
+    const lastRunResult = Array.isArray(schedule.runResults) && schedule.runResults.length > 0
+      ? schedule.runResults[schedule.runResults.length - 1]
+      : null;
+    // Both markers, because they identify different parked runs. A `pending_user_input`
+    // result is a run waiting on the customer; `pendingResumeSessionId` is one the
+    // ENG-657/971 reconciler marked resumable after an abandoned run, whose last
+    // recorded result is typically a `failure`. Keying on the run result alone let
+    // that second kind reach the gate and be skipped — stranding exactly the
+    // mid-flight session this exclusion exists to protect.
+    const isResumingParkedRun =
+      lastRunResult?.status === 'pending_user_input' ||
+      (typeof schedule.pendingResumeSessionId === 'string' && !!schedule.pendingResumeSessionId);
+    const accountGate = (isTest || isResumingParkedRun)
+      ? { blocked: false, accountIds: [], accountNames: [] }
+      : await evaluateLinkedInAccountGate(schedule, userId);
+    if (accountGate.blocked) {
+      console.log(
+        `runScheduledChat: schedule ${schedule.scheduleId} skipped before invoking the model — `
+        + `pinned LinkedIn Outreach account(s) ${accountGate.accountIds.join(', ')} disconnected`,
+      );
+      const skipResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: ACCOUNT_DISCONNECTED_STATUS,
+        passed: false,
+        actualResponse: buildAccountSkipReason(accountGate.accountNames),
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        // The gate probes Unipile over the network, so this is not free. Reporting 0
+        // would hide it, and the sibling ENG-1259 skip records real elapsed time.
+        executionTime: Date.now() - now.getTime(),
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, skipResult);
+      } catch (saveError) {
+        console.error(`Error saving account-gate skip result for schedule ${schedule.scheduleId}:`, saveError);
+      }
+
+      // The skip is deliberately NOT accompanied by its own email. The owner is
+      // already told once, on the disconnect edge, by linkedInConnectionHealth —
+      // and one notification authority is the whole reason that path exists. A
+      // second one here would mail them on every fire of every affected schedule.
+      //
+      // Leaving the schedule active is what makes this self-healing: a reconnect
+      // resumes it with no human action. The pause below exists only for the case
+      // that never comes.
+      const trailingSkips = countTrailingAccountSkips(schedule.runResults);
+      if (trailingSkips + 1 >= MAX_CONSECUTIVE_ACCOUNT_SKIPS) {
+        await pauseScheduleForDisconnectedAccount(schedule, userId, trailingSkips + 1, accountGate);
+      }
+      return skipResult;
+    }
+
     // ENG-657: resume path. When the reconciler marked this schedule to resume an
     // abandoned session (it ended on a safe boundary), CONTINUE that session from
     // its last completed step instead of creating a fresh one and re-running the
@@ -3803,7 +5575,7 @@ export async function runScheduledChat(
     let isResumeRun = false;
     // ENG-657: tool calls the abandoned portion already made, seeded into the
     // resumed run's verification so requiredFunctionCalls counts the whole task.
-    let resumePriorToolCalls: Array<{ name: string; error?: any }> = [];
+    let resumePriorToolCalls: RequiredCallLedgerEntry[] = [];
     const pendingResumeSessionId: string | undefined =
       !isTest && typeof schedule.pendingResumeSessionId === 'string' && schedule.pendingResumeSessionId
         ? schedule.pendingResumeSessionId
@@ -4187,6 +5959,17 @@ export async function runScheduledChat(
         functionName: funcName,
         minCount: functionCallMinCalls[funcName] || 1
       }));
+    // ENG-930: the schedule's OWN publish-capable requiredFunctionCalls names,
+    // BEFORE authorization scoping just above may have excluded one from
+    // `requiredFunctions`. Passed through (not resolved to a boolean here) so
+    // `runVerifiedChat` can recompute the exclusion fresh every attempt
+    // against whatever `requiredFunctions` narrows to mid-run if the owner
+    // revokes consent — a run admitted authorized must not carry a
+    // permanently-false exclusion flag from this one admission-time read
+    // (CodeRabbit review). See publishPressCircuitBreaker's
+    // `publishExcludedFromScope` doc comment for why the exclusion matters at
+    // all.
+    const originalPublishTools = getRequiredPublishTools(expectedFunctionCalls);
 
     // On a resume, the original task prompt is already the first message of the
     // session being continued; re-sending it would make the model start over. Send
@@ -4220,7 +6003,6 @@ export async function runScheduledChat(
       maxAttempts: 20,
       attachments: fileAttachments,
       llmModel: modelToUse,
-      transientFallbackModel: scheduleModelPolicy.transientFallbackModel,
       modelPolicyDecisionForAudit: scheduleModelPolicy,
       // ENG-657: on a resume, count the abandoned portion's tool calls in
       // verification so requiredFunctionCalls isn't falsely missed (empty otherwise).
@@ -4262,6 +6044,7 @@ export async function runScheduledChat(
       // guard. A snapshot taken here would go stale the moment the owner toggles the
       // setting mid-run (Greptile review #30).
       publishAuthorized: () => resolveLivePublishAuthorized(schedule.scheduleId),
+      originalPublishTools,
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
       parkNotifiable: true,
@@ -4271,6 +6054,10 @@ export async function runScheduledChat(
       // ENG-844: the owner's weekday cadence is evaluated in the schedule's
       // timezone (falls back to UTC when unset).
       scheduleTimezone: schedule.timezone
+    }, {
+      // ENG-1719: headless, maxAttempts:20, nobody blocked waiting — see
+      // RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS's comment for the real-data reasoning.
+      lockTimeoutMs: RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS,
     });
 
     // ENG-396: the run parked on a blocking AskUserQuestion with no human present.
@@ -4339,6 +6126,59 @@ export async function runScheduledChat(
       }
     }
 
+    // ENG-1132: an account-level invitation throttle makes additional invite
+    // attempts futile. Persist a plain-language completion note in the session
+    // before deriving the result/email so every surface tells the same truth.
+    // A resumed run's final outcome includes its abandoned portion. Use the
+    // same combined ledger here as the requirement verifier below: a prior
+    // blocked invite is still an account-level capacity signal, and a prior
+    // successful call still counts toward the configured minimum.
+    const linkedInOutcomeToolCalls = [...resumePriorToolCalls, ...result.toolCalls];
+    const linkedInInviteSendBlock = detectLinkedInInviteSendBlock(linkedInOutcomeToolCalls);
+    if (linkedInInviteSendBlock && sessionId) {
+      try {
+        await chatbotDb.addMessageToSession(sessionId, {
+          role: 'assistant',
+          content: linkedInInviteSendBlock.notice,
+          timestamp: new Date().toISOString(),
+          metadata: { timestamp: new Date().toISOString() },
+        });
+      } catch (persistError) {
+        console.error('Failed to persist LinkedIn invitation-block notice to session:', persistError);
+      }
+    }
+    // ENG-1657 (ENG-1132 AC3): "we find out before the customer complains" —
+    // a schedule-wide LinkedIn invite block is a fully-blocked outreach run, so it
+    // must page oncall through the SAME mechanism the LinkedIn-disconnect alerts use
+    // (sendAgentModeOncallAlert), not a bespoke channel. Deduped per account/day: a
+    // cooldown/pacing cap that persists across many scheduled fires in one day must
+    // not flood oncall with a near-identical page every fire.
+    if (linkedInInviteSendBlock && !isTest) {
+      const dedupeAccountKey = linkedInInviteSendBlock.accountId || `schedule:${schedule.scheduleId}`;
+      void sendAgentModeOncallAlert({
+        subject: `LinkedIn outreach run fully blocked: ${schedule.scheduleName}`,
+        message:
+          `Scheduled LinkedIn outreach run for schedule "${schedule.scheduleName}" attempted `
+          + `send-invite and was fully blocked. ${linkedInInviteSendBlock.notice}`,
+        sessionId,
+        // No date component: dedupeWindowMs alone enforces the rolling 24h
+        // suppression window, so an alert at 23:59 UTC and the next at 00:01
+        // UTC the following day correctly dedupe instead of bypassing on the
+        // UTC-midnight key rollover (CodeRabbit).
+        dedupeKey: `linkedin_invite_blocked:${dedupeAccountKey}`,
+        dedupeWindowMs: 24 * 60 * 60 * 1000,
+        context: {
+          'Schedule ID': schedule.scheduleId,
+          'Schedule Name': schedule.scheduleName,
+          'User ID': userId,
+          'Account ID': linkedInInviteSendBlock.accountId || 'unknown',
+        },
+      }).catch((err) => console.error('Failed to send oncall alert for blocked LinkedIn invite run:', err));
+    }
+    const scheduledResponse = linkedInInviteSendBlock
+      ? `${result.content}\n\n${linkedInInviteSendBlock.notice}`
+      : result.content;
+
     // Generate a 2-3 word summary and update the session title
     try {
       // ENG-803: ground the title suffix in the tools that actually ran, so a run
@@ -4373,16 +6213,14 @@ export async function runScheduledChat(
     // tool errored" is exactly what someone reading run history needs to see.
     const actualFunctionCalls = result.toolCalls.map((call: any) => call.name).filter(Boolean);
 
-    // Calculate final function call details. Counted off the requirement evidence,
-    // NOT the audit list above (ENG-947): a failed publish must not report
-    // `actual: 1, required: 1` next to a functionCallMisses entry naming the same
-    // tool. The two fields would contradict each other in run history and in the
-    // result email, and the reassuring one is the one that is wrong.
+    // Calculate final function call details. ENG-1045/ENG-947: counted through the
+    // same outcome-aware helper the checker uses (countCallsSatisfyingRequirement),
+    // so the persisted record cannot say `post_on_connected_account {actual: 0,
+    // required: 1}` on a run the checker passed because the mandated post went out
+    // as a thread, NOR can it report `actual: 1` next to a functionCallMisses entry
+    // naming the same tool because a failed publish attempt was counted as a send —
+    // the same self-contradicting shape ENG-827 removed from this record below.
     const finalFunctionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
-    const actualFunctionCallCounts: { [functionName: string]: number } = {};
-    requirementEvidenceNames(result.toolCalls).forEach((call: string) => {
-      actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
-    });
 
     // ENG-827: report the requirements this run was actually HELD TO, which is the
     // publish-scope-filtered list the checker used above — not the raw schedule
@@ -4399,30 +6237,79 @@ export async function runScheduledChat(
     // next to an empty functionCallMisses on a passing run. Nothing downstream can
     // tell that apart from a genuine silent miss — the false-failure shape ENG-479 /
     // ENG-764 had to unpick.
-    filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization)
-      .forEach((functionName: string) => {
-        finalFunctionCallDetails[functionName] = {
-          actual: actualFunctionCallCounts[functionName] || 0,
-          required: functionCallMinCalls[functionName] || 1
-        };
-      });
+    // ENG-1276 follow-up: also the SAME held-to set the equivalence-route
+    // double-credit suppression checks against below, so a run authorized for only
+    // ONE of an equivalence pair (e.g. post_on_connected_account but not
+    // twitter_manage_post) is scoped identically here and in the checker — not the
+    // wider, unfiltered `requiredFunctionNames` computed earlier in this function.
+    const heldToFunctionNames = filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization);
+    heldToFunctionNames.forEach((functionName: string) => {
+      finalFunctionCallDetails[functionName] = {
+        // ENG-1045 (Greptile): a resumed run's requirement can be satisfied by a call
+        // made in the ABANDONED portion, carried in via `resumePriorToolCalls` — the
+        // same list `runVerifiedChat` folded in above to decide functionCallMatches.
+        // Recounting from `result.toolCalls` alone here reintroduces the same
+        // self-contradicting record the surrounding comment warns about: `passed:
+        // true` next to `actual: 0` for a requirement functionCallMatches already
+        // credits.
+        actual: countCallsSatisfyingRequirement(functionName, [...resumePriorToolCalls, ...result.toolCalls], heldToFunctionNames),
+        required: functionCallMinCalls[functionName] || 1
+      };
+    });
+
+    // An account-wide cooldown/pacing refusal is not a successful send. The
+    // verifier historically counted every non-publish call by name, so correct
+    // Schedules contract by tool name rather than action, so successful
+    // non-invite LinkedIn calls count too. Count every successful call from
+    // the combined ledger, rather than treating one such call as enough for
+    // a schedule that requires multiple calls.
+    const requiredLinkedInCalls = functionCallMinCalls.linkedin_outreach || 1;
+    const successfulLinkedInCalls = linkedInOutcomeToolCalls.filter(
+      (call: any) => call?.name === 'linkedin_outreach' && toolCallSucceeded(call),
+    );
+    const linkedInInviteSendRequirementMissed = Boolean(
+      linkedInInviteSendBlock
+      && heldToFunctionNames.includes('linkedin_outreach')
+      && successfulLinkedInCalls.length < requiredLinkedInCalls,
+    );
+    if (linkedInInviteSendRequirementMissed) {
+      finalFunctionCallDetails.linkedin_outreach = {
+        actual: successfulLinkedInCalls.length,
+        required: requiredLinkedInCalls,
+      };
+    }
+    const finalFunctionCallMatches = linkedInInviteSendRequirementMissed
+      ? result.functionCallMatches.filter((name: string) => name !== 'linkedin_outreach')
+      : result.functionCallMatches;
+    const finalFunctionCallMisses = linkedInInviteSendRequirementMissed
+      ? Array.from(new Set([...result.functionCallMisses, 'linkedin_outreach']))
+      : result.functionCallMisses;
 
     // ENG-635: a run that met its requirements but still deferred to an absent human
     // (deferredUnresolved) produced no real deliverable — record it as a failure so it
     // is surfaced (auto-issue + oncall) instead of scored as a clean run.
-    const runDelivered = result.success && !result.deferredUnresolved;
+    const runDelivered = result.success && !result.deferredUnresolved && !linkedInInviteSendRequirementMissed;
+
+    // ENG-1131: read off this run's tool ledger before it is trimmed for storage.
+    const blockedBy = detectRunBlockedReason(result.toolCalls);
+    if (blockedBy) {
+      console.log(
+        `AgentMode: scheduled run ${schedule.scheduleId} was blocked by ${blockedBy} — ` +
+        `sourcing was unavailable, not empty`,
+      );
+    }
 
     const finalResult = {
       scheduleId: schedule.scheduleId,
       runId: preGeneratedRunId || require('uuid').v4(),
       status: (runDelivered ? 'success' : 'failure') as 'success' | 'failure',
       passed: runDelivered,
-      actualResponse: result.content,
+      actualResponse: scheduledResponse,
       actualFunctionCalls: actualFunctionCalls,
       keywordMatches: result.keywordMatches,
       keywordMisses: result.keywordMisses,
-      functionCallMatches: result.functionCallMatches,
-      functionCallMisses: result.functionCallMisses,
+      functionCallMatches: finalFunctionCallMatches,
+      functionCallMisses: finalFunctionCallMisses,
       functionCallDetails: finalFunctionCallDetails,
       executionTime: Date.now() - now.getTime(),
       sessionId: sessionId,
@@ -4436,6 +6323,21 @@ export async function runScheduledChat(
       // downstream reporting — a bare success would otherwise hide the waived
       // write-call minimums.
       ...(result.conditionalSkip ? { conditionalSkip: true } : {}),
+      // ENG-1297: the run stopped pressing a read-only requirement (e.g.
+      // you_search_web) early once its press budget was spent. A SUCCESSFUL run —
+      // the model already declined the tool for good reason and nothing external
+      // was left unwritten — marked so the waived minimum is still observable in
+      // runResults rather than looking like every requirement was met.
+      ...(result.readOnlyRequirementWaived ? { readOnlyRequirementWaived: true } : {}),
+      // ENG-1131: a prospecting run whose only sourcing path is LinkedIn
+      // people-search still delivers a report when that endpoint is down for the
+      // account, so it lands here as a plain `success` and the owner's schedule
+      // card stays green while zero prospects were sourced — reading exactly like
+      // "nobody matched your filters". Persist WHY it was blocked so the card can
+      // say so. Kept separate from `status` deliberately: the outage is upstream
+      // and self-clearing, so flipping these runs to failures would bury the
+      // owner's real failure signal under a fleet-wide vendor incident.
+      ...(blockedBy ? { blockedBy } : {}),
       // ENG-947: the run ended early because its publish-press budget ran out with
       // the publish tool still uncalled — the content was drafted and held, not
       // published. Still a `failure` (nothing shipped, so the streak/oncall
@@ -4457,6 +6359,57 @@ export async function runScheduledChat(
       // that is empty, when what they need is to reconnect the account.
       ...(result.publishToolFailing ? { publishToolFailing: true } : {}),
     };
+    const scheduledChatFailureDescription =
+      `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\n` +
+      `Missing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\n` +
+      `Keyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}` +
+      (linkedInInviteSendBlock
+        ? `\n\nBlocked action: send-invite. ${linkedInInviteSendBlock.notice}`
+        : '');
+
+    // ENG-1131 follow-up: re-fetch the schedule immediately before deciding on a
+    // sourcing-block transition, instead of using `schedule` as loaded at the
+    // top of this (often multi-minute) function. Two runs of the same schedule
+    // racing concurrently — e.g. a manual Test click overlapping a cron trigger
+    // — would otherwise both read the SAME stale prior-run snapshot and both
+    // fire the alert. This doesn't eliminate the race (a true fix needs a
+    // DB-level conditional write), but narrows the window from run-duration
+    // down to a single DB round-trip. Deliberately NOT a persisted "already
+    // alerted" flag: that write can't be atomic with the email send either, and
+    // would trade a rare, harmless duplicate for the strictly worse failure mode
+    // of a silently missed alert — the same reasoning already established in
+    // this file for notifyScheduleOwnerOfFailure's zero-output path.
+    //
+    // Scoped to REAL scheduled runs only (!isTest), same as every sibling
+    // owner notification in this function (notifyScheduleOwnerOfFailure). A
+    // manual "Test this schedule" click must never send this unsolicited
+    // alert — the owner is already looking at the run they just triggered,
+    // and testing repeatedly while debugging a suspected outage would
+    // otherwise spam an email they didn't ask for. Also skips the re-fetch
+    // entirely on a test run, since it would go unused.
+    if (!isTest) {
+      let freshSchedule: any = null;
+      try {
+        freshSchedule = await scheduleDb.getScheduleById(schedule.scheduleId);
+      } catch (refetchError) {
+        console.error(
+          `Failed to re-fetch schedule ${schedule.scheduleId} for sourcing-block transition check:`, refetchError,
+        );
+        // Fall back to the (possibly stale) `schedule` already in scope below.
+      }
+      const priorRunResultsForTransitionCheck: any[] | undefined =
+        freshSchedule ? freshSchedule.runResults : schedule.runResults;
+
+      if (didSourcingBlockStateChange(priorRunResultsForTransitionCheck, blockedBy)) {
+        // Notify using the freshly re-fetched schedule, not the function-entry
+        // copy — we already paid for this read, so a mid-run edit to
+        // emailNotifications or disableSourcingBlockAlerts is honored at zero
+        // extra cost, rather than ignored until the schedule's next run.
+        await notifyScheduleOwnerOfSourcingBlockTransition(freshSchedule || schedule, userId, {
+          isNowBlocked: Boolean(blockedBy),
+        });
+      }
+    }
 
     // Save the result to database (without actualResponse to save space)
     const resultToStore = { ...finalResult };
@@ -4492,7 +6445,7 @@ export async function runScheduledChat(
     if (!finalResult.passed && !isTest) {
       void fileAutoIssue({
         title: `Scheduled Chat Failed: ${schedule.scheduleName}`,
-        description: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
+        description: scheduledChatFailureDescription,
         source: 'Scheduled chat (validation)',
         extraLabels: ['Scheduled Chat'],
         notionTags: ['Scheduled Chat'],
@@ -4504,9 +6457,13 @@ export async function runScheduledChat(
         }
       })
         .catch(err => console.error('Failed to file scheduled-chat-failure issue:', err))
-        .then(() => sendAgentModeOncallAlert({
+        // A blocked-invite run already paged oncall above via the dedicated
+        // linkedin_invite_blocked alert — sending this generic alert too would
+        // double-page a single blocked run (CodeRabbit). The issue is still
+        // filed unconditionally above so tracking stays intact either way.
+        .then(() => linkedInInviteSendRequirementMissed ? undefined : sendAgentModeOncallAlert({
           subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
-          message: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
+          message: scheduledChatFailureDescription,
           sessionId,
           // One alert per (user, schedule, errorClass) per hour — a flapping
           // schedule cannot flood oncall (ENG-145/146 class). Gated so flag
@@ -4554,6 +6511,60 @@ export async function runScheduledChat(
     return finalResult;
 
   } catch (error) {
+    // ENG-1719: this session was already generating (a live chat turn, another schedule,
+    // or an overlapping run) when this schedule tried to claim it via runVerifiedChat's
+    // lock — expected, benign contention, not a failure of this schedule or the session.
+    // Previously this fell straight into the generic path below, which stamps a scary
+    // error onto the CUSTOMER'S session, files an auto Linear issue, and pages on-call for
+    // something that will simply resolve itself at the schedule's next natural run. Skip
+    // all of that; still record a lightweight run-history entry so this isn't invisible.
+    if (isSessionBusyError(error)) {
+      console.error(
+        `AgentMode: scheduled chat for schedule ${schedule.scheduleId} (session ${sessionId || 'not yet created'}) ` +
+        `skipped — session was busy with another generation in progress. Not a failure; will retry at the next slot.`
+      );
+      const busyResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: 'Skipped: this session was busy with another generation in progress.',
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: Date.now() - now.getTime(),
+        sessionId: sessionId || '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, busyResult);
+      } catch (saveError) {
+        console.error('Error saving session-busy run result:', saveError);
+      }
+      return busyResult;
+    }
+
+    // ENG-1719 follow-up: runVerifiedChat only just gained a wall-clock timeout
+    // (RUN_VERIFIED_CHAT_LOCK_TIMEOUT_MS) — before that fix, this catch could never receive
+    // an isGenerationTimeout error from it at all, so this exposure is new. Per
+    // withGenerationTimeout's own documented contract, the underlying generateSessionResponse
+    // call is NOT cancelled when it times out — it keeps running in the background. Below,
+    // the zero-output detection can misread a merely-slow (not actually dead) run as
+    // producing no output and schedule an automatic RESUME on this SAME sessionId
+    // (`pendingResumeSessionId`) as little as 15 minutes later. Without cancelling the
+    // orphan first, that resume can start generating while the orphan is still writing to
+    // the same session — the identical concurrent-write race this PR exists to close,
+    // self-inflicted by the schedule's own retry machinery instead of an external caller.
+    // Unlike the busy branch above, a genuine timeout is NOT benign — fall through to the
+    // existing zero-output/error handling below after cancelling, don't return early.
+    if ((error as any)?.isGenerationTimeout && sessionId) {
+      requestCancel(sessionId);
+      generateMarketingResponseWorkerService.cancelSession(sessionId);
+    }
+
     console.error(`Error in runScheduledChat for ${schedule.scheduleName}:`, error);
     console.error('Full error details:', {
       message: error instanceof Error ? error.message : String(error),
@@ -4659,6 +6670,14 @@ export async function runScheduledChat(
         const incompleteMessage = mayHavePublished
           ? null
           : zeroAssistantIncompleteMessage(error);
+        // ENG-1670: whether OpenRouter actually sent a Retry-After header for
+        // THIS occurrence — persisted so a future recurrence of this exact
+        // failure class is self-diagnosing from the durable session record,
+        // rather than needing logs that expire in 14 days (which is what made
+        // the original investigation into this failure class unable to answer
+        // the question at all).
+        const retryAfterHeaderPresent = (error as any)?.retryAfterHeaderPresent;
+        const retryAfterMs = (error as any)?.retryAfterMs;
         if (incompleteMessage) try {
           await chatbotDb.addMessageToSession(sessionId, {
             role: 'assistant',
@@ -4669,6 +6688,8 @@ export async function runScheduledChat(
               isErrorMessage: true,
               jobIncomplete: true,
               failureClass,
+              ...(retryAfterHeaderPresent !== undefined ? { retryAfterHeaderPresent } : {}),
+              ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
             },
           });
         } catch (persistError) {
@@ -4784,6 +6805,13 @@ export async function runScheduledChat(
         // Outcome settled — now the transcript can state it truthfully.
         if (sessionId) {
           try {
+            // ENG-1670: this is a SEPARATE persist site from the incompleteMessage
+            // one above (that one is forced null exactly when mayHavePublished,
+            // which is how we got here) — re-derive rather than reuse, matching
+            // this function's existing style of re-deriving classifyZeroAssistantFailure
+            // per write site instead of hoisting it across branches.
+            const retryAfterHeaderPresent = (error as any)?.retryAfterHeaderPresent;
+            const retryAfterMs = (error as any)?.retryAfterMs;
             await chatbotDb.addMessageToSession(sessionId, {
               role: 'assistant',
               content: zeroAssistantPublishedMessage(publishedActions, publishedRunDidResume, publishedRunPaused),
@@ -4793,6 +6821,8 @@ export async function runScheduledChat(
                 isErrorMessage: true,
                 jobIncomplete: true,
                 failureClass: classifyZeroAssistantFailure(error),
+                ...(retryAfterHeaderPresent !== undefined ? { retryAfterHeaderPresent } : {}),
+                ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
               },
             });
           } catch (persistError) {
@@ -5413,16 +7443,16 @@ export async function generateSessionResponse(
   // When absent — the interactive route, or a resumed run entered directly — fall
   // back to reading the schedule for this turn.
   publishAuthorizationOverride?: SchedulePublishAuthorization,
-  // Cost-policy-owned transient retry target. Optimized callers always pass a
-  // string or null; omission preserves the unrestricted global backup behavior.
-  transientFallbackModel?: string | null,
-  // The caller's just-resolved admission decision. This is intentionally not sent
-  // to the worker; it only makes the post-fallback durable audit independent of a
-  // stale pre-admission session read.
-  modelPolicyDecisionForAudit?: EffectiveModelPolicyDecision,
   // ENG-936: approved image-source URLs for this run (currently used by
   // image-revision confirmation preflights). Passed into the worker only.
   approvedRevisionImageSources?: string[],
+  // ENG-1239: tags the persisted user-turn message as server-authored rather than
+  // customer-typed (e.g. 'auto-continuation'), so the customer-portal chat renderer
+  // can hide it instead of showing the raw [SYSTEM] directive as a user chat bubble.
+  userMessageKind?: string,
+  // Enforce a provider-independent structured outcome on workplan progression
+  // turns (step completion or a persisted input/question request).
+  requireWorkPlanDisposition: boolean = false,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -5431,9 +7461,6 @@ export async function generateSessionResponse(
   responseMessages: any[];
   workPlan?: any;
   skills?: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[];
-  backupModelUsed?: boolean;
-  originalModel?: string;
-  backupModel?: string;
   // ENG-244: true when the underlying run exhausted its step budget (maxIterations)
   // and was truncated before emitting the final deliverable. The scheduled-run
   // completion gate uses this flag (not response text) to force a synthesis turn.
@@ -5441,6 +7468,11 @@ export async function generateSessionResponse(
   // ENG-907: the wall-clock counterpart — the turn ran out of time and delivered a
   // partial answer from a forced synthesis turn instead of the full deliverable.
   truncatedByTimeBudget?: boolean;
+  // ENG-1239: true when the run was cooperatively cancelled (e.g. preempted by a genuine
+  // customer message) before it could compose a closing reply — content may be empty
+  // even though toolCalls shows real work (an already-dispatched call can't be aborted).
+  cancelled?: boolean;
+  workPlanTurnDisposition?: WorkPlanTurnDisposition;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
@@ -5497,13 +7529,29 @@ export async function generateSessionResponse(
       } : {}),
       // ENG-396: structured record of the card selection this reply answered (from a
       // click, not the text). The card reads this to show which option was chosen.
-      ...(answeredQuestionMeta ? { askUserQuestionAnswer: answeredQuestionMeta } : {})
+      ...(answeredQuestionMeta ? { askUserQuestionAnswer: answeredQuestionMeta } : {}),
+      // ENG-1239: marks server-authored turns (e.g. the media auto-continuation
+      // directive) so the frontend can hide them instead of rendering them as a
+      // customer-typed chat bubble.
+      ...(userMessageKind ? { kind: userMessageKind } : {})
     }
   };
 
   // Check if this is the first user message (excluding system message)
   const userMessages = session.messages?.filter(msg => msg.role === 'user') || [];
   const isFirstMessage = userMessages.length === 0;
+  // ENG-1626: if the immediately-preceding assistant turn failed to reach a
+  // structured workplan disposition (e.g. a decision-card creation that
+  // silently failed even after the in-turn retry), re-enforce the check on
+  // THIS turn too — regardless of what the customer typed — so the retry
+  // happens automatically instead of depending on them asking for it by name
+  // (production case: the customer had to type "Please retry creating the
+  // card" verbatim before anything happened).
+  const lastMessage = session.messages?.[session.messages.length - 1];
+  const priorTurnFailedDisposition = priorTurnNeedsWorkPlanDispositionRetry(lastMessage);
+  const enforceWorkPlanDisposition = requireWorkPlanDisposition
+    || priorTurnFailedDisposition
+    || (Boolean(session.workPlan) && isFirstMessage);
 
   // If this is the first message, add system message with version info first
   if (isFirstMessage) {
@@ -5614,14 +7662,33 @@ export async function generateSessionResponse(
     }
   }
 
-  // Add user message to session in database
-  console.log('AgentMode generateSessionResponse: Saving user message with attachments:', {
-    hasAttachments: !!(userMessageObj.metadata?.attachments && userMessageObj.metadata.attachments.length > 0),
-    attachmentCount: userMessageObj.metadata?.attachments?.length || 0,
-    attachments: userMessageObj.metadata?.attachments?.map((a: any) => ({ url: a.url, filename: a.filename }))
-  });
-  await chatbotDb.addMessageToSession(sessionId, userMessageObj);
-  console.log('AgentMode generateSessionResponse: User message saved successfully');
+  // ENG-1239 (rework): if a PRIOR auto-continuation attempt already left its directive
+  // dangling at the tail (persisted, then orphaned by a process death before any reply —
+  // see hasUnresolvedMediaDeferral), a fresh scheduleAutoMediaContinuation call would
+  // otherwise persist a SECOND, near-identical directive on top of it — harmless
+  // functionally (both are hidden from the customer, no duplicate images result, proven
+  // live), but it lets hidden rows accumulate in history every time a recovery is itself
+  // interrupted. Scoped to the exact 'auto-continuation' kind so no other caller
+  // (scheduled runs, ishare, a real customer message, every other kind) is ever affected.
+  const reusingDanglingDirective =
+    userMessageKind === 'auto-continuation'
+    && (() => {
+      const priorLast = session.messages?.[session.messages.length - 1];
+      return priorLast?.role === 'user' && (priorLast.metadata as any)?.kind === 'auto-continuation';
+    })();
+
+  if (!reusingDanglingDirective) {
+    // Add user message to session in database
+    console.log('AgentMode generateSessionResponse: Saving user message with attachments:', {
+      hasAttachments: !!(userMessageObj.metadata?.attachments && userMessageObj.metadata.attachments.length > 0),
+      attachmentCount: userMessageObj.metadata?.attachments?.length || 0,
+      attachments: userMessageObj.metadata?.attachments?.map((a: any) => ({ url: a.url, filename: a.filename }))
+    });
+    await chatbotDb.addMessageToSession(sessionId, userMessageObj);
+    console.log('AgentMode generateSessionResponse: User message saved successfully');
+  } else {
+    console.log('AgentMode generateSessionResponse: reusing an already-dangling auto-continuation directive — skipped a redundant duplicate');
+  }
 
   // Get updated session with the new user message
   const updatedSession = await chatbotDb.getChatSession(sessionId);
@@ -5696,8 +7763,8 @@ export async function generateSessionResponse(
       // ENG-907: the caller's whole-turn deadline stamp (undefined when the caller
       // enforces no cap), so the loop wraps itself up against the real deadline.
       turnStartMs,
-      transientFallbackModel,
       approvedRevisionImageSources,
+      requireWorkPlanDisposition: enforceWorkPlanDisposition,
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -5705,27 +7772,6 @@ export async function generateSessionResponse(
     }
   );
 
-  // The admission decision is stamped before dispatch. If the provider then fails
-  // transiently and the approved optimized fallback actually answers, update the
-  // session to the model that incurred cost so audits never report the failed primary
-  // as the effective model. This is scoped to policy-owned fallbacks; unrestricted
-  // legacy retries retain their existing persistence behavior.
-  if (
-    response.backupModelUsed &&
-    response.backupModel &&
-    transientFallbackModel !== undefined &&
-    modelPolicyDecisionForAudit?.usageMode === 'optimized'
-  ) {
-    await chatbotDb.updateSessionLlmModel(sessionId, response.backupModel, {
-      ...toStoredModelPolicyDecision(modelPolicyDecisionForAudit),
-      effectiveModel: response.backupModel,
-      backupModel: response.backupModel,
-      backupSource: modelPolicyDecisionForAudit.transientFallbackSource || 'system',
-      modelSelection: 'corrected',
-      modelSelectionReason: 'primary_model_transient_failure_using_policy_fallback',
-      recordedAt: new Date().toISOString(),
-    });
-  }
 
   // If the user clicked Stop, drop the FINAL (in-flight) turn — we don't run the batch
   // below, so a page reload shows no ghost final response from the cancelled turn. Any
@@ -5782,8 +7828,40 @@ export async function generateSessionResponse(
   };
 }
 
+// ENG-1670: every daily/weekly/monthly/hourly schedule fires at the EXACT same UTC
+// second forever — nothing here ever nudged it. Schedule-creation UIs push users
+// toward round times (9:00:00, 14:45:00), so an unknown number of independent
+// schedules across the whole platform collide on the identical clock second, all
+// competing for one shared OpenRouter/Gemini quota (prod-confirmed: two unrelated
+// schedules, different users, both pinned to :00-second marks — 14:00:00.000Z and
+// 14:45:00.000Z exactly). A stable per-schedule offset spreads that collision across
+// a ~1-minute window.
+//
+// Deliberately capped at 0-59 (never 60-119): the caller applies this with an
+// ABSOLUTE setUTCSeconds, and a value >= 60 overflows into the minute field. That
+// overflow would get baked into the stored nextRunTime, which becomes next cycle's
+// `fromDate` — and since the "preserve time from fromDate" logic downstream can't
+// tell an overflowed minute apart from a genuine one, re-applying the same overflow
+// on top of it drifts the schedule later by another minute every single cycle,
+// forever (verified empirically before landing this — a 76s jitter walked a daily
+// schedule from 14:45 to 14:51 over 6 days with no bound). Staying under 60 means
+// the minute field is never touched, so the offset is exactly reproduced every time
+// rather than compounding.
+export function stableJitterSeconds(seedId: string): number {
+  let hash = 0;
+  for (let i = 0; i < seedId.length; i++) {
+    hash = (hash * 31 + seedId.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash) % 60; // 0-59 seconds, forward-only, never overflows into minutes
+}
+
 // Helper function to calculate next run time based on frequency
-const calculateNextRunTime = (frequency: string, fromDate: Date, frequencyIntervalDays?: number): Date => {
+export const calculateNextRunTime = (
+  frequency: string,
+  fromDate: Date,
+  frequencyIntervalDays?: number,
+  jitterSeedId?: string,
+): Date => {
   const now = new Date();
   let nextRun = new Date(fromDate);
 
@@ -5865,6 +7943,14 @@ const calculateNextRunTime = (frequency: string, fromDate: Date, frequencyInterv
       while (nextRun <= now) {
         nextRun.setUTCDate(nextRun.getUTCDate() + 1);
       }
+  }
+
+  // ABSOLUTE set, not additive — this must overwrite whatever seconds value is
+  // already on nextRun (including a jitter offset baked in from a prior cycle),
+  // not add to it, or the offset compounds by its own value every cycle instead
+  // of staying fixed (verified empirically before landing this).
+  if (jitterSeedId) {
+    nextRun.setUTCSeconds(stableJitterSeconds(jitterSeedId), 0);
   }
 
   return nextRun;
@@ -6084,6 +8170,43 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
+      // ENG-1239: durability backstop for the in-process media auto-continuation chain —
+      // it only fires right after the deferred turn, so a process death in between (a
+      // deploy, a crash) silently loses it. Any later touch of the session re-checks the
+      // tail of history and re-fires if it's still unresolved. Gated on the session NOT
+      // being actively generated (a real request or an already-running continuation holds
+      // that lock) so this never races a resume already in flight — best-effort, must
+      // never block or fail this response.
+      //
+      // Two additional consent guards, both added after review:
+      // - genuineOwnerView: getSession is called by the owner AND by admins (direct or
+      //   delegated) investigating a customer's session. A read-only "let me check on
+      //   this" by support staff must never have the side effect of spending a
+      //   customer's credits on their behalf — only the account owner's own, real,
+      //   non-delegated session can trigger the resume. An admin can still resume it by
+      //   sending an explicit message (the customer's express consent via someone acting
+      //   on their instruction), just not merely by looking.
+      // - staleness bound (BACKSTOP_STALENESS_MS): getSession is a passive READ. Without
+      //   a bound, reopening a batch abandoned days ago would silently re-trigger billed
+      //   generation the customer never asked for on this visit. An old, unresolved
+      //   pause just sits there until they explicitly type "continue" — exactly like
+      //   pre-fix behavior.
+      const genuineOwnerView = user?.userId === session.userId && !(req as any).delegateInfo?.isDelegated;
+      if (
+        genuineOwnerView
+        && !activeSessionGenerations.has(session.sessionId)
+        && hasUnresolvedMediaDeferral(session.messages, Date.now() - BACKSTOP_STALENESS_MS)
+      ) {
+        setImmediate(() => scheduleAutoMediaContinuation(
+          session.sessionId,
+          session.userId,
+          session.llmModel || agentModeService.default_model,
+          1,
+        ).catch((err) =>
+          console.error(`AgentMode: media auto-continuation (durability backstop) failed for session ${session.sessionId}:`, err),
+        ));
+      }
+
       await syncEmailCampaignExecution(session.userId, session.sessionId, session.emailCampaignTaskId || '');
 
       // Build skills list with installed status (includes virtual other_skills), filtered by subscription
@@ -6095,11 +8218,23 @@ export const agentModeController = {
       }
 
       // Filter out tool messages and assistant messages with tool calls for user display
+      // ENG-892/ENG-1313 follow-on: session.llmModel/llmUsagePolicyDecision are only the
+      // model PICKER's last selection, not provenance — a session can run on one model,
+      // hit a hard stop, and continue on a different one without either field ever
+      // reflecting the switch (see ENG-1565/ENG-1579 incident: llmModel and
+      // llmUsagePolicyDecision.effectiveModel both reported gemini-3.7-flash "honored"
+      // for a session whose transcript shows it actually ran on GLM the entire time it
+      // was spiraling). get_chat_history already computes the correct transcript-derived
+      // attribution for the aggregate report; this single-session view previously did
+      // not expose it at all, so reading a session's own detail page — the natural place
+      // to investigate one incident — silently trusted the misleading field.
+      const modelAttribution = computeSessionModelAttribution(session.messages, session.llmModel || null);
       const filteredSession = {
         ...session,
         messages: filterMessagesForClient(session.messages),
         hasActiveProgress: progressActive,
-        skills
+        skills,
+        ...modelAttribution,
       };
 
       res.json(filteredSession);
@@ -6164,7 +8299,7 @@ export const agentModeController = {
     let modelPolicyDecision: EffectiveModelPolicyDecision | undefined;
     try {
       const user = req.user as User;
-      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer } = req.body;
+      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer } = req.body;
       let { userMessage } = req.body;
 
       // If the request contains audio, transcribe it to text first
@@ -6265,33 +8400,59 @@ export const agentModeController = {
           throw err;
         }
       } else if (session.pendingUserQuestion?.status === 'awaiting') {
-        // ENG-396: the user typed a message instead of clicking the open card. Per the
-        // primitive's model, a selection is ONLY an explicit click — never inferred from
-        // prose. So the open question is abandoned: clear it (the old card freezes as
-        // "not answered" history) so the one-live-question guard lets Emma re-ask with a
-        // FRESH card. The irreversible-write gate still blocks until a real structured
-        // answer lands, so this can't rubber-stamp. Inject a directive so Emma re-asks
-        // THAT SAME question instead of inferring a choice from the prose and advancing.
-        // Optimistic-locked (Greptile P1, "Typed messages bypass answer lock"):
-        // a card-answer submission racing this typed message could already have
-        // persisted a real answer between our read and this write. An
-        // unconditional clear would then erase that just-landed answer (or,
-        // the other way round, this clear could land first and make the valid
-        // answer submission fail with a false "already answered"). Guard the
-        // clear on the question still being exactly this one, still awaiting.
         const abandoned = session.pendingUserQuestion;
-        const cleared = await chatbotDb.updateSessionAskUserQuestion(sessionId, null, {
+        const typedAnswer = resolveTypedTextAnswer(abandoned, userMessage, new Date().toISOString());
+        const nextQuestion = typedAnswer ?? null;
+        // Both typed resolution and clear/re-ask retain the same optimistic lock:
+        // a concurrent card click must never be erased or overwritten.
+        const persisted = await chatbotDb.updateSessionAskUserQuestion(sessionId, nextQuestion, {
           requireStillAwaiting: abandoned.questionId,
         });
-        if (cleared) {
-          session.pendingUserQuestion = undefined;
-          answerAck = buildReaskDirective(abandoned);
+        if (persisted) {
+          session.pendingUserQuestion = typedAnswer;
+          if (typedAnswer?.answer) {
+            answerAck = buildAnswerAcknowledgement(typedAnswer) ?? undefined;
+            answeredQuestionMeta = {
+              questionId: typedAnswer.questionId,
+              optionId: typedAnswer.answer.optionId,
+              delegated: false,
+            };
+          } else {
+            answerAck = buildReaskDirective(abandoned);
+          }
         } else {
           // Lost the race — a concurrent structured answer already resolved
           // this question. Re-read the fresh state so the run proceeds against
           // the REAL answer rather than silently discarding it.
           const fresh = await chatbotDb.getChatSession(sessionId);
           session.pendingUserQuestion = fresh?.pendingUserQuestion;
+        }
+      }
+
+      // Work-plan details are validated and persisted as structured values before
+      // Emma receives the continuation. This keeps chat and MCP answers identical
+      // and makes duplicate submits fail closed instead of overwriting the first.
+      if (workPlanInputAnswer) {
+        try {
+          const pendingWorkPlanInput = session.pendingWorkPlanInput;
+          if (!pendingWorkPlanInput) {
+            return res.status(409).json({ error: 'These details are no longer awaiting a response.', code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          const answered = resolveWorkPlanInputAnswer(
+            pendingWorkPlanInput,
+            workPlanInputAnswer.values,
+            new Date().toISOString(),
+          );
+          const persisted = await chatbotDb.updateSessionWorkPlanInputRequest(sessionId, answered, {
+            requireStillAwaiting: workPlanInputAnswer.requestId,
+          });
+          if (!persisted) return res.status(409).json({ error: 'These details were already submitted.', code: 'WORK_PLAN_INPUT_INVALID' });
+          userMessage = `${userMessage}\n\n[Structured work plan details: ${JSON.stringify(answered.answer?.values ?? {})}]`;
+        } catch (err) {
+          if (err instanceof WorkPlanInputRequestError || err instanceof TypeError) {
+            return res.status(409).json({ error: err.message, code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          throw err;
         }
       }
 
@@ -6318,7 +8479,11 @@ export const agentModeController = {
       // Reject concurrent requests for the same session. The claim is atomic
       // (check-and-set in one call) so two near-simultaneous requests can never
       // both proceed — exactly one wins, the other gets 409 SESSION_BUSY.
-      if (!tryClaimSessionGeneration(sessionId)) {
+      // ENG-1239: UNLESS the lock is held by a background media auto-continuation, not
+      // another real request — a genuine customer message takes priority over that, so
+      // preempt it instead of flatly rejecting a request the customer had every right to
+      // make (see preemptAutoContinuationAndWait).
+      if (!tryClaimSessionGeneration(sessionId) && !(await preemptAutoContinuationAndWait(sessionId))) {
         // A DIFFERENT message on a busy session: give back the idem claim we
         // just took so the user's retry (after the busy run finishes) is accepted.
         if (idemKeyHeld) {
@@ -6336,6 +8501,9 @@ export const agentModeController = {
 
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
+      // Composed once for every refusal path below so the three 429s cannot
+      // disagree with each other either (ENG-1344 AC6).
+      const usageBlockCopy = buildUsageBlockCopy({ month: usageStatus.month });
       if (!usageStatus.allowed) {
         if (usageStatus.usagePolicyVersion) {
           modelPolicyDecision = await resolveEffectiveModelForUser({
@@ -6350,7 +8518,10 @@ export const agentModeController = {
             toStoredModelPolicyDecision(modelPolicyDecision),
           );
           return res.status(429).json({
-            error: 'AI usage is paused until your next reset or additional usage is added.',
+            // ENG-1344 AC6: one server-side producer for both the flat string and
+            // the structured copy, so no client can word this block differently.
+            error: usageBlockCopy.message,
+            usageBlock: usageBlockCopy,
             code: 'usage_paused',
             usageMode: modelPolicyDecision.usageMode,
             requestedModel: modelPolicyDecision.requestedModel,
@@ -6363,7 +8534,10 @@ export const agentModeController = {
           });
         }
         return res.status(429).json({
-          error: 'AI usage is paused until your next reset or additional usage is added.',
+          // ENG-1344 AC6: one server-side producer for both the flat string and
+          // the structured copy, so no client can word this block differently.
+          error: usageBlockCopy.message,
+          usageBlock: usageBlockCopy,
           code: 'usage_paused',
           usageMode: 'paused',
         });
@@ -6416,7 +8590,10 @@ export const agentModeController = {
           toStoredModelPolicyDecision(modelPolicyDecision),
         );
         return res.status(429).json({
-          error: 'AI usage is paused until your next reset or additional usage is added.',
+          // ENG-1344 AC6: one server-side producer for both the flat string and
+          // the structured copy, so no client can word this block differently.
+          error: usageBlockCopy.message,
+          usageBlock: usageBlockCopy,
           code: 'usage_paused',
           usageMode: 'paused',
           requestedModel: modelPolicyDecision.requestedModel,
@@ -6496,8 +8673,9 @@ export const agentModeController = {
         answeredQuestionMeta, // ENG-396: structured click record stamped on the reply
         turnStartMs, // ENG-907: the deadline withGenerationTimeout below enforces
         undefined, // publishAuthorizationOverride — interactive path resolves per turn
-        modelPolicyDecision.transientFallbackModel,
-        modelPolicyDecision
+        undefined, // approvedRevisionImageSources
+        undefined, // userMessageKind
+        Boolean(questionAnswer || workPlanInputAnswer),
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -6567,19 +8745,66 @@ export const agentModeController = {
           // the still-missing assets on "continue" (it sees the saved markers in history).
           // Non-media timeouts fall through to the existing 504 unchanged.
           try {
-            // ENG-510: strongly consistent read — a marker written moments before the cap
-            // fired must not be missed by an eventually-consistent read (which would drop
-            // to a bare 504 despite a completed, saved image).
+            // ENG-510: strongly consistent read of MESSAGES — a marker written moments
+            // before the cap fired must not be missed by an eventually-consistent read
+            // (which would drop to a bare 504 despite a completed, saved image).
+            // ENG-1719: this does NOT make `.workPlan` below strongly consistent —
+            // getChatSession's consistentRead flag only threads into
+            // getMessagesFromMessagesTable, never into the base-record fetch `.workPlan`
+            // actually lives on (same gap already documented on
+            // scheduleAutoWorkPlanContinuation's own pre-fire recheck). Best-effort here:
+            // a step completed in the same instant the cap fired could still read as
+            // pending, costing at most one wasted round — round 1's own pre-fire recheck
+            // (which reads the same base record fresh) self-corrects before round 2 fires.
             const timedOutSession = await chatbotDb.getChatSession(sessionId, true);
             const timeoutImages = collectMediaGeneratedSince(timedOutSession?.messages, turnStartMs);
             const continuationMsg = buildTimeoutContinuationMessage(timeoutImages);
+
+            // ENG-1717: the work-plan analogue of the hasPersistedMediaBudgetDeferral hook
+            // below. The stall backstop (ENG-1684) only ran on the SUCCESS path, reading
+            // `response.workPlan` — which doesn't exist here, because the turn was abandoned
+            // by withGenerationTimeout rather than settling. So an autocomplete plan left
+            // unfinished by a timed-out turn got no continuation at all, which is exactly how
+            // the most common failure (a long create_html_file turn blowing the cap) fell
+            // through the backstop entirely. Read the PERSISTED plan off the base record
+            // instead, the same way the media case reads persisted markers.
+            //
+            // Deliberately skipped when the media continuation is about to fire for this same
+            // turn: both claim the same session-generation lock, and racing them is the
+            // interaction bug the ENG-1700 design review already caught on the success path.
+            // Media wins because it is the more specific signal.
+            //
+            // ENG-1719: gating on `hasPersistedMediaBudgetDeferral` ALONE was wrong — that
+            // helper only checks whether a deferral MARKER was persisted, not whether
+            // `continuationMsg` below is actually truthy (buildTimeoutContinuationMessage
+            // returns null when zero images completed since turnStartMs). A deferral marker
+            // can exist with zero completed images — e.g. the cap fires before the first
+            // image in the batch finishes — in which case the media continuation's own gate
+            // (`if (continuationMsg)`, below) never fires either, and with the old check the
+            // work-plan continuation was suppressed for nothing: NEITHER continuation runs.
+            // Require both signals so the work-plan continuation is only suppressed when the
+            // media one will genuinely take over.
+            const mediaContinuationWillFire = Boolean(continuationMsg)
+              && hasPersistedMediaBudgetDeferral(timedOutSession?.messages, turnStartMs);
+            if (
+              !mediaContinuationWillFire &&
+              timedOutSession?.workPlan?.autocomplete === true &&
+              workPlanHasPendingStep(timedOutSession.workPlan)
+            ) {
+              setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
+                console.error(`AgentMode: work-plan auto-continuation (whole-turn timeout) failed for session ${sessionId}:`, err),
+              ));
+            }
             if (continuationMsg) {
               markProgressComplete(sessionId);
               await chatbotDb.addMessageToSession(sessionId, {
                 role: 'assistant',
                 content: continuationMsg,
                 timestamp: new Date().toISOString(),
-                metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+                // ENG-1239: mediaBudgetDeferred distinguishes this media-batch pause from
+                // the generic (non-media) salvage variant below, which shares the same
+                // `kind` but must NOT be picked up by hasUnresolvedMediaDeferral.
+                metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation', mediaBudgetDeferred: true },
               }).catch((persistErr) =>
                 console.error('AgentMode: failed to persist timeout continuation message:', persistErr),
               );
@@ -6587,6 +8812,21 @@ export const agentModeController = {
                 void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'timeout_partial_media' });
               }
               res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+              // ENG-1239: this is the WHOLE-TURN hard-timeout variant of the same batch —
+              // the turn never got far enough to return a `response.toolCalls` ledger for
+              // the success-path hook below to inspect, so hasDeferredMediaBudgetToolCall
+              // can't see it. hasPersistedMediaBudgetDeferral reads the same "a media call
+              // was deferred" signal off what toolDispatch already persisted before the cap
+              // fired (the real production incident, session 822c1ed4, hit exactly this
+              // branch — see the test simulating it). Only fire when a deferral actually
+              // happened this turn, not for every media-bearing timeout, so an unrelated
+              // slow turn that merely made images along the way doesn't get an unwanted
+              // extra continuation call.
+              if (hasPersistedMediaBudgetDeferral(timedOutSession?.messages, turnStartMs)) {
+                setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
+                  console.error(`AgentMode: media auto-continuation (whole-turn timeout) failed for session ${sessionId}:`, err),
+                ));
+              }
               return;
             }
 
@@ -6624,6 +8864,31 @@ export const agentModeController = {
       }
 
       markProgressComplete(sessionId);
+
+      // ENG-1239: this turn deferred a generate_image/video call to stay under the
+      // per-turn media time budget (toolDispatch's media_generation_time_budget
+      // deferral) — the model's own reply asks the user to say "continue", but nothing
+      // forces them to notice. Auto-fire that continuation ourselves so the batch
+      // finishes without the customer's involvement. setImmediate defers the kickoff
+      // past this request's own `finally` below, so scheduleAutoMediaContinuation
+      // claims the generation lock only after THIS request has released it.
+      if (hasDeferredMediaBudgetToolCall(response.toolCalls)) {
+        setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
+          console.error(`AgentMode: media auto-continuation (soft deferral) failed for session ${sessionId}:`, err),
+        ));
+      }
+
+      // ENG-1684: this turn's own settled response left an autocomplete work plan stalled
+      // (no tool calls this turn, but a step is still pending) — the exact pattern from
+      // session 7a9772f6 (Smart Water Heater GTM audit), where the model asked the user to
+      // "retry" instead of just continuing per the plan's own "never wait on the user"
+      // contract, and the session then sat idle for 3+ hours. Auto-fire the continuation
+      // ourselves, same setImmediate-after-release pattern as the media case above.
+      if (hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls)) {
+        setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
+          console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err),
+        ));
+      }
 
       // Compute page invalidations for emma-sidebar sessions so the frontend
       // can refresh the underlying page after a mutating tool call.
@@ -6678,7 +8943,7 @@ export const agentModeController = {
         workPlan: response.workPlan,
         skills: response.skills,
         ...(invalidations ? { invalidations } : {}),
-        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {}),
+        ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
         ...(modelPolicyDecision ? {
           requestedModel: modelPolicyDecision.requestedModel,
           effectiveModel: modelPolicyDecision.effectiveModel,
@@ -6751,20 +9016,26 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       let publishLedger: FalseFailureLedgerEntry[] = [];
+      let artifactUrls: ConfirmedArtifactRef[] = [];
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
             publishLedger = (await loadPublishLedger(sessionId, turnStartCalledFunctions)) || [];
-            // ENG-1173: same blanket "send it again" advice, same duplicate risk after
-            // a confirmed CRM write. The publish notice wins if both apply.
-            diagnosticContent = appendConfirmedDataWriteNotice(
-              appendConfirmedPublishNotice(
-                'The server restarted while processing your request. Please send your message again.',
+            artifactUrls = await loadConfirmedArtifactUrls(sessionId, turnStartMsForDiagnosis);
+            // ENG-1173/ENG-1224: same blanket "send it again" advice, same duplicate
+            // risk after a confirmed CRM write or lost link after a confirmed HTML
+            // edit. The publish notice wins if more than one applies.
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(
+                  'The server restarted while processing your request. Please send your message again.',
+                  publishLedger,
+                ),
                 publishLedger,
               ),
-              publishLedger,
+              artifactUrls,
             );
           } else {
             const userMessage = req.body?.userMessage || '';
@@ -6773,21 +9044,26 @@ export const agentModeController = {
             );
             diagnosticContent = diagnosis.message;
             publishLedger = diagnosis.publishLedger;
+            artifactUrls = diagnosis.artifactUrls;
           }
         }
 
         const errorAssistantMessage: ChatMessage = {
-          // ENG-971: the fallback carries no outcome at all, just blanket retry
-          // advice — so when the ledger confirms a publish, name it. Applied ONLY to
-          // the fixed string: a diagnosis message has already been judged on its own
-          // prose, and a truthful one must not collect a "Correction" banner.
+          // ENG-971/ENG-1224: the fallback carries no outcome at all, just blanket
+          // retry advice — so when the ledger confirms a publish, data write, or HTML
+          // edit, name it. Applied ONLY to the fixed string: a diagnosis message has
+          // already been judged on its own prose, and a truthful one must not collect
+          // a "Correction" banner.
           role: 'assistant',
-          content: diagnosticContent || appendConfirmedDataWriteNotice(
-            appendConfirmedPublishNotice(
-              'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedArtifactNotice(
+            appendConfirmedDataWriteNotice(
+              appendConfirmedPublishNotice(
+                'I encountered an error processing your request. Please try sending your message again.',
+                publishLedger,
+              ),
               publishLedger,
             ),
-            publishLedger,
+            artifactUrls,
           ),
           timestamp: new Date().toISOString(),
           metadata: {
@@ -6970,7 +9246,7 @@ export const agentModeController = {
   async getSupportedModels(req: Request, res: Response) {
     try {
       const { user } = await getUserFromToken(req);
-      const models = await agentModeService.getSupportedModels(user?.isAdmin === true);
+      const models = await agentModeService.getSupportedModelsWithMetadata(user?.isAdmin === true);
       res.json(models);
     } catch (error) {
       console.error('AgentMode: Get supported models error:', error);
@@ -6989,11 +9265,11 @@ export const agentModeController = {
       const optimizedModels = usage.policy
         ? usage.policy.optimizedModelIds.filter((model) => supported.has(model))
         : supportedModels;
-      const selectableModels = usage.mode.usageMode === 'optimized'
-        ? optimizedModels
-        : usage.mode.usageMode === 'paused'
-          ? []
-          : supportedModels;
+      // ENG-1211 AC1: nothing below the hard cap may hide a model. Only a paused
+      // account has an empty picker; every other state offers the full entitled
+      // set. `optimizedModels` is still returned as `scheduleBackupModels` for
+      // the legacy backup field and for the ENG-1213 recommendation catalog.
+      const selectableModels = usage.mode.usageMode === 'paused' ? [] : supportedModels;
       res.json({
         usageMode: usage.mode.usageMode,
         canGenerate: usage.mode.admissionAllowed,
@@ -7060,6 +9336,42 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Get welcome message error:', error);
       res.status(500).json({ error: 'Failed to get welcome message' });
+    }
+  },
+
+  // Presentation-only New Chat greeting. It is never included in Emma's prompt
+  // or persisted as a chat message.
+  async getNewChatHeroGreeting(req: Request, res: Response) {
+    try {
+      res.json(await agentModeService.getNewChatHeroGreeting());
+    } catch (error) {
+      console.error('AgentMode: Get New Chat hero greeting error:', error);
+      res.status(500).json({ error: 'Failed to get New Chat hero greeting' });
+    }
+  },
+
+  async updateNewChatHeroGreeting(req: Request, res: Response) {
+    try {
+      const validationError = validateNewChatHeroGreeting(req.body);
+      if (validationError) return res.status(400).json({ error: validationError });
+
+      const greeting = await agentModeService.saveNewChatHeroGreeting(
+        req.body,
+        req.user?.email || 'system',
+      );
+      res.json(greeting);
+    } catch (error) {
+      console.error('AgentMode: Update New Chat hero greeting error:', error);
+      res.status(500).json({ error: 'Failed to update New Chat hero greeting' });
+    }
+  },
+
+  async resetNewChatHeroGreeting(req: Request, res: Response) {
+    try {
+      res.json(await agentModeService.resetNewChatHeroGreeting());
+    } catch (error) {
+      console.error('AgentMode: Reset New Chat hero greeting error:', error);
+      res.status(500).json({ error: 'Failed to reset New Chat hero greeting' });
     }
   },
 
@@ -7347,7 +9659,8 @@ export const agentModeController = {
           // reflect the real answered option (highlight + "Answered") instead of a bare
           // "View only". Everything here is already visible in the transcript's card, so
           // it leaks nothing new; the share stays read-only via the card's readOnly path.
-          pendingUserQuestion: session.pendingUserQuestion
+          pendingUserQuestion: session.pendingUserQuestion,
+          pendingWorkPlanInput: session.pendingWorkPlanInput
         }
       });
 
@@ -7394,7 +9707,8 @@ export const agentModeController = {
     try {
       const { shareId } = req.params;
       const { conversable } = req.query;
-      const { userMessage, llmModel, attachments = [] } = req.body;
+      const { userMessage, llmModel, attachments = [], workPlanInputAnswer } = req.body;
+      let effectiveUserMessage = userMessage;
 
       if (!userMessage) {
         return res.status(400).json({ error: 'User message is required' });
@@ -7430,7 +9744,9 @@ export const agentModeController = {
       // Reject concurrent requests for the same session. Atomic check-and-set
       // (see tryClaimSessionGeneration) — two near-simultaneous requests can
       // never both proceed; exactly one wins, the other gets 409 SESSION_BUSY.
-      if (!tryClaimSessionGeneration(session.sessionId)) {
+      // ENG-1239: unless it's a background media auto-continuation holding the lock —
+      // preempt that instead (see the regular /generate path above).
+      if (!tryClaimSessionGeneration(session.sessionId) && !(await preemptAutoContinuationAndWait(session.sessionId))) {
         return res.status(409).json({
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
@@ -7439,6 +9755,32 @@ export const agentModeController = {
       }
 
       try {
+
+      if (workPlanInputAnswer) {
+        try {
+          const pendingWorkPlanInput = session.pendingWorkPlanInput;
+          if (!pendingWorkPlanInput) {
+            return res.status(409).json({ error: 'These details are no longer awaiting a response.', code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          const answered = resolveWorkPlanInputAnswer(
+            pendingWorkPlanInput,
+            workPlanInputAnswer.values,
+            new Date().toISOString(),
+          );
+          const persisted = await chatbotDb.updateSessionWorkPlanInputRequest(session.sessionId, answered, {
+            requireStillAwaiting: workPlanInputAnswer.requestId,
+          });
+          if (!persisted) {
+            return res.status(409).json({ error: 'These details were already submitted.', code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          effectiveUserMessage = `${effectiveUserMessage}\n\n[Structured work plan details: ${JSON.stringify(answered.answer?.values ?? {})}]`;
+        } catch (err) {
+          if (err instanceof WorkPlanInputRequestError || err instanceof TypeError) {
+            return res.status(409).json({ error: err.message, code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          throw err;
+        }
+      }
 
       // ENG-705: this route is registered before `router.use(authenticateToken)`,
       // so the caller is anonymous — but the spend is not. Gate on the share
@@ -7505,7 +9847,7 @@ export const agentModeController = {
       const response = await withGenerationTimeout(
         generateSessionResponse(
           session.sessionId,
-          userMessage,
+          effectiveUserMessage,
           session.userId,
           modelToUse,
           attachments,
@@ -7521,8 +9863,9 @@ export const agentModeController = {
           // for it, exactly as ENG-907 described.
           sharedTurnStartMs,
           undefined, // publishAuthorizationOverride — shared path has no schedule consent
-          modelPolicyDecision.transientFallbackModel,
-          modelPolicyDecision
+          undefined, // approvedRevisionImageSources
+          undefined, // userMessageKind
+          Boolean(workPlanInputAnswer),
         ),
         session.sessionId
       );
@@ -7536,7 +9879,7 @@ export const agentModeController = {
         sources: response.sources,
         workPlan: response.workPlan,
         skills: response.skills,
-        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
+        ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
       });
       } finally {
         releaseSessionGeneration(session.sessionId);
@@ -7576,7 +9919,7 @@ export const agentModeController = {
               role: 'assistant',
               content: continuationMsg,
               timestamp: new Date().toISOString(),
-              metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+              metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation', mediaBudgetDeferred: true },
             });
             handledPartialTimeout = true;
             // ENG-510: return the partial delivery as a normal 200 (mirrors the regular
@@ -7585,6 +9928,21 @@ export const agentModeController = {
             // Progress was already completed above; the session lock is released in the
             // inner finally, so this early return is safe.
             res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+            // ENG-1239: same whole-turn hard-timeout auto-continuation as the regular
+            // /generate path above — see that branch's comment for why
+            // hasDeferredMediaBudgetToolCall can't see this case. `session`/`modelToUse`
+            // were declared inside the outer try above and aren't visible in this catch
+            // (same reason `shareId` is re-derived from req.params instead of reused) —
+            // timedOutSession's strongly-consistent read already carries both fields,
+            // since updateSessionLlmModel persisted the effective model before generation
+            // started and continuationMsg being non-null guarantees timedOutSession exists.
+            if (hasPersistedMediaBudgetDeferral(timedOutSession?.messages, sharedTurnStartMs)) {
+              const continuationUserId = timedOutSession!.userId;
+              const continuationModel = timedOutSession!.llmModel || agentModeService.default_model;
+              setImmediate(() => scheduleAutoMediaContinuation(shareId, continuationUserId, continuationModel, 1).catch((err) =>
+                console.error(`AgentMode: media auto-continuation (ishare whole-turn timeout) failed for session ${shareId}:`, err),
+              ));
+            }
             return;
           }
 
@@ -7615,38 +9973,47 @@ export const agentModeController = {
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
       let publishLedger: FalseFailureLedgerEntry[] = [];
+      let artifactUrls: ConfirmedArtifactRef[] = [];
       if (!handledPartialTimeout && shareId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
             publishLedger = (await loadPublishLedger(shareId, turnStartCalledFunctions)) || [];
-            // ENG-1173: see the matching comment on the regular /generate path.
-            diagnosticContent = appendConfirmedDataWriteNotice(
-              appendConfirmedPublishNotice(
-                'The server restarted while processing your request. Please send your message again.',
+            artifactUrls = await loadConfirmedArtifactUrls(shareId, sharedTurnStartMs);
+            // ENG-1173/ENG-1224: see the matching comment on the regular /generate path.
+            diagnosticContent = appendConfirmedArtifactNotice(
+              appendConfirmedDataWriteNotice(
+                appendConfirmedPublishNotice(
+                  'The server restarted while processing your request. Please send your message again.',
+                  publishLedger,
+                ),
                 publishLedger,
               ),
-              publishLedger,
+              artifactUrls,
             );
           } else {
             const userMessage = req.body?.userMessage || '';
             const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage, turnStartCalledFunctions, sharedTurnStartMs);
             diagnosticContent = diagnosis.message;
             publishLedger = diagnosis.publishLedger;
+            artifactUrls = diagnosis.artifactUrls;
           }
         }
 
         const errorAssistantMessage: ChatMessage = {
-          // ENG-971: see the matching comment in generateResponse — the fixed
-          // fallback gets the ledger's confirmed outcome, model prose does not.
+          // ENG-971/ENG-1224: see the matching comment in generateResponse — the
+          // fixed fallback gets the ledger's confirmed outcome, model prose does not.
           role: 'assistant',
-          content: diagnosticContent || appendConfirmedDataWriteNotice(
-            appendConfirmedPublishNotice(
-              'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedArtifactNotice(
+            appendConfirmedDataWriteNotice(
+              appendConfirmedPublishNotice(
+                'I encountered an error processing your request. Please try sending your message again.',
+                publishLedger,
+              ),
               publishLedger,
             ),
-            publishLedger,
+            artifactUrls,
           ),
           timestamp: new Date().toISOString(),
           metadata: {
@@ -8090,6 +10457,108 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Submit message feedback error:', error);
       res.status(500).json({ error: 'Failed to submit feedback' });
+    }
+  },
+
+  /**
+   * POST /api/agent-mode/session/:sessionId/work-plan-recommendations/:recommendationId/accept
+   *
+   * ENG-1472: the owner-only accept endpoint for a `recommend_predefined_work_plan`
+   * proposal. Only the session owner may call it — this route sits below
+   * `router.use(authenticateToken)` and is deliberately NOT registered under the
+   * `/ishare`/`/share` public routes, so interactive/view-only shares (which
+   * authenticate via a conversable token, not a JWT) cannot reach it at all.
+   *
+   * The plan to instantiate is resolved from the SESSION'S OWN persisted
+   * recommendation record by recommendationId — never from anything in the
+   * request body — and re-resolved for access at click time before being
+   * applied via the existing applyPredefinedWorkPlan path.
+   */
+  async acceptWorkPlanRecommendation(req: AuthenticatedRequest, res: Response) {
+    try {
+      const { sessionId, recommendationId } = req.params;
+      const user = req.user as User;
+      if (!user) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Owner-only — no admin bypass. A delegated session already carries the
+      // target customer's userId as req.user (see the delegation docs in
+      // CLAUDE.md), so this still succeeds correctly for a delegated accept;
+      // a real admin viewing someone else's session without delegating is
+      // refused, same as everywhere else a customer's own plan is mutated.
+      if (session.userId !== user.userId) {
+        return res.status(403).json({ error: 'Only the session owner can accept a work plan recommendation.' });
+      }
+
+      const { findWorkPlanRecommendationToolResult, resolveAccessiblePredefinedWorkPlan } =
+        await import('../services/predefinedWorkPlanResolver');
+
+      const recommendation = findWorkPlanRecommendationToolResult(
+        session.messages,
+        (r) => r.recommendationId === recommendationId,
+      );
+      if (!recommendation || !recommendation.plan?.id) {
+        return res.status(404).json({
+          error: 'WORKPLAN_UNAVAILABLE',
+          code: 'WORKPLAN_UNAVAILABLE',
+          message: 'This work plan recommendation is no longer available.',
+        });
+      }
+      const planId = recommendation.plan.id;
+
+      // Idempotency requires the stable template identity. A legacy work plan
+      // without templatePlanId cannot safely be matched by title: ad-hoc plans
+      // can share a template title, so treating one as applied would silently
+      // suppress the selected recommendation.
+      const existingWorkPlan = session.workPlan;
+      const hasActivePlan = !!existingWorkPlan && Array.isArray(existingWorkPlan.steps) && existingWorkPlan.steps.length > 0;
+      const alreadyApplied = hasActivePlan && (existingWorkPlan as any).templatePlanId === planId;
+      if (alreadyApplied) {
+        return res.status(200).json({ success: true, alreadyApplied: true, workPlan: existingWorkPlan });
+      }
+
+      // A DIFFERENT work plan is already active — conflict, never force-replace here.
+      if (hasActivePlan) {
+        return res.status(409).json({
+          error: 'ACTIVE_WORK_PLAN',
+          code: 'ACTIVE_WORK_PLAN',
+          message: `A work plan "${existingWorkPlan!.title}" is already active in this session.`,
+        });
+      }
+
+      // Re-resolve access at click time — the plan can have been deleted,
+      // unpublished, or had its access changed since it was recommended.
+      const plan = await resolveAccessiblePredefinedWorkPlan({ planId, userId: user.userId });
+      if (!plan) {
+        return res.status(404).json({
+          error: 'WORKPLAN_UNAVAILABLE',
+          code: 'WORKPLAN_UNAVAILABLE',
+          message: 'This work plan is no longer available.',
+        });
+      }
+
+      const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId);
+      if (!result.success) {
+        // Defensive backstop for a race between our pre-check above and this
+        // call (e.g. a concurrent accept/launch landed in between) — never a
+        // silent partial: chat/session state is left exactly as applyPredefinedWorkPlan
+        // left it (unchanged on failure).
+        if (result.requiresConfirmation) {
+          return res.status(409).json({ error: 'ACTIVE_WORK_PLAN', code: 'ACTIVE_WORK_PLAN', message: result.message });
+        }
+        return res.status(404).json({ error: 'WORKPLAN_UNAVAILABLE', code: 'WORKPLAN_UNAVAILABLE', message: result.message });
+      }
+
+      return res.status(200).json({ success: true, alreadyApplied: false, workPlan: result.workPlan });
+    } catch (error) {
+      console.error('AgentMode: Accept work plan recommendation error:', error);
+      res.status(500).json({ error: 'Failed to accept work plan recommendation' });
     }
   },
 
@@ -8675,7 +11144,7 @@ export const agentModeController = {
         scheduledNextRunTime = providedDate.toISOString();
       } else {
         // Default behavior: calculate next run time (9 AM UTC = 1 AM PST)
-        const calculatedTime = calculateNextRunTime(scheduleFrequency, now, frequencyIntervalDays);
+        const calculatedTime = calculateNextRunTime(scheduleFrequency, now, frequencyIntervalDays, scheduleId);
         scheduledNextRunTime = calculatedTime.toISOString();
       }
 
@@ -8705,6 +11174,11 @@ export const agentModeController = {
         // and absent from the manage_scheduled_chat MCP allowlist, so only a human
         // can set it.
         requirePublishApproval: requirePublishApproval === true,
+        // ENG-1131 follow-up: owner opt-OUT for the proactive "LinkedIn search
+        // blocked/recovered" transition email specifically — does not affect the
+        // schedule-card badge, per-run emails, or run history, which stay on.
+        // Default false = alerts on, matching every existing schedule's behavior.
+        disableSourcingBlockAlerts: req.body.disableSourcingBlockAlerts === true,
         // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
         // client didn't send one — the cadence check then falls back to UTC).
         ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
@@ -8847,6 +11321,7 @@ export const agentModeController = {
         selfImprove,
         fullAutonomy,
         requirePublishApproval,
+        disableSourcingBlockAlerts,
         timezone
       } = req.body;
 
@@ -8940,9 +11415,28 @@ export const agentModeController = {
         ...(requirePublishApproval !== undefined
           ? { requirePublishApproval: requirePublishApproval === true }
           : {}),
+        // ENG-1131 follow-up: partial-update safe, same pattern as selfImprove —
+        // preserve the existing value when this request doesn't touch it.
+        disableSourcingBlockAlerts: disableSourcingBlockAlerts !== undefined
+          ? (disableSourcingBlockAlerts === true)
+          : ((existingSchedule as any).disableSourcingBlockAlerts || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
-        llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
+        // ENG-1365: partial-update safe, for the reason the requirePublishApproval
+        // comment above already gives. The previous form was
+        // `llmModel !== undefined ? llmModel : (existingSchedule.llmModel || '')`,
+        // whose fallback wrote `''` whenever the request stayed silent AND the
+        // stored attribute was absent -- so a rename, a cadence change, any edit at
+        // all, converted "inherits the platform default" into "stores an empty
+        // string". It only moved one way, and the empty string is the state that
+        // made every model switch 409 permanently (ENG-1363).
+        //
+        // Silent request -> omit the key entirely; the partial SET leaves whatever
+        // is stored exactly as it is, including an existing `''`, which is a data
+        // question and not a rename's business.
+        // Explicit empty -> a REMOVAL below, because inheritance is the ABSENCE of
+        // the attribute, not a blank value in it.
+        ...(llmModel !== undefined && llmModel !== '' ? { llmModel } : {}),
         ...scheduleBackup,
         // ENG-844: update the owner's timezone when a valid one is supplied; keep
         // the existing value otherwise (partial-update safe).
@@ -8954,7 +11448,9 @@ export const agentModeController = {
       // Whenever the prompt actually changes, snapshot the PREVIOUS prompt into the
       // revision history so it can be reverted. This applies to every update path —
       // manual edits, Emma's manage_scheduled_chat tool, and self-improve. Keep the
-      // most recent SCHEDULE_PROMPT_REVISION_LIMIT revisions only.
+      // most recent SCHEDULE_PROMPT_REVISION_LIMIT revisions only; PROMPT_REVISIONS_BUDGET_BYTES
+      // (ENG-1672) is enforced below, inside shedOldest, which has the real projected
+      // item and already owns every other trim decision for this write.
       const previousStartingMessage = existingSchedule.startingMessage || '';
       if (effectiveStartingMessage !== previousStartingMessage) {
         const existingRevisions = Array.isArray((existingSchedule as any).promptRevisions)
@@ -9049,15 +11545,45 @@ export const agentModeController = {
         ? (existingSchedule as any).runResults
         : [];
       let runResultsToShed = 0;
-      const shedOldest = (listKey: 'promptRevisions' | 'runResults') => {
-        if (estimateDynamoItemBytes(projectedItem) <= SCHEDULE_ITEM_BUDGET_BYTES) return;
+      // `ownBudgetBytes` (ENG-1672) lets promptRevisions trim proactively against its
+      // OWN dedicated budget — before the whole item ever crosses SCHEDULE_ITEM_BUDGET_BYTES
+      // — since a self-improve schedule's revision history alone can approach the item
+      // ceiling from just a handful of entries. That trim runs isolated (against `{}`,
+      // not the real projected item) so unrelated fields never inflate how aggressively
+      // it sheds; a whole-item overflow still trims against the real projected item, same
+      // as before ENG-1672.
+      const shedOldest = (listKey: 'promptRevisions' | 'runResults', ownBudgetBytes?: number) => {
         const list = Array.isArray(projectedItem[listKey]) ? projectedItem[listKey] : [];
         if (list.length === 0) return;
-        const { kept, dropped } = trimListToItemBudget(projectedItem, listKey, list);
-        if (dropped === 0) return;
-        console.warn(
-          `AgentMode: schedule ${scheduleId} is over the DynamoDB item budget — dropped the ${dropped} oldest of ${list.length} ${listKey} entries to fit`
-        );
+        const overOwnBudget = ownBudgetBytes !== undefined
+          && estimateDynamoItemBytes({ [listKey]: list }) > ownBudgetBytes;
+        if (!overOwnBudget && estimateDynamoItemBytes(projectedItem) <= SCHEDULE_ITEM_BUDGET_BYTES) return;
+        const { kept: trimmed } = overOwnBudget
+          ? trimListToItemBudget({}, listKey, list, ownBudgetBytes)
+          : trimListToItemBudget(projectedItem, listKey, list);
+        // Never let a trim erase the newest entry outright — including the one this
+        // very edit just created — even when it alone exceeds the byte budget; a
+        // genuinely oversized write is still caught by the whole-item check below.
+        const usedFallback = trimmed.length === 0;
+        const kept = usedFallback ? list.slice(-1) : trimmed;
+        const dropped = list.length - kept.length;
+        if (dropped === 0 && !usedFallback) return;
+        // `usedFallback` always logs, even when `dropped === 0` — that happens when
+        // there was nothing else in `list` to drop in the first place (the single
+        // newest entry alone already exceeds the byte budget). Staying silent just
+        // because nothing existed yet to trim away would defeat the whole point of
+        // this budget: flagging a schedule already sitting at that edge.
+        if (usedFallback) {
+          console.warn(
+            dropped > 0
+              ? `AgentMode: schedule ${scheduleId} kept only the newest ${listKey} entry — it alone still exceeds the byte budget after dropping ${dropped} older entries`
+              : `AgentMode: schedule ${scheduleId} kept the newest ${listKey} entry even though it alone exceeds the byte budget — no older entries existed to drop`
+          );
+        } else {
+          console.warn(
+            `AgentMode: schedule ${scheduleId} is over the DynamoDB item budget — dropped the ${dropped} oldest of ${list.length} ${listKey} entries to fit`
+          );
+        }
         if (listKey === 'runResults') {
           // Never write run history back from the read above: a run finishing while
           // this edit is in flight appends to the tail, and a full-list write derived
@@ -9071,7 +11597,7 @@ export const agentModeController = {
       };
       // Revision history first: it is pure undo state. Run history is only shed once
       // revisions are exhausted, because it feeds the run-health summary.
-      shedOldest('promptRevisions');
+      shedOldest('promptRevisions', PROMPT_REVISIONS_BUDGET_BYTES);
       shedOldest('runResults');
       if (estimateDynamoItemBytes(projectedItem) > SCHEDULE_ITEM_BUDGET_BYTES) {
         return res.status(400).json({
@@ -9102,7 +11628,10 @@ export const agentModeController = {
               expectedLength: observedRunResults.length,
               expectedLast: observedRunResults[observedRunResults.length - 1],
             }
-          : undefined
+          : undefined,
+        // ENG-1365: only when the request EXPLICITLY clears the model. A silent
+        // request removes nothing, because it was never asked to.
+        llmModel === '' ? ['llmModel'] : undefined
       );
 
       res.json({
@@ -9536,7 +12065,12 @@ export const agentModeController = {
           }
         }
       };
-      backgroundRun().catch(err => {
+      // ENG-1189: unlike its sibling runScheduledChat dispatch sites in this
+      // file, this one wasn't wrapped in trackScheduledRun — the graceful
+      // shutdown drain never waited for it, so a deploy mid-run left this
+      // self-calling run to fail against a closed listener the same way
+      // manage_scheduled_chat did.
+      trackScheduledRun(backgroundRun().catch(err => {
         console.error('AgentMode: Background test run error:', err);
         const { reportUIError } = require('../utils/errorReporter');
         reportUIError({
@@ -9549,7 +12083,7 @@ export const agentModeController = {
             'Run ID': runId,
           },
         }).catch((reportErr: Error) => console.error('errorReporter failed:', reportErr));
-      });
+      }));
 
       res.json({
         runId,
@@ -9567,23 +12101,34 @@ export const agentModeController = {
   /**
    * POST /api/agent-mode/scheduled-chats/:scheduleId/publish-consent
    *
-   * ENG-827 (Greptile): a REVOKE-ONLY lever for a schedule's unattended publishing.
+   * ENG-827: sets or clears a schedule's standing unattended-publish consent
+   * (`authorized: true` grants, `authorized: false` revokes). The function name
+   * predates the grant direction being added and is now inaccurate — kept as-is
+   * to avoid an unrelated rename in a docs-only fix; the body below is current.
    *
-   * The setting itself is not writable from the generic update body or the MCP
-   * allowlist, because a model that could GRANT it would be manufacturing standing
-   * consent to post under the owner's name. Revoking is the opposite: it can only ever
-   * make a schedule safer, and it is what lets an owner (or Emma acting on their spoken
-   * instruction — "stop auto-posting on this one") stop future unattended publishing
-   * without hunting through the schedule form.
+   * The setting is still NOT writable from the generic update body or the MCP
+   * allowlist — only this dedicated endpoint can touch it — because a model that
+   * could grant it that way would be manufacturing standing consent to post under
+   * the owner's name with none of the checks below. Those checks are what make the
+   * grant direction safe to expose here at all:
    *
-   * The asymmetry is enforced here rather than trusted to the caller: `authorized: true`
-   * is REJECTED outright. There is no request shape that turns publishing on.
+   *   - Never from a delegated/admin session — only the account owner's own
+   *     authenticated request may grant (revoke stays open to delegation; it only
+   *     ever makes a schedule safer, matching ENG-803's original concern that a
+   *     model able to switch the hold ON could quietly stop a schedule publishing
+   *     and truthfully cite the block).
+   *   - Scope is derived from the schedule's own `requiredFunctionCalls` (or, for
+   *     the one legacy backfill, an explicit ENG-1245 `tools=` line) — never
+   *     inferred or left open-ended. No designated publish tool means nothing to
+   *     authorize, and the request is rejected rather than silently granting
+   *     everything or nothing.
+   *   - The write is optimistic-locked to the exact tools/consent-state read a
+   *     moment earlier, so a schedule edited mid-request 409s instead of
+   *     authorizing a scope the owner never actually saw.
    *
-   * ENG-803's concern is real and is why this stays revoke-only: a model able to switch
-   * the hold ON could quietly stop a schedule publishing and then truthfully cite the
-   * block, recreating that ticket's bug through a legitimate mechanism. That failure is
-   * visible, durable and reversible by the owner — a stray grant would be an
-   * irreversible public post — so the two directions do not deserve the same treatment.
+   * See `agentModeController.revokePublishConsent.test.ts` for the full contract
+   * (both directions, the delegation block, the tool-scope requirement, and the
+   * optimistic-lock behavior on concurrent edits).
    */
   async revokeScheduledChatPublishConsent(req: Request, res: Response) {
     try {
@@ -9780,6 +12325,33 @@ export const agentModeController = {
     }
   },
 
+  // ENG-1071: read-only storage-pressure diagnosis. AGW-241 / ENG-1048 established
+  // that a schedule's item can silently drift toward DynamoDB's 400KB ceiling and
+  // fail every subsequent write with an opaque error, and that root-causing it
+  // required direct CloudWatch + DynamoDB access. This surfaces the same byte
+  // breakdown (current prompt / prompt revisions / run results) that diagnosis used,
+  // through the authenticated API, so Emma or the portal can explain it without an
+  // operator. Read-only: no field is trimmed, pruned, or written here — that stays
+  // ENG-1048's job on the update path above.
+  async getScheduledChatStorageDiagnostics(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
+
+      // Verify schedule exists and belongs to user (same ownership check as every
+      // other scheduled-chat endpoint — this never accepts an operator override).
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      res.json(getScheduleStorageDiagnostics(schedule));
+    } catch (error) {
+      console.error('AgentMode: Get scheduled chat storage diagnostics error:', error);
+      res.status(500).json({ error: 'Failed to get scheduled chat storage diagnostics' });
+    }
+  },
+
   async sendScheduledChatTestEmail(req: Request, res: Response) {
     try {
       const user = req.user as User;
@@ -9946,7 +12518,7 @@ export const agentModeController = {
 
           // Calculate next run based on the current nextRunTime to preserve the scheduled time
           const currentNextRun = new Date(schedule.nextRunTime);
-          const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun, schedule.frequencyIntervalDays);
+          const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun, schedule.frequencyIntervalDays, schedule.scheduleId);
 
           if (scheduleVariables.length > 0 && !isVariableRequestSatisfied) {
             const requestedVariableNames = missingVariableNames.length > 0
@@ -10244,6 +12816,7 @@ export const agentModeController = {
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         workPlan: session.workPlan,
+        pendingWorkPlanInput: session.pendingWorkPlanInput,
         llmModel: modelToUse,
         isConversable: true
       });
@@ -10298,7 +12871,6 @@ export const agentModeController = {
         sources: response.sources,
         workPlan: response.workPlan,
         skills: response.skills,
-        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
     } catch (error) {
       console.error('AgentMode: Generate conversable response error:', error);
@@ -10399,7 +12971,11 @@ export const agentModeController = {
         }
       }
 
-      // Map to legacy shape expected by customer portal (uses 'id' not 'planId')
+      // Map to legacy shape expected by customer portal (uses 'id' not 'planId').
+      // `display` carries the new canonical customer-facing projection alongside
+      // the legacy keys above — existing PlanPage/AgentMode consumers keep
+      // working unchanged, and a consumer that wants the safe, deduped
+      // browse/recommendation shape reads `display` instead (ENG-1469).
       const mapPlan = (p: any) => ({
         id: p.planId,
         title: p.title,
@@ -10415,6 +12991,7 @@ export const agentModeController = {
         visibility: p.visibility,
         thumbnail_url: p.thumbnail_url,
         thumbnail_alt_text: p.thumbnail_alt_text,
+        display: projectWorkPlanForCustomer(p),
       });
 
       // Put private plans first, then public — deduplicate by title so user's
@@ -10493,6 +13070,9 @@ export const agentModeController = {
         defaultModel: workPlan.defaultModel,
         steps: workPlan.steps,
         visibility: workPlan.visibility,
+        // Canonical customer-facing projection alongside the legacy keys above
+        // — existing consumers are unaffected (ENG-1469).
+        display: projectWorkPlanForCustomer(workPlan),
       });
     } catch (error) {
       console.error('AgentMode: Get predefined work plan error:', error);
@@ -10578,11 +13158,20 @@ export const agentModeController = {
           // panel. Without this, the field set in the partner-portal
           // editor never reaches the customer portal.
           ...(step.userInstructions !== undefined && { userInstructions: step.userInstructions }),
+          ...(step.inputRequest !== undefined && { inputRequest: step.inputRequest }),
           status: 'pending' as const,
           completedAt: undefined,
           notes: undefined,
           requiredFunctionCalls: step.requiredFunctionCalls,
-          skillIds: step.skillIds
+          skillIds: step.skillIds,
+          // ENG-1331: this route never carried expectedAssetCount from the template
+          // into the session, unlike its sibling instantiation path
+          // (agentModeService.ts applyPredefinedWorkPlan) — so the step-completion
+          // gate had nothing to enforce even once the template had it set. This is
+          // the exact route the production incident session was created through
+          // (its pageIdentifier `plan-${planTitle}` matches only this path).
+          ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
+          ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
         })),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
@@ -10594,9 +13183,22 @@ export const agentModeController = {
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
         autocomplete: predefinedPlan.autocomplete || false,
         showLoginSignup: predefinedPlan.showLoginSignup || 'after_plan_completed',
-        requireLogin: predefinedPlan.requireLogin || false
+        requireLogin: predefinedPlan.requireLogin || false,
+        // ENG-1472: stamp which template this session's plan came from — the
+        // same field applyPredefinedWorkPlan stamps on its own instantiation
+        // path — so every predefined-plan session is traceable back to its
+        // template regardless of which route created it.
+        templatePlanId: predefinedPlan.planId,
       };
       await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
+      const firstInput = predefinedPlan.steps[0]?.inputRequest;
+      if (firstInput) {
+        await chatbotDb.updateSessionWorkPlanInputRequest(session.sessionId, buildWorkPlanInputRequest({
+          ...firstInput,
+          requestId: uuidv4(),
+          stepCount: 1,
+        }), { failIfAwaitingExists: true });
+      }
 
       // Auto-install ALL skills from ALL work plan steps upfront.
       // Skills need to be available from the start because tool filtering is computed
@@ -10969,7 +13571,25 @@ export const agentModeController = {
       // Ensure attachments is always an array
       const attachmentsArray = Array.isArray(attachments) ? attachments : [];
       console.log('AgentMode verifiedGenerate: Passing attachments to runVerifiedChat:', attachmentsArray.length, attachmentsArray);
-      const result = await runVerifiedChat({
+      // ENG-1189: runVerifiedChat is also called by scheduled runs (already
+      // drained separately via scheduledRunTracker/cronJobRegistry), so this
+      // interactive call is tracked at THIS call site specifically — not
+      // inside runVerifiedChat itself, which would double-count scheduled
+      // work. This in-flight tracking is orthogonal to the per-session
+      // generation LOCK: ENG-1696 found that runVerifiedChat previously took
+      // no lock at all, so a live /generate turn and a verified-generate call
+      // for the SAME session could both write session.workPlan concurrently
+      // and silently corrupt it (updateSessionWorkPlan is an unconditional
+      // overwrite). runVerifiedChat now claims activeSessionGenerations
+      // itself (with a bounded retry — see claimSessionGenerationWithRetry),
+      // the same lock /generate uses; a prior version of this comment argued
+      // that lock "would be wrong" here because two concurrent verifiedGenerate
+      // calls would "race each other's add/delete" — that reasoning didn't
+      // hold up (a second claimant's tryClaimSessionGeneration simply returns
+      // false and is correctly rejected/retried, no actual race), and it never
+      // considered the /generate-vs-verified-generate collision in the first
+      // place, which is the real bug.
+      const result = await cronJobRegistry.track('verifiedGenerateTurn', runVerifiedChat({
         sessionId,
         userId: user.userId,
         startingMessage: startingMessage.trim(),
@@ -10980,7 +13600,7 @@ export const agentModeController = {
         // ENG-636: interactive endpoint — the user's live session renders the
         // pendingUserQuestion card, so a park reaches a human who can answer.
         parkNotifiable: true
-      });
+      }));
 
       // If client disconnected, don't try to send response
       // The results are already saved to the session
@@ -11006,6 +13626,17 @@ export const agentModeController = {
         sessionId: sessionId
       });
     } catch (error: any) {
+      // ENG-1696: a busy session is an expected, benign outcome (the other
+      // side just needs to finish), not a real failure — return the same
+      // 409 shape /generate itself returns on collision, and skip the
+      // generic error path (no oncall alert, no 500) entirely.
+      if (isSessionBusyError(error)) {
+        return res.status(409).json({
+          error: 'Session is busy',
+          message: 'A response is already being generated for this session. Please wait.',
+          code: 'SESSION_BUSY',
+        });
+      }
       console.error('AgentMode: Verified generate error:', error);
       const sessionId = req.body?.sessionId;
       const user = req.user as User;
@@ -11510,6 +14141,10 @@ export const agentModeController = {
       }
 
       const now = new Date();
+      // Generated here (rather than at the schedule-object build below) so it can
+      // seed the jitter that spreads this schedule's fire time off the exact round
+      // second every other platform-wide default-timed schedule collides on.
+      const scheduleId = uuidv4();
       let scheduledNextRunTime: string;
       if (nextRunTime) {
         const providedDate = new Date(nextRunTime);
@@ -11518,7 +14153,7 @@ export const agentModeController = {
         }
         scheduledNextRunTime = providedDate.toISOString();
       } else {
-        scheduledNextRunTime = calculateNextRunTime(frequency, now, interval).toISOString();
+        scheduledNextRunTime = calculateNextRunTime(frequency, now, interval, scheduleId).toISOString();
       }
 
       // Build normalized variable values from template variables
@@ -11543,7 +14178,6 @@ export const agentModeController = {
         ? [user.email]
         : baseEmails;
 
-      const scheduleId = uuidv4();
       const scheduleBackup = await resolveScheduleBackup({
         userId: user.userId,
         requestedBackupModel: overrideBackupModel,

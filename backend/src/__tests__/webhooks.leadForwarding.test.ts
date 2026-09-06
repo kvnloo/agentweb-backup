@@ -612,10 +612,23 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       expect(response.status).toBe(200);
       expect(response.body.event).toBe('lead.unchanged');
       expect(response.body.leadId).toBe('lead_existing');
-      expect(crmDb.updateLead).not.toHaveBeenCalled();
       expect(crmDb.createLead).not.toHaveBeenCalled();
       expect(agentModeService.updateEmailDraftForLead).not.toHaveBeenCalled();
       expect(leadListAlertService.notifyLeadListOwnerIfConfigured).not.toHaveBeenCalled();
+
+      // ENG-926 §B: a repeat touch may now write the match-quality signals this lead was
+      // missing (clientIp / clientUserAgent / metaFbp), so updateLead is no longer
+      // guaranteed to be uncalled. The contract that matters is unchanged and is asserted
+      // above and below: the lead still reports `lead.unchanged`, no draft is created, no
+      // owner alert fires — and the write, if any, touches ONLY those metadata fields.
+      // Deliberately narrowed rather than deleted: "no user-visible field was modified" is
+      // the property this test exists to protect.
+      const MATCH_QUALITY_KEYS = ['clientIp', 'clientUserAgent', 'metaFbp'];
+      for (const call of (crmDb.updateLead as jest.Mock).mock.calls) {
+        const written = Object.keys(call[2]);
+        expect(written.length).toBeGreaterThan(0);
+        expect(written.filter((k) => !MATCH_QUALITY_KEYS.includes(k))).toEqual([]);
+      }
     });
 
     it('should not create auto draft when autoDraftEnabled is off', async () => {

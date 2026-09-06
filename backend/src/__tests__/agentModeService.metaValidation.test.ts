@@ -62,7 +62,7 @@ jest.mock('../services/chatbotService', () => ({
 }));
 
 import { AgentModeService } from '../services/agentModeService';
-import { metaService } from '../services/metaService';
+import { metaService, META_ACCOUNT_SCOPE_REFUSAL_MARKER } from '../services/metaService';
 import { userDb } from '../services/db';
 import { chatbotDb } from '../services/chatbotService';
 import { toolResultError } from '../utils/toolResultError';
@@ -449,6 +449,117 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(result.message).toContain('adset_999');
     });
 
+    /*
+     * A tenancy refusal must BLOCK the write, not soften the prompt.
+     *
+     * The resolvers above are wrapped in a best-effort `catch` written for a transient Graph
+     * blip — and the ad-account ownership check added to getAd/getAdSet/getCampaign throws
+     * through that same catch. Swallowed as a hiccup, "this node belongs to another ad account"
+     * degraded the prompt to `ID <id>` and the write went on to confirmation, where a user
+     * approval is exactly what unlocks the confirmed replay. A guard whose only effect is a
+     * vaguer prompt is not a guard.
+     *
+     * The refusal message is built from the marker the real guard throws
+     * (META_ACCOUNT_SCOPE_REFUSAL_MARKER, imported rather than retyped), so a reworded refusal
+     * fails here rather than silently reopening the path. metaService.singleNodeScope.test.ts
+     * pins the other half: that the real thrown error carries this marker.
+     */
+    describe('a node in another ad account blocks the write instead of degrading the prompt', () => {
+      const tenancyRefusal = () =>
+        new Error(
+          `The requested ad ${META_ACCOUNT_SCOPE_REFUSAL_MARKER}. ` +
+          `If it belongs to a different ad account, select that account and try again.`,
+        );
+
+      it('does not ask the user to approve a write to an out-of-scope ad', async () => {
+        (metaService.getAd as jest.Mock).mockRejectedValue(tenancyRefusal());
+
+        const result = await callApi(service, 'AD', 'UPDATE', {
+          ad_id: 'ad_from_another_account',
+          params: { status: 'PAUSED' },
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.requiresConfirmation).toBeUndefined();
+        expect(result.awaitingUserConfirmation).toBeUndefined();
+        expect(result.confirmationPrompt).toBeUndefined();
+        expect(result.error).toMatch(/^ACCOUNT_SCOPE_REFUSED/);
+        expect(metaService.updateAd).not.toHaveBeenCalled();
+      });
+
+      it('blocks a DELETE the same way, not only an UPDATE', async () => {
+        (metaService.getAd as jest.Mock).mockRejectedValue(tenancyRefusal());
+
+        const result = await callApi(service, 'AD', 'DELETE', { ad_id: 'ad_from_another_account' });
+
+        expect(result.success).toBe(false);
+        expect(result.requiresConfirmation).toBeUndefined();
+        expect(metaService.deleteAd).not.toHaveBeenCalled();
+      });
+
+      it('blocks when the refused node is the AD SET a create would publish into', async () => {
+        // The refusal can come from any resolver, not just the one naming the write's own id.
+        (metaService.getAdSet as jest.Mock).mockRejectedValue(tenancyRefusal());
+
+        const result = await callApi(service, 'AD', 'CREATE', {
+          ad_set_id: 'adset_from_another_account',
+          params: { name: 'Ad', creative_id: 'creative_1' },
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.requiresConfirmation).toBeUndefined();
+        expect(metaService.createAd).not.toHaveBeenCalled();
+      });
+
+      it('blocks a CAMPAIGN UPDATE whose campaign is in another ad account', async () => {
+        (metaService.getCampaign as jest.Mock).mockRejectedValue(tenancyRefusal());
+
+        const result = await callApi(service, 'CAMPAIGN', 'UPDATE', {
+          campaign_id: 'camp_from_another_account',
+          params: { status: 'PAUSED' },
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.requiresConfirmation).toBeUndefined();
+        expect(metaService.updateCampaign).not.toHaveBeenCalled();
+      });
+
+      it('the refusal is not an oracle: no node name, no owning account, no node id', async () => {
+        (metaService.getAd as jest.Mock).mockRejectedValue(tenancyRefusal());
+
+        const result = await callApi(service, 'AD', 'UPDATE', {
+          ad_id: 'ad_from_another_account',
+          params: { status: 'PAUSED' },
+        });
+
+        // The whole reason assertOwnedByAccount withholds these — relaying them through the
+        // confirmation gate would answer the question the block exists to refuse.
+        const text = `${result.message} ${result.error}`;
+        expect(text).not.toContain('ad_from_another_account');
+        expect(text).not.toMatch(/owned by/i);
+        // The SELECTED account is the one the caller already supplied, so naming it discloses
+        // nothing — and without it the model cannot tell the user what to switch away from.
+        expect(result.message).toContain('123456789');
+      });
+
+      it('a TRANSIENT lookup failure still degrades to a prompt rather than blocking', async () => {
+        // The behaviour the best-effort catch was written for, and the reason the two are told
+        // apart instead of the catch simply being removed.
+        (metaService.getAd as jest.Mock).mockRejectedValue(new Error('Meta unreachable'));
+        (metaService.getAdSet as jest.Mock).mockRejectedValue(new Error('Meta unreachable'));
+        (metaService.getCampaign as jest.Mock).mockRejectedValue(new Error('Meta unreachable'));
+
+        const result = await callApi(service, 'AD', 'UPDATE', {
+          ad_id: 'ad_1',
+          params: { status: 'PAUSED' },
+        });
+
+        expect(result.requiresConfirmation).toBe(true);
+        expect(result.error).toBeUndefined();
+        expect(metaService.updateAd).not.toHaveBeenCalled();
+      });
+    });
+
     it('does NOT gate read-only AD LIST', async () => {
       (metaService.listAds as jest.Mock).mockResolvedValue([]);
 
@@ -685,6 +796,20 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       ]);
       expect(out).toContain('Confirm A');
       expect(out).toContain('Confirm B');
+    });
+
+    it('batches AD, AD_SET, and CAMPAIGN writes into one confirmation prompt', () => {
+      const out = (service as any).collectConfirmationPrompt([
+        awaiting('Update AD: pause Prospecting Ad'),
+        awaiting('Update AD_SET: pause Prospecting Ad Set'),
+        awaiting('Update CAMPAIGN: pause Prospecting Campaign'),
+      ]);
+
+      expect(out).toContain('3 changes I\'m about to make');
+      expect(out).toContain('AD: pause Prospecting Ad');
+      expect(out).toContain('AD_SET: pause Prospecting Ad Set');
+      expect(out).toContain('CAMPAIGN: pause Prospecting Campaign');
+      expect(out.match(/Reply "yes" \/ "confirm"/g)?.length).toBe(1);
     });
 
     it('batches multiple confirmations under ONE intro/footer using confirmationDetail', () => {

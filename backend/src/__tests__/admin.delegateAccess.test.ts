@@ -19,6 +19,7 @@ jest.mock('../middleware/admin', () => ({
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn(),
+    incrementDelegateTokenEpoch: jest.fn(),
   },
 }));
 
@@ -37,12 +38,14 @@ describe('Admin delegate access endpoint', () => {
     app.use('/api/admin', adminRoutes);
   });
 
-  it('should create delegate access token with 90 days expiration', async () => {
+  it('mints a short-lived token stamped with the target\'s revocation counters', async () => {
     const targetUserId = 'target-user-1';
     const targetUser = {
       userId: targetUserId,
       email: 'customer@example.com',
       roles: ['customer'],
+      delegateTokenEpoch: 3,
+      sessionVersion: 7,
     };
 
     mockUserDb.getUserById.mockResolvedValue(targetUser as any);
@@ -57,8 +60,8 @@ describe('Admin delegate access endpoint', () => {
     expect(res.body).toHaveProperty('customerPortalUrl');
     expect(res.body).toHaveProperty('expiresIn');
     
-    // Verify expiration time is 90d
-    expect(res.body.expiresIn).toBe('90d');
+    // ENG-1506: 90d of standing customer impersonation is not a security control.
+    expect(res.body.expiresIn).toBe('8h');
 
     // Verify the token is valid and has correct expiration
     const decoded = jwt.decode(res.body.delegateToken) as any;
@@ -72,14 +75,69 @@ describe('Admin delegate access endpoint', () => {
     expect(decoded.delegateAccess.targetUserId).toBe(targetUserId);
     expect(decoded.delegateAccess.targetEmail).toBe('customer@example.com');
 
-    // Verify token expiration is approximately 90 days from now
+    // ENG-1506: the two claims that make this token revocable. Without them the
+    // middleware has nothing to compare against and the token is only bounded by
+    // its expiry — which is the whole defect this ticket was filed for.
+    expect(decoded.dte).toBe(3);
+    expect(decoded.sv).toBe(7);
+
+    // Hours, not months.
     const now = Math.floor(Date.now() / 1000);
-    const expirationTime = decoded.exp;
-    const daysUntilExpiration = (expirationTime - now) / (60 * 60 * 24);
-    
-    // Allow 1 day tolerance for test execution time
-    expect(daysUntilExpiration).toBeGreaterThan(89);
-    expect(daysUntilExpiration).toBeLessThan(91);
+    const hoursUntilExpiration = (decoded.exp - now) / (60 * 60);
+    expect(hoursUntilExpiration).toBeGreaterThan(7.5);
+    expect(hoursUntilExpiration).toBeLessThan(8.5);
+  });
+
+  // A user who has never been delegated to, or predates the field entirely, has
+  // no epoch. That must mint 0 rather than undefined, or the claim is absent and
+  // the middleware's `?? 0` silently compares nothing.
+  it('stamps 0 when the target has no counters yet', async () => {
+    const targetUserId = 'fresh-user-1';
+    mockUserDb.getUserById.mockResolvedValue({
+      userId: targetUserId,
+      email: 'fresh@example.com',
+      roles: ['customer'],
+    } as any);
+
+    const res = await request(app)
+      .post(`/api/admin/users/${targetUserId}/delegate-access`)
+      .set('Authorization', 'Bearer test-token')
+      .expect(200);
+
+    const decoded = jwt.decode(res.body.delegateToken) as any;
+    expect(decoded.dte).toBe(0);
+    expect(decoded.sv).toBe(0);
+  });
+
+  describe('revoke', () => {
+    it('bumps the epoch and reports the new value', async () => {
+      mockUserDb.getUserById.mockResolvedValue({
+        userId: 'target-user-1',
+        email: 'customer@example.com',
+        roles: ['customer'],
+      } as any);
+      (userDb.incrementDelegateTokenEpoch as jest.Mock).mockResolvedValue(4);
+
+      const res = await request(app)
+        .post('/api/admin/users/target-user-1/delegate-access/revoke')
+        .set('Authorization', 'Bearer test-token')
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      expect(res.body.delegateTokenEpoch).toBe(4);
+      expect(userDb.incrementDelegateTokenEpoch).toHaveBeenCalledWith('target-user-1');
+    });
+
+    it('404s for an unknown user instead of bumping anything', async () => {
+      mockUserDb.getUserById.mockResolvedValue(null as any);
+
+      await request(app)
+        .post('/api/admin/users/ghost/delegate-access/revoke')
+        .set('Authorization', 'Bearer test-token')
+        .expect(404);
+
+      expect(userDb.incrementDelegateTokenEpoch).not.toHaveBeenCalled();
+    });
   });
 
   it('should return 404 when user does not exist', async () => {

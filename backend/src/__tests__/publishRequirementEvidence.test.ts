@@ -99,3 +99,11 @@ describe('requirementEvidenceNames (ENG-947)', () => {
     expect(requirementEvidenceNames([null, undefined, { noName: true }] as any)).toEqual([]);
   });
 });
+
+// The alias/equivalence-route behavior that used to be tested here (thread-post
+// substitute, email send substitute, double-credit suppression, JSON-string
+// arguments handling) was consolidated into requiredCallSatisfaction.ts's
+// callSatisfiesRequirement/countCallsSatisfyingRequirement during the ENG-1045 x
+// ENG-1276 merge — ONE shared equivalence table instead of two independently
+// evolving ones (this file's requirementEvidenceNames no longer computes aliases
+// at all). See requiredCallSatisfaction.test.ts for that coverage.

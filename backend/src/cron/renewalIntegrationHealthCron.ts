@@ -9,11 +9,19 @@
  * a trust break worth flagging loudly, not logging quietly.
  *
  * This scans active-subscription users whose renewal falls within the
- * lookahead window and raises a deduped oncall alert when no ad platform
- * account is connected, or the only one(s) connected have an expired token.
+ * lookahead window and raises a deduped oncall alert only for customers who
+ * selected paid ads as a goal AND whose subscription plan actually permits
+ * connecting an ad platform. A missing ad connection is not evidence that
+ * ads are part of a customer's plan (for example, LinkedIn-outreach-only
+ * customers, or a customer's plan that never included ad integration —
+ * ENG-1541, the TFAConnect false positive: her onboarding-time "paid ads"
+ * intent was stale relative to a plan that doesn't allow it), so neither
+ * condition alone may create a renewal-risk alert.
  * Detection is intentionally cheap and synchronous (timestamp-only expiry
  * checks) — no live third-party API calls — so it can run frequently without
- * external dependency risk.
+ * external dependency risk. The one async step is the entitlement lookup
+ * (`subscriptionService.getAllowedConnectedAccounts`), which only runs for
+ * users who already cleared the cheap sync checks.
  *
  * Registered in server.ts to run daily.
  */
@@ -22,6 +30,7 @@ import { userDb } from '../services/db';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { PlatformType } from '../services/connectedAccountsDb';
 import { isTokenNotExpired } from '../services/connectedAccountsDb';
+import { getAllowedConnectedAccounts } from '../services/subscriptionService';
 
 const TAG = '[renewalIntegrationHealthCron]';
 
@@ -55,10 +64,37 @@ function hasHealthyAdIntegration(user: any): boolean {
   return accounts.some((acc) => isAdAccount(acc) && acc.config && isTokenNotExpired(acc));
 }
 
+/** A user needs an ad connection only after explicitly choosing paid ads. */
+function hasPaidAdsIntent(user: any): boolean {
+  if (user?.goal === 'paid_ads') return true;
+  if (Array.isArray(user?.emmaHelpInterests) && user.emmaHelpInterests.includes('paid_ads')) return true;
+  return Array.isArray(user?.onboardingEvents) && user.onboardingEvents.some(
+    (event: any) => event?.event === 'goal_selected' && event?.data?.goal === 'paid_ads',
+  );
+}
+
+/**
+ * True when the user's subscription plan permits connecting at least one ad
+ * platform (meta / google_ads / linkedin_ads). Consults the same entitlement
+ * mechanism that gates the connected-accounts UI
+ * (`subscriptionService.getAllowedConnectedAccounts`) so this cron never
+ * flags a customer whose plan never included ad integration in the first
+ * place, independent of onboarding-time intent (ENG-1541). Unrestricted
+ * plans (`allowedConnectedAccounts` undefined or `['*']`) resolve through
+ * `getAllowedConnectedAccounts` to the full platform list, which includes
+ * `meta` and `google_ads` — so an unrestricted plan is always entitled here,
+ * preserving today's behavior exactly.
+ */
+async function hasAdIntegrationEntitlement(userId: string): Promise<boolean> {
+  const allowed = await getAllowedConnectedAccounts(userId);
+  return allowed.some((platform) => AD_PLATFORMS.has(platform as PlatformType));
+}
+
 /**
  * Scan users with an active subscription renewing within `RENEWAL_LOOKAHEAD_DAYS`
- * and flag any whose ad integration is missing or expired. Resilient: a failure
- * sending one user's alert is logged and never aborts the rest of the run.
+ * and flag paid-ads customers, whose plan actually permits ad integration,
+ * whose ad integration is missing or expired. Resilient: a failure sending
+ * one user's alert is logged and never aborts the rest of the run.
  */
 export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegrationHealthSummary> {
   const summary: RenewalIntegrationHealthSummary = {
@@ -85,16 +121,17 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
   for (const user of users) {
     summary.scannedUsers++;
 
-    if (hasHealthyAdIntegration(user)) continue;
+    if (!hasPaidAdsIntent(user) || hasHealthyAdIntegration(user)) continue;
+    if (!(await hasAdIntegrationEntitlement(user.userId))) continue;
 
     summary.flagged++;
     try {
       await sendAgentModeOncallAlert({
         subject: `Renewal at risk: ${user.email || user.userId} has no healthy ad integration`,
         message:
-          `${user.email || user.userId} renews on ${user.current_period_end} but has no connected, ` +
-          `non-expired ad platform account (Meta/Google Ads/LinkedIn Ads). They will be charged for a ` +
-          `product that isn't functioning. Check the account before the charge fires.`,
+          `${user.email || user.userId} selected paid ads and renews on ${user.current_period_end}, but has no ` +
+          `connected, non-expired ad platform account (Meta/Google Ads/LinkedIn Ads). Check the account ` +
+          `before the charge fires.`,
         dedupeKey: `renewal-integration-health:${user.userId}`,
         dedupeWindowMs: DEDUPE_WINDOW_MS,
         context: {

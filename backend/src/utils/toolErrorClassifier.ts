@@ -10,9 +10,11 @@
  * Classes are intentionally coarse and stable — they feed the agent-mode
  * loop's failure clustering and the inspector UI, so renaming one is a
  * breaking change for historical queries:
- *   timeout | auth | rate_limit | invalid_args | not_found | network |
- *   upstream_5xx | policy_blocked | repeated_failure |
- *   tool_unavailable | upstream_rejected | empty_result | invalid_output
+ *   timeout | auth | rate_limit | quota_exceeded | invalid_args | not_found |
+ *   network | upstream_5xx | policy_blocked | repeated_failure |
+ *   tool_unavailable | upstream_rejected | empty_result | invalid_output |
+ *   subscription_blocked | truncated_response | read_incomplete | read_bounded |
+ *   scope_refused
  *
  * The three trailing classes were added 2026-06-14 after a 7-day production
  * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
@@ -44,6 +46,7 @@
 const GATEWAY_NAME_CLASSES: Record<string, string> = {
   AgentToolBudgetExceededError: 'repeated_failure',
   AgentToolPolicyBlockedError: 'policy_blocked',
+  ToolResultPolicyBlockedError: 'policy_blocked',
   AgentToolRepeatedFailureError: 'repeated_failure',
   AgentToolContractValidationError: 'invalid_args',
   // A tool returned without throwing but produced no usable output (ENG-105).
@@ -55,6 +58,11 @@ const GATEWAY_NAME_CLASSES: Record<string, string> = {
   // Typed X credit-exhaustion (ENG-664) — classify by name so a 402 clusters as
   // a billing stop even when it crosses a module/mock boundary.
   XCreditsExhaustedError: 'payment_required',
+  // A tool call's arguments were a clean-but-incomplete JSON prefix — the
+  // stream was cut off mid-generation, not a formatting mistake (ENG-1477
+  // follow-up; see repairToolCallArguments.ts). Distinct from invalid_args so
+  // the model gets retry guidance instead of "fix your arguments first".
+  TruncatedToolCallArgumentsError: 'truncated_response',
 };
 
 function classFromStatus(status: number): string | null {
@@ -74,6 +82,48 @@ function classFromStatus(status: number): string | null {
 function classFromMessage(message: string): string | null {
   const m = message.toLowerCase();
 
+  // Hard quota exhaustion (OpenAI/Azure `insufficient_quota`, "exceeded your
+  // current quota, please check your plan and billing details") is a
+  // permanent billing stop even though the provider surfaces it as HTTP 429 —
+  // checked before the status/rate-limit matches below so it isn't folded
+  // into the transient 'rate_limit' class, which is exempt from the
+  // session-wide media budget (ENG-1220).
+  if (/insufficient_quota|exceeded your current quota|quota exceeded|check your plan and billing/.test(m)) return 'quota_exceeded';
+
+  /*
+   * A read that did not finish is NOT evidence of absence — and until this branch existed, the
+   * classifier said the opposite of the message it was appended to.
+   *
+   * These messages are ours, and every one of them exists to REFUSE an absence conclusion:
+   * "Do NOT report the file as absent", "this is not a confirmed absence", "this is a FAILED
+   * read". Unclassified, they fell to `not_found` (whose next step is "the target was not
+   * found") or, once main widened the `invalid_args` regex with `is too large`, to "fix the
+   * arguments" for a filename that was never wrong. The verdict is appended AFTER the warning,
+   * so it is the last thing the model reads — ENG-1584 reintroduced through the one channel
+   * this PR had not checked.
+   *
+   * Checked ahead of not_found, invalid_args AND the embedded-status regex below for that
+   * reason. That regex matches any whitespace-preceded 3-digit 4xx/5xx-shaped number — including
+   * one interpolated from a FOLDER OR FILE NAME. "Landing 404 Copy.docx" classified not_found and
+   * appended "the target was not found" directly beneath "Do NOT report the file as absent";
+   * "Studio 403 Shared" appended "reconnect the account" beneath "NOT a permissions problem";
+   * "Creative 500x500.png" — an everyday ad dimension in this product — appended "Retryable: yes"
+   * to a deterministic bound. Being ahead of not_found was not enough while the regex that
+   * defeats it ran first.
+   */
+  if (/do not report the file as absent|not a confirmed absence|this is a failed read|rate-limiting this account|rate-limited the scan/.test(m)) {
+    /*
+     * Two sub-cases, and they need OPPOSITE verdicts.
+     *
+     * A wall-clock/scope bound is deterministic — the message itself says "Do NOT retry this
+     * same call ... a tree this large will stop in the same place every time" — so a
+     * `Retryable: yes` beneath it is the same contradiction one level down. A throttle or a
+     * transient page failure clears on its own and must stay retryable.
+     */
+    if (/do not retry this same call|stop in the same place every time/.test(m)) return 'read_bounded';
+    return 'read_incomplete';
+  }
+
   // HTTP status embedded in the message ("status code 429", "503 Service…").
   const statusMatch = m.match(/(?:status(?:\s+code)?\s+|^|\s)([45]\d{2})(?:\s|$|[^\d])/);
   if (statusMatch) {
@@ -86,12 +136,75 @@ function classFromMessage(message: string): string | null {
   // user has not enabled; a config gap, not a failure of the tool itself.
   if (/is not available\. you must install the required skill|install_skills/.test(m)) return 'tool_unavailable';
 
+  /*
+   * install_skills refusals — the skill exists but the user's plan does not include it.
+   *
+   * Checked HERE, above the generic branches, because the refusal text is deliberately written
+   * to forbid substitution ("Do NOT substitute a different tool's output..."). Left unclassified
+   * it fell through to the legacy `Error` class, whose DEFAULT_NEXT_STEP ends "...use a different
+   * tool", so the retryability line appended by the dispatcher instructed the model to do the
+   * exact thing the refusal forbids. That contradiction is how a gated tool's absence turns into
+   * a fabricated result (ENG-1625: a "UTM Tagging Audit Summary — PASS, 6/6 tagged" produced by
+   * a tool that never ran). Both strings below are ours, emitted by installSkills.
+   */
+
+  /*
+   * An ad-account scope refusal. Unclassified it fell to the legacy `Error` class, whose default
+   * next step ends "...use a different tool" — and for a SCOPE refusal the available different
+   * tool is the unscoped account-wide list, i.e. widening exactly the read whose scope was just
+   * refused. The transient sibling ("could not verify ... please retry") additionally got "do NOT
+   * retry" appended over its own "please retry".
+   *
+   * Keyed on the marker `assertOwnedByAccount` guarantees on every branch, and on the
+   * unverifiable-lookup wording that deliberately does NOT carry it.
+   */
+  /*
+   * Only the MISMATCH branch. `assertOwnedByAccount` deliberately varies its remedy across three
+   * branches, and collapsing them into one class attaches the mismatch verdict — "the object is
+   * not in the selected ad account, select the account that owns it" — to two states where that
+   * is factually untrue:
+   *
+   *   no owner reported  → "ownership could not be CONFIRMED … not a proven mismatch. Retry."
+   *   no account resolved → "a connection problem, not a permissions one — reconnect Meta."
+   *
+   * The second matters most: `account_id ?? ''` deliberately routes an unresolved credential
+   * into exactly that branch, so the two fixes composed into telling a user their own object
+   * belongs to someone else's ad account. Keyed on the remedy sentence, which only the mismatch
+   * branch emits.
+   */
+  if (/is not available in the selected ad account/.test(m)
+      && /belongs to a different ad account, select that account/.test(m)) {
+    return 'scope_refused';
+  }
+  // Could not confirm ownership — our failure or Meta's silence, not a statement about the node.
+  if (/is not available in the selected ad account/.test(m)) return 'upstream_5xx';
+  if (/could not verify the requested .* against the selected ad account/.test(m)) return 'upstream_5xx';
+
+  if (/not available with your current subscription|capability is not on their plan/.test(m)) return 'subscription_blocked';
+  // Bad skill ids from the model — an argument problem, not a plan problem.
+  if (/no valid skills found/.test(m)) return 'invalid_args';
+
   if (/etimedout|timed?\s*out|deadline exceeded|operation was aborted/.test(m)) return 'timeout';
-  if (/too many requests|rate limit|quota exceeded/.test(m)) return 'rate_limit';
+  if (/too many requests|rate limit/.test(m)) return 'rate_limit';
 
   // Bad arguments the model emitted — schema-validation rejections (the
   // contract layer rejects before execution) plus classic validation phrasing.
-  if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short/.test(m)) return 'invalid_args';
+  //
+  // `is too large` (ENG-1672) is deliberately global, not scoped to the schedule
+  // size-block message it was added for — it requires the literal word "is"
+  // before "too large" (verified: "Video file too large…"/"Content too
+  // large…"/"Image too large…" do NOT match this, only messages phrased as
+  // "X is too large" do), but for the ones that do match — an oversized
+  // perform_data_analysis instruction, a too-large cookie header, Gmail's
+  // HTML-body limit — this now classifies messages that previously fell
+  // through unclassified to the generic legacy-name fallback below. The one
+  // exception is a named custom error whose message happens to say "is too
+  // large" AND which previously relied on keeping its own distinct name via
+  // that same fallback (gmailService.ts's GmailBodyTooLargeError) — this now
+  // reclassifies it to invalid_args too. Accepted: a genuinely oversized input
+  // isn't retryable either way, and consistent classification across the app
+  // outweighs one error keeping a bespoke class name.
+  if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short|too large to save|is too large/.test(m)) return 'invalid_args';
 
   if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials|not authorized|do not have permission|permission to|no secrets configured|not a member of channel|account connected|account not configured|not configured to access/.test(m)) return 'auth';
   if (/enotfound|econnrefused|econnreset|eai_again|socket hang up|network error|fetch failed/.test(m)) return 'network';
@@ -132,6 +245,18 @@ export function classifyToolErrorClass(error: unknown): string {
     const byName = GATEWAY_NAME_CLASSES[error.name]
       ?? GATEWAY_NAME_CLASSES[error.constructor?.name ?? ''];
     if (byName) return byName;
+
+    // AWS SDK v2 (DynamoDB et al.) puts the exception name in the STRING
+    // `.code` property (ENG-1626, CodeRabbit) — checked BEFORE the numeric
+    // status below, not after: these errors also carry a numeric
+    // `.statusCode` of 400, and classFromStatus(400) returns 'invalid_args'
+    // before this string check would otherwise ever run, silently discarding
+    // the real classification and disabling retry during throttling.
+    const stringCodeProp = (error as { code?: unknown }).code;
+    if (typeof stringCodeProp === 'string'
+      && (stringCodeProp === 'ThrottlingException' || stringCodeProp === 'ProvisionedThroughputExceededException')) {
+      return 'rate_limit';
+    }
 
     let statusProp = (error as { status?: unknown }).status
       ?? (error as { statusCode?: unknown }).statusCode;

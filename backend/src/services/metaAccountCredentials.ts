@@ -137,7 +137,7 @@ export async function assertOwnedMetaPixel(
 
   const { metaService } = await import('./metaService');
   const { accountId: resolvedAccountId, accessToken } = await getMetaAccountCredentials(user, userId, cleaned);
-  const pixels = await metaService.listPixels(resolvedAccountId, accessToken);
+  const { pixels } = await metaService.listPixels(resolvedAccountId, accessToken);
   if (!(pixels || []).some((p: any) => p.id === pixelId)) {
     throw Object.assign(
       new Error(`Pixel "${pixelId}" was not found on ad account ${resolvedAccountId}.`),

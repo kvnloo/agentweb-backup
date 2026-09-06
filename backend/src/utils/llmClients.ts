@@ -210,6 +210,8 @@ export interface MeterFromResponseContext {
   feature: string;
   sessionId?: string;
   taskId?: string;
+  /** ENG-1251: explicit override; when omitted, meterUsageFromResponse derives one from `response.id`. */
+  eventId?: string;
 }
 
 /**
@@ -248,6 +250,13 @@ export function meterUsageFromResponse(
   try {
     const usage =
       normalizeUsageFromResponse(response) ?? { inputTokens: 0, outputTokens: 0 };
+    // ENG-1251: fall back to the provider response's own id when the caller
+    // doesn't supply one. Stable across a re-processed/retried response,
+    // distinct across genuinely separate calls — closes the retry-defeats-
+    // dedup Greptile P1 for every caller of this shared entry point without
+    // requiring each of them to plumb through their own idempotency key.
+    const derivedEventId: string | undefined =
+      ctx.eventId ?? (typeof response?.id === "string" ? response.id : undefined);
     const meterCtx = {
       userId: ctx.userId,
       billingUserId: ctx.billingUserId,
@@ -257,6 +266,7 @@ export function meterUsageFromResponse(
       feature: ctx.feature,
       sessionId: ctx.sessionId,
       taskId: ctx.taskId,
+      eventId: derivedEventId,
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
       cacheReadTokens: usage.cacheReadTokens,

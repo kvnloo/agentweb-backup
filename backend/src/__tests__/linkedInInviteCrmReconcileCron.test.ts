@@ -37,6 +37,7 @@ jest.mock('../services/unipileSentInvitationsDb', () => ({
   pruneStaleSentInvitations: jest.fn().mockResolvedValue(0),
   getAllSentInvitationsByAccount: jest.fn().mockResolvedValue([]),
   profileUrlFromPublicId: (id: string) => `https://www.linkedin.com/in/${id}/`,
+  deleteSentInvitationsByProfileUrls: jest.fn().mockResolvedValue(0),
 }));
 
 const mockResolveListIdForAccount = jest.fn();
@@ -51,10 +52,10 @@ jest.mock('../services/settingsService', () => ({
   settingsService: { getSetting: (...a: any[]) => mockGetSetting(...a) },
 }));
 
-const mockGetAllUsers = jest.fn();
+const mockScanWithFilter = jest.fn();
 jest.mock('../services/db', () => ({
   crmDb: {},
-  userDb: { getAllUsers: (...a: any[]) => mockGetAllUsers(...a) },
+  userDb: { scanWithFilter: (...a: any[]) => mockScanWithFilter(...a) },
 }));
 
 jest.mock('../services/dripSequenceDb', () => ({
@@ -62,7 +63,11 @@ jest.mock('../services/dripSequenceDb', () => ({
 }));
 jest.mock('../services/leadListAlertService', () => ({ leadListAlertService: {} }));
 
-import { runLinkedInConnectionSync } from '../cron/linkedInConnectionSyncCron';
+import {
+  runLinkedInConnectionSync,
+  __resetDisconnectBackoffForTests,
+  __resetWalkPacingForTests,
+} from '../cron/linkedInConnectionSyncCron';
 
 const ACCOUNT = 'tMgX8uZJTZWTG_mFY1aI2A';
 const OWNER = 'user_1';
@@ -74,11 +79,15 @@ describe('sync cron → invite CRM reconciliation', () => {
   const originalFlag = process.env.LINKEDIN_INVITE_CRM_RECONCILE;
 
   beforeEach(() => {
+  // ENG-1197: the cron paces both its dead-account re-checks and its full
+  // walk in module state.
+  __resetDisconnectBackoffForTests();
+  __resetWalkPacingForTests();
     jest.clearAllMocks();
     process.env.LINKEDIN_INVITE_CRM_RECONCILE = 'true';
     // One per-user Unipile account, no site-wide accounts.
     mockGetSetting.mockResolvedValue(null);
-    mockGetAllUsers.mockResolvedValue([
+    mockScanWithFilter.mockResolvedValue([
       { userId: OWNER, connected_accounts: [{ platform: 'unipile', account_id: ACCOUNT }] },
     ]);
     mockListConnections.mockResolvedValue({ items: [], cursor: undefined });
@@ -107,7 +116,7 @@ describe('sync cron → invite CRM reconciliation', () => {
   });
 
   it('never writes for a site-wide account, which belongs to no single customer', async () => {
-    mockGetAllUsers.mockResolvedValue([]);
+    mockScanWithFilter.mockResolvedValue([]);
     mockGetSetting.mockResolvedValue({
       settingValue: JSON.stringify([{ account_id: 'shared-pool-account', enabled: true }]),
     });
@@ -148,7 +157,7 @@ describe('sync cron → invite CRM reconciliation', () => {
   });
 
   it('runs per account, so one owner-less account does not suppress the others', async () => {
-    mockGetAllUsers.mockResolvedValue([
+    mockScanWithFilter.mockResolvedValue([
       { userId: OWNER, connected_accounts: [{ platform: 'unipile', account_id: ACCOUNT }] },
       { userId: 'user_2', connected_accounts: [{ platform: 'unipile', account_id: 'acct_2' }] },
     ]);

@@ -167,6 +167,34 @@ require_env() {
 }
 
 now_seconds() {
+  # ENG-1522: a test-only clock seam. Production never sets EB_CLOCK_FILE, so on
+  # the deploy path this is `date +%s` verbatim and the branch below is
+  # unreachable. eb-deploy.test.sh asserts structurally that no workflow can set
+  # it, so it cannot reach production by edit either.
+  #
+  # Why the seam exists: this function is read TWICE inside a single poll
+  # iteration -- once to stamp `ready_since` when the environment first reports
+  # Ready, and again to test that stamp against EB_HEALTH_SETTLE_SECONDS.
+  # `date +%s` has one-second granularity, so when the wall clock happens to
+  # tick between those two reads the delta jumps 0 -> 1 and a 1s settle budget
+  # expires a poll early. Against the suite's mocked AWS queue that surfaces as
+  # "health stayed Red for 1s ... describe-instances-health returned no
+  # instances" -- two red checks out of 79, on PRs touching no deploy code
+  # (portal #1092, #1093). Scheduler jitter, not deploy logic. Reproduced
+  # deterministically by forcing that tick, which is how it was confirmed.
+  #
+  # The generalisation matters more than the one case: a fixed mocked event
+  # queue was being consumed against a wall-clock budget, so poll counts
+  # depended on how fast the runner happened to be. With the seam the harness
+  # advances time once per describe-environments call, making time a function of
+  # the mocked event sequence -- identical on an idle laptop and a saturated CI
+  # box. Raising the budget instead would have hidden the race AND made the
+  # settle-window-reset case vacuous, since an un-reset window would then also
+  # fit inside the larger budget.
+  if [ -n "${EB_CLOCK_FILE:-}" ] && [ -r "${EB_CLOCK_FILE}" ]; then
+    cat "${EB_CLOCK_FILE}"
+    return
+  fi
   date +%s
 }
 
@@ -500,7 +528,7 @@ scan_for_terminal_events() {
   EB_LAST_ERROR_EVENTS="${out}"
 
   for pattern in "${EB_TERMINAL_EVENT_PATTERNS[@]}"; do
-    if printf '%s' "${out}" | grep -qF "${pattern}"; then
+    if grep -qF "${pattern}" <<<"${out}"; then
       fail "Elastic Beanstalk REJECTED this update and it cannot succeed. EB reported: '${pattern}'. Version '${EB_VERSION_LABEL}' was NOT applied and '${EB_ENVIRONMENT_NAME}' is still running '${EB_CURRENT_VERSION}'. Full event text: ${out}"
     fi
   done
@@ -519,7 +547,7 @@ events_show_recoverable_abort() {
     return 1
   fi
   for pattern in "${EB_ABORT_EVENT_PATTERNS[@]}"; do
-    if printf '%s' "${EB_LAST_ERROR_EVENTS}" | grep -qF "${pattern}"; then
+    if grep -qF "${pattern}" <<<"${EB_LAST_ERROR_EVENTS}"; then
       return 0
     fi
   done
@@ -541,7 +569,7 @@ create_application_version() {
     return 0
   fi
 
-  if printf '%s' "${out}" | grep -qiF 'already exists'; then
+  if grep -qiF 'already exists' <<<"${out}"; then
     log "Application version '${EB_VERSION_LABEL}' already exists; reusing the existing version. AWS reported: ${out}"
     return 0
   fi
@@ -640,7 +668,7 @@ update_environment() {
     # EB rejects an update while another is running with "Environment named X is
     # in an invalid state for this operation. Must be Ready." That is the one
     # error worth retrying, because the environment settling makes it go away.
-    if printf '%s' "${out}" | grep -qiE 'invalid state|concurrentupdate|concurrent update'; then
+    if grep -qiE 'invalid state|concurrentupdate|concurrent update' <<<"${out}"; then
       log "Environment '${EB_ENVIRONMENT_NAME}' was mid-update on attempt ${attempt}/${EB_UPDATE_MAX_ATTEMPTS}; waiting for it to settle and retrying. AWS reported: ${out}"
       attempt=$(( attempt + 1 ))
       continue
@@ -750,6 +778,90 @@ verify_deployment() {
   done
 }
 
+# Re-asserts the ALB deregistration delay directly against the live target
+# group(s) after a verified deploy (ENG-823 AC4).
+#
+# Two straight `.ebextensions` fixes for this value (5029dfadb 2026-07-01,
+# 1becd3956 2026-09-04) both deployed clean per EB's own event log and still
+# left `deregistration_delay.timeout_seconds` at the AWS default of 20 on
+# both environments, confirmed via `aws elbv2 describe-target-group-attributes`
+# — EB accepted and silently dropped the declared option both times. So this
+# value is no longer declared in `.ebextensions` at all; this function is the
+# real mechanism, applied straight against the ALB API on every deploy so a
+# manual/console change can't silently drift it back, either.
+#
+# Skipped entirely when EB_DEREGISTRATION_DELAY_SECONDS is unset, so a caller
+# that hasn't opted in (e.g. the partner-portal deploy, which has no such
+# requirement) makes zero extra AWS calls.
+ensure_deregistration_delay() {
+  local desired="${EB_DEREGISTRATION_DELAY_SECONDS:-}"
+  [ -z "${desired}" ] && return 0
+
+  local lb_arns lb tg_arns arn current out
+
+  if ! lb_arns=$(aws elasticbeanstalk describe-environment-resources \
+    --environment-name "${EB_ENVIRONMENT_NAME}" \
+    --query 'EnvironmentResources.LoadBalancers[*].Name' \
+    --output text 2>&1); then
+    fail "could not resolve the load balancer for '${EB_ENVIRONMENT_NAME}' to set DeregistrationDelay. AWS reported: ${lb_arns}"
+  fi
+
+  lb_arns=$(printf '%s' "${lb_arns}" | tr '\t' '\n' | grep '^arn:' || true)
+  if [ -z "${lb_arns}" ]; then
+    fail "environment '${EB_ENVIRONMENT_NAME}' has no Application Load Balancer ARN; cannot set DeregistrationDelay via elbv2 (classic ELB is not supported by this path)."
+  fi
+
+  while IFS= read -r lb; do
+    [ -z "${lb}" ] && continue
+    if ! tg_arns=$(aws elbv2 describe-target-groups \
+      --load-balancer-arn "${lb}" \
+      --query 'TargetGroups[*].TargetGroupArn' \
+      --output text 2>&1); then
+      fail "describe-target-groups failed for load balancer ${lb}. AWS reported: ${tg_arns}"
+    fi
+
+    tg_arns=$(printf '%s' "${tg_arns}" | tr '\t' '\n' | grep '^arn:' || true)
+    if [ -z "${tg_arns}" ]; then
+      fail "load balancer ${lb} has no target groups; cannot set DeregistrationDelay."
+    fi
+
+    for arn in ${tg_arns}; do
+      if ! current=$(aws elbv2 describe-target-group-attributes \
+        --target-group-arn "${arn}" \
+        --query "Attributes[?Key=='deregistration_delay.timeout_seconds'].Value | [0]" \
+        --output text 2>&1); then
+        fail "describe-target-group-attributes failed for ${arn}. AWS reported: ${current}"
+      fi
+
+      if [ "${current}" = "${desired}" ]; then
+        log "DeregistrationDelay already ${desired}s on target group ${arn##*/}; no change needed."
+        continue
+      fi
+
+      log "Setting DeregistrationDelay on target group ${arn##*/}: ${current}s -> ${desired}s."
+      if ! out=$(aws elbv2 modify-target-group-attributes \
+        --target-group-arn "${arn}" \
+        --attributes "Key=deregistration_delay.timeout_seconds,Value=${desired}" 2>&1); then
+        fail "modify-target-group-attributes failed for ${arn} (desired ${desired}s). AWS reported: ${out}"
+      fi
+
+      # Re-read rather than trust the mutation call succeeded silently — this
+      # is the exact class of bug (.ebextensions accepted the value and
+      # dropped it) that made this function necessary in the first place.
+      if ! current=$(aws elbv2 describe-target-group-attributes \
+        --target-group-arn "${arn}" \
+        --query "Attributes[?Key=='deregistration_delay.timeout_seconds'].Value | [0]" \
+        --output text 2>&1); then
+        fail "describe-target-group-attributes (post-verify) failed for ${arn}. AWS reported: ${current}"
+      fi
+      if [ "${current}" != "${desired}" ]; then
+        fail "modify-target-group-attributes reported success for ${arn} but the target group still reads ${current}s, not the desired ${desired}s. Refusing to report the deploy as fully applied."
+      fi
+      log "Confirmed DeregistrationDelay=${desired}s on target group ${arn##*/}."
+    done
+  done <<<"${lb_arns}"
+}
+
 main() {
   require_env EB_APPLICATION_NAME
   require_env EB_ENVIRONMENT_NAME
@@ -781,6 +893,8 @@ main() {
   done
 
   log "Deployment of '${EB_VERSION_LABEL}' to '${EB_ENVIRONMENT_NAME}' is complete and verified."
+
+  ensure_deregistration_delay
 }
 
 main "$@"

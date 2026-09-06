@@ -2,8 +2,6 @@
 
 // Mock OpenAI before importing agentModeService (which creates module-level openai instance)
 // Create the mock function inside the factory to ensure it's accessible
-const mockChatCompletionsCreate = jest.fn();
-
 jest.mock('openai', () => {
   // Create mock function that will be shared
   const createMock = jest.fn();
@@ -66,6 +64,7 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
     mockReadBrandGuidelines = jest.spyOn(agentModeService as any, 'readBrandGuidelines') as jest.Mock;
     mockReadMarketStrategy = jest.spyOn(agentModeService as any, 'readMarketStrategy') as jest.Mock;
     mockGetSenderForLead = jest.spyOn(agentModeService as any, 'getSenderForLead') as jest.Mock;
+    jest.spyOn(agentModeService, 'getReportGenerationDefaultModel').mockResolvedValue('gpt-5.5');
 
     // Default: allow access (most tests use list owned by userId)
     mockCrmDb.canOrgMemberAccessList.mockResolvedValue(true);
@@ -78,6 +77,10 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       // If mockCreate is not available, create a fallback
       console.warn('OpenAI mock not found, tests may fail');
     }
+    jest.spyOn(agentModeService, 'callLLM').mockImplementation(
+      (model: string, messages: any[], options: any) =>
+        mockCreate({ model, messages, ...options }),
+    );
   });
 
   describe('Success cases', () => {
@@ -192,6 +195,7 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       );
 
       expect(result.success).toBe(true);
+      expect(mockCreate).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5.5' }));
       expect(crmDb.getLeadEngagements).toHaveBeenCalledWith(listId, leadId, userId);
       expect(mockReadBrandGuidelines).toHaveBeenCalledWith(userId);
       // ENG-945: this prompt embeds formattedContent wholesale, so it must ask

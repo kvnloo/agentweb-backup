@@ -1,6 +1,7 @@
 import { AgentModeService } from '../services/agentModeService';
 import { chatbotDb } from '../services/chatbotService';
 import { workPlanService } from '../services/workPlanService';
+import * as predefinedWorkPlanResolver from '../services/predefinedWorkPlanResolver';
 
 // Mock heavy/external dependencies so the service loads in isolation.
 jest.mock('aws-sdk');
@@ -48,6 +49,24 @@ describe('AgentModeService - predefined work plan templates', () => {
     ],
   };
 
+  const templateWithInputRequest: any = {
+    ...systemTemplate,
+    planId: 'plan-input',
+    title: 'Prospect Decode',
+    steps: [
+      {
+        stepCount: 1,
+        title: 'Intake',
+        inputRequest: {
+          title: 'Who and why',
+          prompt: 'Tell us who to decode.',
+          fields: [{ id: 'prospect', label: 'Prospect', type: 'text', required: true }],
+        },
+      },
+      { stepCount: 2, title: 'Research' },
+    ],
+  };
+
   beforeEach(() => {
     service = new AgentModeService();
     jest.clearAllMocks();
@@ -59,6 +78,7 @@ describe('AgentModeService - predefined work plan templates', () => {
     (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue({});
     (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
     (chatbotDb.updateSessionLlmModel as jest.Mock).mockResolvedValue(undefined);
+    (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockResolvedValue(undefined);
     // Avoid real model registry/secret lookups.
     jest.spyOn(service, 'getSupportedModels').mockResolvedValue(['anthropic.claude-sonnet-4-6']);
   });
@@ -91,6 +111,105 @@ describe('AgentModeService - predefined work plan templates', () => {
       );
     });
 
+    it('ENG-1765: copies inputRequest onto the instantiated step instead of dropping it', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({
+          steps: expect.arrayContaining([
+            expect.objectContaining({
+              stepCount: 1,
+              inputRequest: expect.objectContaining({
+                title: 'Who and why',
+                fields: expect.arrayContaining([expect.objectContaining({ id: 'prospect' })]),
+              }),
+            }),
+          ]),
+        })
+      );
+    });
+
+    it('ENG-1765: surfaces the launched plan\'s first pending inputRequest step immediately, not just reactively', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ stepCount: 1 }),
+        { failIfAwaitingExists: true }
+      );
+    });
+
+    it('ENG-1765: does not call updateSessionWorkPlanInputRequest when no step has an inputRequest', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemTemplate] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlanInputRequest).not.toHaveBeenCalled();
+    });
+
+    it('ENG-1765: a guard failure (a genuinely still-awaiting prior input request) does not fail the launch', async () => {
+      // chatbotService returns null (not a throw) when failIfAwaitingExists guards
+      // the write off -- the launch must not surface a new card in that case, but
+      // must still succeed rather than clobbering the still-active prior request.
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+      (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockResolvedValue(null);
+
+      const result = await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(result.success).toBe(true);
+      expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ stepCount: 1 }),
+        { failIfAwaitingExists: true }
+      );
+      // ENG-1765 follow-up: a silent server log isn't enough -- the model must
+      // be told so it can ask conversationally instead of nobody ever asking.
+      expect(result.message).toContain('Who and why');
+      expect(result.message).toContain('ask the user for this information directly');
+    });
+
+    it('ENG-1765: a real error surfacing the input request is logged and swallowed, not thrown, and the model is told', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+      (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockRejectedValue(new Error('transient dynamo error'));
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      const result = await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(result.success).toBe(true);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        'AgentMode: Error surfacing input request for launched work plan:',
+        expect.any(Error)
+      );
+      expect(result.message).toContain('ask the user for this information directly');
+      consoleErrorSpy.mockRestore();
+    });
+
+    it('ENG-1765: does not add the not-surfaced note when the input request surfaces successfully', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+      (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockResolvedValue({ sessionId });
+
+      const result = await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(result.message).not.toContain('ask the user for this information directly');
+    });
+
     it('auto-installs the union of all step skills upfront', async () => {
       mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
         v === 'system' ? [systemTemplate] : []
@@ -111,6 +230,23 @@ describe('AgentModeService - predefined work plan templates', () => {
       await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
 
       expect(chatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-sonnet-4-6');
+    });
+
+    it('ENG-1698: resets calledFunctions so a predefined-plan launch does not inherit stale tool-call credit', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemTemplate] : []
+      );
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId,
+        messages: [],
+        // Leftover credit from a completely unrelated earlier plan/run on this session.
+        calledFunctions: { read_brand_guidelines: 3 },
+      });
+      (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(undefined);
+
+      await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+      expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(sessionId, {});
     });
 
     it('does not change the model when the plan default is unsupported', async () => {
@@ -186,6 +322,49 @@ describe('AgentModeService - predefined work plan templates', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('Session not found');
+    });
+
+    // ENG-1472: extraction characterization — the private/org/system/public
+    // candidate-building duplication now lives in predefinedWorkPlanResolver.ts.
+    // This proves applyPredefinedWorkPlan actually calls through the extracted
+    // resolver (not a re-inlined copy) and that the resulting session work plan
+    // is stamped with templatePlanId so future template runs are traceable
+    // (also exercised via the accept endpoint, which reuses this same method).
+    it('resolves candidates through the extracted predefinedWorkPlanResolver module', async () => {
+      const candidatesSpy = jest.spyOn(predefinedWorkPlanResolver, 'getAccessiblePredefinedWorkPlanCandidates')
+        .mockResolvedValue([systemTemplate]);
+
+      const result = await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+      expect(candidatesSpy).toHaveBeenCalledWith('user-1');
+      expect(result.success).toBe(true);
+      candidatesSpy.mockRestore();
+    });
+
+    it('stamps templatePlanId on the instantiated session work plan', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemTemplate] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ templatePlanId: 'plan-onboard' })
+      );
+    });
+
+    it('stamps templatePlanId even when launched by planId directly (the accept-endpoint path)', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemTemplate] : []
+      );
+
+      await service.applyPredefinedWorkPlan('plan-onboard', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ templatePlanId: 'plan-onboard', title: 'Client Onboarding' })
+      );
     });
   });
 });

@@ -11,7 +11,7 @@
  *    tokens are still counted.
  */
 
-import { getModelPrice, cacheWriteCost, CacheWriteByTtl } from "../utils/llmPricing";
+import { getModelPrice, cacheWriteCost, CacheWriteByTtl, isPerGenerationPriced } from "../utils/llmPricing";
 import { usageRecordDb, CostSource } from "./usageRecordDb";
 // tokenUsageService is lazy-required inside meterUserUsage (not statically imported):
 // it pulls in db.ts -> config/aws.ts, and usageRecorderService is imported very widely
@@ -35,11 +35,31 @@ export interface RecordUsageContext {
   sessionId?: string;
   taskId?: string;
   /**
+   * ENG-1251: stable identity for THIS charge, used to dedupe a retried usage
+   * report against the per-user monthly cap (see llmChargeAuditDb.recordLlmChargeEvent).
+   * Omit only when the caller genuinely has no natural per-call id — a retry
+   * will then be double-charged, since a fresh one is minted each time.
+   */
+  eventId?: string;
+  /**
    * Explicit USD cost for calls that are NOT token-priced (image/video are billed
    * per generation, so getModelPrice returns null and token-derived cost is 0).
    * When set, it is recorded verbatim instead of computing cost from tokens.
    */
   costUsdOverride?: number;
+  /**
+   * ENG-1251 Greptile P1: YYYY-MM-DD override. A caller that ALSO writes a
+   * paired charge event for the same logical usage (internalUsage.ts is the
+   * only one today) must compute this ledger row's date from the exact same
+   * instant as that charge event's occurredAt -- two independent `new
+   * Date()` calls a few awaits apart can straddle a UTC-midnight boundary,
+   * landing the ledger row on one date and the charge event on the next.
+   * The itemization reconciliation keys on (date, model, feature), so a
+   * one-day mismatch breaks the key match: the charge event can no longer
+   * cover its own aggregate row, and both show up (double count). Omit for
+   * every other caller -- defaults to `new Date()` at call time, unchanged.
+   */
+  date?: string;
 }
 
 /**
@@ -110,6 +130,17 @@ export function computeCostMicroUsd(
 }
 
 /**
+ * ENG-700: true when `model` has no entry in the price book. Used to mark a
+ * usage row's costSource as "unpriced" (0 dollars because the rate is
+ * missing) rather than "allocated" (0 or more real dollars from a known
+ * rate) — the two must stay distinguishable so an unpriced model never reads
+ * as confirmed-free spend.
+ */
+function isUnpriced(model: string): boolean {
+  return getModelPrice(model) === null;
+}
+
+/**
  * Record one LLM call into the shadow usage table.
  *
  * Fire-and-forget: call it WITHOUT await in hot paths. The returned promise
@@ -117,9 +148,27 @@ export function computeCostMicroUsd(
  */
 export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
   try {
+    // ENG-1691: a model priced PER GENERATION (image, video clip) carries no
+    // token rate, so token-metering it writes a $0 row beside the real
+    // per-generation row — two ledger entries for one API call, on a model that
+    // produces no text. `llmClients.ts` already states the rule; this enforces
+    // it at the single point every caller passes through.
+    //
+    // Keyed on the ABSENCE of an override rather than on the feature name: the
+    // legitimate per-generation record supplies `costUsdOverride`, and that is
+    // what distinguishes it from a wrapper that merely observed the same call.
+    // Guarding on `feature` instead would break the moment a caller relabels.
+    //
+    // ENG-700 is unaffected: a model in NEITHER price book has no override and
+    // is not per-generation priced, so it still records and still tags
+    // `unpriced`.
+    if (ctx.costUsdOverride == null && isPerGenerationPriced(ctx.model)) {
+      return;
+    }
+
     const userId = ctx.userId || "system";
     const billingUserId = ctx.billingUserId || userId;
-    const date = new Date().toISOString().slice(0, 10);
+    const date = ctx.date || new Date().toISOString().slice(0, 10);
     const inputTokens = Math.max(0, Math.round(ctx.inputTokens || 0));
     const outputTokens = Math.max(0, Math.round(ctx.outputTokens || 0));
     const cacheReadTokens = Math.max(0, Math.round(ctx.cacheReadTokens || 0));
@@ -137,6 +186,15 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
             ctx.cacheWriteByTtl
           );
 
+    // ENG-700: an override or a known price is real allocated spend (possibly
+    // $0 for a genuinely free call). No override AND no price entry means the
+    // 0 in costMicroUsd is a missing rate, not a fact about the call — tag it
+    // "unpriced" so it never reads as confirmed-free spend. Token counts are
+    // written either way (see inputTokens/outputTokens below), unaffected by
+    // costSource.
+    const costSource =
+      ctx.costUsdOverride != null || !isUnpriced(ctx.model) ? "allocated" : "unpriced";
+
     await usageRecordDb.incrementUsage({
       userId,
       date,
@@ -148,9 +206,7 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
       cacheWriteTokens,
       costMicroUsd,
       billingUserId,
-      // Every dollar on this path is derived from our own price table
-      // (utils/llmPricing) or an explicit override — never vendor-reported.
-      costSource: "allocated",
+      costSource,
       ...(ctx.onBehalfOf ? { onBehalfOf: ctx.onBehalfOf } : {}),
       ...(ctx.provider ? { provider: ctx.provider } : {}),
       ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
@@ -246,7 +302,13 @@ export function meterUserUsage(ctx: RecordUsageContext): void {
 
   // Lazy-required (see import-site note) to keep this module's static load graph light.
   const { incrementUserTokenUsage } = require("./tokenUsageService") as typeof import("./tokenUsageService");
-  void incrementUserTokenUsage(ctx.userId, totalTokens, costUsd).catch((err: unknown) =>
+  void incrementUserTokenUsage(ctx.userId, totalTokens, costUsd, {
+    eventId: ctx.eventId,
+    model: ctx.model,
+    provider: ctx.provider,
+    feature: ctx.feature,
+    sessionId: ctx.sessionId,
+  }).catch((err: unknown) =>
     console.error(
       "[usageRecorder] meterUserUsage: failed to charge per-user cap:",
       err instanceof Error ? err.message : err

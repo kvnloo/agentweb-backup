@@ -16,6 +16,39 @@ import { isCompanyEmail } from "../utils/validation";
 import { isInitialPasswordExpired } from "../utils/secureRandom";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { getJwtSecret } from "../config/jwt";
+import { metaService } from "../services/metaService";
+
+// ENG-1402: server-side half of the CompleteRegistration conversion for our OWN
+// customer-portal signup (not a customer's ad account — reuses sendCapiLeadEvent's
+// hashing/CAPI-send plumbing purely because it already exists, tested, and takes
+// pixelId/accessToken as explicit params). Mirrors agentweb-landing-page's
+// metaCapi.ts pattern: read our own site pixel from env, skip loudly-but-non-fatally
+// when unconfigured — never let a Meta-side gap fail a registration.
+async function sendCompleteRegistrationCapiEvent(eventId: string, email: string): Promise<void> {
+  const pixelId = process.env.AGENTWEB_META_PIXEL_ID?.trim();
+  const accessToken = process.env.AGENTWEB_META_CAPI_ACCESS_TOKEN?.trim();
+  if (!pixelId || !accessToken) {
+    console.error(
+      "[auth.register] AGENTWEB_META_PIXEL_ID / AGENTWEB_META_CAPI_ACCESS_TOKEN not configured — " +
+        "CompleteRegistration CAPI event NOT sent to Meta."
+    );
+    return;
+  }
+  try {
+    const result = await metaService.sendCapiLeadEvent(pixelId, accessToken, {
+      eventId,
+      email,
+      eventName: "CompleteRegistration",
+    });
+    if (!result.success) {
+      console.error(
+        `[auth.register] CompleteRegistration CAPI send failed: ${result.error}`
+      );
+    }
+  } catch (err) {
+    console.error("[auth.register] CompleteRegistration CAPI send threw:", err);
+  }
+}
 
 // ENG-512: domain-based org auto-join. If the new signup's email domain
 // matches an org with autoJoinEnabled, create a pending domain-join request
@@ -248,8 +281,15 @@ export const register = async (req: Request, res: Response) => {
       { expiresIn: "90d" }
     );
 
+    // ENG-1402: shared dedup id for the browser-side fbq('track', 'CompleteRegistration', ...)
+    // call the client fires right after this response. Fire-and-forget — a Meta-side failure
+    // must never affect the registration response the user is waiting on.
+    const metaEventId = crypto.randomUUID();
+    sendCompleteRegistrationCapiEvent(metaEventId, email).catch(() => {});
+
     res.status(201).json({
       token,
+      metaEventId,
       user: {
         userId,
         email,

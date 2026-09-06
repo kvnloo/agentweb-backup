@@ -54,6 +54,9 @@ import {
   GOOGLE_CALENDAR_EVENTS_SCOPE,
   GOOGLE_CALENDAR_READONLY_SCOPE,
 } from '../services/connectedAccountsDb';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 const CONTEXT = { userId: 'user-1' };
 
@@ -252,6 +255,14 @@ describe('google_calendar_update_event error mapping', () => {
     expect(res.needs_reconnect).toBe(true);
   });
 
+  it('ENG-1300: a 403 classifies as auth/config end-to-end, not the generic Error/bug fallback', async () => {
+    mockPatch.mockRejectedValue({ response: { status: 403 }, message: 'forbidden' });
+    const res = await runUpdate({ event_id: 'ev1', summary: 'x' });
+    const classified = toolResultError(res);
+    expect(classifyToolErrorClass(classified)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+  });
+
   it('maps unknown error to generic message', async () => {
     mockPatch.mockRejectedValue({ message: 'boom' });
     const res = await runUpdate({ event_id: 'ev1', summary: 'x' });
@@ -349,6 +360,14 @@ describe('google_calendar_delete_event error mapping', () => {
     const res = await runDelete({ event_id: 'ev1' });
     expect(res.success).toBe(false);
     expect(res.needs_reconnect).toBe(true);
+  });
+
+  it('ENG-1300: a 403 classifies as auth/config end-to-end, not the generic Error/bug fallback', async () => {
+    mockDelete.mockRejectedValue({ response: { status: 403 }, message: 'forbidden' });
+    const res = await runDelete({ event_id: 'ev1' });
+    const classified = toolResultError(res);
+    expect(classifyToolErrorClass(classified)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
   });
 
   it('maps unknown error to generic message', async () => {

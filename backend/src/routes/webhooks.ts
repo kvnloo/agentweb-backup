@@ -7,8 +7,11 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb, userDb, tempEmailDb } from '../services/db';
 import { dripSequenceDb } from '../services/dripSequenceDb';
-import { getUserIdByHubSpotPortalId } from '../services/connectedAccountsDb';
+import { getUserIdByHubSpotPortalId, getAccountsByAttioWorkspaceId } from '../services/connectedAccountsDb';
 import { HubSpotService } from '../services/hubspotService';
+import { AttioService } from '../services/attioService';
+import { AttioAdapter } from '../services/adapters/attioAdapter';
+import { applyAttioPersonEvent } from '../utils/attioPersonWebhookEvent';
 import { getHubSpotClientSecretForAppId } from '../config/integrations';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { agentModeService } from '../services/agentModeService';
@@ -18,7 +21,8 @@ import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { pruneClickIds } from '../utils/leadSchema';
-import { normalizeAttribution } from '../types/attribution';
+import { resolveClientIdentityWithForwarded } from '../utils/clientIdentity';
+import { normalizeAttribution, promoteAttributionFromCustomFields } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
@@ -486,6 +490,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       source,
       customFields,
       attribution,
+      // ENG-1499. First touch and last touch arrive as separate fields from the
+      // lander. `attribution` is the acquiring click and never changes; this is
+      // the most recent attributed visit, and for a returning visitor the two
+      // genuinely differ. Absent for a single-visit lead.
+      lastTouch: incomingLastTouch,
       utm,
       // Baked into the generated app/api/capture/route.ts (see buildCaptureRoute) — not
       // spread through automatically, this handler destructures a fixed field list rather
@@ -502,6 +511,21 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // capture route (buildCaptureRoute) — NOT server CAPI-send time. Validated below
       // before ever being trusted.
       capturedAtMs,
+      // ENG-926 §B: the visitor's OWN ip/user-agent, declared by the platform-owned capture
+      // route (buildCaptureRoute) which is the only place they are knowable — the browser
+      // posts to the site's own domain, we only ever see Vercel. Accepted through the
+      // guarded path in clientIdentity.ts, never trusted as-is; see its doc comment for why
+      // a body-supplied value is safe here only under three conditions.
+      //
+      // ⚠ NAMED `visitorIp`/`visitorUserAgent`, NOT `clientIp`/`clientUserAgent`, on purpose.
+      // Any key this handler starts consuming stops appearing in customFields, where the
+      // passthrough collector would otherwise put it. `clientIp` is a plausible enough name
+      // that some existing caller may already be sending it and reading it back out of
+      // customFields, and this route is public — we cannot enumerate its callers. A name
+      // nobody is already using cannot silently take a field away from anyone. It also says
+      // what the value actually is: the VISITOR, not whoever made this request.
+      visitorIp: declaredClientIp,
+      visitorUserAgent: declaredClientUserAgent,
     } = req.body;
 
     // Validate required field (email)
@@ -524,16 +548,6 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       linkedin: linkedin?.trim() || '',
     };
 
-    // Attribution — accept either the new `attribution` shape or the legacy
-    // flat `utm` shape (same normaliser controllers/auth.ts uses for signup).
-    // If the client sends nothing, we stamp nothing; the CSV import and other
-    // internal paths won't carry attribution.
-    const touch = normalizeAttribution(attribution) ?? normalizeAttribution(utm);
-    if (touch) {
-      leadData.firstTouch = touch;
-      leadData.lastTouch = touch;
-    }
-
     // ENG-926 §C: persist Meta's browser id so a conversion relayed WEEKS later (a deal
     // closing in the CRM) can still be matched to this person. `fbp` is a first-party
     // cookie read here at capture time and used immediately for the Lead event; by the
@@ -547,6 +561,37 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     if (typeof fbp === 'string' && fbp.trim()) {
       leadData.metaFbp = fbp.trim();
     }
+
+    // ENG-926 §B: the other two Event Match Quality signals, kept for the same reason as
+    // `fbp` above. Both were already read here, spent on the immediate Lead event, and then
+    // discarded — so a conversion §C relays weeks later went to Meta with LESS identity than
+    // we held at capture, for no reason other than nothing persisted them.
+    //
+    // Computed once here rather than inside the CAPI block below, because the lead write
+    // needs them too and re-deriving the same value twice is how the two drift apart.
+    // ENG-493 is still deferred (flipping Express's global `trust proxy` would also change
+    // auth.ts's IP-keyed rate limiters), so the x-forwarded-for read stays scoped to this
+    // handler.
+    //
+    // ⚠ Landing pages do NOT reach this route from the browser — they POST to their own
+    // Next.js route, which calls us server-side from Vercel (both `hireemma.ai`'s
+    // /api/lead and the platform's own generated /api/capture). So this resolution is
+    // frequently the FORWARDER, not the visitor: a real end-to-end run recorded
+    // `44.202.76.171` + `node` for a lead that came from an actual iPhone. A wrong IP is
+    // worse than no IP — Meta reads it as a match signal and a datacenter address matches
+    // nobody — and these attributes are WRITE-ONCE in db.ts, so a wrong one is permanent.
+    // resolveClientIdentityWithForwarded drops BOTH when the caller is not a browser AND has
+    // declared nothing — and when it HAS declared, validates the declaration before use.
+    const rawClientIp = (
+      req.headers['x-forwarded-for']?.toString().split(',')[0] ?? req.ip ?? ''
+    ).trim();
+    const { clientIp: capturedClientIp, clientUserAgent: capturedUserAgent } =
+      resolveClientIdentityWithForwarded(req.headers['user-agent'], rawClientIp, {
+        clientIp: declaredClientIp,
+        clientUserAgent: declaredClientUserAgent,
+      });
+    if (capturedClientIp) leadData.clientIp = capturedClientIp;
+    if (capturedUserAgent) leadData.clientUserAgent = capturedUserAgent;
 
     // Any top-level key this handler did NOT destructure above is caller data, and used to
     // be silently discarded. A landing page that posts its own fields flat (rather than
@@ -564,8 +609,13 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // compact payload can still carry hundreds of keys straight into storage.
     const HANDLED_TOP_LEVEL_KEYS = new Set([
       'listId', 'email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes',
-      'linkedin', 'source', 'customFields', 'attribution', 'utm', 'pixelId',
+      'linkedin', 'source', 'customFields', 'attribution', 'lastTouch', 'utm', 'pixelId',
       'metaAccountId', 'eventId', 'fbp', 'fbc', 'capturedAtMs',
+      // ENG-926 §B. Absent from this set they would fall through into customFields as junk
+      // instead of being read as identity — the passthrough collector is deliberately
+      // "anything not handled above", so a newly-handled key MUST be added here too.
+      // (`clientIp`/`clientUserAgent` are deliberately NOT handled — see the destructure.)
+      'visitorIp', 'visitorUserAgent',
     ]);
     const PASSTHROUGH_MAX_KEYS = 50;
     const PASSTHROUGH_MAX_VALUE_LENGTH = 1000;
@@ -590,6 +640,36 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // Add source field (from request or default to 'api')
       source: source?.trim() || customFields?.source || 'api',
     };
+
+    // Attribution — accept either the new `attribution` shape or the legacy
+    // flat `utm` shape (same normaliser controllers/auth.ts uses for signup).
+    // If the client sends nothing, we stamp nothing; the CSV import and other
+    // internal paths won't carry attribution.
+    //
+    // ENG-926 §A: then fill any keys still absent from allowlisted click IDs and
+    // utm_* values sitting in customFields. A lander can capture attribution
+    // perfectly and still deliver a lead with none, by posting it into the free-form
+    // bag rather than the structured envelope — `hireemma.ai` forwards no
+    // `attribution` and no `utm` at all, so its leads arrived with no firstTouch
+    // whatsoever while the site, the POST and the resulting row all looked correct.
+    //
+    // Sourced from `incomingCustomFields` rather than the raw `customFields`, so a
+    // lander that posts its click IDs FLAT at the top level is covered too — those
+    // land in passthrough, and this handler's fixed destructure never reads them.
+    // This is why the block sits here rather than above: it needs that merge.
+    const touch = promoteAttributionFromCustomFields(
+      incomingCustomFields,
+      normalizeAttribution(attribution) ?? normalizeAttribution(utm),
+    );
+    if (touch) {
+      leadData.firstTouch = touch;
+      // ENG-1499. Prefer the lander's own last-touch when it sent one. Falling back
+      // to `touch` keeps a single-visit lead's lastTouch populated rather than
+      // empty — but where the two differ, storing first touch in both is exactly
+      // the bug this closes: last-touch reporting silently showed first-touch
+      // numbers, with nothing to indicate it.
+      leadData.lastTouch = normalizeAttribution(incomingLastTouch) ?? touch;
+    }
 
     // Check if lead already exists by email - merge instead of dropping
     const existingLead = await crmDb.getLeadByEmail(leadList.listId, email.trim().toLowerCase());
@@ -664,9 +744,48 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         }
       }
 
-      if (changed) {
+      // ENG-926 §B: backfill the match-quality signals on a repeat touch, and only when the
+      // lead has none. A returning visitor's IP and device are not the ones that acquired
+      // them, so overwriting would quietly degrade the very signal this is here to
+      // strengthen.
+      //
+      // These checks are an OPTIMISATION, not the guarantee — they avoid issuing a write
+      // that would change nothing, and keep the `lead.unchanged` response honest. The
+      // write-once contract itself is enforced atomically in db.ts via `if_not_exists`,
+      // because a read here followed by a write there is TOCTOU: two repeat submissions
+      // racing while the field is absent would both pass this check.
+      //
+      // `metaFbp` is included because it was accepted by createLead alone: a lead that first
+      // arrived WITHOUT an fbp and later submitted WITH one never got one. That is the
+      // silent-drop failure db.ts's own comment describes, and this is the path it needed.
+      //
+      // Tracked SEPARATELY from `changed`, and that separation is load-bearing. `changed`
+      // becomes `isUpdated`, which gates drip-sequence auto-enrolment, external CRM push and
+      // the owner notification — real outbound email. Counting a silent metadata backfill as
+      // a lead update would enrol a returning visitor into a sequence and notify the owner
+      // because we quietly stored an IP, which is a side effect nobody asked for and the
+      // caller cannot see coming. The write still happens; only the "this lead changed"
+      // claim is withheld.
+      let matchQualityBackfilled = false;
+      if (!existingLead.metaFbp && leadData.metaFbp) {
+        updates.metaFbp = leadData.metaFbp;
+        matchQualityBackfilled = true;
+      }
+      if (!existingLead.clientIp && leadData.clientIp) {
+        updates.clientIp = leadData.clientIp;
+        matchQualityBackfilled = true;
+      }
+      if (!existingLead.clientUserAgent && leadData.clientUserAgent) {
+        updates.clientUserAgent = leadData.clientUserAgent;
+        matchQualityBackfilled = true;
+      }
+
+      if (changed || matchQualityBackfilled) {
         await crmDb.updateLead(leadList.listId, existingLead.leadId, updates);
-        isUpdated = true;
+        // Only a user-visible change makes this an "update". See the ENG-926 §B note above:
+        // isUpdated drives sequence enrolment, CRM sync and owner alerts, so a silent
+        // metadata backfill deliberately does not set it.
+        isUpdated = changed;
       }
 
       lead = { ...existingLead, ...updates };
@@ -717,18 +836,22 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           const owner = await userDb.getUserById(leadList.userId);
           const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
           const { accessToken } = await getMetaAccountCredentials(owner, leadList.userId, metaAccountId);
-          // ENG-493 is deferred (flipping Express's global `trust proxy` also changes
-          // auth.ts's IP-keyed rate limiters — a separate, riskier change). Scope the fix to
-          // just this CAPI call site instead, same pattern as loopEvents.ts/assetController.ts.
-          const clientIp = (req.headers['x-forwarded-for']?.toString().split(',')[0] ?? req.ip ?? 'unknown').trim();
+          // Resolved once at capture (see the ENG-926 §B block above) so the value sent here
+          // and the value stored on the lead are the same one, not two independent reads.
+          //
+          // OMITTED rather than defaulted when the caller was a forwarding server. This
+          // previously passed `'unknown'`, which metaService treats as truthy and sends
+          // verbatim as `client_ip_address` — a literal placeholder string presented to
+          // Meta as a match signal. Before that it sent the forwarder's real datacenter IP,
+          // which is worse: it looks valid and matches nobody. Sending neither is correct.
           const result = await metaService.sendCapiLeadEvent(pixelId, accessToken, {
             eventId,
             email: leadData.email,
             firstName: leadData.firstName,
             lastName: leadData.lastName,
             phone: leadData.phone,
-            clientIp,
-            userAgent: req.headers['user-agent'],
+            clientIp: capturedClientIp,
+            userAgent: capturedUserAgent,
             sourceUrl: req.headers['referer'],
             fbp: typeof fbp === 'string' ? fbp : undefined,
             fbc: typeof fbc === 'string' ? fbc : undefined,
@@ -980,41 +1103,245 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 // ─────────────────────────────────────────────────────────────────────────────
 // ATTIO WEBHOOK RECEIVER
 //
-// Attio sends events here for each user who has registered a webhook.
-// The payload identifies the workspace via workspace_id — matched against
-// connected accounts to find the user.
+// Attio's model is per-workspace (each connected account registers its own
+// webhook subscription via AttioService.registerWebhook — see
+// utils/attioWebhookSubscription.ts) rather than HubSpot's single app-wide
+// subscription list, but the request-handling shape mirrors HubSpot's
+// handler below: ACK 200 immediately, verify the signature, dedup via the
+// durable job queue, then demux across every list bound to the matched
+// workspace.
 //
-// Events handled:
-//   record.created  → log for future sync (pull new person into leads)
-//   record.updated  → log for future sync (update matching lead)
-//   record.deleted  → log for future sync (flag lead as removed)
+// Events handled: record.created/updated/deleted (People only — Companies
+// are skipped, matching HubSpot's own webhook scope, which doesn't touch
+// Companies either) and list-entry.created/updated/deleted (the Deal-analog,
+// for parity with HubSpot's deal.propertyChange handling).
 // ─────────────────────────────────────────────────────────────────────────────
-router.post('/attio', async (req: express.Request, res: express.Response) => {
+
+const attioAdapter = new AttioAdapter();
+
+function verifyAttioSignature(signingKey: string, rawBody: Buffer, signature: string): boolean {
   try {
-    const event = req.body;
-    const eventType: string = event?.event_type ?? event?.type ?? 'unknown';
-    const workspaceId: string = event?.workspace_id ?? '';
-    const objectType: string = event?.data?.object?.slug ?? '';
-    const recordId: string = event?.data?.record?.id?.record_id ?? '';
+    const expected = crypto.createHmac('sha256', signingKey).update(rawBody).digest('hex');
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  } catch {
+    return false;
+  }
+}
 
-    console.log(`[Attio Webhook] event=${eventType} object=${objectType} record=${recordId} workspace=${workspaceId}`);
+interface AttioJobPayload {
+  workspaceId: string;
+  accountId: string; // the specific matched account's id — resolved at signature-verification time
+  userId: string;
+  events: any[];
+}
 
-    // Only process people and companies record events
-    const isRelevantObject = objectType === 'people' || objectType === 'companies';
-    const isRelevantEvent = ['record.created', 'record.updated', 'record.deleted'].includes(eventType);
+export async function processAttioWebhookJob(payload: AttioJobPayload): Promise<void> {
+  const svc = await AttioService.create(payload.userId, payload.accountId);
+  const lists = await crmDb.getLeadListsByUserId(payload.userId);
+  const matchingLists = (lists as any[]).filter(
+    l => l.externalCrmSyncConfigs?.attio?.accountId === payload.accountId,
+  );
 
-    if (!isRelevantObject || !isRelevantEvent) {
-      return res.status(200).json({ received: true, processed: false, reason: 'event not in scope' });
+  // Person attribute types are workspace-wide, not list-scoped, and
+  // loadAttributeTypes has no cache of its own — without sharing one fetch
+  // across this whole job, every record.* event (times every matching list)
+  // reissues the same Attio HTTP request. Fetched lazily (only if the
+  // delivery actually contains a record.* event) and once, then handed to
+  // every applyAttioPersonEvent call below.
+  let peopleAttrCache: Map<string, string> | undefined;
+  if (payload.events.some(e => (e?.event_type ?? '').startsWith('record.'))) {
+    peopleAttrCache = await svc.loadAttributeTypes('people');
+  }
+  // Deal-list attribute types ARE list-scoped (config.attioDealListId), so
+  // cache per distinct deal list id instead — different AgentWeb lists can
+  // point at different Attio deal lists.
+  const dealAttrCacheByListId = new Map<string, Map<string, string>>();
+
+  // CodeRabbit finding (ENG-1380): a per-event failure was recorded into
+  // lastSyncStatus but the job itself still resolved normally, so the
+  // durable job queue called markJobComplete instead of markJobFailed —
+  // a transient failure (Attio fetch error, DynamoDB delete error) was
+  // never retried by the queue's bounded-retry mechanism. OR'd across every
+  // list, not reset per-list, and only thrown after the loop below finishes
+  // — every matching list must still be fully attempted regardless of an
+  // earlier list's failure, exactly as before; only whether the job as a
+  // whole gets retried changes.
+  let anyJobEventFailed = false;
+
+  for (const list of matchingLists) {
+    const syncConfig = await externalCrmSyncService.getConfig(payload.userId, list.listId, 'attio');
+    if (!syncConfig || syncConfig.webhookEnabled === false) continue;
+
+    // Live-caught gap: a webhook-driven update applies correctly (the lead's
+    // data genuinely changes), but nothing stamped lastPullSyncAt/lastSyncStatus
+    // for it — only a manual "Pull" click did. The CRM Sync dialog's "last
+    // pulled" indicator looked permanently stale even while auto-pull was
+    // working. Stamp once per list per job (not per event) once at least one
+    // relevant event was actually attempted against it — set before the call,
+    // not after, so a thrown error still counts as an attempt (and correctly
+    // marks the stamp as a failure, not skips it entirely).
+    let appliedAnyEvent = false;
+    let anyEventFailed = false;
+
+    for (const event of payload.events) {
+      const eventType: string = event?.event_type ?? '';
+      try {
+        if (eventType.startsWith('record.')) {
+          appliedAnyEvent = true;
+          // applyAttioPersonEvent catches its own fetch/deletion failures
+          // internally and returns false rather than throwing (CodeRabbit
+          // finding, ENG-1380) — check the return value, not just the catch.
+          const applied = await applyAttioPersonEvent(list.listId, syncConfig, svc, event, peopleAttrCache);
+          if (!applied) anyEventFailed = true;
+        } else if (eventType.startsWith('list-entry.')) {
+          const entryId: string = event?.id?.entry_id ?? event?.data?.entry_id ?? '';
+          if (entryId) {
+            appliedAnyEvent = true;
+            const dealListId = syncConfig.attioDealListId;
+            let dealAttrCache = dealListId ? dealAttrCacheByListId.get(dealListId) : undefined;
+            if (dealListId && !dealAttrCache) {
+              dealAttrCache = await svc.loadAttributeTypes('people', dealListId);
+              dealAttrCacheByListId.set(dealListId, dealAttrCache);
+            }
+            await attioAdapter.applyListEntryWebhookEvent(list.listId, syncConfig, svc, entryId, eventType, dealAttrCache);
+          }
+        }
+      } catch (err: any) {
+        console.error(`[Attio Webhook] Failed to apply ${eventType} to list ${list.listId}:`, err?.message ?? err);
+        anyEventFailed = true;
+      }
     }
 
-    // TODO: Trigger sync handler when sync service is implemented
-    // await attioSyncService.handleWebhookEvent(workspaceId, eventType, event.data);
-
-    res.status(200).json({ received: true, processed: true });
-  } catch (error: any) {
-    console.error('[Attio Webhook] error:', error);
-    res.status(200).json({ received: true, processed: false, error: error.message });
+    if (appliedAnyEvent) {
+      await externalCrmSyncService.updateSyncTimestamp(syncConfig, 'pull', !anyEventFailed);
+    }
+    if (anyEventFailed) anyJobEventFailed = true;
   }
+
+  // Thrown only after every matching list has been attempted — the caller's
+  // markJobFailed/retry path re-processes this same payload later. Safe to
+  // retry the whole delivery: every event application here (person create/
+  // update, list-entry field merge) is an idempotent upsert, so re-applying
+  // an event that already succeeded on a prior attempt is a no-op, not a
+  // duplicate side effect.
+  if (anyJobEventFailed) {
+    throw new Error('[Attio Webhook] One or more events failed to apply — see prior logs for detail');
+  }
+}
+
+registerProcessor('attio_webhook', processAttioWebhookJob);
+
+router.post('/attio', (req: express.Request, res: express.Response) => {
+  // Attio's webhook-URL verification handshake, if it applies here — echo
+  // X-Hook-Secret back so the subscription activates. (Also handled in
+  // crmWebhook.ts's per-list endpoint; kept defensively for this endpoint
+  // too since it's cheap and the create-webhook flow doesn't rule it out.)
+  const hookSecret = req.headers['x-hook-secret'] as string | undefined;
+  if (hookSecret) {
+    res.set('X-Hook-Secret', hookSecret);
+    return res.status(200).json({ received: true });
+  }
+
+  // Return 200 immediately — Attio retries on non-2xx or timeout (at-least-once
+  // delivery, up to 10 retries over ~3 days). All processing is fire-and-forget.
+  res.status(200).json({ received: true });
+
+  void (async () => {
+    try {
+      const rawBody = req.body as Buffer;
+      const payload: any = JSON.parse(rawBody.toString('utf8'));
+      // Real shape (live-verified, ENG-1380): { webhook_id, events: [{ event_type,
+      // id: { workspace_id, object_id, record_id, ... }, actor }] }. workspace_id
+      // lives on each individual event's `id`, not at the top level — the original
+      // stub's `event?.workspace_id` assumption never matched a real delivery.
+      const rawEvents: any[] = Array.isArray(payload?.events) ? payload.events : [payload];
+      // Real deliveries carry a handful of events at most; cap defensively so a
+      // malformed or oversized body can't fan out into an unbounded number of
+      // per-event Attio API calls and DB writes in processAttioWebhookJob.
+      const MAX_EVENTS_PER_DELIVERY = 200;
+      if (rawEvents.length > MAX_EVENTS_PER_DELIVERY) {
+        console.warn(`[Attio Webhook] Delivery carries ${rawEvents.length} events — processing only the first ${MAX_EVENTS_PER_DELIVERY}`);
+      }
+      const events = rawEvents.slice(0, MAX_EVENTS_PER_DELIVERY);
+      const workspaceId: string = events[0]?.id?.workspace_id ?? '';
+      if (!workspaceId) {
+        console.warn('[Attio Webhook] No workspace_id on delivery — ignored');
+        return;
+      }
+
+      const candidates = await getAccountsByAttioWorkspaceId(workspaceId);
+      if (candidates.length === 0) {
+        console.warn(`[Attio Webhook] No connected account found for workspace ${workspaceId}`);
+        return;
+      }
+
+      // Attio-Signature (duplicated as X-Attio-Signature for legacy support) —
+      // HMAC-SHA256 of the raw body with the matched account's own signing
+      // key. Try each candidate's key rather than committing to a single
+      // guess (same multi-tenant-collision defense as getAccountsByAttioWorkspaceId
+      // itself documents).
+      const signature = (req.headers['attio-signature'] ?? req.headers['x-attio-signature']) as string | undefined;
+      // Fail closed: the unsigned-request bypass is only allowed when
+      // NODE_ENV is explicitly 'development', mirroring this codebase's own
+      // TABLE_PREFIX convention (constants.ts) of treating anything that
+      // isn't exactly 'development' as needing production-safe behavior.
+      // The previous `isProd = NODE_ENV === 'production'` check was
+      // fail-open: an unset, staging, mistyped, or otherwise non-'production'
+      // NODE_ENV value in a real deployment let a completely unauthenticated
+      // request through, matched against the first candidate account, and
+      // processed as if legitimate.
+      const isDev = process.env.NODE_ENV === 'development';
+      let matched: { userId: string; accountId: string } | null = null;
+
+      if (signature) {
+        for (const { userId, account } of candidates) {
+          const signingKey = (account.config as any).webhook_signing_key;
+          if (signingKey && verifyAttioSignature(signingKey, rawBody, signature)) {
+            matched = { userId, accountId: account.account_id };
+            break;
+          }
+        }
+        if (!matched) {
+          console.warn(`[Attio Webhook] Signature did not verify against any connected account for workspace ${workspaceId} — request ignored`);
+          return;
+        }
+      } else if (!isDev) {
+        console.warn('[Attio Webhook] Missing Attio-Signature — request rejected (unsigned requests are only allowed when NODE_ENV=development)');
+        return;
+      } else {
+        console.warn('[Attio Webhook] No Attio-Signature header — proceeding without verification (dev only)');
+        matched = { userId: candidates[0].userId, accountId: candidates[0].account.account_id };
+      }
+
+      const dedupeKey = (req.headers['idempotency-key'] as string | undefined)
+        ?? crypto.createHash('sha256').update(rawBody).digest('hex');
+      const jobPayload: AttioJobPayload = { workspaceId, accountId: matched.accountId, userId: matched.userId, events };
+
+      const enqueueResult = await enqueueJob('attio_webhook', dedupeKey, jobPayload, { claimImmediately: true });
+      if (enqueueResult === 'duplicate') {
+        console.log(`[Attio Webhook] Duplicate delivery (${dedupeKey.slice(0, 12)}...) — already queued, skipping`);
+        return;
+      }
+
+      const stopHeartbeat = enqueueResult === 'enqueued' ? startHeartbeat('attio_webhook', dedupeKey) : () => {};
+      try {
+        await processAttioWebhookJob(jobPayload);
+        if (enqueueResult === 'enqueued') {
+          await markJobComplete('attio_webhook', dedupeKey);
+        }
+      } catch (processingError: any) {
+        if (enqueueResult === 'enqueued') {
+          await markJobFailed('attio_webhook', dedupeKey, processingError);
+        } else {
+          console.error('[Attio Webhook] Processing failed with no durable record (queue unavailable):', processingError?.message ?? processingError);
+        }
+      } finally {
+        stopHeartbeat();
+      }
+    } catch (error: any) {
+      console.error('[Attio Webhook] error:', error);
+    }
+  })();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

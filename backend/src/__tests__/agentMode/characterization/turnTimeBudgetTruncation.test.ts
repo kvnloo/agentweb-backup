@@ -205,6 +205,69 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(executedTools).toHaveLength(finalSynthesisPerCall.filter((f) => !f).length);
   });
 
+  it('applies a set_work_plan_status call discarded by the forced synthesis instead of dropping it (ENG-1682 follow-up)', async () => {
+    // Prod session f771b626-…: create_html_file succeeded, but the turn ran out of time
+    // one call before the model could mark the step completed. Discarding that late
+    // set_work_plan_status call like every other one left the step stuck "pending"
+    // forever even though the deliverable was already done. Applying it directly (a
+    // single bounded DB write, not another LLM round trip) closes the gap.
+    const workPlanSession = {
+      sessionId: 'test-session',
+      messages: [],
+      associatedSkills: null,
+      workPlan: {
+        title: 'Test Plan',
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'completed' },
+          { stepCount: 2, title: 'Step 2', status: 'pending' },
+        ],
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    };
+    installStandardMockDeps(workPlanSession);
+    const mockChatbotService = require('../../../services/chatbotService');
+    mockChatbotService.chatbotDb.updateSessionWorkPlan = jest.fn().mockResolvedValue(workPlanSession);
+    mockChatbotService.chatbotDb.updateSessionWorkPlanInputRequest = jest.fn().mockResolvedValue(workPlanSession);
+    mockChatbotService.chatbotDb.updateCalledFunctions = jest.fn().mockResolvedValue(undefined);
+    mockChatbotService.chatbotDb.addAssociatedSkills = jest.fn().mockResolvedValue(undefined);
+
+    const { result, executedTools } = await runRealLoop(
+      (call, isFinalSynthesis) =>
+        isFinalSynthesis
+          ? {
+              content: 'Report generated — here is what I finished before the time limit.',
+              tool_calls: [
+                {
+                  id: 'late-status',
+                  name: 'set_work_plan_status',
+                  arguments: JSON.stringify({
+                    updates: [{ stepCount: 2, status: 'completed', notes: 'Report generated' }],
+                  }),
+                },
+              ],
+            }
+          : {
+              content: `Scanned batch ${call + 1}.`,
+              tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
+            },
+    );
+
+    expect(result.truncatedByTimeBudget).toBe(true);
+    // The late call never ran through the normal tool-execution path...
+    expect(executedTools).not.toContain('set_work_plan_status');
+    // ...but its state effect still applied: the step is completed in the DB despite the
+    // turn running out of time before the model's call could go through normally.
+    expect(mockChatbotService.chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+      'test-session',
+      expect.objectContaining({
+        steps: expect.arrayContaining([
+          expect.objectContaining({ stepCount: 2, status: 'completed', notes: 'Report generated' }),
+        ]),
+      }),
+    );
+  });
+
   it('warns the model to wrap up before it stops honouring tool calls', async () => {
     let sawWrapUpNudge = false;
     let sawFinalNudge = false;
@@ -244,6 +307,36 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     // inside the reserve held back for this one call, so a retry would spend it and
     // could let the controller's cap fire mid-call — discarding the whole turn, which
     // is the ENG-907 failure itself. One synthesis attempt, then deliver.
+    expect(finalSynthesisPerCall.filter(Boolean)).toHaveLength(1);
+    expect(elapsedMs).toBeLessThanOrEqual(CAP_MS);
+  });
+
+  it('still prefers the ledger recap over the time-limit message when the forced synthesis returns residue (ENG-1576 correction)', async () => {
+    // A forced-final-synthesis turn (truncatedByTimeBudget) can ALSO produce
+    // residue-shaped output ("}]") — isUnusableSynthesis runs unconditionally, so
+    // the two flags are not mutually exclusive (CodeRabbit question, PR #2639). An
+    // earlier revision of this fix made that combination defer to the generic
+    // time-limit message instead of the ledger recap — but that's wrong:
+    // synthesisResidueDropped also covers ENG-1188's echoed-nudge detection
+    // (including the wall-clock nudge specifically — see nudgeEchoRecovery.test.ts's
+    // "recovers with the executed-action ledger when the forced synthesis turn
+    // echoes the time-budget nudge"), and ENG-1188's entire point is that an echoed
+    // nudge must never reach the user, EVEN under time-budget truncation. Since
+    // isUnusableSynthesis gives the caller no way to distinguish plain residue from
+    // a nudge echo, the ledger recap has to win for both — reverted to match.
+    const { result, elapsedMs, finalSynthesisPerCall } = await runRealLoop((call, isFinalSynthesis) =>
+      isFinalSynthesis
+        ? { content: '}]' }
+        : {
+            content: '',
+            tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
+          },
+    );
+
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/built directly from the actions I actually ran/);
+    expect(result.content).toContain('twitter_outreach');
+    expect(result.content).not.toMatch(/time limit/i);
     expect(finalSynthesisPerCall.filter(Boolean)).toHaveLength(1);
     expect(elapsedMs).toBeLessThanOrEqual(CAP_MS);
   });
@@ -375,12 +468,7 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(result.content).toMatch(/time limit/i);
   });
 
-  it('stops waiting on a permitted backup that turns out to be slower than the time left', async () => {
-    // The affordability estimate is drawn from calls this run already made, and the backup
-    // is by definition a DIFFERENT model — it can be slower than anything measured. An
-    // estimate is therefore not a guarantee, so the admitted retry is also hard-bounded: if
-    // it overruns, the turn stops waiting and delivers the partial answer instead of letting
-    // the controller's cap fire and discard everything.
+  it('does not issue a second model call after a transient forced-synthesis failure', async () => {
     let call = 0;
     const modelsCalled: string[] = [];
     jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
@@ -393,10 +481,6 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       );
       modelsCalled.push(args[0]);
       if (isFinalSynthesis) {
-        if (modelsCalled.filter((_, i) => i >= 0).length && args[0] !== service.default_model) {
-          // The backup: never answers within the bound.
-          return new Promise(() => {});
-        }
         nowMs += 1_000;
         throw new Error('Too many requests, please try again later');
       }
@@ -406,37 +490,21 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
         tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
       });
     });
-    jest.spyOn(service as any, 'getBackupModel').mockResolvedValue('gpt-5-chat-2');
     jest.spyOn(service as any, 'executeTool').mockResolvedValue(
       JSON.stringify({ success: true, data: 'mock' }),
     );
     jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
-    // The bound is real wall-clock (minutes), so fire it immediately to keep the test fast.
-    // Restored in `finally` — jest.clearAllMocks() does NOT put the real timer back, and a
-    // leaked instant setTimeout would quietly corrupt every later test in this file.
-    const timerSpy = jest.spyOn(global, 'setTimeout').mockImplementation(((fn: any) => {
-      Promise.resolve().then(() => fn());
-      return { unref() {} } as any;
-    }) as any);
+    const result = (await service.generateMarketingResponse(
+      'Find me the 10 best X posts about agentic wallets, 10 more to reply to, 5 accounts to monitor, and the order to reply in.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+      false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+      nowMs,
+    )) as any;
 
-    let result: any;
-    try {
-      result = (await service.generateMarketingResponse(
-        'Find me the 10 best X posts about agentic wallets, 10 more to reply to, 5 accounts to monitor, and the order to reply in.',
-        [] as any,
-        'test-user',
-        service.default_model,
-        'test-session',
-        false, undefined, undefined, false, undefined, undefined, undefined, false, false,
-        nowMs,
-      )) as any;
-    } finally {
-      timerSpy.mockRestore();
-    }
-
-    // The backup WAS attempted (the estimate allowed it) but never answered, and the turn
-    // still came back with the partial-delivery message instead of hanging into the cap.
-    expect(modelsCalled).toContain('gpt-5-chat-2');
+    expect(new Set(modelsCalled)).toEqual(new Set([service.default_model]));
     expect(result.truncatedByTimeBudget).toBe(true);
     expect(result.content).toMatch(/time limit/i);
   });

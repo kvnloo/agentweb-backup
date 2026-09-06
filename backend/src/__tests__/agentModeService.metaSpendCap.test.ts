@@ -70,6 +70,20 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
     (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
   });
 
+  // ENG-1277: verifyCampaignSpendCap's retry loop sleeps SPEND_CAP_VERIFY_BACKOFF_MS
+  // (3000ms) for real between attempts. Seven tests below exercise 1-3 of those
+  // sleeps (up to 9s each, ~42s total for this file) to reach the real 4-attempt
+  // retry path. Each opts into fake timers, fires the call without awaiting it
+  // directly, then `advanceTimersByTimeAsync(15000)` — comfortably more than the
+  // 9000ms worst case — flushes every pending AND newly-scheduled backoff in one
+  // shot, resolving the retry chain without changing the attempt count, the
+  // backoff value, or any assertion below. useRealTimers() after every test (even
+  // ones that didn't opt in) is a harmless no-op and guards against a fake-timers
+  // leak into a later test in this file.
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
   describe('CREATE', () => {
     const createParams = {
       name: 'Capped campaign',
@@ -107,11 +121,17 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
     });
 
     it('refuses to confirm the cap when the read-back shows none (the reported bug)', async () => {
+      jest.useFakeTimers();
       (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new' });
       // Exactly what a raw Graph read returned for the two new campaigns: no spend_cap at all.
       (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new' });
 
-      const result = await service.createMetaAdsCampaign('user123', createParams as any);
+      const resultPromise = service.createMetaAdsCampaign('user123', createParams as any);
+      // 15s comfortably covers the worst case (3 backoffs x 3000ms = 9000ms); advanceTimersByTimeAsync
+      // flushes microtasks between each fired timer, so newly-scheduled backoffs within this
+      // window fire too — one call resolves the whole retry chain instantly.
+      await jest.advanceTimersByTimeAsync(15000);
+      const result = await resultPromise;
 
       expect(result.spend_cap_verified).toBe(false);
       expect(result.error).toBe('SPEND_CAP_UNCONFIRMED');
@@ -127,20 +147,24 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       // campaign id and invite a duplicate create.
       expect(result.success).toBe(true);
       expect(toolResultError(result)).toBeNull();
-    }, 20000);
+    });
 
     it('reports the cap as unverified (never as applied) when the read-back itself fails', async () => {
+      jest.useFakeTimers();
       (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new', name: 'Capped campaign' });
       (metaService.getCampaign as jest.Mock).mockRejectedValue(new Error('Meta API Error: transient'));
 
-      const result = await service.createMetaAdsCampaign('user123', createParams as any);
+      const resultPromise = service.createMetaAdsCampaign('user123', createParams as any);
+      await jest.advanceTimersByTimeAsync(15000);
+      const result = await resultPromise;
 
       expect(result.spend_cap_verified).toBe(false);
       expect(result.error).toBe('SPEND_CAP_UNCONFIRMED');
       expect(result.message).toMatch(/could NOT be confirmed/i);
-    }, 20000);
+    });
 
     it('does not cry wolf on read-after-write lag — a stale read is retried, not believed', async () => {
+      jest.useFakeTimers();
       // Meta's read-after-write is not instant. Believing the FIRST read would tell a user
       // their money stop is missing when it landed a second later.
       (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new' });
@@ -148,23 +172,28 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
         .mockResolvedValueOnce({ id: 'camp_new' })                        // not propagated yet
         .mockResolvedValueOnce({ id: 'camp_new', spend_cap: '100000' });  // now visible
 
-      const result = await service.createMetaAdsCampaign('user123', createParams as any);
+      const resultPromise = service.createMetaAdsCampaign('user123', createParams as any);
+      await jest.advanceTimersByTimeAsync(15000);
+      const result = await resultPromise;
 
       expect(metaService.getCampaign).toHaveBeenCalledTimes(2);
       expect(result.spend_cap_verified).toBe(true);
       expect(result.error).toBeUndefined();
-    }, 20000);
+    });
 
     it('recovers when the read-back itself fails transiently', async () => {
+      jest.useFakeTimers();
       (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new' });
       (metaService.getCampaign as jest.Mock)
         .mockRejectedValueOnce(new Error('Meta API Error: transient'))
         .mockResolvedValueOnce({ id: 'camp_new', spend_cap: '100000' });
 
-      const result = await service.createMetaAdsCampaign('user123', createParams as any);
+      const resultPromise = service.createMetaAdsCampaign('user123', createParams as any);
+      await jest.advanceTimersByTimeAsync(15000);
+      const result = await resultPromise;
 
       expect(result.spend_cap_verified).toBe(true);
-    }, 20000);
+    });
 
     it('spells out the currency equivalent so a cents/dollars slip is visible', async () => {
       // spend_cap is in cents while budget_amount in the same tool is in dollars; a model
@@ -209,10 +238,13 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
     });
 
     it('fails loudly when the read-back shows a different cap than requested', async () => {
+      jest.useFakeTimers();
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
       (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_1', spend_cap: '100000' });
 
-      const result = await service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
+      const resultPromise = service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
+      await jest.advanceTimersByTimeAsync(15000);
+      const result = await resultPromise;
 
       // NOT success:false — an unconfirmed read is not a failed write, and downgrading it
       // would count a healthy call as a failure and strip every field below.
@@ -223,9 +255,10 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       expect(result.message).toMatch(/could NOT be confirmed/i);
       expect(result.spend_cap_requested).toBe(300000);
       expect(result.spend_cap_read).toBe(100000);
-    }, 20000);
+    });
 
     it('carries the whole story to the model without pretending the write failed', async () => {
+      jest.useFakeTimers();
       // The result stays success:true so it reaches the model as JSON — a success:false
       // result is collapsed at the dispatch boundary into ONE reason string and this tool
       // keeps no minimal fields, so everything below would be lost. The message therefore
@@ -234,7 +267,9 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
       (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_1' });
 
-      const result = await service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
+      const resultPromise = service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
+      await jest.advanceTimersByTimeAsync(15000);
+      const result = await resultPromise;
 
       expect(toolResultError(result)).toBeNull();
       expect(result.message).toContain('300000');
@@ -242,18 +277,21 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       expect(result.message).toMatch(/NO spend cap set/i);
       expect(result.message).toMatch(/do NOT tell the user/i);
       expect(result.message).toMatch(/idempotent/i);
-    }, 20000);
+    });
 
     it('does not claim success-with-cap when the read-back itself fails', async () => {
+      jest.useFakeTimers();
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
       (metaService.getCampaign as jest.Mock).mockRejectedValue(new Error('Meta API Error: transient'));
 
-      const result = await service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
+      const resultPromise = service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
+      await jest.advanceTimersByTimeAsync(15000);
+      const result = await resultPromise;
 
       expect(result.spend_cap_verified).toBe(false);
       expect(result.error).toBe('SPEND_CAP_UNCONFIRMED');
       expect(result.message).toMatch(/could NOT be confirmed/i);
-    }, 20000);
+    });
 
     it('leaves non-spend_cap updates untouched (no extra read-back)', async () => {
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });

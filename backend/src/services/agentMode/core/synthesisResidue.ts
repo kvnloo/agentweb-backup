@@ -16,6 +16,10 @@
  *     ledger, so a synthesis failure can never erase the record of what ran.
  */
 
+import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from './termination';
+import { buildTurnTimeBudgetNudge } from '../../../utils/turnTimeBudget';
+import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
+
 /**
  * Residue is short by nature — it is the tail of a structure the model failed to
  * finish emitting. Anything longer is far likelier to be real (if odd) output, so
@@ -43,6 +47,120 @@ const STRUCTURAL_ONLY = /^[\s{}[\],:"']+$/;
  * its opening marker instead.
  */
 const HISTORY_ECHO_PREFIX = /^\[(?:Result of \S+:|Previously called )/;
+
+/**
+ * ENG-1224 (Variant B): the internal control-directive text this loop itself
+ * injects as a budget nudge — see turnTimeBudget.ts's final-synthesis warning
+ * ("...Do not call any more tools. Write your final answer NOW...") and the
+ * step-budget warning ("Stop all searching/pagination immediately..."). Both
+ * are OUR instructions TO the model, never something a user asked for.
+ *
+ * Production session d5898ffd (model gemini-3.1-flash-lite, under loop stress
+ * after a tool error) echoed the injected instruction back verbatim as its
+ * final answer instead of following it — the entire final turn was the literal
+ * string "Do not call any more tools." A reply that opens with this phrasing is
+ * the model parroting its own context, not answering, exactly like the history
+ * echo above.
+ *
+ * Scoped to phrasing that actually appears in an injected nudge: "Do not call
+ * any more tools" (`buildTurnTimeBudgetNudge`, `turnTimeBudget.ts`) and "Stop
+ * all searching/pagination immediately" (the step-budget warning,
+ * `agentModeService.ts`). Earlier revisions also matched "stop calling tools"
+ * and "no more tool call(s)?", but no code path ever injects either phrase —
+ * being anchored-and-short, they risked misclassifying a genuine final answer
+ * that happens to open with similar wording as unusable synthesis.
+ */
+const INTERNAL_DIRECTIVE_ECHO_RE =
+  /^(?:\[SYSTEM(?:\s+WARNING)?\]\s*)?(?:do\s*n[o']?t\s+call\s+any\s+(?:more|further)\s+tools|stop\s+all\s+searching(?:\s*\/\s*pagination)?)\b/i;
+
+/**
+ * ENG-1188: a gemini-3.1-pro-preview work-plan session generated and
+ * screenshot-verified the corrected assets, then closed with the model echoing the
+ * injected synthesis nudge back verbatim — 3 repeats in 744 chars — instead of
+ * writing the delivery message. Non-empty and only 744 chars, it is far under
+ * `isDegenerateRepetition`'s 1000-char/300-word floor (built for a much larger
+ * collapse) and does not start with the history-echo marker above, so it slipped
+ * past every existing check and shipped straight to the user.
+ *
+ * Two or more verbatim copies of a nudge WE injected is never a real answer — a
+ * turn that merely quotes it once (e.g. explaining what the system told it) is
+ * left alone; only actual repetition trips this.
+ *
+ * `isUnusableSynthesis` is the loop's ONE choke point for terminating content
+ * (agentModeService.ts calls it exactly once, on whatever is about to ship), so
+ * every string the loop pushes as a "respond again" nudge belongs in this list —
+ * not just SYNTHESIS_NUDGE. CONTINUE_PROMPT (max_tokens continuation) and
+ * ANTI_LOOP_STOP_MESSAGE (repeated-identical-tool-calls warning) are injected by
+ * the exact same "push a system message, let the model respond again" mechanism,
+ * so a collapse that echoes either of THOSE back is just as real a failure and was,
+ * before this, just as unguarded.
+ */
+const INJECTED_NUDGES = [SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE];
+
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let index = haystack.indexOf(needle);
+  while (index !== -1) {
+    count++;
+    index = haystack.indexOf(needle, index + needle.length);
+  }
+  return count;
+}
+
+/**
+ * ENG-907's wall-clock nudges (`buildTurnTimeBudgetNudge`, `turnTimeBudget.ts`) are
+ * injected by this exact same mechanism, but each embeds a live remaining-seconds
+ * count, so no two injections are byte-identical — the plain-string check above can
+ * never match one. Rather than hand-copy the wording into a second, driftable
+ * constant, generate a sample with a sentinel duration and turn IT into a pattern:
+ * escape the sample for regex use, then widen the sentinel's digits back into
+ * `\d+`. If the wording in turnTimeBudget.ts ever changes, this pattern changes
+ * with it automatically.
+ */
+const TIME_BUDGET_SENTINEL_SECONDS = 918273;
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildTimeBudgetNudgePattern(kind: 'wrap_up' | 'final_synthesis'): RegExp {
+  const sample = buildTurnTimeBudgetNudge(
+    { phase: kind, elapsedMs: 0, remainingMs: TIME_BUDGET_SENTINEL_SECONDS * 1000, reserveMs: 0 },
+    kind,
+  );
+  const source = escapeRegExp(sample).replace(String(TIME_BUDGET_SENTINEL_SECONDS), '\\d+');
+  return new RegExp(source);
+}
+
+const TIME_BUDGET_NUDGE_PATTERNS = [
+  buildTimeBudgetNudgePattern('wrap_up'),
+  buildTimeBudgetNudgePattern('final_synthesis'),
+];
+
+/** Count non-overlapping matches of an anchorless pattern within `haystack`. */
+function countPatternOccurrences(haystack: string, pattern: RegExp): number {
+  const matches = haystack.match(new RegExp(pattern.source, 'g'));
+  return matches ? matches.length : 0;
+}
+
+/**
+ * True when `trimmed` is mostly one of our own injected nudges, echoed back. An
+ * exact match — the entire turn is one bare copy of a nudge — is non-empty, so it
+ * never re-triggers the retry ladder that injected it in the first place, and it
+ * ships as a real final answer unless caught here alongside the 2+-repeat case.
+ */
+function isNudgeEcho(trimmed: string): boolean {
+  if (
+    INJECTED_NUDGES.some((nudge) => trimmed === nudge || countOccurrences(trimmed, nudge) >= 2)
+  ) {
+    return true;
+  }
+  return TIME_BUDGET_NUDGE_PATTERNS.some((pattern) => {
+    const anchored = new RegExp(`^${pattern.source}$`);
+    return anchored.test(trimmed) || countPatternOccurrences(trimmed, pattern) >= 2;
+  });
+}
 
 /**
  * Degenerate-repetition thresholds. A model that collapses into a repetition loop
@@ -81,9 +199,12 @@ export function isUnusableSynthesis(content: unknown): boolean {
   if (typeof content !== 'string') return false;
   const trimmed = content.trim();
   if (trimmed.length === 0) return false;
-  // Both checked before the length cap: a history echo and a repetition collapse
-  // are long by nature.
+  // Checked before the length cap: a history echo, a nudge echo, a leaked
+  // internal directive, and a repetition collapse are all either long by
+  // nature or an intentionally short exact/prefix match.
   if (HISTORY_ECHO_PREFIX.test(trimmed)) return true;
+  if (isNudgeEcho(trimmed)) return true;
+  if (INTERNAL_DIRECTIVE_ECHO_RE.test(trimmed)) return true;
   if (isDegenerateRepetition(trimmed)) return true;
   if (trimmed.length > MAX_RESIDUE_LENGTH) return false;
   if (!STRUCTURAL_ONLY.test(trimmed)) return false;
@@ -152,21 +273,82 @@ function isReportedFailure(call: ExecutedToolCall): boolean {
   return resultFlags(call)?.success === false;
 }
 
+/**
+ * True for an `install_skills` call that installed SOME of what was asked for and had the
+ * rest refused.
+ *
+ * That result carries `success: true` (something was installed), so every failure test above
+ * reads it as a clean install — and a partial install is exactly the shape where the ONE skill
+ * the gated tool needed is the one that was refused. Treating it as a clean success disarmed
+ * the notice on the case it is most likely to be needed for.
+ *
+ * `rejectedSkillIds` is set by `agentModeService.installSkills` precisely so this is a fact in
+ * the result rather than something inferred from prose in `message`.
+ */
+function isPartialInstall(call: ExecutedToolCall): boolean {
+  const rejected = (call.result as { rejectedSkillIds?: unknown } | null | undefined)?.rejectedSkillIds;
+  return Array.isArray(rejected) && rejected.length > 0;
+}
+
+/**
+ * The tool names a rejected skill would have unlocked, per `installSkills` (agentModeService.ts)
+ * resolving `rejectedSkillIds` before this reader ever sees them. Empty for any call that did
+ * not carry the field — an unscoped throw, a legacy result shape, or a full subscription refusal
+ * that never got as far as knowing which ids to look up.
+ */
+function getRejectedToolNames(call: ExecutedToolCall): string[] {
+  const names = (call.result as { rejectedToolNames?: unknown } | null | undefined)?.rejectedToolNames;
+  return Array.isArray(names) ? names.filter((n): n is string => typeof n === 'string') : [];
+}
+
+
+/**
+ * ENG-1188 root-cause fix recommendation #2: a ledger of tool NAMES and counts
+ * told the user work happened, but not how to get it — "save_file — 1 succeeded"
+ * is not a deliverable. `extractMinimalToolResult` (agentModeService.ts) already
+ * preserves the URL on every asset-producing tool's result — save_file ->
+ * file_url, create_html_file/create_html_from_template -> s3_url, generate_image
+ * -> imageUrl, playwright_browser_take_screenshot -> screenshotUrl, generate_video
+ * -> videoUrl, generate_voiceover -> audioUrl — so it is already sitting in the
+ * ledger this module reads; nothing here ever looked at it.
+ */
+const ASSET_URL_FIELDS = ['file_url', 's3_url', 'imageUrl', 'screenshotUrl', 'videoUrl', 'audioUrl'] as const;
+
+/** The URL on a succeeded call's result, checking every known asset field. */
+function extractAssetUrl(call: ExecutedToolCall): string | null {
+  const result = call.result as Record<string, unknown> | null | undefined;
+  if (!result || typeof result !== 'object') return null;
+  for (const field of ASSET_URL_FIELDS) {
+    const value = result[field];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return null;
+}
+
 /** Tally the ledger into per-tool outcome counts, ignoring collapsed duplicates. */
 function tallyExecutedActions(
   toolCalls: ExecutedToolCall[],
-): Map<string, { ok: number; failed: number; deferred: number }> {
-  const counts = new Map<string, { ok: number; failed: number; deferred: number }>();
+): Map<string, { ok: number; failed: number; deferred: number; urls: string[] }> {
+  const counts = new Map<string, { ok: number; failed: number; deferred: number; urls: string[] }>();
   for (const call of toolCalls || []) {
     const name = call && typeof call.name === 'string' ? call.name.trim() : '';
     if (!name) continue;
     // A collapsed duplicate never ran: the call it points at did, and is counted
     // separately. Including it would report the same action twice.
     if (call.duplicateOf !== undefined && call.duplicateOf !== null) continue;
-    const entry = counts.get(name) || { ok: 0, failed: 0, deferred: 0 };
-    if ('error' in call || isReportedFailure(call)) entry.failed++;
-    else if (isDeferred(call)) entry.deferred++;
-    else entry.ok++;
+    const entry = counts.get(name) || { ok: 0, failed: 0, deferred: 0, urls: [] };
+    if ('error' in call || isReportedFailure(call)) {
+      entry.failed++;
+    } else if (isDeferred(call)) {
+      entry.deferred++;
+    } else {
+      entry.ok++;
+      // Only a succeeded call's URL is a real, fetchable asset — a failed call can
+      // still carry a stale/partial URL field in its error payload, and reporting
+      // that would hand the user a link to something that was never produced.
+      const url = extractAssetUrl(call);
+      if (url && !entry.urls.includes(url)) entry.urls.push(url);
+    }
     counts.set(name, entry);
   }
   return counts;
@@ -183,17 +365,18 @@ function tallyExecutedActions(
 const COUNT_BASIS_NOTE =
   '(Counts are tool calls, not the number of records created or changed.)';
 
-/** Render the `- tool — n succeeded, n failed` lines for a tally. */
+/** Render the `- tool — n succeeded, n failed` lines (plus asset URLs) for a tally. */
 function renderLedgerLines(
-  counts: Map<string, { ok: number; failed: number; deferred: number }>,
+  counts: Map<string, { ok: number; failed: number; deferred: number; urls: string[] }>,
 ): string {
   const lines: string[] = [];
-  for (const [name, { ok, failed, deferred }] of counts) {
+  for (const [name, { ok, failed, deferred, urls }] of counts) {
     const parts: string[] = [];
     if (ok > 0) parts.push(`${ok} succeeded`);
     if (failed > 0) parts.push(`${failed} failed`);
     if (deferred > 0) parts.push(`${deferred} not run (paused for budget)`);
     lines.push(`- ${name} — ${parts.join(', ')}`);
+    for (const url of urls) lines.push(`  ${url}`);
   }
   return lines.join('\n');
 }
@@ -236,11 +419,440 @@ export function buildExecutedActionsFooter(toolCalls: ExecutedToolCall[]): strin
 
 /** True when any tool in the tally has at least one call in `bucket`. */
 function countsInclude(
-  counts: Map<string, { ok: number; failed: number; deferred: number }>,
+  counts: Map<string, { ok: number; failed: number; deferred: number; urls: string[] }>,
   bucket: 'ok' | 'failed' | 'deferred',
 ): boolean {
   for (const entry of counts.values()) if (entry[bucket] > 0) return true;
   return false;
+}
+
+/**
+ * ENG-1331: a work-plan session generated and screenshot-exported only 4 of 12
+ * requested display-ad sizes, then closed with "all 12 sizes have been rendered,
+ * QA'd, and saved" — fluent, well-formed prose, not the junk `isUnusableSynthesis`
+ * above exists to catch. The closing message was built from INTENT ("render all
+ * 12") rather than from what actually ran, so a claim like this reads as a normal
+ * answer and ships straight to the user.
+ *
+ * `detectFalseCompletionClaim` is the orthogonal truth check: instead of judging
+ * whether the text looks like an answer, it parses any explicit numeric completion
+ * claim ("all N <asset noun>", "N of N", "N/N") out of the content and compares it
+ * against the ledger's actual count of succeeded asset-producing tool calls.
+ *
+ * `toolCalls` holds every call made THIS TURN, but "this turn" is not "this step":
+ * in an AUTOCOMPLETE-mode work-plan session the whole loop — including every
+ * `set_work_plan_status` call between steps/variants — runs inside one turn, so a
+ * multi-variant turn can carry several steps' worth of successful assets in one
+ * ledger. Comparing a claim about the LATEST step/variant ("all 12 sizes for
+ * Variant 4") against the WHOLE ledger reproduces the exact ENG-1188 masking bug on
+ * this new mechanism: variants 1-3's already-succeeded renders paper over variant
+ * 4's shortfall, and the guard built to catch that shortfall goes silent on it.
+ * `sinceLastStepBoundary` below scopes the count to calls made after the last
+ * completed/skipped `set_work_plan_status` in the ledger, mirroring the `sinceIso`
+ * cutoff agentModeService.ts already uses for the `expectedAssetCount` gate — same
+ * idea, expressed as a ledger-index cut since this pure module only ever sees one
+ * turn's tool-call array in call order, not the session messages `sinceIso` reads
+ * timestamps from.
+ */
+const ASSET_NOUN = '(?:sizes?|images?|banners?|ads?|assets?|variants?|creatives?|renders?|screenshots?|photos?|videos?|templates?|graphics?)';
+
+/**
+ * Appends the same "an asset noun follows within a few words" requirement
+ * `ALL_N_NOUN_PATTERN` already used, onto any other numeric-claim core pattern. Live
+ * repro: without this, N_OF_N/N_SLASH_N matched an unrelated same-number ratio —
+ * "10 of 10 pages", "3/3 of the brief" — and misread it as an asset-completion
+ * claim. `ALL_N_NOUN_PATTERN` never had that hole because it always required a noun;
+ * the other two patterns need the identical suffix, not a separate ad-hoc check.
+ */
+function withNounProximity(coreSource: string): string {
+  return `${coreSource}(?:\\s+\\S+){0,6}?\\s+${ASSET_NOUN}\\b`;
+}
+
+/** "all 12 sizes", "all 12 of the requested display sizes" (up to 6 words between). */
+const ALL_N_NOUN_PATTERN = new RegExp(withNounProximity('\\ball\\s+(\\d+)'), 'gi');
+/** "12 of 12 banners" — the backreference requires the SAME number twice, so "4 of 12" never matches. */
+const N_OF_N_PATTERN = new RegExp(withNounProximity('\\b(\\d+)\\s+of\\s+\\1'), 'gi');
+/** "12/12 images". */
+const N_SLASH_N_PATTERN = new RegExp(withNounProximity('\\b(\\d+)\\s*\\/\\s*\\1'), 'gi');
+
+const ASSET_PRODUCING_TOOL_NAMES = new Set([
+  'generate_image',
+  'generate_video',
+  'generate_voiceover',
+  'create_html_file',
+  'create_html_from_template',
+  'save_file',
+  'playwright_browser_take_screenshot',
+]);
+
+/**
+ * The tool that closes a work-plan step/variant (`set_work_plan_status`) is
+ * recorded in this same per-turn ledger, so a completed/skipped call to it is a
+ * real boundary between "the previous step's work" and "this step's work".
+ */
+const STEP_BOUNDARY_TOOL_NAME = 'set_work_plan_status';
+
+/**
+ * True for a successful, actually-executed (not errored, not reported-failed,
+ * not a same-turn duplicate) step-boundary call.
+ *
+ * CodeRabbit (ENG-1331 follow-up): a `set_work_plan_status` call the dispatcher
+ * collapsed as a duplicate of an earlier identical one (`duplicateOf` set) never
+ * ran — the call it points at is the real boundary and is its own ledger entry.
+ * Counting the duplicate too could point `sinceLastStepBoundary` at a boundary
+ * that only APPEARS to be the last one in array order, double-counting or
+ * mis-scoping around it. Mirrors `tallyExecutedActions`' existing `duplicateOf`
+ * exclusion elsewhere in this file — same rule, same reason.
+ */
+function isSuccessfulBoundary(call: ExecutedToolCall | undefined): boolean {
+  if (!call || call.name !== STEP_BOUNDARY_TOOL_NAME) return false;
+  if ('error' in call || isReportedFailure(call)) return false;
+  if (call.duplicateOf !== undefined && call.duplicateOf !== null) return false;
+  return true;
+}
+
+/**
+ * Slices `toolCalls` down to the assets that back a claim about the step/variant
+ * the CLOSING SYNTHESIS is describing.
+ *
+ * Two distinct shapes reach this function, and they need opposite scoping:
+ *
+ *  - A not-yet-closed step still being described (e.g. "12 sizes for Variant 4"
+ *    written before Variant 4's own set_work_plan_status call, or never followed
+ *    by one at all): the last successful boundary belongs to an EARLIER,
+ *    already-closed step, so its own preceding assets must be excluded — scope to
+ *    AFTER that boundary. This is the original ENG-1188 masking-prevention case:
+ *    an earlier variant's 40 successful renders must never paper over a later
+ *    variant's shortfall.
+ *
+ *  - A step that just closed ITSELF in this same turn (the last ledger entry IS
+ *    the successful set_work_plan_status call, with nothing after it): the
+ *    closing synthesis is necessarily describing the work THAT call just closed,
+ *    so THOSE preceding assets are exactly what the claim is about — scope to
+ *    AFTER the boundary BEFORE that one instead (or the whole ledger, if this is
+ *    the only boundary). Getting this wrong made a step that genuinely finished
+ *    all N assets and validly closed itself read as producing zero — a live
+ *    false-UNDERCLAIM bug (CodeRabbit, ENG-1331 follow-up) on top of the
+ *    over-claim bug this module was built to catch in the first place.
+ *
+ * "Nothing after it" is what distinguishes the two — but "nothing" means no
+ * MEANINGFUL call, not literally no ledger entries. A same-turn duplicate of the
+ * boundary itself (the model re-emits an identical set_work_plan_status; the
+ * dispatcher collapses the second one with `duplicateOf` set) trailing the real
+ * close is not new work — it never ran — so it must not make a genuinely
+ * self-closing step look like it has "a not-yet-closed step's" shape and get
+ * mis-scoped back to empty (CodeRabbit, ENG-1331 follow-up, second pass: found by
+ * live-tracing the first duplicateOf fix rather than trusting it).
+ */
+function sinceLastStepBoundary(toolCalls: ExecutedToolCall[]): ExecutedToolCall[] {
+  const isDuplicateEntry = (call: ExecutedToolCall | undefined): boolean =>
+    !!call && call.duplicateOf !== undefined && call.duplicateOf !== null;
+
+  for (let i = toolCalls.length - 1; i >= 0; i--) {
+    if (!isSuccessfulBoundary(toolCalls[i])) continue;
+    if (toolCalls.slice(i + 1).every(isDuplicateEntry)) {
+      for (let j = i - 1; j >= 0; j--) {
+        if (!isSuccessfulBoundary(toolCalls[j])) continue;
+        return toolCalls.slice(j + 1);
+      }
+      return toolCalls;
+    }
+    return toolCalls.slice(i + 1);
+  }
+  return toolCalls;
+}
+
+/**
+ * Without `tools`: the largest succeeded-call count among the known
+ * asset-producing tools in the ledger — NOT a sum across tool names. A step like
+ * "Render the Full Size Matrix" (requiredFunctionCalls: create_html_file +
+ * playwright_browser_take_screenshot) builds a FEW reusable HTML templates and
+ * takes MANY per-size screenshots from them; both tools are legitimately part of
+ * "this step's work", but they are not interchangeable units of the same
+ * deliverable. Summing them would let, e.g., 5 create_html_file calls + 7
+ * screenshots satisfy an expectedAssetCount of 12 while only 7 of the 12 requested
+ * sizes were actually rendered — the same "claimed count met by padding across
+ * unrelated calls" failure this module exists to catch, just introduced by ITS OWN
+ * counting instead of the model's prose. Max still correctly reports 12 when a
+ * step genuinely produces 12 of its primary deliverable, whichever single tool
+ * that turns out to be — the safe default for a step that hasn't said which tool
+ * is "the N things".
+ *
+ * With `tools`: sums successes across exactly those tool names instead. The step
+ * author has already resolved the ambiguity max exists to guard against — e.g. a
+ * step whose N deliverables are genuinely split across two tools (some images,
+ * some videos) — so summing the ones they named is correct, not padding.
+ */
+function countProducedAssets(toolCalls: ExecutedToolCall[], tools?: ReadonlySet<string>): number {
+  const counts = tallyExecutedActions(toolCalls);
+  if (tools) {
+    let sum = 0;
+    for (const [name, { ok }] of counts) {
+      if (tools.has(name)) sum += ok;
+    }
+    return sum;
+  }
+  let max = 0;
+  for (const [name, { ok }] of counts) {
+    if (ASSET_PRODUCING_TOOL_NAMES.has(name)) max = Math.max(max, ok);
+  }
+  return max;
+}
+
+/** Minimal shape of a persisted assistant message this reads — mirrors the
+ * identical local interface `seedMediaCallKeysFromHistory` (toolDispatch.ts) already
+ * uses to reconstruct tool calls from `session.messages`. */
+interface HistoryMessageLike {
+  role?: string;
+  timestamp?: string;
+  metadata?: {
+    timestamp?: string;
+    toolCalls?: ExecutedToolCall[];
+  } | null;
+}
+
+/**
+ * ENG-1331: the work-plan step completion gate's asset counter
+ * (`AgentModeService.extractGeneratedImageFilenames`) only recognizes the
+ * system-message marker `generate_image` emits — a step whose deliverable is
+ * Playwright-rendered screenshots (`create_html_file` +
+ * `playwright_browser_take_screenshot`, no `generate_image` call at all) can never
+ * satisfy it, so the ENG-1188 xCures completion gate stays silently blind to
+ * exactly the failure mode production hit here (4 of 12 screenshots rendered, the
+ * step still marked completed). This counts every `ASSET_PRODUCING_TOOL_NAMES`
+ * success across `session.messages` instead of one tool's marker — the same ledger
+ * this module already reads for the synthesis-claim check above, so both
+ * mechanisms agree on what "an asset was produced" means.
+ *
+ * Scoped by `sinceIso` exactly like `extractGeneratedImageFilenames`: only calls
+ * from a message timestamped at or after the cutoff count, so an earlier step's
+ * assets never satisfy a later step's requirement. Per-message granularity (not
+ * per-call) matches `seedMediaCallKeysFromHistory`'s existing precedent for reading
+ * this same persisted shape.
+ *
+ * `tools` (ENG-1331), when the caller has one (a work-plan step's
+ * `expectedAssetCountTools`), is forwarded to `countProducedAssets` as-is — sum
+ * those specific tools instead of taking the max across every producing tool.
+ * Omit it to keep the safe max-based default.
+ */
+export function extractProducedAssetCount(
+  messages: HistoryMessageLike[] | undefined | null,
+  sinceIso?: string,
+  tools?: readonly string[],
+): number {
+  if (!Array.isArray(messages)) return 0;
+  const toolSet = tools && tools.length > 0 ? new Set(tools) : undefined;
+  let total = 0;
+  for (const message of messages) {
+    if (!message || message.role !== 'assistant') continue;
+    const toolCalls = message.metadata?.toolCalls;
+    if (!Array.isArray(toolCalls) || toolCalls.length === 0) continue;
+    const timestamp = message.timestamp || message.metadata?.timestamp;
+    if (sinceIso && timestamp && timestamp < sinceIso) continue;
+    total += countProducedAssets(toolCalls, toolSet);
+  }
+  return total;
+}
+
+export interface FalseCompletionClaim {
+  /** The largest numeric completion claim found in the content. */
+  claimed: number;
+  /** The ledger's actual count of succeeded asset-producing tool calls. */
+  actual: number;
+}
+
+/**
+ * Returns the claim/actual mismatch when `content` asserts a numeric completion
+ * ("all 12 sizes", "12 of 12", "12/12") that the ledger cannot back up, or `null`
+ * when there is no such claim or the ledger meets or exceeds it. A claim that
+ * already admits a shortfall (e.g. "4 of the 12 requested sizes") does not match
+ * any of these patterns, so an honest partial report is never flagged.
+ *
+ * `scopeToLastStepBoundary` (default true) restricts the ledger to
+ * `sinceLastStepBoundary` before counting — correct for the single-turn closing
+ * synthesis this was built for (ENG-1188: an earlier variant's successes must not
+ * paper over a later variant's shortfall). A caller summarizing an entire
+ * multi-step session (CodeRabbit, ENG-1331 follow-up) needs the OPPOSITE: a
+ * truthful claim about assets produced across several already-closed steps would
+ * be scoped down to "since the last set_work_plan_status" and misread as false
+ * whenever the currently-open step hasn't produced anything yet. Pass `false` to
+ * count the whole ledger instead.
+ */
+export function detectFalseCompletionClaim(
+  content: unknown,
+  toolCalls: ExecutedToolCall[],
+  scopeToLastStepBoundary: boolean = true,
+): FalseCompletionClaim | null {
+  if (typeof content !== 'string' || !content.trim()) return null;
+
+  const claims = new Set<number>();
+  for (const pattern of [ALL_N_NOUN_PATTERN, N_OF_N_PATTERN, N_SLASH_N_PATTERN]) {
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(content)) !== null) {
+      const n = parseInt(match[1], 10);
+      if (Number.isFinite(n) && n > 0) claims.add(n);
+    }
+  }
+  if (claims.size === 0) return null;
+
+  const claimed = Math.max(...claims);
+  const scopedToolCalls = scopeToLastStepBoundary ? sinceLastStepBoundary(toolCalls) : toolCalls;
+  const actual = countProducedAssets(scopedToolCalls);
+  if (actual >= claimed) return null;
+  return { claimed, actual };
+}
+
+/**
+ * Correction to APPEND when `detectFalseCompletionClaim` finds a claim the ledger
+ * cannot back up. Keeps the model's original prose (it may still hold other real,
+ * useful detail) but states the real count and the named shortfall right underneath
+ * it, so the user is never left believing more happened than actually did.
+ *
+ * Scoped to the same `sinceLastStepBoundary` slice `detectFalseCompletionClaim`
+ * used to compute `claim.actual` — showing a wider ledger here would contradict the
+ * very count the correction is stating (e.g. "only 4 of 12" next to a list that
+ * includes 40 unrelated successes from earlier steps).
+ */
+/**
+ * A line stating, as fact, that a capability could not run this turn — or null when every tool
+ * that was refused later succeeded.
+ *
+ * PREPENDED by the caller, and deliberately UNCONDITIONAL rather than gated on detecting a false
+ * claim in the prose. Both of those are the lessons from the live case this exists for: a
+ * delegated session where the skill gate refused `audit_ad_utm_coverage`, `install_skills` was
+ * refused by subscription, and the model then ran an unrelated AD LIST and presented a confident
+ * "UTM Tagging Audit Summary — PASS, 6/6 ads tagged" table built from it. A correction WAS
+ * produced by `buildFalseClaimCorrectionFooter` — but appended below the fabricated table, and
+ * only because that particular claim happened to carry a checkable number.
+ *
+ * So this does not try to decide whether the answer claims the tool ran. Whether a tool was
+ * refused by the gate and never afterwards succeeded is a FACT already in the ledger, needing no
+ * inference, so it cannot false-positive: it only ever states something that definitively
+ * happened. And a claim phrased in a way no detector anticipates is exactly the case a
+ * conditional guard misses, which is why this one is not conditional.
+ *
+ * Redundant when the model was already honest about it. That is the cheap direction to be wrong.
+ */
+export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]): string | null {
+  const calls = toolCalls ?? [];
+
+  /*
+   * Fires only when the model ATTEMPTED to obtain the capability and could not.
+   *
+   * Three failure modes this narrowing exists for, all found in review:
+   *
+   *  - The gate refuses ANY name not in the session's allowed set, including one the model tried
+   *    speculatively and then simply did without. Warning there puts a banner above a perfectly
+   *    correct answer, and a warning that appears when nothing is wrong is one people learn to
+   *    skip — exactly when it finally matters. If no install was attempted, the model was not
+   *    blocked from something it needed.
+   *  - An install that FAILED is not always shaped as a throw: `installSkills` NEVER throws —
+   *    every one of its paths returns `{ success: false, message }`. In today's wiring the
+   *    dispatcher's `toolResultError` downgrade does convert that into a ledger `error`, so the
+   *    throw check happens to catch it; `isReportedFailure` reads the returned shape directly
+   *    so this does not silently depend on that downgrade staying wired.
+   *  - A PARTIAL install reports `success: true` because SOMETHING installed, while the skill
+   *    the gated tool needed may be the one that was refused (`isPartialInstall`). Nothing
+   *    upstream flags this one: no error is raised, because from installSkills' point of view
+   *    the call succeeded.
+   *
+   * Note what is deliberately NOT required: that the install came AFTER the refusal, or even
+   * that no install this turn succeeded. Both used to be enforced via a ledger-index comparison
+   * (`installSucceededAfter > i`), which is meaningless: `executePreparedTools` (toolDispatch.ts)
+   * always appends Phase 1 preflight failures — which is what a skill-gate refusal is — before
+   * any Phase 3 executed result, including every `install_skills` outcome, regardless of the
+   * order the model emitted the calls in. So an index comparison could never see a gate refusal
+   * as coming AFTER a successful install; on the real incident shape (a refusal plus ANY
+   * install_skills call, failed or not) it would only ever suppress the notice, never correctly
+   * arm it — including when the turn also contains an install failure that is the actual cause.
+   *
+   * A per-tool "did the skill THIS tool needed actually arrive" check is possible on a PARTIAL
+   * install: `installSkills` resolves its `rejectedSkillIds` to the tool names they would have
+   * unlocked (`rejectedToolNames`, agentModeService.ts) precisely so this reader does not have
+   * to guess. When that field is present, only a gated tool whose name is actually in it counts
+   * as still unavailable — a failure over here does not arm the notice for an unrelated tool B
+   * whose own skill installed fine.
+   *
+   * A full refusal (subscription-blocked, no valid ids at all) carries no such mapping — nothing
+   * in the ledger says which tool names the model was after. For that shape only, this falls
+   * back to turn-global: any install failure with no name info arms the notice for every gated
+   * tool in the turn. A redundant banner on a turn that in fact recovered is the cheap direction
+   * to be wrong; silently hiding a real gap is not.
+   */
+  let installAttempted = false;
+  let installFailed = false;
+  let unscopedInstallFailure = false;
+  const rejectedToolNames = new Set<string>();
+  calls.forEach((call) => {
+    if (call?.name !== 'install_skills') return;
+    installAttempted = true;
+    const threw = call?.error !== undefined && call?.error !== null;
+    if (threw || isReportedFailure(call) || isPartialInstall(call)) {
+      installFailed = true;
+      const names = getRejectedToolNames(call);
+      if (names.length > 0) {
+        names.forEach((n) => rejectedToolNames.add(n));
+      } else {
+        unscopedInstallFailure = true;
+      }
+    }
+  });
+
+  const succeeded = new Set<string>();
+  for (const call of calls) {
+    const name = typeof call?.name === 'string' ? call.name : '';
+    if (!name) continue;
+    const threw = call?.error !== undefined && call?.error !== null;
+    if (!threw && !isReportedFailure(call)) succeeded.add(name);
+  }
+
+  const unavailable = new Set<string>();
+  calls.forEach((call) => {
+    const name = typeof call?.name === 'string' ? call.name : '';
+    if (!name || call?.error === undefined || call?.error === null) return;
+    const err = call.error instanceof Error ? call.error : new Error(String(call.error));
+    if (classifyToolErrorClass(err) !== 'tool_unavailable') return;
+    // Ran successfully at some point in the turn — the capability is present.
+    if (succeeded.has(name)) return;
+    // Never tried to obtain it: doing without a speculative tool is not a missing capability.
+    if (!installAttempted) return;
+    // Every install this turn came back clean, so nothing stopped the model from getting what
+    // it asked for. Only an install that could NOT deliver means a capability was missing.
+    if (!installFailed) return;
+    // A failure this turn was scoped to specific tool names (a partial install) and THIS tool
+    // is not among them — some other skill was refused, not the one this tool needed. Only an
+    // unscoped failure (no name info at all) falls back to arming every gated tool.
+    if (rejectedToolNames.size > 0 && !rejectedToolNames.has(name) && !unscopedInstallFailure) return;
+    unavailable.add(name);
+  });
+
+  if (unavailable.size === 0) return null;
+  const names = [...unavailable].sort();
+  const one = names.length === 1;
+  return (
+    `⚠️ ${one ? 'This capability was' : 'These capabilities were'} not available this turn and did not run: ` +
+    `${names.map((n) => `\`${n}\``).join(', ')}. ` +
+    `Anything below that would normally come from ${one ? 'it' : 'them'} was not produced by ${one ? 'that tool' : 'those tools'}.`
+  );
+}
+
+
+export function buildFalseClaimCorrectionFooter(
+  claim: FalseCompletionClaim,
+  toolCalls: ExecutedToolCall[],
+): string {
+  const counts = tallyExecutedActions(sinceLastStepBoundary(toolCalls));
+  const ledgerLines = counts.size > 0 ? renderLedgerLines(counts) : '(No assets were actually produced.)';
+
+  return [
+    '---',
+    `⚠️ *Correction: the "${claim.claimed}" figure above is not accurate — only ${claim.actual} of ${claim.claimed} were actually produced this turn; the rest were never generated.* Here is what actually ran:`,
+    '',
+    ledgerLines,
+    '',
+    COUNT_BASIS_NOTE,
+  ].join('\n').trim();
 }
 
 /**

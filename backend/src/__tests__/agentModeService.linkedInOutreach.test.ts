@@ -17,37 +17,67 @@ jest.mock('../utils/secretsManager', () => ({
 // Mock connectedAccountsDb
 const mockGetAccountsByUserId = jest.fn();
 const mockGetAccountsByUserIdIncludingOrgShared = jest.fn();
+// Resolves by default (daily-volume persistence, ENG-1197 durability follow-up)
+// so existing tests that don't care about it don't have to mock it explicitly —
+// the pacer's write is best-effort/caught, but an unresolved mock would still
+// hang the call.
+const mockUpdateAccountConfig = jest.fn().mockResolvedValue(undefined);
+const mockGetAccountsWithOwnerIncludingOrgShared = jest.fn();
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: (...args: any[]) => mockGetAccountsByUserId(...args),
   getAccountsByUserIdIncludingOrgShared: (...args: any[]) => mockGetAccountsByUserIdIncludingOrgShared(...args),
+  getAccountsWithOwnerIncludingOrgShared: (...args: any[]) => mockGetAccountsWithOwnerIncludingOrgShared(...args),
+  updateAccountConfig: (...args: any[]) => mockUpdateAccountConfig(...args),
 }));
 
 // Mock linkedInOutreachService
 const mockSendMessage = jest.fn();
+const mockGetLinkedInProfile = jest.fn();
 const mockSendInMail = jest.fn();
 const mockSendInvitation = jest.fn();
+const mockAcceptInvitation = jest.fn();
+const mockGetProfile = jest.fn();
+const mockListReceivedInvitations = jest.fn().mockResolvedValue({ items: [], cursor: null });
+const mockIsUnderInvitationCooldown = jest.fn((..._args: any[]) => false);
 const mockGetMessagesWithContact = jest.fn();
 const mockResolveProviderId = jest.fn();
 const mockSearchPeople = jest.fn();
 const mockResolveAccountId = jest.fn();
+const mockResolveAccountIdWithSource = jest.fn();
+const mockListUserOwnedUnipileAccountIds = jest.fn();
 const mockGetInviteCharLimitForAccount = jest.fn().mockResolvedValue(200);
 const mockIsAccountConnected = jest.fn().mockResolvedValue(true);
 const mockProbeAccountSession = jest.fn().mockResolvedValue('connected');
 const mockProbeSearchCapability = jest.fn().mockResolvedValue('ok');
 const mockClearStatusCache = jest.fn();
+// ENG-1558: default mirrors the real no-op contract (unchanged items, zero
+// exclusions) so every pre-existing search-people test — none of which pass
+// company_size_min/max — keeps working without having to know this exists.
+const mockFilterByCompanySize = jest.fn(
+  async (...args: any[]) => ({ items: args[0], excludedUnverifiable: 0 }),
+);
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     sendMessage: (...args: any[]) => mockSendMessage(...args),
+    getLinkedInProfile: (...args: any[]) => mockGetLinkedInProfile(...args),
     sendInMail: (...args: any[]) => mockSendInMail(...args),
     sendInvitation: (...args: any[]) => mockSendInvitation(...args),
+    acceptInvitation: (...args: any[]) => mockAcceptInvitation(...args),
+    getProfile: (...args: any[]) => mockGetProfile(...args),
+    listReceivedInvitations: (...args: any[]) => mockListReceivedInvitations(...args),
+    // ENG-126 breaker check — must be present or send-invite throws before pacing.
+    isUnderInvitationCooldown: (...args: any[]) => mockIsUnderInvitationCooldown(...args),
     getMessagesWithContact: (...args: any[]) => mockGetMessagesWithContact(...args),
     resolveProviderId: (...args: any[]) => mockResolveProviderId(...args),
     searchPeople: (...args: any[]) => mockSearchPeople(...args),
     resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
+    resolveAccountIdWithSource: (...args: any[]) => mockResolveAccountIdWithSource(...args),
+    listUserOwnedUnipileAccountIds: (...args: any[]) => mockListUserOwnedUnipileAccountIds(...args),
     getInviteCharLimitForAccount: (...args: any[]) => mockGetInviteCharLimitForAccount(...args),
     isAccountConnected: (...args: any[]) => mockIsAccountConnected(...args),
     probeAccountSession: (...args: any[]) => mockProbeAccountSession(...args),
     probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
+    filterByCompanySize: (...args: any[]) => mockFilterByCompanySize(...args),
     clearStatusCache: (...args: any[]) => mockClearStatusCache(...args),
   },
 }));
@@ -64,6 +94,7 @@ jest.mock('../services/emailEventsDb', () => ({
 
 // Mock crmDb
 const mockGetLeadById = jest.fn();
+const mockUpdateLead = jest.fn().mockResolvedValue(undefined);
 const mockUpdateLeadLinkedInSyncAt = jest.fn().mockResolvedValue(undefined);
 const mockGetLeadListById = jest.fn();
 const mockGetUserById = jest.fn().mockResolvedValue(null);
@@ -71,6 +102,7 @@ const mockGetOrgById = jest.fn();
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadById: (...args: any[]) => mockGetLeadById(...args),
+    updateLead: (...args: any[]) => mockUpdateLead(...args),
     updateLeadLinkedInSyncAt: (...args: any[]) => mockUpdateLeadLinkedInSyncAt(...args),
     getLeadListById: (...args: any[]) => mockGetLeadListById(...args),
   },
@@ -89,6 +121,11 @@ const mockResolveListIdForAccount = jest.fn().mockResolvedValue(null);
 jest.mock('../services/linkedInInviteCrmMirror', () => ({
   mirrorLinkedInInviteToCrm: (...args: any[]) => mockMirrorLinkedInInviteToCrm(...args),
   resolveListIdForAccount: (...args: any[]) => mockResolveListIdForAccount(...args),
+  // Real pure name-splitting logic — no reason to stub it, and the accept-invitation
+  // tests below assert on the actual firstName/lastName it derives.
+  splitInvitedUserName: jest.requireActual('../services/linkedInInviteCrmMirror').splitInvitedUserName,
+  INVITE_SENT_EVENT: 'linkedin.invite.sent',
+  INVITE_ACCEPTED_EVENT: 'linkedin.invite.accepted',
 }));
 
 // Mock unipileSentInvitationsDb (ENG-182 pre-invite dedup cache). The pre-check
@@ -106,6 +143,7 @@ jest.mock('../services/unipileConnectionsDb', () => ({
 }));
 
 import { AgentModeService } from '../services/agentModeService';
+import { __resetWritePacerForTests } from '../services/linkedInWritePacer';
 
 describe('AgentModeService - LinkedIn Outreach', () => {
   let service: AgentModeService;
@@ -113,10 +151,17 @@ describe('AgentModeService - LinkedIn Outreach', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     service = new AgentModeService();
+    mockUpdateAccountConfig.mockImplementation(async (...args: any[]) => {
+      const mutation = args[3];
+      if (typeof mutation === 'function') mutation({});
+    });
 
     // Default: user owns the account (or it is org-shared)
     mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
       { platform: 'unipile', account_id: 'test-account-id' },
+    ]);
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'test-account-id', userId: 'user-1' },
     ]);
 
     // Default: the Unipile session is live. clearAllMocks() does not reset
@@ -127,6 +172,17 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     // Default: the account CAN search, so a zero-result search is a real
     // no-match and the ENG-975 guard stays out of the way.
     mockProbeSearchCapability.mockResolvedValue('ok');
+    // Default: an explicitly-passed account_id is the user's own (ENG-1198
+    // usedSharedAccount determination for read actions).
+    mockListUserOwnedUnipileAccountIds.mockResolvedValue(['test-account-id']);
+    // ENG-1026 Greptile P1 ("agent-tool authorization gap"): send-message's
+    // CRM-linked checks (sync gate, duplicate check, identity check) now
+    // require list access before reading a lead. Every test in this file
+    // that supplies list_id/lead_id calls as user-1 against list_test123 and
+    // expects those checks to run — default to "user-1 owns list_test123"
+    // so existing tests keep passing; the dedicated access-denial tests
+    // override this per-call.
+    mockGetLeadListById.mockResolvedValue({ id: 'list_test123', userId: 'user-1' });
   });
 
   describe('send-message', () => {
@@ -309,6 +365,9 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
         { platform: 'unipile', account_id: 'different-account' },
       ]);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'different-account', userId: 'user-1' },
+      ]);
 
       const result = await service.linkedinOutreach('user-1', validArgs);
 
@@ -453,6 +512,15 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       linkedin: 'https://www.linkedin.com/in/johndoe/',
     };
 
+    beforeEach(() => {
+      // updateArgs supplies a raw provider_id (not profile_url), which now gets
+      // validated via getProfile before getMessagesWithContact is called — see
+      // "rejects with a clear error when provider_id does not resolve to a real
+      // profile" below. Default to a valid profile so these tests exercise the
+      // sync behavior, not the new validation guard.
+      mockGetProfile.mockResolvedValue({ provider_id: 'li-provider-123' });
+    });
+
     it('returns synced: 0 and stamps syncAt when no message history exists', async () => {
       mockGetLeadById.mockResolvedValue(lead);
       mockGetMessagesWithContact.mockResolvedValue([]); // no messages
@@ -552,6 +620,40 @@ describe('AgentModeService - LinkedIn Outreach', () => {
         'test-account-id',  // account_id from args
       );
     });
+
+    it('rejects with a clear error when a raw provider_id does not resolve to a real profile, instead of silently reporting synced: 0', async () => {
+      // getMessagesWithContact treats a chat_attendee 404 as "never messaged"
+      // (ENG-1623), which is indistinguishable from a 404 caused by an
+      // invalid/nonexistent provider_id. A raw provider_id (no profile_url) is
+      // not validated by resolveProviderId, so it must be validated here instead.
+      mockGetLeadById.mockResolvedValue(lead);
+      mockGetProfile.mockRejectedValue(
+        Object.assign(new Error('Attendee not found'), {
+          structuredError: { classification: 'NOT_FOUND', message: 'Attendee not found' },
+        })
+      );
+
+      const result = await service.linkedinOutreach('user-1', updateArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Attendee not found');
+      // Must fail before ever reaching the chat lookup, sync, or gate-satisfying write.
+      expect(mockGetMessagesWithContact).not.toHaveBeenCalled();
+      expect(mockUpdateLeadLinkedInSyncAt).not.toHaveBeenCalled();
+    });
+
+    it('does not run the provider_id validation check when a profile_url is supplied (already validated by resolveProviderId)', async () => {
+      const urlArgs = { ...updateArgs, provider_id: undefined, profile_url: 'https://www.linkedin.com/in/johndoe/' };
+      mockGetLeadById.mockResolvedValue(lead);
+      mockResolveProviderId.mockResolvedValue('li-provider-123');
+      mockGetMessagesWithContact.mockResolvedValue([]);
+
+      const result = await service.linkedinOutreach('user-1', urlArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockGetProfile).not.toHaveBeenCalled();
+      expect(mockResolveProviderId).toHaveBeenCalledWith('https://www.linkedin.com/in/johndoe/', true, 'test-account-id');
+    });
   });
 
   describe('send-inmail', () => {
@@ -574,6 +676,9 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     it('returns error when account is not owned or org-shared', async () => {
       mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
         { platform: 'unipile', account_id: 'different-account' },
+      ]);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'different-account', userId: 'user-1' },
       ]);
 
       const result = await service.linkedinOutreach('user-1', validArgs);
@@ -788,7 +893,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     });
 
     it('reports the unconnected-account error, not the disconnect error, when no account exists', async () => {
-      mockResolveAccountId.mockResolvedValue(null);
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: null, usedSharedAccount: false });
 
       const result = await service.linkedinOutreach('user-1', {
         action: 'search-people',
@@ -933,6 +1038,202 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.success).toBe(false);
       expect(result.error || '').toMatch(/keyword|filter|search_url|cursor/i);
       expect(mockSearchPeople).not.toHaveBeenCalled();
+    });
+  });
+
+  // ENG-1558 — Unipile has no native headcount filter for the People search
+  // category (only Companies), so company_size_min/max is applied as a
+  // post-filter over linkedInOutreachService.searchPeople's raw results via
+  // linkedInOutreachService.filterByCompanySize (unit-tested on its own in
+  // linkedInOutreachService.test.ts). These tests cover the dispatcher's
+  // wiring: does it call the filter with the right args, and does it shape
+  // the response correctly around the result.
+  describe('ENG-1558: company-size post-filter wiring', () => {
+    it('does not call filterByCompanySize when company_size_min/max are both omitted', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [{ provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'B' }],
+        cursor: null,
+      });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.data.items).toHaveLength(1);
+      // The dispatcher may still call the (no-op-by-default) mock; what
+      // matters is it never receives real bounds when the caller passed none.
+      if (mockFilterByCompanySize.mock.calls.length > 0) {
+        expect(mockFilterByCompanySize.mock.calls[0][1]).toEqual({ min: undefined, max: undefined });
+      }
+    });
+
+    it('passes company_size_min/max through to filterByCompanySize with the right account', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [{ provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'B' }],
+        cursor: null,
+      });
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_min: 1,
+        company_size_max: 200,
+      });
+
+      expect(mockFilterByCompanySize).toHaveBeenCalledWith(
+        expect.any(Array),
+        { min: 1, max: 200 },
+        'test-account-id',
+      );
+    });
+
+    it('returns only the candidates filterByCompanySize kept', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [
+          { provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'Startup' },
+          { provider_id: 'p2', public_identifier: 'p2', first_name: 'B', last_name: 'Enterprise' },
+        ],
+        cursor: null,
+      });
+      mockFilterByCompanySize.mockResolvedValueOnce({
+        items: [{ provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'Startup' }],
+        excludedUnverifiable: 0,
+      });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_max: 200,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.data.items).toHaveLength(1);
+      expect(result.data.items[0].last_name).toBe('Startup');
+    });
+
+    it('reports companySizeFiltered on the response when candidates were excluded', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [
+          { provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'Startup' },
+          { provider_id: 'p2', public_identifier: 'p2', first_name: 'B', last_name: 'Enterprise' },
+        ],
+        cursor: null,
+      });
+      mockFilterByCompanySize.mockResolvedValueOnce({
+        items: [{ provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'Startup' }],
+        excludedUnverifiable: 1,
+      });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_max: 200,
+      });
+
+      expect(result.data.companySizeFiltered).toBe(1);
+    });
+
+    it('does not add a companySizeFiltered field when nothing was excluded', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [{ provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'B' }],
+        cursor: null,
+      });
+      mockFilterByCompanySize.mockResolvedValueOnce({
+        items: [{ provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'B' }],
+        excludedUnverifiable: 0,
+      });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_max: 200,
+      });
+
+      expect(result.data.companySizeFiltered).toBeUndefined();
+    });
+
+    it('reports a transparent "narrow niche" message, not a false empty/outage, when every candidate is excluded by size', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [
+          { provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'One' },
+          { provider_id: 'p2', public_identifier: 'p2', first_name: 'B', last_name: 'Two' },
+        ],
+        cursor: null,
+      });
+      mockFilterByCompanySize.mockResolvedValueOnce({ items: [], excludedUnverifiable: 2 });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_max: 200,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('excluded all 2');
+      expect(result.message).not.toMatch(/unavailable|outage/i);
+      expect(mockProbeSearchCapability).not.toHaveBeenCalled();
+    });
+
+    it('applies the size filter AFTER the anonymized-result filter (never sizes an unusable placeholder)', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [
+          { provider_id: 'p1', public_identifier: 'undefined', first_name: 'LinkedIn', last_name: 'Member' },
+          { provider_id: 'p2', public_identifier: 'p2', first_name: 'Real', last_name: 'Person' },
+        ],
+        cursor: null,
+      });
+      mockFilterByCompanySize.mockResolvedValueOnce({
+        items: [{ provider_id: 'p2', public_identifier: 'p2', first_name: 'Real', last_name: 'Person' }],
+        excludedUnverifiable: 0,
+      });
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_max: 200,
+      });
+
+      // Only the real (non-anonymized) item should have reached the filter.
+      const passedItems = mockFilterByCompanySize.mock.calls[0][0];
+      expect(passedItems).toHaveLength(1);
+      expect(passedItems[0].provider_id).toBe('p2');
+    });
+
+    // ENG-1558 follow-up: live production testing after this feature shipped
+    // found company_size_max excluded 10/10 candidates at every bound tried,
+    // including a bound wide enough that it should have been a no-op. Root
+    // cause: classic search-people items don't carry `work_experience` (only
+    // `headline`), so filterByCompanySize's employer lookup found nothing to
+    // resolve and marked every candidate unverifiable. The fix resolves an
+    // employer name from the headline (mirroring importLeadsFromSearch's own
+    // tiered resolution) before handing items to filterByCompanySize.
+    it('resolves an employer from headline (no work_experience on the raw item) before filtering by size', async () => {
+      mockSearchPeople.mockResolvedValue({
+        items: [
+          { provider_id: 'p1', public_identifier: 'p1', first_name: 'A', last_name: 'One', headline: 'Product Manager at Foo Inc' },
+        ],
+        cursor: null,
+      });
+      mockFilterByCompanySize.mockResolvedValueOnce({ items: [], excludedUnverifiable: 1 });
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'product manager',
+        company_size_max: 200,
+      });
+
+      const passedItems = mockFilterByCompanySize.mock.calls[0][0];
+      expect(passedItems[0].work_experience).toEqual([{ company: 'Foo Inc', current: true }]);
     });
   });
 
@@ -1101,6 +1402,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
         ],
         fromCache: true,
         source: 'cache',
+        usedSharedAccount: false,
       });
     });
 
@@ -1168,7 +1470,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     });
 
     it('falls back to site-wide account_id when none is provided', async () => {
-      mockResolveAccountId.mockResolvedValue('site-wide-account');
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: 'site-wide-account', usedSharedAccount: true });
       mockResolve.mockResolvedValue({ candidates: [], fromCache: false, source: 'api' });
 
       const result = await service.linkedinOutreach('user-1', {
@@ -1177,7 +1479,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
         keywords: 'Acme',
       });
 
-      expect(mockResolveAccountId).toHaveBeenCalledWith('user-1');
+      expect(mockResolveAccountIdWithSource).toHaveBeenCalledWith('user-1');
       expect(mockResolve).toHaveBeenCalledWith('site-wide-account', expect.any(Object));
       expect(result.success).toBe(true);
     });
@@ -1529,6 +1831,152 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     });
   });
 
+  describe('accept-invitation CRM mirror (ENG-1595)', () => {
+    const acceptArgs = {
+      action: 'accept-invitation',
+      account_id: 'test-account-id',
+      invitation_id: 'inv-123',
+      shared_secret: 'secret-abc',
+      list_id: 'list_owned',
+    };
+
+    const RECEIVED_PAGE = {
+      items: [
+        { id: 'inv-123', sender_profile: { public_id: 'jane-doe', provider_id: 'prov-jane', full_name: 'Jane Doe' } },
+      ],
+      cursor: null,
+    };
+
+    beforeEach(() => {
+      mockAcceptInvitation.mockResolvedValue({ object: 'InvitationAccepted' });
+      mockListReceivedInvitations.mockResolvedValue(RECEIVED_PAGE);
+    });
+
+    it('accepts the invitation and mirrors the now-accepted connection using identity from the received-invitation record, not caller args', async () => {
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
+
+      const result = await service.linkedinOutreach('user-1', acceptArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockListReceivedInvitations).toHaveBeenCalledWith('test-account-id', undefined);
+      expect(mockAcceptInvitation).toHaveBeenCalledWith('inv-123', 'test-account-id', 'secret-abc');
+      expect(mockGetLeadListById).toHaveBeenCalledWith('list_owned');
+      expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'user-1',
+          listId: 'list_owned',
+          linkedinUrl: 'https://www.linkedin.com/in/jane-doe/',
+          firstName: 'Jane',
+          lastName: 'Doe',
+          invitationId: 'inv-123',
+          eventType: 'linkedin.invite.accepted',
+        }),
+      );
+    });
+
+    it('ignores caller-supplied profile_url/first_name/last_name entirely — identity always comes from the verified invitation record', async () => {
+      // A model could pass a name/URL for a DIFFERENT person than invitation_id
+      // actually belongs to (mistake or otherwise) — the mirror must never
+      // attribute the CRM write to whatever the caller merely claims.
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
+
+      await service.linkedinOutreach('user-1', {
+        ...acceptArgs,
+        profile_url: 'https://www.linkedin.com/in/someone-else/',
+        provider_id: 'prov-someone-else',
+        first_name: 'Not',
+        last_name: 'Jane',
+      });
+
+      expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
+        expect.objectContaining({
+          linkedinUrl: 'https://www.linkedin.com/in/jane-doe/',
+          firstName: 'Jane',
+          lastName: 'Doe',
+        }),
+      );
+      // The unverified provider_id must never be resolved as a fallback path.
+      expect(mockGetProfile).not.toHaveBeenCalled();
+    });
+
+    it('skips the mirror when the invitation is not found in the received-invitations record (identity unverifiable)', async () => {
+      mockListReceivedInvitations.mockResolvedValue({ items: [], cursor: null });
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
+
+      const result = await service.linkedinOutreach('user-1', acceptArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
+    });
+
+    it('bounds the received-invitations page scan rather than paging unboundedly', async () => {
+      mockListReceivedInvitations.mockImplementation(async (_accountId: string, cursor?: string) => ({
+        items: [{ id: `other-${cursor || 0}`, sender_profile: { public_id: 'nope' } }],
+        cursor: String((Number(cursor) || 0) + 1),
+      }));
+
+      await service.linkedinOutreach('user-1', acceptArgs);
+
+      expect(mockListReceivedInvitations.mock.calls.length).toBeLessThanOrEqual(5);
+      expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
+    });
+
+    it('still accepts successfully when list_id is omitted — mirrors nothing rather than guessing', async () => {
+      const { list_id, ...withoutListId } = acceptArgs as any;
+
+      const result = await service.linkedinOutreach('user-1', withoutListId);
+
+      expect(result.success).toBe(true);
+      expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
+    });
+
+    // ENG-1595 follow-up: unlike send-invite, accept-invitation must NEVER fall back
+    // to the account's bound list when list_id is omitted. Sending an invite is
+    // always a deliberate targeting action; accepting one is not — the account
+    // owner never decided "every accepted connection is a lead" just by having a
+    // list configured. Only an explicit list_id (i.e. the task actually judged this
+    // person relevant) may trigger a mirror.
+    it('does NOT fall back to the account-bound list when list_id is omitted, even if one is configured', async () => {
+      const { list_id, ...withoutListId } = acceptArgs as any;
+      mockResolveListIdForAccount.mockResolvedValue('list_bound');
+
+      const result = await service.linkedinOutreach('user-1', withoutListId);
+
+      expect(result.success).toBe(true);
+      expect(mockResolveListIdForAccount).not.toHaveBeenCalled();
+      expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
+    });
+
+    it('skips the mirror (no cross-tenant write) when the resolved list is foreign', async () => {
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'someone-else' });
+
+      const result = await service.linkedinOutreach('user-1', acceptArgs);
+
+      // The accept still succeeds (Unipile already confirmed it); only the CRM write is skipped.
+      expect(result.success).toBe(true);
+      expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
+    });
+
+    it('never fails the accept when the received-invitations lookup throws', async () => {
+      mockListReceivedInvitations.mockRejectedValueOnce(new Error('unipile down'));
+
+      const result = await service.linkedinOutreach('user-1', acceptArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockAcceptInvitation).toHaveBeenCalled();
+      expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
+    });
+
+    it('never fails the accept when the CRM mirror throws', async () => {
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
+      mockMirrorLinkedInInviteToCrm.mockRejectedValueOnce(new Error('dynamo down'));
+
+      const result = await service.linkedinOutreach('user-1', acceptArgs);
+
+      expect(result.success).toBe(true);
+    });
+  });
+
   describe('formatToolError — linkedin_outreach char limit guidance', () => {
     it('returns shorten-and-retry instruction when error message contains "too long"', () => {
       // Access the private method via cast
@@ -1558,5 +2006,363 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(errorContent).toContain('⚠️ Tool Error');
       expect(errorContent).not.toContain('Do NOT report this as a success');
     });
+  });
+});
+
+// ─── ENG-1026: identity cross-check before agent-tool sends ──────────────────
+
+describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
+  let service: AgentModeService;
+
+  const mismatchProfile = {
+    first_name: 'Florence',
+    last_name: 'Su',
+    headline: 'Technical Program Manager at Snowflake',
+    work_experience: [{ position: 'TPM', company: 'Snowflake', current: true }],
+  };
+
+  const vivianLead = {
+    leadId: 'lead_test456',
+    listId: 'list_test123',
+    firstName: 'Florence',
+    lastName: 'Su',
+    company: 'Vivian Health',
+    linkedin: 'https://www.linkedin.com/in/florencesu/',
+    linkedinMessageSyncAt: new Date().toISOString(),
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new AgentModeService();
+    mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'test-account-id' },
+    ]);
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'test-account-id', userId: 'user-1' },
+    ]);
+    mockIsAccountConnected.mockResolvedValue(true);
+    mockProbeAccountSession.mockResolvedValue('connected');
+    mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+    // Earlier suites set persistent implementations (e.g. a rejected duplicate
+    // check) that clearAllMocks() does not remove — re-assert clean defaults.
+    mockGetEventsByEmailDomainAndLeadEmail.mockResolvedValue([]);
+    mockAddLinkedInMessageEvent.mockResolvedValue(undefined);
+    mockUpdateLeadLinkedInSyncAt.mockResolvedValue(undefined);
+    mockUpdateLead.mockResolvedValue(undefined);
+    // ENG-1026 Greptile P1 ("agent-tool authorization gap"): the identity
+    // check now requires list access, same as every other CRM write in this
+    // file. Default to "user-1 owns list_test123" so the existing tests in
+    // this block (all called as user-1 against list_test123) keep passing
+    // unmodified; the access-denial tests below override this per-call.
+    mockGetLeadListById.mockResolvedValue({ id: 'list_test123', userId: 'user-1' });
+  });
+
+  it('send-message with lead context refuses on identity mismatch with a structured error', async () => {
+    mockGetLeadById.mockResolvedValue(vivianLead);
+    mockGetLinkedInProfile.mockResolvedValue(mismatchProfile);
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'send-message',
+      account_id: 'test-account-id',
+      profile_url: 'https://www.linkedin.com/in/florencesu/',
+      message: 'Hi Florence!',
+      list_id: 'list_test123',
+      lead_id: 'lead_test456',
+    });
+
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result.success).toBe(false);
+    expect(result.code).toBe('linkedin_identity_mismatch');
+    expect(result.details).toEqual(expect.objectContaining({ leadCompany: 'Vivian Health' }));
+  });
+
+  it('send-invite with lead context refuses on identity mismatch', async () => {
+    mockGetLeadById.mockResolvedValue(vivianLead);
+    mockGetLinkedInProfile.mockResolvedValue(mismatchProfile);
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'send-invite',
+      account_id: 'test-account-id',
+      profile_url: 'https://www.linkedin.com/in/florencesu/',
+      message: 'Hi Florence!',
+      list_id: 'list_test123',
+      lead_id: 'lead_test456',
+    });
+
+    expect(mockSendInvitation).not.toHaveBeenCalled();
+    expect(result.success).toBe(false);
+    expect(result.code).toBe('linkedin_identity_mismatch');
+  });
+
+  it('send-message without lead context is unchanged (no fetch, no block)', async () => {
+    mockSendMessage.mockResolvedValue({ id: 'msg-1' });
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'send-message',
+      account_id: 'test-account-id',
+      profile_url: 'https://www.linkedin.com/in/whoever/',
+      message: 'Hello!',
+    });
+    expect(result.success).toBe(true);
+    expect(mockGetLinkedInProfile).not.toHaveBeenCalled();
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('send-message stamps the lead on a successful cross-check', async () => {
+    mockGetLeadById.mockResolvedValue(vivianLead);
+    mockGetLinkedInProfile.mockResolvedValue({
+      first_name: 'Florence',
+      last_name: 'Su',
+      work_experience: [{ position: 'VP Performance Marketing', company: 'Vivian Health', current: true }],
+    });
+    mockSendMessage.mockResolvedValue({ id: 'msg-1' });
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'send-message',
+      account_id: 'test-account-id',
+      profile_url: 'https://www.linkedin.com/in/florencesu/',
+      message: 'Hi Florence!',
+      list_id: 'list_test123',
+      lead_id: 'lead_test456',
+    });
+
+    expect(result.success).toBe(true);
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    expect(mockUpdateLead).toHaveBeenCalledWith('list_test123', 'lead_test456', expect.objectContaining({
+      linkedinIdentityVerifiedAt: expect.any(String),
+    }));
+  });
+
+  // ENG-1026 Greptile P1 ("agent-tool authorization gap"): list_id/lead_id are
+  // LLM-supplied tool arguments. Without a list-access check, a model-supplied
+  // (or manipulated) list_id belonging to ANOTHER TENANT let this code read
+  // that tenant's lead identity fields and — on a passing cross-check — stamp
+  // (mutate) their lead record, entirely outside any ownership/org-share check.
+  // Fixed the same way every other CRM write in this file is gated: resolve
+  // the list, require canDestructiveCrmList, and never touch the lead's data
+  // at all when access is denied (matches the sibling CRM-mirror access guard
+  // immediately above — best-effort skip, not a hard user-facing error, since
+  // this is a side-channel guard inside send-message/send-invite, not the
+  // primary user-requested action).
+  describe('agent-tool list-access guard (security)', () => {
+    const FOREIGN_LIST = { id: 'list_test123', userId: 'someone-else' };
+
+    it('send-message: never reads the lead when the caller lacks access to the list, and the send proceeds unprotected by the identity check', async () => {
+      mockGetLeadListById.mockResolvedValue(FOREIGN_LIST);
+      mockSendMessage.mockResolvedValue({ id: 'msg-1' });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-message',
+        account_id: 'test-account-id',
+        profile_url: 'https://www.linkedin.com/in/florencesu/',
+        message: 'Hi Florence!',
+        list_id: 'list_test123',
+        lead_id: 'lead_test456',
+      });
+
+      // The foreign tenant's lead is never fetched, never read, never stamped.
+      expect(mockGetLeadById).not.toHaveBeenCalled();
+      expect(mockGetLinkedInProfile).not.toHaveBeenCalled();
+      expect(mockUpdateLead).not.toHaveBeenCalled();
+      // The send itself is not blocked by this guard (best-effort side channel).
+      expect(result.success).toBe(true);
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('send-invite: never reads the lead when the caller lacks access to the list', async () => {
+      mockGetLeadListById.mockResolvedValue(FOREIGN_LIST);
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+      mockSendInvitation.mockResolvedValue({ id: 'invite-1' });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        profile_url: 'https://www.linkedin.com/in/florencesu/',
+        message: 'Hi Florence!',
+        list_id: 'list_test123',
+        lead_id: 'lead_test456',
+      });
+
+      expect(mockGetLeadById).not.toHaveBeenCalled();
+      expect(mockGetLinkedInProfile).not.toHaveBeenCalled();
+      expect(mockUpdateLead).not.toHaveBeenCalled();
+      expect(result.success).toBe(true);
+      expect(mockSendInvitation).toHaveBeenCalledTimes(1);
+    });
+
+    it('send-message: never reads the lead when the list does not exist', async () => {
+      mockGetLeadListById.mockResolvedValue(null);
+      mockSendMessage.mockResolvedValue({ id: 'msg-1' });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-message',
+        account_id: 'test-account-id',
+        profile_url: 'https://www.linkedin.com/in/florencesu/',
+        message: 'Hi Florence!',
+        list_id: 'list_test123',
+        lead_id: 'lead_test456',
+      });
+
+      expect(mockGetLeadById).not.toHaveBeenCalled();
+      expect(result.success).toBe(true);
+    });
+
+    it('send-message: a same-org listed CRM editor on the list still gets the identity check (access is granted, not just self-ownership)', async () => {
+      mockGetLeadListById.mockResolvedValue({ id: 'list_test123', userId: 'owner-1' });
+      mockGetUserById.mockImplementation((id: string) =>
+        Promise.resolve(
+          id === 'owner-1' ? { userId: 'owner-1', orgId: 'org-A' } : { userId: id, orgId: 'org-A' }
+        )
+      );
+      mockGetOrgById.mockResolvedValue({
+        orgId: 'org-A',
+        ownerUserId: 'org-owner-id',
+        shareSettings: { crm: { enabled: true, editors: ['user-1'] } },
+      });
+      mockGetLeadById.mockResolvedValue(vivianLead);
+      mockGetLinkedInProfile.mockResolvedValue(mismatchProfile);
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-message',
+        account_id: 'test-account-id',
+        profile_url: 'https://www.linkedin.com/in/florencesu/',
+        message: 'Hi Florence!',
+        list_id: 'list_test123',
+        lead_id: 'lead_test456',
+      });
+
+      // Access WAS granted (listed editor) -- the identity check ran and refused on mismatch.
+      expect(mockGetLeadById).toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.code).toBe('linkedin_identity_mismatch');
+    });
+  });
+
+  describe('write pacing spends slots only on real Unipile writes (ENG-1197)', () => {
+    // The pacer's budget exists to stop a drain bursting the session to death. If a
+    // slot is taken before the action's own skip checks, the paths that never reach
+    // LinkedIn — an already-pending invite, a duplicate message — spend that budget
+    // anyway, and the genuinely-new sends later in the same run get refused for
+    // writes that never happened.
+    //
+    // Ceiling of 1 with a zero gap makes that visible without any wall-clock waiting:
+    // under the old placement the SECOND call through a skip path was refused.
+    beforeEach(() => {
+      __resetWritePacerForTests();
+      process.env.LINKEDIN_WRITE_MIN_GAP_MS = '0';
+      process.env.LINKEDIN_WRITE_MAX_PER_HOUR = '1';
+    });
+
+    afterEach(() => {
+      delete process.env.LINKEDIN_WRITE_MIN_GAP_MS;
+      delete process.env.LINKEDIN_WRITE_MAX_PER_HOUR;
+      delete process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX;
+      delete process.env.LINKEDIN_DAILY_MESSAGE_CAP;
+      __resetWritePacerForTests();
+    });
+
+    const inviteArgs = {
+      action: 'send-invite',
+      account_id: 'test-account-id',
+      profile_url: 'https://www.linkedin.com/in/chang-liu/',
+      message: 'Great to connect!',
+    };
+
+    it('does not spend a slot on an already-pending invite', async () => {
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue({ sentAt: null });
+
+      const results = [
+        await service.linkedinOutreach('user-1', inviteArgs),
+        await service.linkedinOutreach('user-1', inviteArgs),
+        await service.linkedinOutreach('user-1', inviteArgs),
+      ];
+
+      // All three skip; none is refused by the pacer despite a ceiling of one.
+      for (const result of results) {
+        expect(result.alreadyInvited).toBe(true);
+        expect(result.message).not.toBe('LinkedIn write actions are being paced');
+      }
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('does not spend a slot on a duplicate message', async () => {
+      mockGetLeadById.mockResolvedValue({
+        leadId: 'lead_test456',
+        listId: 'list_test123',
+        linkedin: 'https://www.linkedin.com/in/johndoe/',
+        linkedinMessageSyncAt: new Date().toISOString(),
+      });
+      mockGetEventsByEmailDomainAndLeadEmail.mockResolvedValue([
+        { eventType: 'linkedin.message.sent', data: { text: 'Hello, let us connect!' }, createdAt: '2026-08-01T00:00:00.000Z' },
+      ]);
+      const dupeArgs = {
+        action: 'send-message',
+        account_id: 'test-account-id',
+        provider_id: 'li-provider-123',
+        message: 'Hello, let us connect!',
+        list_id: 'list_test123',
+        lead_id: 'lead_test456',
+      };
+
+      const first = await service.linkedinOutreach('user-1', dupeArgs);
+      const second = await service.linkedinOutreach('user-1', dupeArgs);
+
+      expect(first.duplicate).toBe(true);
+      expect(second.duplicate).toBe(true);
+      expect(mockSendMessage).not.toHaveBeenCalled();
+    });
+
+    it('does not spend a slot while the ENG-126 breaker is armed', async () => {
+      // The breaker short-circuits the network call INSIDE sendInvitation, so a
+      // paced caller slept a full gap and burned one of the account's hourly writes
+      // for a request that never left the process — for the whole hour the breaker
+      // is armed, on every queued invite. That inverts the breaker's own purpose.
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockIsUnderInvitationCooldown.mockReturnValue(true);
+
+      const results = [
+        await service.linkedinOutreach('user-1', inviteArgs),
+        await service.linkedinOutreach('user-1', inviteArgs),
+        await service.linkedinOutreach('user-1', inviteArgs),
+      ];
+
+      for (const result of results) {
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Cannot resend yet');
+        // Not the pacer's refusal: the ceiling of one was never touched.
+        expect(result.message).not.toBe('LinkedIn write actions are being paced');
+      }
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+      mockIsUnderInvitationCooldown.mockReturnValue(false);
+    });
+
+    it('still spends a slot on a send that does reach Unipile', async () => {
+      // The control: without this the test above would also pass if pacing were
+      // simply switched off.
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockSendInvitation.mockResolvedValue({ id: 'inv-xyz' });
+
+      const first = await service.linkedinOutreach('user-1', inviteArgs);
+      const second = await service.linkedinOutreach('user-1', inviteArgs);
+
+      expect(first.success).toBe(true);
+      expect(second.success).toBe(false);
+      expect(second.message).toBe('LinkedIn write actions are being paced');
+      expect(mockSendInvitation).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not reserve daily volume when the hourly pacer refuses the write', async () => {
+      process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX = '10';
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockSendInvitation.mockResolvedValue({ id: 'inv-hourly' });
+
+      const first = await service.linkedinOutreach('user-1', inviteArgs);
+      const second = await service.linkedinOutreach('user-1', inviteArgs);
+
+      expect(first.success).toBe(true);
+      expect(second.success).toBe(false);
+      expect(second.message).toBe('LinkedIn write actions are being paced');
+      expect(mockUpdateAccountConfig).toHaveBeenCalledTimes(1);
+    });
+
   });
 });

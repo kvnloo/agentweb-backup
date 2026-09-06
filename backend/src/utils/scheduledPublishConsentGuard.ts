@@ -2,6 +2,7 @@ import {
   resolveSchedulePublishAuthorization,
   narrowPublishAuthorization,
   isPublishCall,
+  isPublishCallWithinAuthorizedScope,
   SchedulePublishAuthorization,
 } from './schedulePublishAuthorization';
 import { extractScheduleId } from './schedulePublishApproval';
@@ -32,22 +33,43 @@ import { extractScheduleId } from './schedulePublishApproval';
 
 export interface ScheduledPublishRefusal {
   success: false;
+  blocked: true;
+  reason: 'publish_consent';
   error: string;
 }
 
 export interface ScheduledPublishGuardDeps {
   getChatSession: (sessionId: string) => Promise<any>;
   getScheduleById: (scheduleId: string) => Promise<any>;
+  /**
+   * ENG-1616 — the account_id's REAL platform, read from storage rather than
+   * trusted from the tool call's own args. Optional so every pre-existing
+   * caller/test that never exercises an account_id-bearing publish call is
+   * unaffected; omitting it preserves the prior fail-closed behavior.
+   */
+  resolveAccountPlatform?: (accountId: string, userId: string) => Promise<string | null>;
 }
 
 async function defaultDeps(): Promise<ScheduledPublishGuardDeps> {
-  const [{ chatbotDb }, { scheduleDb }] = await Promise.all([
+  const [{ chatbotDb }, { scheduleDb }, { getAccountsWithOwnerIncludingOrgShared, SOCIAL_POSTING_PLATFORMS }] = await Promise.all([
     import('../services/chatbotService'),
     import('../services/db'),
+    import('../services/connectedAccountsDb'),
   ]);
   return {
     getChatSession: (sessionId: string) => chatbotDb.getChatSession(sessionId),
     getScheduleById: (scheduleId: string) => scheduleDb.getScheduleById(scheduleId),
+    resolveAccountPlatform: async (accountId: string, userId: string) => {
+      const accounts = await getAccountsWithOwnerIncludingOrgShared(userId);
+      // account_id alone does not identify an account — the same id can sit on two
+      // platforms — so narrow to social-posting platforms first, mirroring
+      // postOnConnectedAccount's own socialAccounts filter (SOCIAL_POSTING_PLATFORMS
+      // is the single shared source for that allowlist — see its doc comment).
+      const socialAccounts = accounts.filter((a) =>
+        (SOCIAL_POSTING_PLATFORMS as readonly string[]).includes(a.platform)
+      );
+      return socialAccounts.find((a) => a.account_id === accountId)?.platform ?? null;
+    },
   };
 }
 
@@ -162,6 +184,8 @@ export function readAdmittedAuthorization(session: any): SchedulePublishAuthoriz
 function refuse(toolName: string, detail: string): ScheduledPublishRefusal {
   return {
     success: false,
+    blocked: true,
+    reason: 'publish_consent',
     error:
       `${toolName} was not executed: this unattended scheduled run is not authorized to publish. ${detail} ` +
       `Do NOT retry this tool in this run. Save the content as a draft, state plainly that it is ` +
@@ -214,6 +238,8 @@ export async function refuseUnauthorizedScheduledPublish(
     );
     return {
       success: false,
+      blocked: true,
+      reason: 'publish_consent',
       error:
         `${toolName} was not executed: this run's publishing authorization could not be confirmed, ` +
         `and an unconfirmed permission is treated as withheld — a live post cannot be un-made. ` +
@@ -284,10 +310,41 @@ export async function refuseUnauthorizedScheduledPublish(
   // publish immediately while a mid-run grant is invisible to this run.
   const authorization = narrowPublishAuthorization(admitted, latest);
 
+  // ENG-1616: an equivalence route keyed on `args.platform` (e.g. ENG-1599's
+  // twitter_manage_post -> post_on_connected_account route) cannot trust that field
+  // once `args.account_id` is also present, because the handler ignores `platform`
+  // entirely in that case and a mismatched account_id could otherwise borrow a
+  // platform-scoped grant. Resolve the account_id's REAL platform from storage so
+  // that ordinary calls — a model that just looked up the account via
+  // list_connected_accounts and passed its account_id, exactly as it's meant to —
+  // aren't refused for want of a claim the handler would ignore anyway. Only looked
+  // up when it could actually change the outcome: an exact tool-name match never
+  // needs it, and an unauthorized run has nothing for it to unlock.
+  const hasAccountId = typeof args?.account_id === 'string' && args.account_id.length > 0;
+  let resolvedAccountPlatform: string | null | undefined;
+  if (hasAccountId && authorization.authorized && !authorization.tools.includes(toolName)) {
+    try {
+      resolvedAccountPlatform = await resolved.resolveAccountPlatform?.(args.account_id, session.userId);
+    } catch (accountReadError) {
+      console.error(
+        `ENG-1616: could not resolve the platform for account ${args.account_id} while checking publish ` +
+        `consent for ${toolName}; treating it as unknown (fail-closed):`, accountReadError
+      );
+      resolvedAccountPlatform = null;
+    }
+  }
+
   // Gate on the boolean AND the approved scope. Consent is recorded against the publish
   // tools the owner could see when they gave it, so a run can be authorized for one tool
-  // while reaching for another they never approved — that call is refused.
-  if (!authorization.authorized || !authorization.tools.includes(toolName)) {
+  // while reaching for another they never approved — that call is refused. ENG-1045: the
+  // scope check also credits a call that ACHIEVES an approved tool's mandated outcome
+  // via an equivalent route (e.g. a thread through twitter_manage_post satisfying a
+  // post_on_connected_account grant) — without it this gate refused the exact call the
+  // completion checker's equivalence route exists to credit, before that logic ever ran.
+  if (
+    !authorization.authorized ||
+    !isPublishCallWithinAuthorizedScope(toolName, args, authorization.tools, resolvedAccountPlatform)
+  ) {
     return refuse(
       toolName,
       authorization.tools.length > 0

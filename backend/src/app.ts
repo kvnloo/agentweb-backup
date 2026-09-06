@@ -30,7 +30,6 @@ import agentModeRoutes from "./routes/agentMode";
 import settingsRoutes from "./routes/settings";
 import imageModelsRoutes from "./routes/image-models";
 import webhookRoutes from "./routes/webhooks";
-import devEnvRoutes from "./routes/devEnv";
 import benchmarkRoutes from "./routes/benchmark";
 import seoRoutes from "./routes/seo";
 import funnelRoutes from "./routes/funnel";
@@ -58,6 +57,7 @@ import googleAdsAuthRoutes from "./routes/googleAdsAuth";
 import fathomAuthRoutes from "./routes/fathomAuth";
 import fathomWebhookRoutes from "./routes/fathomWebhook";
 import calendlyWebhookRoutes from "./routes/calendlyWebhook";
+import unipileWebhookRoutes from "./routes/unipileWebhook";
 // ENG-926 §C: registers the CRM -> Meta conversion relay's queue processor at boot. The
 // poller leaves a job claimed-but-unprocessed when no processor is registered for its
 // source, so this cannot be deferred to the first status transition of a process's life —
@@ -67,6 +67,7 @@ import fathomOnboardingAdminRoutes from "./routes/fathomOnboardingAdmin";
 import hubspotAuthRoutes from "./routes/hubspotAuth";
 import attioAuthRoutes from "./routes/attioAuth";
 import crmSyncRoutes from "./routes/crmSync";
+import adsThresholdsRoutes from "./routes/adsThresholds";
 import crmWebhookRoutes from "./routes/crmWebhook";
 import mcpServersRoutes, { mcpOAuthPublicRouter } from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
@@ -75,6 +76,7 @@ import userWorkPlanRoutes from "./routes/userWorkPlanRoutes";
 import adminWorkPlanRoutes from "./routes/adminWorkPlanRoutes";
 import adminLandingPagesRoutes from "./routes/adminLandingPages";
 import adminOrgDiagnosticsRoutes from "./routes/adminOrgDiagnostics";
+import adminTrackingMonitorRoutes from "./routes/adminTrackingMonitor";
 import adminPromptTemplatesRoutes from "./routes/adminPromptTemplates";
 import adminScheduleTemplateRoutes from "./routes/adminScheduleTemplateRoutes";
 import supportRoutes from "./routes/support";
@@ -183,10 +185,26 @@ const corsOptions = {
       "https://agentweb-user-files.s3.us-west-2.amazonaws.com", // S3 bucket for user files
       process.env.FRONTEND_URL || "http://localhost:5173", // Partner Portal (Deployed or Local)
       process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174", // Customer Portal (Deployed or Local)
-      process.env.GROWTH_GENIUS_CHAT_URL || "http://localhost:8080", // Growth Genius Chat (Deployed or Local)
-      /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
-      /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/, // Allow any ngrok.io subdomain
     ];
+
+    // ngrok tunnels are a local-dev convenience (exposing a laptop's backend to a
+    // webhook sender, a mobile device, etc.) and must never be a credentialed
+    // origin in production — any ngrok tenant on the internet would otherwise be
+    // allowed (ENG-1751). Fail closed on NODE_ENV: neither tracked EB config nor
+    // package.json sets NODE_ENV=production explicitly, so `!== "production"`
+    // was fail-open (unset/mistyped/staging all fell through as "allow"), the
+    // exact class of bug already fixed in webhooks.ts's Attio isDev check. Only
+    // an explicit NODE_ENV=development, or the CORS_ALLOW_NGROK=1 opt-in, allows
+    // ngrok origins.
+    if (
+      process.env.NODE_ENV === "development" ||
+      process.env.CORS_ALLOW_NGROK === "1"
+    ) {
+      allowedOrigins.push(
+        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
+        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/ // Allow any ngrok.io subdomain
+      );
+    }
 
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
@@ -265,6 +283,7 @@ app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" })
 // HubSpot webhook needs raw body for HMAC-SHA256 signature verification.
 app.use("/api/webhooks/hubspot", express.raw({ type: "application/json" }));
 app.use("/api/webhooks/calendly", express.raw({ type: "application/json" })); // raw body needed for HMAC signature verification
+app.use("/api/webhooks/attio", express.raw({ type: "application/json" })); // raw body needed for Attio-Signature HMAC verification
 // Linear webhook (bug-resolve bridge) needs raw body for HMAC signature verification — before express.json().
 app.use("/api/integrations/linear/webhook", express.raw({ type: "application/json" }));
 // Featurebase webhook (Slack ship-notify) signs the raw body too — before express.json().
@@ -325,8 +344,8 @@ app.use("/api/image-models", imageModelsRoutes);
 app.use("/api/webhooks", webhookRoutes);
 app.use("/api/webhooks/fathom", fathomWebhookRoutes);
 app.use("/api/webhooks/calendly", calendlyWebhookRoutes);
+app.use("/api/webhooks/unipile", unipileWebhookRoutes);
 registerConversionRelayProcessor();
-app.use("/api", devEnvRoutes);
 app.use("/api/benchmark", benchmarkRoutes);
 app.use("/api/seo", seoRoutes);
 app.use("/api/funnels", funnelRoutes);
@@ -341,6 +360,9 @@ app.use("/api/crm/webhooks/apollo", apolloWebhookRoutes);
 app.use("/api/crm/sequences", sequenceRoutes);
 app.use("/api/crm/companies", crmCompaniesRoutes);
 app.use("/api/crm", crmRoutes);
+// ENG-918 — per-account ads-detection thresholds. Every route authenticates and re-derives
+// ad-account ownership from the caller's own connected accounts; see the route file's header.
+app.use("/api/ads-thresholds", adsThresholdsRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
 app.use("/api/oauth/linkedin", linkedinAuthRoutes);
@@ -378,6 +400,7 @@ app.use("/api/user-work-plans", authenticateToken, userWorkPlanRoutes);
 app.use("/api/admin/work-plans", authenticateToken, isAdmin, adminWorkPlanRoutes);
 app.use("/api/admin/landing-pages", authenticateToken, isAdmin, adminLandingPagesRoutes);
 app.use("/api/admin/org-diagnostics", authenticateToken, isAdmin, adminOrgDiagnosticsRoutes);
+app.use("/api/admin/tracking-monitor", authenticateToken, isAdmin, adminTrackingMonitorRoutes);
 app.use("/api/admin/prompt-templates", authenticateToken, isAdmin, adminPromptTemplatesRoutes);
 app.use("/api/admin/schedule-templates", authenticateToken, isAdmin, adminScheduleTemplateRoutes);
 app.use("/api/support", supportRoutes);

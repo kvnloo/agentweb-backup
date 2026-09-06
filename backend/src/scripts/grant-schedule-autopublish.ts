@@ -52,9 +52,23 @@
  *     make, and reversing it is the one thing this migration must never do
  *   - revisit a schedule that already has a consent decision recorded, grant OR refusal
  *   - touch an inactive schedule
- *   - invent a tool scope. A prompt that says "post this" while naming no publishing
- *     tool gets nothing: consent is recorded against specific tools, and there are none
- *     to name. Those owners tick the box themselves, which is the honest outcome.
+ *   - INFER a tool scope from the schedule's own configuration. The survey (no
+ *     allowlist) still requires a publish tool already named in requiredFunctionCalls,
+ *     because with nothing else on the line that field is the only candidate signal —
+ *     and inferring consent from it circularly is exactly what this ticket exists to
+ *     stop.
+ *
+ * ENG-1245 — an ALLOWLISTED line may instead SPELL OUT the tools with `tools=`, because
+ * that is not inference: it is the operator recording an answer a human actually gave.
+ * Session 0e5af215's schedule (1d001fba-0fb7-4bcd-80f6-6041b244a442, "Harsha Daily X
+ * Post (Autonomous)") is exactly the case the survey-only design missed — its
+ * requiredFunctionCalls (["twitter_outreach"]) names no publish tool (it names the
+ * research tool the completion checker happens to require), so it was never a
+ * candidate and even a confirmed allowlist line for it granted nothing. `tools=` is
+ * scoped no differently than the derived path: still gated on every existing safety
+ * check (active, no `requirePublishApproval`, no consent already recorded, owner
+ * match), and still validated against the real publish-tool registry
+ * (`isPublishCapableTool`) so a typo cannot grant an unrelated tool.
  *
  * Usage:
  *   # Phase 1 — who needs to be asked
@@ -68,10 +82,17 @@
  * Allowlist format — one schedule per line, `#` comments and blank lines ignored:
  *   <scheduleId>  <ownerUserId>  <how the owner confirmed>
  *   sched-abc123  e86420f2-4374-…  ruiw@agentweb.pro confirmed in #ops on 2026-08-11
+ *
+ * An optional `tools=` token — no spaces, comma-separated — between the owner id and
+ * the note records the EXACT tools the owner confirmed, independent of
+ * requiredFunctionCalls. Only needed when the schedule doesn't already name a publish
+ * tool there:
+ *   <scheduleId>  <ownerUserId>  tools=<tool1>[,<tool2>...]  <how the owner confirmed>
+ *   1d001fba-0fb7-4bcd-80f6-6041b244a442  1743956381327  tools=post_on_connected_account  Harsha confirmed via Linear ENG-1404 on 2026-08-20
  */
 
 import { scheduleDb } from '../services/db';
-import { getRequiredPublishTools } from '../utils/schedulePublishAuthorization';
+import { getRequiredPublishTools, isPublishCapableTool } from '../utils/schedulePublishAuthorization';
 
 interface Candidate {
   scheduleId: string;
@@ -84,6 +105,12 @@ interface Candidate {
 export interface ConsentConfirmation {
   scheduleId: string;
   ownerUserId: string;
+  /**
+   * ENG-1245: the exact tools the owner confirmed, from a `tools=` token — present
+   * only when the line carried one. Absent (not an empty array) means "derive the
+   * scope from requiredFunctionCalls", the original ENG-827 behavior.
+   */
+  tools?: string[];
   note: string;
 }
 
@@ -115,14 +142,32 @@ export function parseConsentAllowlist(text: string): ConsentConfirmation[] {
     if (!line || line.startsWith('#')) return;
 
     const [scheduleId, ownerUserId, ...rest] = line.split(/\s+/);
-    const note = rest.join(' ').trim();
+
+    // ENG-1245: an optional tools=a,b token, always the first word after the owner id
+    // and never spaced internally (the line is whitespace-delimited). Everything after
+    // it is still the free-text note.
+    let tools: string[] | undefined;
+    let noteTokens = rest;
+    if (rest[0]?.startsWith('tools=')) {
+      tools = rest[0]
+        .slice('tools='.length)
+        .split(',')
+        .map((t) => t.trim())
+        .filter(Boolean);
+      if (tools.length === 0) {
+        throw new Error(`Allowlist line ${i + 1} has an empty tools= list: ${line}`);
+      }
+      noteTokens = rest.slice(1);
+    }
+
+    const note = noteTokens.join(' ').trim();
     if (!scheduleId || !ownerUserId || !note) {
       throw new Error(
-        `Allowlist line ${i + 1} is not "<scheduleId> <ownerUserId> <how the owner confirmed>": ${line}`,
+        `Allowlist line ${i + 1} is not "<scheduleId> <ownerUserId> [tools=t1,t2] <how the owner confirmed>": ${line}`,
       );
     }
 
-    out.push({ scheduleId, ownerUserId, note });
+    out.push(tools ? { scheduleId, ownerUserId, tools, note } : { scheduleId, ownerUserId, note });
   });
 
   return out;
@@ -150,6 +195,19 @@ export async function backfillPublishConsent(opts: {
     throw new Error('Refusing to apply with an empty allowlist — consent has to be confirmed per schedule.');
   }
 
+  // Safety gates that apply no matter how the tool scope is determined — the derived
+  // survey path below, and the ENG-1245 explicit `tools=` allowlist path further down.
+  // None of these are about scope; all of them are about whether a grant may happen
+  // at all.
+  const ineligibilityReason = (schedule: any): string | null => {
+    if (schedule.status !== 'active') return 'not active';
+    if (schedule.requirePublishApproval === true) return 'owner requires approval';
+    if (schedule.autopublishAuthorized !== undefined && schedule.autopublishAuthorized !== null) {
+      return 'consent already recorded';
+    }
+    return null;
+  };
+
   const all = (await listSchedules()) || [];
   const candidates: Candidate[] = [];
   const skipped: BackfillResult['skipped'] = [];
@@ -161,16 +219,9 @@ export async function backfillPublishConsent(opts: {
     if (!scheduleId) continue;
     byId.set(scheduleId, schedule);
 
-    if (schedule.status !== 'active') {
-      skipped.push({ scheduleId, scheduleName, reason: 'not active' });
-      continue;
-    }
-    if (schedule.requirePublishApproval === true) {
-      skipped.push({ scheduleId, scheduleName, reason: 'owner requires approval' });
-      continue;
-    }
-    if (schedule.autopublishAuthorized !== undefined && schedule.autopublishAuthorized !== null) {
-      skipped.push({ scheduleId, scheduleName, reason: 'consent already recorded' });
+    const reason = ineligibilityReason(schedule);
+    if (reason) {
+      skipped.push({ scheduleId, scheduleName, reason });
       continue;
     }
 
@@ -206,6 +257,32 @@ export async function backfillPublishConsent(opts: {
     if (schedule.userId !== entry.ownerUserId) {
       // A mistyped id must not grant on whoever's schedule it landed on.
       reject(`owner mismatch — allowlist says ${entry.ownerUserId}, schedule belongs to ${schedule.userId}`);
+      continue;
+    }
+
+    if (entry.tools) {
+      // ENG-1245: an explicit, operator-recorded answer — not inferred from
+      // requiredFunctionCalls, so it can grant a schedule that never became a
+      // `candidates` entry (e.g. one whose requiredFunctionCalls names a checker
+      // tool, not a publish tool). Still bound by every other safety gate, and still
+      // validated against the real publish-tool registry so a typo can't grant an
+      // unrelated tool.
+      const reason = ineligibilityReason(schedule);
+      if (reason) {
+        reject(reason);
+        continue;
+      }
+      const invalid = entry.tools.filter((t) => !isPublishCapableTool(t));
+      if (invalid.length > 0) {
+        reject(`tools= names a tool that is not publish-capable: ${invalid.join(', ')}`);
+        continue;
+      }
+      confirmed.push({
+        scheduleId: entry.scheduleId,
+        scheduleName: schedule.scheduleName || schedule.name || '(unnamed)',
+        userId: schedule.userId,
+        tools: Array.from(new Set(entry.tools)),
+      });
       continue;
     }
 

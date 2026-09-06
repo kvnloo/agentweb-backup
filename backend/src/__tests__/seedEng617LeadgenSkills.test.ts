@@ -69,12 +69,16 @@ describe('seed-eng617-leadgen-skills', () => {
       );
     });
 
-    it('carries the absolute PUBLISH GATE, deferring the unattended call to the run', () => {
+    it('carries the PUBLISH GATE, deferring the unattended call to the run', () => {
       // ENG-947: this used to assert "never publish" unattended. That blanket
       // refusal outranked the run's PUBLISH AUTHORIZATION block and deadlocked
       // authorized schedules, so the gate now defers rather than decides.
+      // ENG-1311: the block's heading changed from "(ABSOLUTE — overrides
+      // every other instruction in this prompt)" to "(scoped — governs ONLY
+      // the moment ... about to call a tool that posts/publishes/...)" so it
+      // no longer colours the whole session — see applyHardening.ts.
       const skill = buildAeoSkill();
-      expect(skill.systemPrompt).toContain('## PUBLISH GATE (ABSOLUTE');
+      expect(skill.systemPrompt).toContain('## PUBLISH GATE (scoped');
       expect(skill.systemPrompt).not.toContain('save as a draft and notify; never publish');
       expect(skill.systemPrompt!.replace(/\s+/g, ' ')).toContain('PUBLISH AUTHORIZATION');
       expect(skill.systemPrompt).toContain('## FAILURE HANDLING');
@@ -131,7 +135,12 @@ describe('seed-eng617-leadgen-skills', () => {
       ]) {
         expect(skill.systemPrompt).toContain(block);
       }
-      expect(skill.systemPrompt).toContain('5 LinkedIn invites');
+      // The fixed "5 LinkedIn invites" prompt number was replaced by a real,
+      // Premium-aware daily cap enforced in the backend (linkedInWritePacer.ts,
+      // ENG-1197 follow-up) — asserting the old literal here would lock in the
+      // stale prompt text as the invariant instead of the enforced behavior.
+      expect(skill.systemPrompt).toContain('capped PER DAY by the backend');
+      expect(skill.systemPrompt).toContain('SELF-REPORTED, not detected');
       expect(skill.systemPrompt).toContain('25 emails');
       expect(skill.systemPrompt).toContain('across ALL channels combined');
     });

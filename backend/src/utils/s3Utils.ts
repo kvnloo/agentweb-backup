@@ -50,16 +50,24 @@ export function extractS3KeyFromUrl(
 
 /**
  * Generate a presigned GET URL for an S3 object.
+ *
+ * `responseContentDisposition` (ENG-1188): when set, S3 echoes it back as the
+ * response's `Content-Disposition` header on this specific request — e.g.
+ * `attachment; filename="banner.html"` forces a real download instead of the
+ * browser rendering/displaying the object inline, without touching the
+ * underlying object's own (public, header-less) storage.
  */
 export function generatePresignedUrl(
   key: string,
   bucket: string = DEFAULT_BUCKET,
-  expiresIn: number = PRESIGNED_URL_EXPIRY
+  expiresIn: number = PRESIGNED_URL_EXPIRY,
+  responseContentDisposition?: string
 ): string {
   return s3.getSignedUrl('getObject', {
     Bucket: bucket,
     Key: key,
     Expires: expiresIn,
+    ...(responseContentDisposition ? { ResponseContentDisposition: responseContentDisposition } : {}),
   });
 }
 
@@ -70,11 +78,12 @@ export function generatePresignedUrl(
 export function presignS3Url(
   publicUrl: string,
   bucket: string = DEFAULT_BUCKET,
-  expiresIn: number = PRESIGNED_URL_EXPIRY
+  expiresIn: number = PRESIGNED_URL_EXPIRY,
+  responseContentDisposition?: string
 ): string | null {
   const key = extractS3KeyFromUrl(publicUrl, bucket);
   if (!key) return null;
-  return generatePresignedUrl(key, bucket, expiresIn);
+  return generatePresignedUrl(key, bucket, expiresIn, responseContentDisposition);
 }
 
 /**
@@ -204,6 +213,10 @@ export interface S3UploadResult {
   url?: string;
   key?: string;
   error?: string;
+  // ENG-1300: the real HTTP status from AWS SDK v2's error.statusCode, when
+  // present — separate from error.code, which on this SDK is a STRING error
+  // name (e.g. "AccessDenied", "NoSuchBucket"), never a numeric status.
+  statusCode?: number;
 }
 
 /**
@@ -276,7 +289,8 @@ export async function uploadFileToS3(
     console.error('Error in uploadFileToS3:', error);
     return {
       success: false,
-      error: error instanceof Error ? error.message : 'Unknown error'
+      error: error instanceof Error ? error.message : 'Unknown error',
+      statusCode: (error as any)?.statusCode
     };
   }
 }

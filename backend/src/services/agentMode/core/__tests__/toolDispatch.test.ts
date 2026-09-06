@@ -16,6 +16,9 @@ import {
 import {
   executePreparedTools,
   stableStringify,
+  seedMediaCallKeysFromHistory,
+  seedSearchCallCountFromHistory,
+  SEARCH_CALL_SESSION_CAP,
   type ExecutePreparedToolsInput,
   type ToolDispatchPorts,
 } from '../toolDispatch';
@@ -30,6 +33,9 @@ import {
 } from '../../../../utils/toolOutputContract';
 import { extractToolContent } from '../../../../utils/extractToolContent';
 import { classifyToolErrorClass } from '../../../../utils/toolErrorClassifier';
+// The REAL downgrade the dispatcher is wired with in production, so the install_skills ledger
+// shape below is established rather than assumed.
+import { toolResultError as realToolResultError } from '../../../../utils/toolResultError';
 
 /** Build a model tool_call in the shape the loop emits. */
 function toolCall(id: string, name: string, args: string) {
@@ -99,6 +105,133 @@ function makeInput(
 }
 
 describe('executePreparedTools', () => {
+  /*
+   * Observed live (delegated session a1a6345a, Phoenix): this gate refused
+   * `audit_ad_utm_coverage`, the `install_skills` fallback was refused by subscription, and the
+   * model then ran an unrelated AD LIST and presented a confident "UTM Tagging Audit Summary —
+   * PASS, 6/6 tagged" table built from it, as though the audit had run and passed. A downstream
+   * truthfulness guard appended a correction, but BELOW the fabricated table.
+   *
+   * The gate error told the model to install the skill and said nothing about what to do when
+   * the install itself fails — so it improvised. These pin the instruction it now carries.
+   */
+  describe('a skill-gated tool refusal', () => {
+    const gatedInput = (ports: any) =>
+      makeInput([toolCall('g', 'audit_ad_utm_coverage', '{}')], ports, {
+        publishedSkillsCount: 1,
+        sessionAssociatedSkillIdsCount: 1,
+        allowedToolNames: new Set<string>(['read_brand_guidelines']),
+      });
+
+    it('forbids substituting another tool and presenting it as this tool having run', async () => {
+      const ports = makePorts();
+      const input = gatedInput(ports);
+
+      await executePreparedTools(input);
+
+      const err = String(input.toolCallsLedger[0]?.error ?? '');
+      expect(err).toMatch(/do not run a different tool/i);
+      expect(err).toMatch(/substituting other data makes the claim false/i);
+    });
+
+    it('says what to do when the install itself cannot succeed', async () => {
+      const ports = makePorts();
+      const input = gatedInput(ports);
+
+      await executePreparedTools(input);
+
+      const err = String(input.toolCallsLedger[0]?.error ?? '');
+      expect(err).toMatch(/unavailable on their plan/i);
+    });
+
+    it('keeps the prefix that classifyToolErrorClass keys tool_unavailable off', async () => {
+      const ports = makePorts();
+      const input = gatedInput(ports);
+
+      await executePreparedTools(input);
+
+      const err = String(input.toolCallsLedger[0]?.error ?? '');
+      // Appending guidance must not change how the error is classified upstream.
+      expect(err).toContain('is not available. You must install the required skill first using install_skills.');
+      expect(classifyToolErrorClass(new Error(err))).toBe('tool_unavailable');
+    });
+
+    it('still does not execute the gated tool', async () => {
+      const ports = makePorts();
+      const input = gatedInput(ports);
+
+      await executePreparedTools(input);
+
+      expect((ports as any).__execOrder ?? []).not.toContain('audit_ad_utm_coverage');
+    });
+
+    /*
+     * What a REFUSED install_skills actually looks like in the ledger, established here rather
+     * than assumed anywhere downstream.
+     *
+     * `installSkills` never throws — every refusal returns `{ success: false, message }` and so
+     * travels the dispatcher's SUCCESS path. The claim that this therefore reaches the ledger
+     * with neither an `error` nor a `success: false` is WRONG, and worth pinning so nobody
+     * re-derives it: the downgrade below (the REAL `toolResultError`, wired as the production
+     * port is) converts a `success: false` result into a tool failure first, so the entry does
+     * carry an `error`.
+     *
+     * Anything reading the ledger to decide whether the install worked keys off exactly that,
+     * so this test is what keeps the two from drifting: unwire the downgrade and it fails here,
+     * not silently in production.
+     */
+    it('a refused install_skills reaches the ledger as a failure, not a bare success', async () => {
+      const ports = makePorts({
+        toolResultError: realToolResultError,
+        executePreparedAgentTool: async () => ({
+          success: false,
+          message: 'The requested skills are not available with your current subscription.',
+        }),
+      });
+      const input = makeInput([toolCall('i', 'install_skills', '{"skillIds":["utm-audit"]}')], ports);
+
+      await executePreparedTools(input);
+
+      const entry = input.toolCallsLedger[0];
+      expect(entry.name).toBe('install_skills');
+      expect(String(entry.error)).toMatch(/not available with your current subscription/i);
+    });
+
+    /*
+     * The gap the downgrade genuinely cannot cover. A PARTIAL install returns `success: true` —
+     * something did install — so `toolResultError` raises nothing and the entry is an ordinary
+     * success. Only the minimized RESULT can say that the skill the gated tool needed may have
+     * been the one refused, which is why extractMinimalToolResult keeps `rejectedSkillIds`.
+     */
+    it('a PARTIAL install reaches the ledger as a success, so the result must carry the refusal', async () => {
+      const partial = {
+        success: true,
+        message: 'Successfully installed 1 skill(s). 1 skill(s) were not available with your subscription.',
+        installedSkills: ['Some Other Skill'],
+        rejectedSkillIds: ['utm-audit'],
+        // The tool names installSkills resolved rejectedSkillIds to (agentModeService.ts) —
+        // what buildUnavailableCapabilityNotice's per-tool scoping keys off. Included here so
+        // this test proves it reaches the ledger through the actual dispatch boundary, not
+        // just through extractMinimalToolResult called directly.
+        rejectedToolNames: ['audit_ad_utm_coverage'],
+      };
+      const ports = makePorts({
+        toolResultError: realToolResultError,
+        executePreparedAgentTool: async () => partial,
+      });
+      const input = makeInput([toolCall('i', 'install_skills', '{"skillIds":["a","utm-audit"]}')], ports);
+
+      await executePreparedTools(input);
+
+      const entry = input.toolCallsLedger[0];
+      expect(entry.error).toBeUndefined();
+      expect(entry.result.rejectedToolNames).toEqual(['audit_ad_utm_coverage']);
+      // makePorts' minimizer is identity, so this asserts the FIELD survives to the minimizer.
+      // agentModeService.skills.test.ts pins that the real minimizer keeps it.
+      expect(entry.result.rejectedSkillIds).toEqual(['utm-audit']);
+    });
+  });
+
   it('executes a batch and appends tool messages in original order', async () => {
     const ports = makePorts();
     const input = makeInput(
@@ -237,6 +370,34 @@ describe('executePreparedTools', () => {
     expect(result.pendingCounterUpdates).toEqual({});
   });
 
+  // ENG-1626: a ToolResultPolicyBlockedError is a tool refusing BY DESIGN (e.g.
+  // set_work_plan_status's out-of-order/missing-calls gates, which return
+  // {success:false, blocked:true, reason:'...'} without throwing). It downgrades
+  // to a model-visible error like any other, but must NOT feed failedCounterUpdates
+  // (session.failedFunctions) -- that field is what the failure-cluster telemetry
+  // and this issue's "set_work_plan_status failed 2x" reading were built from, so
+  // a self-correcting gate refusal must not read as an infra flake.
+  it('downgrades a ToolResultPolicyBlockedError result WITHOUT counting it as a failure', async () => {
+    const { ToolResultPolicyBlockedError } = require('../../../../utils/toolResultError');
+    const ports = makePorts({
+      toolResultError: (r: any) =>
+        r?.blocked === true ? new ToolResultPolicyBlockedError(r.message, r.reason) : null,
+      executePreparedAgentTool: async () => ({
+        success: false,
+        blocked: true,
+        reason: 'workplan_out_of_order',
+        message: 'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
+      }),
+    });
+    const input = makeInput([toolCall('a', 'set_work_plan_status', '{}')], ports);
+    const result = await executePreparedTools(input);
+
+    expect(input.toolCallsLedger[0].error).toBe(
+      'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
+    );
+    expect(result.failedCounterUpdates).toEqual({});
+  });
+
   it('offloads a large tool response to S3 and caps the in-memory copy', async () => {
     const big = 'Y'.repeat(15_000);
     const upload = jest.fn().mockResolvedValue({ success: true, key: 'tool-responses/sess-1/a.txt' });
@@ -363,6 +524,50 @@ describe('executePreparedTools', () => {
 
     expect(input.toolCallsLedger[0].error).toMatch(/Failed to parse arguments/);
     expect(result.failedCounterUpdates).toEqual({ read_brand_guidelines: 1 });
+    expect((ports as any).__execOrder).toEqual([]);
+  });
+
+  // ENG-1477: create_html_file/save_file calls carrying a title or content
+  // value with an unescaped inner quote (a quoted phrase, or HTML markup
+  // like class="...") used to fail here with "Failed to parse arguments:
+  // Expected ',' or '}' after property value" even though the call was
+  // otherwise well-formed. The repair pass in parseToolCallArguments should
+  // recover it and let the call reach the gateway.
+  it('recovers a tool call whose arguments contain an unescaped inner quote', async () => {
+    const ports = makePorts({
+      executePreparedAgentTool: async (i: any) => ({ received: i.args }),
+    });
+    const raw = '{"title":"Phoenix FFL Merchants — "Creative Fatigue" Audit","content_draft":"<div class="header">Hi</div>"}';
+    const input = makeInput([toolCall('a', 'read_brand_guidelines', raw)], ports);
+    const result = await executePreparedTools(input);
+
+    expect(input.toolCallsLedger[0].error).toBeUndefined();
+    expect(input.toolCallsLedger[0].arguments).toEqual({
+      title: 'Phoenix FFL Merchants — "Creative Fatigue" Audit',
+      content_draft: '<div class="header">Hi</div>',
+    });
+    expect(result.failedCounterUpdates).toEqual({});
+    expect((ports as any).__execOrder).toEqual(['read_brand_guidelines']);
+  });
+
+  // ENG-1477 follow-up: production evidence (AW-ChatMessages, session
+  // 02ab5f5e...) showed the real prod failures were not unescaped quotes at
+  // all — every one was a clean JSON prefix cut off mid-object, always
+  // missing the required trailing field, never an unescaped quote anywhere.
+  // That shape must be told "retry the same call", not ENG-124's default
+  // "don't retry, fix your args" (there is nothing to fix).
+  it('classifies a genuinely truncated tool call as retryable, not invalid_args', async () => {
+    const ports = makePorts();
+    // No unescaped quote anywhere — a clean prefix that stops dead with no
+    // closing brace, matching the real production failure shape exactly.
+    const raw = '{"title":"Phoenix FFL Merchants — 30-Day Report","format_requirements":"Dark theme"';
+    const input = makeInput([toolCall('a', 'create_html_file', raw)], ports);
+    const result = await executePreparedTools(input);
+
+    expect(input.toolCallsLedger[0].error).toMatch(/Failed to parse arguments/);
+    expect(input.messages[0].content).toContain('Retryable: yes');
+    expect(input.messages[0].content).toContain('cut off');
+    expect(result.failedCounterUpdates).toEqual({ create_html_file: 1 });
     expect((ports as any).__execOrder).toEqual([]);
   });
 
@@ -591,6 +796,34 @@ describe('executePreparedTools', () => {
       expect(forwarded[0]).toMatchObject({ status: 'deferred', toolCall: expect.objectContaining({ id: 'a' }) });
     });
 
+    // CodeRabbit (PR #2479): the persisted tool-role message's `mediaBudgetDeferred: true`
+    // was set unconditionally for EVERY deferral, including a handler-supplied one (ENG-822's
+    // anonymous-account-scoped refusal) that carries its own unrelated reason. Durability
+    // checks (hasPersistedMediaBudgetDeferral, hasUnresolvedMediaDeferral) key off exactly
+    // this flag to decide "should I auto-resume this" — so an ENG-822 refusal (a deliberate,
+    // permanent policy block, never meant to be retried) would have been indistinguishable
+    // from a genuine time-budget pause and incorrectly auto-retried.
+    it('does NOT tag the persisted marker mediaBudgetDeferred for a handler-supplied (non-time-budget) deferral', async () => {
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => ({
+          status: 'success',
+          result: { deferred: true, reason: 'anonymous_account_scoped', message: 'Sign in to use this feature.' },
+          durationMs: 1,
+          policyDecision: i.policyDecision,
+        }),
+      });
+      const input = makeInput([toolCall('a', 'generate_image', '{"prompt":"x"}')], ports, {});
+      await executePreparedTools(input);
+
+      expect(input.toolCallsLedger[0].result).toEqual({
+        deferred: true,
+        reason: 'anonymous_account_scoped',
+        message: 'Sign in to use this feature.',
+      });
+      expect(input.messages[0]).toMatchObject({ tool_call_id: 'a', role: 'tool', content: 'Sign in to use this feature.' });
+      expect(input.messages[0].metadata?.mediaBudgetDeferred).not.toBe(true);
+    });
+
     it('a deferred call that did not run does not count as a produced asset', async () => {
       // Over budget with an asset already produced: a soft {success:false} would never
       // be reached because we defer BEFORE executing. Proves deferral short-circuits.
@@ -602,6 +835,76 @@ describe('executePreparedTools', () => {
       );
       const result = await executePreparedTools(input);
       expect(result.mediaAssetsProduced).toBe(0);
+      expect(result.mediaBudgetDeferred).toBe(true);
+    });
+  });
+
+  // ENG-1331: a Playwright-rendered asset loop (e.g. a display-ad size matrix) hits the
+  // exact same "one batch exceeds the run's wall clock" failure MEDIA_GEN_TOOLS already
+  // defers for — production evidence: a 12-size render silently stopped at 4 with no
+  // deferral marker and no auto-resume. playwright_browser_take_screenshot now shares the
+  // same deferral mechanism via DEFERRABLE_ASSET_TOOLS.
+  describe('playwright screenshot deferral (ENG-1331)', () => {
+    function screenshotPorts() {
+      const executed: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          executed.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async (i: any) => ({ success: true, screenshotUrl: `https://s3/${i.toolName}.png` }),
+      });
+      return { ports, executed };
+    }
+
+    it('defers a screenshot call once the deadline has passed and ≥1 asset already exists this run', async () => {
+      const { ports, executed } = screenshotPorts();
+      const input = makeInput(
+        [toolCall('a', 'playwright_browser_take_screenshot', '{"size":"300x250"}')],
+        ports,
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 1 },
+      );
+      const result = await executePreparedTools(input);
+
+      expect(executed).toEqual([]);
+      expect(result.mediaBudgetDeferred).toBe(true);
+      expect(result.mediaAssetsProduced).toBe(0);
+      expect(result.pendingCounterUpdates).toEqual({});
+      expect(input.messages[0]).toMatchObject({ tool_call_id: 'a', role: 'tool', name: 'playwright_browser_take_screenshot' });
+      expect(input.toolCallsLedger[0].result).toEqual({ deferred: true, reason: 'media_generation_time_budget' });
+    });
+
+    it('does NOT defer when no deadline is supplied (prior behavior preserved)', async () => {
+      const { ports, executed } = screenshotPorts();
+      const input = makeInput(
+        [toolCall('a', 'playwright_browser_take_screenshot', '{"size":"300x250"}')],
+        ports,
+        { mediaGenerationDeadlineMs: undefined, mediaAssetsProducedThisRun: 5 },
+      );
+      const result = await executePreparedTools(input);
+
+      expect(executed).toEqual(['playwright_browser_take_screenshot']);
+      expect(result.mediaBudgetDeferred).toBe(false);
+      expect(result.mediaAssetsProduced).toBe(1);
+    });
+
+    it('counts a successful screenshot toward mediaAssetsProduced (the ≥1-asset deferral gate)', async () => {
+      const { ports, executed } = screenshotPorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'playwright_browser_take_screenshot', '{"size":"300x250"}'),
+          toolCall('b', 'playwright_browser_take_screenshot', '{"size":"728x90"}'),
+        ],
+        ports,
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 0 },
+      );
+      const result = await executePreparedTools(input);
+
+      // First call makes forward progress (no asset produced yet this run); once it
+      // succeeds the second is deferred the same turn.
+      expect(executed).toEqual(['playwright_browser_take_screenshot']);
+      expect(result.mediaAssetsProduced).toBe(1);
       expect(result.mediaBudgetDeferred).toBe(true);
     });
   });
@@ -1187,6 +1490,49 @@ describe('executePreparedTools — cross-iteration media dedupe (ENG-510)', () =
     expect(msg.role).toBe('tool');
   });
 
+  // ENG-1331: deliberately the OPPOSITE of generate_image's cross-iteration dedupe.
+  // A dimension-based filename (e.g. "300x250.png") is inherently reused across
+  // attempts, and this exact template's QA step ("Fix and re-render failures before
+  // delivery") calls for re-taking a screenshot with that SAME filename after fixing
+  // a problem — deduping it would silently keep the broken original with no error
+  // surfaced. generate_image's dedupe protects against re-paying for an expensive,
+  // rate-limited external call; a screenshot has the opposite risk profile (cheap,
+  // local, and legitimately re-requested), so it must stay retryable even when an
+  // identical-argument call already succeeded earlier this run.
+  it('does NOT cross-iteration-dedupe a screenshot — a same-filename re-render must still run', async () => {
+    const screenshotPorts = () =>
+      makePorts({
+        executePreparedAgentTool: async (_i: any) => ({ success: true, screenshotUrl: 'https://s3/300x250.png' }),
+      });
+
+    const ports1 = screenshotPorts();
+    const in1 = makeInput(
+      [toolCall('a', 'playwright_browser_take_screenshot', '{"filename":"300x250.png"}')],
+      ports1,
+      { priorMediaCallKeys: new Map<string, string>() },
+    );
+    const r1 = await executePreparedTools(in1);
+    expect((ports1 as any).__execOrder).toEqual(['playwright_browser_take_screenshot']);
+    // producedMediaCallKeys IS populated for a screenshot too (countsAsAsset uses the
+    // broader DEFERRABLE_ASSET_TOOLS, kept for the deferral/duration bookkeeping this
+    // key-recording is bundled with) — the protection isn't that the key is absent,
+    // it's that the SUPPRESSION check below never consults it for this tool name.
+    expect(r1.producedMediaCallKeys.size).toBe(1);
+
+    const ports2 = screenshotPorts();
+    const in2 = makeInput(
+      [toolCall('b', 'playwright_browser_take_screenshot', '{"filename":"300x250.png"}')],
+      ports2,
+      // Simulate a key that WOULD suppress a generate_image call, to prove
+      // screenshot ignores priorMediaCallKeys entirely rather than merely never
+      // populating it.
+      { priorMediaCallKeys: new Map([[`playwright_browser_take_screenshot:${stableStringify({ filename: '300x250.png' })}`, 'a']]) },
+    );
+    const r2 = await executePreparedTools(in2);
+    expect((ports2 as any).__execOrder).toEqual(['playwright_browser_take_screenshot']); // re-ran, not suppressed
+    expect(r2.mediaAssetsProduced).toBe(1);
+  });
+
   it('does NOT suppress a distinct variant (different args) from a prior iteration', async () => {
     const prior = new Map<string, string>([[`generate_image:${stableStringify({ prompt: 'sun' })}`, 'a']]);
     const ports = imageGatewayPorts();
@@ -1221,5 +1567,304 @@ describe('executePreparedTools — cross-iteration media dedupe (ENG-510)', () =
     });
     const result = await executePreparedTools(input);
     expect(result.producedMediaCallKeys.size).toBe(0); // failure not recorded → retryable
+  });
+});
+
+describe('seedMediaCallKeysFromHistory (ENG-1239)', () => {
+  // The in-run dedupe map above (priorMediaCallKeys) only ever starts non-empty when the
+  // CALLER threads a prior iteration's keys into it — it always starts empty at the top of
+  // a fresh turn (agentModeService.ts: `new Map()`), so a media auto-continuation (a brand
+  // new turn) got NO code-level dedupe protection against the model re-emitting an
+  // already-done generate_image call — only the LLM-prompt "already generated" awareness
+  // block, which the model can ignore. This reconstructs the SAME key shape
+  // (`name:stableStringify(args)`) from persisted history so a continuation turn seeds the
+  // dispatcher's dedupe map with what already actually happened, hardening it beyond the
+  // prompt-only guard.
+  const successMsg = (name: string, args: string, iso: string) => ({
+    role: 'assistant',
+    timestamp: iso,
+    metadata: { toolCalls: [{ id: 'x', name, arguments: JSON.parse(args), result: { success: true, imageUrl: 'https://s3/img.png' } }] },
+  });
+
+  it('returns an empty map for non-array input', () => {
+    expect(seedMediaCallKeysFromHistory(undefined, 0).size).toBe(0);
+    expect(seedMediaCallKeysFromHistory(null, 0).size).toBe(0);
+  });
+
+  it('seeds a key for a successful generate_image call at/after sinceMs', () => {
+    const sinceMs = Date.parse('2026-08-14T18:00:00Z');
+    const msgs = [successMsg('generate_image', '{"prompt":"sun"}', '2026-08-14T18:20:51.906Z')];
+    const seeded = seedMediaCallKeysFromHistory(msgs, sinceMs);
+    expect(seeded.get(`generate_image:${stableStringify({ prompt: 'sun' })}`)).toBe('x');
+  });
+
+  it('ignores a call from BEFORE sinceMs (an unrelated, much earlier session/turn)', () => {
+    const sinceMs = Date.parse('2026-08-14T18:00:00Z');
+    const msgs = [successMsg('generate_image', '{"prompt":"sun"}', '2026-08-01T00:00:00Z')];
+    expect(seedMediaCallKeysFromHistory(msgs, sinceMs).size).toBe(0);
+  });
+
+  // CodeRabbit (PR #2479): the boundary comparison is `ts >= sinceMs` (inclusive) — pin
+  // the exact-equal case explicitly, not just a call safely after the bound.
+  it('seeds a call whose timestamp is exactly sinceMs (inclusive boundary)', () => {
+    const sinceMs = Date.parse('2026-08-14T18:00:00Z');
+    const msgs = [successMsg('generate_image', '{"prompt":"sun"}', new Date(sinceMs).toISOString())];
+    const seeded = seedMediaCallKeysFromHistory(msgs, sinceMs);
+    expect(seeded.get(`generate_image:${stableStringify({ prompt: 'sun' })}`)).toBe('x');
+  });
+
+  it('does NOT seed a deferred call (nothing was actually produced)', () => {
+    const msgs = [{
+      role: 'assistant',
+      timestamp: '2026-08-14T18:20:51.906Z',
+      metadata: { toolCalls: [{ id: 'x', name: 'generate_image', arguments: { prompt: 'sun' }, result: { deferred: true, reason: 'media_generation_time_budget' } }] },
+    }];
+    expect(seedMediaCallKeysFromHistory(msgs, 0).size).toBe(0);
+  });
+
+  it('does NOT seed a FAILED call (it must stay retryable, not be treated as a duplicate)', () => {
+    const msgs = [{
+      role: 'assistant',
+      timestamp: '2026-08-14T18:20:51.906Z',
+      metadata: { toolCalls: [{ id: 'x', name: 'generate_image', arguments: { prompt: 'sun' }, error: 'provider timeout' }] },
+    }];
+    expect(seedMediaCallKeysFromHistory(msgs, 0).size).toBe(0);
+  });
+
+  it('does NOT seed a confirmation-gate pause (awaitingUserConfirmation, no asset produced)', () => {
+    const msgs = [{
+      role: 'assistant',
+      timestamp: '2026-08-14T18:20:51.906Z',
+      metadata: { toolCalls: [{ id: 'x', name: 'generate_image', arguments: { prompt: 'sun' }, result: { success: true, awaitingUserConfirmation: true } }] },
+    }];
+    expect(seedMediaCallKeysFromHistory(msgs, 0).size).toBe(0);
+  });
+
+  it('ignores a non-media tool call entirely (e.g. send_email)', () => {
+    const msgs = [{
+      role: 'assistant',
+      timestamp: '2026-08-14T18:20:51.906Z',
+      metadata: { toolCalls: [{ id: 'x', name: 'send_email', arguments: { to: 'a@b.com' }, result: { success: true } }] },
+    }];
+    expect(seedMediaCallKeysFromHistory(msgs, 0).size).toBe(0);
+  });
+
+  it('ignores malformed entries and non-assistant messages', () => {
+    const msgs = [
+      null,
+      undefined,
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', metadata: {} },
+      { role: 'assistant', metadata: { toolCalls: [null, {}] } },
+    ];
+    expect(seedMediaCallKeysFromHistory(msgs as any, 0).size).toBe(0);
+  });
+
+  // ENG-1331: deliberately does NOT seed a key for a screenshot, unlike
+  // generate_image. This reconstruction feeds the cross-iteration dedupe a
+  // screenshot must stay exempt from (see toolDispatch.ts's dedupe-check comment) —
+  // a dimension-based filename is legitimately reused when the QA step re-renders a
+  // corrected size, and seeding it here would make that re-render look like an
+  // already-done duplicate on the very next continuation turn.
+  it('does NOT seed a key for a successful playwright_browser_take_screenshot call', () => {
+    const msgs = [{
+      role: 'assistant',
+      timestamp: '2026-08-18T09:12:37.587Z',
+      metadata: {
+        toolCalls: [{
+          id: 'x',
+          name: 'playwright_browser_take_screenshot',
+          arguments: { filename: 'AgentWeb-300x250-MediumRectangle.png' },
+          result: { success: true, screenshotUrl: 'https://s3/300x250.png' },
+        }],
+      },
+    }];
+    expect(seedMediaCallKeysFromHistory(msgs, 0).size).toBe(0);
+  });
+});
+
+// ENG-426: prod incident — a research turn made 193 web-search calls (73 file reads, 503
+// retained messages, 17.4M prompt tokens, $8.68) before an outer time limit ended it. The
+// loop's exact-match anti-loop signature check never caught it because each search varied
+// its query text. This is a session-wide volume cap on WEB_SEARCH_TOOL_NAMES, mirroring
+// Claude Code's own fix for the identical failure mode (default-200-per-session WebSearch
+// cap) — every prior call counts regardless of arguments, so rephrasing can't outrun it.
+describe('search-call session budget (ENG-426)', () => {
+  const searchPorts = () =>
+    makePorts({
+      executePreparedAgentTool: async (_i: any) => ({ success: true, results: [] }),
+    });
+
+  it('allows a search call under the cap and counts it in searchCallsThisIteration', async () => {
+    const ports = searchPorts();
+    const input = makeInput([toolCall('a', 'you_search_web', '{"query":"AI readiness"}')], ports, {
+      priorSearchCallCount: 0,
+    });
+    const result = await executePreparedTools(input);
+    expect((ports as any).__execOrder).toEqual(['you_search_web']);
+    expect(result.searchCallsThisIteration).toBe(1);
+    expect(result.failedCounterUpdates).toEqual({});
+  });
+
+  it('rejects a search call once the prior count already meets the cap — does NOT execute it', async () => {
+    const ports = searchPorts();
+    const input = makeInput([toolCall('a', 'you_search_web', '{"query":"one more angle"}')], ports, {
+      priorSearchCallCount: SEARCH_CALL_SESSION_CAP,
+    });
+    const result = await executePreparedTools(input);
+
+    expect((ports as any).__execOrder).toEqual([]); // never dispatched to the gateway
+    expect(result.searchCallsThisIteration).toBe(0);
+    expect(result.failedCounterUpdates).toEqual({ you_search_web: 1 });
+
+    const msg = input.messages.find((m: any) => m.tool_call_id === 'a');
+    expect(msg.content).toContain('Search budget reached');
+    const ledgerEntry = input.toolCallsLedger.find((t: any) => t.id === 'a');
+    expect(ledgerEntry.error).toContain('Search budget reached');
+  });
+
+  it('shares ONE budget across the different search tools (you_search_web, google_search_web, you_search_news)', async () => {
+    const ports = searchPorts();
+    const input = makeInput(
+      [
+        toolCall('a', 'you_search_web', '{"query":"x"}'),
+        toolCall('b', 'google_search_web', '{"query":"y"}'),
+      ],
+      ports,
+      { priorSearchCallCount: SEARCH_CALL_SESSION_CAP - 1 },
+    );
+    const result = await executePreparedTools(input);
+
+    // "a" is the CAPth call this session — allowed. "b" would be CAP+1 — rejected.
+    expect((ports as any).__execOrder).toEqual(['you_search_web']);
+    expect(result.searchCallsThisIteration).toBe(1);
+    const rejected = input.messages.find((m: any) => m.tool_call_id === 'b');
+    expect(rejected.content).toContain('Search budget reached');
+  });
+
+  it('does NOT cap a non-search tool once the search budget is exhausted', async () => {
+    const ports = makePorts();
+    const input = makeInput([toolCall('a', 'create_lead', '{"email":"x@y.com"}')], ports, {
+      priorSearchCallCount: SEARCH_CALL_SESSION_CAP + 50,
+    });
+    const result = await executePreparedTools(input);
+    expect((ports as any).__execOrder).toEqual(['create_lead']);
+    expect(result.failedCounterUpdates).toEqual({});
+  });
+
+  it('accumulates searchCallsThisIteration across multiple allowed calls in one batch', async () => {
+    const ports = searchPorts();
+    const input = makeInput(
+      [
+        toolCall('a', 'you_search_web', '{"query":"x"}'),
+        toolCall('b', 'you_search_web', '{"query":"y"}'),
+        toolCall('c', 'you_search_web', '{"query":"z"}'),
+      ],
+      ports,
+      { priorSearchCallCount: 0 },
+    );
+    const result = await executePreparedTools(input);
+    expect(result.searchCallsThisIteration).toBe(3);
+  });
+
+  it('defaults priorSearchCallCount to 0 when the caller does not wire it (no behavior change for unmigrated callers)', async () => {
+    const ports = searchPorts();
+    const input = makeInput([toolCall('a', 'you_search_web', '{"query":"x"}')], ports);
+    const result = await executePreparedTools(input);
+    expect((ports as any).__execOrder).toEqual(['you_search_web']);
+  });
+
+  it('does not count an exact-duplicate search suppressed by same-turn dedupe toward the budget', async () => {
+    const ports = searchPorts();
+    const input = makeInput(
+      [
+        toolCall('a', 'you_search_web', '{"query":"same"}'),
+        toolCall('b', 'you_search_web', '{"query":"same"}'),
+      ],
+      ports,
+      { priorSearchCallCount: 0 },
+    );
+    const result = await executePreparedTools(input);
+    // Only one real dispatch (ENG-108 same-turn dedupe collapses the second).
+    expect((ports as any).__execOrder).toEqual(['you_search_web']);
+    expect(result.searchCallsThisIteration).toBe(1);
+  });
+});
+
+describe('seedSearchCallCountFromHistory (ENG-426)', () => {
+  const searchMsg = (name: string, query: string) => ({
+    role: 'assistant',
+    metadata: { toolCalls: [{ id: 'x', name, arguments: { query } }] },
+  });
+
+  it('returns 0 for non-array input', () => {
+    expect(seedSearchCallCountFromHistory(undefined)).toBe(0);
+    expect(seedSearchCallCountFromHistory(null)).toBe(0);
+  });
+
+  it('counts a you_search_web call', () => {
+    expect(seedSearchCallCountFromHistory([searchMsg('you_search_web', 'a')])).toBe(1);
+  });
+
+  it('counts google_search_web and you_search_news too — every WEB_SEARCH_TOOL_NAMES member shares one budget', () => {
+    const msgs = [
+      searchMsg('you_search_web', 'a'),
+      searchMsg('google_search_web', 'b'),
+      searchMsg('you_search_news', 'c'),
+    ];
+    expect(seedSearchCallCountFromHistory(msgs)).toBe(3);
+  });
+
+  it('counts multiple search calls within one assistant message', () => {
+    const msg = {
+      role: 'assistant',
+      metadata: { toolCalls: [
+        { id: 'x', name: 'you_search_web', arguments: { query: 'a' } },
+        { id: 'y', name: 'you_search_web', arguments: { query: 'b' } },
+      ] },
+    };
+    expect(seedSearchCallCountFromHistory([msg])).toBe(2);
+  });
+
+  it('counts a call regardless of success/failure — this is a volume cap, not a duplicate detector', () => {
+    const failed = {
+      role: 'assistant',
+      metadata: { toolCalls: [{ id: 'x', name: 'you_search_web', arguments: { query: 'a' }, error: 'timeout' }] },
+    };
+    expect(seedSearchCallCountFromHistory([failed])).toBe(1);
+  });
+
+  it('ignores a non-search tool call (e.g. send_email)', () => {
+    const msg = { role: 'assistant', metadata: { toolCalls: [{ id: 'x', name: 'send_email', arguments: {} }] } };
+    expect(seedSearchCallCountFromHistory([msg])).toBe(0);
+  });
+
+  it('ignores non-assistant messages and malformed entries', () => {
+    const msgs = [
+      null,
+      undefined,
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', metadata: {} },
+      { role: 'assistant', metadata: { toolCalls: [null, {}] } },
+    ];
+    expect(seedSearchCallCountFromHistory(msgs as any)).toBe(0);
+  });
+
+  // CodeRabbit (PR #2633): appendSuppressedDuplicate persists a ledger entry for the
+  // COLLAPSED call too (name + duplicateOf), so the next LLM turn isn't left with an
+  // orphaned tool_call_id. That entry never actually dispatched — no network call, no
+  // budget spent — so a later turn reconstructing the count from this same history must
+  // not count it a second time for one real search.
+  it('does not double-count a same-turn suppressed duplicate persisted in history', () => {
+    const msg = {
+      role: 'assistant',
+      metadata: {
+        toolCalls: [
+          { id: 'a', name: 'you_search_web', arguments: { query: 'x' } },
+          { id: 'b', name: 'you_search_web', arguments: { query: 'x' }, duplicateOf: 'a' },
+        ],
+      },
+    };
+    expect(seedSearchCallCountFromHistory([msg])).toBe(1);
   });
 });

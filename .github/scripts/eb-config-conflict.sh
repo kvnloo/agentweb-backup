@@ -16,10 +16,17 @@
 # production was undeployable for roughly 29 hours and an innocent PR (#2234)
 # failed for a fault that was never its own.
 #
-# Staging cannot catch this: staging is `AllAtOnce`, which has no
+# No pre-production deploy can catch this, so this script is the substitute.
+#
+# ENG-1184: this used to say "staging is `AllAtOnce`, which has no
 # resource/instance restriction, so it accepts the identical change and reports
-# green. That green is evidence of nothing about prod. This script is the
-# substitute for a check staging structurally cannot perform.
+# green". Both halves have since stopped being true, and nothing noticed:
+# ENG-1128 switched staging to Immutable on 2026-08-11, and ENG-1463 then
+# removed the staging deploy job entirely, so nothing in CI deploys to staging
+# at all. A deployment policy is an environment-level setting in AWS, not
+# something this repo can read, so asserting one here is a claim that can
+# silently invert — which is what it did, in a line this script also LOGS to
+# engineers deciding whether a green run means anything.
 #
 # Usage:
 #   git diff --name-only "$BASE...$HEAD" | bash .github/scripts/eb-config-conflict.sh
@@ -142,7 +149,7 @@ matched_needles() {
   local content="$1" needle
   shift
   for needle in "$@"; do
-    if printf '%s' "${content}" | grep -qF "${needle}"; then
+    if grep -qF "${needle}" <<<"${content}"; then
       printf '%s\n' "${needle}"
     fi
   done
@@ -153,7 +160,7 @@ contains_any() {
   local content="$1" needle
   shift
   for needle in "$@"; do
-    if printf '%s' "${content}" | grep -qF "${needle}"; then
+    if grep -qF "${needle}" <<<"${content}"; then
       return 0
     fi
   done
@@ -282,7 +289,8 @@ main() {
   printf '%s' "${instance_hits}"
   log 'Fix: split into two sequential deploys. Resource-only lands first and'
   log 'settles, then instance-only. Neither trips the immutable constraint.'
-  log 'Staging will NOT reproduce this: staging is AllAtOnce and accepts it.'
+  log 'No staging run is evidence either way: CI has not deployed to staging'
+  log 'since ENG-1463 removed that job. This gate is the only check for it.'
   return 1
 }
 

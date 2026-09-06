@@ -43,9 +43,21 @@
 import AWS from 'aws-sdk';
 
 /**
- * Fixed hook name, mirrored in .ebextensions/07-termination-lifecycle.config.
+ * Fixed hook name, matching the one .github/scripts/eb-deploy.sh installs in
+ * ensure_termination_lifecycle_hook() before every EB update (see DEPLOYMENT above).
  * Pinning it here means the instance never needs autoscaling:DescribeLifecycleHooks
  * just to answer the hook it is already parked on.
+ *
+ * ENG-1184: this used to say the name was "mirrored in
+ * .ebextensions/07-termination-lifecycle.config". That file has never existed, and
+ * it should not: the comment above ensure_termination_lifecycle_hook()
+ * records why. An .ebextensions resource delta
+ * cannot ride an immutable application deploy at all — proven on 2026-08-04 at the
+ * cost of ~50 minutes of undeployable main (ENG-818) — and a hook created once by
+ * hand does not survive Elastic Beanstalk replacing the ASG. Reinstalling it from
+ * the deploy path is the design, not a workaround for a missing file. The pointer
+ * cost a full investigation before that was established; naming the mechanism
+ * instead of a filename is what keeps it from costing another.
  */
 export const TERMINATION_LIFECYCLE_HOOK_NAME = 'agentweb-drain-before-terminate';
 

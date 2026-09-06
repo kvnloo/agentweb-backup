@@ -145,3 +145,5 @@ customer-portal/
 .claude-total-cost
 .ec2-session-meta
 .notion-page-id
+# a worktree may symlink this rather than have a real dir; `node_modules/` does not match a symlink
+node_modules

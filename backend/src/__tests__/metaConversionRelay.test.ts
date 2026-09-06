@@ -318,6 +318,43 @@ describe('relayLeadStatusEvent — sending', () => {
     expect(event.fbp).toBeUndefined();
   });
 
+  // ENG-926 §B. Both were in hand at capture and thrown away, so every conversion relayed
+  // weeks later reached Meta with weaker identity than we held at the moment of capture.
+  // Meta names client_ip_address / client_user_agent among the most commonly skipped and
+  // most valuable Event Match Quality inputs.
+  it('sends the persisted client IP and user agent so a late conversion still matches', async () => {
+    const deps = makeDeps();
+    await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ clientIp: '203.0.113.7', clientUserAgent: 'Mozilla/5.0 (iPhone)' }) }),
+      deps,
+    );
+
+    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
+    expect(event.clientIp).toBe('203.0.113.7');
+    expect(event.userAgent).toBe('Mozilla/5.0 (iPhone)');
+  });
+
+  it('omits both for a lead captured before they were persisted', async () => {
+    const deps = makeDeps();
+    await relayLeadStatusEvent(ctx(), deps);
+
+    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
+    expect(event.clientIp).toBeUndefined();
+    expect(event.userAgent).toBeUndefined();
+  });
+
+  it('ignores non-string or blank values rather than sending junk to Meta', async () => {
+    const deps = makeDeps();
+    await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ clientIp: '   ', clientUserAgent: 12345 as any }) }),
+      deps,
+    );
+
+    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
+    expect(event.clientIp).toBeUndefined();
+    expect(event.userAgent).toBeUndefined();
+  });
+
   it('declares action_source as system_generated, not website', async () => {
     // A CRM status change is not a browser event. Meta validates this field — a bogus value
     // is rejected outright — so claiming 'website' is a factual misstatement about where

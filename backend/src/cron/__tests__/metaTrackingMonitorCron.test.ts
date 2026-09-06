@@ -42,6 +42,86 @@ beforeEach(() => {
   checkConversionDivergenceForUser.mockResolvedValue({ status: 'skipped' });
 });
 
+describe('metaTrackingMonitorCron — duplicate ad accounts (ENG-1326)', () => {
+  it('passes ONE shared set to every user, so an account is swept once per run', async () => {
+    // 21 production connection rows resolve to 15 distinct ad accounts. Without a set shared
+    // across users, each duplicate is a full second sweep and every counter double-counts.
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }, { userId: 'u3' }]);
+
+    await runMetaTrackingMonitor();
+
+    const sets = monitorUserTracking.mock.calls.map((c: any[]) => c[1]?.sweptAccountIds);
+    expect(sets).toHaveLength(3);
+    expect(sets[0]).toBeInstanceOf(Set);
+    // The SAME object, not three fresh ones — a per-user set would dedupe nothing.
+    expect(sets[1]).toBe(sets[0]);
+    expect(sets[2]).toBe(sets[0]);
+  });
+
+  it('aggregates the skipped-duplicate counter', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }]);
+    monitorUserTracking
+      .mockResolvedValueOnce(summary({ duplicateAccountsSkipped: 0 }))
+      .mockResolvedValueOnce(summary({ duplicateAccountsSkipped: 2 }));
+
+    const result = await runMetaTrackingMonitor();
+
+    expect(result.duplicateAccountsSkipped).toBe(2);
+  });
+
+  it('treats a summary without the field as 0, not NaN', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+    monitorUserTracking.mockResolvedValue(summary());
+    const result = await runMetaTrackingMonitor();
+    expect(result.duplicateAccountsSkipped).toBe(0);
+    expect(Number.isNaN(result.duplicateAccountsSkipped)).toBe(false);
+  });
+});
+
+describe('metaTrackingMonitorCron — §G destination counters', () => {
+  it('aggregates destination counters across users', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }]);
+    monitorUserTracking
+      .mockResolvedValueOnce(summary({ destinationAlerts: 2, destinationUnverifiable: 1, destinationOk: 5, destinationUnconfirmed: 1 }))
+      .mockResolvedValueOnce(summary({ destinationAlerts: 1, destinationUnverifiable: 0, destinationOk: 7, destinationUnconfirmed: 2 }));
+
+    const result = await runMetaTrackingMonitor();
+
+    expect(result.destinationAlerts).toBe(3);
+    expect(result.destinationUnverifiable).toBe(1);
+    expect(result.destinationOk).toBe(12);
+    expect(result.destinationUnconfirmed).toBe(3);
+  });
+
+  it('treats a monitor result missing the counters as zero, not NaN', async () => {
+    // Every downstream guard is a `> 0` comparison, and NaN fails all of them silently — the
+    // counter would read as "no findings" forever rather than as broken. A per-user summary
+    // predating these fields (an older worker mid-deploy) must not poison the fleet total.
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+    monitorUserTracking.mockResolvedValue(summary());
+
+    const result = await runMetaTrackingMonitor();
+
+    expect(result.destinationAlerts).toBe(0);
+    expect(result.destinationOk).toBe(0);
+    expect(Number.isNaN(result.destinationAlerts)).toBe(false);
+  });
+
+  it('always reports destinations verified, so a check that ran is distinguishable from one that did not', async () => {
+    // Zero alerts is ambiguous alone: it reads identically whether every destination was
+    // healthy or none was ever fetched. The verified count is the only thing separating them.
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+    monitorUserTracking.mockResolvedValue(summary({ destinationOk: 4 }));
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+
+    await runMetaTrackingMonitor();
+
+    const swept = log.mock.calls.map((c) => String(c[0])).find((l) => l.includes('swept'))!;
+    expect(swept).toContain('4 destination(s) verified');
+    log.mockRestore();
+  });
+});
+
 describe('metaTrackingMonitorCron', () => {
   it('sweeps every user', async () => {
     getAllUsers.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }, { userId: 'u3' }]);
@@ -144,3 +224,63 @@ describe('metaTrackingMonitorCron — the divergence half', () => {
     expect(checkConversionDivergenceForUser).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('metaTrackingMonitorCron — the divergence check must be DRY-RUN-ABLE (ENG-926 §F)', () => {
+  /**
+   * It used to be skipped outright on a dry run (`if (dryRun) continue`), because its
+   * convenience wrapper hardcodes a REAL oncall-email transport. The consequence was not
+   * merely a gap in the diagnostic: the FIRST time this detector ever ran against real relay
+   * data would have been in production, unattended, at 09:00 UTC, sending a real alert that
+   * nobody had ever seen the shape of.
+   *
+   * ⚠ The danger in fixing it is the opposite failure, and this codebase has already paid for
+   * it once (CodeRabbit, #2469): a dry run reaching the REAL transport sends live oncall
+   * alerts from a run whose entire contract is "no side effects". So the important assertion
+   * here is not "it ran" — it is "it ran AND was handed a capturing transport".
+   */
+
+  it('RUNS the divergence check on a dry run instead of skipping it', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }]);
+
+    await runMetaTrackingMonitor({ dryRun: true });
+
+    expect(checkConversionDivergenceForUser).toHaveBeenCalledTimes(2);
+  });
+
+  it('⚠ hands it a CAPTURING transport on a dry run — never the real one', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+
+    await runMetaTrackingMonitor({ dryRun: true });
+
+    const [, transport] = checkConversionDivergenceForUser.mock.calls[0];
+    expect(typeof transport).toBe('function');
+  });
+
+  it('captured divergence alerts land in the run summary, and are NOT sent', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+    // Drive the injected transport the way the real check would when it alerts.
+    checkConversionDivergenceForUser.mockImplementation(async (_user: any, transport: any) => {
+      await transport?.('Conversions relayed but not arriving', 'body', { userId: 'u1' });
+      return { status: 'not-arriving', crmSent: 5, metaSeen: 0 };
+    });
+
+    const result: any = await runMetaTrackingMonitor({ dryRun: true });
+
+    expect(result.conversionDivergences).toBe(1);
+    expect(result.capturedAlerts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ subject: 'Conversions relayed but not arriving' }),
+      ]),
+    );
+  });
+
+  it('passes NO transport override on a real run, so the real one is used', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+
+    await runMetaTrackingMonitor();
+
+    const [, transport] = checkConversionDivergenceForUser.mock.calls[0];
+    expect(transport).toBeUndefined();
+  });
+});
+

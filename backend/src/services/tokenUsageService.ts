@@ -1,8 +1,14 @@
 import { userDb, orgDb, User } from "./db";
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from "./subscriptionService";
 import { inheritsOrgBilling } from "./orgAuthz";
-import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy } from "./llmUsagePolicyService";
+import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy,
+  resolveAlertThresholds,
+  type ResolvedAlertThresholds,
+} from "./llmUsagePolicyService";
 import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
+import { randomUUID } from 'crypto';
+import { recordLlmChargeEvent, LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
+import { buildUsageBlockCopy, type UsageBlockCopy } from '../utils/usageBlockCopy';
 
 export interface TokenUsageStatus {
   allowed: boolean;
@@ -27,6 +33,70 @@ export interface TokenUsageStatus {
   costEnforced: boolean;
   usageMode?: LlmUsageMode;
   usagePolicyVersion?: string | null;
+  /**
+   * Alert thresholds with defaults ALREADY applied (ENG-1214 AC5, ENG-1210 AC9).
+   *
+   * Resolved here rather than left nullable so the client never carries its own
+   * fallback. A portal holding a private default would keep warning at the old
+   * number for any tier whose policy set a different one, and the disagreement
+   * would be invisible — both sides look right in isolation while the customer
+   * is warned at the wrong moment.
+   */
+  alertThresholds: ResolvedAlertThresholds;
+}
+
+/**
+ * The customer-facing projection of `TokenUsageStatus` (ENG-1212 AC4).
+ *
+ * `costUsed` and `costAllowance` are dropped. `hasCostAllowance` replaces the
+ * only thing the client ever did with the latter — a null check.
+ */
+export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'costAllowance'> & {
+  /**
+   * Whether a dollar ceiling exists at all, without saying what it is.
+   *
+   * The portal never rendered `costAllowance`; it tested `costAllowance != null`
+   * to decide which dimension is the quota (UsageMeter, SubscriptionCard
+   * `showCostQuota`). This carries that one bit and nothing more.
+   */
+  hasCostAllowance: boolean;
+  /**
+   * ENG-1344 AC6: the block explanation, composed server-side so the portal
+   * modal and the ENG-1035 MCP 429 cannot describe the same block differently.
+   * Always present — the client decides WHEN to show it (only while blocked),
+   * the server decides WHAT it says.
+   */
+  usageBlock: UsageBlockCopy;
+};
+
+/**
+ * Strip internal dollar amounts at the API boundary (ENG-1212 AC4: "No internal
+ * USD amounts are returned by customer APIs; authorized admin diagnostics may
+ * include them", and the ticket's own outcome, "without exposing dollar
+ * ceilings").
+ *
+ * The sibling `/usage-runway` route has always done this via `toCustomerRunway`;
+ * `/usage` returned `checkTokenUsage` verbatim, so `costUsed` and
+ * `costAllowance` reached every authenticated customer in plain USD. That was
+ * not a deliberate product choice — the UI states the opposite intent in two
+ * places: SubscriptionCard renders the cost quota "ONLY as a percentage bar
+ * (never the dollar figures)" and "Dollars stay admin-only; to the user this is
+ * simply 'usage'". `costUsed` had no non-test reader anywhere in the portal.
+ *
+ * `costPercentUsed` stays: a percentage is not a dollar amount, and it is what
+ * the bar actually renders. Admin dollar figures are unaffected — the partner
+ * portal builds them from subscription-type policy, not from this endpoint.
+ *
+ * Strip at the boundary, once, here — the internal type is unchanged, so
+ * emailService and the policy services keep the figures they need.
+ */
+export function toCustomerTokenUsage(status: TokenUsageStatus): CustomerTokenUsageStatus {
+  const { costUsed: _costUsed, costAllowance, ...customerSafe } = status;
+  return {
+    ...customerSafe,
+    hasCostAllowance: costAllowance != null,
+    usageBlock: buildUsageBlockCopy({ month: status.month }),
+  };
 }
 
 /**
@@ -58,6 +128,25 @@ export async function resolveBillingUserId(userId: string): Promise<string> {
     return userId;
   }
 
+  // ENG-1215: the org can name an owner that does not resolve. Two shapes exist
+  // in real data: `ownerUserId` absent from the row entirely, and an id left
+  // dangling when the owner was deleted while members remained.
+  //
+  // Returning either one hands every caller a billing subject that
+  // `getUserTokenUsage` throws `User not found` on. That is not confined to the
+  // usage surfaces it was first seen on (a 500 from /usage-runway): this
+  // function also resolves the subject for `checkTokenUsage`, the gate on the
+  // chat path, so a member whose OWN record is perfectly healthy is locked out
+  // of the product by a defect in a row they cannot see.
+  //
+  // Fall back to the member's own partition, exactly as the `!org` case above
+  // does. There is no org counter to pool onto when the root does not exist, so
+  // the member is billed and quota'd on their own — the restrictive direction,
+  // never an uncapped one.
+  if (!org.ownerUserId) return userId;
+  const billingRoot = await userDb.getUserById(org.ownerUserId);
+  if (!billingRoot) return userId;
+
   return org.ownerUserId;
 }
 
@@ -83,11 +172,52 @@ function computePercentUsed(used: number, allowance: number | null): number {
 }
 
 /**
+ * Fixed, conservative dollar cap for an anonymous (`anon_`-owned) session.
+ * There is no subscription tier to size this from — an anon owner has no
+ * AW-Users row — so this exists purely to bound worst-case spend on the
+ * publicly reachable ishare/generate path (ENG-705, ENG-1163). Observed
+ * cost to run the full two-step Founder_Linkedin_Sales_Readiness_Eval plan
+ * is ~$0.45; this caps at roughly 4x that.
+ */
+export const ANONYMOUS_SESSION_COST_CAP_USD = 2;
+
+/**
+ * Sums `totalCost` across every AW-ChatSessions row owned by an anonymous
+ * `anon_<uuid>` id (via the existing UserIdIndex GSI). Lazy-imported —
+ * chatbotService pulls in agentModeService, and a static import here would
+ * drag that graph into every suite that mocks this module (same reasoning
+ * as the tokenUsageService lazy-import in agentModeService).
+ */
+async function getAnonymousSessionCostUsedUsd(userId: string): Promise<number> {
+  const { chatbotDb } = await import('./chatbotService');
+  const { sessions } = await chatbotDb.getUserSessions(userId);
+  return sessions.reduce((sum, session) => sum + (session.totalCost || 0), 0);
+}
+
+/**
  * Get a user's current month token usage, performing lazy reset if month changed.
  */
 export async function getUserTokenUsage(
   userId: string
 ): Promise<{ month: string; totalTokens: number; totalCost: number; bonus: number }> {
+  // ENG-1163: mirrors checkTokenUsage's anon_ short-circuit. This function is
+  // also called directly (bypassing checkTokenUsage entirely) by
+  // getEffectiveLlmUsagePolicy — every generateSharedResponse turn reaches it
+  // via resolveEffectiveModelForUser right after the checkTokenUsage gate — so
+  // without this guard an anon-owned session still throws 'User not found' on
+  // its first reply even after the checkTokenUsage fix, just one call deeper.
+  if (typeof userId === 'string' && userId.startsWith('anon_')) {
+    const currentMonth = getCurrentMonth();
+    let totalCost: number;
+    try {
+      totalCost = await getAnonymousSessionCostUsedUsd(userId);
+    } catch (err) {
+      console.error(`[tokenUsageService] Failed to resolve anon session cost for ${userId}:`, err);
+      totalCost = ANONYMOUS_SESSION_COST_CAP_USD;
+    }
+    return { month: currentMonth, totalTokens: 0, totalCost, bonus: 0 };
+  }
+
   const user = await userDb.getUserById(userId);
   if (!user) throw new Error(`User not found: ${userId}`);
 
@@ -146,6 +276,48 @@ export async function getUserTokenAllowance(
  * For org members, quota is checked against the org owner's subscription and usage.
  */
 export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus> {
+  // ENG-1163: an anonymous predefined-work-plan session (createSessionWithPlan)
+  // is owned by a synthetic `anon_<uuid>` id that has no AW-Users row and never
+  // will — resolveBillingUserId returns it unchanged (no org to pool onto), and
+  // getUserTokenUsage then throws "User not found", which generateSharedResponse
+  // does not catch specially: the visitor's very first reply on an anonymous
+  // work-plan session came back as a raw error instead of the agent's response.
+  // There is no owner to gate spend against by subscription here, but that does
+  // NOT mean uncapped: createSessionWithPlan activates interactive sharing on
+  // every one of these sessions, and generateSharedResponse's ishare/generate
+  // route is the ENG-705 gate meant to bound an anonymous visitor's spend — the
+  // only rate limiter on that public route. A strict `anon_` prefix check (not
+  // the broader isAnonymousUserId, which also swallowed empty/non-string ids
+  // into this same free pass) plus a fixed conservative cost cap keeps that
+  // invariant intact instead of trading a crash for unlimited free generation.
+  if (typeof userId === 'string' && userId.startsWith('anon_')) {
+    let costUsed: number;
+    try {
+      costUsed = await getAnonymousSessionCostUsedUsd(userId);
+    } catch (err) {
+      // Fail closed: if we can't verify how much this anon owner has already
+      // spent, do not hand out an unlimited allowance — treat as at-cap.
+      console.error(`[tokenUsageService] Failed to resolve anon session cost for ${userId}:`, err);
+      costUsed = ANONYMOUS_SESSION_COST_CAP_USD;
+    }
+    const costPercentUsed = computePercentUsed(costUsed, ANONYMOUS_SESSION_COST_CAP_USD);
+    return {
+      allowed: costUsed < ANONYMOUS_SESSION_COST_CAP_USD,
+      warning: costUsed < ANONYMOUS_SESSION_COST_CAP_USD && costPercentUsed >= 80,
+      used: 0,
+      allowance: null,
+      bonus: 0,
+      effectiveAllowance: null,
+      percentUsed: 0,
+      month: getCurrentMonth(),
+      costUsed,
+      costAllowance: ANONYMOUS_SESSION_COST_CAP_USD,
+      costPercentUsed,
+      costEnforced: true,
+      alertThresholds: resolveAlertThresholds(null),
+    };
+  }
+
   const billingUserId = await resolveBillingUserId(userId);
   const usage = await getUserTokenUsage(billingUserId);
   const [{ allowance, bonus, effectiveAllowance, costAllowance, llmUsagePolicy }, billingUser] = await Promise.all([
@@ -245,6 +417,8 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
     costEnforced: costIsGate,
     usageMode: versionedCostPolicyEnforced ? usageDecision.usageMode : (allowed ? "full_choice" : "paused"),
     usagePolicyVersion: llmUsagePolicy?.version || null,
+    // Always present, always resolved — see the note on the field.
+    alertThresholds: resolveAlertThresholds(llmUsagePolicy),
   };
 }
 
@@ -294,7 +468,36 @@ export function deriveBlockedByCost(status: {
 export async function incrementUserTokenUsage(
   userId: string,
   tokens: number,
-  cost: number
+  cost: number,
+  audit?: {
+    eventId?: string;
+    model?: string;
+    provider?: string;
+    feature?: string;
+    sessionId?: string;
+    /**
+     * ENG-1251 Greptile P1: overrides the charge event's occurredAt. A
+     * caller that ALSO writes a paired shadow-ledger row for the same
+     * logical usage (internalUsage.ts is the only one today) must derive
+     * this from the exact same instant as that row's date -- otherwise two
+     * independent `new Date()` calls a few awaits apart can straddle a
+     * UTC-midnight boundary, and the itemization reconciliation's
+     * (date, model, feature) key no longer matches between the two.
+     * Omit for every other caller -- defaults to `new Date()`, unchanged.
+     */
+    occurredAt?: string;
+    /**
+     * ENG-1251 Greptile P1: how many underlying calls this ONE charge event
+     * represents. internalUsage.ts sums an engine batch's tokens/cost into
+     * one charge event per (user, model, feature), so that event can stand
+     * in for several calls, not one -- the itemization reconciliation must
+     * subtract the true count from the aggregate row's callCount, or a
+     * multi-call batch under-subtracts and leaves phantom "uncovered" calls
+     * behind. Every other caller charges exactly one call per invocation,
+     * so omitting this defaults to 1, unchanged.
+     */
+    calls?: number;
+  }
 ): Promise<void> {
   if (tokens <= 0 && cost <= 0) return;
 
@@ -302,63 +505,114 @@ export async function incrementUserTokenUsage(
 
   try {
     const billingUserId = await resolveBillingUserId(userId);
-    // Try to read current user to check if we need a month reset
-    const user = await userDb.getUserById(billingUserId);
-    if (!user) return;
+    // Persist the evidence before changing the counter. A failed evidence write
+    // therefore fails open (no surprise charge), while a retry with the same
+    // event id is a no-op rather than a duplicate counter increment.
+    //
+    // ENG-1251 Greptile P1: the random fallback below only protects a caller
+    // that truly has no stable identity for this charge. When the SAME usage
+    // report is retried without an eventId, the fallback mints a fresh one
+    // every time and the dedup above never fires — so callers that CAN supply
+    // a real one must. The two highest-volume paths (agentModeService.callLLM,
+    // chatbotService's chat turn) now pass the provider response's own id,
+    // which is identical across a re-processed/retried response and distinct
+    // across genuinely separate calls. Other callers (image/video/voice/deep
+    // research/llmService) still fall through to the random default — each is
+    // either structurally called at most once per success today or lacks a
+    // verified stable id at the call site; tracked as a fast-follow rather
+    // than guessed here.
+    const occurredAt = audit?.occurredAt || new Date().toISOString();
+    const eventId = audit?.eventId || `${occurredAt}#${randomUUID()}`;
+    // ENG-1251 Greptile P1: isNewCharge=false means an event with this ID was
+    // ALREADY RECORDED -- it does NOT mean it was already APPLIED. A prior
+    // attempt could have recorded the event and then been interrupted before
+    // (or during) the atomic apply below -- e.g. a crash, a timeout, or the
+    // retry loop below exhausting its attempts. Returning here on
+    // isNewCharge=false used to strand that event permanently: eventId is
+    // stable across a legitimate retry, so recordLlmChargeEvent would keep
+    // returning false for it forever, and the counter would never be
+    // charged. So this is intentionally NOT gated on isNewCharge -- always
+    // proceed to the atomic apply below; its own idempotency guard
+    // (attribute_not_exists(counterAppliedAt) inside applyMonthlyChargeAtomic)
+    // is what makes re-attempting a truly-already-applied charge a no-op.
+    await recordLlmChargeEvent({
+      billingUserId, eventId, occurredAt, actingUserId: userId,
+      tokens: Math.max(0, Math.round(tokens)), costMicroUsd: Math.max(0, Math.round(cost * 1_000_000)),
+      model: audit?.model, provider: audit?.provider, feature: audit?.feature, sessionId: audit?.sessionId,
+      calls: audit?.calls,
+    });
 
-    const existingMonth = user.tokenUsage?.month;
-
-    if (existingMonth !== currentMonth) {
-      // New month — archive previous month to history, reset usage, clear bonus
-      const prevUsage = user.tokenUsage;
-      const existingHistory = user.tokenUsageHistory || [];
-      let newHistory = existingHistory;
-      if (prevUsage && prevUsage.month) {
-        const entry = { month: prevUsage.month, totalTokens: prevUsage.totalTokens, totalCost: prevUsage.totalCost };
-        newHistory = [...existingHistory, entry].slice(-24);
+    // Apply the counter update and mark the audit event applied atomically —
+    // either both land or neither does (ENG-1251 Greptile fix). Previously
+    // these were two separate calls: a markLlmChargeApplied failure after a
+    // successful counter update silently hid an applied charge from
+    // itemization, and a lost concurrency race still marked the event
+    // applied even though the counter was never touched. Bounded retry
+    // against a fresh read handles a genuine concurrent writer (rollover or
+    // same-month increment) the same way the old two-branch logic did.
+    const MAX_ATTEMPTS = 3;
+    let outcome: "applied" | "already_applied" | "lost_race" | "no_user" = "lost_race";
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      // Greptile P1: getUserById reads through the UserIdIndex GSI, which
+      // DynamoDB cannot serve as a strongly consistent read. After a lost
+      // race (another writer just committed the counter this attempt is
+      // about to retry against), a GSI read can still return the
+      // pre-transaction row, so this attempt derives isNewMonth from stale
+      // state and fails the SAME way again -- all MAX_ATTEMPTS retries can
+      // exhaust on a staleness window rather than genuine repeated
+      // contention, silently dropping the charge. getUserByIdConsistent
+      // does the same two-step lookup this codebase already uses elsewhere
+      // for exactly this guarantee (see its own docstring): resolve the
+      // key via the GSI, then a strongly consistent read on the base table.
+      const user = await userDb.getUserByIdConsistent(billingUserId);
+      if (!user || !user.email) {
+        outcome = "no_user";
+        break;
       }
-      // Conditional: succeeds only while nobody else has rolled the month over.
-      // The previous unconditional write meant two concurrent charges at rollover
-      // both reset the counter and the second silently discarded the first.
-      const didReset = await userDb.resetTokenUsageForMonth({
+
+      const existingMonth = user.tokenUsage?.month;
+      const isNewMonth = existingMonth !== currentMonth;
+
+      let history: Array<{ month: string; totalTokens: number; totalCost: number }> | undefined;
+      if (isNewMonth) {
+        // New month — archive previous month to history, reset usage, clear bonus.
+        const prevUsage = user.tokenUsage;
+        const existingHistory = user.tokenUsageHistory || [];
+        history = existingHistory;
+        if (prevUsage && prevUsage.month) {
+          const entry = { month: prevUsage.month, totalTokens: prevUsage.totalTokens, totalCost: prevUsage.totalCost };
+          history = [...existingHistory, entry].slice(-24);
+        }
+      }
+
+      outcome = await userDb.applyMonthlyChargeAtomic({
         userId: billingUserId,
+        userEmail: user.email,
         month: currentMonth,
         tokens,
         cost,
-        resetDate: getNextResetDate(),
-        history: newHistory,
+        resetDate: isNewMonth ? getNextResetDate() : (user.tokenUsage?.resetDate || getNextResetDate()),
+        isNewMonth,
+        history,
+        auditTableName: LLM_CHARGE_EVENTS_TABLE,
+        billingUserId,
+        eventId,
       });
 
-      if (!didReset) {
-        // Lost the race — the winner already created this month's counter (and
-        // archived the previous month). Apply this charge on top of theirs rather
-        // than dropping it.
-        const updated = await userDb.incrementTokenUsageForMonth(
-          billingUserId,
-          currentMonth,
-          tokens,
-          cost,
-          getNextResetDate()
-        );
-        if (!updated) {
-          console.warn(
-            `[tokenUsageService] Skipped token increment for ${billingUserId}: month changed again during rollover`
-          );
-        }
-      }
-    } else {
-      const updated = await userDb.incrementTokenUsageForMonth(
-        billingUserId,
-        currentMonth,
-        tokens,
-        cost,
-        user.tokenUsage?.resetDate || getNextResetDate()
+      if (outcome === "applied" || outcome === "already_applied") break;
+      // outcome === "lost_race": another writer rolled the month or incremented
+      // this user concurrently — re-read fresh state and retry.
+    }
+
+    if (outcome === "lost_race") {
+      // Exhausted retries under real contention. Fail open, per the same
+      // contract recordLlmChargeEvent already documents: the counter is NOT
+      // incremented, and the audit event is left unmarked rather than
+      // falsely claiming the charge was applied.
+      console.warn(
+        `[tokenUsageService] Failed to atomically apply charge for ${billingUserId} after ${MAX_ATTEMPTS} attempts ` +
+        `(eventId=${eventId}): concurrent writers kept winning the race. Charge NOT counted.`
       );
-      if (!updated) {
-        console.warn(
-          `[tokenUsageService] Skipped token increment for ${billingUserId}: tokenUsage month changed during update`
-        );
-      }
     }
   } catch (error) {
     // Don't block message flow on usage tracking failures

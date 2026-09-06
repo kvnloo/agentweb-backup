@@ -178,6 +178,37 @@ describe('AgentModeService - extractMinimalToolResult', () => {
         filename: 'image.png'
       });
     });
+
+    // ENG-1027: this minimizer whitelists fields per tool — everything unnamed is
+    // dropped (ENG-736/ENG-1526 already hit this trap for other tools). Without this
+    // case, the post-generation data-fabrication warning would silently vanish before
+    // reaching Emma, exactly like the un-relayed approval tokens did.
+    it('preserves dataReliabilityWarning from a generate_image result', () => {
+      const result = {
+        success: true,
+        message: 'Image generated successfully',
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png',
+        dataReliabilityWarning: 'DATA RELIABILITY CHECK: this image appears to contain specific numbers...'
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'generate_image');
+
+      expect(minimalResult.dataReliabilityWarning).toBe(result.dataReliabilityWarning);
+    });
+
+    it('omits dataReliabilityWarning when the check did not fire', () => {
+      const result = {
+        success: true,
+        message: 'Image generated successfully',
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png'
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'generate_image');
+
+      expect(minimalResult.dataReliabilityWarning).toBeUndefined();
+    });
   });
 
   describe('generate_video result extraction', () => {
@@ -331,6 +362,67 @@ describe('AgentModeService - extractMinimalToolResult', () => {
         status: 'pending',
         message: 'Task created successfully'
       });
+    });
+  });
+
+  // ENG-1472: the workplan_recommendation result MUST survive minimization —
+  // it is the only thing that lets the customer portal render the recommendation
+  // card again after a reload (the ledger entry is all it has at that point).
+  describe('recommend_predefined_work_plan result extraction', () => {
+    const successResult = {
+      success: true,
+      type: 'workplan_recommendation',
+      version: 1,
+      recommendationId: 'abc123',
+      plan: {
+        id: 'plan-onboard',
+        title: 'Client Onboarding',
+        summary: 'Get a new client set up',
+        steps: [{ position: 1, label: 'Analyze website' }],
+      },
+      reason: 'The user wants to onboard a new client.',
+      formattedContent: 'Recommended work plan "Client Onboarding" — because reasons',
+    };
+
+    it('preserves the full structured payload for a successful proposal (reload survives)', () => {
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(successResult, 'recommend_predefined_work_plan');
+
+      expect(minimalResult).toEqual({
+        success: true,
+        type: 'workplan_recommendation',
+        version: 1,
+        recommendationId: 'abc123',
+        plan: successResult.plan,
+        reason: 'The user wants to onboard a new client.',
+      });
+      // formattedContent (model-visible only) is dropped from the persisted ledger entry.
+      expect(minimalResult.formattedContent).toBeUndefined();
+    });
+
+    it('preserves the source marker when present (completion-recommendation extension)', () => {
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(
+        { ...successResult, source: 'completion_next' },
+        'recommend_predefined_work_plan',
+      );
+      expect(minimalResult.source).toBe('completion_next');
+    });
+
+    it('minimizes a rejected/failed proposal to success:false + message only (boundary/malformed case)', () => {
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(
+        { success: false, message: 'Work plan template "plan-x" is not available.' },
+        'recommend_predefined_work_plan',
+      );
+      expect(minimalResult).toEqual({ success: false, message: 'Work plan template "plan-x" is not available.' });
+      expect(minimalResult.type).toBeUndefined();
+    });
+
+    it('never treats a wrong-type/unversioned payload as a valid recommendation', () => {
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(
+        { success: true, type: 'workplan_recommendation', version: 2, plan: { id: 'x' } },
+        'recommend_predefined_work_plan',
+      );
+      expect(minimalResult).toEqual({ success: true, message: undefined });
+      expect(minimalResult.plan).toBeUndefined();
     });
   });
 });

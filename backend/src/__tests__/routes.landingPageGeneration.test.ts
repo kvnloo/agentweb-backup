@@ -137,6 +137,9 @@ jest.mock("../services/v0Service", () => ({
   updateLandingPageMetaPixel: (...args: any[]) => mockUpdateLandingPageMetaPixel(...args),
   updateLandingPageMetaTrackingInstalled: (...args: any[]) => mockUpdateLandingPageMetaTrackingInstalled(...args),
   syncLeadCaptureFilesToRepo: (...args: any[]) => mockSyncLeadCaptureFilesToRepo(...args),
+  // Re-export the real constant: the route compares against it, and an object-literal mock
+  // would leave it undefined so the comparison could never match.
+  NO_CAPTURE_LAYER: "no-capture-layer",
   updateLandingPageContext: (...args: any[]) => mockUpdateLandingPageContext(...args),
   resolveVercelProjectId: (...args: any[]) => mockResolveVercelProjectId(...args),
   triggerVercelDeployment: (...args: any[]) => mockTriggerVercelDeployment(...args),
@@ -505,6 +508,23 @@ describe("POST /api/landing-pages/v0/generate", () => {
     
     // Verify generation service was called with the lead_list_id
     expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("list-123");
+  });
+
+  it("FAIL CASE (ENG-967): a failed enabling write is reported, not returned as a clean 201", async () => {
+    // The write stays best-effort — a DB hiccup must not block generation — but handing back
+    // an unqualified success for a page whose form cannot save a lead is the silent drop again.
+    mockGetUserById.mockResolvedValueOnce({ userId: "test-user-id" });
+    mockGetLeadListById.mockResolvedValue({ id: "list-123", publicAccessEnabled: false });
+    mockUpdateLeadList.mockRejectedValueOnce(new Error("dynamo blip"));
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-123" });
+
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe("page-1");
+    expect(res.body.warnings).toEqual([expect.stringContaining("public")]);
   });
 
   it("SUCCESS (ENG-449 capture-or-fail): lead_list_id omitted → auto-resolves the existing default list, generation proceeds bound to it", async () => {
@@ -1000,9 +1020,20 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
   afterEach(resetGitHubStubs);
 
   const stubGitHubMergeFlow = () => {
-    // GET pre-merge main ref → POST /merges → DELETE branch ref
-    mockAxios.get.mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } });
-    mockAxios.post.mockResolvedValueOnce({ data: { sha: "merge-sha" } });
+    // GET main ref → consent → GET draft ref → find/create PR → inspect Tests
+    // → re-read draft tip → consent → POST /merges → re-read before DELETE branch ref
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
+      })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } });
+    mockAxios.post
+      .mockResolvedValueOnce({ data: { number: 123 } })
+      .mockResolvedValueOnce({ data: { sha: "merge-sha" } });
     mockAxios.delete.mockResolvedValueOnce({ data: {} });
   };
 
@@ -1163,10 +1194,189 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
   const stub409Fallback = () => {
     mockAxios.get
       .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })  // pre-merge main
-      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }); // branch tip
-    mockAxios.post.mockRejectedValueOnce({ response: { status: 409 } });
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }) // initial draft ref
+      .mockResolvedValueOnce({ data: [] }) // no existing PR
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
+      })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }) // branch tip after Tests
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }); // branch tip before delete
+    mockAxios.post
+      .mockResolvedValueOnce({ data: { number: 123 } })
+      .mockRejectedValueOnce({ response: { status: 409 } });
     mockAxios.delete.mockResolvedValueOnce({ data: {} });
   };
+
+  const stubDraftCheck = (check: { status: string; conclusion: string | null }) => {
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: { check_runs: [{ name: "Tests", ...check }] } });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+  };
+
+  it("FAIL: missing Tests result preserves the draft and never advances main", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: { check_runs: [] } });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(res.body.message).toMatch(/Tests.*not started/i);
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: pending Tests result preserves the draft and never advances main", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubDraftCheck({ status: "in_progress", conclusion: null });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: cancelled Tests result is retryable and preserves the draft", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubDraftCheck({ status: "completed", conclusion: "cancelled" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: failed Tests result preserves the draft and never advances main", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubDraftCheck({ status: "completed", conclusion: "failure" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_failed");
+    expect(res.body.message).toMatch(/Tests.*failed/i);
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: passing Tests for the exact draft SHA permits the existing merge flow", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(mockAxios.get).toHaveBeenCalledWith(
+      expect.stringContaining("/commits/draft-tip-sha/check-runs"), expect.anything()
+    );
+    expect(mockAxios.post).toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
+  it("FAIL: a draft updated after Tests ran is neither merged nor deleted", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "tested-draft-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
+      })
+      .mockResolvedValueOnce({ data: { object: { sha: "newer-draft-sha" } } });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("draft_changed_after_tests");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+    expect(mockAxios.delete).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: a duplicate PR creation response reuses the concurrently created PR", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: [{ number: 456 }] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
+      })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } });
+    mockAxios.post
+      .mockRejectedValueOnce({ response: { status: 422, data: { message: "A pull request already exists" } } })
+      .mockResolvedValueOnce({ data: { sha: "merge-sha" } });
+    mockAxios.delete.mockResolvedValueOnce({ data: {} });
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://everyio.agentwebforms.com");
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(mockAxios.post).toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.objectContaining({ head: "draft-tip-sha" }), expect.anything()
+    );
+  });
+
+  it("FAIL: an unrelated pull-request validation error is not retried as a duplicate", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] });
+    mockAxios.post.mockRejectedValueOnce({
+      response: { status: 422, data: { message: "Validation Failed: head repository is unavailable" } },
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(500);
+    expect(mockAxios.get).toHaveBeenCalledTimes(3);
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
 
   it("FAIL: consent revoked during the 409 fallback → main is never force-advanced", async () => {
     mockGetLandingPageById.mockResolvedValueOnce(PAGE);
@@ -1568,6 +1778,96 @@ describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
     expect(res.status).toBe(201);
     expect(mockGetLeadListsForUser).toHaveBeenCalledWith("test-user-id");
     expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("default-list-1");
+  });
+
+  // ENG-967: /generate enables public access on the list it binds; duplicate bound one
+  // and stopped there, so the copy's form 403'd on every submission at forward-lead.
+  it("FAIL CASE (ENG-967): a carried-over private list is made publicly submittable before the copy is generated", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-original",
+    });
+    mockGetLeadListById.mockResolvedValue({ id: "list-original", publicAccessEnabled: false });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockUpdateLeadList).toHaveBeenCalledWith("list-original", { publicAccessEnabled: true });
+  });
+
+  it("FAIL CASE (ENG-967): a carried-over list that no longer exists is reported, never treated as fine", async () => {
+    // Three such binds existed in production on 2026-08-21 — a page POSTing into a 404 at
+    // forward-lead. Nothing here can repair it (repointing is a judgement call), so it is said.
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-deleted",
+    });
+    mockGetLeadListById.mockResolvedValue(null);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockUpdateLeadList).not.toHaveBeenCalled();
+    expect(res.body.warnings).toEqual([expect.stringContaining("list-deleted")]);
+  });
+
+  it("FAIL CASE (ENG-967): a failed enabling write on the copy is reported, not a clean 201", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-original",
+    });
+    mockGetLeadListById.mockResolvedValue({ id: "list-original", publicAccessEnabled: false });
+    mockUpdateLeadList.mockRejectedValueOnce(new Error("dynamo blip"));
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(res.body.warnings).toEqual([expect.stringContaining("public")]);
+  });
+
+  it("SUCCESS (ENG-967): an already-public carried-over list is not re-written", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-original",
+    });
+    mockGetLeadListById.mockResolvedValue({ id: "list-original", publicAccessEnabled: true });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockUpdateLeadList).not.toHaveBeenCalled();
   });
 });
 
@@ -2123,6 +2423,64 @@ describe("POST /api/landing-pages/v0/generated/:id/meta-pixel", () => {
     expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledWith("sub-a", true);
     expect(mockUpdateLandingPageMetaTrackingInstalled).not.toHaveBeenCalledWith("other-1", expect.anything());
     expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledTimes(2);
+  });
+
+  it("BESPOKE REPO: reports that server-side tracking was NOT configured instead of a clean success", async () => {
+    // The base pixel snippet still goes into the layout, but the CAPI half lives in the
+    // capture route — which the install floor refuses to write on a repo we do not own.
+    // Answering "Meta Pixel injected" here would claim tracking that does not exist.
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([root]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValueOnce({ committed: false, reason: "no-capture-layer" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings).toEqual([expect.stringContaining("server-side conversion tracking was not configured")]);
+    // ⚠ Not transient — it must not promise a retry or a redeploy.
+    expect(res.body.warnings[0]).not.toMatch(/retry|redeploy/i);
+  });
+
+  it("REMOVAL wording: says the pixel was 'removed', not 'updated'", async () => {
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([root]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValueOnce({ committed: false, reason: "no-capture-layer" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings[0]).toMatch(/browser pixel was removed/);
+  });
+
+  it("committed:true is NOT enough — a skipped capture route is still reported", async () => {
+    // The silent-partial `committed` alone cannot see: the commit landed, but the capture
+    // route was deliberately excluded because its deployed map could not be parsed.
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([root]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValueOnce({ committed: true, captureRouteSkipped: true });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings[0]).toMatch(/could not be read/);
   });
 
   it("FAIL: verification failure on malformed layout → 422, no partial write", async () => {

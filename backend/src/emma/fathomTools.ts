@@ -130,6 +130,10 @@ emmaToolRegistry.register({
         meetings,
       };
     } catch (error: any) {
+      // ENG-1300: carry `status` through so a clean 401/403 classifies as auth/
+      // config instead of the generic Error/bug fallback — the reconnect
+      // message text alone doesn't match classifyToolErrorClass's patterns
+      // (it says "is invalid or has been revoked", not "invalid token").
       const status = error?.response?.status;
       if (status === 401 || status === 403) {
         return {
@@ -137,12 +141,14 @@ emmaToolRegistry.register({
           message:
             'Your Fathom access token is invalid or has been revoked. ' +
             'Please reconnect your Fathom account in Settings → Connected Accounts.',
+          status,
         };
       }
       console.error('[fathom_get_meetings] API error:', error?.message);
       return {
         success: false,
         message: `Failed to fetch meetings from Fathom: ${error?.message || 'Unknown error'}`,
+        status,
       };
     }
   },
@@ -249,6 +255,7 @@ emmaToolRegistry.register({
         transcript: turns,
       };
     } catch (error: any) {
+      // ENG-1300: carry `status` through — see fathom_get_meetings.
       const status = error?.response?.status;
       if (status === 401 || status === 403) {
         return {
@@ -256,18 +263,21 @@ emmaToolRegistry.register({
           message:
             'Your Fathom access token is invalid or has been revoked. ' +
             'Please reconnect your Fathom account in Settings → Connected Accounts.',
+          status,
         };
       }
       if (status === 404) {
         return {
           success: false,
           message: `Recording ${args.recording_id} not found. Use fathom_get_meetings to list available recordings.`,
+          status,
         };
       }
       console.error('[fathom_get_transcript] API error:', error?.message);
       return {
         success: false,
         message: `Failed to fetch transcript from Fathom: ${error?.message || 'Unknown error'}`,
+        status,
       };
     }
   },

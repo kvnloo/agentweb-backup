@@ -7,6 +7,7 @@ import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
+import { mintDelegateToken } from "../services/delegateAccessToken";
 import { linkedInOutreachService } from "../services/linkedInOutreachService";
 import { deleteAccountById, createAccount } from "../services/connectedAccountsDb";
 import { waitlistDb } from "../services/waitlistDb";
@@ -26,6 +27,7 @@ import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secur
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance, resolveBillingUserId } from "../services/tokenUsageService";
 import { grantMonthlyLlmUsageCredit } from "../services/llmUsageCreditService";
 import { getRevenueMetrics } from "../services/revenueService";
+import { detectMrrCollectionGaps } from "../services/mrrCollectionGapService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import { resyncAllSubscriptionAmounts, reconcileStripeUserById } from "../services/stripeService";
 import { syncNewUserToLeadList, syncUserUpdateToLeadList } from "../services/crmAutoSyncService";
@@ -45,6 +47,21 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_FILE_SIZE },
 });
+/**
+ * Lifetime of an admin/contractor "access as customer" delegate token (ENG-1506).
+ *
+ * Was 90 days, with a comment claiming that was "for security". Ninety days of
+ * standing customer impersonation, on a token with no revocation path, is the
+ * opposite of that. A support session is measured in hours, and re-minting is one
+ * API call, so the short default costs an admin nothing and caps the damage from
+ * a token that leaks. Override only with a deliberate reason.
+ */
+// Typed as jwt's own expiresIn rather than string: @types/jsonwebtoken narrows
+// it to a `StringValue` template-literal union, which a plain env-derived
+// string does not satisfy. The old code sidestepped this by inlining a literal.
+const DELEGATE_TOKEN_TTL = (process.env.DELEGATE_TOKEN_TTL ||
+  "8h") as jwt.SignOptions["expiresIn"];
+
 const CRM_SYNC_SOURCES = new Set(["users", "waitlist"]);
 const CRM_SYNC_SETTING_PREFIX = "admin_crm_sync_";
 
@@ -176,7 +193,6 @@ const ADMIN_USER_LIST_FIELDS = [
   "fromName",
   "slackChannel",
   "slackChannels",
-  "slackSuggestedRepliesDisabled",
   "seoDomains",
   "googleAnalyticsPropertyId",
   "googleAnalyticsProperties",
@@ -1349,29 +1365,6 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
   }
 });
 
-// Toggle Slack suggested-reply (slack-triggered) monitoring for a user.
-// Body: { enabled: boolean } — true = suggestions on (default), false = suppress.
-// Persisted as the inverse `slackSuggestedRepliesDisabled` flag so absent = enabled.
-router.put("/users/:userId/slack-suggested-replies", async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { enabled } = req.body;
-
-    const user = await userDb.getUserById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    const updatedUser = await userDb.updateUser(userId, {
-      slackSuggestedRepliesDisabled: !enabled,
-    });
-    res.json(updatedUser);
-  } catch (error) {
-    console.error("Error updating slack suggested replies setting:", error);
-    res.status(500).json({ message: "Error updating slack suggested replies setting" });
-  }
-});
-
 // Get user secret names (keys only, not values)
 router.get("/users/:userId/secrets", async (req, res) => {
   try {
@@ -1549,6 +1542,8 @@ router.get("/google-drive-folders", async (req, res) => {
       fields: "files(id, name)",
       orderBy: "name",
       pageSize: 100,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
     });
 
     const folders = (response.data.files || []).map((f) => ({
@@ -1876,24 +1871,19 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
       });
     }
 
-    // Create delegation token
-    const delegatePayload = {
-      userId: targetUser.userId, // This will be the active user in the token
-      email: targetUser.email,
-      roles: targetUser.roles,
-      isAdmin: false, // Target user permissions
-      delegateAccess: {
-        adminUserId: adminReq.user.userId,
-        adminEmail: adminReq.user.email,
-        targetUserId: targetUser.userId,
-        targetEmail: targetUser.email
-      }
-    };
-
-    const delegateToken = jwt.sign(
-      delegatePayload,
-      getJwtSecret(),
-      { expiresIn: "90d" } // Delegate tokens expire in 90 days for security
+    // Create delegation token.
+    //
+    // ENG-1506: `dte` and `sv` are what make this token revocable. Both are read
+    // from the TARGET user and compared on every request by the auth middleware —
+    // bumping either one rejects this token immediately. Without them the only
+    // limit on a leaked support token was its expiry.
+    //
+    // ENG-1596: minting extracted to delegateAccessToken.ts so the MCP tool layer
+    // (apiTools.ts) can mint the same shape of token internally, per tool call.
+    const delegateToken = mintDelegateToken(
+      { userId: adminReq.user.userId, email: adminReq.user.email },
+      targetUser,
+      DELEGATE_TOKEN_TTL,
     );
 
     // Return the delegate token and customer portal URL
@@ -1902,11 +1892,40 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
     res.json({
       delegateToken,
       customerPortalUrl: `${customerPortalUrl}/oauth-callback?token=${delegateToken}`,
-      expiresIn: "90d"
+      expiresIn: DELEGATE_TOKEN_TTL
     });
   } catch (error) {
     console.error("Error creating delegate access:", error);
     res.status(500).json({ message: "Error creating delegate access" });
+  }
+});
+
+// Revoke every outstanding delegate token for a user (ENG-1506).
+//
+// Deliberately per-user rather than per-token: the realistic incident is "a
+// support token for this customer may be loose" — not "revoke exactly this JWT,
+// whose id nobody wrote down." Bumping the epoch invalidates all of them at once
+// and costs the admin one re-mint to resume legitimate access. It does NOT touch
+// the customer's own sessions.
+router.post("/users/:userId/delegate-access/revoke", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const targetUser = await userDb.getUserById(userId);
+    if (!targetUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const delegateTokenEpoch = await userDb.incrementDelegateTokenEpoch(userId);
+
+    res.json({
+      success: true,
+      delegateTokenEpoch,
+      message: "All outstanding delegate tokens for this user have been revoked. The user's own sessions are unaffected.",
+    });
+  } catch (error) {
+    console.error("Error revoking delegate access:", error);
+    res.status(500).json({ message: "Error revoking delegate access" });
   }
 });
 
@@ -3239,11 +3258,11 @@ router.get("/chat-sessions", async (req, res) => {
       }
     }
 
-    const { sessions, lastEvaluatedKey: nextKey } = await chatbotDb.getRecentSessionsPage(
-      limit,
-      lastEvaluatedKey,
-      timeRange
-    );
+    const {
+      sessions,
+      lastEvaluatedKey: nextKey,
+      gapQueryTruncated,
+    } = await chatbotDb.getRecentSessionsPage(limit, lastEvaluatedKey, timeRange);
 
     // Load messages from the messages table for each session
     const sessionsWithMessages = await Promise.all(
@@ -3259,6 +3278,39 @@ router.get("/chat-sessions", async (req, res) => {
     );
 
     // Sync mode: batch-score sessions that need it (default + all judges)
+    let scoringSummary: {
+      scored: number;
+      skipped: number;
+      failed: number;
+      notAttempted: number;
+      timedOut: boolean;
+    } | undefined;
+    // ENG-1332: coverage metadata travels with the response so a caller (e.g.
+    // the Daily Satisfaction Score Report) can state its own denominator
+    // honestly instead of inferring one from sessions.length.
+    let scoringCoverage:
+      | {
+          requestedRangeCount: number;
+          totalFetched: number;
+          alreadyScored: number;
+          newlyScored: number;
+          // ENG-1332 (Greptile): named `unscored`, not `skippedForBudget` — an
+          // in-range session lands here whenever it has no persisted score
+          // after this run, whether that's because the scoring budget ran out
+          // (see `timedOut`), the scorer threw, it intentionally returned no
+          // score, or it lost the conditional-write race to an admin override.
+          // The old name implied budget was always the cause; it usually
+          // isn't distinguishable from here, so the name no longer claims it.
+          unscored: number;
+          timedOut: boolean;
+          // True when the gap query (see getRecentSessionsPage) hit its page
+          // cap before exhausting [endTime, now] — some late-touched in-range
+          // sessions may exist beyond where it stopped, so requestedRangeCount
+          // may understate the true population for this window.
+          requestedRangeMayBeIncomplete: boolean;
+        }
+      | undefined;
+
     if (syncMode) {
       // Load all configured judges
       let judges: ScoringJudge[] = [];
@@ -3270,6 +3322,26 @@ router.get("/chat-sessions", async (req, res) => {
       } catch (error) {
         console.error("Error loading scoring judges for sync mode:", error);
       }
+
+      // ENG-1332 (Greptile): alreadyScored/newlyScored must be counted over the
+      // same population as requestedRangeCount, or a time-range sync that also
+      // fetched historical sessions (touched, not created, in the window) can
+      // report a scored total that exceeds its own denominator. Scope both to
+      // sessions actually created in the requested range.
+      const inRangeSessions = timeRange
+        ? sessionsWithMessages.filter(
+            (session: any) =>
+              session.createdAt &&
+              session.createdAt >= timeRange.startTime &&
+              session.createdAt <= timeRange.endTime
+          )
+        : sessionsWithMessages;
+      const requestedRangeCount = inRangeSessions.length;
+      const alreadyScoredIds = new Set(
+        inRangeSessions
+          .filter((session: any) => session.satisfactionScore?.evaluatedAt)
+          .map((session: any) => session.sessionId)
+      );
 
       // ENG-291: score with bounded concurrency under a wall-clock budget and
       // apply the results in-memory. This returns before the tool timeout even on
@@ -3286,6 +3358,58 @@ router.get("/chat-sessions", async (req, res) => {
           `[chat-history] sync scoring hit its time budget: scored ${backfill.scored}/${backfill.scored + backfill.skipped}, ${backfill.skipped} left for a later run`
         );
       }
+
+      // ENG-929: attach each session's scoring verdict. sync=true promises to
+      // score whatever is unscored, but a scorer that failed and a session that
+      // is legitimately unscorable both used to come back as
+      // `satisfactionScore: null` — so the Daily Satisfaction Score Report
+      // silently under-sampled (four completed, expensive sessions, including
+      // the most expensive in the window, were simply missing). Reporting the
+      // outcome per session makes "we could not score this" visible.
+      const byId = new Map(sessionsWithMessages.map((s: any) => [s.sessionId, s]));
+      for (const outcome of backfill.outcomes) {
+        const session = byId.get(outcome.sessionId) as any;
+        if (!session) continue;
+        session.scoringOutcome = {
+          status: outcome.status,
+          ...(outcome.reason ? { reason: outcome.reason } : {}),
+          ...(outcome.judgeErrors ? { judgeErrors: outcome.judgeErrors } : {}),
+        };
+      }
+      scoringSummary = {
+        scored: backfill.outcomes.filter((o) => o.status === "scored").length,
+        skipped: backfill.outcomes.filter((o) => o.status === "skipped").length,
+        failed: backfill.outcomes.filter((o) => o.status === "failed").length,
+        notAttempted: backfill.outcomes.filter((o) => o.status === "not-attempted").length,
+        timedOut: backfill.timedOut,
+      };
+
+      const newlyScored = inRangeSessions.filter(
+        (session: any) =>
+          session.satisfactionScore?.evaluatedAt && !alreadyScoredIds.has(session.sessionId)
+      ).length;
+
+      // ENG-1332 (Greptile): backfill.skipped counts across the FULL fetched
+      // set (in-range + historical), the same population mismatch as
+      // alreadyScored/newlyScored above. What the report actually needs — "how
+      // many requested-window sessions remain unscored" — is fully derivable
+      // from the counts already scoped to inRangeSessions: every in-range
+      // session is accounted for by exactly one of alreadyScored (had a score
+      // already), newlyScored (scored this run), or neither — so the
+      // remainder is the honest, correctly-scoped count. It is NOT purely a
+      // budget count (see the `unscored` field comment above), which is why
+      // it's paired with `timedOut` rather than named after budget alone.
+      const unscored = requestedRangeCount - alreadyScoredIds.size - newlyScored;
+
+      scoringCoverage = {
+        requestedRangeCount,
+        totalFetched: sessionsWithMessages.length,
+        alreadyScored: alreadyScoredIds.size,
+        newlyScored,
+        unscored,
+        timedOut: backfill.timedOut,
+        requestedRangeMayBeIncomplete: gapQueryTruncated === true,
+      };
     }
 
     const nextCursor = nextKey
@@ -3299,7 +3423,12 @@ router.get("/chat-sessions", async (req, res) => {
     );
 
     await ensureIshareLinkForReview(nonEmptySessions);
-    res.json({ sessions: nonEmptySessions, nextCursor });
+    res.json({
+      sessions: nonEmptySessions,
+      nextCursor,
+      ...(scoringSummary ? { scoringSummary } : {}),
+      ...(scoringCoverage ? { scoringCoverage } : {}),
+    });
   } catch (error) {
     console.error("Error fetching chat sessions:", error);
     res.status(500).json({ message: "Failed to fetch chat sessions" });
@@ -4598,7 +4727,11 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-ses
     const planUserId = plan.userId;
     const { generateSessionResponse } = await import('../controllers/agentModeController');
     const { io } = await import('../server');
-    generateSessionResponse(session.sessionId, initialMessage, planUserId, modelToUse, workItemAttachments.length > 0 ? workItemAttachments : undefined)
+    const { cronJobRegistry } = await import('../utils/cronJobRegistry');
+    // ENG-1189: this turn's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener.
+    cronJobRegistry.track('gtmPlanAdminAgentTurn', generateSessionResponse(session.sessionId, initialMessage, planUserId, modelToUse, workItemAttachments.length > 0 ? workItemAttachments : undefined))
       .then(() => {
         console.log(`GTM work item session ${session.sessionId}: AI response generated (admin)`);
         io.to(`user:${planUserId}`).emit("gtm-session-ready", {
@@ -4876,6 +5009,24 @@ router.post("/subscription-types", async (req, res) => {
             ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map((model: unknown) => String(model).trim()).filter(Boolean))]
             : [],
           optimizedDefaultModel: String(type.llmUsagePolicy.optimizedDefaultModel || '').trim(),
+          // ENG-1214 AC5. Carried through RAW and only when present.
+          //
+          // Raw, because `validateLlmUsagePolicy` rejects a present-but-invalid
+          // value: coercing here (Number(...), `=== true`) would turn every bad
+          // input into a valid-looking one and make that validation a no-op, so
+          // an admin typing 100 would silently get a threshold that never fires.
+          //
+          // Only when present, because this object is built from an explicit
+          // whitelist and REPLACES the stored policy. Materialising a default
+          // here would freeze today's 90 onto every tier, after which the
+          // default could never move; and absent must stay distinguishable from
+          // deliberately-configured-to-90.
+          ...(type.llmUsagePolicy.alertUsagePercentThreshold !== undefined
+            ? { alertUsagePercentThreshold: type.llmUsagePolicy.alertUsagePercentThreshold }
+            : {}),
+          ...(type.llmUsagePolicy.alertOnForecastShortfall !== undefined
+            ? { alertOnForecastShortfall: type.llmUsagePolicy.alertOnForecastShortfall }
+            : {}),
         };
         const policyErrors = validateLlmUsagePolicy(normalizedLlmUsagePolicy);
         const supportedModels = new Set(await agentModeService.getSupportedModels(true));
@@ -5406,7 +5557,7 @@ router.delete("/result-endpoints/:name", async (req, res) => {
 // Score chat sessions for satisfaction
 router.post("/chat-sessions/score", async (req, res) => {
   try {
-    const { sessionIds } = req.body;
+    const { sessionIds, force } = req.body;
 
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
       return res.status(400).json({ message: "sessionIds must be a non-empty array" });
@@ -5419,7 +5570,11 @@ router.post("/chat-sessions/score", async (req, res) => {
       sessionIds.map(async (sessionId: string) => {
         const session = await chatbotDb.getChatSession(sessionId);
         if (!session) return { sessionId, score: null };
-        const score = await scoreSessionIfNeeded(session);
+        // ENG-1296: force bypasses the "already scored, up-to-date" skip — the
+        // explicit escape hatch for re-running a specific session through the
+        // current scoring rules after a rubric/prompt change. Default false
+        // preserves the normal cheap-skip behavior for routine sync/backfill.
+        const score = await scoreSessionIfNeeded(session, { force: force === true });
         return { sessionId, score };
       })
     );
@@ -5464,7 +5619,7 @@ router.put("/chat-sessions/:sessionId/score", async (req, res) => {
       adminOverride: true as const,
     };
 
-    await chatbotDb.updateSessionSatisfactionScore(sessionId, satisfactionScore);
+    await chatbotDb.updateSessionSatisfactionScore(sessionId, satisfactionScore, { allowOverride: true });
 
     res.json({ satisfactionScore });
   } catch (error: any) {
@@ -5476,7 +5631,7 @@ router.put("/chat-sessions/:sessionId/score", async (req, res) => {
 // Score sessions with a custom judge
 router.post("/chat-sessions/judge-score", async (req, res) => {
   try {
-    const { sessionIds, judgeId } = req.body;
+    const { sessionIds, judgeId, force } = req.body;
 
     if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
       return res.status(400).json({ message: "sessionIds must be a non-empty array" });
@@ -5510,7 +5665,9 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
       sessionIds.map(async (sessionId: string) => {
         const session = await chatbotDb.getChatSession(sessionId);
         if (!session) return { sessionId, score: null };
-        const score = await scoreSessionWithJudgeIfNeeded(session, judge);
+        // ENG-1296: force bypasses the "already scored, up-to-date" skip — see
+        // the matching comment on POST /chat-sessions/score above.
+        const score = await scoreSessionWithJudgeIfNeeded(session, judge, { force: force === true });
         return { sessionId, score };
       })
     );
@@ -5594,6 +5751,16 @@ router.get("/revenue-metrics", async (req, res) => {
   } catch (error: any) {
     console.error("Error fetching revenue metrics:", error.message);
     res.status(500).json({ message: "Failed to fetch revenue metrics" });
+  }
+});
+
+router.get("/revenue-collection-gaps", async (req, res) => {
+  try {
+    const flags = await detectMrrCollectionGaps();
+    res.json({ flags, count: flags.length });
+  } catch (error: any) {
+    console.error("Error detecting MRR collection gaps:", error.message);
+    res.status(500).json({ message: "Failed to detect MRR collection gaps" });
   }
 });
 

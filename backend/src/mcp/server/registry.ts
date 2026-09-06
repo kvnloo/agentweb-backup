@@ -3,6 +3,20 @@ import { refuseUnauthorizedScheduledPublish, attachPublishRevalidation } from '.
 
 export interface McpToolHandler {
   name: string;
+  /**
+   * `definition.inputSchema.properties` names are load-bearing beyond this tool's
+   * own handler: `validateAndRepairToolArgs` (agentToolGatewayService.ts, ENG-1668)
+   * silently hoists fields out of a stray wrapper object the model might invent
+   * (e.g. `params: { your_field: ... }`) whenever the wrapper key is a generic name
+   * like `params`/`args`/`data`/`config` (see LIKELY_WRAPPER_KEY_NAMES there) AND the
+   * nested key matches one of YOUR schema's property names that's still empty. This
+   * runs for every tool, not just the one it was built for — if your schema reuses a
+   * very common field name, a stray wrapper on an unrelated tool call could in
+   * principle land a value in your field. It never overwrites a value you already
+   * set, and only fires for those generic wrapper-like key names, but if that ever
+   * matters for your tool, read agentToolGatewayService.ts's validateAndRepairToolArgs
+   * before assuming a nested-looking argument was ignored.
+   */
   definition: any;
   execute: (args: any, context?: any) => Promise<any>;
   /**
@@ -34,6 +48,24 @@ export interface McpToolHandler {
    * first contact with the product.
    */
   requiresUserAccount?: boolean;
+  /**
+   * ENG-1276 follow-up — declares that EVERY call to this tool, for ANY
+   * arguments, has no external side effect (nothing published, sent, or
+   * written to a customer's live account/CRM — pure read/compute/research).
+   * Consulted by the scheduled-run conditional-skip veto and the ENG-1297
+   * read-only press circuit breaker (`isReadOnlyToolName` in
+   * utils/toolWriteClassification.ts) so a schedule's "check
+   * something first" step doesn't get misclassified as a write just because
+   * its name doesn't lead with get/read/list/... — the exact bug that broke
+   * perform_data_analysis (ENG-1276).
+   *
+   * Leave unset (defaults to write) for any tool that bundles a write action
+   * under SOME arguments — e.g. twitter_manage_post (post_thread writes,
+   * get_tweet_metrics doesn't) or call_google_ads_api (LIST reads, CREATE/
+   * UPDATE write). A whole-tool boolean cannot express "read-only for THESE
+   * arguments only"; only set this when no possible call writes anything.
+   */
+  readOnly?: boolean;
 }
 
 export { isAnonymousUserId } from '../anonymousToolAccess';

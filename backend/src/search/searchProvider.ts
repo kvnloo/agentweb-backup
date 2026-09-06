@@ -10,6 +10,8 @@ export type SearchPurpose =
 export interface SearchRequest {
   query: string;
   count: number;
+  /** Account charged for this paid provider request; absent means platform/system. */
+  userId?: string;
   freshness?: 'day' | 'week' | 'month' | 'year' | string;
   country?: string;
   language?: string;

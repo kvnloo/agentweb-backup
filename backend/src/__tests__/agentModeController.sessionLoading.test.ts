@@ -80,7 +80,13 @@ describe('Agent Mode Controller - Session Loading', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
         hasActiveProgress: false,
-        skills: []
+        skills: [],
+        // ENG-1579: no fixture message carries `.llm` and the fixture has no
+        // `llmModel`, so there is nothing to attribute — all null.
+        generationModels: null,
+        attributedModels: null,
+        attributionBasis: null,
+        modelLine: null
       });
     });
 
@@ -221,7 +227,11 @@ describe('Agent Mode Controller - Session Loading', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
         hasActiveProgress: false,
-        skills: []
+        skills: [],
+        generationModels: null,
+        attributedModels: null,
+        attributionBasis: null,
+        modelLine: null
       });
     });
 
@@ -257,8 +267,46 @@ describe('Agent Mode Controller - Session Loading', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
         hasActiveProgress: false,
-        skills: []
+        skills: [],
+        generationModels: null,
+        attributedModels: null,
+        attributionBasis: null,
+        modelLine: null
       });
+    });
+
+    // ENG-1579 (found investigating the ENG-426/ENG-1565 incident, session
+    // e6c9e693-…): session.llmModel is only the picker's last selection — a
+    // session that ran on one model, hit a hard stop, and continued on a
+    // DIFFERENT model never got that reflected in llmModel or
+    // llmUsagePolicyDecision. This is the exact regression guard for that.
+    it('exposes the real per-turn model attribution — never just the picker selection', async () => {
+      const sessionWithModelSwitch = {
+        ...mockSession,
+        llmModel: 'gemini-3.7-flash',
+        messages: [
+          { role: 'user', content: 'research this' },
+          { role: 'assistant', content: 'working on it', llm: 'openrouter/z-ai/glm-5.2' },
+          { role: 'assistant', content: 'still working', llm: 'openrouter/z-ai/glm-5.2' },
+          { role: 'user', content: 'reassess with a new model' },
+          { role: 'assistant', content: 'here is the reassessment', llm: 'gemini-3.7-flash' },
+        ],
+      };
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(sessionWithModelSwitch);
+
+      const req = mockRequest(mockUser, 'session-123');
+      const res = mockResponse();
+
+      await agentModeController.getSession(req, res);
+
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          generationModels: ['openrouter/z-ai/glm-5.2', 'gemini-3.7-flash'],
+          attributedModels: ['openrouter/z-ai/glm-5.2', 'gemini-3.7-flash'],
+          attributionBasis: 'transcript',
+          modelLine: 'picker: gemini-3.7-flash · ran: openrouter/z-ai/glm-5.2, gemini-3.7-flash',
+        })
+      );
     });
   });
 });

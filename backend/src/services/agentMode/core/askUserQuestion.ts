@@ -46,7 +46,7 @@
 
 /** One selectable option on the card. */
 export interface AskUserQuestionOption {
-  /** Stable id the frontend returns on selection (never re-parsed from prose). */
+  /** Stable id the frontend returns on a structured selection. */
   id: string;
   /** Short button label, e.g. "Leads". */
   label: string;
@@ -74,7 +74,7 @@ export interface AskUserQuestionAnswer {
   /** 'user' = explicit human selection; 'delegation' = explicit delegation click
    *  or a policy-permitted headless auto-take of the recommendation. */
   answeredBy: AskUserQuestionAnsweredBy;
-  /** For delegated answers: why the recommended option was taken (logged). */
+  /** Why this answer was resolved, for delegated recommendations or typed-text resolution. */
   rationale?: string;
   /** ISO timestamp the answer landed. */
   at: string;
@@ -320,6 +320,58 @@ export function resolveInboundAnswer(
   });
 }
 
+const TYPED_TEXT_PROVENANCE = 'Resolved from typed user text.';
+const AFFIRMATIVE_OPTION_TERMS = /\b(?:approve|approved|yes|confirm|confirmed|proceed|continue)\b/i;
+const BARE_AFFIRMATIVE = /^(?:yes|yeah|yep|approved?|confirm(?:ed)?|looks good|go ahead|proceed|continue)(?:[\s,!.]+(?:looks good|please|thanks))?[\s!.]*$/i;
+
+function optionMatchesTypedText(option: AskUserQuestionOption, message: string): boolean {
+  const normalizedMessage = message.trim().replace(/\s+/g, ' ').toLowerCase();
+  const matches = (candidate: string): boolean =>
+    candidate.trim().replace(/\s+/g, ' ').toLowerCase() === normalizedMessage;
+  return matches(option.id) || matches(option.label);
+}
+
+/**
+ * Resolve unambiguous user prose into the same human-attributed answer shape as
+ * a card click. A direct option-id/label match wins; otherwise only a bare
+ * affirmative can settle an approval-shaped card with exactly one affirmative
+ * option. Ambiguous or unrelated prose returns undefined so the controller
+ * retains the existing clear-and-re-ask behavior.
+ */
+export function resolveTypedTextAnswer(
+  pending: PendingUserQuestion | null | undefined,
+  messageText: string | null | undefined,
+  at: string,
+): PendingUserQuestion | undefined {
+  if (!pending || pending.status !== 'awaiting' || typeof messageText !== 'string') return undefined;
+  const message = messageText.trim();
+  if (!message) return undefined;
+
+  const directMatches = pending.options.filter((option) => optionMatchesTypedText(option, message));
+  if (directMatches.length === 1) {
+    return applyAnswer(pending, {
+      optionId: directMatches[0].id,
+      delegated: false,
+      answeredBy: 'user',
+      rationale: TYPED_TEXT_PROVENANCE,
+      at,
+    });
+  }
+  if (directMatches.length > 1 || !BARE_AFFIRMATIVE.test(message)) return undefined;
+
+  const affirmativeOptions = pending.options.filter((option) =>
+    AFFIRMATIVE_OPTION_TERMS.test(`${option.id} ${option.label}`),
+  );
+  if (affirmativeOptions.length !== 1) return undefined;
+  return applyAnswer(pending, {
+    optionId: affirmativeOptions[0].id,
+    delegated: false,
+    answeredBy: 'user',
+    rationale: TYPED_TEXT_PROVENANCE,
+    at,
+  });
+}
+
 /**
  * Resolve the answer's concrete machine payload for the consumer to apply
  * verbatim (deterministic — no model re-inference). Returns undefined if the
@@ -337,8 +389,8 @@ export function selectedPayload(question: PendingUserQuestion): Record<string, u
  * decide", where they never named an option themselves.
  *
  * This is appended to the LLM message content ONLY — never to the stored/displayed
- * user bubble (which stays "Let Emma decide" / the picked label). Returns null when
- * the question isn't answered or the chosen option can't be resolved (nothing to say).
+ * user bubble (which stays "Let Emma decide" / the typed text / the picked label). Returns
+ * null when the question isn't answered or the chosen option can't be resolved.
  */
 export function buildAnswerAcknowledgement(question: PendingUserQuestion): string | null {
   if (question.status !== 'answered' || !question.answer) return null;
@@ -360,11 +412,9 @@ export function buildAnswerAcknowledgement(question: PendingUserQuestion): strin
 }
 
 /**
- * ENG-396: a model-visible directive injected when the user TYPES a message instead of
- * clicking an open card. The typed reply abandons the question (it's cleared server-side),
- * and this tells Emma to re-ask that SAME question rather than infer a choice from the
- * prose or move on. Without it the model tends to treat "lets do traffic" as the answer
- * and advance — leaving the (immutable) question unanswered while the card says so.
+ * ENG-396: a model-visible directive injected when typed text does not unambiguously
+ * resolve an open card. The question is cleared server-side, and this tells Emma to
+ * re-ask THAT SAME question rather than infer a choice from ambiguous prose or move on.
  *
  * Appended to the LLM message content ONLY (never the displayed user bubble).
  */
@@ -387,7 +437,7 @@ export function buildReaskDirective(question: PendingUserQuestion): string {
  * confirmation-halt surfaces). The structured `options` on the tool result
  * drive the interactive card; this text is the accessible mirror. Deliberately
  * carries NO instruction on how to answer — the model must not be able to
- * self-resolve; only an inbound user selection does.
+ * self-resolve; only an inbound user action can.
  */
 export function renderQuestionPrompt(question: PendingUserQuestion): string {
   const lines = question.options.map((o, i) => {
@@ -482,6 +532,72 @@ export function findQuestionByKind(
     for (const q of Object.values(archive)) {
       if (q.kind === kind) return q;
     }
+  }
+  return undefined;
+}
+
+export interface AnsweredObjectiveCandidateOptions {
+  accountId: string;
+  validObjectives: readonly string[];
+  bindsLabel: (objective: string, labelAndConsequence: string) => boolean;
+  consumedQuestionIds?: ReadonlySet<string>;
+}
+
+export function summarizeAnsweredObjectiveQuestions(
+  pending: PendingUserQuestion | null | undefined,
+  archive: Record<string, PendingUserQuestion> | null | undefined,
+  validObjectives: readonly string[],
+): { consumedQuestionIds: Set<string>; hasAnsweredObjectiveCard: boolean } {
+  const consumedQuestionIds = new Set<string>();
+  let hasAnsweredObjectiveCard = false;
+  for (const question of [pending, ...Object.values(archive ?? {})]) {
+    if (!question || question.status !== 'answered' || !question.answer) continue;
+    const chosen = question.options.find((option) => option.id === question.answer?.optionId);
+    const sourceQuestionId = chosen?.payload?.sourceQuestionId;
+    if (typeof sourceQuestionId === 'string') consumedQuestionIds.add(sourceQuestionId);
+    if (
+      question.kind === 'meta_objective' ||
+      question.kind?.startsWith('meta_objective:') ||
+      validObjectives.includes(String(chosen?.payload?.objective ?? ''))
+    ) {
+      hasAnsweredObjectiveCard = true;
+    }
+  }
+  return { consumedQuestionIds, hasAnsweredObjectiveCard };
+}
+
+/**
+ * Find a human-attributed objective answer whose producer did not know the
+ * campaign-specific correlator kind. Account scoping and label/payload binding
+ * keep this compatibility lookup narrower than a semantic text search.
+ */
+export function findAnsweredObjectiveCandidate(
+  pending: PendingUserQuestion | null | undefined,
+  archive: Record<string, PendingUserQuestion> | null | undefined,
+  options: AnsweredObjectiveCandidateOptions,
+): { question: PendingUserQuestion; objective: string } | undefined {
+  const candidates = [pending, ...Object.values(archive ?? {})].filter(
+    (question, index, all): question is PendingUserQuestion =>
+      Boolean(question) && all.findIndex((item) => item?.questionId === question?.questionId) === index,
+  );
+
+  for (const question of candidates) {
+    if (options.consumedQuestionIds?.has(question.questionId)) continue;
+    const gate = checkQuestionGate(question);
+    if (!gate.allowed) continue;
+
+    const kind = question.kind;
+    if (kind && kind !== 'meta_objective') {
+      if (!kind.startsWith('meta_objective:')) continue;
+      const scopedAccount = kind.slice('meta_objective:'.length).split('|', 1)[0];
+      if (scopedAccount !== options.accountId) continue;
+    }
+
+    const objective = (gate.payload as Record<string, unknown> | undefined)?.objective;
+    if (typeof objective !== 'string' || !options.validObjectives.includes(objective)) continue;
+    const selected = question.options.find((candidate) => candidate.id === gate.answer.optionId);
+    if (!selected || !options.bindsLabel(objective, `${selected.label} ${selected.consequence}`)) continue;
+    return { question, objective };
   }
   return undefined;
 }

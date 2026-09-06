@@ -87,12 +87,19 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         ];
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-        (metaService.listAdSets as jest.Mock).mockResolvedValue(mockAdSets);
+        (metaService.listAdSets as jest.Mock).mockResolvedValue({
+          adSets: mockAdSets,
+          truncated: false,
+          pagesFetched: 1,
+          scope: {},
+        });
 
         const result = await agentModeService.listMetaAdsAdSets('user123');
 
         expect(result.success).toBe(true);
-        expect(result.message).toBe('Found 2 ad set(s)');
+        // ENG-1625: bare "Found N ad set(s)" was the ENG-1476/ENG-1584 sentence shape — the
+        // message now names scope and completeness explicitly.
+        expect(result.message).toBe('Found 2 ad set(s) in this ad account (complete list).');
         expect(result.adSets).toEqual(mockAdSets);
         expect(result.totalCount).toBe(2);
       });
@@ -217,7 +224,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAdSet).toHaveBeenCalledWith(
           'mock-access-token',
           'adset_123',
-          expect.objectContaining({ daily_budget: 15000 })
+          expect.objectContaining({ daily_budget: 15000 }),
+          '123456789'
         );
       });
 
@@ -232,7 +240,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAdSet).toHaveBeenCalledWith(
           'mock-access-token',
           'adset_123',
-          expect.objectContaining({ lifetime_budget: 50000 })
+          expect.objectContaining({ lifetime_budget: 50000 }),
+          '123456789'
         );
       });
 
@@ -247,7 +256,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAdSet).toHaveBeenCalledWith(
           'mock-access-token',
           'adset_123',
-          expect.objectContaining({ bid_amount: 250 })
+          expect.objectContaining({ bid_amount: 250 }),
+          '123456789'
         );
       });
 
@@ -262,7 +272,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAdSet).toHaveBeenCalledWith(
           'mock-access-token',
           'adset_123',
-          expect.objectContaining({ name: 'Renamed Ad Set', status: 'ACTIVE' })
+          expect.objectContaining({ name: 'Renamed Ad Set', status: 'ACTIVE' }),
+          '123456789'
         );
       });
     });
@@ -290,19 +301,24 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         ];
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-        (metaService.listAdCreatives as jest.Mock).mockResolvedValue(mockCreatives);
+        (metaService.listAdCreatives as jest.Mock).mockResolvedValue({
+          creatives: mockCreatives, truncated: false, pagesFetched: 1, scope: {}
+        });
 
         const result = await agentModeService.listMetaAdsAdCreatives('user123');
 
         expect(result.success).toBe(true);
-        expect(result.message).toBe('Found 2 ad creative(s)');
+        expect(result.message).toBe('Found 2 ad creative(s) in this ad account (complete list).');
         expect(result.creatives).toEqual(mockCreatives);
         expect(result.totalCount).toBe(2);
+        expect(result.complete).toBe(true);
       });
 
       it('should handle empty results', async () => {
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-        (metaService.listAdCreatives as jest.Mock).mockResolvedValue([]);
+        (metaService.listAdCreatives as jest.Mock).mockResolvedValue({
+          creatives: [], truncated: false, pagesFetched: 1, scope: {}
+        });
 
         const result = await agentModeService.listMetaAdsAdCreatives('user123');
 
@@ -494,25 +510,32 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         ];
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-        (metaService.listAds as jest.Mock).mockResolvedValue(mockAds);
+        (metaService.listAds as jest.Mock).mockResolvedValue({
+          ads: mockAds, truncated: false, pagesFetched: 1, scope: {}
+        });
 
         const result = await agentModeService.listMetaAdsAds('user123');
 
         expect(result.success).toBe(true);
-        expect(result.message).toBe('Found 2 ad(s)');
+        expect(result.message).toBe('Found 2 ad(s) in this ad account (complete list).');
         expect(result.ads).toEqual(mockAds);
         expect(result.totalCount).toBe(2);
+        expect(result.complete).toBe(true);
       });
 
       it('should filter by adSetId when provided', async () => {
         const mockAds = [{ id: 'ad_1', name: 'Ad 1' }];
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-        (metaService.listAds as jest.Mock).mockResolvedValue(mockAds);
+        (metaService.listAds as jest.Mock).mockResolvedValue({
+          ads: mockAds, truncated: false, pagesFetched: 1, scope: { adSetId: 'adset_123' }
+        });
 
         await agentModeService.listMetaAdsAds('user123', 'adset_123');
 
-        expect(metaService.listAds).toHaveBeenCalledWith('123456789', 'mock-access-token', 'adset_123');
+        expect(metaService.listAds).toHaveBeenCalledWith(
+          '123456789', 'mock-access-token', 'adset_123', { campaignId: undefined }
+        );
       });
     });
 
@@ -548,7 +571,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         expect(result.success).toBe(true);
         expect(result.message).toBe('Ad updated successfully');
-        expect(metaService.updateAd).toHaveBeenCalledWith('mock-access-token', 'ad_123', params);
+        expect(metaService.updateAd).toHaveBeenCalledWith('mock-access-token', 'ad_123', params, '123456789');
         // Should NOT call getAd or getAdCreative for ad-level updates
         expect(metaService.getAd).not.toHaveBeenCalled();
         expect(metaService.getAdCreative).not.toHaveBeenCalled();
@@ -574,7 +597,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAd).toHaveBeenCalledWith(
           'mock-access-token',
           'ad_123',
-          { creative: { creative_id: 'new_creative_B' } }
+          { creative: { creative_id: 'new_creative_B' } },
+          '123456789'
         );
         // Must NOT pass a bare top-level creative_id to Meta
         expect(metaService.updateAd).not.toHaveBeenCalledWith(
@@ -608,13 +632,15 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAd).toHaveBeenCalledWith(
           'mock-access-token',
           'ad_123',
-          { creative: { creative_id: 'new_creative_B' } }
+          { creative: { creative_id: 'new_creative_B' } },
+          '123456789'
         );
         // The ad-level status change is issued separately, without the creative_id
         expect(metaService.updateAd).toHaveBeenCalledWith(
           'mock-access-token',
           'ad_123',
-          { status: 'ACTIVE' }
+          { status: 'ACTIVE' },
+          '123456789'
         );
       });
 
@@ -712,7 +738,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAd).toHaveBeenCalledWith(
           'mock-access-token',
           'ad_123',
-          { creative: { creative_id: 'new_creative_456' } }
+          { creative: { creative_id: 'new_creative_456' } },
+          '123456789'
         );
       });
 
@@ -1290,7 +1317,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateAd).toHaveBeenCalledWith(
           'mock-access-token',
           'ad_123',
-          { creative: { creative_id: 'new_placement_creative' } }
+          { creative: { creative_id: 'new_placement_creative' } },
+          '123456789'
         );
       });
 
@@ -1552,7 +1580,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateCampaign).toHaveBeenCalledWith(
           'mock-access-token',
           'camp_123',
-          expect.objectContaining({ daily_budget: 15000 })
+          expect.objectContaining({ daily_budget: 15000 }),
+          '123456789'
         );
         const call = (metaService.updateCampaign as jest.Mock).mock.calls[0][2];
         expect(call.budget_amount).toBeUndefined();
@@ -1567,7 +1596,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(metaService.updateCampaign).toHaveBeenCalledWith(
           'mock-access-token',
           'camp_123',
-          expect.objectContaining({ name: 'New Name', status: 'PAUSED' })
+          expect.objectContaining({ name: 'New Name', status: 'PAUSED' }),
+          '123456789'
         );
       });
 

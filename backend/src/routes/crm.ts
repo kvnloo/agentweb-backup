@@ -12,7 +12,6 @@ import {
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { meterUsageFromResponse } from '../utils/llmClients';
 import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, checkEmailFormat, injectColorSchemeMeta } from '../utils/emailVariables';
 import axios from 'axios';
 import { assertPublicHostname, SsrfBlockedError } from '../utils/ssrfGuard';
@@ -24,6 +23,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
@@ -69,7 +69,7 @@ import { buildConfigServiceDeps } from '../services/enrichmentConfigDeps';
 import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentServiceV3';
 import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import { sanitizeLeadForResponse } from '../utils/enrichmentMetadataPresentation';
-import { getHubspotConnection, getMappedAgentwebFields, mappedFieldChanged, resolveSyncStatus } from '../utils/leadSyncStatus';
+import { getExternalCrmConnection, getMappedAgentwebFields, mappedFieldChanged, resolveSyncStatus } from '../utils/leadSyncStatus';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 
@@ -222,7 +222,11 @@ import {
   normalizeSender,
 } from '../services/crmSenderService';
 import { MAILBOX_PROVIDERS, CrmSender, isMailboxSender } from '../services/crmSenderTypes';
-import { sendAsSender } from '../services/sendAsSender';
+import { sendAsSender, SenderDailyLimitExceededError } from '../services/sendAsSender';
+import { claimEmailDomain, releaseEmailDomainClaim, confirmEmailDomainClaim, EmailDomainAlreadyClaimedError } from '../services/emailDomainClaimService';
+import { getPendingBatch, upsertPendingBatch, deletePendingBatch, PendingBatchConflictError } from '../services/groupEmailPendingBatchService';
+import { effectiveDailyLimit } from '../services/senderUsageTracker';
+import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
 router.use(apolloSubRouter);
 
 const normalizeAlertEvents = (alertEvents: any) => {
@@ -1820,10 +1824,11 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
-    // HubSpot connection drives the sync-status filter + per-lead resolution.
-    // The syncStatus param is only honored when the list is actually connected.
-    const hsConn = getHubspotConnection(list);
-    const syncStatusFilter = hsConn.connected ? syncStatusQuery : '';
+    // The connected CRM (HubSpot or Attio — a list is only ever connected to
+    // one) drives the sync-status filter + per-lead resolution. The
+    // syncStatus param is only honored when the list is actually connected.
+    const crmConn = getExternalCrmConnection(list);
+    const syncStatusFilter = crmConn.connected ? syncStatusQuery : '';
 
     // Validate inputs
     const validPage = Math.max(1, page);
@@ -1903,7 +1908,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
           const normalized = (lead.linkedin as string).trim().toLowerCase().replace(/\/?$/, '/');
           if (!connectedLinkedInUrlSet.has(normalized)) return false;
         }
-        if (syncStatusFilter && resolveSyncStatus(lead, hsConn.connected) !== syncStatusFilter) {
+        if (syncStatusFilter && resolveSyncStatus(lead, crmConn.connected) !== syncStatusFilter) {
           return false;
         }
         return true;
@@ -1967,7 +1972,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
             engagementCountLast7Days: engagementCounts.last7Days,
             totalAllMessages: engagementCounts.totalAllMessages,
           }),
-          syncStatus: resolveSyncStatus(lead, hsConn.connected),
+          syncStatus: resolveSyncStatus(lead, crmConn.connected),
         };
       })
     );
@@ -1983,7 +1988,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       totalPages: knownTotalPages ?? (hasMoreLeads ? null : validPage), // null means unknown total
       hasMore: hasMoreLeads,
       totalFilteredCount, // Total ICP count when icpsOnly is enabled, null otherwise
-      hubspotConnected: hsConn.connected,
+      crmConnected: crmConn.connected,
     });
   } catch (error: any) {
     console.error('Error fetching leads:', error);
@@ -2045,11 +2050,11 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
-    // Stamp an initial per-lead sync status when this list is connected to
-    // HubSpot. If auto-sync is on, the subsequent autoSyncLead push overwrites
-    // this with 'synced'/'sync_failed' via the adapter.
-    const hsConn = getHubspotConnection(list);
-    if (hsConn.connected) {
+    // Stamp an initial per-lead sync status when this list is connected to a
+    // CRM (HubSpot or Attio). If auto-sync is on, the subsequent autoSyncLead
+    // push overwrites this with 'synced'/'sync_failed' via the adapter.
+    const crmConn = getExternalCrmConnection(list);
+    if (crmConn.connected) {
       leadData.syncMetadata = { ...(leadData.syncMetadata || {}), syncStatus: 'sync_pending' };
     }
 
@@ -2600,15 +2605,15 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       updates.selectedSenderId = normalizedSenderId;
     }
 
-    // When this list is connected to HubSpot with auto-sync OFF, a change to a
-    // HubSpot-mapped field on an already-synced lead means it needs re-pushing —
+    // When this list is connected to a CRM with auto-sync OFF, a change to a
+    // CRM-mapped field on an already-synced lead means it needs re-pushing —
     // surface that as update_pending so it shows in the sync filter. With
     // auto-sync ON the adapter sets synced/sync_failed instead, so we skip.
-    const hsConnUpd = getHubspotConnection(list);
-    if (hsConnUpd.connected && !hsConnUpd.autoSyncEnabled) {
+    const crmConnUpd = getExternalCrmConnection(list);
+    if (crmConnUpd.connected && !crmConnUpd.autoSyncEnabled) {
       const existingForSync = await crmDb.getLeadById(listId, leadId);
       if (existingForSync && resolveSyncStatus(existingForSync, true) === 'synced'
-          && mappedFieldChanged(existingForSync, updates, getMappedAgentwebFields(hsConnUpd.config))) {
+          && mappedFieldChanged(existingForSync, updates, getMappedAgentwebFields(crmConnUpd.config))) {
         updates.syncMetadata = { ...(existingForSync.syncMetadata || {}), syncStatus: 'update_pending' };
       }
     }
@@ -3728,7 +3733,11 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
       // Process each chunk in parallel
       const chunkProcessors = chunks.map(async (chunk, chunkIndex) => {
         // Create separate LLM service instance for each parallel task
-        const llmService = createLLMService('gpt-5.2-chat', 1);
+        // gpt-5.2-chat's Azure inference cutoff was 2026-06-29 (fully deprecated,
+        // no working version deployable) — this call has been failing silently
+        // since then. Swapped to gpt-5.4, the current non-deprecated model in
+        // the same "balanced general-purpose" line.
+        const llmService = createLLMService('gpt-5.4', 1);
 
         const batchSize = 10;
         let chunkProcessedCount = 0;
@@ -4402,10 +4411,22 @@ router.post('/lists/:listId/check-linkedin-connections', async (req: Request, re
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    // Only check connections using the LinkedIn account explicitly assigned to this list.
-    // No fallback to user-level or site-wide accounts.
-    const accountId: string | null = (list as any).linkedInAccountId ?? null;
-    if (!accountId) return res.json({ connected: [], invited: [] });
+    // ENG-1612 gap #6/#4: don't require a list-level linkedInAccountId — fall back to
+    // the caller's own connected account (same fallback POST /check-linkedin-connections
+    // already uses for the cross-list Inbox view) so a list without one still shows real
+    // connection/invite state instead of silently rendering as "not invited".
+    let accountId: string | null = (list as any).linkedInAccountId ?? null;
+    let accountSource: 'list' | 'user' | null = accountId ? 'list' : null;
+    if (!accountId) {
+      const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+      accountId = await linkedInOutreachService.resolveUserOwnedAccountId(userId);
+      if (accountId) accountSource = 'user';
+    }
+    if (!accountId) {
+      // Explicit empty-state: distinguishable from "checked, nothing found" so the UI can
+      // render "connect a LinkedIn account" instead of reading this as zero connections.
+      return res.json({ connected: [], invited: [], accountId: null, noLinkedInAccountConnected: true });
+    }
 
     const { getConnectionByProfileUrlAndAccount } = await import('../services/unipileConnectionsDb');
     const { getSentInvitationByProfileUrlAndAccount } = await import('../services/unipileSentInvitationsDb');
@@ -4414,19 +4435,265 @@ router.post('/lists/:listId/check-linkedin-connections', async (req: Request, re
     const invited: Array<{ url: string; sentAt: string | null }> = [];
     await Promise.all(urls.map(async (url: string) => {
       const normalizedUrl = url.trim().toLowerCase().replace(/\/?$/, '/');
-      const conn = await getConnectionByProfileUrlAndAccount(url, accountId).catch(() => null);
+      const conn = await getConnectionByProfileUrlAndAccount(url, accountId!).catch(() => null);
       if (conn) {
         connected.push({ url: normalizedUrl, connectedAt: conn.connectedAt ?? null });
         return; // already connected — pending-invite state is irrelevant
       }
-      const inv = await getSentInvitationByProfileUrlAndAccount(url, accountId).catch(() => null);
+      const inv = await getSentInvitationByProfileUrlAndAccount(url, accountId!).catch(() => null);
       if (inv) invited.push({ url: normalizedUrl, sentAt: inv.sentAt ?? null });
     }));
 
-    return res.json({ connected, invited });
+    return res.json({ connected, invited, accountId, accountSource });
   } catch (error: any) {
     console.error('Error checking LinkedIn connections:', error);
     return res.status(500).json({ message: error.message || 'Failed to check LinkedIn connections' });
+  }
+});
+
+/**
+ * @route GET /api/crm/linkedin/sent-invitations
+ * @desc List this user's pending (sent, not-yet-accepted) LinkedIn connection invitations
+ *       for a given account, from the AW-UnipileSentInvitations cache (synced ~10 min by
+ *       linkedInConnectionSyncCron). Exposes ENG-1612 gap #1: the backend already
+ *       materializes the full pending set per account, but there was no list endpoint.
+ * @query { accountId?: string } — defaults to the caller's own connected Unipile account.
+ * @access Private
+ */
+router.get('/linkedin/sent-invitations', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const requestedAccountId = typeof req.query.accountId === 'string' ? req.query.accountId : null;
+
+    // Only ever list invitations for an account this user actually owns (their own
+    // connected account, or an org-shared one) — never an arbitrary accountId string.
+    const ownedAccountIds = await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+    let accountId: string | null = requestedAccountId;
+    if (accountId && !ownedAccountIds.includes(accountId)) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+    if (!accountId) accountId = ownedAccountIds[0] ?? null;
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected. Connect a LinkedIn account in Settings first.' });
+    }
+
+    const { getAllSentInvitationsByAccount } = await import('../services/unipileSentInvitationsDb');
+    const invitations = await getAllSentInvitationsByAccount(accountId);
+    // Newest first — that's the useful reading order for a "manage my pending invites" view.
+    invitations.sort((a, b) => new Date(b.sentAt).getTime() - new Date(a.sentAt).getTime());
+
+    return res.json({ accountId, invitations });
+  } catch (error: any) {
+    console.error('Error listing LinkedIn sent invitations:', error);
+    return res.status(500).json({ message: error.message || 'Failed to list LinkedIn sent invitations' });
+  }
+});
+
+/**
+ * @route POST /api/crm/linkedin/sent-invitations/:invitationId/withdraw
+ * @desc Withdraw (cancel) a pending LinkedIn connection invitation. Wires the existing
+ *       linkedInOutreachService.cancelInvitation to the UI (ENG-1612 gap #2) and cleans
+ *       up the pending-invite cache write-through so the amber dot/chip clear immediately
+ *       rather than waiting for the next cron prune (mirrors the Emma tool-call cleanup
+ *       in agentModeService.ts's 'cancel-invitation' case).
+ *
+ *       Routes through the same pace/cooldown gate as Emma's cancel-invitation action
+ *       (linkedInDailyVolumeGate.ts) — a UI-initiated withdraw must not bypass the
+ *       account-health pacer that the manual crm.ts send paths currently do (ENG-1612 #5).
+ * @body { accountId: string }
+ * @access Private
+ */
+router.post('/linkedin/sent-invitations/:invitationId/withdraw', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { invitationId } = req.params;
+    const { accountId } = req.body;
+    if (!invitationId) return res.status(400).json({ message: 'invitationId is required' });
+    if (!accountId || typeof accountId !== 'string') {
+      return res.status(400).json({ message: 'accountId is required' });
+    }
+
+    const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+    const resolvedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+    if (!resolvedAccount) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+
+    const paced = await paceLinkedInWrite('cancel-invitation', resolvedAccount, accountId);
+    if (paced.refusal) {
+      return res.status(429).json(paced.refusal);
+    }
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const cancelResult = await linkedInOutreachService.cancelInvitation(invitationId, accountId);
+
+    // Best-effort cache write-through, same as the Emma tool path — a failed cleanup
+    // must not turn a successful withdrawal into a reported failure (the 10-min cron
+    // prune is the backstop either way).
+    const { deleteSentInvitationByInvitationId } = await import('../services/unipileSentInvitationsDb');
+    await deleteSentInvitationByInvitationId(accountId, invitationId).catch((err) =>
+      console.error(`[crm] Failed to drop withdrawn invitation ${invitationId} from cache:`, err),
+    );
+
+    return res.json({ success: true, invitationId, accountId, result: cancelResult });
+  } catch (error: any) {
+    console.error('Error withdrawing LinkedIn invitation:', error);
+    return res.status(500).json({ message: error.message || 'Failed to withdraw LinkedIn invitation' });
+  }
+});
+
+/**
+ * @route GET /api/crm/linkedin/received-invitations
+ * @desc List LinkedIn connection invitations received FROM others, so they're visible
+ *       and acceptable from the UI (ENG-1612 gap #3/AC #3) — previously Emma-chat-only
+ *       via linkedInOutreachService.listReceivedInvitations.
+ * @query { accountId?: string, cursor?: string }
+ * @access Private
+ */
+router.get('/linkedin/received-invitations', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const requestedAccountId = typeof req.query.accountId === 'string' ? req.query.accountId : null;
+    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+
+    const ownedAccountIds = await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+    let accountId: string | null = requestedAccountId;
+    if (accountId && !ownedAccountIds.includes(accountId)) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+    if (!accountId) accountId = ownedAccountIds[0] ?? null;
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected. Connect a LinkedIn account in Settings first.' });
+    }
+
+    const result = await linkedInOutreachService.listReceivedInvitations(accountId, cursor);
+    return res.json({ accountId, ...result });
+  } catch (error: any) {
+    console.error('Error listing LinkedIn received invitations:', error);
+    return res.status(500).json({ message: error.message || 'Failed to list LinkedIn received invitations' });
+  }
+});
+
+/**
+ * @route POST /api/crm/linkedin/received-invitations/:invitationId/accept
+ * @desc Accept a received LinkedIn connection invitation (ENG-1612 gap #3/AC #3).
+ * @body { accountId: string, sharedSecret: string }
+ * @access Private
+ */
+router.post('/linkedin/received-invitations/:invitationId/accept', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { invitationId } = req.params;
+    const { accountId, sharedSecret } = req.body;
+    if (!invitationId) return res.status(400).json({ message: 'invitationId is required' });
+    if (!accountId || typeof accountId !== 'string') {
+      return res.status(400).json({ message: 'accountId is required' });
+    }
+    if (!sharedSecret || typeof sharedSecret !== 'string') {
+      return res.status(400).json({ message: 'sharedSecret is required (returned by GET /linkedin/received-invitations)' });
+    }
+
+    const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+    const resolvedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+    if (!resolvedAccount) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+
+    const paced = await paceLinkedInWrite('accept-invitation', resolvedAccount, accountId);
+    if (paced.refusal) {
+      return res.status(429).json(paced.refusal);
+    }
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, accountId, sharedSecret);
+
+    return res.json({ success: true, invitationId, accountId, result: acceptResult });
+  } catch (error: any) {
+    console.error('Error accepting LinkedIn invitation:', error);
+    return res.status(500).json({ message: error.message || 'Failed to accept LinkedIn invitation' });
+  }
+});
+
+/**
+ * @route GET /api/crm/linkedin/daily-quota
+ * @desc Remaining daily invite/message quota + any active hourly/burst cooldown for an
+ *       account, from linkedInDailyVolumeGate / linkedInWritePacer state (ENG-1612 gap #6/
+ *       AC #5) — so a Send button can show "7 of 10 invites left today" or "cooling down
+ *       until 14:32" before the user attempts a send that the pacer would refuse anyway.
+ *       Read-only: does not reserve a slot.
+ * @query { accountId?: string }
+ * @access Private
+ */
+router.get('/linkedin/daily-quota', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const requestedAccountId = typeof req.query.accountId === 'string' ? req.query.accountId : null;
+    const ownedAccountIds = await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+    let accountId: string | null = requestedAccountId;
+    if (accountId && !ownedAccountIds.includes(accountId)) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+    if (!accountId) accountId = ownedAccountIds[0] ?? null;
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected. Connect a LinkedIn account in Settings first.' });
+    }
+
+    const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+    const { resolveDailyInviteCap, dailyMessageCap, peekWriteCooldown } = await import('../services/linkedInWritePacer');
+    const resolvedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+    if (!resolvedAccount) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+
+    const now = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const inviteCap = resolveDailyInviteCap(resolvedAccount.configuredDailyInviteCap);
+    const inviteWindow = resolvedAccount.dailyVolumeState?.invite;
+    const inviteWindowExpired = !inviteWindow || now - inviteWindow.windowStartedAt >= DAY_MS;
+    const inviteUsed = inviteWindowExpired ? 0 : inviteWindow!.count;
+
+    const messageCap = dailyMessageCap();
+    const messageWindow = resolvedAccount.dailyVolumeState?.message;
+    const messageWindowExpired = !messageWindow || now - messageWindow.windowStartedAt >= DAY_MS;
+    const messageUsed = messageWindowExpired ? 0 : messageWindow!.count;
+
+    return res.json({
+      accountId,
+      invites: {
+        used: inviteUsed,
+        cap: Number.isFinite(inviteCap) ? inviteCap : null, // null = uncapped (operator disabled)
+        remaining: Number.isFinite(inviteCap) ? Math.max(0, inviteCap - inviteUsed) : null,
+        windowResetsAt: inviteWindowExpired ? null : new Date(inviteWindow!.windowStartedAt + DAY_MS).toISOString(),
+      },
+      messages: {
+        used: messageUsed,
+        cap: messageCap > 0 ? messageCap : null, // null = uncapped (operator disabled or Jest)
+        remaining: messageCap > 0 ? Math.max(0, messageCap - messageUsed) : null,
+        windowResetsAt: messageWindowExpired ? null : new Date(messageWindow!.windowStartedAt + DAY_MS).toISOString(),
+      },
+      cooldown: peekWriteCooldown(accountId, now),
+    });
+  } catch (error: any) {
+    console.error('Error fetching LinkedIn daily quota:', error);
+    return res.status(500).json({ message: error.message || 'Failed to fetch LinkedIn daily quota' });
   }
 });
 
@@ -4511,6 +4778,20 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
     }
 
+    // ENG-1026: cross-check the live profile's identity against the lead before
+    // sending. Positive mismatch (wrong person behind the stored URL) → 409.
+    const { verifyLinkedInIdentityForSend } = await import('../services/linkedInIdentityCheck');
+    const identity = await verifyLinkedInIdentityForSend({
+      lead: lead as any,
+      listId,
+      leadId,
+      profileUrl: leadLinkedIn,
+      accountId,
+    });
+    if (!identity.allowed) {
+      return res.status(409).json(identity.refusal);
+    }
+
     await linkedInOutreachService.sendMessage(accountId, leadLinkedIn, true, message.trim());
 
     // Record the engagement
@@ -4580,6 +4861,20 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
       : ((list as any).linkedInAccountId || await linkedInOutreachService.resolveUserOwnedAccountId(userId));
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
+    }
+
+    // ENG-1026: cross-check the live profile's identity against the lead before
+    // sending the invite. Positive mismatch → 409, nothing sent.
+    const { verifyLinkedInIdentityForSend } = await import('../services/linkedInIdentityCheck');
+    const identity = await verifyLinkedInIdentityForSend({
+      lead: lead as any,
+      listId,
+      leadId,
+      profileUrl: leadLinkedIn,
+      accountId,
+    });
+    if (!identity.allowed) {
+      return res.status(409).json(identity.refusal);
     }
 
     const note = message && typeof message === 'string' && message.trim() ? message.trim() : undefined;
@@ -4751,21 +5046,14 @@ Good example: "Sarah, Island's browser-isolation approach is one of the smarter 
 
 Reply with ONLY valid JSON, nothing else: {"content": "the note text"}`;
 
-    const geminiClient = await agentModeService.getGeminiClient();
-    const completion = await (geminiClient as any).chat.completions.create({
-      model: 'gemini-3.5-flash',
-      messages: [{ role: 'user', content: prompt }],
+    const completion = await agentModeService.callLLM('gemini-3.5-flash', [
+      { role: 'user', content: prompt },
+    ], {
       temperature: 0.8,
-      max_tokens: 2048,
+      max_completion_tokens: 2048,
+      usageContext: { userId, feature: 'invite_note_generate' },
+      taskClass: 'content_generation',
     });
-    // Meter this direct Gemini draft generation (bypasses callLLM): shadow analytics +
-    // the per-user cap, matching the invite-note shortener path for the same feature.
-    meterUsageFromResponse({
-      userId,
-      model: 'gemini-3.5-flash',
-      provider: 'gemini',
-      feature: 'invite_note_generate',
-    }, completion);
 
     const raw = completion.choices[0].message.content || '';
     let rawNote = '';
@@ -4806,7 +5094,7 @@ Reply with ONLY valid JSON, nothing else: {"content": "the note text"}`;
     // the same trimInviteMessage() sendInvitation uses, so every invite-note path is consistent.
     if (rawNote.length > inviteCharLimit) {
       const { shortenInviteNoteToLimit } = await import('../services/inviteNoteShortener');
-      rawNote = await shortenInviteNoteToLimit(geminiClient, rawNote, inviteCharLimit, 2);
+      rawNote = await shortenInviteNoteToLimit(undefined, rawNote, inviteCharLimit, 2, userId);
     }
     const content = LinkedInOutreachService.trimInviteMessage(rawNote, inviteCharLimit);
 
@@ -5002,10 +5290,28 @@ router.get('/sender-emails', async (req: Request, res: Response) => {
 
     // Emit both shapes: the legacy keys (senderType / gmailAccountId) so the
     // current portal keeps rendering, and the neutral ones the new UI reads.
-    const senders = config.senders.map((s) => ({
-      ...serializeSender(s),
-      senderProvider: s.senderProvider,
-      connectedAccountId: s.connectedAccountId,
+    // Also attach today's send usage against each sender's effective cap
+    // (ENG-265) so the settings UI can show "warming up" / "N/limit today"
+    // without a second round trip.
+    const senders = await Promise.all(config.senders.map(async (s) => {
+      const limit = effectiveDailyLimit(s);
+      // A rejected usage read must not blank the whole sender list — none of the rest of this
+      // response (senders, default sender, connected accounts) depends on usage counts. Same
+      // defensive-fallback pattern already used for connected_accounts above and
+      // resendService.getDomain in GET /email-domains.
+      const usage = limit !== null
+        ? await senderUsageTracker.getUsage(userId, s.id).catch((err: any) => {
+            console.warn(`[crm] getUsage failed for sender ${s.id}:`, err?.message || err);
+            return null;
+          })
+        : null;
+      return {
+        ...serializeSender(s),
+        senderProvider: s.senderProvider,
+        connectedAccountId: s.connectedAccountId,
+        effectiveDailyLimit: limit,
+        sentToday: usage?.sentCount ?? 0,
+      };
     }));
 
     res.json({
@@ -5116,6 +5422,8 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
           notes: s.notes ? s.notes.trim() : undefined,
           senderProvider: s.senderProvider ?? s.senderType ?? 'resend',
           connectedAccountId: s.connectedAccountId ?? s.gmailAccountId,
+          dailyLimit: typeof s.dailyLimit === 'number' ? s.dailyLimit : undefined,
+          warmupStartedAt: typeof s.warmupStartedAt === 'string' ? s.warmupStartedAt : undefined,
         }),
       ),
       defaultSenderId: defaultSenderId || (senders.length > 0 ? senders[0].id || '0' : null),
@@ -5163,53 +5471,79 @@ router.post('/email-domain', async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'Invalid domain format' });
     }
 
-    // Check if another user already has this domain
+    // Check if another user already has this domain — fast-fail UX check only (eventually
+    // consistent scan, TOCTOU-prone on its own); claimEmailDomain() below is the actual
+    // cross-user correctness guarantee (ENG-265: this legacy singular route previously bypassed
+    // that protocol entirely, letting it race the plural route's own protection).
     const usersWithDomain = await userDb.getUsersByEmailDomain(normalizedDomain);
     const otherUserWithDomain = usersWithDomain.find(u => u.userId !== userId);
     if (otherUserWithDomain) {
       return res.status(409).json({ message: 'This domain is already in use by another account' });
     }
 
-    // Check if domain already exists in Resend
-    const existingDomains = await resendService.listDomains();
-    const existingDomain = existingDomains.find(d => d.name === normalizedDomain);
+    try {
+      await claimEmailDomain(userId, normalizedDomain);
+    } catch (claimError: any) {
+      if (claimError instanceof EmailDomainAlreadyClaimedError) {
+        return res.status(409).json({ message: 'This domain is already in use by another account' });
+      }
+      throw claimError;
+    }
 
-    if (existingDomain) {
-      // Domain already exists in Resend — return its current status and records
-      const domainDetails = await resendService.getDomain(existingDomain.id);
-      if (!domainDetails) {
-        return res.status(500).json({ message: 'Failed to retrieve existing domain details' });
+    try {
+      // Check if domain already exists in Resend
+      const existingDomains = await resendService.listDomains();
+      const existingDomain = existingDomains.find(d => d.name === normalizedDomain);
+
+      if (existingDomain) {
+        // Domain already exists in Resend — return its current status and records
+        const domainDetails = await resendService.getDomain(existingDomain.id);
+        if (!domainDetails) {
+          await releaseEmailDomainClaim(normalizedDomain, userId);
+          return res.status(500).json({ message: 'Failed to retrieve existing domain details' });
+        }
+
+        // Save the resend domain ID and domain to the user record
+        await userDb.updateUser(userId, {
+          emailDomain: normalizedDomain,
+          resendDomainId: existingDomain.id,
+        });
+        await confirmEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+          console.error(`CRITICAL: failed to confirm email domain claim for "${normalizedDomain}" (user ${userId}) after retries — claim may expire and be taken over:`, e));
+
+        return res.json({
+          message: 'Domain already registered in Resend',
+          domain: domainDetails,
+          alreadyExists: true,
+        });
+      }
+
+      // Create new domain in Resend
+      const result = await resendService.createDomain(normalizedDomain);
+      if (!result) {
+        await releaseEmailDomainClaim(normalizedDomain, userId);
+        return res.status(500).json({ message: 'Failed to create domain in Resend' });
       }
 
       // Save the resend domain ID and domain to the user record
       await userDb.updateUser(userId, {
         emailDomain: normalizedDomain,
-        resendDomainId: existingDomain.id,
+        resendDomainId: result.id,
       });
+      await confirmEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+        console.error(`CRITICAL: failed to confirm email domain claim for "${normalizedDomain}" (user ${userId}) after retries — claim may expire and be taken over:`, e));
 
-      return res.json({
-        message: 'Domain already registered in Resend',
-        domain: domainDetails,
-        alreadyExists: true,
+      res.json({
+        message: 'Domain created successfully. Add the DNS records below to verify.',
+        domain: result,
       });
+    } catch (innerError) {
+      // The claim succeeded but a later step didn't — release it so the domain isn't
+      // permanently stuck unclaimable by anyone.
+      await releaseEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+        console.error(`Failed to release email domain claim for "${normalizedDomain}" after a failed registration:`, e));
+      throw innerError;
     }
-
-    // Create new domain in Resend
-    const result = await resendService.createDomain(normalizedDomain);
-    if (!result) {
-      return res.status(500).json({ message: 'Failed to create domain in Resend' });
-    }
-
-    // Save the resend domain ID and domain to the user record
-    await userDb.updateUser(userId, {
-      emailDomain: normalizedDomain,
-      resendDomainId: result.id,
-    });
-
-    res.json({
-      message: 'Domain created successfully. Add the DNS records below to verify.',
-      domain: result,
-    });
   } catch (error: any) {
     console.error('Error creating email domain:', error);
     res.status(500).json({ message: error.message || 'Failed to create email domain' });
@@ -5233,6 +5567,16 @@ router.delete('/email-domain', async (req: Request, res: Response) => {
     const user = await userDb.getUserById(userId);
     if (!user?.resendDomainId && !user?.emailDomain) {
       return res.status(400).json({ message: 'No domain configured to reset' });
+    }
+
+    // Release the claim before clearing the user record (same reasoning and ordering as
+    // DELETE /email-domains/:domainId) — this is a confirmed claim that never expires on its
+    // own, so a domain deleted only through this legacy route would otherwise remain
+    // permanently claimed, unregistrable through either endpoint, by no one. Idempotent (a
+    // no-op if this domain predates the claim protocol and was never actually claimed) via the
+    // conditional delete already inside releaseEmailDomainClaim.
+    if (user.emailDomain) {
+      await releaseEmailDomainClaim(user.emailDomain, userId);
     }
 
     // Clear domain fields from user record (don't delete from Resend — may be shared or reused)
@@ -5326,6 +5670,376 @@ router.get('/email-domain/status', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error fetching email domain status:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch email domain status' });
+  }
+});
+
+// ── Multi-domain endpoints (ENG-265) ──────────────────────────────────────
+// The singular /email-domain* routes above stay as-is for backward
+// compatibility during rollout. These plural routes operate on User.emailDomains[]
+// instead of the single emailDomain/resendDomainId scalar fields.
+
+type SenderDomainEntry = { id: string; domain: string; status: string; addedAt: string };
+
+/**
+ * A domain registered before ENG-265's multi-domain support only ever set the legacy scalar
+ * fields (emailDomain/resendDomainId), never emailDomains[]. Surface that legacy domain in the
+ * new plural endpoints too, via a synthesized entry — not a data migration — so an account that
+ * registered before this PR shipped doesn't lose visibility into (and the ability to manage)
+ * its existing domain just because it predates the array.
+ */
+function getEffectiveDomains(
+  user: { emailDomain?: string; resendDomainId?: string; emailDomains?: SenderDomainEntry[] } | null | undefined,
+): SenderDomainEntry[] {
+  const domains = user?.emailDomains || [];
+  if (
+    user?.emailDomain &&
+    user?.resendDomainId &&
+    !domains.some((d) => d.id === user.resendDomainId || d.domain === user.emailDomain)
+  ) {
+    return [...domains, {
+      id: user.resendDomainId,
+      domain: user.emailDomain,
+      status: 'unknown', // re-fetched live from Resend on every GET regardless of this placeholder
+      addedAt: new Date(0).toISOString(), // registration predates this field — no real timestamp to recover
+    }];
+  }
+  return domains;
+}
+
+/**
+ * @route GET /api/crm/email-domains
+ * @desc List every sending domain registered by the authenticated user, each enriched with live Resend status/records
+ * @access Private
+ */
+router.get('/email-domains', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const user = await userDb.getUserById(userId);
+    const domains: SenderDomainEntry[] = getEffectiveDomains(user);
+
+    const enriched = await Promise.all(domains.map(async (d: SenderDomainEntry) => {
+      // A transient failure on ONE domain's live-status lookup must not blank the whole list —
+      // Promise.all rejects on the first rejection, and with up to MAX_EMAIL_DOMAINS_PER_ACCOUNT
+      // (20) outbound Resend calls per page load, some transient failure is not unlikely. Fall
+      // back to the last-known stored status for that one entry instead of failing the request.
+      const details = await resendService.getDomain(d.id).catch((err: any) => {
+        console.warn(`[crm] getDomain failed for ${d.domain}:`, err?.message || err);
+        return null;
+      });
+      return {
+        id: d.id,
+        domain: d.domain,
+        addedAt: d.addedAt,
+        status: details?.status || d.status,
+        records: details?.records || [],
+      };
+    }));
+
+    res.json({ domains: enriched });
+  } catch (error: any) {
+    console.error('Error listing email domains:', error);
+    res.status(500).json({ message: error.message || 'Failed to list email domains' });
+  }
+});
+
+/**
+ * @route POST /api/crm/email-domains
+ * @desc Register an additional sending domain in Resend for the authenticated user
+ * @access Private
+ */
+router.post('/email-domains', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { domain } = req.body;
+    if (!domain || typeof domain !== 'string') {
+      return res.status(400).json({ message: 'Domain is required' });
+    }
+
+    const normalizedDomain = domain.trim().toLowerCase();
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(normalizedDomain)) {
+      return res.status(400).json({ message: 'Invalid domain format' });
+    }
+
+    const user = await userDb.getUserById(userId);
+    // Real, stored array — this (not the effective one below) is what the CAS write further
+    // down is based on and conditioned against; the synthesized legacy entry was never actually
+    // persisted in emailDomains[], so including it in the expected-size check would make the
+    // conditional write fail against the real (smaller) stored array on every attempt.
+    const existingDomains: SenderDomainEntry[] = user?.emailDomains || [];
+    // Includes a legacy scalar-field domain (if any) — cap/duplicate detection only, so it
+    // counts toward the cap and can't be "re-registered" as a spurious duplicate.
+    const effectiveDomains: SenderDomainEntry[] = getEffectiveDomains(user);
+
+    const alreadyOwned = effectiveDomains.find((d: SenderDomainEntry) => d.domain === normalizedDomain);
+    if (alreadyOwned) {
+      return res.status(409).json({ message: 'You have already registered this domain', domain: alreadyOwned });
+    }
+
+    // GET /email-domains fans out one resendService.getDomain() call per entry — bound the
+    // array so that stays a handful of requests, not an unbounded fan-out.
+    const MAX_EMAIL_DOMAINS_PER_ACCOUNT = 20;
+    if (effectiveDomains.length >= MAX_EMAIL_DOMAINS_PER_ACCOUNT) {
+      return res.status(400).json({
+        message: `You've reached the limit of ${MAX_EMAIL_DOMAINS_PER_ACCOUNT} sending domains per account. Remove one before adding another.`,
+        code: 'EMAIL_DOMAIN_CAP_EXCEEDED',
+      });
+    }
+
+    // Check if another user already has this domain (legacy scalar or emailDomains[]).
+    // This is a fast-fail UX check only (eventually-consistent scan, TOCTOU-prone on its
+    // own) — claimEmailDomain() below is the actual cross-user correctness guarantee.
+    const usersWithDomain = await userDb.getUsersByEmailDomain(normalizedDomain);
+    const otherUserWithDomain = usersWithDomain.find(u => u.userId !== userId);
+    if (otherUserWithDomain) {
+      return res.status(409).json({ message: 'This domain is already in use by another account' });
+    }
+
+    // ENG-265: atomic global claim — makes cross-user "first writer wins" actually hold even
+    // when two different users' requests race past the scan check above at the same time.
+    try {
+      await claimEmailDomain(userId, normalizedDomain);
+    } catch (claimError: any) {
+      if (claimError instanceof EmailDomainAlreadyClaimedError) {
+        return res.status(409).json({ message: 'This domain is already in use by another account' });
+      }
+      throw claimError;
+    }
+
+    try {
+      // Check if domain already exists in Resend
+      const resendDomains = await resendService.listDomains();
+      const existingResendDomain = resendDomains.find(d => d.name === normalizedDomain);
+
+      let domainResult: { id: string; name: string; status: string; records: any[] } | null;
+      let alreadyExists = false;
+      if (existingResendDomain) {
+        domainResult = await resendService.getDomain(existingResendDomain.id);
+        alreadyExists = true;
+      } else {
+        domainResult = await resendService.createDomain(normalizedDomain);
+      }
+
+      if (!domainResult) {
+        await releaseEmailDomainClaim(normalizedDomain, userId);
+        return res.status(500).json({ message: 'Failed to register domain in Resend' });
+      }
+
+      const newEntry = {
+        id: domainResult.id,
+        domain: normalizedDomain,
+        status: domainResult.status,
+        addedAt: new Date().toISOString(),
+      };
+
+      // emailDomains[] is read-modify-write. Guard against a lost update from a concurrent
+      // request for the same user (double-click, two tabs) by conditioning the write on the
+      // array being unchanged since we read it; on a race, re-read once and retry rather
+      // than surfacing a spurious 500/409 for what's usually a double-click.
+      let domainsToWrite: SenderDomainEntry[] = [...existingDomains, newEntry];
+      let expectedSize = existingDomains.length;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await userDb.updateUser(userId, {
+            emailDomains: domainsToWrite,
+            emailDomainList: domainsToWrite.map(d => d.domain),
+          }, {
+            condition: {
+              expression: expectedSize === 0
+                ? 'attribute_not_exists(#emailDomains) OR size(#emailDomains) = :expectedSize'
+                : 'size(#emailDomains) = :expectedSize',
+              names: { '#emailDomains': 'emailDomains' },
+              values: { ':expectedSize': expectedSize },
+            },
+          });
+          break;
+        } catch (writeError: any) {
+          if (writeError?.code !== 'ConditionalCheckFailedException' || attempt >= 1) {
+            throw writeError;
+          }
+          const freshUser = await userDb.getUserById(userId);
+          const freshDomains: SenderDomainEntry[] = freshUser?.emailDomains || [];
+          if (freshDomains.some((d: SenderDomainEntry) => d.domain === normalizedDomain)) {
+            // We already hold the claim, so this can only be our own retry/duplicate
+            // submission, not another user — nothing to release, the entry is already there.
+            return res.status(409).json({ message: 'You have already registered this domain' });
+          }
+          // Re-check the cap against the fresh count, not just the value read at the top of the
+          // request — two requests can each start under the cap, race the write, and both retry
+          // against a fresh array that's now one bigger, pushing the account over the limit.
+          // Effective (not just stored) count, so a legacy scalar-field domain is still counted.
+          if (getEffectiveDomains(freshUser).length >= MAX_EMAIL_DOMAINS_PER_ACCOUNT) {
+            await releaseEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+              console.error(`Failed to release email domain claim for "${normalizedDomain}" after hitting the cap on retry:`, e));
+            return res.status(400).json({
+              message: `You've reached the limit of ${MAX_EMAIL_DOMAINS_PER_ACCOUNT} sending domains per account. Remove one before adding another.`,
+              code: 'EMAIL_DOMAIN_CAP_EXCEEDED',
+            });
+          }
+          domainsToWrite = [...freshDomains, newEntry];
+          expectedSize = freshDomains.length;
+        }
+      }
+
+      // The emailDomains[] write landed — promote the claim to confirmed so the abandoned-claim
+      // staleness window in claimEmailDomain no longer applies to it (a completed registration
+      // must never expire and become takeable by another account). confirmEmailDomainClaim
+      // retries transient failures itself; if it still throws here, the domain IS registered
+      // and functional, so we log loudly (real signal for on-call, not routine noise) and still
+      // return success rather than fail an otherwise-successful registration — the residual risk
+      // is a claim that can be taken over by someone else 10 minutes from now despite this user
+      // legitimately owning the domain, which needs a lease/fencing mechanism to close fully
+      // and wasn't worth the added complexity for what the retry already makes a rare case.
+      await confirmEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+        console.error(`CRITICAL: failed to confirm email domain claim for "${normalizedDomain}" (user ${userId}) after retries — claim may expire and be taken over:`, e));
+
+      res.json({
+        message: alreadyExists
+          ? 'Domain already registered in Resend'
+          : 'Domain created successfully. Add the DNS records below to verify.',
+        domain: domainResult,
+        alreadyExists,
+      });
+    } catch (innerError) {
+      // The claim succeeded but a later step didn't — release it so the domain isn't
+      // permanently stuck unclaimable by anyone. releaseEmailDomainClaim already treats a
+      // superseded-claim conflict as a silent no-op internally, so anything that still throws
+      // here is a genuine unexpected failure (not routine) and worth surfacing: an unreleased
+      // claim after a failed registration leaves the domain unclaimable by anyone, including
+      // the user who just failed to register it, until the 10-minute staleness window passes.
+      await releaseEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+        console.error(`Failed to release email domain claim for "${normalizedDomain}" after a failed registration:`, e));
+      throw innerError;
+    }
+  } catch (error: any) {
+    console.error('Error creating email domain:', error);
+    res.status(500).json({ message: error.message || 'Failed to create email domain' });
+  }
+});
+
+/**
+ * @route POST /api/crm/email-domains/:domainId/verify
+ * @desc Trigger Resend verification for one of the user's registered domains
+ * @access Private
+ */
+router.post('/email-domains/:domainId/verify', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { domainId } = req.params;
+    const user = await userDb.getUserById(userId);
+    const entry = getEffectiveDomains(user).find((d: SenderDomainEntry) => d.id === domainId);
+    if (!entry) {
+      return res.status(404).json({ message: 'Domain not found' });
+    }
+
+    await resendService.verifyDomain(entry.id);
+    const domainDetails = await resendService.getDomain(entry.id);
+    if (!domainDetails) {
+      return res.status(500).json({ message: 'Failed to retrieve domain status after verification' });
+    }
+
+    res.json({
+      message: domainDetails.status === 'verified'
+        ? 'Domain verified successfully!'
+        : 'Verification triggered. DNS records may take a few minutes to propagate.',
+      domain: domainDetails,
+    });
+  } catch (error: any) {
+    console.error('Error verifying email domain:', error);
+    res.status(500).json({ message: error.message || 'Failed to verify email domain' });
+  }
+});
+
+/**
+ * @route DELETE /api/crm/email-domains/:domainId
+ * @desc Remove one of the user's registered sending domains (does not delete from Resend — may be shared or reused)
+ * @access Private
+ */
+router.delete('/email-domains/:domainId', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { domainId } = req.params;
+    const user = await userDb.getUserById(userId);
+    const existingDomains: SenderDomainEntry[] = user?.emailDomains || [];
+    const removedEntry = getEffectiveDomains(user).find((d: SenderDomainEntry) => d.id === domainId);
+    if (!removedEntry) {
+      return res.status(404).json({ message: 'Domain not found' });
+    }
+
+    // Release the claim BEFORE touching the user record, and let a genuine failure here
+    // propagate as the normal 500 instead of being swallowed. This claim is confirmed, so it
+    // never expires via claimEmailDomain's staleness window — a release failure silently
+    // eaten after the user record already shows "removed" would leave the domain permanently
+    // unclaimable by anyone, including this owner on retry. Releasing first is the safer
+    // direction to fail in: the delete is conditioned on still owning the claim (idempotent —
+    // ConditionalCheckFailedException is already treated as a no-op inside the service), so a
+    // retry after a real failure here is always safe, whereas the reverse order risks a
+    // permanent lockout with nothing to retry against.
+    await releaseEmailDomainClaim(removedEntry.domain, userId);
+
+    // The removed entry can be a legacy scalar-field domain that was never actually persisted
+    // in emailDomains[] — there's no array element to filter out. Clear the scalar fields
+    // directly instead (same as the singular DELETE /email-domain route).
+    if (!existingDomains.some((d: SenderDomainEntry) => d.id === domainId)) {
+      await userDb.updateUser(userId, { emailDomain: '', resendDomainId: '' });
+      return res.json({ message: 'Domain removed.' });
+    }
+
+    // ENG-265: same lost-update guard as POST /email-domains — condition the write on the
+    // array being unchanged since we read it, and retry once on a race.
+    let domainsToWrite = existingDomains.filter((d: SenderDomainEntry) => d.id !== domainId);
+    let expectedSize = existingDomains.length;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await userDb.updateUser(userId, {
+          emailDomains: domainsToWrite,
+          emailDomainList: domainsToWrite.map((d: SenderDomainEntry) => d.domain),
+        }, {
+          condition: {
+            expression: 'size(#emailDomains) = :expectedSize',
+            names: { '#emailDomains': 'emailDomains' },
+            values: { ':expectedSize': expectedSize },
+          },
+        });
+        break;
+      } catch (writeError: any) {
+        if (writeError?.code !== 'ConditionalCheckFailedException' || attempt >= 1) {
+          throw writeError;
+        }
+        const freshUser = await userDb.getUserById(userId);
+        const freshDomains: SenderDomainEntry[] = freshUser?.emailDomains || [];
+        if (!freshDomains.some((d: SenderDomainEntry) => d.id === domainId)) {
+          // Already removed by the racing request — nothing left to do.
+          return res.json({ message: 'Domain removed.' });
+        }
+        domainsToWrite = freshDomains.filter((d: SenderDomainEntry) => d.id !== domainId);
+        expectedSize = freshDomains.length;
+      }
+    }
+
+    res.json({ message: 'Domain removed.' });
+  } catch (error: any) {
+    console.error('Error removing email domain:', error);
+    res.status(500).json({ message: error.message || 'Failed to remove email domain' });
   }
 });
 
@@ -5756,17 +6470,24 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     const riskyLeadsList = leads.filter((l: any) => l.email && validationStatus(l) === 'risky');
     const undeliverableCount = undeliverableLeadsList.length;
     const riskyCount = riskyLeadsList.length;
-    // Eligibility = has email && not DNC && not undeliverable. Single boolean
-    // filter (not arithmetic subtraction) so overlapping categories don't
-    // produce negative counts.
+    // ENG-1194: catches malformed addresses and provider-disallowed test domains
+    // (e.g. example.com) that the async email_validation enrichment never covers
+    // — leads it hasn't run against still had a blank status, so they slipped
+    // through as "eligible" and failed with a 422 at send time.
+    const invalidLeadsList = leads.filter((l: any) => l.email && !isEligibleGroupEmailRecipient(l.email));
+    const invalidCount = invalidLeadsList.length;
+    // Eligibility = has email && not DNC && not undeliverable && not
+    // malformed/test-domain. Single boolean filter (not arithmetic
+    // subtraction) so overlapping categories don't produce negative counts.
     const eligibleLeads = leads.filter((l: any) =>
-      l.email && !isDoNotContact(l) && validationStatus(l) !== 'undeliverable',
+      l.email && !isDoNotContact(l) && validationStatus(l) !== 'undeliverable' && isEligibleGroupEmailRecipient(l.email),
     ).length;
 
     // Return small samples (first 50) of email lists so the UI modals can show
     // exactly which addresses fall in each bucket. Cap at 50 to keep payload tight.
     const undeliverableEmails = undeliverableLeadsList.slice(0, 50).map((l: any) => l.email);
     const riskyEmails = riskyLeadsList.slice(0, 50).map((l: any) => l.email);
+    const invalidEmails = invalidLeadsList.slice(0, 50).map((l: any) => l.email);
 
     return res.json({
       totalLeads,
@@ -5776,8 +6497,10 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
       noEmailCount,
       undeliverableCount,
       riskyCount,
+      invalidCount,
       undeliverableEmails,
       riskyEmails,
+      invalidEmails,
     });
   } catch (error) {
     console.error('Error previewing group email:', error);
@@ -5818,8 +6541,10 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
 
     let leads = await fetchAllLeadsForGroupEmail(listId);
 
-    // Only consider eligible leads (have email, not do-not-contact/unsubscribed)
-    const eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
+    // Only consider eligible leads (have email, not do-not-contact/unsubscribed, valid syntax/domain)
+    const eligibleLeads = leads.filter(
+      (l: any) => l.email && !isDoNotContact(l) && isEligibleGroupEmailRecipient(l.email),
+    );
     const eligibleCount = eligibleLeads.length;
 
     // Auto-fix dark mode: inject color-scheme opt-out before format check so
@@ -5923,6 +6648,14 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     const skippedDoNotContact = leads.filter((l: any) => isDoNotContact(l)).length;
     let eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
 
+    // ENG-1194: malformed addresses and provider-disallowed test domains (e.g.
+    // example.com) always fail at the provider — same validator preview uses,
+    // so preview's eligible count matches what's actually attempted here.
+    // Unlike undeliverable, there's no override: these can never be sent.
+    const beforeInvalidCount = eligibleLeads.length;
+    eligibleLeads = eligibleLeads.filter((l: any) => isEligibleGroupEmailRecipient(l.email));
+    const skippedInvalid = beforeInvalidCount - eligibleLeads.length;
+
     // Filter undeliverable emails. Two override modes:
     //   - includeUndeliverableEmails: string[]  → per-address whitelist (Proposal B)
     //   - includeUndeliverable: true            → blanket override (legacy/Emma)
@@ -5977,8 +6710,21 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     let failed = 0;
     const failedEmails: string[] = [];
     const failureReasons: Array<{ email: string; reason: string }> = [];
+    // ENG-265: once the sender hits its daily cap, every remaining send would
+    // fail the same way — stop the batch instead of burning through the rest
+    // of the list generating identical failures, and report why.
+    let stoppedEarlyReason: string | null = null;
+    // A send is never recorded back onto the lead record (no timestamp, no engagement
+    // entry), so nothing here can distinguish "already emailed in this exact batch" from
+    // "never contacted" on a later request. Re-running the same send against the FULL
+    // eligible list — even after the cap resets, even from a different sender — would
+    // re-email everyone who already went through in this batch. skippedLeadIds is the only
+    // safe way to resume: it lets the caller re-POST scoped to just these ids (leadIds is
+    // already an accepted filter on this route) instead of the whole list.
+    const skippedLeadIds: string[] = [];
 
-    for (const lead of eligibleLeads) {
+    for (let i = 0; i < eligibleLeads.length; i++) {
+      const lead = eligibleLeads[i];
       try {
         // Substitute variables in subject and content
         const personalizedSubject = substituteVariables(subject, lead);
@@ -6005,6 +6751,11 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         });
         sent++;
       } catch (err: any) {
+        if (err instanceof SenderDailyLimitExceededError) {
+          stoppedEarlyReason = err.message;
+          skippedLeadIds.push(...eligibleLeads.slice(i).map((l: any) => l.leadId));
+          break;
+        }
         const reason = err.message || String(err);
         console.error(`Failed to send group email to ${lead.email}:`, reason);
         failed++;
@@ -6018,6 +6769,50 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       }
     }
 
+    const skippedDueToLimit = skippedLeadIds.length;
+
+    // Durable record of what's left, so the gap survives closing the tab or coming back a
+    // different day — the in-response skippedLeadIds above is correct but ephemeral (React
+    // state), and a campaign that needs 20 days to clear a 50/day cap will absolutely
+    // outlive one browser session. A resume that finishes everyone clears the record; a
+    // resume that stops early again replaces it with the new (smaller) remaining set while
+    // preserving the campaign's original totals.
+    if (stoppedEarlyReason) {
+      // Conditioned on the record being unchanged since we read it, so a concurrent send/resume
+      // for this same list can't silently clobber this write's skippedLeadIds/sentSoFar (and
+      // vice versa). On a lost race, reload the latest record and fold this send's progress on
+      // top of it rather than overwriting — same retry shape as the emailDomains[] writes above.
+      let existingBatch = await getPendingBatch(userId, listId).catch(() => null);
+      const MAX_PENDING_BATCH_WRITE_ATTEMPTS = 3;
+      for (let attempt = 0; attempt < MAX_PENDING_BATCH_WRITE_ATTEMPTS; attempt++) {
+        try {
+          await upsertPendingBatch(userId, {
+            listId,
+            senderId: sender.id,
+            senderEmail: sender.email,
+            senderName: sender.fromName,
+            subject,
+            htmlContent,
+            textContent,
+            unsubscribeFooterHtml,
+            skippedLeadIds,
+            sentSoFar: (existingBatch?.sentSoFar ?? 0) + sent,
+            totalOriginal: existingBatch?.totalOriginal ?? total,
+            createdAt: existingBatch?.createdAt ?? new Date().toISOString(),
+          }, existingBatch?.updatedAt ?? null);
+          break;
+        } catch (writeError: any) {
+          if (!(writeError instanceof PendingBatchConflictError) || attempt === MAX_PENDING_BATCH_WRITE_ATTEMPTS - 1) {
+            console.error('Failed to persist pending group-email batch:', writeError);
+            break;
+          }
+          existingBatch = await getPendingBatch(userId, listId).catch(() => null);
+        }
+      }
+    } else {
+      await deletePendingBatch(userId, listId).catch(() => {});
+    }
+
     return res.json({
       total,
       sent,
@@ -6028,10 +6823,73 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedDoNotContact,
       skippedMissingVars,
       skippedUndeliverable,
+      skippedInvalid,
+      skippedDueToLimit,
+      skippedLeadIds,
+      stoppedEarlyReason,
     });
   } catch (error) {
     console.error('Error sending group email:', error);
     return res.status(500).json({ message: 'Failed to send group email' });
+  }
+});
+
+/**
+ * @route GET /api/crm/lists/:listId/group-email/pending
+ * @desc Get the durable record of an incomplete group-email campaign for this list, if any
+ *       (ENG-265 — survives closing the tab; see groupEmailPendingBatchService.ts)
+ */
+router.get('/lists/:listId/group-email/pending', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (!(await canAccessCrmList(userId, list))) {
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
+    }
+
+    const batch = await getPendingBatch(userId, listId);
+    res.json({ batch });
+  } catch (error: any) {
+    console.error('Error getting pending group email batch:', error);
+    res.status(500).json({ message: error.message || 'Failed to get pending group email batch' });
+  }
+});
+
+/**
+ * @route DELETE /api/crm/lists/:listId/group-email/pending
+ * @desc Dismiss the pending-batch record without sending the rest
+ */
+router.delete('/lists/:listId/group-email/pending', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (!(await canDestructiveCrmList(userId, list))) {
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
+    }
+
+    await deletePendingBatch(userId, listId);
+    res.json({ message: 'Pending group email dismissed.' });
+  } catch (error: any) {
+    console.error('Error dismissing pending group email batch:', error);
+    res.status(500).json({ message: error.message || 'Failed to dismiss pending group email batch' });
   }
 });
 
@@ -6105,6 +6963,7 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
     let failedCount = 0;
     const failedEmails: string[] = [];
     const failureReasons: Array<{ email: string; reason: string }> = [];
+    let stoppedEarlyReason: string | null = null;
 
     for (const email of validEmails) {
       try {
@@ -6116,6 +6975,10 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
         });
         sent++;
       } catch (err: any) {
+        if (err instanceof SenderDailyLimitExceededError) {
+          stoppedEarlyReason = err.message;
+          break;
+        }
         const reason = err.message || String(err);
         console.error(`Failed to send test group email to ${email}:`, reason);
         failedCount++;
@@ -6130,6 +6993,8 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
       sent,
       failed: failedCount,
       failedEmails,
+      skippedDueToLimit: stoppedEarlyReason ? validEmails.length - sent - failedCount : 0,
+      stoppedEarlyReason,
     });
   } catch (error) {
     console.error('Error sending test group email:', error);
@@ -6904,6 +7769,46 @@ router.get('/attribution/click-id-coverage', async (req: Request, res: Response)
   } catch (error: any) {
     console.error('[CRM] click-id coverage failed:', error?.message);
     return res.status(500).json({ message: 'Failed to compute click ID coverage' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/crm/attribution/capi-key-coverage
+//
+// ENG-926 §F — of the conversions we actually SENT to Meta, what fraction carried each
+// identity key, per day and per event type.
+//
+// ⚠ This is NOT Meta's Event Match Quality, and must not be presented as it. Meta sells no
+// EMQ API: `event_match_quality` is not a valid `/stats` aggregation, and the only EMQ
+// surface that exists (`GET /{dataset}?fields=event_stats`) returns `"{}"` on live pixels.
+// This measures the half we own — what left our process. What Meta then MATCHED is invisible
+// to us, and `/stats?aggregation=match_keys` reports arrival rather than match, and never
+// reports `fbc`/`fbp` at all.
+// ---------------------------------------------------------------------------
+router.get('/attribution/capi-key-coverage', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const rawDays = req.query.days;
+    // Matched strictly rather than parsed leniently, for the same reason as click-ID
+    // coverage: `parseInt('7.5.1')` is 7, so a lenient parse silently answers a question
+    // the caller did not ask.
+    const isWellFormed = rawDays === undefined || /^\d+$/.test(String(rawDays));
+    const days = rawDays === undefined ? 30 : Number(rawDays);
+    if (!isWellFormed || !Number.isFinite(days) || days < 1 || days > 365) {
+      return res.status(400).json({ message: 'days must be an integer between 1 and 365' });
+    }
+
+    const { computeCapiKeyCoverageForUser } = await import('../services/metaCapiKeyCoverage');
+    const coverage = await computeCapiKeyCoverageForUser(userId, days);
+    return res.json(coverage);
+  } catch (error: any) {
+    console.error('[CRM] CAPI key coverage failed:', error?.message);
+    return res.status(500).json({ message: 'Failed to compute CAPI key coverage' });
   }
 });
 

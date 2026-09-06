@@ -42,13 +42,14 @@ describe('Scheduled Chat MCP Tools', () => {
   // ─── FAIL tests: invalid inputs, boundary conditions, error paths ────
 
   describe('registration', () => {
-    it('should register all 5 scheduled chat tools', () => {
+    it('should register all 6 scheduled chat tools', () => {
       const names = mcpToolRegistry.getToolNames();
       expect(names).toContain('list_scheduled_chats');
       expect(names).toContain('manage_scheduled_chat');
       expect(names).toContain('test_scheduled_chat');
       expect(names).toContain('get_scheduled_chat_test_history');
       expect(names).toContain('submit_scheduled_chat_variables');
+      expect(names).toContain('get_scheduled_chat_storage_diagnostics');
     });
 
     it('exposes an explicit backup model for scheduled chat create/update', () => {
@@ -559,6 +560,52 @@ describe('Scheduled Chat MCP Tools', () => {
       expect(text.toLowerCase()).toContain('poll');
       // Must instruct the model not to report an empty result as a finished run
       expect(text.toLowerCase()).toContain('do not');
+    });
+  });
+
+  describe('get_scheduled_chat_storage_diagnostics', () => {
+    it('should call GET /api/agent-mode/scheduled-chats/:id/storage-diagnostics', async () => {
+      mockMcpFetch.mockResolvedValue({
+        totalBytes: 435200,
+        limitBytes: 409600,
+        budgetBytes: 389120,
+        fields: { currentPrompt: 35840, promptRevisions: 340000, runResults: 58000, other: 1360 },
+        dominantField: 'promptRevisions',
+        approachingLimit: true,
+        correctiveAction: 'Shorten the starting message.',
+      });
+
+      const result = await mcpToolRegistry.execute('get_scheduled_chat_storage_diagnostics', {
+        schedule_id: 'sc-1',
+      }, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith({
+        method: 'GET',
+        path: '/api/agent-mode/scheduled-chats/sc-1/storage-diagnostics',
+        context: { userId: 'user-123', agentUserId: 'user-123' },
+      });
+      // Assert the actual returned VALUES, not just that the keys are present —
+      // a formatter that dropped or mangled a value would still pass a
+      // keys-only check.
+      const text = result.content[0].text;
+      expect(text).toContain('435200');
+      expect(text).toContain('409600');
+      expect(text).toContain('389120');
+      expect(text).toContain('promptRevisions');
+      expect(text).toContain('true'); // approachingLimit: true
+      expect(text).toContain('Shorten the starting message.');
+    });
+
+    it('should propagate HTTP errors from mcpFetch', async () => {
+      mockMcpFetch.mockRejectedValue(new Error('API error (404): Scheduled chat not found'));
+      await expect(
+        mcpToolRegistry.execute('get_scheduled_chat_storage_diagnostics', { schedule_id: 'missing' }, context)
+      ).rejects.toThrow('API error (404)');
+    });
+
+    it('requires schedule_id in its input schema', () => {
+      const definition: any = mcpToolRegistry.getTool('get_scheduled_chat_storage_diagnostics')?.definition;
+      expect(definition.inputSchema.required).toContain('schedule_id');
     });
   });
 

@@ -22,6 +22,17 @@ jest.mock('../services/gmailService', () => ({
     getEmails: jest.fn(),
     sendEmail: jest.fn(),
   },
+  // ENG-1300: real typed error classes — plain classes, no side effects to
+  // import — needed to test emailProviderErrorStatus() against the real thing.
+  ...(() => {
+    const actual = jest.requireActual('../services/gmailService');
+    return {
+      GmailNotConnectedError: actual.GmailNotConnectedError,
+      GmailTokenRevokedError: actual.GmailTokenRevokedError,
+      GmailQuotaError: actual.GmailQuotaError,
+      GmailSendNotAuthorizedError: actual.GmailSendNotAuthorizedError,
+    };
+  })(),
 }));
 
 import {
@@ -29,10 +40,17 @@ import {
   getEmailProvider,
   resolveEmailAccount,
   bootstrapEmailProviders,
+  emailProviderErrorStatus,
   EMAIL_PLATFORMS,
   type IEmailService,
   type EmailPlatform,
 } from '../services/emailProviderService';
+import {
+  GmailNotConnectedError,
+  GmailTokenRevokedError,
+  GmailQuotaError,
+  GmailSendNotAuthorizedError,
+} from '../services/gmailService';
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -141,6 +159,38 @@ describe('emailProviderService', () => {
         bootstrapEmailProviders(),
         bootstrapEmailProviders(),
       ])).resolves.not.toThrow();
+    });
+  });
+
+  // ── emailProviderErrorStatus (ENG-1300) ───────────────────────────────────
+  // Gmail/Outlook throw fully-typed EmailProviderError subclasses that
+  // deliberately carry no HTTP status of their own — this maps by constructor
+  // name to a representative HTTP-equivalent status instead of falling
+  // through to the generic Error/bug classification.
+  describe('emailProviderErrorStatus', () => {
+    it('maps GmailNotConnectedError to 401', () => {
+      expect(emailProviderErrorStatus(new GmailNotConnectedError())).toBe(401);
+    });
+
+    it('maps GmailTokenRevokedError to 401', () => {
+      expect(emailProviderErrorStatus(new GmailTokenRevokedError())).toBe(401);
+    });
+
+    it('maps GmailSendNotAuthorizedError to 403', () => {
+      expect(emailProviderErrorStatus(new GmailSendNotAuthorizedError())).toBe(403);
+    });
+
+    it('leaves GmailQuotaError unmapped (its message already classifies via classFromMessage\'s "quota exceeded" pattern)', () => {
+      expect(emailProviderErrorStatus(new GmailQuotaError())).toBeUndefined();
+    });
+
+    it('returns undefined for a plain Error (e.g. Resend failures, which carry no typed class here)', () => {
+      expect(emailProviderErrorStatus(new Error('Resend API error'))).toBeUndefined();
+    });
+
+    it('returns undefined for a non-Error value', () => {
+      expect(emailProviderErrorStatus('not an error')).toBeUndefined();
+      expect(emailProviderErrorStatus(undefined)).toBeUndefined();
     });
   });
 });

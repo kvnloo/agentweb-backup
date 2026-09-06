@@ -120,8 +120,37 @@ describe('listAccountHierarchy', () => {
 
     const tree = await service.listAccountHierarchy('test-access-token');
     expect(tree).toEqual([
-      { type: 'leaf', customerId: '1234567890', name: 'Test Account', currency: 'USD', loginCustomerId: '1234567890' },
+      { type: 'leaf', customerId: '1234567890', name: 'Test Account', currency: 'USD', loginCustomerId: '1234567890', testAccount: false },
     ]);
+  });
+
+  /**
+   * ENG-1362. Note the fixture above: an account DESCRIPTIVELY NAMED "Test Account" whose
+   * `test_account` flag is false. That is not a contrived case — it is the live situation
+   * this ticket was filed over, and it is why the flag is captured here rather than
+   * inferred downstream from the name.
+   */
+  it('captures a genuine Google test account as testAccount: true', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/1234567890'] } });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ customer: { id: '1234567890', descriptiveName: 'Production', currencyCode: 'USD', manager: false, testAccount: true } }] },
+    });
+
+    const tree = await service.listAccountHierarchy('test-access-token');
+    expect(tree[0]).toMatchObject({ customerId: '1234567890', testAccount: true });
+  });
+
+  it('treats an absent test_account as false rather than undefined', async () => {
+    // Google omits the field on some responses. Undefined would flow downstream as
+    // "unknown", and unknown must never soften into "safe" — so it is pinned to false
+    // at the point of capture, where the query that asked for it is in scope.
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/1234567890'] } });
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ customer: { id: '1234567890', descriptiveName: 'Sandbox', currencyCode: 'USD', manager: false } }] },
+    });
+
+    const tree = await service.listAccountHierarchy('test-access-token');
+    expect(tree[0]).toMatchObject({ testAccount: false });
   });
 
   it('returns empty array if no accessible customers', async () => {
@@ -142,8 +171,8 @@ describe('listAccountHierarchy', () => {
     const tree = await service.listAccountHierarchy('test-access-token');
     expect(tree).toEqual([
       { type: 'manager', customerId: '9999999999', name: 'MCC Account', children: [
-        { customerId: '222', name: 'Child A', currency: 'USD', loginCustomerId: '9999999999' },
-        { customerId: '333', name: 'Child B', currency: 'EUR', loginCustomerId: '9999999999' },
+        { customerId: '222', name: 'Child A', currency: 'USD', loginCustomerId: '9999999999', testAccount: false },
+        { customerId: '333', name: 'Child B', currency: 'EUR', loginCustomerId: '9999999999', testAccount: false },
       ] },
     ]);
     // the customer_client enumeration must run with the manager as login-customer-id
@@ -166,7 +195,7 @@ describe('listAccountHierarchy', () => {
     const tree = await service.listAccountHierarchy('test-access-token');
     expect(tree).toEqual([
       { type: 'manager', customerId: '999', name: 'Top MCC', children: [
-        { customerId: '444', name: 'Deep Leaf', currency: 'USD', loginCustomerId: '999' },
+        { customerId: '444', name: 'Deep Leaf', currency: 'USD', loginCustomerId: '999', testAccount: false },
       ] },
     ]);
   });
@@ -195,7 +224,7 @@ describe('listAccountHierarchy', () => {
     // 222 must NOT appear as a top-level leaf; only the manager node carries it
     expect(tree).toEqual([
       { type: 'manager', customerId: '999', name: 'My MCC', children: [
-        { customerId: '222', name: 'My Leaf', currency: 'USD', loginCustomerId: '999' },
+        { customerId: '222', name: 'My Leaf', currency: 'USD', loginCustomerId: '999', testAccount: false },
       ] },
     ]);
   });
@@ -208,7 +237,7 @@ describe('listAccountHierarchy', () => {
 
     const tree = await service.listAccountHierarchy('test-access-token');
     expect(tree).toEqual([
-      { type: 'leaf', customerId: '333', name: 'Reachable', currency: 'USD', loginCustomerId: '333' },
+      { type: 'leaf', customerId: '333', name: 'Reachable', currency: 'USD', loginCustomerId: '333', testAccount: false },
     ]);
   });
 
@@ -260,7 +289,7 @@ describe('listAccountHierarchy', () => {
     const tree = await service.listAccountHierarchy('test-access-token');
 
     expect(tree).toEqual([
-      { type: 'leaf', customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111' },
+      { type: 'leaf', customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111', testAccount: false },
       { type: 'manager', customerId: '999', name: 'My MCC', children: [] },
     ]);
     warnSpy.mockRestore();
@@ -271,14 +300,14 @@ describe('listAccountHierarchy', () => {
 describe('flattenConnectableLeaves', () => {
   it('flattens leaves and manager children into a single connectable list', () => {
     const flat = service.flattenConnectableLeaves([
-      { type: 'leaf', customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111' },
+      { type: 'leaf', customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111', testAccount: false },
       { type: 'manager', customerId: '999', name: 'MCC', children: [
-        { customerId: '222', name: 'Child', currency: 'USD', loginCustomerId: '999' },
+        { customerId: '222', name: 'Child', currency: 'USD', loginCustomerId: '999', testAccount: false },
       ] },
     ]);
     expect(flat).toEqual([
-      { customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111' },
-      { customerId: '222', name: 'Child', currency: 'USD', loginCustomerId: '999' },
+      { customerId: '111', name: 'Standalone', currency: 'USD', loginCustomerId: '111', testAccount: false },
+      { customerId: '222', name: 'Child', currency: 'USD', loginCustomerId: '999', testAccount: false },
     ]);
   });
 });
@@ -803,6 +832,20 @@ describe('createAdGroup', () => {
     expect(ag.resourceName).toBe('customers/123/adGroups/789');
     const body = mockAxiosPost.mock.calls[0][1];
     expect(body.operations[0].create.type).toBe('SEARCH_STANDARD');
+    expect(body.operations[0].create.status).toBe('ENABLED');
+  });
+
+  it('passes a requested PAUSED status through to Google Ads', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/adGroups/789' }] },
+    });
+    await service.createAdGroup('user-123', '1234567890', {
+      name: 'Paused Ad Group',
+      campaignResourceName: 'customers/123/campaigns/1',
+      type: 'SEARCH_STANDARD',
+      status: 'PAUSED',
+    });
+    expect(mockAxiosPost.mock.calls[0][1].operations[0].create.status).toBe('PAUSED');
   });
 });
 
@@ -1033,6 +1076,22 @@ describe('createAd (Responsive Search Ad)', () => {
     const body = mutateBody();
     expect(body.operations[0].create.ad.responsiveSearchAd.headlines).toHaveLength(3);
     expect(body.operations[0].create.ad.finalUrls[0]).toBe('https://example.com');
+  });
+
+  it('passes a requested PAUSED status through to Google Ads', async () => {
+    mockNoInheritedSuffix();
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/adGroupAds/1' }] },
+    });
+    await service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/123/adGroups/789',
+      type: 'RESPONSIVE_SEARCH_AD',
+      headlines: ['Headline 1'],
+      descriptions: ['Description 1'],
+      finalUrl: 'https://example.com',
+      status: 'PAUSED',
+    });
+    expect(mutateBody().operations[0].create.status).toBe('PAUSED');
   });
 });
 
@@ -1665,5 +1724,43 @@ describe('createCampaign — PMax with brand guidelines', () => {
     // Fourth op: LOGO campaign asset
     expect(body.mutateOperations[3].campaignAssetOperation.create.fieldType).toBe('LOGO');
     expect(body.mutateOperations[3].campaignAssetOperation.create.asset).toBe('customers/123/assets/logo-1');
+  });
+});
+
+describe('every Google Ads call is bounded by a timeout (CodeRabbit, #2519)', () => {
+  // callApi had none. An axios request without a timeout waits forever on a stalled
+  // connection — which blocks the agent-mode tool call that made it, and on the
+  // offline-conversion path would stall a background sweep with no error anywhere.
+  const src = require('fs').readFileSync(
+    require('path').join(__dirname, '../services/googleAdsService.ts'), 'utf8');
+
+  it('bounds both callApi paths', () => {
+    // Deliberately not an exact count across the file — three more calls were bounded
+    // afterwards, and a fixed number turns every correct addition into a failing test.
+    expect(src).toMatch(/axios\.get\(url, \{ headers, timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS/);
+    expect(src).toMatch(/axios\.post\(url, body, \{ headers, timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS/);
+  });
+
+  it('leaves no bare axios call in callApi', () => {
+    expect(src).not.toMatch(/await axios\.get\(url, \{ headers \}\)/);
+    expect(src).not.toMatch(/await axios\.post\(url, body, \{ headers \}\)/);
+  });
+
+  it('pins the ceiling at exactly 60s', () => {
+    // A range assertion would let a regression to 30s pass silently. 60s is the contract:
+    // generous enough that a slow GAQL read over a large account is not turned into a
+    // spurious failure, which is worse than having no timeout at all.
+    const m = src.match(/const GOOGLE_ADS_HTTP_TIMEOUT_MS = ([0-9_]+);/);
+    expect(m).toBeTruthy();
+    expect(Number(m[1].replace(/_/g, ''))).toBe(60_000);
+  });
+
+  it('leaves NO unbounded axios call anywhere in the service', () => {
+    // callApi was fixed first and three others were missed — refreshAccessToken's OAuth
+    // call, listAccessibleCustomers and geoTargetConstants:suggest. Asserting the class
+    // rather than the instances is what stops the next one.
+    const calls = src.match(/await axios\.(get|post)\(/g) || [];
+    const bounded = src.match(/timeout: (GOOGLE_ADS_HTTP_TIMEOUT_MS|15000)/g) || [];
+    expect(bounded.length).toBeGreaterThanOrEqual(calls.length);
   });
 });

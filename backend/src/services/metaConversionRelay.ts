@@ -631,6 +631,17 @@ export async function relayLeadStatusEvent(
       // and a conversion sent without either matches on email alone.
       fbp: typeof lead.metaFbp === 'string' && lead.metaFbp ? lead.metaFbp : undefined,
       fbc: buildFbcFromFirstTouch(lead.firstTouch),
+      // ENG-926 §B: the other two match signals, also captured once and kept. Meta names
+      // client_ip_address / client_user_agent among the most commonly skipped and most
+      // valuable EMQ inputs; both were previously read at capture, used for the immediate
+      // Lead event, then discarded — so this event, fired weeks later when a deal closes,
+      // went out with less identity than we already had. Same string-and-non-blank guard as
+      // fbp: a stored blank or a non-string is upstream corruption, not a match signal.
+      clientIp: typeof lead.clientIp === 'string' && lead.clientIp.trim() ? lead.clientIp.trim() : undefined,
+      userAgent:
+        typeof lead.clientUserAgent === 'string' && lead.clientUserAgent.trim()
+          ? lead.clientUserAgent.trim()
+          : undefined,
       sourceUrl: lead.firstTouch?.landingUrl,
       eventName,
       // A CRM status change is not a website event — nobody was on a page. Meta validates

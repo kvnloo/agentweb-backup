@@ -77,6 +77,8 @@ const mockUpdateLeadList = jest.fn();
 const mockGetLandingPagesByOwner = jest.fn();
 const mockSyncLeadCaptureFilesToRepo = jest.fn();
 const mockGetLeadListById = jest.fn();
+/** crmDb.updateLeadList — distinct from v0Service.updateLandingPageLeadList above. */
+const mockUpdateLeadListRecord = jest.fn();
 const mockGetUserById = jest.fn();
 const mockGetOrgById = jest.fn();
 const mockCanEditItem = jest.fn();
@@ -95,7 +97,10 @@ jest.mock("../services/v0Service", () => {
 jest.mock("../services/db", () => ({
   userDb: { getUserById: (...a: any[]) => mockGetUserById(...a) },
   orgDb: { getOrgById: (...a: any[]) => mockGetOrgById(...a) },
-  crmDb: { getLeadListById: (...a: any[]) => mockGetLeadListById(...a) },
+  crmDb: {
+    getLeadListById: (...a: any[]) => mockGetLeadListById(...a),
+    updateLeadList: (...a: any[]) => mockUpdateLeadListRecord(...a),
+  },
 }));
 
 jest.mock("../services/orgShareService", () => ({
@@ -115,11 +120,14 @@ jest.mock("../middleware/auth", () => ({
 import express, { Application } from "express";
 import request from "supertest";
 import router from "../routes/landingPageGeneration";
+import { findOrphanedCaptureEntries } from "../services/v0Service";
 
 // The REAL implementation under test (the module mock above replaces it for the route,
 // so reach past it here). Its axios / aws-sdk / secrets deps are still mocked.
 const {
   syncLeadCaptureFilesToRepo,
+  isPlatformGeneratedRepo,
+  NO_CAPTURE_LAYER,
   buildLandingPageMiddleware,
   buildCaptureRoute,
   buildDomainMapFile,
@@ -317,6 +325,115 @@ describe("syncLeadCaptureFilesToRepo", () => {
     expect(treePaths()).toContain("domainMap.ts");
   });
 
+  it("PRESERVES a hand-added path instead of deleting it — the live Every.io shape", async () => {
+    // The live Every.io shape: the deployed route maps "/" to a list by hand, because the
+    // record that owned "/" was archived while the frontend stayed up. Rewriting from the DB
+    // would delete that mapping and the root form would 422 for real visitors.
+    mockGitHub({
+      "middleware.ts": "// stale middleware\n",
+      "app/api/capture/route.ts": buildCaptureRoute({
+        "/": "list_root_handmade",
+        "/pricing": "list_p",
+      }),
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/pricing": "list_p" }));
+
+    expect(result.committed).toBe(true);
+    // The route IS rewritten — freezing it would stop new sub-pages registering, which
+    // 422s their forms: the same breakage through the other door.
+    expect(treePaths()).toContain("app/api/capture/route.ts");
+    // ...and the hand-added mapping survives the rebuild.
+    expect(blobForPath("app/api/capture/route.ts")).toBe(
+      buildCaptureRoute({ "/": "list_root_handmade", "/pricing": "list_p" }),
+    );
+  });
+
+  it("refuses to rewrite ONLY when the deployed map cannot be read at all", async () => {
+    // A map we cannot parse is a map we cannot preserve. This is the fail-closed half, and
+    // it is distinct from a pre-ENG-308 route with no map at all — that one has nothing to
+    // lose and must still be overwritten (asserted in the findOrphanedCapturePaths block).
+    mockGitHub({
+      "middleware.ts": "// stale middleware\n",
+      // Values that are not JSON — we cannot preserve what we cannot read, so this is the
+      // one case that still leaves the file alone.
+      "app/api/capture/route.ts":
+        'const LIST_BY_PATH: Record<string, string> = { "/": someIdentifier\n};\n',
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/pricing": "list_p" }));
+
+    expect(result.committed).toBe(true);
+    expect(treePaths()).not.toContain("app/api/capture/route.ts");
+    expect(treePaths()).toEqual(expect.arrayContaining(["middleware.ts"]));
+    // ⚠ committed:true here does NOT mean the capture route carries the caller's pixel — it
+    // was deliberately excluded. Callers configuring tracking must be able to see that, or
+    // they report success over a route we never wrote.
+    expect(result.captureRouteSkipped).toBe(true);
+  });
+
+  it("flags a skipped capture route even when NOTHING is committed (up-to-date no-op)", async () => {
+    // The gap a commit-status flag alone leaves: every other file already matches, so we
+    // return "up-to-date" and never write the route — which was unreadable anyway. A caller
+    // configuring tracking would otherwise see a clean no-op over a route we did not touch.
+    mockGitHub({
+      "middleware.ts": buildLandingPageMiddleware(),
+      "lib/agentweb-track.ts": buildTrackingHelper(),
+      "app/api/capture/route.ts":
+        'const LIST_BY_PATH: Record<string, string> = { "/": someIdentifier\n};\n',
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/pricing": "list_p" }));
+
+    expect(result.committed).toBe(false);
+    expect(result.reason).toBe("up-to-date");
+    expect(result.captureRouteSkipped).toBe(true);
+    expect(mockAxiosPatch).not.toHaveBeenCalled();
+  });
+
+  it("commits the capture route normally when the deployed map has no extra paths", async () => {
+    // The guard must not become "never update anything". A deployed map that is a subset of
+    // ours (a page was added) is not hand-edited and must still be rewritten.
+    mockGitHub({
+      "middleware.ts": "// stale middleware\n",
+      "app/api/capture/route.ts": buildCaptureRoute({ "/pricing": "list_p" }),
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({
+      "/pricing": "list_p",
+      "/new": "list_n",
+    }));
+
+    expect(result.committed).toBe(true);
+    expect(treePaths()).toContain("app/api/capture/route.ts");
+    expect(blobForPath("app/api/capture/route.ts")).toBe(
+      buildCaptureRoute({ "/pricing": "list_p", "/new": "list_n" }),
+    );
+  });
+
+  it("makes NO commit when preserving leaves the deployed route byte-identical", async () => {
+    // Every.io's steady state: the rebuilt route (DB pages + the preserved "/") equals what
+    // is already deployed, so there is no commit and no live redeploy — on every sync.
+    mockGitHub({
+      "middleware.ts": buildLandingPageMiddleware(),
+      "lib/agentweb-track.ts": buildTrackingHelper(),
+      "app/api/capture/route.ts": buildCaptureRoute({
+        "/": "list_root_handmade",
+        "/pricing": "list_p",
+      }),
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/pricing": "list_p" }));
+
+    expect(result.committed).toBe(false);
+    expect(result.reason).toBe("up-to-date");
+  });
+
   it("commits the FULL site map, not just one page", async () => {
     mockGitHub({
       "middleware.ts": "// stale\n",
@@ -403,6 +520,8 @@ describe("syncLeadCaptureFilesToRepo", () => {
         : { "/a": "list_a", "/b": "list_b" };     // retry: fresh, includes the sibling that landed
     };
 
+    // Every file reads 404 here on purpose (see above) so each attempt reaches a real commit.
+    // REPO is an lp-* repo, so the install floor permits creating the layer.
     const result = await syncLeadCaptureFilesToRepo(REPO, buildListByPath);
 
     expect(result.committed).toBe(true);
@@ -424,6 +543,89 @@ describe("syncLeadCaptureFilesToRepo", () => {
 });
 
 // =============================================================================
+// =============================================================================
+// The install guard: only ever write a capture layer we own, on a repo we generated
+// =============================================================================
+const BESPOKE_REPO = "AgentWebPro/agentweb-landing-page"; // hireemma.ai — AgentWeb's own site
+const OWNED_MIDDLEWARE = buildLandingPageMiddleware(); // carries the aw_first_touch marker
+
+describe("syncLeadCaptureFilesToRepo — install guard", () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it("REFUSES a bespoke repo with no capture layer at all", async () => {
+    mockGitHub({});
+    const result = await syncLeadCaptureFilesToRepo(BESPOKE_REPO, () => ({ "/": "list_1" }));
+
+    expect(result).toEqual({ committed: false, reason: NO_CAPTURE_LAYER });
+    expect(mockAxiosPatch).not.toHaveBeenCalled();
+    expect(treePaths()).toEqual([]);
+  });
+
+  it("REFUSES a bespoke repo whose root middleware.ts is its OWN, and never overwrites it", async () => {
+    // The case a bare "middleware.ts exists" check gets wrong. A bespoke Next.js app may
+    // legitimately run middleware for auth/i18n/redirects; treating that as our capture layer
+    // would CLOBBER it — worse than the bug this guard exists for.
+    const customMiddleware = "export function middleware(req) { /* their auth gate */ }\n";
+    mockGitHub({ "middleware.ts": customMiddleware });
+
+    const result = await syncLeadCaptureFilesToRepo(BESPOKE_REPO, () => ({ "/": "list_1" }));
+
+    expect(result).toEqual({ committed: false, reason: NO_CAPTURE_LAYER });
+    expect(treePaths()).toEqual([]);
+    expect(mockAxiosPatch).not.toHaveBeenCalled();
+    // Nothing we uploaded may be our middleware — their file stands untouched.
+    for (const content of blobBySha.values()) expect(content).not.toBe(OWNED_MIDDLEWARE);
+  });
+
+  it("REFUSES a bespoke repo carrying its own app/api/capture/route.ts", async () => {
+    // v0-xc-ures-landing-page really is in this state, which is why a capture-route marker
+    // would be the wrong ownership signal.
+    mockGitHub({ "app/api/capture/route.ts": "// their own capture handler\n" });
+    const result = await syncLeadCaptureFilesToRepo(BESPOKE_REPO, () => ({ "/": "list_1" }));
+    expect(result.reason).toBe(NO_CAPTURE_LAYER);
+  });
+
+  it("ALLOWS a platform-generated repo with no layer yet — the pre-ENG-309 repair case", async () => {
+    mockGitHub({});
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }));
+
+    expect(result.committed).toBe(true);
+    expect(treePaths()).toEqual(expect.arrayContaining(["middleware.ts", "app/api/capture/route.ts"]));
+  });
+
+  it("ALLOWS any repo that already carries OUR layer — those are files we wrote", async () => {
+    mockGitHub({
+      "middleware.ts": OWNED_MIDDLEWARE,
+      "lib/agentweb-track.ts": "// stale helper\n",
+      "app/api/capture/route.ts": "// stale route\n",
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(BESPOKE_REPO, () => ({ "/": "list_1" }));
+
+    expect(result.committed).toBe(true);
+  });
+});
+
+describe("isPlatformGeneratedRepo", () => {
+  it("recognises platform-generated repos", () => {
+    expect(isPlatformGeneratedRepo("AgentWebPro/lp-taskflow-test-page-249d7f67")).toBe(true);
+    expect(isPlatformGeneratedRepo("lp-demystifying-ai-agentweb-lead-180f2e2b")).toBe(true);
+  });
+
+  it("rejects the bespoke and v0-era customer sites, which is the whole point", () => {
+    // Real production repos: 34 landing-page records point at these four.
+    for (const r of [
+      "AgentWebPro/agentweb-landing-page",
+      "AgentWebPro/v0-xc-ures-landing-page",
+      "AgentWebPro/v0-waldium-lander",
+      "AgentWebPro/v0-haven-ai-landing-page",
+    ]) {
+      expect(isPlatformGeneratedRepo(r)).toBe(false);
+    }
+  });
+});
+
 // Route: PATCH /generated/:id/lead-list
 // =============================================================================
 const app: Application = express();
@@ -461,7 +663,12 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
     mockGetLandingPageById.mockResolvedValue(rootPage);
     mockGetUserById.mockResolvedValue({ userId: "u1" });
     mockUpdateLeadList.mockResolvedValue(undefined);
-    mockGetLeadListById.mockResolvedValue({ listId: "list_home", userId: "u1" });
+    // ENG-967: a page-bound list is publicly submittable in the healthy state this suite
+    // describes. Leaving the flag off here would make every case below also exercise the
+    // enabling write and carry its warning — the binding behaviour is covered on its own in
+    // routes.landingPages.leadList.test.ts.
+    mockGetLeadListById.mockResolvedValue({ listId: "list_home", userId: "u1", publicAccessEnabled: true });
+    mockUpdateLeadListRecord.mockResolvedValue(undefined);
     mockGetLandingPagesByOwner.mockResolvedValue([rootPage, pricingPage, otherSitePage]);
     mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: true });
   });
@@ -523,6 +730,47 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
     await expect(buildListByPath()).resolves.toEqual({ "/pricing": "list_pricing" });
   });
 
+  it("BESPOKE REPO: DETACHING says 'removed', not 'saved'", async () => {
+    const bespoke = { ...rootPage, githubRepoUrl: "https://github.com/AgentWebPro/agentweb-landing-page", leadListId: "list_home" };
+    mockGetLandingPageById.mockResolvedValue(bespoke);
+    mockGetLandingPagesByOwner.mockResolvedValue([bespoke]);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: false, reason: NO_CAPTURE_LAYER });
+
+    const res = await request(app)
+      .patch("/api/landing-pages/v0/generated/p1/lead-list")
+      .send({ leadListId: null });
+
+    expect(res.status).toBe(200);
+    expect(res.body.captureSyncWarning).toMatch(/^Lead list removed/);
+    expect(res.body.captureSyncWarning).not.toMatch(/Lead list saved/);
+  });
+
+  it("BESPOKE REPO: the lead-list path may not install a capture layer, and says so accurately", async () => {
+    // hireemma.ai. 34 production records point at four repos like this one. Committing here
+    // would CREATE a root middleware.ts on AgentWeb's own marketing site.
+    const bespoke = { ...rootPage, githubRepoUrl: "https://github.com/AgentWebPro/agentweb-landing-page" };
+    mockGetLandingPageById.mockResolvedValue(bespoke);
+    mockGetLandingPagesByOwner.mockResolvedValue([bespoke]);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: false, reason: NO_CAPTURE_LAYER });
+
+    const res = await request(app)
+      .patch("/api/landing-pages/v0/generated/p1/lead-list")
+      .send({ leadListId: "list_home" });
+
+    expect(res.status).toBe(200);
+    // The route still calls the sync — the refusal is decided centrally in the service, so
+    // no caller can opt out of it or forget to opt in.
+    expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(
+      "AgentWebPro/agentweb-landing-page",
+      expect.any(Function),
+      undefined,
+      undefined,
+    );
+    // ⚠ Wording matters: this is NOT transient, so it must not promise a later retry.
+    expect(res.body.captureSyncWarning).toMatch(/does not use the platform's lead-capture code/);
+    expect(res.body.captureSyncWarning).not.toMatch(/next deploy or retry/);
+  });
+
   it("a GitHub failure does not lose the DB write — 200 with captureSyncWarning", async () => {
     mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: false, reason: "github 500: boom" });
 
@@ -560,6 +808,23 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
     expect(res.body.captureSyncWarning).toBeUndefined();
   });
 
+  it("ENG-967: a failed public-access enable and a failed repo sync BOTH surface", async () => {
+    // Two independent failures, one response field. Reporting only the sync failure would
+    // tell the customer to check GitHub while their form keeps 403ing at forward-lead.
+    mockGetLeadListById.mockResolvedValue({ listId: "list_home", userId: "u1", publicAccessEnabled: false });
+    mockUpdateLeadListRecord.mockRejectedValue(new Error("dynamo blip"));
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: false, reason: "github 500: boom" });
+
+    const res = await request(app)
+      .patch("/api/landing-pages/v0/generated/p1/lead-list")
+      .send({ leadListId: "list_home" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings).toHaveLength(2);
+    expect(res.body.captureSyncWarning).toMatch(/public/);
+    expect(res.body.captureSyncWarning).toMatch(/boom/);
+  });
+
   it("an up-to-date repo is not a warning", async () => {
     mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: false, reason: "up-to-date" });
 
@@ -569,5 +834,75 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.captureSyncWarning).toBeUndefined();
+  });
+});
+
+/**
+ * ENG-926 §B — a hand-edited capture route must never be silently overwritten.
+ *
+ * Every.io's root path "/" is hand-added to its deployed LIST_BY_PATH: the AW-LandingPages
+ * record that owned "/" was archived while the frontend stayed live, so the entry exists in
+ * the repo and in no database. Regenerating from the DB drops it and the site's root form
+ * answers 422 to real visitors on a live managed client.
+ *
+ * This was always true of any regeneration. It stayed asleep only because the idempotence
+ * check usually found the file already up to date and made no commit — so ANY change to
+ * buildCaptureRoute wakes it, for this repo and for any other hand-edited one that nothing
+ * tracks. Failing closed is the only safe reading of "we cannot tell a deliberate hand-edit
+ * from a page legitimately deleted".
+ */
+describe('ENG-926 §B — findOrphanedCaptureEntries', () => {
+  const routeWith = (map: Record<string, string>) =>
+    buildCaptureRoute(map, undefined, undefined, undefined);
+
+  it('finds nothing when the deployed map matches ours', () => {
+    const map = { '/a': 'list_a', '/b': 'list_b' };
+    expect(findOrphanedCaptureEntries(routeWith(map), map)).toEqual({});
+  });
+
+  it('finds nothing when OUR map has grown — a new page is not an orphan', () => {
+    const deployed = routeWith({ '/a': 'list_a' });
+    expect(findOrphanedCaptureEntries(deployed, { '/a': 'list_a', '/b': 'list_b' })).toEqual({});
+  });
+
+  it('returns the hand-added entry WITH its list id — the real Every.io shape', () => {
+    // The list id is what makes preserving possible; a bare path could not be carried.
+    const deployed = routeWith({ '/': 'list_root_handmade', '/pricing': 'list_p' });
+    expect(findOrphanedCaptureEntries(deployed, { '/pricing': 'list_p' })).toEqual({
+      '/': 'list_root_handmade',
+    });
+  });
+
+  it('parses a SINGLE-LINE map, not just the pretty-printed one', () => {
+    // A deployed file may be single-line, from an older builder or a hand-edit. A regex
+    // that only matched the pretty form read those as unreadable and froze the site —
+    // caught by 14 real test failures, not by review.
+    expect(
+      findOrphanedCaptureEntries(
+        'const LIST_BY_PATH: Record<string, string> = {"/features":"list_features"};',
+        { '/pricing': 'list_p' },
+      ),
+    ).toEqual({ '/features': 'list_features' });
+  });
+
+  it('returns null when a map exists but its VALUES are not JSON', () => {
+    expect(
+      findOrphanedCaptureEntries(
+        'const LIST_BY_PATH: Record<string, string> = { "/": someIdentifier\n};',
+        {},
+      ),
+    ).toBeNull();
+  });
+
+  it('treats a PRE-ENG-308 route with no map at all as nothing to preserve', () => {
+    // Those routes hardcode a single list id and have no LIST_BY_PATH. Overwriting them is
+    // exactly what ENG-310 is for — PMPS's repo is this shape, and refusing here would
+    // silently stop the UTM-repair path for every old customer repo.
+    expect(findOrphanedCaptureEntries('const LEAD_LIST_ID = "list_old";', {})).toEqual({});
+    expect(findOrphanedCaptureEntries('export const nothing = 1', {})).toEqual({});
+  });
+
+  it('treats an ABSENT file as nothing to preserve, so a first-time sync still writes', () => {
+    expect(findOrphanedCaptureEntries(null, { '/a': 'list_a' })).toEqual({});
   });
 });

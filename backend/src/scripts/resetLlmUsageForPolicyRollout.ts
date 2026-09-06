@@ -14,6 +14,7 @@ import AWS from 'aws-sdk';
 AWS.config.update({ region: process.env.AWS_REGION || 'us-west-2' });
 
 const apply = process.argv.includes('--apply');
+const allBillingUsers = process.argv.includes('--all-billing-users');
 
 function readTargetBillingUserIds(): string[] {
   const direct = process.argv
@@ -37,13 +38,19 @@ async function main() {
   } = await import('../services/llmUsageCreditService');
   const currentMonth = getCurrentUsageMonth();
   const requestedBillingUserIds = readTargetBillingUserIds();
-  if (requestedBillingUserIds.length === 0) {
-    throw new Error('Pass at least one --billing-user-id=<id> or --billing-user-ids-file=<path>; unrestricted scans are forbidden');
+  if (allBillingUsers && !process.argv.includes('--confirm-all-billing-users')) {
+    throw new Error('--all-billing-users requires --confirm-all-billing-users');
+  }
+  if (!allBillingUsers && requestedBillingUserIds.length === 0) {
+    throw new Error('Pass a billing user target or --all-billing-users --confirm-all-billing-users');
   }
   const billingUsers = new Set<string>();
   let inspected = 0;
 
-  for (const requestedBillingUserId of requestedBillingUserIds) {
+  const requestedIds = allBillingUsers
+    ? (await userDb.getAllUsers()).map((user) => String(user.userId))
+    : requestedBillingUserIds;
+  for (const requestedBillingUserId of requestedIds) {
     const canonicalBillingUserId = await resolveBillingUserId(requestedBillingUserId);
     const target = await userDb.getUserById(canonicalBillingUserId);
     if (target && !String(target.userId).startsWith('deleted_')) {
@@ -86,7 +93,7 @@ async function main() {
   }
   console.log(JSON.stringify({
     mode: apply ? 'apply' : 'dry-run', currentMonth,
-    targets: requestedBillingUserIds, summary,
+    targets: allBillingUsers ? 'all billing users' : requestedBillingUserIds, summary,
   }, null, 2));
 }
 

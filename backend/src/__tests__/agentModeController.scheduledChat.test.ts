@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import * as sseProgress from '../utils/sseProgress';
 
 // Mock all dependencies before importing the controller
 // Mock subscriptionService so subscription checks always pass in tests
@@ -58,6 +59,7 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   generateMarketingResponseWorkerService: {
     runInWorker: jest.fn(),
     releaseSessionClients: jest.fn(),
+    cancelSession: jest.fn(),
   },
 }));
 
@@ -101,6 +103,7 @@ jest.mock('../services/emailService', () => ({
     sendScheduledChatErrorEmail: jest.fn(),
     sendScheduledChatTokenLimitEmail: jest.fn(),
     sendScheduledRunFailedEmail: jest.fn(),
+    sendScheduleSourcingBlockTransitionEmail: jest.fn(),
   },
 }));
 
@@ -128,6 +131,14 @@ jest.mock('../services/notionService', () => ({
   createOncallItem: jest.fn().mockResolvedValue(undefined),
 }));
 
+// ENG-1719: previously unmocked — real calls silently failed and were swallowed by the
+// caller's own .catch(), which is why no existing test needed this. Mocking it is a strict
+// improvement (a resolved no-op instead of a failing real network call) and lets the new
+// session-busy test below assert it was correctly skipped.
+jest.mock('../services/intakeService', () => ({
+  fileAutoIssue: jest.fn().mockResolvedValue(undefined),
+}));
+
 jest.mock('../services/skillService', () => ({
   skillService: {
     getPublishedSkills: jest.fn().mockResolvedValue([]),
@@ -143,7 +154,15 @@ import { generateMarketingResponseWorkerService } from '../services/generateMark
 import { getAllowedFunctionCalls, getAllowedSkills, isSubscriptionFeatureEnabled } from '../services/subscriptionService';
 import { skillService } from '../services/skillService';
 import { checkTokenUsage } from '../services/tokenUsageService';
-import { agentModeController, runScheduledChat } from '../controllers/agentModeController';
+import { fileAutoIssue } from '../services/intakeService';
+import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import {
+  agentModeController,
+  runScheduledChat,
+  activeSessionGenerations,
+  tryClaimSessionGeneration,
+  RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS,
+} from '../controllers/agentModeController';
 
 const mockedGetAllowedFunctionCalls = getAllowedFunctionCalls as jest.MockedFunction<typeof getAllowedFunctionCalls>;
 const mockedGetAllowedSkills = getAllowedSkills as jest.MockedFunction<typeof getAllowedSkills>;
@@ -158,6 +177,8 @@ const mockTaskDb = taskDb as jest.Mocked<typeof taskDb>;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockEmailService = emailService as jest.Mocked<typeof emailService>;
 const mockGenerateMarketingResponseWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
+const mockFileAutoIssue = fileAutoIssue as jest.Mock;
+const mockSendAgentModeOncallAlert = sendAgentModeOncallAlert as jest.Mock;
 
 describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
   const mockUserId = 'test-user-123';
@@ -338,6 +359,132 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(result.status).toBe('failure');
       expect(mockGenerateMarketingResponseWorkerService.releaseSessionClients)
         .toHaveBeenCalledWith(result.sessionId);
+    });
+
+    // ENG-1719: live-found on production — this schedule's own catch block previously
+    // treated SessionBusyError (thrown by runVerifiedChat when it can't claim the session
+    // lock — e.g. the customer is live-chatting on this exact session when the schedule
+    // fires) exactly like a genuine crash: paged on-call and auto-filed a Linear ticket for
+    // completely ordinary, expected contention that resolves itself at the next run.
+    describe('session-busy contention (ENG-1719)', () => {
+      afterEach(() => {
+        activeSessionGenerations.clear();
+      });
+
+      it('does not page on-call or file an auto-issue when the session is already busy', async () => {
+        // Pre-claim the lock exactly like a live /generate turn on this session would —
+        // runVerifiedChat's own claim (inside its multi-attempt loop, before any
+        // generation happens) then fails and throws SessionBusyError. Real timers: the
+        // claim genuinely retries for ~12s before giving up, same as production.
+        tryClaimSessionGeneration(mockSession.sessionId);
+
+        const result = await runScheduledChat(baseSchedule, mockUserId, true);
+
+        expect(result.status).toBe('failure');
+        expect(result.actualResponse).toMatch(/session was busy/i);
+        // The worker was never even reached — the claim fails before generation starts.
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+        // The whole point of the fix: no false alarm for benign contention.
+        expect(mockSendAgentModeOncallAlert).not.toHaveBeenCalled();
+        expect(mockFileAutoIssue).not.toHaveBeenCalled();
+        // Also must not stamp a scary error onto the customer's own session record.
+        expect(mockChatbotDb.updateSessionError).not.toHaveBeenCalled();
+      }, 15000);
+
+      it('still records a run-history entry, so the skip is not invisible', async () => {
+        tryClaimSessionGeneration(mockSession.sessionId);
+
+        await runScheduledChat(baseSchedule, mockUserId, true);
+
+        expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith(
+          mockScheduleId,
+          expect.objectContaining({ status: 'failure', actualResponse: expect.stringMatching(/session was busy/i) }),
+        );
+      }, 15000);
+
+      it('a genuine (non-busy) failure still writes the session error as before', async () => {
+        // Regression guard for the fix itself: the new branch must be gated on
+        // isSessionBusyError specifically, not swallow every error. updateSessionError is
+        // the one write the busy-branch above explicitly (and only) skips, so it's the
+        // most direct signal that the generic path still runs unchanged for a real failure.
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(new Error('worker died'));
+
+        const result = await runScheduledChat(baseSchedule, mockUserId, true);
+
+        expect(result.status).toBe('failure');
+        expect(mockChatbotDb.updateSessionError).toHaveBeenCalled();
+      });
+    });
+
+    // ENG-1719 follow-up (from a scoped re-review of the fix above): runVerifiedChat only
+    // just gained a wall-clock timeout, so this catch could never receive an
+    // isGenerationTimeout error before now. withGenerationTimeout's own contract is that it
+    // does NOT cancel the underlying generation on timeout — it keeps running. The
+    // zero-output detection below can then misread a merely-slow run as having produced
+    // nothing and schedule an automatic RESUME on the SAME sessionId as little as 15 minutes
+    // later, which would race the still-running orphan for the same session — the identical
+    // concurrent-write class this whole PR exists to close, just self-inflicted this time.
+    describe('generation-timeout orphan cancellation (ENG-1719 follow-up)', () => {
+      it('cancels the orphaned generation before falling through to the normal error path', async () => {
+        const requestCancelSpy = jest.spyOn(sseProgress, 'requestCancel');
+        const timeoutError = Object.assign(new Error('Generation timed out'), { isGenerationTimeout: true });
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(timeoutError);
+
+        const result = await runScheduledChat(baseSchedule, mockUserId, true);
+
+        // Cancelled the orphan...
+        expect(requestCancelSpy).toHaveBeenCalledWith(mockSession.sessionId);
+        expect(mockGenerateMarketingResponseWorkerService.cancelSession).toHaveBeenCalledWith(mockSession.sessionId);
+        // ...but a genuine timeout is NOT benign like SessionBusyError — it still falls
+        // through to the normal error/zero-output handling rather than returning early.
+        expect(result.status).toBe('failure');
+
+        requestCancelSpy.mockRestore();
+      });
+
+      it('does not cancel anything for a non-timeout error', async () => {
+        const requestCancelSpy = jest.spyOn(sseProgress, 'requestCancel');
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(new Error('worker died'));
+
+        await runScheduledChat(baseSchedule, mockUserId, true);
+
+        expect(requestCancelSpy).not.toHaveBeenCalled();
+        expect(mockGenerateMarketingResponseWorkerService.cancelSession).not.toHaveBeenCalled();
+
+        requestCancelSpy.mockRestore();
+      });
+    });
+
+    describe('LONG lock-timeout for headless runs (ENG-1719 follow-up)', () => {
+      beforeEach(() => {
+        jest.useFakeTimers();
+      });
+
+      afterEach(() => {
+        jest.useRealTimers();
+        activeSessionGenerations.clear();
+      });
+
+      it('honors the LONG lock-timeout override instead of the short human-waiting default', async () => {
+        // Worker call never settles — simulates a stuck LLM/tool call. runScheduledChat is
+        // headless (maxAttempts:20, nobody blocked waiting) and must pass
+        // RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS through to runVerifiedChat — if it fell back
+        // to the short human-waiting default instead, this lock would release well before
+        // the 120-minute mark checked below.
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => new Promise(() => {}));
+
+        const runPromise = runScheduledChat(baseSchedule, mockUserId, true);
+
+        // Past the SHORT default (90 min) but well inside the LONG ceiling (6 hr).
+        await jest.advanceTimersByTimeAsync(120 * 60 * 1000);
+        expect(activeSessionGenerations.has(mockSession.sessionId)).toBe(true);
+
+        // Now past the LONG ceiling too — must release.
+        await jest.advanceTimersByTimeAsync(RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS);
+        const result = await runPromise;
+        expect(result.status).toBe('failure');
+        expect(activeSessionGenerations.has(mockSession.sessionId)).toBe(false);
+      }, 30000);
     });
 
     // ENG-657: resume an abandoned run whose instance was terminated mid-flight
@@ -540,6 +687,11 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(result.passed).toBe(true);
         // ...and the verify loop does NOT retry (which could have re-driven the tool).
         expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+        // Greptile (ENG-1045) / CodeRabbit (ENG-1276), same finding independently:
+        // the persisted functionCallDetails count must agree with
+        // functionCallMatches/passed — not recount from only the continuation turn's
+        // (empty) toolCalls and silently report `actual: 0` next to `passed: true`.
+        expect(result.functionCallDetails?.[priorCall]).toEqual({ actual: 1, required: 1 });
       });
 
       it('DEFERS when it loses the atomic claim (another dispatcher won) — no resume AND no fresh restart', async () => {
@@ -795,14 +947,23 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       const result = await runScheduledChat(scheduleWithSearchWeb, mockUserId, true);
 
-      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
+      // ENG-1297: you_search_web is read-only, so once it's the ONLY unmet
+      // requirement the read-only press circuit breaker stops the run after its
+      // (small) press budget instead of grinding to maxAttempts (20) — the run
+      // still correctly recognizes legacy_news_search does NOT satisfy
+      // you_search_web (functionCallMatches/functionCallMisses below are
+      // unchanged), it just no longer pays for 18 more identical presses to
+      // reach that same conclusion, and ends as a successful, waived run rather
+      // than a hard failure.
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(2);
       expect(result).toEqual(
         expect.objectContaining({
-          status: 'failure',
-          passed: false,
-          attempt: 20,
+          status: 'success',
+          passed: true,
+          attempt: 2,
           functionCallMatches: [],
           functionCallMisses: ['you_search_web'],
+          readOnlyRequirementWaived: true,
         })
       );
     });
@@ -3608,7 +3769,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // ENG-827: consent is always on the wire as a boolean, never an absent key —
       // see agentModeController.scheduledChatConsentShape.test.ts for why.
       autopublishAuthorized: s.autopublishAuthorized === true,
-      runHealth: { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0 },
+      // ENG-1131 adds lastRunBlockedBy (why the last run could not source), null here.
+      runHealth: { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null },
     });
 
     it('should sort scheduled chats by createdAt descending (newest first)', async () => {
@@ -3853,6 +4015,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costAllowance: null,
         costPercentUsed: 0,
         costEnforced: false,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
       });
 
       const scheduleWithEmails = {
@@ -3888,6 +4052,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costAllowance: null,
         costPercentUsed: 0,
         costEnforced: false,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
       });
 
       const scheduleNoEmails = {
@@ -3921,6 +4087,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costAllowance: null,
         costPercentUsed: 0,
         costEnforced: false,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
       });
 
       const scheduleWithEmails = { ...baseSchedule, requiredFunctionCalls: [], emailNotifications: ['owner@example.com'] };
@@ -3932,7 +4100,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
     });
 
-    it('should render a cost-based block message when the cost cap is the cause and tokens are unlimited', async () => {
+    it('should render a percentage-only block message when the cost cap is the cause — never the raw dollar spend (ENG-1566)', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
         warning: false,
@@ -3946,6 +4114,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costAllowance: 40,
         costPercentUsed: 106,
         costEnforced: true,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
       });
 
       const scheduleWithEmails = {
@@ -3957,9 +4127,47 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       const result = await runScheduledChat(scheduleWithEmails, mockUserId, true);
 
       expect(mockEmailService.sendScheduledChatTokenLimitEmail).toHaveBeenCalled();
-      expect(result.actualResponse).toContain('Monthly cost limit reached');
-      expect(result.actualResponse).toContain('$42.50 / $40.00 spent this month');
+      expect(result.actualResponse).toContain('monthly usage limit');
+      expect(result.actualResponse).toContain('106% used');
+      // ENG-1566: the raw dollar spend/allowance and the "cost" vs "token" dimension
+      // name must never reach the customer — only a percentage of "monthly usage".
+      expect(result.actualResponse).not.toContain('$');
+      expect(result.actualResponse).not.toContain('cost limit');
       expect(result.actualResponse).not.toContain('tokens used');
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('should render a percentage-only block message when the token cap is the cause — never the raw token count (ENG-1566)', async () => {
+      mockedCheckTokenUsage.mockResolvedValueOnce({
+        allowed: false,
+        warning: false,
+        used: 1050000,
+        allowance: 1000000,
+        percentUsed: 105,
+        effectiveAllowance: 1000000,
+        bonus: 0,
+        month: '2026-04',
+        costUsed: 0,
+        costAllowance: null,
+        costPercentUsed: 0,
+        costEnforced: false,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
+      });
+
+      const scheduleWithEmails = {
+        ...baseSchedule,
+        requiredFunctionCalls: [],
+        emailNotifications: ['owner@example.com'],
+      };
+
+      const result = await runScheduledChat(scheduleWithEmails, mockUserId, true);
+
+      expect(result.actualResponse).toContain('monthly usage limit');
+      expect(result.actualResponse).toContain('105% used');
+      expect(result.actualResponse).not.toContain('$');
+      expect(result.actualResponse).not.toContain('token limit');
+      expect(result.actualResponse).not.toContain('1,050,000');
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
     });
 
@@ -4307,6 +4515,99 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           emailNotifications: ['admin@example.com'],
         })
       );
+    });
+  });
+
+  // ENG-1131 follow-up: end-to-end proof that the sourcing-block transition alert
+  // actually wires up through the real runScheduledChat flow, not just the pure
+  // helper functions it's built from in isolation. This is the exact gap that let
+  // a real bug (the alert firing on manual "Test this schedule" runs, with no
+  // !isTest guard) ship unnoticed — every other coverage for this feature tested
+  // detectRunBlockedReason/didSourcingBlockStateChange/the email template as
+  // isolated pure functions, never the actual wiring inside runScheduledChat.
+  describe('sourcing-block transition alert wiring (ENG-1131 follow-up)', () => {
+    const blockedToolCallsResponse = {
+      ...mockResponse,
+      toolCalls: [
+        { name: 'linkedin_outreach', arguments: {}, result: { searchUnavailable: true } },
+      ],
+    };
+
+    it('fires the transition alert on a REAL scheduled run when sourcing just became blocked', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      // Prior run was healthy (no blockedBy) — the schedule re-fetched mid-run must
+      // see this via getScheduleById, since that's what the transition check reads.
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...baseSchedule,
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(baseSchedule, mockUserId, false); // isTest=false: a real run
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).toHaveBeenCalledTimes(1);
+      const [, , , isNowBlocked] = mockEmailService.sendScheduleSourcingBlockTransitionEmail.mock.calls[0];
+      expect(isNowBlocked).toBe(true);
+    });
+
+    it('does NOT fire the transition alert on a manual "Test this schedule" run (isTest=true)', async () => {
+      // Same blocked-transition shape as the test above — the ONLY difference is
+      // isTest=true. A manual test click must never send this unsolicited alert.
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...baseSchedule,
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(baseSchedule, mockUserId, true); // isTest=true
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
+    });
+
+    it('does NOT fire the alert on a real run when there is no transition (already blocked last run too)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...baseSchedule,
+        runResults: [{ status: 'success', passed: true, blockedBy: 'linkedin_search_unavailable', createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(baseSchedule, mockUserId, false);
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
+    });
+
+    // A user can edit a schedule's notification settings WHILE a run (which can take
+    // minutes) is already in flight. The transition check already re-fetches the
+    // schedule for its runResults — reusing that SAME fresh copy for recipients and
+    // the opt-out check costs nothing extra and honors the edit immediately, instead
+    // of silently applying it only starting from the NEXT run.
+    it('uses the freshly re-fetched schedule, not the stale function-entry copy, for recipients', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      const staleSchedule = { ...baseSchedule, emailNotifications: ['stale@example.com'] };
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...staleSchedule,
+        emailNotifications: ['fresh@example.com'], // edited mid-run
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(staleSchedule, mockUserId, false);
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).toHaveBeenCalledTimes(1);
+      const [recipients] = mockEmailService.sendScheduleSourcingBlockTransitionEmail.mock.calls[0];
+      expect(recipients).toEqual(['fresh@example.com']);
+    });
+
+    it('honors a mid-run opt-out edit: suppresses the alert using the freshly re-fetched disableSourcingBlockAlerts', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      const staleSchedule = { ...baseSchedule, disableSourcingBlockAlerts: false };
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...staleSchedule,
+        disableSourcingBlockAlerts: true, // owner just turned this on mid-run
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(staleSchedule, mockUserId, false);
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
     });
   });
 });

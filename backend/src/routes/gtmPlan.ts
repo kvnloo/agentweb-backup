@@ -1493,7 +1493,11 @@ router.post("/:planId/phases/:phaseId/work-items/:workItemId/start-session", aut
     // Dynamic imports to avoid loading server.ts → app.ts chain at module load time
     const { generateSessionResponse } = await import('../controllers/agentModeController');
     const { io } = await import('../server');
-    generateSessionResponse(session.sessionId, initialMessage, userId, modelToUse, workItemAttachments.length > 0 ? workItemAttachments : undefined)
+    const { cronJobRegistry } = await import('../utils/cronJobRegistry');
+    // ENG-1189: this turn's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener.
+    cronJobRegistry.track('gtmPlanAgentTurn', generateSessionResponse(session.sessionId, initialMessage, userId, modelToUse, workItemAttachments.length > 0 ? workItemAttachments : undefined))
       .then(() => {
         console.log(`GTM work item session ${session.sessionId}: AI response generated`);
         io.to(`user:${userId}`).emit("gtm-session-ready", {

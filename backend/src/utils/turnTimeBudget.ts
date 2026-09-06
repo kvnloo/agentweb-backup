@@ -102,19 +102,26 @@ export function buildTurnTimeBudgetNudge(
     return (
       `[SYSTEM] Time budget: about ${remainingSeconds}s of wall-clock time remain for this turn. ` +
       `Stop starting new research, searches, browsing or pagination. Complete any pending writes ` +
-      `now, then write your answer with the results you already have. If the request had several ` +
-      `parts, deliver the parts you completed and say plainly which parts are still missing.`
+      `now, then write your answer with the results you already have, split into two labeled ` +
+      `sections: "Verified:" for anything you confirmed with a tool call in THIS session, and ` +
+      `"Unverified / not checked:" for anything else — recalled from memory, estimated, or not yet ` +
+      `looked up. Never state an item from the unverified section as if it were confirmed. If the ` +
+      `request had several parts, deliver the parts you completed and say plainly which parts are ` +
+      `still missing.`
     );
   }
   return (
     `[SYSTEM WARNING] The time limit for this turn is about to be reached (~${remainingSeconds}s left). ` +
     `Any tool call you make now will be DISCARDED without running, so calling one only wastes the ` +
     `time you have left. Do not call any more tools. Write your final answer NOW using ` +
-    `everything you already gathered so far, even if it is incomplete: lead with a short "Partial ` +
-    `results" note stating which parts are done and which are missing, then give the actual content ` +
-    `you have (lists, findings, links), and finish by telling the user they can reply "continue" to ` +
-    `pick up the rest. Never reply with only an apology or a request to try again — partial output is ` +
-    `far more useful than none.`
+    `everything you already gathered so far, even if it is incomplete. Split the answer into two ` +
+    `labeled sections: "Verified:" — only facts or numbers you confirmed with a tool call in THIS ` +
+    `session — and "Unverified / not checked:" — anything else, including recalled or estimated ` +
+    `figures and parts you did not get to. Never assert an item from the unverified section as fact. ` +
+    `Lead with a short "Partial results" note stating which parts are done and which are missing, ` +
+    `then give the actual content you have (lists, findings, links) under the right section, and ` +
+    `finish by telling the user they can reply "continue" to pick up the rest. Never reply with only ` +
+    `an apology or a request to try again — a labeled partial answer is far more useful than none.`
   );
 }
 
