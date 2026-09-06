@@ -352,20 +352,92 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * live there at all).
      */
     describe('2026-08-19 — quality/cost meter scores', () => {
-      const SCORED_IDS = [
-        'anthropic.claude-opus-5', 'anthropic.claude-opus-4-8', 'anthropic.claude-opus-4-6-v1',
-        'anthropic.claude-sonnet-5', 'anthropic.claude-sonnet-4-6', 'anthropic.claude-sonnet-4-5-20250929-v1:0',
-        'anthropic.claude-haiku-4-5-20251001-v1:0',
-        'gpt-5.5', 'gpt-5.4', 'gpt-5.4-nano',
-        'gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.5-flash', 'gemini-3.7-flash', 'gemini-3.1-flash-lite',
-        'openrouter/openai/gpt-4o-mini', 'openrouter/x-ai/grok-4.6',
-        'openrouter/deepseek/deepseek-v4-pro', 'openrouter/deepseek/deepseek-v4-flash',
-        'openrouter/qwen/qwen3.8-max', 'openrouter/mistralai/mistral-small-2603',
-        'openrouter/moonshotai/kimi-k3', 'openrouter/moonshotai/kimi-k2.7-code',
-        'openrouter/z-ai/glm-5.2', 'openrouter/z-ai/glm-4.7-flash',
-        'openrouter/openai/gpt-5.6-sol', 'openrouter/openai/gpt-5.6-terra', 'openrouter/openai/gpt-5.6-luna',
-        'openrouter/openai/gpt-6-astra', // ENG-1769
+      // ENG-1786: human-supplied AA v4.2 research, canonical/default variants,
+      // snapshot 2026-09-05. These are benchmark variants, not runtime effort settings.
+      const AA_V42: [string, number, string][] = [
+        ['openrouter/anthropic/claude-fable-5.1', 57, 'Claude Fable 5.1, Adaptive Reasoning, Max Effort'],
+        ['openrouter/openai/gpt-6-astra', 55, 'GPT-6 Astra, max'],
+        ['anthropic.claude-opus-5', 54, 'Claude Opus 5, Adaptive Reasoning, Max Effort'],
+        ['openrouter/openai/gpt-5.6-sol', 51, 'GPT-5.6 Sol, max'],
+        ['openrouter/x-ai/grok-4.6', 51, 'Grok 4.6, high'],
+        ['openrouter/moonshotai/kimi-k3', 50, 'Kimi K3, max'],
+        ['openrouter/openai/gpt-5.6-terra', 47, 'GPT-5.6 Terra, max'],
+        ['openrouter/qwen/qwen3.8-max', 47, 'Qwen3.8 Max, reasoning'],
+        ['gemini-3.8-flash', 47, 'Gemini 3.8 Flash, high'],
+        ['gpt-5.5', 46, 'GPT-5.5, xhigh'],
+        ['anthropic.claude-opus-4-8', 46, 'Claude Opus 4.8, Adaptive Reasoning, Max Effort (AA estimate)'],
+        ['anthropic.claude-sonnet-5', 45, 'Claude Sonnet 5, Adaptive Reasoning, Max Effort'],
+        ['gemini-3.7-flash', 45, 'Gemini 3.7 Flash, high'],
+        ['gpt-5.4', 43, 'GPT-5.4, xhigh'],
+        ['openrouter/openai/gpt-5.6-luna', 43, 'GPT-5.6 Luna, max'],
+        ['openrouter/z-ai/glm-5.2', 43, 'GLM 5.2, max'],
+        ['openrouter/deepseek/deepseek-v4-pro', 42, 'DeepSeek V4 Pro 0813, Reasoning, Max Effort'],
+        ['openrouter/qwen/qwen3.8-27b', 41, 'Qwen3.8 27B, xhigh'],
+        ['openrouter/deepseek/deepseek-v4-flash', 41, 'DeepSeek V4 Flash 0731, Reasoning, Max Effort'],
+        ['gemini-3.5-flash', 40, 'Gemini 3.5 Flash, high'],
+        ['anthropic.claude-sonnet-4-6', 38, 'Claude Sonnet 4.6, Adaptive Reasoning, Max Effort'],
+        ['gemini-3.1-pro-preview', 37, 'Gemini 3.1 Pro Preview, reasoning'],
+        ['openrouter/moonshotai/kimi-k2.7-code', 34, 'Kimi K2.7 Code, reasoning'],
+        ['gpt-5.4-nano', 31, 'GPT-5.4 Nano, xhigh (AA estimate)'],
+        ['anthropic.claude-opus-4-6-v1', 31, 'Claude Opus 4.6, Non-reasoning, High Effort'],
+        ['anthropic.claude-sonnet-4-5-20250929-v1:0', 23, 'Claude Sonnet 4.5, Non-reasoning'],
+        ['gemini-3-flash-preview', 21, 'Gemini 3 Flash Preview, Non-reasoning (AA estimate)'],
+        ['gemini-3.1-flash-lite', 19, 'Gemini 3.1 Flash Lite, reasoning'],
+        ['anthropic.claude-haiku-4-5-20251001-v1:0', 17, 'Claude Haiku 4.5, Non-reasoning'],
+        ['openrouter/z-ai/glm-4.7-flash', 17, 'GLM 4.7 Flash, reasoning'],
+        ['openrouter/mistralai/mistral-small-2603', 13, 'Mistral Small 4, reasoning'],
+        ['openrouter/openai/gpt-4o-mini', 1, 'GPT-4o Mini, non-reasoning (AA estimate)'],
       ];
+      const SCORED_IDS = AA_V42.map(([id]) => id);
+
+      it.each(AA_V42)('ENG-1786: %s reports its v4.2 score and canonical variant', async (id, score, variant) => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const info = models.find((model) => model.id === id)!;
+        expect(info.qualityScore).toBe(score);
+        expect(info.qualityScoreSource).toBe(`Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, ${variant}`);
+      });
+
+      it('ENG-1786: every scored registry row names an index version and uses the v4.2 snapshot', () => {
+        const registry = (agentModeService as any).llmModels;
+        const scoredIds = Object.keys(registry).filter((id) => typeof registry[id].qualityScore === 'number');
+        expect(scoredIds.sort()).toEqual([...SCORED_IDS].sort());
+        for (const id of scoredIds) {
+          expect(registry[id].qualityScoreSource).toMatch(/Intelligence Index v\d+\.\d+(?:\.\d+)?\b/);
+          expect(registry[id].qualityScoreSource).toMatch(/^Artificial Analysis Intelligence Index v4\.2, snapshot 2026-09-05, .+/);
+        }
+      });
+
+      it('ENG-1786: Fable (57) > Astra (55) > Sol (51), with Astra directly below Fable', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const quality = (id: string) => models.find((model) => model.id === id)!.qualityScore!;
+        const fable = quality('openrouter/anthropic/claude-fable-5.1');
+        const astra = quality('openrouter/openai/gpt-6-astra');
+        const sol = quality('openrouter/openai/gpt-5.6-sol');
+        expect([fable, astra, sol]).toEqual([57, 55, 51]);
+        expect(fable).toBeGreaterThan(astra);
+        expect(astra).toBeGreaterThan(sol);
+        expect(models.filter((model) => model.qualityScore! > astra).map((model) => model.id))
+          .toEqual(['openrouter/anthropic/claude-fable-5.1']);
+      });
+
+      it.each<[string | undefined, string[]]>([
+        ['gpt5-chat', ['gpt-5.5']],
+        ['gpt5-nano', ['gpt-5.4-nano', 'openrouter/openai/gpt-4o-mini']],
+        ['gemini-flash', ['gemini-3.5-flash', 'gemini-3.7-flash']],
+        ['claude-opus', []],
+        ['claude-sonnet', []],
+        ['claude-fable', []],
+        [undefined, []],
+      ])('ENG-1786: %s keeps its baseline dominance-only legacy rows', async (family, expected) => {
+        // Baseline includes ENG-1784 bands and ENG-1781 Luna pricing.
+        // Static legacy rows remain covered by the existing legacy tests.
+        const registry = (agentModeService as any).llmModels;
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const dominated = models.filter((model) =>
+          registry[model.id].family === family && !registry[model.id].legacy && model.legacy,
+        ).map((model) => model.id);
+        expect(dominated.sort()).toEqual([...expected].sort());
+      });
 
       it.each(SCORED_IDS)('%s has an in-range (0-100) qualityScore and costScore, each with a source note', async (id) => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
@@ -383,12 +455,12 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       // Regression pins on a few real, hand-verified values — catches an
       // accidental reshuffle without re-deriving the whole table in the
-      // assertion. qualityScore is AA Intelligence Index v4.1.1
-      // (live-fetched 2026-08-19); costScore is computed from MODEL_PRICING.
+      // assertion. qualityScore is AA Intelligence Index v4.2
+      // (snapshot 2026-09-05); costScore is computed from MODEL_PRICING.
       it('pins Claude Opus 5 at the real AA-sourced quality / MODEL_PRICING-derived cost values', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
         const info = models.find((m) => m.id === 'anthropic.claude-opus-5')!;
-        expect(info.qualityScore).toBe(63);
+        expect(info.qualityScore).toBe(54);
         expect(info.costScore).toBe(70); // $5/$25 blended 75:25 -> $10.00/1M, log-normalized
         // 70 was the top of the old 64–70 "pro" band; ENG-1784 (2026-09-05)
         // re-cut Flagship to ≥64 precisely so Opus 5 sits with GPT-5.6 Sol.
@@ -398,7 +470,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       it('pins GPT-4o Mini (the cheapest, weakest scored model) at the real values', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
         const info = models.find((m) => m.id === 'openrouter/openai/gpt-4o-mini')!;
-        expect(info.qualityScore).toBe(7);
+        expect(info.qualityScore).toBe(1);
         expect(info.costScore).toBe(22);
         expect(info.tier).toBe('ultra_cheap'); // 22 falls in the <=30 "ultra_cheap" cost band
       });
@@ -411,8 +483,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         const opus5 = (agentModeService as any).llmModels['anthropic.claude-opus-5'];
         const opus48 = (agentModeService as any).llmModels['anthropic.claude-opus-4-8'];
         const opus46 = (agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'];
-        expect(opus48.qualityScore).toBe(57);
-        expect(opus46.qualityScore).toBe(45);
+        expect(opus48.qualityScore).toBe(46);
+        expect(opus46.qualityScore).toBe(31);
         expect(opus5.qualityScore).toBeGreaterThan(opus48.qualityScore);
         expect(opus48.qualityScore).toBeGreaterThan(opus46.qualityScore);
       });
@@ -493,7 +565,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       it('carries a sourced Artificial Analysis quality score', () => {
         const config = (agentModeService as any).llmModels[ASTRA];
-        expect(config.qualityScore).toBe(61);
+        expect(config.qualityScore).toBe(55);
         expect(config.qualityScoreSource).toMatch(/Artificial Analysis/);
       });
 
@@ -510,9 +582,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(astra.costScore!).toBeGreaterThan(sol.costScore!);
       });
 
-      // Same AA Intelligence Index score as Sol's current 61 (v4.1.1) at twice
-      // the price: neither dominates the other, so neither may be auto-flagged
-      // legacy.
+      // Astra is stronger than Sol on v4.2 (55 vs 51), but these distinct
+      // product lines must not auto-retire each other.
       // Enforced structurally — Astra carries no `family` (same treatment as
       // Sol itself and Kimi K3), so the dominance rule never compares them.
       it('does not flip GPT-5.6 Sol to legacy, and is not legacy itself (AC3)', async () => {
