@@ -535,6 +535,58 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     });
 
     /*
+     * ENG-1789 (2026-09-06) — Harsha, after ENG-1786 re-snapshotted quality
+     * scores to AA v4.2: "fable + astra are flagship, opus + 5.6 sol are pro,
+     * sonnet + 5.6 terra are mid, haiku + 5.6 luna are low." A quality-driven
+     * grouping, independent of the cost-driven `tier` field above — see
+     * `qualityTier` / `tierFromQualityScore` / `QUALITY_SCORE_BANDS`. Live
+     * v4.2 scores that day: Fable 5.1 57, Astra 55, Opus 5 54, Sol 51,
+     * Terra 47, Sonnet 5 45, Luna 43, Haiku 4.5 17. Ties resolve to the
+     * higher band (Harsha, 2026-09-06): e.g. Grok 4.6 also scores 51 and
+     * also lands in 'pro', same as Sol.
+     */
+    describe('ENG-1789 — quality bands: Flagship >=55, Pro >=51, Medium >=45, Cheap >=17', () => {
+      const qualityTierOf = async (id: string) => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        return models.find((m) => m.id === id)!.qualityTier;
+      };
+
+      it('puts Claude Fable 5.1 and GPT-6 Astra in the Flagship quality tier', async () => {
+        expect(await qualityTierOf('openrouter/anthropic/claude-fable-5.1')).toBe('ultra_premium');
+        expect(await qualityTierOf('openrouter/openai/gpt-6-astra')).toBe('ultra_premium');
+      });
+
+      it('puts Claude Opus 5 and GPT-5.6 Sol in the Pro quality tier', async () => {
+        expect(await qualityTierOf('anthropic.claude-opus-5')).toBe('pro');
+        expect(await qualityTierOf('openrouter/openai/gpt-5.6-sol')).toBe('pro');
+      });
+
+      it('puts Claude Sonnet 5 and GPT-5.6 Terra in the Medium quality tier', async () => {
+        expect(await qualityTierOf('anthropic.claude-sonnet-5')).toBe('medium');
+        expect(await qualityTierOf('openrouter/openai/gpt-5.6-terra')).toBe('medium');
+      });
+
+      it('puts Claude Haiku 4.5 and GPT-5.6 Luna in the Cheap quality tier', async () => {
+        expect(await qualityTierOf('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe('cheap');
+        expect(await qualityTierOf('openrouter/openai/gpt-5.6-luna')).toBe('cheap');
+      });
+
+      // The quality axis is independent of the cost axis: Opus 5/Sol are
+      // Flagship on cost (ENG-1784, tier: ultra_premium) but only Pro on
+      // quality (qualityTier: pro) — both fields are real and neither
+      // overrides the other.
+      it('keeps qualityTier independent of the cost-derived tier for Opus 5 and Sol', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const opus5 = models.find((m) => m.id === 'anthropic.claude-opus-5')!;
+        const sol = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!;
+        expect(opus5.tier).toBe('ultra_premium');
+        expect(opus5.qualityTier).toBe('pro');
+        expect(sol.tier).toBe('ultra_premium');
+        expect(sol.qualityTier).toBe('pro');
+      });
+    });
+
+    /*
      * ENG-1769 (2026-09-05) — GPT-6 Astra, OpenAI's frontier release of
      * 2026-09-03, routed through OpenRouter and BYOK-served by our own Azure
      * resource (agentweb-openrouter-byok, deployment `gpt-6-astra`; live-

@@ -1025,6 +1025,36 @@ export function tierFromCostScore(costScore: number): ModelTier {
   return band?.tier ?? 'ultra_cheap';
 }
 
+/**
+ * Quality-score band boundaries backing the picker's quality tier grouping
+ * (ENG-1789, 2026-09-06). Independent axis from TIER_COST_SCORE_BANDS above:
+ * that one groups by costScore (what we charge), this one groups by
+ * qualityScore (AA Intelligence Index v4.2, re-snapshotted ENG-1786).
+ * Harsha's directive: "fable + astra are flagship, opus + 5.6 sol are pro,
+ * sonnet + 5.6 terra are mid, haiku + 5.6 luna are low." Solved for
+ * thresholds against the live v4.2 scores (Fable 57, Astra 55, Opus 5 54,
+ * Sol 51, Sonnet 5 45, Terra 47, Haiku 17, Luna 43) with ties resolving to
+ * the higher band (Harsha, 2026-09-06): ultra_premium >=55, pro >=51,
+ * medium >=45, cheap >=17, ultra_cheap below. Same ModelTier union and
+ * >= / highest-band-first shape as the cost bands so the two stay
+ * structurally identical even though they measure different things.
+ */
+export const QUALITY_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minQualityScore: number }> = [
+  { tier: 'ultra_premium', minQualityScore: 55 },
+  { tier: 'pro', minQualityScore: 51 },
+  { tier: 'medium', minQualityScore: 45 },
+  { tier: 'cheap', minQualityScore: 17 },
+  { tier: 'ultra_cheap', minQualityScore: 0 },
+];
+
+/** Derives a model's quality-tier bucket from its qualityScore (independent of cost tier). */
+export function tierFromQualityScore(qualityScore: number): ModelTier {
+  const band = QUALITY_SCORE_BANDS.find((b) => qualityScore >= b.minQualityScore);
+  // Last band has minQualityScore: 0, matching any qualityScore >= 0 — so
+  // `band` is only undefined for a negative/NaN input.
+  return band?.tier ?? 'ultra_cheap';
+}
+
 /** Cheapest-to-most-expensive numeric rank of each tier, for dominance comparison. */
 const TIER_RANK: Record<ModelTier, number> = {
   ultra_cheap: 0,
@@ -1081,7 +1111,15 @@ export type ModelProvider =
 export interface SupportedModelInfo {
   id: string;
   name: string;
+  /** Cost tier — derived from costScore via tierFromCostScore (see TIER_COST_SCORE_BANDS). */
   tier: ModelTier;
+  /**
+   * Quality tier — derived from qualityScore via tierFromQualityScore (see
+   * QUALITY_SCORE_BANDS). Independent axis from `tier`: a model can be
+   * Flagship on quality but Pro on cost, or vice versa. Omitted when
+   * qualityScore itself is omitted (no benchmark evidence).
+   */
+  qualityTier?: ModelTier;
   description: string;
   provider: ModelProvider;
   /** True for a superseded version the picker should tuck behind "Show more". Omitted (not `false`) for a current/primary model. */
@@ -2653,6 +2691,12 @@ export class AgentModeService {
    * agree with the cost meter it's grouping by. Only when a model has no
    * MODEL_PRICING entry (so costScore can't be computed) does tier fall back
    * to the config's static field, and costScore/costScoreSource are omitted.
+   *
+   * qualityTier (ENG-1789) is a SEPARATE axis derived from qualityScore via
+   * tierFromQualityScore/QUALITY_SCORE_BANDS — it groups by benchmark quality,
+   * not cost, and is omitted whenever qualityScore itself is omitted. `tier`
+   * remains the cost-driven field the picker's existing section headers use;
+   * qualityTier is additive, for any quality-driven grouping/filter.
    */
   async getSupportedModelsWithMetadata(isAdmin: boolean = false): Promise<SupportedModelInfo[]> {
     const ids = await this.getSupportedModels(isAdmin);
@@ -2666,6 +2710,7 @@ export class AgentModeService {
         id,
         name: config?.name ?? id,
         tier: typeof costScore === 'number' ? tierFromCostScore(costScore) : (config?.tier ?? 'medium'),
+        qualityTier: typeof config?.qualityScore === 'number' ? tierFromQualityScore(config.qualityScore) : undefined,
         description: config?.description ?? 'General-purpose model',
         provider: config?.provider ?? 'other',
         family: config?.family,
@@ -2684,6 +2729,7 @@ export class AgentModeService {
       id: e.id,
       name: e.name,
       tier: e.tier,
+      ...(e.qualityTier ? { qualityTier: e.qualityTier } : {}),
       description: e.description,
       provider: e.provider,
       ...(e.staticLegacy || dominatedIds.has(e.id) ? { legacy: true as const } : {}),
