@@ -21,11 +21,13 @@ the grant list below) — without it, the logging-preferences check itself is de
 1. Find the instance ID for the environment you need:
    ```bash
    aws elasticbeanstalk describe-environment-resources \
+     --region us-west-2 \
      --environment-name <env-name> \
      --query "EnvironmentResources.Instances[].Id" --output text
    ```
    (`<env-name>` is one of `Agentweb-backend-env-prod-3`, `Agentweb-backend-env-1` (staging), or the
-   other EB-managed environments.)
+   other EB-managed environments.) A scaled environment returns multiple instance IDs — pick the one
+   you actually need before running `start-session` below.
 
 2. Start a session:
    ```bash
@@ -56,8 +58,11 @@ an attached policy granting at minimum:
 This is separate from the instance side: `AmazonSSMManagedInstanceCore` on the shared
 `aws-elasticbeanstalk-ec2-role` instance profile only lets the *instance* register with SSM and
 receive sessions — it grants nothing to the operator calling `aws ssm start-session`. If
-`start-session` fails with an authorization error, the caller's identity is missing one of the three
-grants above; request it before assuming the instance is unreachable.
+`start-session` fails with an authorization error, the caller's identity is missing one of the two
+`ssm:StartSession` grants above; request it before assuming the instance is unreachable.
+`ssm:TerminateSession`/`ssm:ResumeSession` failures point to the session grant instead, and a failed
+`ssm get-document` logging-preferences check points to the separate `ssm:GetDocument` grant — don't
+conflate the three when diagnosing a permission error.
 
 ## Verifying the fleet is actually closed
 
