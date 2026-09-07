@@ -39,7 +39,13 @@ jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     getSupportedModels: jest.fn(),
     getDefaultModel: jest.fn()
-  }
+  },
+  // ENG-1802: the controller now imports the real title-normalization helper
+  // directly (not through the agentModeService object above), so this module
+  // mock must still provide it -- pull in the real implementation rather than
+  // stubbing it, since it's a pure string helper the title-matching tests
+  // below rely on behaving correctly.
+  normalizeWorkPlanTitleForMatch: jest.requireActual('../services/agentModeService').normalizeWorkPlanTitleForMatch,
 }));
 
 jest.mock('../middleware/auth', () => ({
@@ -533,6 +539,42 @@ describe('AgentModeController - createSessionWithPlan', () => {
 
       expect(mockChatbotDb.createChatSession).toHaveBeenCalled();
       expect(res.json).toHaveBeenCalled();
+    });
+
+    // ENG-1802: the URL param match used to be `.toLowerCase()` only, so a
+    // template stored with an underscore-joined title (the common shape) never
+    // resolved from a naturally-typed, spaced :planTitle URL param. Switched to
+    // normalizeWorkPlanTitleForMatch, the same separator/case normalization
+    // applyPredefinedWorkPlan already uses (ENG-1794).
+    it('resolves a stored underscore-joined title against a spaced, mixed-case :planTitle param (ENG-1802)', async () => {
+      const underscoredPlans = [
+        {
+          planId: 'plan-underscored',
+          title: 'Founder_Linkedin_Sales_Readiness_Audit',
+          steps: [{ stepCount: 1, title: 'Step 1' }],
+          welcomeMessage: 'Welcome!',
+          visibility: 'system' as const,
+          isBuiltIn: true,
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z',
+        },
+      ];
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+        if (visibility === 'system') return Promise.resolve(underscoredPlans);
+        return Promise.resolve([]);
+      });
+      mockChatbotDb.createChatSession.mockResolvedValue({
+        ...mockSession,
+        pageIdentifier: 'plan-Founder Linkedin Sales Readiness Audit',
+      } as any);
+
+      const req = mockRequest('Founder LinkedIn Sales Readiness Audit');
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(res.status).not.toHaveBeenCalledWith(404);
+      expect(mockChatbotDb.createChatSession).toHaveBeenCalled();
     });
 
     it('should handle errors gracefully', async () => {
