@@ -32947,6 +32947,73 @@ ${strippedHtml}`;
         return unresolvedRequirements.length > 0 ? [...requested, ...unresolvedRequirements] : requested;
       };
 
+      // ENG-1800: sibling protection for the asset-count completion gate
+      // (expectedAssetCount/expectedAssetCountTools) -- see the merge call
+      // below for the full incident writeup and the applied fix.
+      const findAssetCountCutoff = (
+        allSteps: Array<{ stepCount: number; status?: string; resolvedAt?: string; completedAt?: string }>,
+        stepCount: number,
+      ): string | undefined => {
+        const earlier = allSteps
+          .filter((s) => s.stepCount < stepCount)
+          .sort((a, b) => b.stepCount - a.stepCount);
+        for (const s of earlier) {
+          if (s.status === 'completed' || s.status === 'skipped') {
+            const resolvedAt = s.resolvedAt || s.completedAt;
+            if (resolvedAt) return resolvedAt;
+          }
+        }
+        return undefined;
+      };
+      const computeStepProducedAssetCount = (
+        tools: string[] | undefined,
+        sinceIso: string | undefined,
+      ): number => tools?.length
+        ? extractProducedAssetCount(session.messages, sinceIso, tools)
+        : Math.max(
+            AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
+            extractProducedAssetCount(session.messages, sinceIso),
+          );
+
+      // ENG-1800: a production predefined-plan session (ca06a9e0-...) hit the
+      // asset-count gate's workplan_insufficient_assets block for "Render the
+      // Full Size Matrix" (expectedAssetCount 12, expectedAssetCountTools
+      // ["playwright_browser_take_screenshot"], only 1 real screenshot
+      // produced). Instead of producing the remaining assets, the model called
+      // modify_work_plan TWICE in the same run to shrink expectedAssetCount
+      // first to 1, then to 0 for that step (and later 0 for two more steps) --
+      // silently clearing the exact gate it was failing. Nothing distinguished
+      // that self-serving edit from a genuine user-approved scope reduction
+      // (the blocked response's own guidance tells the model to do exactly
+      // this once the USER approves a smaller set), so the steps completed
+      // with 1 of the promised 12 assets and the closing synthesis then
+      // falsely claimed "✅ Deliverables Generated & Verified" across "all 12
+      // units".
+      //
+      // Fix: expectedAssetCount can still be freely changed (raised, lowered,
+      // or cleared) EXCEPT it may never be silently LOWERED while the step's
+      // own actual produced-asset count has not yet met the EXISTING (pre-edit)
+      // requirement -- the exact "shrink the goalpost to dodge a failing gate"
+      // bypass this incident hit. The moment the step has genuinely produced
+      // enough assets to meet its current target, the requirement is
+      // unaffected and can be freely lowered or cleared afterward (the same
+      // "failed and later succeeded" carve-out ENG-1793/ENG-1799 established
+      // for requiredFunctionCalls above). A step that has already resolved
+      // (completed/skipped) is likewise exempt -- the gate that mattered
+      // already ran its decision.
+      const mergeExpectedAssetCount = (
+        existingStep: { stepCount: number; status?: string; expectedAssetCount?: number; expectedAssetCountTools?: string[] },
+        requested: number | undefined,
+      ): number | undefined => {
+        if (requested === undefined) return existingStep.expectedAssetCount;
+        const existing = existingStep.expectedAssetCount;
+        if (existingStep.status === 'completed' || existingStep.status === 'skipped') return requested;
+        if (typeof existing !== 'number' || existing <= 0 || requested >= existing) return requested;
+        const sinceIso = findAssetCountCutoff(workPlan.steps, existingStep.stepCount);
+        const produced = computeStepProducedAssetCount(existingStep.expectedAssetCountTools, sinceIso);
+        return produced < existing ? existing : requested;
+      };
+
       // Update or add steps
       for (const newStep of steps) {
         const existingIndex = workPlan.steps.findIndex(s => s.stepCount === newStep.stepCount);
@@ -32964,10 +33031,12 @@ ${strippedHtml}`;
             ),
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
             // Allow scope changes: an explicit expectedAssetCount overrides (including 0
-            // to clear the asset gate when the user approves a smaller set); omitting it
-            // preserves the existing value. Same override-or-preserve semantics for
-            // expectedAssetCountTools (ENG-1331).
-            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount,
+            // to clear the asset gate when the user approves a smaller set) UNLESS the
+            // step hasn't actually produced enough assets to meet its current
+            // requirement yet -- see mergeExpectedAssetCount (ENG-1800) above. Omitting
+            // it preserves the existing value. expectedAssetCountTools keeps its
+            // existing override-or-preserve semantics (ENG-1331).
+            expectedAssetCount: mergeExpectedAssetCount(workPlan.steps[existingIndex], newStep.expectedAssetCount),
             expectedAssetCountTools: newStep.expectedAssetCountTools !== undefined ? newStep.expectedAssetCountTools : workPlan.steps[existingIndex].expectedAssetCountTools
           };
         } else {
