@@ -164,7 +164,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -1442,7 +1442,7 @@ function validateDriveDateFilter(value: string, label: string): string {
  * templates whose titles genuinely differ (e.g. the "_Eval"/"_Audit" suffix
  * itself) never collide.
  */
-function normalizeWorkPlanTitleForMatch(value: unknown): string {
+export function normalizeWorkPlanTitleForMatch(value: unknown): string {
   return String(value ?? '')
     .toLowerCase()
     .replace(/[_-]+/g, ' ')
@@ -32888,6 +32888,23 @@ ${strippedHtml}`;
 
       const workPlan = { ...session.workPlan };
 
+      // Snapshot of every step as it existed before this call's removeStepCounts
+      // filtering runs below, keyed by stepCount. Used further down to detect
+      // and protect against "remove step N via removeStepCounts, then add a
+      // fresh step N back in the same steps[] array" -- a step reaching the
+      // "add new step" branch is otherwise treated as having no prior history
+      // at all, even when this exact call just removed the real history one
+      // line below. Live-verified on test-env1, 2026-09-07 (unprompted,
+      // organic model behavior, not a scripted repro): the model removed steps
+      // 2 and 3 via removeStepCounts and added a single new step 2 with
+      // requiredFunctionCalls: [], silently dropping list_html_templates and
+      // create_html_from_template -- both genuinely never called -- with zero
+      // protection, even though the ENG-1799/1800 merge guards were already
+      // active for ordinary same-step edits.
+      const originalStepsBeforeRemoval = new Map<number, (typeof workPlan.steps)[number]>(
+        workPlan.steps.map((s: any) => [s.stepCount, s]),
+      );
+
       // Update autocomplete if explicitly provided
       if (autocomplete !== undefined) {
         workPlan.autocomplete = autocomplete;
@@ -32910,28 +32927,150 @@ ${strippedHtml}`;
       // had nothing left to check for that step and let it complete despite the
       // failed required call never succeeding.
       //
+      // ENG-1799 (follow-up): the original fix here only protected a function
+      // that had already FAILED at least once (failed>0 && succeeded===0). A
+      // production predefined-plan session (3fce3c5a-...) showed the same class
+      // of gap for functions that were simply never called at all -- never
+      // attempted, so never in failedFunctions either, but still genuinely
+      // required and unsatisfied. That shape passed the old check trivially
+      // (failed===0 fails the `failed > 0` test), so modify_work_plan could
+      // silently drop a still-unmet requirement the model had not gotten
+      // around to calling yet, the same gate-bypass shape, just without a
+      // prior failed attempt on record.
+      //
       // Fix: requiredFunctionCalls can still be freely modified -- added to,
       // reordered, or have functions removed -- EXCEPT it may never silently
-      // drop a function that has already failed for this session and has not
-      // since succeeded. That specific removal is the exact gate-bypass this
-      // incident hit. A function that was never required to begin with, or
-      // that failed and later succeeded, or that never failed at all, is
-      // unaffected and can still be dropped normally (e.g. a genuine,
-      // deliberate scope reduction).
-      const failedFunctionCounts = session.failedFunctions || {};
+      // drop a function that has not yet SUCCEEDED for this session, whether
+      // it previously failed or was never attempted at all. A function that
+      // was never required to begin with, or that has already succeeded at
+      // least once, is unaffected and can still be dropped normally (e.g. a
+      // genuine, deliberate scope reduction).
+      //
+      // NOT exempt once a step has resolved (completed/skipped): a resolved
+      // step can be reset back to 'pending' later (e.g. "assets need
+      // regenerating" -- see the ENG-1188/CodeRabbit PR #2430 cutoff-timestamp
+      // handling above, which explicitly treats that reset as a supported
+      // transition) without restoring requiredFunctionCalls to anything. An
+      // earlier version of this fix exempted resolved steps on the theory
+      // that "the gate that mattered already ran" -- but that only holds
+      // until the very next reset-to-pending, at which point a
+      // never-actually-called requirement cleared while 'completed' stays
+      // silently cleared through the reset and the step re-completes with no
+      // gate at all. Note this protection is NOT a pure no-op for every
+      // resolved step: `session.calledFunctions[fn]` decrements back toward 0
+      // once the step consuming its credit completes (ENG-1698's
+      // decrementCalledFunctionsClamped), so a function called exactly once
+      // for its own step looks like `succeeded === 0` again immediately after
+      // that step's own legitimate completion -- indistinguishable from
+      // "never called." That's intentional, not a bug: it forces a genuine
+      // scope-reduction edit on an already-resolved step to re-prove the
+      // requirement rather than trust stale state, matching the
+      // "fail closed" posture the rest of this fix takes, and is itself
+      // covered by a dedicated test below rather than assumed harmless.
       const succeededFunctionCounts = session.calledFunctions || {};
       const mergeRequiredFunctionCalls = (
         existingRequired: string[] | undefined,
         requested: string[] | undefined,
       ): string[] | undefined => {
         if (requested === undefined) return existingRequired;
-        const unresolvedFailures = (existingRequired || []).filter((fn) => {
+        const unresolvedRequirements = (existingRequired || []).filter((fn) => {
           if (requested.includes(fn)) return false;
-          const failed = failedFunctionCounts[fn] || 0;
           const succeeded = succeededFunctionCounts[fn] || 0;
-          return failed > 0 && succeeded === 0;
+          return succeeded === 0;
         });
-        return unresolvedFailures.length > 0 ? [...requested, ...unresolvedFailures] : requested;
+        return unresolvedRequirements.length > 0 ? [...requested, ...unresolvedRequirements] : requested;
+      };
+
+      // ENG-1800: sibling protection for the asset-count completion gate
+      // (expectedAssetCount/expectedAssetCountTools) -- see the merge call
+      // below for the full incident writeup and the applied fix.
+      const findAssetCountCutoff = (
+        allSteps: Array<{ stepCount: number; status?: string; resolvedAt?: string; completedAt?: string }>,
+        stepCount: number,
+      ): string | undefined => {
+        const earlier = allSteps
+          .filter((s) => s.stepCount < stepCount)
+          .sort((a, b) => b.stepCount - a.stepCount);
+        for (const s of earlier) {
+          if (s.status === 'completed' || s.status === 'skipped') {
+            const resolvedAt = s.resolvedAt || s.completedAt;
+            if (resolvedAt) return resolvedAt;
+          }
+        }
+        return undefined;
+      };
+      const computeStepProducedAssetCount = (
+        tools: string[] | undefined,
+        sinceIso: string | undefined,
+      ): number => tools?.length
+        ? extractProducedAssetCount(session.messages, sinceIso, tools)
+        : Math.max(
+            AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
+            extractProducedAssetCount(session.messages, sinceIso),
+          );
+
+      // ENG-1800: a production predefined-plan session (ca06a9e0-...) hit the
+      // asset-count gate's workplan_insufficient_assets block for "Render the
+      // Full Size Matrix" (expectedAssetCount 12, expectedAssetCountTools
+      // ["playwright_browser_take_screenshot"], only 1 real screenshot
+      // produced). Instead of producing the remaining assets, the model called
+      // modify_work_plan TWICE in the same run to shrink expectedAssetCount
+      // first to 1, then to 0 for that step (and later 0 for two more steps) --
+      // silently clearing the exact gate it was failing. Nothing distinguished
+      // that self-serving edit from a genuine user-approved scope reduction
+      // (the blocked response's own guidance tells the model to do exactly
+      // this once the USER approves a smaller set), so the steps completed
+      // with 1 of the promised 12 assets and the closing synthesis then
+      // falsely claimed "✅ Deliverables Generated & Verified" across "all 12
+      // units".
+      //
+      // Fix: expectedAssetCount can still be freely changed (raised, lowered,
+      // or cleared) EXCEPT it may never be silently LOWERED while the step's
+      // own actual produced-asset count has not yet met the EXISTING (pre-edit)
+      // requirement -- the exact "shrink the goalpost to dodge a failing gate"
+      // bypass this incident hit. The moment the step has genuinely produced
+      // enough assets to meet its current target, the requirement is
+      // unaffected and can be freely lowered or cleared afterward (the same
+      // "failed and later succeeded" carve-out ENG-1793/ENG-1799 established
+      // for requiredFunctionCalls above).
+      //
+      // NOT exempt once a step has resolved (completed/skipped) -- same
+      // reasoning as mergeRequiredFunctionCalls above: a resolved step can be
+      // reset back to 'pending' without restoring expectedAssetCount, and for
+      // a step that resolved normally `produced` was already >= `existing`
+      // when it completed, so this protection is a no-op in the normal case
+      // and only bites the reset-then-shrink-then-recomplete abuse path.
+      //
+      // Fresh-eyes review of this PR also found `expectedAssetCountTools`
+      // itself had ZERO protection: leaving expectedAssetCount unchanged
+      // (e.g. still 12) while silently retargeting expectedAssetCountTools to
+      // an unrelated tool the model already called 12+ times for other
+      // reasons achieves the identical "dodge a failing gate" outcome through
+      // a field this check never looked at. mergeExpectedAssetCountTools
+      // below applies the same guard: don't allow the counted-tools list to
+      // change while the CURRENT requirement (measured against the EXISTING
+      // tools) hasn't genuinely been met.
+      const mergeExpectedAssetCount = (
+        existingStep: { stepCount: number; status?: string; expectedAssetCount?: number; expectedAssetCountTools?: string[] },
+        requested: number | undefined,
+      ): number | undefined => {
+        if (requested === undefined) return existingStep.expectedAssetCount;
+        const existing = existingStep.expectedAssetCount;
+        if (typeof existing !== 'number' || existing <= 0 || requested >= existing) return requested;
+        const sinceIso = findAssetCountCutoff(workPlan.steps, existingStep.stepCount);
+        const produced = computeStepProducedAssetCount(existingStep.expectedAssetCountTools, sinceIso);
+        return produced < existing ? existing : requested;
+      };
+      const mergeExpectedAssetCountTools = (
+        existingStep: { stepCount: number; status?: string; expectedAssetCount?: number; expectedAssetCountTools?: string[] },
+        requested: string[] | undefined,
+      ): string[] | undefined => {
+        if (requested === undefined) return existingStep.expectedAssetCountTools;
+        const existing = existingStep.expectedAssetCount;
+        if (typeof existing !== 'number' || existing <= 0) return requested;
+        const sinceIso = findAssetCountCutoff(workPlan.steps, existingStep.stepCount);
+        const produced = computeStepProducedAssetCount(existingStep.expectedAssetCountTools, sinceIso);
+        return produced < existing ? existingStep.expectedAssetCountTools : requested;
       };
 
       // Update or add steps
@@ -32944,17 +33083,45 @@ ${strippedHtml}`;
             title: newStep.title,
             description: newStep.description,
             ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
-            requiredFunctionCalls: mergeRequiredFunctionCalls(workPlan.steps[existingIndex].requiredFunctionCalls, newStep.requiredFunctionCalls),
+            requiredFunctionCalls: mergeRequiredFunctionCalls(
+              workPlan.steps[existingIndex].requiredFunctionCalls,
+              newStep.requiredFunctionCalls,
+            ),
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
-            // Allow scope changes: an explicit expectedAssetCount overrides (including 0
-            // to clear the asset gate when the user approves a smaller set); omitting it
-            // preserves the existing value. Same override-or-preserve semantics for
-            // expectedAssetCountTools (ENG-1331).
-            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount,
-            expectedAssetCountTools: newStep.expectedAssetCountTools !== undefined ? newStep.expectedAssetCountTools : workPlan.steps[existingIndex].expectedAssetCountTools
+            // Allow scope changes: an explicit expectedAssetCount/expectedAssetCountTools
+            // overrides (including 0/[] to clear the asset gate when the user approves a
+            // smaller set) UNLESS the step hasn't actually produced enough assets to meet
+            // its current requirement yet -- see mergeExpectedAssetCount/
+            // mergeExpectedAssetCountTools (ENG-1800) above. Omitting either preserves the
+            // existing value.
+            expectedAssetCount: mergeExpectedAssetCount(workPlan.steps[existingIndex], newStep.expectedAssetCount),
+            expectedAssetCountTools: mergeExpectedAssetCountTools(workPlan.steps[existingIndex], newStep.expectedAssetCountTools)
           };
         } else {
-          // Add new step (stepCount will be fixed by updateSessionWorkPlan)
+          // Add new step (stepCount will be fixed by updateSessionWorkPlan).
+          //
+          // If this stepCount was just removed via removeStepCounts in this
+          // same call, this is really an edit wearing a "new step" costume --
+          // apply the same merge protection as the existingIndex>=0 branch
+          // above, using the pre-removal step as the baseline, so removing and
+          // re-adding a step can't be used to launder away an unresolved
+          // requirement (see the comment on originalStepsBeforeRemoval above).
+          // A genuinely new stepCount (never existed before this call) has no
+          // history to protect, so it's unaffected.
+          const removedOriginal = removeStepCounts?.includes(newStep.stepCount)
+            ? originalStepsBeforeRemoval.get(newStep.stepCount)
+            : undefined;
+          // When removedOriginal exists, the merge functions must run
+          // UNCONDITIONALLY, not only when the caller explicitly supplied the
+          // corresponding field. mergeExpectedAssetCount/Tools already handle
+          // requested === undefined correctly (return the existing value) --
+          // exactly like the existingIndex>=0 branch above, which calls them
+          // unconditionally for the same reason. Gating the call itself on
+          // `newStep.expectedAssetCount !== undefined` (the old pattern, still
+          // correct for a genuinely new step with no removedOriginal) would
+          // let a reused stepCount that simply OMITS the field skip protection
+          // entirely -- the asset-count gate would never even activate on the
+          // re-added step, a strictly worse bypass than an explicit lowering.
           workPlan.steps.push({
             stepCount: newStep.stepCount,
             title: newStep.title,
@@ -32963,10 +33130,16 @@ ${strippedHtml}`;
             status: 'pending',
             completedAt: undefined,
             notes: undefined,
-            requiredFunctionCalls: newStep.requiredFunctionCalls,
+            requiredFunctionCalls: removedOriginal
+              ? mergeRequiredFunctionCalls(removedOriginal.requiredFunctionCalls, newStep.requiredFunctionCalls)
+              : newStep.requiredFunctionCalls,
             skillIds: newStep.skillIds,
-            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount }),
-            ...(newStep.expectedAssetCountTools !== undefined && { expectedAssetCountTools: newStep.expectedAssetCountTools })
+            ...(removedOriginal
+              ? { expectedAssetCount: mergeExpectedAssetCount(removedOriginal, newStep.expectedAssetCount) }
+              : (newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount })),
+            ...(removedOriginal
+              ? { expectedAssetCountTools: mergeExpectedAssetCountTools(removedOriginal, newStep.expectedAssetCountTools) }
+              : (newStep.expectedAssetCountTools !== undefined && { expectedAssetCountTools: newStep.expectedAssetCountTools }))
           });
         }
       }
