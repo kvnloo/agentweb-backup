@@ -40,6 +40,7 @@ import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { ACCOUNT_DISCONNECTED_STATUS, MAX_CONSECUTIVE_ACCOUNT_SKIPS, AccountGateResult, buildAccountSkipReason, countTrailingAccountSkips, evaluateAccountGate } from '../utils/scheduledRunAccountGate';
+import { CapacityGateResult, SEND_CAPACITY_EXHAUSTED_STATUS, buildCapacitySkipReason, evaluateCapacityGate } from '../utils/scheduledRunCapacityGate';
 import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
@@ -613,13 +614,15 @@ export interface ScheduleRunHealth {
   // Widened to the statuses runScheduledChat can actually store: computeScheduleRunHealth
   // forwards `last.status` verbatim, so any status the run path writes can appear here.
   // 'skipped_no_content' (ENG-1259) already exceeded the old union; 'skipped_account_disconnected'
-  // (ENG-1197) would have been the second.
+  // (ENG-1197) would have been the second, and 'skipped_send_capacity_exhausted' (ENG-1717)
+  // the third.
   lastRunStatus:
     | 'success'
     | 'failure'
     | 'pending_user_input'
     | 'skipped_no_content'
     | 'skipped_account_disconnected'
+    | 'skipped_send_capacity_exhausted'
     | null;
   lastRunAt: string | null;
   // Failures counted back from the MOST RECENT run, stopping at the first non-failure.
@@ -4883,6 +4886,55 @@ async function evaluateLinkedInAccountGate(
 }
 
 /**
+ * Wiring only — the decision lives in `scheduledRunCapacityGate.evaluateCapacityGate`
+ * (ENG-1717), same split as the ENG-1197 account gate above.
+ *
+ * Reads own AND org-shared accounts, because `resolveLinkedInAccountForWrite` lets a
+ * write route through either; judging on own-only would withhold a run that a shared
+ * account could still have completed.
+ *
+ * The pending-invitation count is best-effort: it is REPORTED in the skip reason but
+ * never decides the verdict (LinkedIn publishes no pending cap to compare it
+ * against), so a failed count must not cost us the gate. It is fetched only for
+ * accounts that are already out of daily budget, so the common path pays nothing.
+ */
+async function evaluateLinkedInCapacityGate(
+  schedule: any,
+  userId: string,
+): Promise<CapacityGateResult> {
+  const gate = await evaluateCapacityGate(schedule, userId, {
+    listUsableAccounts: async (uid) => {
+      const { getAccountsWithOwnerIncludingOrgShared } = await import('../services/connectedAccountsDb');
+      const { remainingDailyInvites } = await import('../services/linkedInWritePacer');
+      return (await getAccountsWithOwnerIncludingOrgShared(uid))
+        .filter((acc: any) => acc.platform === 'unipile')
+        .map((acc: any) => ({
+          account_id: acc.account_id,
+          account_name: acc.account_name,
+          config: acc.config,
+          // Pure arithmetic over already-loaded config — no I/O per account.
+          headroom: remainingDailyInvites(acc?.config?.daily_invite_cap, acc?.config?.daily_volume),
+        }));
+    },
+  });
+
+  // Pending counts are for the REPORT only — they never decide the verdict, since
+  // LinkedIn publishes no pending cap to compare them against. Fetched here, after
+  // the decision, so a passing run pays nothing and a failed count cannot cost us
+  // the gate.
+  if (!gate.blocked) return gate;
+  const { countSentInvitationsByAccount } = await import('../services/unipileSentInvitationsDb');
+  const accounts = await Promise.all(gate.accounts.map(async (acc) => ({
+    ...acc,
+    pendingCount: await countSentInvitationsByAccount(acc.account_id).catch((err) => {
+      console.error(`[capacityGate] pending count unavailable for ${acc.account_id}:`, err);
+      return null;
+    }),
+  })));
+  return { ...gate, accounts };
+}
+
+/**
  * Stop a schedule that has now been skipped for a disconnected account this many
  * times in a row. Best-effort and loudly logged: failing to pause leaves the
  * schedule skipping cheaply, which is a tolerable end state, so this must never
@@ -5055,7 +5107,17 @@ export async function runScheduledChat(
   // LinkedIn account the schedule pins has no live session, so the run cannot do
   // the thing it exists to do. Kept separate from 'skipped_no_content' because the
   // remedy is a customer reconnect, not a prompt or cadence change.
-  status: 'success' | 'failure' | 'pending_user_input' | 'skipped_no_content' | 'skipped_account_disconnected';
+  // ENG-1717: 'skipped_send_capacity_exhausted' also exits before the model, but for a
+  // condition that resolves ITSELF — the account's daily invite budget is spent and
+  // renews within 24h. Separate from 'skipped_account_disconnected' precisely because
+  // it needs no customer action, so it must never drive a reconnect prompt or a pause.
+  status:
+    | 'success'
+    | 'failure'
+    | 'pending_user_input'
+    | 'skipped_no_content'
+    | 'skipped_account_disconnected'
+    | 'skipped_send_capacity_exhausted';
   passed: boolean;
   actualResponse: string;
   actualFunctionCalls: string[];
@@ -5564,6 +5626,53 @@ export async function runScheduledChat(
         await pauseScheduleForDisconnectedAccount(schedule, userId, trailingSkips + 1, accountGate);
       }
       return skipResult;
+    }
+
+    // ENG-1717 (ENG-1609 AC #9): the account is connected, but may have no daily
+    // invite budget left — in which case every send this run attempts is already
+    // proven to be refused. Withhold the run instead of spending it discovering
+    // that one recipient at a time.
+    //
+    // Runs for a TEST too, unlike the disconnect gate above: AC #9 says
+    // "scheduled/test run", and the run that opened ENG-1132 (iTrials, 2026-08-26)
+    // was itself a test run that burned 5 of 7 sends on the same condition.
+    //
+    // A resuming parked run is still excluded — it is mid-flight work whose
+    // remaining steps may not be sends at all.
+    const capacityGate = isResumingParkedRun
+      ? { blocked: false, accounts: [] }
+      : await evaluateLinkedInCapacityGate(schedule, userId);
+    if (capacityGate.blocked) {
+      console.log(
+        `runScheduledChat: schedule ${schedule.scheduleId} skipped before invoking the model — `
+        + `no daily LinkedIn invite budget on ${capacityGate.accounts.map((a) => a.account_id).join(', ')}`,
+      );
+      const capacitySkipResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: SEND_CAPACITY_EXHAUSTED_STATUS,
+        passed: false,
+        actualResponse: buildCapacitySkipReason(capacityGate.accounts),
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: Date.now() - now.getTime(),
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, capacitySkipResult);
+      } catch (saveError) {
+        console.error(`Error saving capacity-gate skip result for schedule ${schedule.scheduleId}:`, saveError);
+      }
+      // Deliberately NO pause and NO email, unlike the disconnect gate. A daily cap
+      // renews within 24 hours by construction, so this schedule is already
+      // self-healing; pausing it would be a defect, and mailing the owner every time
+      // a safety limit worked as intended is noise, not a signal.
+      return capacitySkipResult;
     }
 
     // ENG-657: resume path. When the reconciler marked this schedule to resume an
