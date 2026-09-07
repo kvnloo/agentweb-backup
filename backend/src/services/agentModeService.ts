@@ -32828,7 +32828,11 @@ ${strippedHtml}`;
 
   public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
-      const session = await chatbotDb.getChatSession(sessionId);
+      // ENG-1793: consistentRead=true, mirroring setWorkPlanStatusAttempt's ENG-1188
+      // read -- the requiredFunctionCalls protection below (see the update-loop
+      // comment) needs to see a required call's failure even when it was recorded
+      // earlier in this very turn, immediately before this modify_work_plan call.
+      const session = await chatbotDb.getChatSession(sessionId, true);
       if (!session || !session.workPlan) {
         return {
           success: false,
@@ -32848,6 +32852,42 @@ ${strippedHtml}`;
         workPlan.steps = workPlan.steps.filter(s => !removeStepCounts.includes(s.stepCount));
       }
 
+      // ENG-1793: a production predefined-plan session (a90b38fc-...) called
+      // modify_work_plan mid-run for its "Create HTML report" step right after
+      // that step's required create_html_from_template call had just FAILED.
+      // The template authored requiredFunctionCalls: ["create_html_from_template"]
+      // for that step, but the modify_work_plan update happened to pass
+      // requiredFunctionCalls: [] for it -- a defined, non-undefined value, so
+      // the old merge below ("use newStep's value if provided, else keep the
+      // old one") silently replaced the real requirement with an empty one.
+      // set_work_plan_status's completion gate (setWorkPlanStatusAttempt) then
+      // had nothing left to check for that step and let it complete despite the
+      // failed required call never succeeding.
+      //
+      // Fix: requiredFunctionCalls can still be freely modified -- added to,
+      // reordered, or have functions removed -- EXCEPT it may never silently
+      // drop a function that has already failed for this session and has not
+      // since succeeded. That specific removal is the exact gate-bypass this
+      // incident hit. A function that was never required to begin with, or
+      // that failed and later succeeded, or that never failed at all, is
+      // unaffected and can still be dropped normally (e.g. a genuine,
+      // deliberate scope reduction).
+      const failedFunctionCounts = session.failedFunctions || {};
+      const succeededFunctionCounts = session.calledFunctions || {};
+      const mergeRequiredFunctionCalls = (
+        existingRequired: string[] | undefined,
+        requested: string[] | undefined,
+      ): string[] | undefined => {
+        if (requested === undefined) return existingRequired;
+        const unresolvedFailures = (existingRequired || []).filter((fn) => {
+          if (requested.includes(fn)) return false;
+          const failed = failedFunctionCounts[fn] || 0;
+          const succeeded = succeededFunctionCounts[fn] || 0;
+          return failed > 0 && succeeded === 0;
+        });
+        return unresolvedFailures.length > 0 ? [...requested, ...unresolvedFailures] : requested;
+      };
+
       // Update or add steps
       for (const newStep of steps) {
         const existingIndex = workPlan.steps.findIndex(s => s.stepCount === newStep.stepCount);
@@ -32858,7 +32898,7 @@ ${strippedHtml}`;
             title: newStep.title,
             description: newStep.description,
             ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
-            requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls,
+            requiredFunctionCalls: mergeRequiredFunctionCalls(workPlan.steps[existingIndex].requiredFunctionCalls, newStep.requiredFunctionCalls),
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
             // Allow scope changes: an explicit expectedAssetCount overrides (including 0
             // to clear the asset gate when the user approves a smaller set); omitting it
