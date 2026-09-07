@@ -981,7 +981,7 @@ interface LLMModelConfig {
   qualityScore?: number;
   /** Methodology/source note for qualityScore — benchmark name, source
    *  version, and evaluation date (e.g. "Artificial Analysis Intelligence
-   *  Index, snapshot 2026-08-19"). Surfaced in the picker's quality tooltip. */
+   *  Index v4.2, snapshot 2026-09-05, max"). Surfaced in the picker's quality tooltip. */
   qualityScoreSource?: string;
   // No costScore/costScoreSource field here (unlike qualityScore) — cost is
   // fully derivable from MODEL_PRICING (see getSupportedModelsWithMetadata),
@@ -994,7 +994,14 @@ export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_ch
 
 /**
  * Cost-score band boundaries backing the picker's tier buckets (Harsha's
- * exact thresholds, revised 2026-08-19 after reviewing the live numbers) —
+ * exact thresholds, revised 2026-08-19 after reviewing the live numbers, and
+ * re-cut 2026-09-05 (ENG-1784): "low should have everything 52 and below
+ * (very low is fine as it is now), then medium should be 57-53, then pro
+ * should be 63-58, frontier is everything above" — so Flagship/"frontier"
+ * (≥64) holds Fable 5.1 and GPT-6 Astra (79), GPT-5.6 Sol (71) and Claude
+ * Opus 5 (70) together, Pro (58–63) starts at Sonnet 5 / Terra / Kimi K3,
+ * Medium (53–57) is Grok 4.6 / Qwen3.8 Max, Cheap (31–52) Luna / Haiku /
+ * the Gemini Flash line, Very Cheap (≤30) unchanged) —
  * inclusive lower bound, ordered highest band first. costScore is 0-100 and
  * higher = more expensive (see costScoreFromPrice), so a model's tier is
  * simply whichever band its own cost score falls in. Tier IDs (ultra_premium/
@@ -1003,9 +1010,9 @@ export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_ch
  * modelTiers.ts TIER_LABELS); no backend API contract change.
  */
 export const TIER_COST_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minCostScore: number }> = [
-  { tier: 'ultra_premium', minCostScore: 71 },
-  { tier: 'pro', minCostScore: 64 },
-  { tier: 'medium', minCostScore: 51 },
+  { tier: 'ultra_premium', minCostScore: 64 },
+  { tier: 'pro', minCostScore: 58 },
+  { tier: 'medium', minCostScore: 53 },
   { tier: 'cheap', minCostScore: 31 },
   { tier: 'ultra_cheap', minCostScore: 0 },
 ];
@@ -1015,6 +1022,36 @@ export function tierFromCostScore(costScore: number): ModelTier {
   const band = TIER_COST_SCORE_BANDS.find((b) => costScore >= b.minCostScore);
   // TIER_COST_SCORE_BANDS' last band has minCostScore: 0, which matches any
   // costScore >= 0 — so `band` is only undefined for a negative/NaN input.
+  return band?.tier ?? 'ultra_cheap';
+}
+
+/**
+ * Quality-score band boundaries backing the picker's quality tier grouping
+ * (ENG-1789, 2026-09-06). Independent axis from TIER_COST_SCORE_BANDS above:
+ * that one groups by costScore (what we charge), this one groups by
+ * qualityScore (AA Intelligence Index v4.2, re-snapshotted ENG-1786).
+ * Harsha's directive: "fable + astra are flagship, opus + 5.6 sol are pro,
+ * sonnet + 5.6 terra are mid, haiku + 5.6 luna are low." Solved for
+ * thresholds against the live v4.2 scores (Fable 57, Astra 55, Opus 5 54,
+ * Sol 51, Sonnet 5 45, Terra 47, Haiku 17, Luna 43) with ties resolving to
+ * the higher band (Harsha, 2026-09-06): ultra_premium >=55, pro >=51,
+ * medium >=45, cheap >=17, ultra_cheap below. Same ModelTier union and
+ * >= / highest-band-first shape as the cost bands so the two stay
+ * structurally identical even though they measure different things.
+ */
+export const QUALITY_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minQualityScore: number }> = [
+  { tier: 'ultra_premium', minQualityScore: 55 },
+  { tier: 'pro', minQualityScore: 51 },
+  { tier: 'medium', minQualityScore: 45 },
+  { tier: 'cheap', minQualityScore: 17 },
+  { tier: 'ultra_cheap', minQualityScore: 0 },
+];
+
+/** Derives a model's quality-tier bucket from its qualityScore (independent of cost tier). */
+export function tierFromQualityScore(qualityScore: number): ModelTier {
+  const band = QUALITY_SCORE_BANDS.find((b) => qualityScore >= b.minQualityScore);
+  // Last band has minQualityScore: 0, matching any qualityScore >= 0 — so
+  // `band` is only undefined for a negative/NaN input.
   return band?.tier ?? 'ultra_cheap';
 }
 
@@ -1042,8 +1079,8 @@ export interface DominanceCandidate {
  * Ids that should be treated as legacy because a same-`family`, originally
  * non-legacy sibling is at least as cheap (same-or-lower cost tier band) AND
  * at least as good (same-or-higher quality score), strictly so in at least
- * one dimension — e.g. GPT-5.6 Luna (ultra_cheap, quality 52) strictly beats
- * GPT-5.4 Nano (ultra_cheap, quality 40): same band, higher quality, so Nano
+ * one dimension — e.g. GPT-5.6 Luna (ultra_cheap, quality 43) strictly beats
+ * GPT-5.4 Nano (ultra_cheap, quality 31): same band, higher quality, so Nano
  * is dominated. Comparison is scoped to `family`, never "same provider" —
  * Claude Opus and Claude Sonnet are different product tiers, not
  * generations of one model, so a stronger Opus must never hide Sonnet.
@@ -1074,7 +1111,15 @@ export type ModelProvider =
 export interface SupportedModelInfo {
   id: string;
   name: string;
+  /** Cost tier — derived from costScore via tierFromCostScore (see TIER_COST_SCORE_BANDS). */
   tier: ModelTier;
+  /**
+   * Quality tier — derived from qualityScore via tierFromQualityScore (see
+   * QUALITY_SCORE_BANDS). Independent axis from `tier`: a model can be
+   * Flagship on quality but Pro on cost, or vice versa. Omitted when
+   * qualityScore itself is omitted (no benchmark evidence).
+   */
+  qualityTier?: ModelTier;
   description: string;
   provider: ModelProvider;
   /** True for a superseded version the picker should tuck behind "Show more". Omitted (not `false`) for a current/primary model. */
@@ -2324,6 +2369,9 @@ export class AgentModeService {
   }
 
   private llmModels: Record<string, LLMModelConfig> = {
+    // ENG-1786: all quality scores use AA Intelligence Index v4.2, snapshot
+    // 2026-09-05 (32-row research table in Linear). Sources name the canonical
+    // AA page variant; benchmark effort need not match the provider runtime default.
     // Logical model metadata only. `callLLM` resolves every text/tool request
     // through OpenRouter; no provider client is constructed from this registry.
     // supportsVision flags below were verified empirically against the describe_image
@@ -2339,9 +2387,9 @@ export class AgentModeService {
     // id resolves forward instead of throwing "Invalid model". Do not delete a
     // registry entry without an alias first; that was exactly the caution the
     // prior version of this comment existed to enforce.
-    'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.4, xhigh' },
+    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 31, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.4 Nano, xhigh (AA estimate)' },
+    'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 46, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.5, xhigh' },
     // List gemini models - client will be lazy-loaded
     // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
     // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
@@ -2362,10 +2410,10 @@ export class AgentModeService {
     // gateway can fail over transports, but it cannot make an invalid upstream
     // request valid. Fresh Emma sidebar sessions expose the legacy full tool
     // catalog, so omitting this cap made Gemini fail deterministically with 400.
-    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 21, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3 Flash Preview, Non-reasoning (AA estimate)' },
+    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 37, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.1 Pro Preview, reasoning' },
+    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 19, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.1 Flash Lite, reasoning' },
+    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.5 Flash, high' },
     // 2026-08-19: Gemini 3.7 Flash (GA, released 2026-08-13) added — verified
     // live against three independent sources (ai.google.dev/deepmind.google/
     // blog.google, OpenRouter, Artificial Analysis), no Gemini 3.7 Pro or
@@ -2383,8 +2431,8 @@ export class AgentModeService {
     // sampling parameters" — confirmed live 2026-09-03 for both ids). Google
     // currently ignores the param on these models (soft no-op) but states a
     // future generation will hard-400 on it, so this is set ahead of that.
-    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
-    'gemini-3.8-flash': { name: 'Gemini 3.8 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 59, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-8-flash (high)" page, snapshot 2026-09-02' },
+    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.7 Flash, high' },
+    'gemini-3.8-flash': { name: 'Gemini 3.8 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 47, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.8 Flash, high' },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
@@ -2412,7 +2460,7 @@ export class AgentModeService {
     //   already used successfully by gpt-4o-mini above.) This does NOT apply
     //   to non-OpenRouter adminOnly entries elsewhere in this registry (e.g.
     //   anthropic.claude-opus-4-6-v1), which are gated for unrelated reasons.
-    'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 7, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 1, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-4o Mini, non-reasoning (AA estimate)' },
     // Workload-specific research agent. It is intentionally callable only from
     // DeepResearchService, not exposed as a general chat-picker model.
     'openrouter/perplexity/sonar-deep-research': { client: null, supportsTemperature: true, internalOnly: true },
@@ -2447,9 +2495,8 @@ export class AgentModeService {
     // registry — so there is no existing Fable entry to compare against yet.
     // Going straight to 5.1 (the current model; Fable 5 is already superseded
     // as of 2026-09-01) rather than also backfilling the now-superseded 5.
-    // Live AA Intelligence Index score (66, max-effort w/ fallback) confirmed
-    // 2026-09-01 — currently the #1 model on the independent leaderboard, 3pts
-    // above Claude Opus 5 (63). qualityScore/costScore below plug into the
+    // AA Intelligence Index v4.2 (2026-09-05): 57, Adaptive Reasoning,
+    // Max Effort — #1, 3pts above Claude Opus 5 (54). Quality and cost plug into the
     // EXISTING dominance rule (getSupportedModelsWithMetadata) automatically —
     // no dominance action needed today since there's no sibling family member,
     // but the very next same-family add (e.g. a future Fable 5.2) will
@@ -2460,19 +2507,14 @@ export class AgentModeService {
     // ENG-199's cost-control blocker (ENG-200) is closed — org/per-user LLM
     // cost caps already exist and apply automatically to every model priced
     // in llmPricing.ts, this one included.
-    'openrouter/anthropic/claude-fable-5.1': { name: 'Claude Fable 5.1', family: 'claude-fable', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s top-ranked model for coding & agentic work', client: null, supportsTemperature: false, supportsVision: true, qualityScore: 66, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, max effort w/ fallback, snapshot 2026-09-01' },
-    'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    // 2026-08-19: qualityScore corrected 52 -> 40. The 52 belonged to a
-    // DIFFERENT, newer snapshot ("DeepSeek V4 Flash 0731, Max Effort") —
-    // this registry id resolves on OpenRouter to "DeepSeek V4 Flash 0423",
-    // whose real AA Intelligence Index score is 40 (confirmed live against
-    // AA's own page + independent coverage). Not a stale-number issue like
-    // the Kimi K3 pricing catch — the wrong model's score was attached to
-    // the model we actually invoke. Pricing is unaffected: our MODEL_PRICING
-    // entry ($0.068/$0.168) already matches the real 0423 snapshot.
-    'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "DeepSeek V4 Flash 0423" page (the snapshot this OpenRouter id actually resolves to), snapshot 2026-08-19' },
-    'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, qualityScore: 58, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/anthropic/claude-fable-5.1': { name: 'Claude Fable 5.1', family: 'claude-fable', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s top-ranked model for coding & agentic work', client: null, supportsTemperature: false, supportsVision: true, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Fable 5.1, Adaptive Reasoning, Max Effort' },
+    'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 51, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Grok 4.6, high' },
+    'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 42, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, DeepSeek V4 Pro 0813, Reasoning, Max Effort' },
+    // ENG-1786 research uses AA's canonical DeepSeek V4 Flash 0731,
+    // Reasoning, Max Effort variant. The prior 2026-08-19 source used 0423;
+    // this benchmark snapshot does not change the OpenRouter id or pricing.
+    'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 41, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, DeepSeek V4 Flash 0731, Reasoning, Max Effort' },
+    'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, qualityScore: 47, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Qwen3.8 Max, reasoning' },
     // 2026-08-26 (ENG-1604): added after live cost+quality research — AA
     // Intelligence Index 52 (v4.1.1, measured, not estimated), #1 of 138
     // models in its size class, roughly matching DeepSeek V4 Pro's quality
@@ -2480,12 +2522,12 @@ export class AgentModeService {
     // qwen3-coder-next (AA 21, coding-only, deferred by Harsha this pass),
     // qwen3-max/qwen3-max-thinking/qwen3-vl-235b (AA "estimated", not
     // measured, or AA-flagged deprecated).
-    'openrouter/qwen/qwen3.8-27b': { name: 'Qwen3.8 27B', provider: 'qwen', tier: 'medium', description: 'Alibaba\'s efficient open-weight model, leading in its size class', client: null, supportsTemperature: true, qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-26' },
-    'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, qualityScore: 20, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, qualityScore: 60, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 23, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/qwen/qwen3.8-27b': { name: 'Qwen3.8 27B', provider: 'qwen', tier: 'medium', description: 'Alibaba\'s efficient open-weight model, leading in its size class', client: null, supportsTemperature: true, qualityScore: 41, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Qwen3.8 27B, xhigh' },
+    'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, qualityScore: 13, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Mistral Small 4, reasoning' },
+    'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, qualityScore: 50, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Kimi K3, max' },
+    'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, qualityScore: 34, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Kimi K2.7 Code, reasoning' },
+    'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GLM 5.2, max' },
+    'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 17, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GLM 4.7 Flash, reasoning' },
     // 2026-08-19: OpenAI's GPT-5.6 three-tier family (Sol/Terra/Luna, launched
     // 2026-07-09), added via OpenRouter — live-confirmed slugs and pricing at
     // openrouter.ai/openai/gpt-5.6-{sol,terra,luna}. adminOnly per the
@@ -2506,9 +2548,51 @@ export class AgentModeService {
     // redundant — a coincidence of a volatile promo price, not a real
     // "Terra is superseded" fact. Same principle as keeping Kimi K3 out of
     // a family with Kimi K2.7-Code (a coding-specialized sibling).
-    'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: false, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: false, qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: false, qualityScore: 51, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.6 Sol, max' },
+    'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, qualityScore: 47, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.6 Terra, max' },
+    'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: false, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.6 Luna, max' },
+    // ENG-1769 (2026-09-05): GPT-6 Astra — OpenAI's frontier release of
+    // 2026-09-03, added the day Harsha asked ("is it possible to launch astra
+    // on agentweb now? ... go ahead"). Same one-line OpenRouter convention as
+    // the GPT-5.6 trio above and Fable 5.1 (ENG-199): id =
+    // openrouter/<upstream-provider>/<upstream-model>, no new routing code.
+    // Transport: OpenRouter BYOK → our own Azure resource
+    // (agentweb-openrouter-byok, westus3, deployment `gpt-6-astra` version
+    // 2026-09-03, GlobalStandard, created 2026-09-05). Live-confirmed the same
+    // day: response provider "Azure", usage.is_byok true, upstream cost exactly
+    // Azure's $10/$50 list rate — which is what llmPricing.ts bills, because
+    // the OpenRouter usage.cost override is skipped for BYOK calls. First call
+    // on the fresh deployment took ~67s (cold start); steady state ~2s, on par
+    // with Sol on the same path.
+    // Quality: AA Intelligence Index v4.2 (2026-09-05), max effort: Astra 55,
+    // below Fable 5.1 (57), above Sol (51). Canonical benchmark variants only.
+    // Deliberately NO `family`: Astra and Sol are distinct product lines;
+    // sharing a family could auto-retire one after a price move, like the
+    // Terra false-positive documented above. Same treatment as Sol and Kimi K3.
+    // supportsVision: verified EMPIRICALLY 2026-09-05 against the exact shape
+    // describeImage sends (a `data:image/png;base64,…` image_url, ~8 KB PNG)
+    // through this OpenRouter→Azure BYOK path: correct answer, and the same
+    // image via an https URL also correct — the bar LLMModelConfig.supportsVision
+    // sets, not just OpenRouter's architecture metadata (which also lists
+    // file+image+text). Curiosity recorded, not a blocker: a 64x64 two-color
+    // synthetic PNG was misread by Astra ("can't see the image" / wrong
+    // colors) while GPT-5.5 and Sol read it correctly on the same path — real
+    // images are what describe_image sends. supportsTemperature false: a
+    // reasoning model — `temperature` is not in its supported_parameters
+    // (Azure's reasoning-models doc says the same).
+    // maxTools 128: the upstream is Azure OpenAI (live-confirmed above), and
+    // Azure's 128-tool cap is a recorded production failure in this repo, not a
+    // doc claim — ce154d09c / dev.md 2026-04-26: gpt-5.4 returned HTTP 400
+    // "Invalid 'tools': array too long. Expected an array with maximum length
+    // 128, but got an array with length 143" once skills pushed the registry
+    // past 128, which is what introduced maxTools + callLLM's truncation. The
+    // OpenRouter block header omits maxTools because OpenRouter's APIs expose
+    // no limit for ARBITRARY upstreams; that rationale does not apply when the
+    // upstream is known to be Azure. (The GPT-5.6 trio above omit it and have
+    // run since 2026-08-19 — the same gap, not evidence of a higher cap.)
+    // `tier` is the no-price fallback only; the picker derives ultra_premium
+    // live from MODEL_PRICING.
+    'openrouter/openai/gpt-6-astra': { name: 'GPT-6 Astra', provider: 'openai', tier: 'ultra_premium', description: 'OpenAI\'s frontier model for coding and agentic work', client: null, supportsTemperature: false, supportsVision: true, maxTools: 128, qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-6 Astra, max' },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     // 2026-08-19: all four below are `legacy` (picker-grouping only, see
     // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still
@@ -2516,21 +2600,21 @@ export class AgentModeService {
     // have active schedules touching them the same day this was written), so
     // NOT deleted and NOT adminOnly — customers can still select them via
     // "Show more", they're just no longer the default row per tier.
-    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 37, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true, legacy: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 23, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Sonnet 4.5, Non-reasoning' },
+    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 38, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Sonnet 4.6, Adaptive Reasoning, Max Effort' },
+    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true, legacy: true , qualityScore: 31, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Opus 4.6, Non-reasoning, High Effort' },
     // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
     // temperature is deprecated for this model
-    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true, legacy: true , qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true, legacy: true , qualityScore: 46, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Opus 4.8, Adaptive Reasoning, Max Effort (AA estimate)' },
     // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
     // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
     // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
     // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
     // deprecated for this model") — verified against live Bedrock, not assumed.
-    'anthropic.claude-opus-5': { name: 'Claude Opus 5', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 63, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-opus-5': { name: 'Claude Opus 5', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 54, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Opus 5, Adaptive Reasoning, Max Effort' },
+    'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Sonnet 5, Adaptive Reasoning, Max Effort' },
     // Haiku 4.5 still accepts temperature (also live-verified).
-    'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 30, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 17, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Haiku 4.5, Non-reasoning' },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -2607,6 +2691,12 @@ export class AgentModeService {
    * agree with the cost meter it's grouping by. Only when a model has no
    * MODEL_PRICING entry (so costScore can't be computed) does tier fall back
    * to the config's static field, and costScore/costScoreSource are omitted.
+   *
+   * qualityTier (ENG-1789) is a SEPARATE axis derived from qualityScore via
+   * tierFromQualityScore/QUALITY_SCORE_BANDS — it groups by benchmark quality,
+   * not cost, and is omitted whenever qualityScore itself is omitted. `tier`
+   * remains the cost-driven field the picker's existing section headers use;
+   * qualityTier is additive, for any quality-driven grouping/filter.
    */
   async getSupportedModelsWithMetadata(isAdmin: boolean = false): Promise<SupportedModelInfo[]> {
     const ids = await this.getSupportedModels(isAdmin);
@@ -2620,6 +2710,7 @@ export class AgentModeService {
         id,
         name: config?.name ?? id,
         tier: typeof costScore === 'number' ? tierFromCostScore(costScore) : (config?.tier ?? 'medium'),
+        qualityTier: typeof config?.qualityScore === 'number' ? tierFromQualityScore(config.qualityScore) : undefined,
         description: config?.description ?? 'General-purpose model',
         provider: config?.provider ?? 'other',
         family: config?.family,
@@ -2638,6 +2729,7 @@ export class AgentModeService {
       id: e.id,
       name: e.name,
       tier: e.tier,
+      ...(e.qualityTier ? { qualityTier: e.qualityTier } : {}),
       description: e.description,
       provider: e.provider,
       ...(e.staticLegacy || dominatedIds.has(e.id) ? { legacy: true as const } : {}),
@@ -19343,7 +19435,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
         fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
         fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
+        // ENG-1742 follow-up: unencoded `{...}` in a nested field selector is silently
+        // mangled by Graph — on this `ads` edge it doesn't hard-error, it just drops the
+        // `creative` field from every result with no indication anything is missing.
+        // Confirmed live 2026-09-04: this exact string returned every ad with `creative`
+        // entirely absent; the encoded form returns real thumbnail_url/title/body/image_url.
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/ads?fields=id,name,status,adset_id,campaign_id,${encodeURIComponent('creative{thumbnail_url,title,body,image_url}')}${filteringParam}&access_token=${accessToken}`),
         // Ad-level insights for ads processing
         fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
         // Adset-level insights for ad sets processing
@@ -32463,6 +32560,13 @@ ${strippedHtml}`;
           skillIds: step.skillIds,
           ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
           ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
+          // ENG-1765: this whitelist previously omitted inputRequest, silently
+          // dropping every predefined template's authored guided-input-card data
+          // on launch -- the only code that reads step.inputRequest (below, in
+          // setWorkPlanStatusAttempt) could therefore never fire for any
+          // predefined-plan launch, live-confirmed dead against 26 of 28 real
+          // production templates.
+          ...(step.inputRequest !== undefined && { inputRequest: step.inputRequest }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
         autocomplete: predefinedPlan.autocomplete || false,
@@ -32475,6 +32579,57 @@ ${strippedHtml}`;
         templatePlanId: predefinedPlan.planId,
       };
       await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      // ENG-1765: the reactive "surface the next pending step's inputRequest"
+      // check in setWorkPlanStatusAttempt only runs after a set_work_plan_status
+      // call — it never runs on a fresh launch. Most predefined templates put
+      // their inputRequest on step 1 itself, which starts pending with nothing
+      // before it to trigger that reactive scan, so without this it would still
+      // never surface even after restoring the field above. Surface it here too,
+      // the same way, so a launch's own first pending input-requesting step is
+      // never silently skipped.
+      //
+      // Reviewer finding: this write must use the same failIfAwaitingExists
+      // guard as the reactive block. Without it, updateSessionWorkPlanInputRequest
+      // attaches no ConditionExpression at all and blindly overwrites
+      // pendingWorkPlanInput — a force=true relaunch could silently clobber a
+      // genuinely still-awaiting card from whatever was active before, leaving
+      // it orphaned (pointing at a step that's no longer in the active plan)
+      // instead of failing closed. On a guard failure this just logs and skips
+      // surfacing the new step's card rather than blocking the launch — the
+      // plan itself is still valid without it, and the model can still recover
+      // by asking conversationally like it already does today.
+      // User-facing signal (not just a server log) when this doesn't surface:
+      // the model is told via the returned message so it can ask for the same
+      // information conversationally instead of the user silently never seeing
+      // a card and the model never knowing to ask.
+      let inputRequestNotSurfaced: { title: string; prompt?: string } | null = null;
+      const launchInputStep = workPlan.steps
+        .slice()
+        .sort((a, b) => a.stepCount - b.stepCount)
+        .find((s) => s.status === 'pending' && (s as any).inputRequest);
+      if (launchInputStep) {
+        const req = (launchInputStep as any).inputRequest;
+        try {
+          const written = await chatbotDb.updateSessionWorkPlanInputRequest(
+            sessionId,
+            buildWorkPlanInputRequest({
+              ...req,
+              requestId: uuidv4(),
+              stepCount: launchInputStep.stepCount,
+            }),
+            { failIfAwaitingExists: true },
+          );
+          if (!written) {
+            // Guarded off: a genuinely still-awaiting request from before this
+            // launch won the race, per design (see comment above) — not an error.
+            inputRequestNotSurfaced = { title: req.title, prompt: req.prompt };
+          }
+        } catch (inputRequestError) {
+          console.error('AgentMode: Error surfacing input request for launched work plan:', inputRequestError);
+          inputRequestNotSurfaced = { title: req.title, prompt: req.prompt };
+        }
+      }
 
       // ENG-1698: same reset as createWorkPlan — see that call site's comment. A
       // predefined-plan launch on an existing session (including a force=true
@@ -32515,9 +32670,16 @@ ${strippedHtml}`;
         }
       }
 
+      // ENG-1765: tell the model when step 1's input card didn't surface, so it
+      // asks for the same information conversationally instead of the session
+      // silently sitting on a step whose required input nobody was ever asked for.
+      const inputRequestNote = inputRequestNotSurfaced
+        ? ` Note: this plan's first step normally asks "${inputRequestNotSurfaced.title}" via a structured card, but that card could not be shown right now — ask the user for this information directly instead: ${inputRequestNotSurfaced.prompt || inputRequestNotSurfaced.title}`
+        : '';
+
       return {
         success: true,
-        message: `Started work plan "${predefinedPlan.title}" with ${workPlan.steps.length} steps`,
+        message: `Started work plan "${predefinedPlan.title}" with ${workPlan.steps.length} steps${inputRequestNote}`,
         workPlan,
         welcomeMessage: workPlan.welcomeMessage,
         formattedContent: `Started work plan "${predefinedPlan.title}":\n${workPlan.steps.map((s: any) => `${s.stepCount}. ${s.title}`).join('\n')}`,
