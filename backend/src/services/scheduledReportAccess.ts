@@ -26,6 +26,7 @@ export const CROSS_ACCOUNT_USER_DATA_TOOLS = [
   'get_chat_history',
   'list_all_clients',
   'assess_client_health',
+  'monitor_lead_volume',
   'manage_user_notes',
   'get_users_by_lifecycle_stage',
   'get_registration_status',
