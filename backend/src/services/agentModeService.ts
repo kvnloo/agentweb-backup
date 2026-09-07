@@ -35780,8 +35780,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // the account still needs to be the caller's own/shared account) but is
     // deliberately NOT in PACED_WRITE_ACTIONS — it doesn't touch LinkedIn at
     // all, so none of the burst/hourly/daily send-pacing below applies to it.
+    // ENG-1719: withdraw-stale-invitations shares the ownership check for the same
+    // reason set-daily-invite-cap does — it writes to the account, so it must be the
+    // caller's own or org-shared one. It is deliberately NOT in PACED_WRITE_ACTIONS:
+    // the umbrella call itself performs no LinkedIn write, and pacing it here would
+    // consume a slot on top of the one each individual withdrawal already reserves
+    // inside the drain.
     let resolvedLinkedInAccount: ResolvedLinkedInAccount | null = null;
-    if (PACED_WRITE_ACTIONS.has(action) || action === 'set-daily-invite-cap') {
+    if (
+      PACED_WRITE_ACTIONS.has(action)
+      || action === 'set-daily-invite-cap'
+      || action === 'withdraw-stale-invitations'
+    ) {
       resolvedLinkedInAccount = await resolveLinkedInAccountForWrite(userId, account_id);
       if (!resolvedLinkedInAccount) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
@@ -36777,6 +36787,64 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             console.error(`[AgentMode] Failed to drop withdrawn invitation ${invitationId}:`, err),
           );
           return { success: true, data: cancelResult };
+        }
+
+        // ENG-1719 / ENG-1609 AC #8: bulk-withdraw the oldest pending invitations.
+        //
+        // Routed through paceLinkedInWrite per withdrawal, exactly like the
+        // single-shot cancel-invitation above, so the drain inherits the spacing
+        // gap and the hourly ceiling instead of working around them — and,
+        // because dailyVolumeClassFor returns null for cancel, does not consume
+        // the account's daily invite budget.
+        case 'withdraw-stale-invitations': {
+          const {
+            withdrawStaleInvitations,
+            DEFAULT_MAX_WITHDRAWALS_PER_RUN,
+          } = await import('./agentMode/linkedInStaleInvitationDrain');
+          const {
+            getAllSentInvitationsByAccount,
+            deleteSentInvitationByInvitationId,
+          } = await import('./unipileSentInvitationsDb');
+
+          const rawDays = Number(args.older_than_days);
+          if (!Number.isFinite(rawDays) || rawDays < 1) {
+            throw new Error('older_than_days is required for withdraw-stale-invitations and must be at least 1');
+          }
+          const rawMax = Number(args.max_withdrawals);
+
+          const result = await withdrawStaleInvitations({
+            accountId: account_id,
+            olderThanDays: rawDays,
+            maxWithdrawals: Number.isFinite(rawMax) && rawMax > 0 ? rawMax : DEFAULT_MAX_WITHDRAWALS_PER_RUN,
+            deps: {
+              fetchPending: (acc) => getAllSentInvitationsByAccount(acc),
+              // The pacer's own refusal text, or null to proceed. Reusing
+              // paceLinkedInWrite rather than reserveWriteSlot directly keeps the
+              // drain on the identical path every other LinkedIn write takes.
+              pace: async (acc) => {
+                const paced = await paceLinkedInWrite('cancel-invitation', resolvedLinkedInAccount!, acc);
+                // resolvedLinkedInAccount is non-null here: this action is in the
+                // ownership gate above, which returns early when it cannot resolve.
+                return paced.refusal ? paced.refusal.error : null;
+              },
+              cancel: async (invitationId, acc) => {
+                await linkedInOutreachService.cancelInvitation(invitationId, acc);
+              },
+              forget: (acc, invitationId) => deleteSentInvitationByInvitationId(acc, invitationId),
+              recordWithdrawal: async (candidate) => {
+                const { recordInviteWithdrawnInCrm } = await import('./linkedInInviteCrmMirror');
+                return recordInviteWithdrawnInCrm({
+                  userId,
+                  accountId: account_id,
+                  linkedinUrl: candidate.publicProfileUrl,
+                  invitationId: candidate.invitationId,
+                  sentAt: candidate.sentAt,
+                  ...(args.list_id ? { listId: args.list_id } : {}),
+                });
+              },
+            },
+          });
+          return { success: true, data: result };
         }
 
         case 'search-parameters': {
