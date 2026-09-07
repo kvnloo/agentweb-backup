@@ -13,7 +13,7 @@
 
 import { getModelPrice, cacheWriteCost, CacheWriteByTtl, isPerGenerationPriced } from "../utils/llmPricing";
 import { usageRecordDb, CostSource } from "./usageRecordDb";
-import { mirrorVendorUsage } from "./spendLedgerDualWrite";
+import { buildShadowEvent, mirrorVendorUsage } from "./spendLedgerDualWrite";
 // tokenUsageService is lazy-required inside meterUserUsage (not statically imported):
 // it pulls in db.ts -> config/aws.ts, and usageRecorderService is imported very widely
 // (via llmClients). A static import would drag that whole graph into every consumer's
@@ -87,6 +87,18 @@ export interface RecordVendorUsageContext {
   costSource: CostSource;
   /** Dollar cost of this call. Omitted means 0 — ENG-700 makes an unpriced unit loud. */
   costUsd?: number;
+  /**
+   * ENG-702 AC1: a stable token for THIS vendor call, supplied at the call
+   * site. When present, the daily aggregate row and the immutable spend event
+   * are written in ONE transaction guarded on it, so a retried call increases
+   * recorded spend exactly once on BOTH rails.
+   *
+   * Omit only when the call site genuinely has no natural per-call id. A retry
+   * is then counted twice — which is what every vendor path did before this
+   * field existed, and is deliberately preserved so adoption can be
+   * incremental rather than a single flag day across seven adapters.
+   */
+  idempotencyKey?: string;
 }
 
 /** Log at most one shadow-ledger failure per minute, on its own throttle so a
@@ -243,8 +255,81 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
  * different vendors can never aggregate into one row and overwrite each other's
  * `provider`. For token-priced LLM rows that ambiguity is ENG-700's job.
  */
+/**
+ * The idempotent vendor write (ENG-702 AC1).
+ *
+ * Never throws, for the same reason the shadow mirror never does: every caller
+ * invokes recordVendorUsage fire-and-forget, so a rejection here becomes an
+ * unhandled promise rejection and takes the process down. AC3's "surfaced
+ * rather than silently discarded" is served by the failure counter and alert,
+ * not by throwing into a caller that cannot catch it.
+ */
+async function recordVendorUsageIdempotent(ctx: RecordVendorUsageContext, now: Date): Promise<void> {
+  const userId = ctx.userId || "system";
+  const billingUserId = ctx.billingUserId || userId;
+
+  try {
+    const built = buildShadowEvent(ctx, now.toISOString());
+    if ("skip" in built) {
+      // Unpriced: no spend event may exist for it, so there is nothing to make
+      // the aggregate write idempotent against. Fall back to the plain write
+      // rather than inventing a $0 event the billing boundary forbids.
+      await usageRecordDb.incrementUsage(buildVendorIncrement(ctx, userId, billingUserId, now));
+      return;
+    }
+
+    const outcome = await usageRecordDb.incrementUsageWithSpendEvent(
+      buildVendorIncrement(ctx, userId, billingUserId, now),
+      built.event,
+    );
+
+    if (outcome === "conflict") {
+      // Two concurrent writers touched the same aggregate row. Neither rail
+      // moved, so this is a retryable nothing rather than a lost charge -- and
+      // the token makes the retry safe.
+      logRecorderFailure(new Error(`transaction conflict on vendor usage for ${billingUserId}; not applied`));
+    }
+  } catch (error) {
+    logRecorderFailure(error);
+  }
+}
+
+/** The daily-aggregate shape for a vendor call, shared by both write paths. */
+function buildVendorIncrement(
+  ctx: RecordVendorUsageContext,
+  userId: string,
+  billingUserId: string,
+  now: Date,
+) {
+  return {
+    userId,
+    date: now.toISOString().slice(0, 10),
+    model: `${ctx.provider}:${ctx.operation}`,
+    feature: ctx.feature || "unknown",
+    inputTokens: 0,
+    outputTokens: 0,
+    costMicroUsd: Math.max(0, Math.round((ctx.costUsd || 0) * 1e6)),
+    billingUserId,
+    provider: ctx.provider,
+    unit: ctx.unit,
+    quantity: ctx.quantity,
+    costSource: ctx.costSource,
+    ...(ctx.onBehalfOf ? { onBehalfOf: ctx.onBehalfOf } : {}),
+    ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+  };
+}
+
 export async function recordVendorUsage(ctx: RecordVendorUsageContext): Promise<void> {
   const now = new Date();
+
+  // ENG-702 AC1. With a token, both rails move together under one condition:
+  // a replay skips the spend event and the aggregate's contribution as a unit.
+  // Without one, the legacy path below keeps today's behaviour — unconditional
+  // aggregate write, then a fail-open shadow mirror.
+  if (ctx.idempotencyKey) {
+    await recordVendorUsageIdempotent(ctx, now);
+    return;
+  }
 
   try {
     const userId = ctx.userId || "system";
