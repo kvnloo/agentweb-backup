@@ -56,6 +56,11 @@ export const MIN_OLDER_THAN_DAYS = 1;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/** In-run attempts at the CRM provenance write before giving up and reporting it. */
+export const CRM_RECORD_ATTEMPTS = 3;
+/** Base backoff between those attempts; multiplied by the attempt number. */
+export const CRM_RETRY_BACKOFF_MS = 250;
+
 export interface StaleInvitationCandidate {
   invitationId: string;
   invitedUserPublicId: string;
@@ -202,6 +207,8 @@ export interface StaleInvitationDrainDeps {
   /** Best-effort CRM provenance. Never allowed to fail a completed withdrawal. */
   recordWithdrawal?: (candidate: StaleInvitationCandidate) => Promise<unknown>;
   now?: () => number;
+  /** Injected for tests; real runs back off between CRM retries. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 function summarise(r: Omit<StaleInvitationDrainResult, 'notice'>): string {
@@ -309,13 +316,40 @@ export async function withdrawStaleInvitations(params: {
       });
     });
     if (deps.recordWithdrawal) {
-      await Promise.resolve(deps.recordWithdrawal(candidate)).catch((err) => {
-        console.error(`[staleInvitationDrain] failed to record CRM withdrawal for ${candidate.publicProfileUrl}:`, err);
+      // Retried IN-RUN (CodeRabbit on PR #2801). Unlike the ledger row above,
+      // nothing re-runs this afterwards: the invite-SENT path has a reconcile cron
+      // behind it, but that cron walks still-pending invitations and a withdrawn
+      // one is no longer pending. So a transient CRM blip would otherwise lose the
+      // history entry permanently, on the first and only attempt.
+      //
+      // A few spaced attempts cover the transient case this is actually exposed
+      // to. Deliberately NOT a durable queue: that means a new persisted work item
+      // and a worker to drain it, a larger design than this ticket -- and a
+      // sustained outage still lands in `crmRecordFailed`, where the run report
+      // names the affected leads rather than hiding them.
+      const wait = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+      let recorded = false;
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < CRM_RECORD_ATTEMPTS; attempt++) {
+        try {
+          await deps.recordWithdrawal(candidate);
+          recorded = true;
+          break;
+        } catch (err) {
+          lastErr = err;
+          if (attempt < CRM_RECORD_ATTEMPTS - 1) await wait(CRM_RETRY_BACKOFF_MS * (attempt + 1));
+        }
+      }
+      if (!recorded) {
+        console.error(
+          `[staleInvitationDrain] failed to record CRM withdrawal for ${candidate.publicProfileUrl} `
+          + `after ${CRM_RECORD_ATTEMPTS} attempts:`, lastErr,
+        );
         crmRecordFailed.push({
           invitedUserName: candidate.invitedUserName,
           publicProfileUrl: candidate.publicProfileUrl,
         });
-      });
+      }
     }
     withdrawn.push({
       invitedUserName: candidate.invitedUserName,

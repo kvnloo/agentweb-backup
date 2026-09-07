@@ -7,6 +7,7 @@
 import { reserveDailyVolumeSlot } from '../services/linkedInWritePacer';
 import { PACED_WRITE_ACTIONS } from '../services/linkedInWritePacer';
 import {
+  CRM_RECORD_ATTEMPTS,
   DEFAULT_MAX_WITHDRAWALS_PER_RUN,
   selectStaleInvitations,
   withdrawStaleInvitations,
@@ -192,6 +193,7 @@ describe('withdrawStaleInvitations', () => {
     const deps = makeDeps([row('a', 40)], {
       forget: jest.fn(async () => { throw new Error('dynamo down'); }),
       recordWithdrawal: jest.fn(async () => { throw new Error('crm down'); }),
+      sleep: async () => {},
     });
 
     const result = await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps });
@@ -218,11 +220,42 @@ describe('withdrawStaleInvitations', () => {
     expect(result.notice).toContain('next sync');
   });
 
+  it('retries a transient CRM failure in-run rather than losing the history entry', async () => {
+    // The invite-SENT path has a reconcile cron behind it; this one does not,
+    // because that cron walks still-pending invitations and a withdrawn one is not.
+    // So a single blip would otherwise lose the entry permanently.
+    let calls = 0;
+    const deps = makeDeps([row('a', 40)], {
+      recordWithdrawal: jest.fn(async () => {
+        if (++calls < 3) throw new Error('crm blip');
+        return { leadId: 'l1', listId: 'list1' };
+      }),
+      sleep: async () => {},
+    });
+
+    const result = await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps });
+
+    expect(calls).toBe(3);
+    expect(result.crmRecordFailed).toEqual([]);
+    expect(result.withdrawn).toHaveLength(1);
+  });
+
+  it('gives up after the bounded attempts and reports it', async () => {
+    const recordWithdrawal = jest.fn(async () => { throw new Error('crm down'); });
+    const deps = makeDeps([row('a', 40)], { recordWithdrawal, sleep: async () => {} });
+
+    const result = await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps });
+
+    expect(recordWithdrawal).toHaveBeenCalledTimes(CRM_RECORD_ATTEMPTS);
+    expect(result.crmRecordFailed).toHaveLength(1);
+  });
+
   it('reports a CRM provenance failure, and says nothing retries it', async () => {
     // Unlike the cache row, nothing re-runs this: the only automatic
     // reconciliation walks still-pending invitations, and this one is not.
     const deps = makeDeps([row('a', 40)], {
       recordWithdrawal: jest.fn(async () => { throw new Error('crm down'); }),
+      sleep: async () => {},
     });
 
     const result = await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps });
