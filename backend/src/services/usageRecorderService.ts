@@ -280,6 +280,10 @@ async function recordVendorUsageIdempotent(ctx: RecordVendorUsageContext, now: D
       // the aggregate write idempotent against. Fall back to the plain write
       // rather than inventing a $0 event the billing boundary forbids.
       await usageRecordDb.incrementUsage(buildVendorIncrement(ctx, userId, billingUserId, now));
+      // Recovery on ANY successful path closes an open window, not just the
+      // priced+keyed one (CodeRabbit, PR #2807) — otherwise an account whose
+      // vendor traffic is all unpriced never reports its final alert.
+      flushDroppedWriteAlerts();
       return;
     }
 
@@ -383,6 +387,8 @@ export async function recordVendorUsage(ctx: RecordVendorUsageContext): Promise<
       ...(ctx.onBehalfOf ? { onBehalfOf: ctx.onBehalfOf } : {}),
       ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
     });
+    // Recovery on the legacy path closes an open window too.
+    flushDroppedWriteAlerts();
   } catch (error) {
     logRecorderFailure(error);
     // ENG-702 AC3: counted even here, so an outage's cost is visible whether or

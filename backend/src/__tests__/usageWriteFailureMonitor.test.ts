@@ -8,6 +8,7 @@
  */
 import {
   ALERT_WINDOW_MS,
+  RECOVERY_QUIET_MS,
   DroppedWriteWindow,
   flushDroppedWriteAlerts,
   getDroppedWriteTotals,
@@ -169,13 +170,61 @@ describe('recordDroppedWrite (AC3 + AC6)', () => {
       expect(alerts[0].lostMicroUsd).toBe(999);
     });
 
-    it('does not emit a window that is still open', () => {
+    it('does not emit while drops are still arriving', () => {
       const t0 = 6_000_000;
       recordDroppedWrite({ provider: 'p', operation: 'o', costMicroUsd: 1, billingUserId: 'o', reason: 'x' }, t0);
 
       flushDroppedWriteAlerts(t0 + 1);
 
       expect(alerts).toHaveLength(0);
+    });
+
+    // CodeRabbit, PR #2807: an age-only check meant a SHORT outage followed by
+    // recovery left its window open forever, since nothing later arrives to
+    // close it.
+    it('closes a short outage once the drops have settled, without waiting a full window', () => {
+      const t0 = 7_000_000;
+      recordDroppedWrite({ provider: 'p', operation: 'o', costMicroUsd: 42, billingUserId: 'o', reason: 'brief' }, t0);
+
+      // 10 seconds later — far short of ALERT_WINDOW_MS, but quiet.
+      flushDroppedWriteAlerts(t0 + 10_000);
+
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0].lostMicroUsd).toBe(42);
+    });
+
+    it('does NOT close early while failures and successes interleave — that would be one alert per record', () => {
+      const t0 = 8_000_000;
+      for (let i = 0; i < 5; i++) {
+        recordDroppedWrite({ provider: 'p', operation: 'o', costMicroUsd: 1, billingUserId: 'o', reason: 'x' }, t0 + i * 1000);
+        // a success between each failure, as happens during a partial outage
+        flushDroppedWriteAlerts(t0 + i * 1000 + 1);
+      }
+
+      expect(alerts).toHaveLength(0);
+
+      // Only once they genuinely stop does the single alert fire, carrying all 5.
+      flushDroppedWriteAlerts(t0 + 5 * 1000 + RECOVERY_QUIET_MS);
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0].count).toBe(5);
+    });
+
+    it('a throwing alert sink never escapes, and never re-emits the same window', () => {
+      // emit is injectable; on the fire-and-forget vendor path an escaping
+      // exception is an unhandled rejection that takes the process down.
+      const t0 = 9_500_000;
+      setDroppedWriteAlertSink(() => {
+        throw new Error('sink exploded');
+      });
+      recordDroppedWrite({ provider: 'p', operation: 'o', costMicroUsd: 1, billingUserId: 'o', reason: 'x' }, t0);
+
+      expect(() => flushDroppedWriteAlerts(t0 + ALERT_WINDOW_MS + 1)).not.toThrow();
+
+      // window was cleared before the sink ran, so a broken sink cannot loop
+      const seen: unknown[] = [];
+      setDroppedWriteAlertSink((s) => seen.push(s));
+      flushDroppedWriteAlerts(t0 + 2 * ALERT_WINDOW_MS);
+      expect(seen).toHaveLength(0);
     });
 
     it('is a no-op with nothing pending', () => {

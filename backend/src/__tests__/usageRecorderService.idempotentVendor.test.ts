@@ -178,6 +178,26 @@ describe('recordVendorUsage — idempotent vendor writes (ENG-702 AC1)', () => {
       jest.spyOn(Date, 'now').mockRestore();
     });
 
+    it.each([
+      ['unpriced keyed', { idempotencyKey: 'b', costSource: 'unpriced' as const, costUsd: undefined }],
+      ['tokenless legacy', {}],
+    ])('a successful %s write also flushes the final alert window', async (_label, success) => {
+      // CodeRabbit, PR #2807: recovery through these paths left the window open
+      // until some unrelated priced+keyed write happened to occur.
+      const alerts: unknown[] = [];
+      setDroppedWriteAlertSink((summary) => alerts.push(summary));
+
+      mockTxn.mockRejectedValue(Object.assign(new Error('down'), { code: 'ValidationException' }));
+      await recordVendorUsage(ctx({ idempotencyKey: 'a' }));
+      expect(alerts).toHaveLength(0);
+
+      jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 120_000);
+      await recordVendorUsage(ctx(success));
+
+      expect(alerts).toHaveLength(1);
+      jest.spyOn(Date, 'now').mockRestore();
+    });
+
     it('counts a loss on the tokenless path too, but never retries it', async () => {
       // That path's aggregate write is an unconditional ADD: a retry after a
       // lost response double-counts, which is the failure AC1 exists to

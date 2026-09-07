@@ -112,6 +112,13 @@ export interface DroppedWriteWindow {
 /** How long one alert covers. A sustained outage produces one line per window. */
 export const ALERT_WINDOW_MS = 60_000;
 
+/**
+ * How long the drops must have stopped before a successful write may close the
+ * open window early. Short enough that a brief outage is reported promptly,
+ * long enough that interleaved failures do not each get their own alert.
+ */
+export const RECOVERY_QUIET_MS = 5_000;
+
 let window: DroppedWriteWindow | null = null;
 let windowStartedAt = 0;
 let cumulative = { count: 0, lostMicroUsd: 0 };
@@ -142,6 +149,29 @@ export function setDroppedWriteAlertSink(sink: Emit): void {
 }
 
 /**
+ * Emit, clearing the window FIRST and swallowing a sink failure.
+ *
+ * `emit` is injectable, so it can throw (CodeRabbit, PR #2807). On the
+ * fire-and-forget vendor path that exception escapes as an unhandled rejection
+ * and takes the process down — alerting about lost writes becoming a bigger
+ * outage than the lost writes. Clearing before the call also stops a
+ * persistently broken sink from re-emitting the same window forever.
+ */
+function emitAndClear(): void {
+  const pending = window;
+  window = null;
+  if (!pending) return;
+  try {
+    emit(pending);
+  } catch (error) {
+    console.error(
+      "[usageWriteFailure] alert sink threw; dropped-write summary lost:",
+      error instanceof Error ? error.message : error,
+    );
+  }
+}
+
+/**
  * Record a write that could not be persisted, and alert at most once per
  * window (AC6).
  *
@@ -154,8 +184,7 @@ export function recordDroppedWrite(drop: DroppedWrite, now: number = Date.now())
   cumulative = { count: cumulative.count + 1, lostMicroUsd: cumulative.lostMicroUsd + drop.costMicroUsd };
 
   if (window && now - windowStartedAt >= ALERT_WINDOW_MS) {
-    emit(window);
-    window = null;
+    emitAndClear();
   }
 
   if (!window) {
@@ -185,10 +214,24 @@ export function recordDroppedWrite(drop: DroppedWrite, now: number = Date.now())
  * would sit unemitted forever.
  */
 export function flushDroppedWriteAlerts(now: number = Date.now()): void {
-  if (window && now - windowStartedAt >= ALERT_WINDOW_MS) {
-    emit(window);
-    window = null;
-  }
+  if (!window) return;
+
+  // Two independent reasons to close a window, and the age check alone was
+  // wrong (CodeRabbit, PR #2807): if writes fail for ten seconds and then
+  // recover, the window is only ten seconds old, so an age-gated flush is a
+  // no-op — and with no later drop to close it, that alert never fires at all.
+  // Recovery is itself the signal that a window is complete.
+  //
+  // The quiet period is what keeps AC6 intact. Flushing on every success
+  // outright would emit one alert per failure whenever failures and successes
+  // interleave, which is precisely the "one alert per dropped record" AC6
+  // forbids. A window only closes once no new drop has landed for
+  // RECOVERY_QUIET_MS, so a sustained outage still produces one alert per
+  // ALERT_WINDOW_MS and nothing more.
+  const expired = now - windowStartedAt >= ALERT_WINDOW_MS;
+  const settled = now - Date.parse(window.lastAt) >= RECOVERY_QUIET_MS;
+
+  if (expired || settled) emitAndClear();
 }
 
 /** Totals since process start. Surfaces what was lost, per AC3. */
