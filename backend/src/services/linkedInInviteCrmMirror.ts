@@ -20,6 +20,19 @@ export const INVITE_SENT_EVENT = 'linkedin.invite.sent';
 export const INVITE_ACCEPTED_EVENT = 'linkedin.invite.accepted';
 
 /**
+ * ENG-1719: a stale invitation we withdrew ourselves.
+ *
+ * Logged so a lead's history reads truthfully — "we invited them, then withdrew
+ * it" — rather than ending at `linkedin.invite.sent` forever. Deliberately does
+ * NOT flip the lead back from 'contacted' and does NOT clear
+ * `linkedInInviteSentAt`: we really did contact that person, and rewriting that
+ * would be falsifying history rather than correcting it. What has to stop being
+ * true is the "invitation pending" indicator, and that is driven off the
+ * AW-UnipileSentInvitations row, which the withdrawal deletes.
+ */
+export const INVITE_WITHDRAWN_EVENT = 'linkedin.invite.withdrawn';
+
+/**
  * True when the lead already carries an invite-sent engagement for this invitee
  * from this sending account.
  *
@@ -562,4 +575,61 @@ export async function reconcileSentInvitationsToCrm(
       : '',
   );
   return result;
+}
+
+
+/**
+ * ENG-1719: append a withdrawal engagement to an EXISTING lead, if there is one.
+ *
+ * Deliberately much narrower than `mirrorLinkedInInviteToCrm`: it never creates a
+ * lead and never changes a lead's status. A withdrawal is not an act of outreach,
+ * so inventing a CRM record for someone who has none would manufacture a contact
+ * from the act of undoing one. When the lead already exists, its history should
+ * say what happened.
+ *
+ * Best-effort by contract, like every other call into this module: the invitation
+ * is already withdrawn on LinkedIn's side by the time this runs, so a CRM write
+ * failing here must never be reported as a failed withdrawal.
+ */
+export async function recordInviteWithdrawnInCrm(params: {
+  userId: string;
+  accountId: string;
+  linkedinUrl: string;
+  invitationId: string;
+  sentAt?: string;
+  listId?: string;
+}): Promise<{ leadId: string; listId: string } | null> {
+  const normalized = normalizeLinkedInUrl(params.linkedinUrl);
+  if (!normalized) return null;
+
+  const listId = params.listId || (await resolveListIdForAccount(params.userId, params.accountId));
+  if (!listId) return null;
+
+  const { crmDb } = await import('./db');
+  const existing = await crmDb.findLeadByLinkedinInList(listId, normalized);
+  if (!existing?.leadId) return null;
+
+  // Same duplicate guard the sent/accepted paths use, keyed on this event type and
+  // this invitation id — a re-run of the drain must not append a second identical
+  // withdrawal to the same lead.
+  if (hasInviteEngagement(existing, {
+    linkedin: normalized,
+    accountId: params.accountId,
+    invitationId: params.invitationId,
+    eventType: INVITE_WITHDRAWN_EVENT,
+  })) {
+    return { leadId: String(existing.leadId), listId };
+  }
+
+  await crmDb.addLeadEngagement(listId, String(existing.leadId), {
+    eventType: INVITE_WITHDRAWN_EVENT,
+    eventData: {
+      linkedin: normalized,
+      accountId: params.accountId,
+      invitationId: params.invitationId,
+      ...(params.sentAt ? { originallySentAt: params.sentAt } : {}),
+    },
+    createdAt: new Date().toISOString(),
+  });
+  return { leadId: String(existing.leadId), listId };
 }
