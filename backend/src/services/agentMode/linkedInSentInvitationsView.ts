@@ -54,8 +54,22 @@ export interface TrimmedSentInvitation {
 
 export interface SentInvitationsView {
   items: TrimmedSentInvitation[];
-  /** Total known pending for the account, which may exceed the trimmed `items`. */
+  /** Pending invitations known for the account, which may exceed the trimmed `items`. */
   totalPending: number;
+  /**
+   * True when `totalPending` is a FLOOR rather than a total.
+   *
+   * CodeRabbit on PR #2796: `getAllInvitationsSent` is cursor-paginated and
+   * publishes no grand total, so one page's length is only what this page held.
+   * Reporting it as the backlog size would be the same false precision this
+   * module removes from the empty case — the tool description promised callers a
+   * "true backlog size", which a page count is not. Aggregating every page was
+   * rejected: the trim exists because these objects reach 200+ and bloat a
+   * scheduled run's context, and walking the whole cursor would multiply the
+   * provider calls this account is already rate-limited on. Saying "at least N"
+   * costs nothing and is true.
+   */
+  totalPendingIsLowerBound?: boolean;
   source: SentInvitationsSource;
   cursor?: string | null;
   /** Always present. Explains the result, including when it is empty. */
@@ -73,9 +87,42 @@ export interface SentInvitationsView {
  */
 export const MAX_RETURNED_INVITATIONS = 50;
 
-/** The envelope the Unipile SDK's own schema promises for this endpoint. */
+/**
+ * Does one row look like the `InvitationSent` the SDK schema promises?
+ *
+ * CodeRabbit on PR #2796, and it is the defect this whole module exists to
+ * remove, one level further down than the first fix reached. Checking only the
+ * ENVELOPE let `{ items: [null] }` through: `trimLive` turned that into a row of
+ * five nulls, the view reported "1 pending invitation read live from LinkedIn",
+ * and — worse — the non-empty page suppressed the cache fallback that held the
+ * real data. A fabricated invitation presented as a live fact is exactly what
+ * ENG-1718 is about.
+ *
+ * An item is usable only if it is an object carrying an IDENTITY we could act
+ * on: the invitation id (what `cancel-invitation` and the stale-invitation drain
+ * take) or the invitee's public id. A row with neither cannot be withdrawn,
+ * deduplicated, or shown to anyone, so counting it as a pending invitation is
+ * always wrong.
+ */
+function isConformingLiveItem(item: any): boolean {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+  const hasId = typeof item.id === 'string' && item.id.trim().length > 0;
+  const hasPublicId = typeof item.invited_user_public_id === 'string'
+    && item.invited_user_public_id.trim().length > 0;
+  return hasId || hasPublicId;
+}
+
+/**
+ * The envelope AND every row. Fails closed on a partially-malformed page: the
+ * module's whole thesis is that an unreliable read must never be presented as
+ * fact, and a response carrying rows we do not understand is not a response we
+ * understand. Falling back to our own ledger is the safe answer, and it is a
+ * known-good one — in the ENG-1132 incident it held 126 rows for the very
+ * account reporting nothing.
+ */
 function isConformingLiveResponse(raw: any): boolean {
-  return !!raw && typeof raw === 'object' && Array.isArray(raw.items);
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.items)) return false;
+  return raw.items.every(isConformingLiveItem);
 }
 
 function trimLive(item: any): TrimmedSentInvitation {
@@ -148,14 +195,22 @@ export async function getSentInvitationsView(
   if (!liveUnavailable) {
     const items = (live.items as any[]).map(trimLive);
     if (items.length > 0) {
+      // A cursor means more pages exist, so this page's length is a floor on the
+      // backlog, not its size. Say "at least" rather than overstate our knowledge.
+      const morePages = Boolean(live.cursor);
       return {
         items: items.slice(0, MAX_RETURNED_INVITATIONS),
         totalPending: items.length,
+        ...(morePages ? { totalPendingIsLowerBound: true } : {}),
         source: 'live',
         cursor: live.cursor ?? null,
         notice:
-          `${items.length} pending invitation${items.length === 1 ? '' : 's'} read live from LinkedIn`
+          `${morePages ? 'At least ' : ''}${items.length} pending invitation${items.length === 1 ? '' : 's'} `
+          + `read live from LinkedIn`
           + `${items.length > MAX_RETURNED_INVITATIONS ? `; showing the first ${MAX_RETURNED_INVITATIONS}` : ''}.`
+          + (morePages
+            ? ' More pages remain, so the real backlog is larger than this number — pass the cursor to read on.'
+            : '')
           + ' Each carries sent_at, so the stale ones can be identified by age.',
       };
     }
