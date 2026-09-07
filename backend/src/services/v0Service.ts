@@ -1465,8 +1465,8 @@ async function generateFirstPage(
       // (3–15 min in prod), guaranteeing a loss against the 300s attempt timeout and
       // minting an orphan, credit-burning chat on every "timeout". Async returns the
       // chatId in seconds; waitForCompletedV0Version absorbs the generation time. (ENG-287)
-      create: () => withRetry(
-        meteredV0({ userId, operation: "chat_create" }, () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" })),
+      create: (meteringKey) => withRetry(
+        meteredV0({ userId, operation: "chat_create", idempotencyKey: meteringKey }, () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" })),
         "v0 chat creation",
         // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
         // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
@@ -1851,8 +1851,8 @@ async function addPageToExistingRepo(
       prompt: enrichedPrompt,
       // responseMode async — see the first-page call site for why sync mode cannot
       // survive the 300s attempt timeout. (ENG-287)
-      create: () => withRetry(
-        meteredV0({ userId, operation: "chat_create" }, () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" })),
+      create: (meteringKey) => withRetry(
+        meteredV0({ userId, operation: "chat_create", idempotencyKey: meteringKey }, () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" })),
         "v0 chat creation (additional page)",
         // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
         // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
@@ -1955,8 +1955,8 @@ async function addPageToExistingRepo(
               scopeId: existingPage.siteId ?? existingPage.id,
               chatId,
               attempt: validationAttempt,
-              send: () => withRetry(
-                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
+              send: (meteringKey) => withRetry(
+                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
                   chatId,
                   message:
                     "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
@@ -2009,8 +2009,8 @@ async function addPageToExistingRepo(
               scopeId: existingPage.siteId ?? existingPage.id,
               chatId: chatId!,
               attempt: validationAttempt,
-              send: () => withRetry(
-                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
+              send: (meteringKey) => withRetry(
+                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
                   chatId: chatId!,
                   message:
                     "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
@@ -2055,8 +2055,8 @@ async function addPageToExistingRepo(
               scopeId: existingPage.siteId ?? existingPage.id,
               chatId,
               attempt: validationAttempt,
-              send: () => withRetry(
-                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
+              send: (meteringKey) => withRetry(
+                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
                   chatId,
                   message:
                     "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
@@ -2103,8 +2103,8 @@ async function addPageToExistingRepo(
             // the SAME version and re-downloaded the SAME broken zip — a 3-attempt self-heal
             // that was really 1. (ENG-287 residual)
             attempt: validationAttempt,
-            send: () => withRetry(
-              meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
+            send: (meteringKey) => withRetry(
+              meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
                 chatId,
                 message:
                   "The previous output was not valid code. Please generate actual React/Next.js code — " +
@@ -3101,8 +3101,8 @@ export async function deployLandingPage(
               scopeId: record.siteId ?? record.id,
               chatId: record.v0ChatId!,
               attempt: validationAttempt,
-              send: () => withRetry(
-                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
+              send: (meteringKey) => withRetry(
+                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
                   chatId: record.v0ChatId!,
                   message:
                     "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
@@ -3150,8 +3150,8 @@ export async function deployLandingPage(
               scopeId: record.siteId ?? record.id,
               chatId: record.v0ChatId!,
               attempt: validationAttempt,
-              send: () => withRetry(
-                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
+              send: (meteringKey) => withRetry(
+                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
                   chatId: record.v0ChatId!,
                   message:
                     "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
@@ -3198,8 +3198,8 @@ export async function deployLandingPage(
               scopeId: record.siteId ?? record.id,
               chatId: record.v0ChatId!,
               attempt: validationAttempt,
-              send: () => withRetry(
-                meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
+              send: (meteringKey) => withRetry(
+                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
                   chatId: record.v0ChatId!,
                   message:
                     "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
@@ -3245,8 +3245,8 @@ export async function deployLandingPage(
             // Each loop round is a different send — without this discriminator round 2 was
             // skipped and we re-downloaded the same broken zip. (ENG-287 residual)
             attempt: validationAttempt,
-            send: () => withRetry(
-              meteredV0({ userId, operation: "correction_message" }, () => v0.chats.sendMessage({
+            send: (meteringKey) => withRetry(
+              meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
                 chatId: record.v0ChatId!,
                 message:
                   "The previous output was not valid code. Please generate actual React/Next.js code — " +
@@ -5817,8 +5817,8 @@ export async function iterateLandingPage(
         scopeId: id,
         chatId,
         message,
-        send: () => withRetry(
-          meteredV0({ userId: iterateActorUserId, billingUserId: iterateOwnerUserId, ...(iterateActorUserId && iterateOwnerUserId && iterateActorUserId !== iterateOwnerUserId ? { onBehalfOf: iterateActorUserId } : {}), operation: "iterate_message" }, () => v0.chats.sendMessage({ chatId, message, responseMode: "async" })),
+        send: (meteringKey) => withRetry(
+          meteredV0({ userId: iterateActorUserId, billingUserId: iterateOwnerUserId, ...(iterateActorUserId && iterateOwnerUserId && iterateActorUserId !== iterateOwnerUserId ? { onBehalfOf: iterateActorUserId } : {}), operation: "iterate_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({ chatId, message, responseMode: "async" })),
           "v0 chat iterate",
           undefined, undefined, undefined,
           { retryOnTimeout: false }

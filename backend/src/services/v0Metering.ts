@@ -63,6 +63,20 @@ export interface V0MeterContext {
   /** Set when the acting member is not the accountable owner (AC5). */
   onBehalfOf?: string;
   operation: V0Operation;
+  /**
+   * ENG-702 AC1: the charge's identity. Supplied by v0UsageGuard, which already
+   * owns the canonical notion of "the same generation", so the guard and the
+   * ledger can never disagree about what one call is.
+   *
+   * The unit is ONE CHARGE PER RESERVATION, not per attempt. `meteredV0`
+   * returns a thunk that `withRetry` re-invokes, so every retry inside one
+   * reservation used to book another charge -- the exact defect ENG-702 names:
+   * "the v0 retry loop books duplicates under one reservation". Sharing the
+   * key across those attempts collapses them into one charge, while a
+   * guard-permitted retry after a failure mints a NEW reservation and is
+   * charged in full, because it really did call v0 again.
+   */
+  idempotencyKey?: string;
 }
 
 /** True when the error carries evidence that v0 answered, so the call was billable. */
@@ -91,6 +105,7 @@ export function recordV0Call(ctx: V0MeterContext): void {
       feature: "landing_page",
       unit: "generation",
       quantity: 1,
+      ...(ctx.idempotencyKey ? { idempotencyKey: ctx.idempotencyKey } : {}),
       ...(rate === null
         ? // The card lost the entry: make it loud rather than book a silent $0.
           { costSource: "unpriced" as const }
