@@ -32927,18 +32927,29 @@ ${strippedHtml}`;
       // it previously failed or was never attempted at all. A function that
       // was never required to begin with, or that has already succeeded at
       // least once, is unaffected and can still be dropped normally (e.g. a
-      // genuine, deliberate scope reduction). Once a step has already
-      // resolved (completed/skipped), the gate that mattered already ran its
-      // decision, so edits to its requiredFunctionCalls afterward are pure
-      // bookkeeping and are exempt from this protection.
+      // genuine, deliberate scope reduction).
+      //
+      // NOT exempt once a step has resolved (completed/skipped): a resolved
+      // step can be reset back to 'pending' later (e.g. "assets need
+      // regenerating" -- see the ENG-1188/CodeRabbit PR #2430 cutoff-timestamp
+      // handling above, which explicitly treats that reset as a supported
+      // transition) without restoring requiredFunctionCalls to anything. An
+      // earlier version of this fix exempted resolved steps on the theory
+      // that "the gate that mattered already ran" -- but that only holds
+      // until the very next reset-to-pending, at which point a
+      // never-actually-called requirement cleared while 'completed' stays
+      // silently cleared through the reset and the step re-completes with no
+      // gate at all. For a step that resolved normally (every required call
+      // genuinely succeeded before it could complete), this protection is a
+      // no-op regardless of status -- `succeeded` is already >0 for
+      // everything that mattered -- so leaving it active while resolved costs
+      // nothing in the normal case and closes the reset-abuse path.
       const succeededFunctionCounts = session.calledFunctions || {};
       const mergeRequiredFunctionCalls = (
         existingRequired: string[] | undefined,
         requested: string[] | undefined,
-        stepStatus: string | undefined,
       ): string[] | undefined => {
         if (requested === undefined) return existingRequired;
-        if (stepStatus === 'completed' || stepStatus === 'skipped') return requested;
         const unresolvedRequirements = (existingRequired || []).filter((fn) => {
           if (requested.includes(fn)) return false;
           const succeeded = succeededFunctionCounts[fn] || 0;
@@ -32998,20 +33009,45 @@ ${strippedHtml}`;
       // enough assets to meet its current target, the requirement is
       // unaffected and can be freely lowered or cleared afterward (the same
       // "failed and later succeeded" carve-out ENG-1793/ENG-1799 established
-      // for requiredFunctionCalls above). A step that has already resolved
-      // (completed/skipped) is likewise exempt -- the gate that mattered
-      // already ran its decision.
+      // for requiredFunctionCalls above).
+      //
+      // NOT exempt once a step has resolved (completed/skipped) -- same
+      // reasoning as mergeRequiredFunctionCalls above: a resolved step can be
+      // reset back to 'pending' without restoring expectedAssetCount, and for
+      // a step that resolved normally `produced` was already >= `existing`
+      // when it completed, so this protection is a no-op in the normal case
+      // and only bites the reset-then-shrink-then-recomplete abuse path.
+      //
+      // Fresh-eyes review of this PR also found `expectedAssetCountTools`
+      // itself had ZERO protection: leaving expectedAssetCount unchanged
+      // (e.g. still 12) while silently retargeting expectedAssetCountTools to
+      // an unrelated tool the model already called 12+ times for other
+      // reasons achieves the identical "dodge a failing gate" outcome through
+      // a field this check never looked at. mergeExpectedAssetCountTools
+      // below applies the same guard: don't allow the counted-tools list to
+      // change while the CURRENT requirement (measured against the EXISTING
+      // tools) hasn't genuinely been met.
       const mergeExpectedAssetCount = (
         existingStep: { stepCount: number; status?: string; expectedAssetCount?: number; expectedAssetCountTools?: string[] },
         requested: number | undefined,
       ): number | undefined => {
         if (requested === undefined) return existingStep.expectedAssetCount;
         const existing = existingStep.expectedAssetCount;
-        if (existingStep.status === 'completed' || existingStep.status === 'skipped') return requested;
         if (typeof existing !== 'number' || existing <= 0 || requested >= existing) return requested;
         const sinceIso = findAssetCountCutoff(workPlan.steps, existingStep.stepCount);
         const produced = computeStepProducedAssetCount(existingStep.expectedAssetCountTools, sinceIso);
         return produced < existing ? existing : requested;
+      };
+      const mergeExpectedAssetCountTools = (
+        existingStep: { stepCount: number; status?: string; expectedAssetCount?: number; expectedAssetCountTools?: string[] },
+        requested: string[] | undefined,
+      ): string[] | undefined => {
+        if (requested === undefined) return existingStep.expectedAssetCountTools;
+        const existing = existingStep.expectedAssetCount;
+        if (typeof existing !== 'number' || existing <= 0) return requested;
+        const sinceIso = findAssetCountCutoff(workPlan.steps, existingStep.stepCount);
+        const produced = computeStepProducedAssetCount(existingStep.expectedAssetCountTools, sinceIso);
+        return produced < existing ? existingStep.expectedAssetCountTools : requested;
       };
 
       // Update or add steps
@@ -33027,17 +33063,16 @@ ${strippedHtml}`;
             requiredFunctionCalls: mergeRequiredFunctionCalls(
               workPlan.steps[existingIndex].requiredFunctionCalls,
               newStep.requiredFunctionCalls,
-              workPlan.steps[existingIndex].status,
             ),
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
-            // Allow scope changes: an explicit expectedAssetCount overrides (including 0
-            // to clear the asset gate when the user approves a smaller set) UNLESS the
-            // step hasn't actually produced enough assets to meet its current
-            // requirement yet -- see mergeExpectedAssetCount (ENG-1800) above. Omitting
-            // it preserves the existing value. expectedAssetCountTools keeps its
-            // existing override-or-preserve semantics (ENG-1331).
+            // Allow scope changes: an explicit expectedAssetCount/expectedAssetCountTools
+            // overrides (including 0/[] to clear the asset gate when the user approves a
+            // smaller set) UNLESS the step hasn't actually produced enough assets to meet
+            // its current requirement yet -- see mergeExpectedAssetCount/
+            // mergeExpectedAssetCountTools (ENG-1800) above. Omitting either preserves the
+            // existing value.
             expectedAssetCount: mergeExpectedAssetCount(workPlan.steps[existingIndex], newStep.expectedAssetCount),
-            expectedAssetCountTools: newStep.expectedAssetCountTools !== undefined ? newStep.expectedAssetCountTools : workPlan.steps[existingIndex].expectedAssetCountTools
+            expectedAssetCountTools: mergeExpectedAssetCountTools(workPlan.steps[existingIndex], newStep.expectedAssetCountTools)
           };
         } else {
           // Add new step (stepCount will be fixed by updateSessionWorkPlan)
