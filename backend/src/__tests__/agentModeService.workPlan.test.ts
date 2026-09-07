@@ -2806,6 +2806,86 @@ describe('AgentModeService - Work Plan', () => {
         expect(completeResult.missingFunctionCalls[0].missing).toContain('list_html_templates (need 1, have 0)');
       });
 
+      it('does not silently drop expectedAssetCount/expectedAssetCountTools when a reused step OMITS those fields entirely', async () => {
+        // Second-round fresh-eyes review of PR #2794 found: the reused-stepCount
+        // fix above unconditionally protects requiredFunctionCalls (the merge
+        // function always runs when removedOriginal exists), but
+        // expectedAssetCount/expectedAssetCountTools kept the OLD
+        // "only call the merge function if the caller explicitly supplied the
+        // field" pattern. A model reusing a just-removed stepCount and simply
+        // OMITTING expectedAssetCount (rather than explicitly lowering it to
+        // 0 -- the only case the earlier tests covered) skipped
+        // mergeExpectedAssetCount entirely, so the re-added step ended up with
+        // NO expectedAssetCount property at all -- a complete, silent removal
+        // of the asset-count gate, worse than an explicit lowering, through
+        // exactly the reused-stepCount surface this fix claims to close.
+        // Reproduced independently before this test was written: pushing a
+        // step with only { stepCount, title } (no asset-count fields) through
+        // a removed-and-reused stepCount left expectedAssetCount undefined
+        // instead of preserving the pre-removal value of 12.
+        const workPlan = {
+          title: 'Display Ad Set Production',
+          steps: [
+            {
+              stepCount: 3,
+              title: 'Render the Full Size Matrix',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['playwright_browser_take_screenshot'],
+              expectedAssetCount: 12,
+              expectedAssetCountTools: ['playwright_browser_take_screenshot'],
+            },
+          ],
+          createdAt: '2026-08-12T14:54:35.000Z',
+          updatedAt: '2026-08-12T14:54:35.000Z',
+        };
+
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          // Only 1 of the 12 required assets has genuinely been produced.
+          messages: [{
+            role: 'assistant',
+            timestamp: '2026-08-12T15:35:00.000Z',
+            metadata: {
+              timestamp: '2026-08-12T15:35:00.000Z',
+              toolCalls: [{ name: 'playwright_browser_take_screenshot', result: { success: true } }],
+            },
+          }],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: { playwright_browser_take_screenshot: 1 },
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        // Remove step 3, add a new step 3 (same number) that OMITS
+        // expectedAssetCount/expectedAssetCountTools entirely -- no explicit
+        // lowering, just silence.
+        const modifyResult = await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix' }],
+          [3],
+          mockSessionId
+        );
+        expect(modifyResult.success).toBe(true);
+
+        const newStep3 = mockSession.workPlan.steps.find((s: any) => s.stepCount === 3);
+        expect(newStep3.expectedAssetCount).toBe(12);
+        expect(newStep3.expectedAssetCountTools).toEqual(['playwright_browser_take_screenshot']);
+
+        // Attempting to complete the re-added step with only 1 of 12 assets
+        // produced must still be blocked.
+        const completeResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 3, status: 'completed' }],
+          mockSessionId
+        );
+        expect(completeResult.success).toBe(false);
+        expect(completeResult.reason).toBe('workplan_insufficient_assets');
+      });
+
       it('end-to-end: modify_work_plan cannot be used to bypass set_work_plan_status\'s completion gate for a never-called function', async () => {
         const workPlan = {
           title: 'Founder_Linkedin_Sales_Readiness_Audit',
