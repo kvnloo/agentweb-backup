@@ -2927,6 +2927,81 @@ describe('AgentModeService - Work Plan', () => {
         expect(mockSession.workPlan.pendingRequiredFunctionCalls).toEqual([]);
       });
 
+      it('ENG-1811: does not falsely re-block when the CURRENTLY-COMPLETING step also genuinely requires the same debt function', async () => {
+        // Fresh-eyes review of this PR found and reproduced a real bug: the debt
+        // check originally compared against calledFunctionCounts, a LOCAL COPY
+        // that gets decremented in-place (once per required call) as this same
+        // batch's OWN steps pass their gates above (the pre-existing ENG-1698
+        // credit-consumption mechanic). If a debt name is ALSO genuinely
+        // required and satisfied by the step currently completing in this exact
+        // batch, that step's own gate consumes the shared credit and drives the
+        // LOCAL copy to 0 -- making a real, same-turn success look like it
+        // never happened, and permanently blocking the plan from ever
+        // finishing (retrying the identical batch fails identically forever,
+        // since nothing persists past a blocked gate). Fixed by reading the
+        // raw, never-mutated session.calledFunctions for this specific check
+        // instead -- a debt is a "did this ever genuinely happen" fact check,
+        // not a shared-pool credit-consumption check like the per-step gates.
+        const workPlan = {
+          title: 'Meta_Ads_Perf_Report',
+          steps: [
+            {
+              stepCount: 2,
+              title: 'Perform data analysis on metrics',
+              status: 'pending' as const,
+              // The currently-completing step's OWN requirement is the exact
+              // same function name recorded as an outstanding debt.
+              requiredFunctionCalls: ['list_html_templates'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+          pendingRequiredFunctionCalls: ['list_html_templates'],
+        };
+
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          // Called exactly once, genuinely -- enough to satisfy step 2's own
+          // requirement, which is also all the debt was ever asking for.
+          calledFunctions: { list_html_templates: 1 },
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        const completeResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 2, status: 'completed' }],
+          mockSessionId
+        );
+        expect(completeResult.success).toBe(true);
+        expect(completeResult.reason).not.toBe('workplan_unresolved_removed_requirements');
+        expect(mockSession.workPlan.pendingRequiredFunctionCalls).toEqual([]);
+
+        // A retry of the identical batch (proving this isn't a one-shot
+        // ordering fluke) must also succeed, not repeat the same false block.
+        const secondSession: any = {
+          ...mockSession,
+          workPlan: { ...workPlan, steps: [{ ...workPlan.steps[0], status: 'pending', completedAt: undefined, resolvedAt: undefined }] },
+        };
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(secondSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          secondSession.workPlan = updatedPlan;
+          return Promise.resolve(secondSession);
+        });
+        const retryResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 2, status: 'completed' }],
+          mockSessionId
+        );
+        expect(retryResult.success).toBe(true);
+      });
+
       it('ENG-1811: a removed step\'s debt does NOT block completing an unrelated, still-in-progress step -- only finishing the whole plan', async () => {
         const workPlan = {
           title: 'Meta_Ads_Perf_Report',
