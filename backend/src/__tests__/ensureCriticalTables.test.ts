@@ -71,6 +71,29 @@ describe('ensureCriticalTables', () => {
     expect(names.some((n) => n.endsWith('AW-LlmChargeEvents'))).toBe(true);
   });
 
+  it('provisions AW-SpendEvents with the approved key shape, GSI, and no TTL', () => {
+    // ENG-1250: Harsha approved these exact parameters on 2026-09-03. A drift
+    // here is a data-plane change that never went back through the gate.
+    const se = CRITICAL_TABLE_SPECS.find((s) => s.TableName.endsWith('AW-SpendEvents'));
+    expect(se).toBeDefined();
+    expect(se!.KeySchema).toEqual([
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'eventId', KeyType: 'RANGE' },
+    ]);
+    expect(se!.GlobalSecondaryIndexes).toEqual([
+      expect.objectContaining({
+        IndexName: 'BillingUserOccurredAtIndex',
+        KeySchema: [
+          { AttributeName: 'billingUserId', KeyType: 'HASH' },
+          { AttributeName: 'occurredAt', KeyType: 'RANGE' },
+        ],
+      }),
+    ]);
+    // No TTL was approved, and CreateTable cannot express one anyway — this
+    // asserts nobody later adds a TimeToLiveSpecification believing it does.
+    expect(Object.keys(se!)).not.toContain('TimeToLiveSpecification');
+  });
+
   it('onboarding metrics spec carries the StepStartedAtIndex GSI', () => {
     const om = CRITICAL_TABLE_SPECS.find((s) => s.TableName.endsWith('AW-OnboardingMetrics'))!;
     expect((om.GlobalSecondaryIndexes ?? []).some((g: any) => g.IndexName === 'StepStartedAtIndex')).toBe(true);

@@ -1896,6 +1896,45 @@ const createLlmChargeEventsTable = async () => {
   catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
 };
 
+// ENG-1250 §1: the cross-vendor immutable spend ledger. Approved by Harsha on
+// 2026-09-03 with every parameter named — key shape, GSI, retention, fields.
+//
+// NO TTL, deliberately. AW-LlmChargeEvents above expires rows at 365 days; this
+// one is the evidence behind "a pause is explainable to the cent" (AC3), so
+// there is no `ttl` attribute and nothing to enable in the console. Its absence
+// is the decision, not the usual missed manual step.
+const createSpendEventsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-SpendEvents`,
+    AttributeDefinitions: [
+      { AttributeName: 'billingUserId', AttributeType: 'S' },
+      { AttributeName: 'eventId', AttributeType: 'S' },
+      { AttributeName: 'occurredAt', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'eventId', KeyType: 'RANGE' },
+    ],
+    // eventId is the caller-supplied idempotency token and does not sort by
+    // time, so month/range queries go through this index -- the same defect
+    // ENG-1251 had to retrofit onto AW-LlmChargeEvents after monthly queries
+    // were found silently missing events.
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'BillingUserOccurredAtIndex',
+        KeySchema: [
+          { AttributeName: 'billingUserId', KeyType: 'HASH' },
+          { AttributeName: 'occurredAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+};
+
 // ENG-1217 AC9: append-only audit for customer-confirmed model switches, so a
 // change can be explained and undone. Sort key is `{changedAt}#{changeId}` —
 // timestamp FIRST, so a date-range query works on the base table and this needs
@@ -2543,6 +2582,7 @@ const main = async () => {
     await createMcpSessionsTable();
     await createUsageRecordsTable();
     await createLlmChargeEventsTable();
+    await createSpendEventsTable();
     await createModelChangeAuditTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
