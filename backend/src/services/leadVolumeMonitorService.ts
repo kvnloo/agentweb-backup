@@ -31,6 +31,13 @@ export interface LeadVolumeMonitorResult {
   error?: string;
   client?: { userId: string; email: string; displayName?: string };
   reports?: LeadVolumeReport[];
+  /** True when either underlying snapshot query hit adsMetricsDb's MAX_QUERY_PAGES cap — the
+   * store's own contract is that callers MUST NOT read a truncated result as complete. A
+   * truncated read means some campaigns' baseline/window history is partial, which can produce a
+   * wrong drought verdict with no other signal that anything was cut short. Surfaced here rather
+   * than silently dropped so a caller (the route, the MCP tool description, a reading admin) has
+   * something to act on. */
+  truncated?: boolean;
 }
 
 /**
@@ -112,5 +119,6 @@ export async function monitorLeadVolume(
     success: true,
     client: { userId: client.userId, email: client.email, displayName: client.displayName },
     reports,
+    truncated: campaignResult.truncated || accountDayResult.truncated,
   };
 }

@@ -2960,7 +2960,9 @@ Trigger is distribution-aware, not a fixed day count: a campaign is flagged only
 
 ⚠ The response also includes 'unattributedContext' and 'totalUnattributedLeads' at the ACCOUNT level, separate from every campaign's own totals. A nonzero unattributed count is normal (not every ad carries a matchable UTM) — NEVER read it as evidence any specific campaign's volume collapsed, and never subtract it from a campaign's lead total.
 
-Returns one report per connected Meta ad account for the client.`,
+Returns one report per connected Meta ad account for the client.
+
+⚠ If the response has 'truncated': true, the underlying data read was cut short and every verdict in this response (including 'normal' ones) may be based on incomplete history — narrow the since/until window and retry rather than reporting any of it as final.`,
     inputSchema: {
       type: 'object',
       properties: {

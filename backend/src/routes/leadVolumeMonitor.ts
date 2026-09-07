@@ -14,6 +14,12 @@ import { monitorLeadVolume } from '../services/leadVolumeMonitorService';
 
 const router = express.Router();
 
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+/** Generous cap, not a product constant — bounds how wide a window an admin/LLM caller can ask
+ * for in one request. Without it, an unusually wide since/until pair is the mechanism that makes
+ * a MAX_QUERY_PAGES truncation (see LeadVolumeMonitorResult.truncated) actually reachable. */
+const MAX_WINDOW_DAYS = 366;
+
 /**
  * GET /api/lead-volume-monitor/:clientEmail?since=YYYY-MM-DD&until=YYYY-MM-DD
  *
@@ -30,6 +36,22 @@ router.get('/:clientEmail', async (req: Request, res: Response) => {
     const clientEmail = decodeURIComponent(req.params.clientEmail);
     const since = typeof req.query.since === 'string' ? req.query.since : undefined;
     const until = typeof req.query.until === 'string' ? req.query.until : undefined;
+
+    if (since !== undefined && !ISO_DATE_RE.test(since)) {
+      return res.status(400).json({ success: false, message: 'since must be YYYY-MM-DD' });
+    }
+    if (until !== undefined && !ISO_DATE_RE.test(until)) {
+      return res.status(400).json({ success: false, message: 'until must be YYYY-MM-DD' });
+    }
+    if (since !== undefined && until !== undefined) {
+      const days = (new Date(until).getTime() - new Date(since).getTime()) / (24 * 60 * 60 * 1000);
+      if (days < 0) {
+        return res.status(400).json({ success: false, message: 'since must not be after until' });
+      }
+      if (days > MAX_WINDOW_DAYS) {
+        return res.status(400).json({ success: false, message: `window must not exceed ${MAX_WINDOW_DAYS} days` });
+      }
+    }
 
     const result = await monitorLeadVolume(userId, clientEmail, authReq.user.isAdmin, { since, until });
     return res.json(result);
