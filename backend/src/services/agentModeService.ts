@@ -1414,6 +1414,42 @@ function validateDriveDateFilter(value: string, label: string): string {
   return value;
 }
 
+/**
+ * ENG-1794: normalize a predefined-work-plan title for matching in
+ * `applyPredefinedWorkPlan` (the `launch_predefined_work_plan` tool handler).
+ *
+ * Templates are stored with underscore-joined titles (e.g.
+ * "Founder_Linkedin_Sales_Readiness_Eval"), but a user/model referring to one
+ * in chat naturally types it with spaces and mixed case (e.g. "Founder
+ * LinkedIn Sales Readiness Eval"). The previous match was `.toLowerCase()`
+ * only, so that natural phrasing never matched the stored title at all — the
+ * call failed with "not found" and the model fell back to grepping the full
+ * (370KB+) plan listing via search_tool_response/read_tool_response to find
+ * a title to retry with. When two templates are near-duplicates (identical
+ * welcomeMessage/description, titles differing only by an "_Eval"/"_Audit"
+ * suffix), that fallback search is exactly where the model can pick up the
+ * WRONG template's title from a truncated snippet and silently launch it
+ * with no error, since the retry is then a legitimate exact match against
+ * the wrong record (confirmed live: ENG-1794, session
+ * 3fce3c5a-6b25-4167-987b-b5bd8c7f4c5b launched
+ * "Founder_Linkedin_Sales_Readiness_Audit" instead of "..._Eval").
+ *
+ * Folding underscores/hyphens to spaces and collapsing whitespace before the
+ * case-insensitive comparison lets the natural-language phrasing resolve
+ * directly on the FIRST call, so the risky multi-step fallback search never
+ * has to run for this common case. This only smooths over separator/case
+ * differences — it does not do fuzzy/substring/similarity matching, so two
+ * templates whose titles genuinely differ (e.g. the "_Eval"/"_Audit" suffix
+ * itself) never collide.
+ */
+function normalizeWorkPlanTitleForMatch(value: unknown): string {
+  return String(value ?? '')
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
   // ENG-1295 hardening: self-consistency cache for perform_data_analysis. Keyed by
@@ -32533,10 +32569,12 @@ ${strippedHtml}`;
       // behavior — title-based launches from Emma — unchanged.
       const candidates = await getAccessiblePredefinedWorkPlanCandidates(userId);
 
-      const needle = planTitleOrId.toLowerCase();
-      const predefinedPlan = candidates.find(
-        (p) => p.planId === planTitleOrId || (p.title && p.title.toLowerCase() === needle)
-      );
+      // ENG-1794: case/whitespace/underscore-insensitive title match (see
+      // normalizeWorkPlanTitleForMatch above) — planId still wins on an exact
+      // match first, since a title collision must never shadow a stable id.
+      const needle = normalizeWorkPlanTitleForMatch(planTitleOrId);
+      const predefinedPlan = candidates.find((p) => p.planId === planTitleOrId)
+        ?? candidates.find((p) => p.title && normalizeWorkPlanTitleForMatch(p.title) === needle);
 
       if (!predefinedPlan) {
         return { success: false, message: `Work plan template "${planTitleOrId}" not found` };
