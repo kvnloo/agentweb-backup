@@ -56,21 +56,6 @@ jest.mock('../services/agentModeService', () => ({
     getFoundationToolNames: jest.fn().mockReturnValue(new Set(['read_file_content'])),
     getAdminToolNames: jest.fn().mockReturnValue([]),
   },
-  // ENG-1811: the controller's workPlanCompleted checks now call the real
-  // static helper instead of inlining `.every(...)` themselves. Mirror its
-  // actual logic here rather than stubbing it out — this suite's WORK-PLAN
-  // test depends on a workPlan with all-terminal steps (and no debt field)
-  // being reported completed, exactly like the real implementation.
-  AgentModeService: {
-    isWorkPlanFullyResolved: (workPlan: any, calledFunctions?: Record<string, number>) => {
-      if (!workPlan || !Array.isArray(workPlan.steps)) return true;
-      const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
-      if (!allStepsTerminal) return false;
-      const called = calledFunctions || {};
-      const unresolved = (workPlan.pendingRequiredFunctionCalls || []).filter((fn: string) => !(called[fn] > 0));
-      return unresolved.length === 0;
-    },
-  },
 }));
 
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
