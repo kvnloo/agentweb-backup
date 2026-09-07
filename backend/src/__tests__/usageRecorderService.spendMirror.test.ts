@@ -64,12 +64,30 @@ describe('recordVendorUsage -> spend ledger mirror', () => {
   });
 
   it('stamps both rows from ONE instant, so they cannot straddle UTC midnight', async () => {
-    await recordVendorUsage(ctx);
+    // A plain assertion here proves nothing: two clock reads microseconds apart
+    // agree on the date almost always, so the test would pass against a second
+    // `new Date()`. Pinning the clock and pushing it over midnight DURING the
+    // live write is what makes the single-read guarantee observable.
+    jest.useFakeTimers();
+    try {
+      jest.setSystemTime(new Date('2026-09-07T23:59:59.500Z'));
+      mockIncrement.mockImplementation(async () => {
+        jest.setSystemTime(new Date('2026-09-08T00:00:01.000Z'));
+      });
 
-    const mirroredAt: string = mockMirror.mock.calls[0][1];
-    const legacyDate: string = mockIncrement.mock.calls[0][0].date;
+      await recordVendorUsage(ctx);
 
-    expect(mirroredAt.slice(0, 10)).toBe(legacyDate);
+      const mirroredAt: string = mockMirror.mock.calls[0][1];
+      const legacyDate: string = mockIncrement.mock.calls[0][0].date;
+
+      expect(legacyDate).toBe('2026-09-07');
+      // A second clock read would stamp this 2026-09-08 and put the two rows in
+      // different days — and the reconciliation would read that as drift.
+      expect(mirroredAt).toBe('2026-09-07T23:59:59.500Z');
+      expect(mirroredAt.slice(0, 10)).toBe(legacyDate);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('a mirror rejection never escapes into the metering path', async () => {
@@ -86,10 +104,14 @@ describe('recordVendorUsage -> spend ledger mirror', () => {
     expect(mockIncrement).toHaveBeenCalledTimes(1);
   });
 
-  it('a failure in the ORIGINAL rail still leaves the mirror attempted', async () => {
+  // CodeRabbit, PR #2793: the shadow mirrors the live rail, it never leads it.
+  it('does NOT mirror a row the live rail failed to write', async () => {
     mockIncrement.mockRejectedValue(new Error('usage table down'));
 
     await expect(recordVendorUsage(ctx)).resolves.toBeUndefined();
-    expect(mockMirror).toHaveBeenCalledTimes(1);
+    // A ledger row with no matching usage record is not the difference §8
+    // exists to measure — it is an outage artifact, and §8 cannot tell them
+    // apart.
+    expect(mockMirror).not.toHaveBeenCalled();
   });
 });
