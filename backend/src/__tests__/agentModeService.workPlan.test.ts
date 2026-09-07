@@ -2728,29 +2728,21 @@ describe('AgentModeService - Work Plan', () => {
         expect(secondComplete.missingFunctionCalls[0].missing).toContain('create_html_file (need 1, have 0)');
       });
 
-      it('does not lose a never-called requirement when a step is removed via removeStepCounts and the SAME stepCount is added back in the same call', async () => {
+      it('ENG-1811: a removed step\'s never-called requirement blocks finishing the plan, even reused in the SAME call, with requiredFunctionCalls omitted', async () => {
         // Live-verified on test-env1, 2026-09-07 (unprompted, organic model
         // behavior against the real deployed branch, not a scripted repro):
         // the model called modify_work_plan with removeStepCounts including a
         // stepCount, and a new step reusing that exact same stepCount, in the
-        // SAME call. Because removeStepCounts filters workPlan.steps BEFORE
-        // the update-or-add loop runs, the re-added step landed in the "add
-        // new step" branch (existingIndex === -1), bypassing
-        // mergeRequiredFunctionCalls entirely -- a different bypass mechanism
-        // than the reset-to-pending one above, and one the original
-        // ENG-1799/1800 fix (and its first correction) both missed since
-        // neither touched the removeStepCounts interaction.
-        //
-        // Scope note: this test covers the exact reused-stepCount pattern
-        // observed live and protected by originalStepsBeforeRemoval above. A
-        // broader N-to-M consolidation (e.g. removing steps 2 AND 3, adding
-        // back only step 2 with a different, larger scope) can still lose
-        // step 3's specific unresolved requirement if step 3's number is
-        // never reused -- tracked separately as a follow-up rather than
-        // guessed at here, since blindly attaching an unrelated removed
-        // step's requirements to whatever new step happens to appear in the
-        // same call risks over-blocking genuinely unrelated, legitimate
-        // step deletions.
+        // SAME call, omitting requiredFunctionCalls entirely. Because
+        // removeStepCounts filters workPlan.steps BEFORE the update-or-add
+        // loop runs, the re-added step landed in the "add new step" branch
+        // (existingIndex === -1), bypassing mergeRequiredFunctionCalls
+        // entirely -- a different bypass mechanism than the reset-to-pending
+        // one above, and one the original ENG-1799/1800 fix (and its first
+        // correction) both missed since neither touched the removeStepCounts
+        // interaction. The pendingRequiredFunctionCalls ledger closes this by
+        // tracking the debt at the session level rather than trying to
+        // reattach it to whichever step happens to reuse the stepCount.
         const workPlan = {
           title: 'Meta_Ads_Perf_Report',
           steps: [
@@ -2781,29 +2773,286 @@ describe('AgentModeService - Work Plan', () => {
           return Promise.resolve(mockSession);
         });
 
-        // Remove step 2, add a new step 2 (same number) with no requiredFunctionCalls.
+        // Remove step 2, add a new step 2 (same number) with requiredFunctionCalls
+        // omitted entirely -- the exact live-observed payload.
         const modifyResult = await (agentModeService as any).modifyWorkPlan(
-          [{ stepCount: 2, title: 'Performance Report & Analysis', requiredFunctionCalls: [] }],
+          [{ stepCount: 2, title: 'Performance Report & Analysis' }],
           [2],
           mockSessionId
         );
         expect(modifyResult.success).toBe(true);
 
         const newStep2 = mockSession.workPlan.steps.find((s: any) => s.stepCount === 2);
-        // list_html_templates never succeeded -- must survive into the
-        // re-added step. perform_data_analysis genuinely succeeded, so it's
-        // correctly allowed to drop.
-        expect(newStep2.requiredFunctionCalls).toEqual(expect.arrayContaining(['list_html_templates']));
-        expect(newStep2.requiredFunctionCalls).not.toContain('perform_data_analysis');
+        // The re-added step itself carries no requirement -- the ledger is
+        // what actually protects the never-called function now, not the
+        // step's own list.
+        expect(newStep2.requiredFunctionCalls ?? []).toEqual([]);
+        expect(mockSession.workPlan.pendingRequiredFunctionCalls).toEqual(['list_html_templates']);
 
-        // Attempting to complete the re-added step without ever calling
-        // list_html_templates must still be blocked.
+        // Attempting to finish the plan (this is the only remaining step)
+        // without ever calling list_html_templates must be blocked, citing
+        // the removed-step debt specifically -- not the ordinary
+        // missing-function-calls gate, since step 2 itself no longer
+        // declares the requirement.
         const completeResult = await (agentModeService as any).setWorkPlanStatus(
           [{ stepCount: 2, status: 'completed' }],
           mockSessionId
         );
         expect(completeResult.success).toBe(false);
-        expect(completeResult.missingFunctionCalls[0].missing).toContain('list_html_templates (need 1, have 0)');
+        expect(completeResult.reason).toBe('workplan_unresolved_removed_requirements');
+        expect(completeResult.pendingRequiredFunctionCalls).toEqual(['list_html_templates']);
+      });
+
+      it('ENG-1811: the debt survives across two SEPARATE modify_work_plan calls (remove in one, re-add with omitted fields in a later, independent call)', async () => {
+        // The exact live-observed exploit that defeated the first (same-call
+        // only) version of this fix: removal and re-addition split across two
+        // independent modify_work_plan invocations. Each invocation does its
+        // own fresh getChatSession read and has no in-memory knowledge of the
+        // other -- only a value actually persisted on the session (workPlan
+        // itself, hence pendingRequiredFunctionCalls living there) can bridge
+        // the two.
+        const workPlan = {
+          title: 'Meta_Ads_Perf_Report',
+          steps: [
+            { stepCount: 1, title: 'Load Campaign Metrics', status: 'completed' as const, requiredFunctionCalls: [] },
+            {
+              stepCount: 2,
+              title: 'Perform data analysis on metrics',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['list_html_templates', 'perform_data_analysis'],
+            },
+            {
+              stepCount: 3,
+              title: 'Create HTML report',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['create_html_from_template'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: { perform_data_analysis: 1, create_html_file: 1 },
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        // Call A: remove steps 2 and 3 entirely, no re-add in this call.
+        const removeResult = await (agentModeService as any).modifyWorkPlan([], [2, 3], mockSessionId);
+        expect(removeResult.success).toBe(true);
+        expect(mockSession.workPlan.steps.map((s: any) => s.stepCount)).toEqual([1]);
+        expect(mockSession.workPlan.pendingRequiredFunctionCalls).toEqual(
+          expect.arrayContaining(['list_html_templates', 'create_html_from_template'])
+        );
+        // perform_data_analysis genuinely succeeded before removal -- not a debt.
+        expect(mockSession.workPlan.pendingRequiredFunctionCalls).not.toContain('perform_data_analysis');
+
+        // Call B: a SEPARATE, later modify_work_plan call re-adds steps 2 and 3
+        // with requiredFunctionCalls omitted -- this call does not mention
+        // removeStepCounts at all, since it isn't removing anything.
+        const readdResult = await (agentModeService as any).modifyWorkPlan(
+          [
+            { stepCount: 2, title: 'Perform data analysis on metrics' },
+            { stepCount: 3, title: 'Create HTML report' },
+          ],
+          [],
+          mockSessionId
+        );
+        expect(readdResult.success).toBe(true);
+        for (const s of mockSession.workPlan.steps) {
+          expect(s.requiredFunctionCalls ?? []).toEqual([]);
+        }
+
+        // Completing steps 2 and 3 (finishing the plan) without ever calling
+        // list_html_templates or create_html_from_template must be blocked.
+        const completeResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 2, status: 'completed' }, { stepCount: 3, status: 'completed' }],
+          mockSessionId
+        );
+        expect(completeResult.success).toBe(false);
+        expect(completeResult.reason).toBe('workplan_unresolved_removed_requirements');
+        expect(completeResult.pendingRequiredFunctionCalls).toEqual(
+          expect.arrayContaining(['list_html_templates', 'create_html_from_template'])
+        );
+      });
+
+      it('ENG-1811: the debt clears once the function genuinely succeeds, and no longer blocks finishing the plan', async () => {
+        const workPlan = {
+          title: 'Meta_Ads_Perf_Report',
+          steps: [
+            {
+              stepCount: 2,
+              title: 'Perform data analysis on metrics',
+              status: 'pending' as const,
+              requiredFunctionCalls: [],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+          // Simulates a debt already recorded from an earlier removal this session.
+          pendingRequiredFunctionCalls: ['list_html_templates'],
+        };
+
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          // The model went back and genuinely called it for real.
+          calledFunctions: { list_html_templates: 1 },
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        const completeResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 2, status: 'completed' }],
+          mockSessionId
+        );
+        expect(completeResult.success).toBe(true);
+        expect(mockSession.workPlan.pendingRequiredFunctionCalls).toEqual([]);
+      });
+
+      it('ENG-1811: a removed step\'s debt does NOT block completing an unrelated, still-in-progress step -- only finishing the whole plan', async () => {
+        const workPlan = {
+          title: 'Meta_Ads_Perf_Report',
+          steps: [
+            { stepCount: 1, title: 'Load Campaign Metrics', status: 'pending' as const, requiredFunctionCalls: [] },
+            {
+              stepCount: 2,
+              title: 'Perform data analysis on metrics',
+              status: 'pending' as const,
+              requiredFunctionCalls: [],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+          pendingRequiredFunctionCalls: ['list_html_templates'],
+        };
+
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {},
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        // Step 2 still hasn't resolved, so this batch does not finish the plan.
+        const completeResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+        expect(completeResult.success).toBe(true);
+        // The debt is untouched -- still tracked for when the plan actually finishes.
+        expect(mockSession.workPlan.pendingRequiredFunctionCalls).toEqual(['list_html_templates']);
+      });
+
+      it('ENG-1808: N-to-M consolidation (remove steps 2 AND 3, re-add only step 2, step 3\'s number never reused) still blocks finishing the plan', async () => {
+        // ENG-1808's exact original scenario, previously filed as a
+        // deliberately-deferred residual gap on top of the (then same-call-only)
+        // ENG-1811 fix: the reused-stepCount reattachment could never help step
+        // 3's requirement here, because step 3's number is never used again --
+        // the "replacement" work is folded entirely into step 2. The
+        // session-level, stepCount-agnostic pendingRequiredFunctionCalls ledger
+        // has no such limitation: it doesn't matter which step (if any) a
+        // removed function's requirement is ever attached to again, only
+        // whether the function itself has genuinely succeeded before the plan
+        // finishes. This closes ENG-1808 for requiredFunctionCalls fully, not
+        // just narrows it.
+        const workPlan = {
+          title: 'Meta_Ads_Perf_Report',
+          steps: [
+            { stepCount: 1, title: 'Load Campaign Metrics', status: 'completed' as const, requiredFunctionCalls: [] },
+            {
+              stepCount: 2,
+              title: 'Perform data analysis on metrics',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['list_html_templates', 'perform_data_analysis'],
+            },
+            {
+              stepCount: 3,
+              title: 'Create HTML report',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['create_html_from_template'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: { perform_data_analysis: 1 },
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        // Remove steps 2 and 3, add back ONLY a consolidated step 2 -- step 3's
+        // number is never mentioned again for the rest of the session.
+        const modifyResult = await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 2, title: 'Performance Report & Analysis', requiredFunctionCalls: [] }],
+          [2, 3],
+          mockSessionId
+        );
+        expect(modifyResult.success).toBe(true);
+        expect(mockSession.workPlan.steps.map((s: any) => s.stepCount)).toEqual([1, 2]);
+        expect(mockSession.workPlan.pendingRequiredFunctionCalls).toEqual(
+          expect.arrayContaining(['list_html_templates', 'create_html_from_template'])
+        );
+
+        // Finishing the plan (step 2 is now the only remaining pending step)
+        // without ever calling either debt function must be blocked --
+        // including create_html_from_template, whose original step (3) is
+        // permanently gone.
+        const completeResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 2, status: 'completed' }],
+          mockSessionId
+        );
+        expect(completeResult.success).toBe(false);
+        expect(completeResult.reason).toBe('workplan_unresolved_removed_requirements');
+        expect(completeResult.pendingRequiredFunctionCalls).toEqual(
+          expect.arrayContaining(['list_html_templates', 'create_html_from_template'])
+        );
+
+        // Once both genuinely succeed, finishing the plan is correctly allowed.
+        mockSession.calledFunctions.list_html_templates = 1;
+        mockSession.calledFunctions.create_html_from_template = 1;
+        const secondAttempt = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 2, status: 'completed' }],
+          mockSessionId
+        );
+        expect(secondAttempt.success).toBe(true);
+        expect(mockSession.workPlan.pendingRequiredFunctionCalls).toEqual([]);
       });
 
       it('does not silently drop expectedAssetCount/expectedAssetCountTools when a reused step OMITS those fields entirely', async () => {
