@@ -1442,7 +1442,7 @@ function validateDriveDateFilter(value: string, label: string): string {
  * templates whose titles genuinely differ (e.g. the "_Eval"/"_Audit" suffix
  * itself) never collide.
  */
-function normalizeWorkPlanTitleForMatch(value: unknown): string {
+export function normalizeWorkPlanTitleForMatch(value: unknown): string {
   return String(value ?? '')
     .toLowerCase()
     .replace(/[_-]+/g, ' ')
