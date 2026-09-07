@@ -7348,6 +7348,7 @@ const adminToolNames = [
   'list_all_clients',
   'assess_client_health',
   'monitor_lead_volume',
+  'check_account_tracking_health',
   'get_pr_digest',
   'freeze_user_account',
   'manage_scoring_judges',
