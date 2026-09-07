@@ -153,6 +153,34 @@ export interface StaleInvitationDrainResult {
   withdrawn: WithdrawnInvitation[];
   /** Attempted but refused by LinkedIn/Unipile itself, with the reason. */
   failed: Array<{ invitedUserName: string; publicProfileUrl: string; reason: string }>;
+  /**
+   * Withdrawn on LinkedIn, but our own cache row could not be deleted (CodeRabbit
+   * on PR #2801). The withdrawal is real and is reported as such — but until the
+   * row goes, the CRM keeps showing that person as "invitation pending", and a
+   * later drain will see them as stale again and re-attempt a withdrawal that now
+   * fails per-invitation.
+   *
+   * Reported rather than retried here: `AW-UnipileSentInvitations` is a cache the
+   * ~10-minute `linkedInConnectionSyncCron` reconciles against Unipile's own sent
+   * feed, and a withdrawn invitation has left that feed — so `pruneStaleSentInvitations`
+   * removes the row on its next tick without any help from us. Building a second,
+   * bespoke retry path for something an existing cron already fixes would be the
+   * duplicate mechanism, not the fix. What was actually wrong was the SILENCE.
+   */
+  ledgerCleanupFailed: Array<{ invitedUserName: string; publicProfileUrl: string }>;
+  /**
+   * Withdrawn, but the CRM provenance engagement could not be written (CodeRabbit
+   * on PR #2801). Unlike the cache row above, NOTHING re-runs this: the only
+   * automatic reconciliation walks still-pending invitations, and this one is no
+   * longer pending. The lead's history will permanently lack its
+   * `linkedin.invite.withdrawn` entry unless someone acts on this list.
+   *
+   * Surfaced, not queued. A durable retry record for a history entry means a new
+   * persisted work item and a worker to drain it; that is a larger design than
+   * this ticket, and inventing it silently here would be worse than naming the
+   * gap. The run ledger now says which leads are affected.
+   */
+  crmRecordFailed: Array<{ invitedUserName: string; publicProfileUrl: string }>;
   /** Still older than the threshold and not attempted in this run. */
   remainingStale: number;
   totalPending: number;
@@ -197,6 +225,19 @@ function summarise(r: Omit<StaleInvitationDrainResult, 'notice'>): string {
   } else if (r.remainingStale > 0) {
     parts.push(`${r.remainingStale} remain old enough to withdraw.`);
   }
+  if (r.ledgerCleanupFailed.length > 0) {
+    parts.push(
+      `${r.ledgerCleanupFailed.length} ${r.ledgerCleanupFailed.length === 1 ? 'was' : 'were'} withdrawn on LinkedIn `
+      + 'but could not be cleared from our own records, so they may still show as "invitation pending" until the '
+      + 'next sync (about ten minutes) reconciles them.',
+    );
+  }
+  if (r.crmRecordFailed.length > 0) {
+    parts.push(
+      `${r.crmRecordFailed.length} withdrawal${r.crmRecordFailed.length === 1 ? '' : 's'} could not be written to `
+      + 'the CRM, so those leads will not show the withdrawal in their history. Nothing retries this automatically.',
+    );
+  }
   if (r.unwithdrawable > 0) {
     parts.push(
       `${r.unwithdrawable} old invitation${r.unwithdrawable === 1 ? ' has' : 's have'} no withdrawable id in our records `
@@ -226,6 +267,8 @@ export async function withdrawStaleInvitations(params: {
 
   const withdrawn: WithdrawnInvitation[] = [];
   const failed: StaleInvitationDrainResult['failed'] = [];
+  const ledgerCleanupFailed: StaleInvitationDrainResult['ledgerCleanupFailed'] = [];
+  const crmRecordFailed: StaleInvitationDrainResult['crmRecordFailed'] = [];
   let stopReason: DrainStopReason =
     selection.totalStale > selection.candidates.length ? 'limit_reached' : 'completed';
   let attempted = 0;
@@ -254,13 +297,25 @@ export async function withdrawStaleInvitations(params: {
     // turn that into a reported failure — the invitation IS gone on LinkedIn's
     // side, and saying otherwise would be the false report ENG-1718 removed from
     // the read path.
-    await Promise.resolve(deps.forget(accountId, candidate.invitationId)).catch((err) =>
-      console.error(`[staleInvitationDrain] failed to drop withdrawn invitation ${candidate.invitationId}:`, err),
-    );
+    // Neither follow-up may turn a completed withdrawal into a reported failure —
+    // the invitation IS gone on LinkedIn's side. But neither may be SWALLOWED
+    // either: a silent cleanup failure leaves the run claiming a clean sweep while
+    // the CRM still shows the person as pending.
+    await Promise.resolve(deps.forget(accountId, candidate.invitationId)).catch((err) => {
+      console.error(`[staleInvitationDrain] failed to drop withdrawn invitation ${candidate.invitationId}:`, err);
+      ledgerCleanupFailed.push({
+        invitedUserName: candidate.invitedUserName,
+        publicProfileUrl: candidate.publicProfileUrl,
+      });
+    });
     if (deps.recordWithdrawal) {
-      await Promise.resolve(deps.recordWithdrawal(candidate)).catch((err) =>
-        console.error(`[staleInvitationDrain] failed to record CRM withdrawal for ${candidate.publicProfileUrl}:`, err),
-      );
+      await Promise.resolve(deps.recordWithdrawal(candidate)).catch((err) => {
+        console.error(`[staleInvitationDrain] failed to record CRM withdrawal for ${candidate.publicProfileUrl}:`, err);
+        crmRecordFailed.push({
+          invitedUserName: candidate.invitedUserName,
+          publicProfileUrl: candidate.publicProfileUrl,
+        });
+      });
     }
     withdrawn.push({
       invitedUserName: candidate.invitedUserName,
@@ -274,6 +329,8 @@ export async function withdrawStaleInvitations(params: {
     olderThanDays,
     withdrawn,
     failed,
+    ledgerCleanupFailed,
+    crmRecordFailed,
     // Everything still stale that this run did not successfully withdraw: the
     // candidates it never reached, plus the ones it reached and could not clear.
     remainingStale: selection.totalStale - withdrawn.length,

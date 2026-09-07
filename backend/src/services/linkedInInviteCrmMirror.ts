@@ -150,6 +150,14 @@ export interface MirrorInviteResult {
 }
 
 /** Bound the cross-list search so a large account cannot turn one mirror into many reads. */
+/**
+ * CAS attempts before a contended engagement append is skipped rather than
+ * written blind. Shared by `mirrorLinkedInInviteToCrm` and
+ * `recordInviteWithdrawnInCrm` so the two cannot drift — an unguarded append is
+ * exactly the duplicate the guard exists to prevent.
+ */
+const MAX_ATTEMPTS = 3;
+
 const MAX_SEARCH_LISTS = 25;
 
 /**
@@ -368,7 +376,6 @@ export async function mirrorLinkedInInviteToCrm(
   // say — can both read "not present" and both append. Guard the append on the lead
   // being unchanged since the read that decided it, and on a lost race re-read and
   // re-decide: the loser then sees the winner's engagement and skips.
-  const MAX_ATTEMPTS = 3;
   // Seed from the post-update item so the very first attempt CASes against the
   // updatedAt this mirror just stamped, not the pre-update snapshot (which a
   // legacy lead may carry without an updatedAt at all). Merge over `existing` so
@@ -609,19 +616,8 @@ export async function recordInviteWithdrawnInCrm(params: {
   const existing = await crmDb.findLeadByLinkedinInList(listId, normalized);
   if (!existing?.leadId) return null;
 
-  // Same duplicate guard the sent/accepted paths use, keyed on this event type and
-  // this invitation id — a re-run of the drain must not append a second identical
-  // withdrawal to the same lead.
-  if (hasInviteEngagement(existing, {
-    linkedin: normalized,
-    accountId: params.accountId,
-    invitationId: params.invitationId,
-    eventType: INVITE_WITHDRAWN_EVENT,
-  })) {
-    return { leadId: String(existing.leadId), listId };
-  }
-
-  await crmDb.addLeadEngagement(listId, String(existing.leadId), {
+  const leadId = String(existing.leadId);
+  const engagement = {
     eventType: INVITE_WITHDRAWN_EVENT,
     eventData: {
       linkedin: normalized,
@@ -630,6 +626,50 @@ export async function recordInviteWithdrawnInCrm(params: {
       ...(params.sentAt ? { originallySentAt: params.sentAt } : {}),
     },
     createdAt: new Date().toISOString(),
-  });
-  return { leadId: String(existing.leadId), listId };
+  };
+
+  // Same duplicate guard the sent/accepted paths use, keyed on this event type and
+  // this invitation id — a re-run of the drain must not append a second identical
+  // withdrawal to the same lead.
+  //
+  // CodeRabbit on PR #2801: the guard alone is not enough, and the first version
+  // of this function had only the guard. `addLeadEngagement` appends
+  // unconditionally unless `expectedUpdatedAt` is supplied, so the read and the
+  // append are two separate operations — two concurrent drains can BOTH observe
+  // "not present" and both append. That is the precise race the CAS-and-retry loop
+  // in `mirrorLinkedInInviteToCrm` above already solves; this reuses it rather
+  // than inventing a weaker variant, which is what it should have done from the
+  // start.
+  let snapshot: any = existing;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (hasInviteEngagement(snapshot, {
+      linkedin: normalized,
+      accountId: params.accountId,
+      invitationId: params.invitationId,
+      eventType: INVITE_WITHDRAWN_EVENT,
+    })) {
+      return { leadId, listId };
+    }
+    const expectedUpdatedAt = snapshot?.updatedAt ? String(snapshot.updatedAt) : undefined;
+    try {
+      await crmDb.addLeadEngagement(
+        listId, leadId, engagement,
+        expectedUpdatedAt === undefined ? {} : { expectedUpdatedAt },
+      );
+      return { leadId, listId };
+    } catch (err: any) {
+      if (!err?.preconditionFailed) throw err;
+      // Someone wrote to the lead in between — possibly this same withdrawal.
+      // Re-read and let the loop re-decide.
+      snapshot = await crmDb.getLeadById(listId, leadId);
+      if (!snapshot) return { leadId, listId };
+    }
+  }
+
+  // Contention outliving the retries: skip rather than append blind, because an
+  // unguarded append is exactly the duplicate this guard exists to prevent.
+  console.warn(
+    `[recordInviteWithdrawn] gave up appending the withdrawal engagement for lead ${listId}/${leadId} after ${MAX_ATTEMPTS} contended attempts`,
+  );
+  return { leadId, listId };
 }

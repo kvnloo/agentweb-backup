@@ -200,6 +200,50 @@ describe('withdrawStaleInvitations', () => {
     expect(result.failed).toHaveLength(0);
   });
 
+  // CodeRabbit on PR #2801: not turning them into failures was right; SWALLOWING
+  // them was not. A silent cleanup failure let the run claim a clean sweep while
+  // the CRM still showed the person as pending.
+  it('reports a ledger-cleanup failure instead of claiming a clean sweep', async () => {
+    const deps = makeDeps([row('a', 40)], {
+      forget: jest.fn(async () => { throw new Error('dynamo down'); }),
+    });
+
+    const result = await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps });
+
+    expect(result.withdrawn).toHaveLength(1);
+    expect(result.ledgerCleanupFailed).toEqual([
+      { invitedUserName: 'A', publicProfileUrl: 'https://www.linkedin.com/in/a/' },
+    ]);
+    expect(result.notice).toContain('could not be cleared from our own records');
+    expect(result.notice).toContain('next sync');
+  });
+
+  it('reports a CRM provenance failure, and says nothing retries it', async () => {
+    // Unlike the cache row, nothing re-runs this: the only automatic
+    // reconciliation walks still-pending invitations, and this one is not.
+    const deps = makeDeps([row('a', 40)], {
+      recordWithdrawal: jest.fn(async () => { throw new Error('crm down'); }),
+    });
+
+    const result = await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps });
+
+    expect(result.withdrawn).toHaveLength(1);
+    expect(result.crmRecordFailed).toEqual([
+      { invitedUserName: 'A', publicProfileUrl: 'https://www.linkedin.com/in/a/' },
+    ]);
+    expect(result.notice).toContain('will not show the withdrawal in their history');
+    expect(result.notice).toContain('Nothing retries this automatically');
+  });
+
+  it('a clean run reports both lists empty', async () => {
+    const result = await withdrawStaleInvitations({
+      accountId: 'acc-1', olderThanDays: 14, deps: makeDeps([row('a', 40)]),
+    });
+    expect(result.ledgerCleanupFailed).toEqual([]);
+    expect(result.crmRecordFailed).toEqual([]);
+    expect(result.notice).not.toContain('could not be cleared');
+  });
+
   it('stops at its own budget and says how many remain', async () => {
     const rows = Array.from({ length: 10 }, (_, i) => row(`p${i}`, 30 + i));
     const deps = makeDeps(rows);
