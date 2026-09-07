@@ -12,6 +12,7 @@ import {
   measureBasisDivergence,
   reconcileMonth,
   reconcileVendorFidelity,
+  selectReconcilableSubjects,
   splitVendorModel,
 } from '../services/spendReconciliation';
 import { SpendEvent } from '../services/spendEventDb';
@@ -195,6 +196,81 @@ describe('reconcileVendorFidelity', () => {
   });
 });
 
+describe('mirrorStartedAt — scoping fidelity to the period the mirror existed', () => {
+  const MIRROR_START = '2026-09-07T15:09:00.000Z';
+
+  it('without the bound, history the mirror never saw reads as failure forever', () => {
+    // This is the state the first live run was in: every pre-deploy row
+    // unmirrored by construction, so fidelity could never go green.
+    const report = reconcileVendorFidelity([], [aVendorRow({ date: '2026-09-01' })]);
+
+    expect(report.ok).toBe(false);
+    expect(report.unmirroredGroups).toHaveLength(1);
+  });
+
+  it('drops whole days before the mirror started', () => {
+    const report = reconcileVendorFidelity([], [aVendorRow({ date: '2026-09-01' })], {
+      mirrorStartedAt: MIRROR_START,
+    });
+
+    expect(report.preMirrorGroups).toHaveLength(1);
+    expect(report.unmirroredGroups).toEqual([]);
+    expect(report.assessedGroupCount).toBe(0);
+  });
+
+  it('treats the changeover day as partial, not as a failure', () => {
+    // The live rail aggregates per DAY, so that row legitimately holds calls
+    // from both sides of the deploy and cannot be split.
+    const report = reconcileVendorFidelity(
+      [anEvent({ occurredAt: '2026-09-07T16:00:00.000Z' })],
+      [aVendorRow({ date: '2026-09-07', costMicroUsd: 62500, callCount: 5 })],
+      { mirrorStartedAt: MIRROR_START },
+    );
+
+    expect(report.partialGroups).toHaveLength(1);
+    expect(report.driftingGroups).toEqual([]);
+    expect(report.assessedGroupCount).toBe(0);
+  });
+
+  it('assesses days fully after the mirror started', () => {
+    const report = reconcileVendorFidelity(
+      [anEvent({ occurredAt: '2026-09-08T10:00:00.000Z' })],
+      [aVendorRow({ date: '2026-09-08' })],
+      { mirrorStartedAt: MIRROR_START },
+    );
+
+    expect(report.assessedGroupCount).toBe(1);
+    expect(report.ok).toBe(true);
+    expect(report.driftMicroUsd).toBe(0);
+  });
+
+  it('totals cover assessed groups only, so they cannot contradict the verdict', () => {
+    // A huge pre-mirror drift printed beside ok:true would make a reader
+    // trusting the number conclude the ledger is broken when it is just young.
+    const report = reconcileVendorFidelity(
+      [anEvent({ occurredAt: '2026-09-08T10:00:00.000Z' })],
+      [aVendorRow({ date: '2026-09-01', costMicroUsd: 9_000_000 }), aVendorRow({ date: '2026-09-08' })],
+      { mirrorStartedAt: MIRROR_START },
+    );
+
+    expect(report.ok).toBe(true);
+    expect(report.liveMicroUsd).toBe(12500);
+    expect(report.driftMicroUsd).toBe(0);
+  });
+
+  it('a run that assessed nothing is NOT evidence, even though ok is true', () => {
+    // The worst failure this module could have: a green light produced by
+    // having no data at all.
+    const report = reconcileMonth('owner-1', '2026-09', [], [aVendorRow({ date: '2026-09-01' })], {
+      mirrorStartedAt: MIRROR_START,
+    });
+
+    expect(report.fidelity.ok).toBe(true);
+    expect(report.fidelity.assessedGroupCount).toBe(0);
+    expect(report.readyForCutoverEvidence).toBe(false);
+  });
+});
+
 describe('measureBasisDivergence', () => {
   const clean = reconcileVendorFidelity([anEvent()], [aVendorRow()]);
 
@@ -222,8 +298,67 @@ describe('measureBasisDivergence', () => {
     expect(measureBasisDivergence([anLlmRow(), aVendorRow()], broken).trustworthy).toBe(false);
   });
 
+  it('is NOT trustworthy when nothing was assessed, even though ok is vacuously true', () => {
+    // Found by running the report against production: every group was
+    // pre-mirror, fidelity reported ok, and the divergence printed as clean
+    // while resting on no comparison at all.
+    const vacuous = reconcileVendorFidelity([], [aVendorRow({ date: '2026-09-01' })], {
+      mirrorStartedAt: '2026-09-07T15:09:00.000Z',
+    });
+
+    expect(vacuous.ok).toBe(true);
+    expect(vacuous.assessedGroupCount).toBe(0);
+    expect(measureBasisDivergence([anLlmRow(), aVendorRow()], vacuous).trustworthy).toBe(false);
+  });
+
   it('marks it trustworthy when the mirror is faithful', () => {
     expect(measureBasisDivergence([anLlmRow(), aVendorRow()], clean).trustworthy).toBe(true);
+  });
+});
+
+describe('selectReconcilableSubjects', () => {
+  it('includes a subject whose mirror failed COMPLETELY — the worst case', () => {
+    // No events at all, only live vendor rows. Deriving subjects from events
+    // would skip it entirely and the run would print clean precisely when the
+    // mirror had failed hardest.
+    const { reconcilable } = selectReconcilableSubjects([], [aVendorRow({ billingUserId: 'all-failed' })]);
+
+    expect(reconcilable).toEqual(['all-failed']);
+  });
+
+  it('includes a subject known only from the ledger', () => {
+    const { reconcilable } = selectReconcilableSubjects([anEvent({ billingUserId: 'ledger-only' })], []);
+
+    expect(reconcilable).toEqual(['ledger-only']);
+  });
+
+  it('separates LLM-only subjects instead of dropping them silently', () => {
+    const { reconcilable, llmOnly } = selectReconcilableSubjects(
+      [],
+      [anLlmRow({ billingUserId: 'llm-guy' }), aVendorRow({ billingUserId: 'vendor-guy' })],
+    );
+
+    expect(reconcilable).toEqual(['vendor-guy']);
+    expect(llmOnly).toEqual(['llm-guy']);
+  });
+
+  it('does not list a subject as LLM-only when it also has vendor spend', () => {
+    const { reconcilable, llmOnly } = selectReconcilableSubjects(
+      [],
+      [anLlmRow({ billingUserId: 'both' }), aVendorRow({ billingUserId: 'both' })],
+    );
+
+    expect(reconcilable).toEqual(['both']);
+    expect(llmOnly).toEqual([]);
+  });
+
+  it('deduplicates and sorts', () => {
+    const { reconcilable } = selectReconcilableSubjects(
+      [anEvent({ billingUserId: 'b' }), anEvent({ billingUserId: 'a' })],
+      [aVendorRow({ billingUserId: 'b' })],
+    );
+
+    expect(reconcilable).toEqual(['a', 'b']);
   });
 });
 
