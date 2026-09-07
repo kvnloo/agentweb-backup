@@ -15,6 +15,7 @@ jest.mock('../services/spendEventDb', () => ({
 
 import {
   ChargeRequest,
+  InvalidChargeQuantityError,
   UnpricedSpendError,
   chargeForCall,
   classify,
@@ -105,8 +106,32 @@ describe('spendChargingService', () => {
       expect(() => resolveCost(aRequest({ measuredCostUsd: -1 }))).toThrow(/non-negative/);
     });
 
-    it('treats a non-positive quantity as zero rather than negative money', () => {
-      expect(resolveCost(aRequest({ quantity: -5 })).costMicroUsd).toBe(0);
+    // CodeRabbit, PR #2788: coercing these to 0 produced costMicroUsd 0 with
+    // costSource still "allocated" — a row that looks priced and re-derivable
+    // but books nothing, on the revenue path.
+    it.each([-5, Number.NaN, Number.POSITIVE_INFINITY])(
+      'rejects quantity %s rather than booking a silent $0 allocated charge',
+      (quantity) => {
+        expect(() => resolveCost(aRequest({ quantity }))).toThrow(InvalidChargeQuantityError);
+      },
+    );
+
+    it('still allows a zero quantity — buying nothing really does cost nothing', () => {
+      const cost = resolveCost(aRequest({ quantity: 0 }));
+      expect(cost.costMicroUsd).toBe(0);
+      expect(cost.costSource).toBe('allocated');
+    });
+
+    it('an invalid quantity never reaches the store', async () => {
+      await expect(reserveSpend(aRequest({ quantity: Number.NaN }))).rejects.toBeInstanceOf(
+        InvalidChargeQuantityError,
+      );
+      expect(mockRecord).not.toHaveBeenCalled();
+    });
+
+    it('persists the validated quantity, not the raw request value', async () => {
+      await reserveSpend(aRequest({ quantity: 7 }));
+      expect(mockRecord.mock.calls[0][0].quantity).toBe(7);
     });
   });
 
@@ -234,6 +259,27 @@ describe('spendChargingService', () => {
       );
 
       expect(mockTransition).toHaveBeenCalledWith(expect.any(String), 'evt-1', 'settled', 1250000);
+    });
+
+    // CodeRabbit, PR #2788: both of these sit on the wrapper every adapter is
+    // meant to use, so a DynamoDB blip degraded every wrapped vendor call.
+    it('re-throws the VENDOR error even when voiding the reservation also fails', async () => {
+      const vendorError = new Error('vendor exploded');
+      mockTransition.mockRejectedValue(new Error('DynamoDB throttled'));
+
+      await expect(
+        chargeForCall(aRequest(), async () => {
+          throw vendorError;
+        }),
+      ).rejects.toBe(vendorError);
+    });
+
+    it('returns the vendor result even when settling fails — the money is already spent', async () => {
+      mockTransition.mockRejectedValue(new Error('DynamoDB throttled'));
+
+      // Throwing here would discard work the customer has paid for and invite a
+      // duplicate vendor call. The reservation stays open for §8 instead.
+      await expect(chargeForCall(aRequest(), async () => 'paid-for-result')).resolves.toBe('paid-for-result');
     });
 
     it('runs the vendor call and charges nothing for customer-paid work', async () => {

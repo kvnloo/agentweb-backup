@@ -96,6 +96,17 @@ export class UnpricedSpendError extends Error {
   }
 }
 
+export class InvalidChargeQuantityError extends Error {
+  constructor(provider: string, operation: string, quantity: unknown) {
+    super(
+      `Invalid quantity ${String(quantity)} for "${provider}" / "${operation}" — ` +
+        "must be a finite, non-negative number. Coercing it would book an " +
+        "allocated charge of $0 that looks priced but is not.",
+    );
+    this.name = "InvalidChargeQuantityError";
+  }
+}
+
 /** A charge that was skipped because it is not AgentWeb's to bill. */
 export interface NotChargedResult {
   charged: false;
@@ -142,6 +153,8 @@ export interface ResolvedCost {
   costSource: SpendEventCostSource;
   rateCardVersion?: string;
   unit: string;
+  /** The validated quantity, so the event records what was actually priced. */
+  quantity: number;
 }
 
 /**
@@ -153,7 +166,16 @@ export interface ResolvedCost {
  * that unpriced paid egress "must never become a silent $0 charge".
  */
 export function resolveCost(request: ChargeRequest): ResolvedCost {
-  const quantity = Number.isFinite(request.quantity) && request.quantity > 0 ? request.quantity : 0;
+  // Reject rather than coerce (CodeRabbit, PR #2788). Clamping a NaN or a
+  // negative quantity to 0 produced costMicroUsd 0 with costSource still
+  // "allocated" -- a row that looks priced and re-derivable but books nothing,
+  // which is precisely the silent $0 charge this file's header forbids, on the
+  // revenue path. Zero itself stays legal: buying zero units really does cost
+  // zero, and that is a priced answer, not an unknown one.
+  if (!Number.isFinite(request.quantity) || request.quantity < 0) {
+    throw new InvalidChargeQuantityError(request.provider, request.operation, request.quantity);
+  }
+  const quantity = request.quantity;
 
   if (request.measuredCostUsd !== undefined) {
     if (!Number.isFinite(request.measuredCostUsd) || request.measuredCostUsd < 0) {
@@ -163,6 +185,7 @@ export function resolveCost(request: ChargeRequest): ResolvedCost {
       costMicroUsd: Math.round(request.measuredCostUsd * 1e6),
       costSource: "measured",
       unit: request.unit || getRecordingUnit(request.provider as VendorRateProvider, request.operation) || "call",
+      quantity,
     };
   }
 
@@ -174,6 +197,7 @@ export function resolveCost(request: ChargeRequest): ResolvedCost {
     costSource: "allocated",
     rateCardVersion: VENDOR_RATE_CARD_VERSION,
     unit: request.unit || getRecordingUnit(request.provider as VendorRateProvider, request.operation) || "call",
+    quantity,
   };
 }
 
@@ -196,7 +220,10 @@ function buildEvent(request: ChargeRequest, lifecycle: SpendEvent["lifecycle"]):
     operation: request.operation,
     ...(request.feature ? { feature: request.feature } : {}),
     unit: cost.unit,
-    quantity: request.quantity,
+    // The validated value from resolveCost, not request.quantity raw -- the two
+    // were the same number by luck, and only the store's own validator stood
+    // between a NaN request and a NaN row.
+    quantity: cost.quantity,
     costMicroUsd: cost.costMicroUsd,
     costSource: cost.costSource,
     ...(cost.rateCardVersion ? { rateCardVersion: cost.rateCardVersion } : {}),
@@ -274,8 +301,16 @@ export async function voidSpend(billingUserId: string, eventId: string): Promise
  * The settle is what stays idempotent — a second settle against an already
  * settled event returns false and books nothing.
  *
- * A thrown vendor error voids the reservation and re-throws unchanged, so the
- * caller's own error handling is unaffected by being metered.
+ * A thrown vendor error voids the reservation and re-throws UNCHANGED, so the
+ * caller's own error handling is unaffected by being metered -- including when
+ * the void itself fails, which is logged rather than allowed to replace the
+ * vendor's error.
+ *
+ * A failure to SETTLE after a successful vendor call is likewise logged rather
+ * than thrown. The money is already spent by then, so throwing would discard
+ * the result the caller paid for and invite a duplicate vendor call. The
+ * reservation stays `reserved`, which overstates spend rather than losing it
+ * and surfaces in the §8 reconciliation as an unsettled row.
  */
 export async function chargeForCall<T>(
   request: ChargeRequest,
@@ -293,20 +328,51 @@ export async function chargeForCall<T>(
   try {
     result = await call();
   } catch (error) {
-    await voidSpend(billingUserId, eventId);
+    // The vendor error must reach the caller unchanged (CodeRabbit, PR #2788).
+    // If voidSpend throws -- a DynamoDB throttle, say -- its error would
+    // replace the vendor's, and a caller switching on the vendor error type
+    // would see a database error instead. The stuck `reserved` row is the
+    // safe failure: it overstates spend rather than losing it, and §8 surfaces
+    // it as an unsettled reservation.
+    try {
+      await voidSpend(billingUserId, eventId);
+    } catch (voidError) {
+      console.error(
+        `[spendCharging] could not void reservation ${eventId} for ${billingUserId} after a vendor failure:`,
+        voidError instanceof Error ? voidError.message : voidError,
+      );
+    }
     throw error;
   }
 
   const actualCostUsd = settleWith ? settleWith(result) : undefined;
-  if (actualCostUsd === undefined) {
-    // Settle at the reserved amount using the figure already in hand, rather
-    // than settleSpend's read-back path: a fixed-price call would otherwise pay
-    // for a DynamoDB read on every single charge to recover a number this
-    // function computed moments earlier. Passing micro-dollars straight through
-    // also avoids a needless /1e6 -> *1e6 round trip through float.
-    await transitionSpendEvent(billingUserId, eventId, "settled", reservation.event.costMicroUsd);
-  } else {
-    await settleSpend(billingUserId, eventId, actualCostUsd);
+  try {
+    if (actualCostUsd === undefined) {
+      // Settle at the reserved amount using the figure already in hand, rather
+      // than settleSpend's read-back path: a fixed-price call would otherwise
+      // pay for a DynamoDB read on every single charge to recover a number this
+      // function computed moments earlier. Passing micro-dollars straight
+      // through also avoids a needless /1e6 -> *1e6 round trip through float.
+      await transitionSpendEvent(billingUserId, eventId, "settled", reservation.event.costMicroUsd);
+    } else {
+      await settleSpend(billingUserId, eventId, actualCostUsd);
+    }
+  } catch (settleError) {
+    // The vendor call already succeeded and the money is already spent
+    // (CodeRabbit, PR #2788). Throwing here would discard `result`, so the
+    // caller loses work it has paid for and very likely retries the vendor
+    // call -- paying twice. The reservation simply stays `reserved`, which
+    // overstates spend rather than losing it and shows up in §8 as an
+    // unsettled reservation.
+    //
+    // This is not a hole in the module's throw policy. That policy exists so a
+    // charge is never lost silently; a stuck reservation is neither lost nor
+    // silent.
+    console.error(
+      `[spendCharging] vendor call succeeded but settling ${eventId} for ${billingUserId} failed; ` +
+        "reservation left open for reconciliation:",
+      settleError instanceof Error ? settleError.message : settleError,
+    );
   }
   return result;
 }
