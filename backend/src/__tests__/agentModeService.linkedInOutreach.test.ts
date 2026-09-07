@@ -56,6 +56,7 @@ const mockClearStatusCache = jest.fn();
 const mockFilterByCompanySize = jest.fn(
   async (...args: any[]) => ({ items: args[0], excludedUnverifiable: 0 }),
 );
+const mockListSentInvitations = jest.fn();
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     sendMessage: (...args: any[]) => mockSendMessage(...args),
@@ -65,6 +66,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
     acceptInvitation: (...args: any[]) => mockAcceptInvitation(...args),
     getProfile: (...args: any[]) => mockGetProfile(...args),
     listReceivedInvitations: (...args: any[]) => mockListReceivedInvitations(...args),
+    listSentInvitations: (...args: any[]) => mockListSentInvitations(...args),
     // ENG-126 breaker check — must be present or send-invite throws before pacing.
     isUnderInvitationCooldown: (...args: any[]) => mockIsUnderInvitationCooldown(...args),
     getMessagesWithContact: (...args: any[]) => mockGetMessagesWithContact(...args),
@@ -132,9 +134,14 @@ jest.mock('../services/linkedInInviteCrmMirror', () => ({
 // uses the publicProfileUrl GSI getter (case-robust, matches the CRM path).
 const mockGetSentInvitationByProfileUrlAndAccount = jest.fn().mockResolvedValue(null);
 const mockUpsertSentInvitation = jest.fn().mockResolvedValue(undefined);
+// ENG-1718: list-sent-invitations now falls back to this same ledger when the live
+// read is unusable, so the getter belongs on the ONE mock for this module — a second
+// jest.mock for the same path silently overrides the first.
+const mockGetAllSentInvitationsByAccount = jest.fn().mockResolvedValue([]);
 jest.mock('../services/unipileSentInvitationsDb', () => ({
   getSentInvitationByProfileUrlAndAccount: (...args: any[]) => mockGetSentInvitationByProfileUrlAndAccount(...args),
   upsertSentInvitation: (...args: any[]) => mockUpsertSentInvitation(...args),
+  getAllSentInvitationsByAccount: (...args: any[]) => mockGetAllSentInvitationsByAccount(...args),
 }));
 
 // Mock unipileConnectionsDb (normalizeLinkedInUrl used by the write-through upsert)
@@ -2364,5 +2371,94 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
       expect(mockUpdateAccountConfig).toHaveBeenCalledTimes(1);
     });
 
+  });
+});
+
+/**
+ * ENG-1718 — the handler wiring, on top of linkedInSentInvitationsView.test.ts
+ * which pins the decision. The defect was in this dispatch: any body without an
+ * `items` array became `{ success: true, data: <that body> }`, so a non-conforming
+ * 200 read as "no pending invitations".
+ */
+describe('ENG-1718: list-sent-invitations never returns a bare empty result', () => {
+  let service: AgentModeService;
+
+  beforeEach(() => {
+    service = new AgentModeService();
+    mockListSentInvitations.mockReset();
+    mockGetAllSentInvitationsByAccount.mockReset();
+    mockGetAllSentInvitationsByAccount.mockResolvedValue([]);
+  });
+
+  it('falls back to our own ledger when the live read returns the non-conforming {}', async () => {
+    // The exact body the SDK hands back at its default validateRequestPayloadLevel
+    // of 'warn' when the response fails its own schema.
+    mockListSentInvitations.mockResolvedValue({});
+    mockGetAllSentInvitationsByAccount.mockResolvedValue([
+      { invitationId: 'inv-1', invitedUserPublicId: 'monid', invitedUserName: 'Monica DeVreese', sentAt: '2026-07-28T00:00:00Z' },
+    ]);
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'list-sent-invitations',
+      account_id: 'test-account-id',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.data.source).toBe('cache');
+    expect(result.data.liveUnavailable).toBe(true);
+    expect(result.data.totalPending).toBe(1);
+    expect(result.data.items[0].sent_at).toBe('2026-07-28T00:00:00Z');
+    expect(result.data.notice).toEqual(expect.stringContaining('live read was unavailable'));
+  });
+
+  it('says "not tracked here" explicitly when live and ledger genuinely agree on none', async () => {
+    mockListSentInvitations.mockResolvedValue({ object: 'InvitationList', items: [], cursor: null });
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'list-sent-invitations',
+      account_id: 'test-account-id',
+    });
+
+    expect(result.data.source).toBe('none');
+    expect(result.data.liveUnavailable).toBeUndefined();
+    expect(result.data.notice).toEqual(expect.stringContaining('outside AgentWeb'));
+  });
+
+  it('never reports an unreadable backlog as an empty one', async () => {
+    mockListSentInvitations.mockRejectedValue(new Error('502 Bad Gateway'));
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'list-sent-invitations',
+      account_id: 'test-account-id',
+    });
+
+    expect(result.data.source).toBe('none');
+    expect(result.data.liveUnavailable).toBe(true);
+    expect(result.data.notice).toEqual(expect.stringContaining('NOT evidence'));
+  });
+
+  it('returns live rows with sent_at, which the old trim dropped', async () => {
+    mockListSentInvitations.mockResolvedValue({
+      object: 'InvitationList',
+      cursor: null,
+      items: [{
+        object: 'InvitationSent',
+        id: 'inv-live-1',
+        date: '2026-08-20T00:00:00Z',
+        parsed_datetime: '2026-08-20T00:00:00Z',
+        invited_user: 'Clara Paye',
+        invited_user_id: 'uid-1',
+        invited_user_public_id: 'clarapaye',
+      }],
+    });
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'list-sent-invitations',
+      account_id: 'test-account-id',
+    });
+
+    expect(result.data.source).toBe('live');
+    expect(result.data.items[0].sent_at).toBe('2026-08-20T00:00:00Z');
+    expect(result.data.items[0].id).toBe('inv-live-1');
   });
 });
