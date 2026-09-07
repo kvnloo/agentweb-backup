@@ -172,6 +172,44 @@ describe('spendEventDb', () => {
     it('rejects a malformed occurredAt', () => {
       expect(() => validateSpendEvent(anEvent({ occurredAt: 'yesterday' }))).toThrow(/ISO-8601/);
     });
+
+    // CodeRabbit, PR #2787: a prefix match on the date is not enough.
+    it('rejects an offset timestamp whose UTC instant is in another month', () => {
+      // Real instant is 2026-09-30T23:30Z, but the string carries "2026-10" and
+      // sorts under October on the GSI — it would land in one month's
+      // projection and be invisible to the other month's range query.
+      expect(() =>
+        validateSpendEvent(anEvent({ occurredAt: '2026-10-01T00:30:00+01:00', billingMonth: '2026-10' })),
+      ).toThrow(/canonical UTC/);
+    });
+
+    it('rejects any non-Z timezone, including an explicit +00:00', () => {
+      expect(() => validateSpendEvent(anEvent({ occurredAt: '2026-09-07T10:00:00+00:00' }))).toThrow(/canonical UTC/);
+      expect(() => validateSpendEvent(anEvent({ occurredAt: '2026-09-07T10:00:00' }))).toThrow(/canonical UTC/);
+    });
+
+    it('rejects a date that does not exist rather than letting Date roll it forward', () => {
+      // Date() turns this into 2026-03-02, so a real event would be stored on an unreal day.
+      expect(() => validateSpendEvent(anEvent({ occurredAt: '2026-02-30T00:00:00Z', billingMonth: '2026-02' })))
+        .toThrow(/canonical UTC/);
+    });
+
+    it('rejects month 13 in both fields', () => {
+      expect(() => validateSpendEvent(anEvent({ occurredAt: '2026-13-01T00:00:00Z', billingMonth: '2026-13' })))
+        .toThrow(/canonical UTC/);
+      expect(() => validateSpendEvent(anEvent({ occurredAt: '2026-09-07T10:00:00Z', billingMonth: '2026-13' })))
+        .toThrow(/real month/);
+    });
+
+    it('accepts a leap day that does exist', () => {
+      expect(() => validateSpendEvent(anEvent({ occurredAt: '2028-02-29T12:00:00.000Z', billingMonth: '2028-02' })))
+        .not.toThrow();
+    });
+
+    it('accepts an instant with and without milliseconds', () => {
+      expect(() => validateSpendEvent(anEvent({ occurredAt: '2026-09-07T10:00:00Z' }))).not.toThrow();
+      expect(() => validateSpendEvent(anEvent({ occurredAt: '2026-09-07T10:00:00.123Z' }))).not.toThrow();
+    });
   });
 
   describe('lifecycle', () => {

@@ -121,7 +121,47 @@ export class SpendEventValidationError extends Error {
   }
 }
 
-const MONTH_OF = /^(\d{4}-\d{2})/;
+/**
+ * A canonical UTC instant, and nothing else.
+ *
+ * A prefix match on the date is not enough (CodeRabbit, PR #2787): with an
+ * offset timestamp, `"2026-10-01T00:30:00+01:00"` carries billing month
+ * `2026-10` while the real instant is 2026-09-30T23:30Z. The GSI sorts these
+ * strings raw, so the row lands in October's projection *and* is invisible to a
+ * September range query -- the reconciliation in §8 would report it as drift
+ * with no way to see which field was wrong. Requiring `Z` makes the string's
+ * sort order and its instant the same thing.
+ */
+const UTC_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?Z$/;
+const BILLING_MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+/**
+ * The `YYYY-MM` of a canonical UTC instant, or null if it is not one.
+ *
+ * Round-trips every field through `Date` because the regex alone still admits
+ * dates that do not exist: `2026-02-30T00:00:00Z` matches it, and `Date` then
+ * silently rolls it forward to March 2. Comparing the parsed fields back
+ * against the literal is what rejects those instead of storing a real event on
+ * an unreal day.
+ */
+function utcMonthOf(value: string): string | null {
+  const m = UTC_INSTANT.exec(value);
+  if (!m) return null;
+
+  const [, year, month, day, hour, minute, second] = m;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+
+  const sameInstant =
+    parsed.getUTCFullYear() === Number(year) &&
+    parsed.getUTCMonth() + 1 === Number(month) &&
+    parsed.getUTCDate() === Number(day) &&
+    parsed.getUTCHours() === Number(hour) &&
+    parsed.getUTCMinutes() === Number(minute) &&
+    parsed.getUTCSeconds() === Number(second);
+
+  return sameInstant ? `${year}-${month}` : null;
+}
 
 /**
  * Reject anything that would make the §3 invariant unprovable later. These are
@@ -142,10 +182,17 @@ export function validateSpendEvent(event: SpendEvent): void {
   if (!event.operation) fail("operation is required");
   if (!event.unit) fail("unit is required");
 
-  const month = MONTH_OF.exec(event.occurredAt || "");
-  if (!month) fail(`occurredAt must be an ISO-8601 timestamp, got ${JSON.stringify(event.occurredAt)}`);
-  if (!/^\d{4}-\d{2}$/.test(event.billingMonth)) fail(`billingMonth must be YYYY-MM, got ${JSON.stringify(event.billingMonth)}`);
-  if (month && month[1] !== event.billingMonth) {
+  const month = utcMonthOf(event.occurredAt || "");
+  if (!month) {
+    fail(
+      `occurredAt must be a canonical UTC ISO-8601 instant ending in Z (e.g. 2026-09-07T10:00:00.000Z), ` +
+        `got ${JSON.stringify(event.occurredAt)}`,
+    );
+  }
+  if (!BILLING_MONTH.test(event.billingMonth)) {
+    fail(`billingMonth must be YYYY-MM with a real month, got ${JSON.stringify(event.billingMonth)}`);
+  }
+  if (month !== event.billingMonth) {
     fail(`billingMonth ${event.billingMonth} disagrees with occurredAt ${event.occurredAt}`);
   }
 
