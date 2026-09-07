@@ -51,7 +51,9 @@ export interface FidelityGroup {
 
 export interface FidelityReport {
   ok: boolean;
+  /** Over ASSESSED groups only — excludes pre-mirror history and the changeover day. */
   ledgerMicroUsd: number;
+  /** Over ASSESSED groups only. */
   liveMicroUsd: number;
   driftMicroUsd: number;
   /** Only the groups that failed, so a clean run has nothing to read. */
@@ -70,7 +72,16 @@ export interface FidelityReport {
    * guarantee has regressed.
    */
   orphanGroups: FidelityGroup[];
+  /** Days wholly before the mirror existed. Excluded from the verdict. */
+  preMirrorGroups: FidelityGroup[];
+  /** The changeover day, which spans both sides of the deploy. Excluded too. */
+  partialGroups: FidelityGroup[];
   groupCount: number;
+  /**
+   * Groups the verdict is actually based on. Zero means nothing was checked --
+   * `ok` is then vacuously true and must not be read as evidence of anything.
+   */
+  assessedGroupCount: number;
 }
 
 const keyOf = (date: string, provider: string, operation: string) => `${date} ${provider} ${operation}`;
@@ -98,10 +109,29 @@ export function splitVendorModel(model: string): { provider: string; operation: 
  * Only `settled` events count: a reservation is not spend, and a void is
  * explicitly not spend.
  */
+export interface FidelityOptions {
+  /**
+   * When the dual-write actually began, as an ISO instant.
+   *
+   * Without it every row that predates the mirror reads as "not mirrored" and
+   * fidelity can never go green -- the check would be permanently red for
+   * history it was never meant to cover, which makes it useless as the AC6
+   * precondition it exists to be.
+   *
+   * The live rail aggregates per DAY, so the day the mirror started cannot be
+   * split: its row legitimately holds calls from both before and after. That
+   * day is reported as PARTIAL and excluded from the verdict rather than
+   * counted as a failure, and full days before it are dropped entirely.
+   */
+  mirrorStartedAt?: string;
+}
+
 export function reconcileVendorFidelity(
   events: readonly SpendEvent[],
   liveRows: readonly UsageRecordRow[],
+  options: FidelityOptions = {},
 ): FidelityReport {
+  const mirrorStartDay = options.mirrorStartedAt?.slice(0, 10);
   const groups = new Map<string, FidelityGroup>();
 
   const groupFor = (date: string, provider: string, operation: string): FidelityGroup => {
@@ -149,11 +179,29 @@ export function reconcileVendorFidelity(
   const driftingGroups: FidelityGroup[] = [];
   const unmirroredGroups: FidelityGroup[] = [];
   const orphanGroups: FidelityGroup[] = [];
+  const preMirrorGroups: FidelityGroup[] = [];
+  const partialGroups: FidelityGroup[] = [];
 
   for (const group of groups.values()) {
     group.driftMicroUsd = group.ledgerMicroUsd - group.liveMicroUsd;
     group.ok = Math.abs(group.driftMicroUsd) <= DRIFT_TOLERANCE_MICRO_USD;
 
+    if (mirrorStartDay && group.date < mirrorStartDay) {
+      // Entirely before the mirror existed. Not a finding.
+      preMirrorGroups.push(group);
+      continue;
+    }
+    if (mirrorStartDay && group.date === mirrorStartDay) {
+      // The changeover day. Its live row spans both sides of the deploy and the
+      // daily aggregate cannot be split, so a shortfall here is expected.
+      partialGroups.push(group);
+      continue;
+    }
+
+    // Totals cover ASSESSED groups only. Including history the mirror never saw
+    // would print a huge drift beside `ok: true`, and a reader who trusted the
+    // number over the verdict would conclude the ledger is broken when it is
+    // merely young.
     ledgerMicroUsd += group.ledgerMicroUsd;
     liveMicroUsd += group.liveMicroUsd;
 
@@ -172,8 +220,41 @@ export function reconcileVendorFidelity(
     driftingGroups,
     unmirroredGroups,
     orphanGroups,
+    preMirrorGroups,
+    partialGroups,
     groupCount: groups.size,
+    assessedGroupCount: groups.size - preMirrorGroups.length - partialGroups.length,
   };
+}
+
+/**
+ * Which billing subjects a monthly reconciliation should actually cover.
+ *
+ * Vendor activity on EITHER rail makes a subject reconcilable. Deriving the set
+ * from spend events alone hides the single worst case this check exists to
+ * catch (CodeRabbit, PR #2805): a subject whose mirror writes ALL failed has no
+ * events, so it would never be looked at, and the run would print clean
+ * precisely when the mirror had failed hardest.
+ *
+ * Subjects with only LLM spend are returned separately rather than dropped
+ * silently — they have nothing to reconcile here, but "19 subjects not listed"
+ * is a materially different report from one that simply omits them.
+ */
+export function selectReconcilableSubjects(
+  events: readonly SpendEvent[],
+  liveRows: readonly UsageRecordRow[],
+): { reconcilable: string[]; llmOnly: string[] } {
+  const reconcilable = new Set<string>(events.map((e) => e.billingUserId).filter(Boolean));
+  const llmOnly = new Set<string>();
+
+  for (const row of liveRows) {
+    if (!row.billingUserId) continue;
+    if (isVendorEntry(row)) reconcilable.add(row.billingUserId);
+    else llmOnly.add(row.billingUserId);
+  }
+  for (const id of reconcilable) llmOnly.delete(id);
+
+  return { reconcilable: [...reconcilable].sort(), llmOnly: [...llmOnly].sort() };
 }
 
 export interface BasisDivergenceReport {
@@ -185,8 +266,11 @@ export interface BasisDivergenceReport {
   /** How much larger the new basis is, as a percentage of the old. */
   increasePercent: number;
   /**
-   * Whether the fidelity check passed. A divergence computed on top of a broken
-   * mirror is not a measurement and must not be quoted as one.
+   * Whether the fidelity check passed AND actually assessed something.
+   *
+   * A divergence computed on top of a broken mirror is not a measurement. Nor
+   * is one computed where no comparison happened at all — that reports `ok`
+   * vacuously, which is the more dangerous of the two because it looks clean.
    */
   trustworthy: boolean;
 }
@@ -220,7 +304,12 @@ export function measureBasisDivergence(
     // An account with no LLM spend has no baseline to be a percentage of;
     // reporting Infinity or 100% would both be inventions.
     increasePercent: llmOnlyMicroUsd === 0 ? 0 : (vendorMicroUsd / llmOnlyMicroUsd) * 100,
-    trustworthy: fidelity.ok,
+    // `ok` alone is not enough: a run that assessed nothing reports ok
+    // VACUOUSLY, and this figure would then be published as verified while
+    // resting on no comparison at all. Found by running the report against
+    // production, where every group was pre-mirror and the divergence printed
+    // clean.
+    trustworthy: fidelity.ok && fidelity.assessedGroupCount > 0,
   };
 }
 
@@ -229,7 +318,13 @@ export interface ReconciliationReport {
   billingMonth: string;
   fidelity: FidelityReport;
   divergence: BasisDivergenceReport;
-  /** True only when the shadow is faithful — an AC6 precondition, not a verdict. */
+  /**
+   * True only when the shadow is faithful AND something was actually assessed.
+   *
+   * A run that checked nothing reports `fidelity.ok === true` vacuously, and
+   * treating that as evidence would be the worst possible failure of this
+   * module: a green light produced by having no data.
+   */
   readyForCutoverEvidence: boolean;
 }
 
@@ -246,17 +341,18 @@ export function reconcileMonth(
   billingMonth: string,
   events: readonly SpendEvent[],
   liveRows: readonly UsageRecordRow[],
+  options: FidelityOptions = {},
 ): ReconciliationReport {
   const mine = events.filter((e) => e.billingUserId === billingUserId && e.billingMonth === billingMonth);
   const myRows = liveRows.filter((r) => r.billingUserId === billingUserId && r.date.slice(0, 7) === billingMonth);
 
-  const fidelity = reconcileVendorFidelity(mine, myRows);
+  const fidelity = reconcileVendorFidelity(mine, myRows, options);
 
   return {
     billingUserId,
     billingMonth,
     fidelity,
     divergence: measureBasisDivergence(myRows, fidelity),
-    readyForCutoverEvidence: fidelity.ok,
+    readyForCutoverEvidence: fidelity.ok && fidelity.assessedGroupCount > 0,
   };
 }
