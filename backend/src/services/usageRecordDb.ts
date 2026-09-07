@@ -16,6 +16,7 @@
 
 import AWS from "aws-sdk";
 import { LLM_CHARGE_EVENTS_TABLE, LlmChargeAuditEvent } from "./llmChargeAuditDb";
+import { SPEND_EVENTS_TABLE, SpendEvent, validateSpendEvent } from "./spendEventDb";
 
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-UsageRecords`;
@@ -373,6 +374,70 @@ export const usageRecordDb = {
       // array (index order matches TransactItems: 0 = ledger, 1 = charge),
       // not the single-item ConditionalCheckFailedException recordLlmChargeEvent
       // catches on its own standalone put.
+      const reasons = error?.CancellationReasons as Array<{ Code?: string }> | undefined;
+      if (error?.code === "TransactionConflictException") return "conflict";
+      if (error?.code === "TransactionCanceledException" && reasons) {
+        if (reasons[1]?.Code === "ConditionalCheckFailed") return "duplicate";
+        const isPureConflict =
+          reasons.some((reason) => reason?.Code === "TransactionConflict") &&
+          reasons.every((reason) => reason?.Code === "TransactionConflict" || reason?.Code === "None");
+        if (isPureConflict) return "conflict";
+      }
+      throw error;
+    }
+  },
+
+  /**
+   * The vendor equivalent of `incrementUsageWithChargeEvent` (ENG-702 AC1).
+   *
+   * Writes the daily aggregate row and its immutable spend event in ONE
+   * transaction, conditional on the caller-supplied idempotency token. A
+   * replayed token therefore no-ops the spend event AND skips the aggregate's
+   * contribution *together* — never independently, which is the exact defect
+   * ENG-1251 was raised to close on the LLM side: a retried batch could
+   * previously dedupe its charge event while its ledger contribution landed
+   * a second time.
+   *
+   * Targets AW-SpendEvents, not AW-LlmChargeEvents. That table declares itself
+   * "deliberately LLM-only: it is not the future cross-vendor wallet", so
+   * vendor events have no business in it.
+   *
+   * No TTL is written, unlike the LLM charge event above. AW-SpendEvents is
+   * retained by decision (ENG-1796) — see spendEventDb.
+   */
+  async incrementUsageWithSpendEvent(
+    inc: UsageRecordIncrement,
+    spendEvent: SpendEvent
+  ): Promise<"applied" | "duplicate" | "conflict"> {
+    // Fail before the transaction rather than writing a malformed row: the
+    // store's guarantees (month agrees with instant, integer micro-dollars,
+    // allocated costs carry a rate version) are worth nothing if the
+    // transactional path can bypass them.
+    validateSpendEvent(spendEvent);
+
+    const ledgerParams = buildIncrementUsageUpdate(inc);
+    const ledgerItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = {
+      Update: { TableName: TABLE_NAME, ...ledgerParams },
+    };
+    const spendItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = {
+      Put: {
+        TableName: SPEND_EVENTS_TABLE,
+        Item: spendEvent,
+        ConditionExpression: "attribute_not_exists(billingUserId) AND attribute_not_exists(eventId)",
+      },
+    };
+
+    try {
+      await getDocumentClient()
+        .transactWrite({ TransactItems: [ledgerItem, spendItem] })
+        .promise();
+      return "applied";
+    } catch (error: any) {
+      // Same classification as incrementUsageWithChargeEvent: a transaction
+      // condition failure surfaces as TransactionCanceledException with a
+      // per-item CancellationReasons array (index order matches TransactItems:
+      // 0 = ledger, 1 = spend event), not the single-item
+      // ConditionalCheckFailedException a standalone put would raise.
       const reasons = error?.CancellationReasons as Array<{ Code?: string }> | undefined;
       if (error?.code === "TransactionConflictException") return "conflict";
       if (error?.code === "TransactionCanceledException" && reasons) {
