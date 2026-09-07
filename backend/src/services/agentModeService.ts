@@ -32889,21 +32889,49 @@ ${strippedHtml}`;
       const workPlan = { ...session.workPlan };
 
       // Snapshot of every step as it existed before this call's removeStepCounts
-      // filtering runs below, keyed by stepCount. Used further down to detect
-      // and protect against "remove step N via removeStepCounts, then add a
-      // fresh step N back in the same steps[] array" -- a step reaching the
-      // "add new step" branch is otherwise treated as having no prior history
-      // at all, even when this exact call just removed the real history one
-      // line below. Live-verified on test-env1, 2026-09-07 (unprompted,
-      // organic model behavior, not a scripted repro): the model removed steps
-      // 2 and 3 via removeStepCounts and added a single new step 2 with
-      // requiredFunctionCalls: [], silently dropping list_html_templates and
-      // create_html_from_template -- both genuinely never called -- with zero
-      // protection, even though the ENG-1799/1800 merge guards were already
-      // active for ordinary same-step edits.
+      // filtering runs below, keyed by stepCount. Still used further down for
+      // expectedAssetCount/expectedAssetCountTools: when a step reusing a
+      // just-removed stepCount reaches the "add new step" branch in THIS SAME
+      // call, reattach the pre-removal asset-count requirement instead of
+      // treating it as having no history. (requiredFunctionCalls no longer
+      // uses this snapshot -- see pendingRequiredFunctionCalls below, which
+      // closes the same gap completely instead of only within one call.)
       const originalStepsBeforeRemoval = new Map<number, (typeof workPlan.steps)[number]>(
         workPlan.steps.map((s: any) => [s.stepCount, s]),
       );
+
+      // ENG-1811: before removing anything, carry forward any genuinely
+      // unresolved requiredFunctionCalls from the steps about to be removed
+      // into a session-lifetime, stepCount-agnostic debt ledger
+      // (workPlan.pendingRequiredFunctionCalls). This is deliberately NOT
+      // scoped to "does a later step reuse this same stepCount" -- that
+      // per-call/per-stepCount approach (the first attempt at this fix) was
+      // itself defeated live, unprompted, on test-env1: the model removed
+      // steps 2 and 3 via removeStepCounts in one modify_work_plan call, then
+      // re-added them with omitted requiredFunctionCalls in a SEPARATE, LATER
+      // call that didn't mention removeStepCounts at all -- that later call's
+      // own invocation has no memory of the earlier removal, so a per-call
+      // snapshot can never see across it. A plain session-level ledger does,
+      // because workPlan (and this field on it) is the one thing every
+      // invocation reads fresh and writes back. See setWorkPlanStatusAttempt
+      // for where this is enforced: it blocks a batch from resolving the LAST
+      // remaining pending step(s) (finishing the plan) while any entry here
+      // still hasn't succeeded, regardless of which step (if any) still lists
+      // it as required.
+      const priorPendingRequiredFunctionCalls = workPlan.pendingRequiredFunctionCalls || [];
+      if (removeStepCounts && removeStepCounts.length > 0) {
+        const succeededFunctionCountsAtRemoval = session.calledFunctions || {};
+        const newlyUnresolved = new Set(priorPendingRequiredFunctionCalls);
+        for (const step of workPlan.steps) {
+          if (!removeStepCounts.includes(step.stepCount)) continue;
+          for (const fn of step.requiredFunctionCalls || []) {
+            if ((succeededFunctionCountsAtRemoval[fn] || 0) === 0) {
+              newlyUnresolved.add(fn);
+            }
+          }
+        }
+        workPlan.pendingRequiredFunctionCalls = Array.from(newlyUnresolved);
+      }
 
       // Update autocomplete if explicitly provided
       if (autocomplete !== undefined) {
@@ -33100,28 +33128,26 @@ ${strippedHtml}`;
         } else {
           // Add new step (stepCount will be fixed by updateSessionWorkPlan).
           //
-          // If this stepCount was just removed via removeStepCounts in this
-          // same call, this is really an edit wearing a "new step" costume --
-          // apply the same merge protection as the existingIndex>=0 branch
-          // above, using the pre-removal step as the baseline, so removing and
-          // re-adding a step can't be used to launder away an unresolved
-          // requirement (see the comment on originalStepsBeforeRemoval above).
-          // A genuinely new stepCount (never existed before this call) has no
-          // history to protect, so it's unaffected.
+          // requiredFunctionCalls is taken as given here, unprotected -- ENG-1811's
+          // pendingRequiredFunctionCalls ledger (populated above whenever a step is
+          // removed) is what actually guarantees a genuinely unresolved requirement
+          // can't be walked away from, enforced at completion time in
+          // setWorkPlanStatusAttempt regardless of which step (if any) still lists
+          // it. That covers this stepCount being reused in this same call, a later
+          // separate call, or never being reused at all -- strictly more than a
+          // per-call reattachment here could.
+          //
+          // expectedAssetCount/expectedAssetCountTools have no equivalent
+          // session-level ledger yet (the "produced count" calculation is inherently
+          // step-relative, not easily genericized the way a function name is) -- if
+          // this stepCount was just removed via removeStepCounts in THIS SAME call,
+          // still reattach its pre-removal asset-count requirement as a best-effort
+          // guard using the pre-removal step as the baseline. A genuinely new
+          // stepCount, or one whose removal happened in an earlier, separate call,
+          // has no such reattachment (a known, narrower residual gap -- see ENG-1808).
           const removedOriginal = removeStepCounts?.includes(newStep.stepCount)
             ? originalStepsBeforeRemoval.get(newStep.stepCount)
             : undefined;
-          // When removedOriginal exists, the merge functions must run
-          // UNCONDITIONALLY, not only when the caller explicitly supplied the
-          // corresponding field. mergeExpectedAssetCount/Tools already handle
-          // requested === undefined correctly (return the existing value) --
-          // exactly like the existingIndex>=0 branch above, which calls them
-          // unconditionally for the same reason. Gating the call itself on
-          // `newStep.expectedAssetCount !== undefined` (the old pattern, still
-          // correct for a genuinely new step with no removedOriginal) would
-          // let a reused stepCount that simply OMITS the field skip protection
-          // entirely -- the asset-count gate would never even activate on the
-          // re-added step, a strictly worse bypass than an explicit lowering.
           workPlan.steps.push({
             stepCount: newStep.stepCount,
             title: newStep.title,
@@ -33130,9 +33156,7 @@ ${strippedHtml}`;
             status: 'pending',
             completedAt: undefined,
             notes: undefined,
-            requiredFunctionCalls: removedOriginal
-              ? mergeRequiredFunctionCalls(removedOriginal.requiredFunctionCalls, newStep.requiredFunctionCalls)
-              : newStep.requiredFunctionCalls,
+            requiredFunctionCalls: newStep.requiredFunctionCalls,
             skillIds: newStep.skillIds,
             ...(removedOriginal
               ? { expectedAssetCount: mergeExpectedAssetCount(removedOriginal, newStep.expectedAssetCount) }
@@ -33572,6 +33596,40 @@ ${strippedHtml}`;
         insufficientAssets,
         formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nGenerate the remaining assets with generate_image, then mark the step completed. If the user has explicitly approved a smaller set, call modify_work_plan to lower the step's expected asset count first.`
       };
+    }
+
+    // ENG-1811: a step removed via modify_work_plan's removeStepCounts can carry
+    // requiredFunctionCalls that never succeeded -- genuinely necessary work that
+    // was never done. Refuse to let this batch finish the WHOLE plan (resolve the
+    // last remaining pending step(s)) while any such debt is still outstanding,
+    // regardless of whether any current step still lists it as required. Scoped to
+    // "finishing the plan" rather than every individual step transition so
+    // unrelated, still-in-progress steps keep completing normally in the
+    // meantime -- only the moment the run would otherwise look fully done is
+    // gated, which is the only place a silently-dropped requirement actually
+    // matters.
+    const unresolvedPendingRequiredFunctionCalls = (workPlan.pendingRequiredFunctionCalls || [])
+      .filter(fn => (calledFunctionCounts[fn] || 0) === 0);
+    if (unresolvedPendingRequiredFunctionCalls.length > 0) {
+      const noStepsRemainPending = !workPlan.steps.some(s => s.status === 'pending');
+      if (noStepsRemainPending) {
+        return {
+          success: false,
+          // ENG-1626: deliberate gate, see the out-of-order gate above for why
+          // blocked/reason is set here.
+          blocked: true,
+          reason: 'workplan_unresolved_removed_requirements',
+          message: 'Cannot finish this work plan. A required function call from a removed step was never made.',
+          pendingRequiredFunctionCalls: unresolvedPendingRequiredFunctionCalls,
+          formattedContent: `❌ Cannot mark this plan finished yet: ${unresolvedPendingRequiredFunctionCalls.join(', ')} ${unresolvedPendingRequiredFunctionCalls.length === 1 ? 'was' : 'were'} required by a step that got removed, but never actually succeeded.\n\nCall it for real, or use modify_work_plan to add back a step that genuinely does this work, before finishing the plan.`
+        };
+      }
+    }
+    // Auto-clear any debts that have since genuinely succeeded (by any means --
+    // not necessarily via the stepCount that originally required them), so the
+    // ledger doesn't grow stale forever once real work actually happens.
+    if (workPlan.pendingRequiredFunctionCalls && workPlan.pendingRequiredFunctionCalls.length > 0) {
+      workPlan.pendingRequiredFunctionCalls = unresolvedPendingRequiredFunctionCalls;
     }
 
     // Check if any steps were not found

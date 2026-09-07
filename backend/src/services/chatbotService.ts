@@ -221,6 +221,26 @@ export interface ChatSession {
     // create_work_plan. Used for accept-endpoint idempotency and to chain into
     // a completed template's author-approved "next plan" suggestions.
     templatePlanId?: string;
+    // ENG-1811: a session-lifetime, stepCount-agnostic ledger of required
+    // function names that were removed from some step via modify_work_plan's
+    // removeStepCounts while genuinely unresolved (never succeeded). Populated
+    // by modifyWorkPlan whenever it removes a step; enforced by
+    // setWorkPlanStatusAttempt, which refuses to let a batch resolve the LAST
+    // remaining pending step(s) (finish the plan) while any entry here still
+    // hasn't succeeded -- regardless of whether the removed step's number, or
+    // any step at all, ever mentions that function again. This closes a real,
+    // live-observed gap: the per-step requiredFunctionCalls protection
+    // (mergeRequiredFunctionCalls) only guards a step whose OWN declared list
+    // is being edited; removing the step entirely (optionally re-adding a
+    // differently-scoped replacement, in the same modify_work_plan call or a
+    // later, separate one) bypassed it completely, since neither the merge
+    // logic nor any later "add new step" branch has a way to know the
+    // function was ever required at all once its owning step is gone. Cleared
+    // entries are removed once their function succeeds; the whole field is
+    // naturally reset on a genuinely new plan (createWorkPlan/
+    // applyPredefinedWorkPlan replace workPlan wholesale, never carrying this
+    // field forward from the prior plan).
+    pendingRequiredFunctionCalls?: string[];
   };
   contextLimitReported?: boolean; // True once a context-limit issue report has been auto-filed
   // ENG-396: the single structured question Emma is currently blocked on (if any).
@@ -3403,6 +3423,8 @@ export class ChatbotDB {
       autocomplete?: boolean;
       /** ENG-1472: see the matching field on the read-side workPlan type above. */
       templatePlanId?: string;
+      /** ENG-1811: see the matching field on the read-side workPlan type above. */
+      pendingRequiredFunctionCalls?: string[];
     }
   ): Promise<ChatSession> {
     const timestamp = new Date().toISOString();
