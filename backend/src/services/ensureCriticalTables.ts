@@ -23,6 +23,7 @@ import { LOOP_DISPATCHES_TABLE } from './loopDispatchTracker';
 import { ONBOARDING_METRICS_TABLE, ONBOARDING_METRICS_STEP_INDEX } from './onboardingMetricsService';
 import { CONTACT_EVENTS_TABLE, CONTACT_EVENTS_SOURCE_RECORD_INDEX } from './contactEventsDb';
 import { LLM_CHARGE_EVENTS_TABLE, LLM_CHARGE_EVENTS_OCCURRED_AT_INDEX } from './llmChargeAuditDb';
+import { SPEND_EVENTS_TABLE, SPEND_EVENTS_OCCURRED_AT_INDEX } from './spendEventDb';
 
 export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
   {
@@ -39,6 +40,33 @@ export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
     GlobalSecondaryIndexes: [
       {
         IndexName: LLM_CHARGE_EVENTS_OCCURRED_AT_INDEX,
+        KeySchema: [
+          { AttributeName: 'billingUserId', KeyType: 'HASH' },
+          { AttributeName: 'occurredAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  },
+  {
+    // ENG-1250 §1 -- cross-vendor immutable spend ledger. Ensured at boot for
+    // the same reason the tables below are: it is defined in
+    // scripts/create-tables.ts, and that script is not run on deploy.
+    // No TTL by design (see spendEventDb.ts).
+    TableName: SPEND_EVENTS_TABLE,
+    AttributeDefinitions: [
+      { AttributeName: 'billingUserId', AttributeType: 'S' },
+      { AttributeName: 'eventId', AttributeType: 'S' },
+      { AttributeName: 'occurredAt', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'eventId', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: SPEND_EVENTS_OCCURRED_AT_INDEX,
         KeySchema: [
           { AttributeName: 'billingUserId', KeyType: 'HASH' },
           { AttributeName: 'occurredAt', KeyType: 'RANGE' },
