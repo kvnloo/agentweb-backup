@@ -49,6 +49,24 @@ describe('AgentModeService - predefined work plan templates', () => {
     ],
   };
 
+  const templateWithInputRequest: any = {
+    ...systemTemplate,
+    planId: 'plan-input',
+    title: 'Prospect Decode',
+    steps: [
+      {
+        stepCount: 1,
+        title: 'Intake',
+        inputRequest: {
+          title: 'Who and why',
+          prompt: 'Tell us who to decode.',
+          fields: [{ id: 'prospect', label: 'Prospect', type: 'text', required: true }],
+        },
+      },
+      { stepCount: 2, title: 'Research' },
+    ],
+  };
+
   beforeEach(() => {
     service = new AgentModeService();
     jest.clearAllMocks();
@@ -60,6 +78,7 @@ describe('AgentModeService - predefined work plan templates', () => {
     (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue({});
     (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
     (chatbotDb.updateSessionLlmModel as jest.Mock).mockResolvedValue(undefined);
+    (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockResolvedValue(undefined);
     // Avoid real model registry/secret lookups.
     jest.spyOn(service, 'getSupportedModels').mockResolvedValue(['anthropic.claude-sonnet-4-6']);
   });
@@ -92,6 +111,105 @@ describe('AgentModeService - predefined work plan templates', () => {
       );
     });
 
+    it('ENG-1765: copies inputRequest onto the instantiated step instead of dropping it', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({
+          steps: expect.arrayContaining([
+            expect.objectContaining({
+              stepCount: 1,
+              inputRequest: expect.objectContaining({
+                title: 'Who and why',
+                fields: expect.arrayContaining([expect.objectContaining({ id: 'prospect' })]),
+              }),
+            }),
+          ]),
+        })
+      );
+    });
+
+    it('ENG-1765: surfaces the launched plan\'s first pending inputRequest step immediately, not just reactively', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ stepCount: 1 }),
+        { failIfAwaitingExists: true }
+      );
+    });
+
+    it('ENG-1765: does not call updateSessionWorkPlanInputRequest when no step has an inputRequest', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemTemplate] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlanInputRequest).not.toHaveBeenCalled();
+    });
+
+    it('ENG-1765: a guard failure (a genuinely still-awaiting prior input request) does not fail the launch', async () => {
+      // chatbotService returns null (not a throw) when failIfAwaitingExists guards
+      // the write off -- the launch must not surface a new card in that case, but
+      // must still succeed rather than clobbering the still-active prior request.
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+      (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockResolvedValue(null);
+
+      const result = await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(result.success).toBe(true);
+      expect(chatbotDb.updateSessionWorkPlanInputRequest).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ stepCount: 1 }),
+        { failIfAwaitingExists: true }
+      );
+      // ENG-1765 follow-up: a silent server log isn't enough -- the model must
+      // be told so it can ask conversationally instead of nobody ever asking.
+      expect(result.message).toContain('Who and why');
+      expect(result.message).toContain('ask the user for this information directly');
+    });
+
+    it('ENG-1765: a real error surfacing the input request is logged and swallowed, not thrown, and the model is told', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+      (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockRejectedValue(new Error('transient dynamo error'));
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      const result = await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(result.success).toBe(true);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        'AgentMode: Error surfacing input request for launched work plan:',
+        expect.any(Error)
+      );
+      expect(result.message).toContain('ask the user for this information directly');
+      consoleErrorSpy.mockRestore();
+    });
+
+    it('ENG-1765: does not add the not-surfaced note when the input request surfaces successfully', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [templateWithInputRequest] : []
+      );
+      (chatbotDb.updateSessionWorkPlanInputRequest as jest.Mock).mockResolvedValue({ sessionId });
+
+      const result = await service.applyPredefinedWorkPlan('Prospect Decode', sessionId, 'user-1');
+
+      expect(result.message).not.toContain('ask the user for this information directly');
+    });
+
     it('auto-installs the union of all step skills upfront', async () => {
       mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
         v === 'system' ? [systemTemplate] : []
@@ -112,6 +230,23 @@ describe('AgentModeService - predefined work plan templates', () => {
       await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
 
       expect(chatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-sonnet-4-6');
+    });
+
+    it('ENG-1698: resets calledFunctions so a predefined-plan launch does not inherit stale tool-call credit', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemTemplate] : []
+      );
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId,
+        messages: [],
+        // Leftover credit from a completely unrelated earlier plan/run on this session.
+        calledFunctions: { read_brand_guidelines: 3 },
+      });
+      (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(undefined);
+
+      await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+      expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(sessionId, {});
     });
 
     it('does not change the model when the plan default is unsupported', async () => {
@@ -229,6 +364,89 @@ describe('AgentModeService - predefined work plan templates', () => {
       expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
         sessionId,
         expect.objectContaining({ templatePlanId: 'plan-onboard', title: 'Client Onboarding' })
+      );
+    });
+
+    // ENG-1794: two real production templates, byte-identical welcomeMessage,
+    // titles differing only by the "_Eval"/"_Audit" suffix. Live-confirmed
+    // production bug: asking for the Eval template's title in natural
+    // (spaced, mixed-case) phrasing launched the Audit template instead, with
+    // no error. Root cause was that the previous match was
+    // `.toLowerCase()`-only against the stored underscore-joined title, so
+    // this natural phrasing never matched on the first call at all; the
+    // resulting "not found" pushed the caller into a fallback path (grepping
+    // the full plan listing) where the wrong near-duplicate title could be
+    // picked up and then matched exactly. See
+    // normalizeWorkPlanTitleForMatch in agentModeService.ts.
+    describe('ENG-1794: near-duplicate titles sharing an identical welcomeMessage', () => {
+      const linkedInEval: any = {
+        ...systemTemplate,
+        planId: 'plan-linkedin-eval',
+        title: 'Founder_Linkedin_Sales_Readiness_Eval',
+        welcomeMessage: "Let's assess your LinkedIn sales readiness.",
+      };
+      const linkedInAudit: any = {
+        ...systemTemplate,
+        planId: 'plan-linkedin-audit',
+        title: 'Founder_Linkedin_Sales_Readiness_Audit',
+        welcomeMessage: "Let's assess your LinkedIn sales readiness.",
+      };
+
+      beforeEach(() => {
+        mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+          v === 'system' ? [linkedInEval, linkedInAudit] : []
+        );
+      });
+
+      it('resolves a spaced, mixed-case title argument to the matching Eval template, not the Audit one', async () => {
+        const result = await service.applyPredefinedWorkPlan('Founder LinkedIn Sales Readiness Eval', sessionId, 'user-1');
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          sessionId,
+          expect.objectContaining({ templatePlanId: 'plan-linkedin-eval', title: 'Founder_Linkedin_Sales_Readiness_Eval' })
+        );
+      });
+
+      it('resolves a spaced, mixed-case title argument to the matching Audit template, not the Eval one', async () => {
+        const result = await service.applyPredefinedWorkPlan('Founder LinkedIn Sales Readiness Audit', sessionId, 'user-1');
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          sessionId,
+          expect.objectContaining({ templatePlanId: 'plan-linkedin-audit', title: 'Founder_Linkedin_Sales_Readiness_Audit' })
+        );
+      });
+    });
+
+    // ENG-1794 regression guard: the sibling pair from the same production
+    // sweep whose welcomeMessage text DIFFERS between templates ("evaluate"
+    // vs "audit" your GTM positioning) already resolved correctly before this
+    // fix. Pinned here so the title-normalization change above can never
+    // regress this already-working case.
+    it('ENG-1794: still resolves correctly when near-duplicate titles have DIFFERING welcomeMessage text', async () => {
+      const gtmEval: any = {
+        ...systemTemplate,
+        planId: 'plan-gtm-eval',
+        title: 'AI_GTM_Position_Eval',
+        welcomeMessage: "Let's evaluate your GTM positioning.",
+      };
+      const gtmAudit: any = {
+        ...systemTemplate,
+        planId: 'plan-gtm-audit',
+        title: 'AI_GTM_Position_Audit',
+        welcomeMessage: "Let's audit your GTM positioning.",
+      };
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [gtmEval, gtmAudit] : []
+      );
+
+      const result = await service.applyPredefinedWorkPlan('AI GTM Position Eval', sessionId, 'user-1');
+
+      expect(result.success).toBe(true);
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ templatePlanId: 'plan-gtm-eval', title: 'AI_GTM_Position_Eval' })
       );
     });
   });

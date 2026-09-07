@@ -164,7 +164,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -981,7 +981,7 @@ interface LLMModelConfig {
   qualityScore?: number;
   /** Methodology/source note for qualityScore — benchmark name, source
    *  version, and evaluation date (e.g. "Artificial Analysis Intelligence
-   *  Index, snapshot 2026-08-19"). Surfaced in the picker's quality tooltip. */
+   *  Index v4.2, snapshot 2026-09-05, max"). Surfaced in the picker's quality tooltip. */
   qualityScoreSource?: string;
   // No costScore/costScoreSource field here (unlike qualityScore) — cost is
   // fully derivable from MODEL_PRICING (see getSupportedModelsWithMetadata),
@@ -994,7 +994,14 @@ export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_ch
 
 /**
  * Cost-score band boundaries backing the picker's tier buckets (Harsha's
- * exact thresholds, revised 2026-08-19 after reviewing the live numbers) —
+ * exact thresholds, revised 2026-08-19 after reviewing the live numbers, and
+ * re-cut 2026-09-05 (ENG-1784): "low should have everything 52 and below
+ * (very low is fine as it is now), then medium should be 57-53, then pro
+ * should be 63-58, frontier is everything above" — so Flagship/"frontier"
+ * (≥64) holds Fable 5.1 and GPT-6 Astra (79), GPT-5.6 Sol (71) and Claude
+ * Opus 5 (70) together, Pro (58–63) starts at Sonnet 5 / Terra / Kimi K3,
+ * Medium (53–57) is Grok 4.6 / Qwen3.8 Max, Cheap (31–52) Luna / Haiku /
+ * the Gemini Flash line, Very Cheap (≤30) unchanged) —
  * inclusive lower bound, ordered highest band first. costScore is 0-100 and
  * higher = more expensive (see costScoreFromPrice), so a model's tier is
  * simply whichever band its own cost score falls in. Tier IDs (ultra_premium/
@@ -1003,9 +1010,9 @@ export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_ch
  * modelTiers.ts TIER_LABELS); no backend API contract change.
  */
 export const TIER_COST_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minCostScore: number }> = [
-  { tier: 'ultra_premium', minCostScore: 71 },
-  { tier: 'pro', minCostScore: 64 },
-  { tier: 'medium', minCostScore: 51 },
+  { tier: 'ultra_premium', minCostScore: 64 },
+  { tier: 'pro', minCostScore: 58 },
+  { tier: 'medium', minCostScore: 53 },
   { tier: 'cheap', minCostScore: 31 },
   { tier: 'ultra_cheap', minCostScore: 0 },
 ];
@@ -1015,6 +1022,36 @@ export function tierFromCostScore(costScore: number): ModelTier {
   const band = TIER_COST_SCORE_BANDS.find((b) => costScore >= b.minCostScore);
   // TIER_COST_SCORE_BANDS' last band has minCostScore: 0, which matches any
   // costScore >= 0 — so `band` is only undefined for a negative/NaN input.
+  return band?.tier ?? 'ultra_cheap';
+}
+
+/**
+ * Quality-score band boundaries backing the picker's quality tier grouping
+ * (ENG-1789, 2026-09-06). Independent axis from TIER_COST_SCORE_BANDS above:
+ * that one groups by costScore (what we charge), this one groups by
+ * qualityScore (AA Intelligence Index v4.2, re-snapshotted ENG-1786).
+ * Harsha's directive: "fable + astra are flagship, opus + 5.6 sol are pro,
+ * sonnet + 5.6 terra are mid, haiku + 5.6 luna are low." Solved for
+ * thresholds against the live v4.2 scores (Fable 57, Astra 55, Opus 5 54,
+ * Sol 51, Sonnet 5 45, Terra 47, Haiku 17, Luna 43) with ties resolving to
+ * the higher band (Harsha, 2026-09-06): ultra_premium >=55, pro >=51,
+ * medium >=45, cheap >=17, ultra_cheap below. Same ModelTier union and
+ * >= / highest-band-first shape as the cost bands so the two stay
+ * structurally identical even though they measure different things.
+ */
+export const QUALITY_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minQualityScore: number }> = [
+  { tier: 'ultra_premium', minQualityScore: 55 },
+  { tier: 'pro', minQualityScore: 51 },
+  { tier: 'medium', minQualityScore: 45 },
+  { tier: 'cheap', minQualityScore: 17 },
+  { tier: 'ultra_cheap', minQualityScore: 0 },
+];
+
+/** Derives a model's quality-tier bucket from its qualityScore (independent of cost tier). */
+export function tierFromQualityScore(qualityScore: number): ModelTier {
+  const band = QUALITY_SCORE_BANDS.find((b) => qualityScore >= b.minQualityScore);
+  // Last band has minQualityScore: 0, matching any qualityScore >= 0 — so
+  // `band` is only undefined for a negative/NaN input.
   return band?.tier ?? 'ultra_cheap';
 }
 
@@ -1042,8 +1079,8 @@ export interface DominanceCandidate {
  * Ids that should be treated as legacy because a same-`family`, originally
  * non-legacy sibling is at least as cheap (same-or-lower cost tier band) AND
  * at least as good (same-or-higher quality score), strictly so in at least
- * one dimension — e.g. GPT-5.6 Luna (ultra_cheap, quality 52) strictly beats
- * GPT-5.4 Nano (ultra_cheap, quality 40): same band, higher quality, so Nano
+ * one dimension — e.g. GPT-5.6 Luna (ultra_cheap, quality 43) strictly beats
+ * GPT-5.4 Nano (ultra_cheap, quality 31): same band, higher quality, so Nano
  * is dominated. Comparison is scoped to `family`, never "same provider" —
  * Claude Opus and Claude Sonnet are different product tiers, not
  * generations of one model, so a stronger Opus must never hide Sonnet.
@@ -1074,7 +1111,15 @@ export type ModelProvider =
 export interface SupportedModelInfo {
   id: string;
   name: string;
+  /** Cost tier — derived from costScore via tierFromCostScore (see TIER_COST_SCORE_BANDS). */
   tier: ModelTier;
+  /**
+   * Quality tier — derived from qualityScore via tierFromQualityScore (see
+   * QUALITY_SCORE_BANDS). Independent axis from `tier`: a model can be
+   * Flagship on quality but Pro on cost, or vice versa. Omitted when
+   * qualityScore itself is omitted (no benchmark evidence).
+   */
+  qualityTier?: ModelTier;
   description: string;
   provider: ModelProvider;
   /** True for a superseded version the picker should tuck behind "Show more". Omitted (not `false`) for a current/primary model. */
@@ -1367,6 +1412,42 @@ function validateDriveDateFilter(value: string, label: string): string {
     throw new Error(`${label} is not a real calendar date: ${JSON.stringify(value)}.`);
   }
   return value;
+}
+
+/**
+ * ENG-1794: normalize a predefined-work-plan title for matching in
+ * `applyPredefinedWorkPlan` (the `launch_predefined_work_plan` tool handler).
+ *
+ * Templates are stored with underscore-joined titles (e.g.
+ * "Founder_Linkedin_Sales_Readiness_Eval"), but a user/model referring to one
+ * in chat naturally types it with spaces and mixed case (e.g. "Founder
+ * LinkedIn Sales Readiness Eval"). The previous match was `.toLowerCase()`
+ * only, so that natural phrasing never matched the stored title at all — the
+ * call failed with "not found" and the model fell back to grepping the full
+ * (370KB+) plan listing via search_tool_response/read_tool_response to find
+ * a title to retry with. When two templates are near-duplicates (identical
+ * welcomeMessage/description, titles differing only by an "_Eval"/"_Audit"
+ * suffix), that fallback search is exactly where the model can pick up the
+ * WRONG template's title from a truncated snippet and silently launch it
+ * with no error, since the retry is then a legitimate exact match against
+ * the wrong record (confirmed live: ENG-1794, session
+ * 3fce3c5a-6b25-4167-987b-b5bd8c7f4c5b launched
+ * "Founder_Linkedin_Sales_Readiness_Audit" instead of "..._Eval").
+ *
+ * Folding underscores/hyphens to spaces and collapsing whitespace before the
+ * case-insensitive comparison lets the natural-language phrasing resolve
+ * directly on the FIRST call, so the risky multi-step fallback search never
+ * has to run for this common case. This only smooths over separator/case
+ * differences — it does not do fuzzy/substring/similarity matching, so two
+ * templates whose titles genuinely differ (e.g. the "_Eval"/"_Audit" suffix
+ * itself) never collide.
+ */
+export function normalizeWorkPlanTitleForMatch(value: unknown): string {
+  return String(value ?? '')
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 export class AgentModeService {
@@ -2324,6 +2405,9 @@ export class AgentModeService {
   }
 
   private llmModels: Record<string, LLMModelConfig> = {
+    // ENG-1786: all quality scores use AA Intelligence Index v4.2, snapshot
+    // 2026-09-05 (32-row research table in Linear). Sources name the canonical
+    // AA page variant; benchmark effort need not match the provider runtime default.
     // Logical model metadata only. `callLLM` resolves every text/tool request
     // through OpenRouter; no provider client is constructed from this registry.
     // supportsVision flags below were verified empirically against the describe_image
@@ -2339,9 +2423,9 @@ export class AgentModeService {
     // id resolves forward instead of throwing "Invalid model". Do not delete a
     // registry entry without an alias first; that was exactly the caution the
     // prior version of this comment existed to enforce.
-    'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.4, xhigh' },
+    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 31, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.4 Nano, xhigh (AA estimate)' },
+    'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 46, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.5, xhigh' },
     // List gemini models - client will be lazy-loaded
     // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
     // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
@@ -2362,10 +2446,10 @@ export class AgentModeService {
     // gateway can fail over transports, but it cannot make an invalid upstream
     // request valid. Fresh Emma sidebar sessions expose the legacy full tool
     // catalog, so omitting this cap made Gemini fail deterministically with 400.
-    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 21, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3 Flash Preview, Non-reasoning (AA estimate)' },
+    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 37, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.1 Pro Preview, reasoning' },
+    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 19, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.1 Flash Lite, reasoning' },
+    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.5 Flash, high' },
     // 2026-08-19: Gemini 3.7 Flash (GA, released 2026-08-13) added — verified
     // live against three independent sources (ai.google.dev/deepmind.google/
     // blog.google, OpenRouter, Artificial Analysis), no Gemini 3.7 Pro or
@@ -2383,8 +2467,8 @@ export class AgentModeService {
     // sampling parameters" — confirmed live 2026-09-03 for both ids). Google
     // currently ignores the param on these models (soft no-op) but states a
     // future generation will hard-400 on it, so this is set ahead of that.
-    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
-    'gemini-3.8-flash': { name: 'Gemini 3.8 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 59, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-8-flash (high)" page, snapshot 2026-09-02' },
+    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.7 Flash, high' },
+    'gemini-3.8-flash': { name: 'Gemini 3.8 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 47, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.8 Flash, high' },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
@@ -2412,7 +2496,7 @@ export class AgentModeService {
     //   already used successfully by gpt-4o-mini above.) This does NOT apply
     //   to non-OpenRouter adminOnly entries elsewhere in this registry (e.g.
     //   anthropic.claude-opus-4-6-v1), which are gated for unrelated reasons.
-    'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 7, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 1, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-4o Mini, non-reasoning (AA estimate)' },
     // Workload-specific research agent. It is intentionally callable only from
     // DeepResearchService, not exposed as a general chat-picker model.
     'openrouter/perplexity/sonar-deep-research': { client: null, supportsTemperature: true, internalOnly: true },
@@ -2447,9 +2531,8 @@ export class AgentModeService {
     // registry — so there is no existing Fable entry to compare against yet.
     // Going straight to 5.1 (the current model; Fable 5 is already superseded
     // as of 2026-09-01) rather than also backfilling the now-superseded 5.
-    // Live AA Intelligence Index score (66, max-effort w/ fallback) confirmed
-    // 2026-09-01 — currently the #1 model on the independent leaderboard, 3pts
-    // above Claude Opus 5 (63). qualityScore/costScore below plug into the
+    // AA Intelligence Index v4.2 (2026-09-05): 57, Adaptive Reasoning,
+    // Max Effort — #1, 3pts above Claude Opus 5 (54). Quality and cost plug into the
     // EXISTING dominance rule (getSupportedModelsWithMetadata) automatically —
     // no dominance action needed today since there's no sibling family member,
     // but the very next same-family add (e.g. a future Fable 5.2) will
@@ -2460,19 +2543,14 @@ export class AgentModeService {
     // ENG-199's cost-control blocker (ENG-200) is closed — org/per-user LLM
     // cost caps already exist and apply automatically to every model priced
     // in llmPricing.ts, this one included.
-    'openrouter/anthropic/claude-fable-5.1': { name: 'Claude Fable 5.1', family: 'claude-fable', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s top-ranked model for coding & agentic work', client: null, supportsTemperature: false, supportsVision: true, qualityScore: 66, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, max effort w/ fallback, snapshot 2026-09-01' },
-    'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    // 2026-08-19: qualityScore corrected 52 -> 40. The 52 belonged to a
-    // DIFFERENT, newer snapshot ("DeepSeek V4 Flash 0731, Max Effort") —
-    // this registry id resolves on OpenRouter to "DeepSeek V4 Flash 0423",
-    // whose real AA Intelligence Index score is 40 (confirmed live against
-    // AA's own page + independent coverage). Not a stale-number issue like
-    // the Kimi K3 pricing catch — the wrong model's score was attached to
-    // the model we actually invoke. Pricing is unaffected: our MODEL_PRICING
-    // entry ($0.068/$0.168) already matches the real 0423 snapshot.
-    'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "DeepSeek V4 Flash 0423" page (the snapshot this OpenRouter id actually resolves to), snapshot 2026-08-19' },
-    'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, qualityScore: 58, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/anthropic/claude-fable-5.1': { name: 'Claude Fable 5.1', family: 'claude-fable', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s top-ranked model for coding & agentic work', client: null, supportsTemperature: false, supportsVision: true, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Fable 5.1, Adaptive Reasoning, Max Effort' },
+    'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 51, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Grok 4.6, high' },
+    'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 42, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, DeepSeek V4 Pro 0813, Reasoning, Max Effort' },
+    // ENG-1786 research uses AA's canonical DeepSeek V4 Flash 0731,
+    // Reasoning, Max Effort variant. The prior 2026-08-19 source used 0423;
+    // this benchmark snapshot does not change the OpenRouter id or pricing.
+    'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 41, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, DeepSeek V4 Flash 0731, Reasoning, Max Effort' },
+    'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, qualityScore: 47, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Qwen3.8 Max, reasoning' },
     // 2026-08-26 (ENG-1604): added after live cost+quality research — AA
     // Intelligence Index 52 (v4.1.1, measured, not estimated), #1 of 138
     // models in its size class, roughly matching DeepSeek V4 Pro's quality
@@ -2480,12 +2558,12 @@ export class AgentModeService {
     // qwen3-coder-next (AA 21, coding-only, deferred by Harsha this pass),
     // qwen3-max/qwen3-max-thinking/qwen3-vl-235b (AA "estimated", not
     // measured, or AA-flagged deprecated).
-    'openrouter/qwen/qwen3.8-27b': { name: 'Qwen3.8 27B', provider: 'qwen', tier: 'medium', description: 'Alibaba\'s efficient open-weight model, leading in its size class', client: null, supportsTemperature: true, qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-26' },
-    'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, qualityScore: 20, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, qualityScore: 60, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 23, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/qwen/qwen3.8-27b': { name: 'Qwen3.8 27B', provider: 'qwen', tier: 'medium', description: 'Alibaba\'s efficient open-weight model, leading in its size class', client: null, supportsTemperature: true, qualityScore: 41, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Qwen3.8 27B, xhigh' },
+    'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, qualityScore: 13, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Mistral Small 4, reasoning' },
+    'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, qualityScore: 50, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Kimi K3, max' },
+    'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, qualityScore: 34, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Kimi K2.7 Code, reasoning' },
+    'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GLM 5.2, max' },
+    'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 17, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GLM 4.7 Flash, reasoning' },
     // 2026-08-19: OpenAI's GPT-5.6 three-tier family (Sol/Terra/Luna, launched
     // 2026-07-09), added via OpenRouter — live-confirmed slugs and pricing at
     // openrouter.ai/openai/gpt-5.6-{sol,terra,luna}. adminOnly per the
@@ -2506,9 +2584,51 @@ export class AgentModeService {
     // redundant — a coincidence of a volatile promo price, not a real
     // "Terra is superseded" fact. Same principle as keeping Kimi K3 out of
     // a family with Kimi K2.7-Code (a coding-specialized sibling).
-    'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: false, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: false, qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: false, qualityScore: 51, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.6 Sol, max' },
+    'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, qualityScore: 47, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.6 Terra, max' },
+    'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: false, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.6 Luna, max' },
+    // ENG-1769 (2026-09-05): GPT-6 Astra — OpenAI's frontier release of
+    // 2026-09-03, added the day Harsha asked ("is it possible to launch astra
+    // on agentweb now? ... go ahead"). Same one-line OpenRouter convention as
+    // the GPT-5.6 trio above and Fable 5.1 (ENG-199): id =
+    // openrouter/<upstream-provider>/<upstream-model>, no new routing code.
+    // Transport: OpenRouter BYOK → our own Azure resource
+    // (agentweb-openrouter-byok, westus3, deployment `gpt-6-astra` version
+    // 2026-09-03, GlobalStandard, created 2026-09-05). Live-confirmed the same
+    // day: response provider "Azure", usage.is_byok true, upstream cost exactly
+    // Azure's $10/$50 list rate — which is what llmPricing.ts bills, because
+    // the OpenRouter usage.cost override is skipped for BYOK calls. First call
+    // on the fresh deployment took ~67s (cold start); steady state ~2s, on par
+    // with Sol on the same path.
+    // Quality: AA Intelligence Index v4.2 (2026-09-05), max effort: Astra 55,
+    // below Fable 5.1 (57), above Sol (51). Canonical benchmark variants only.
+    // Deliberately NO `family`: Astra and Sol are distinct product lines;
+    // sharing a family could auto-retire one after a price move, like the
+    // Terra false-positive documented above. Same treatment as Sol and Kimi K3.
+    // supportsVision: verified EMPIRICALLY 2026-09-05 against the exact shape
+    // describeImage sends (a `data:image/png;base64,…` image_url, ~8 KB PNG)
+    // through this OpenRouter→Azure BYOK path: correct answer, and the same
+    // image via an https URL also correct — the bar LLMModelConfig.supportsVision
+    // sets, not just OpenRouter's architecture metadata (which also lists
+    // file+image+text). Curiosity recorded, not a blocker: a 64x64 two-color
+    // synthetic PNG was misread by Astra ("can't see the image" / wrong
+    // colors) while GPT-5.5 and Sol read it correctly on the same path — real
+    // images are what describe_image sends. supportsTemperature false: a
+    // reasoning model — `temperature` is not in its supported_parameters
+    // (Azure's reasoning-models doc says the same).
+    // maxTools 128: the upstream is Azure OpenAI (live-confirmed above), and
+    // Azure's 128-tool cap is a recorded production failure in this repo, not a
+    // doc claim — ce154d09c / dev.md 2026-04-26: gpt-5.4 returned HTTP 400
+    // "Invalid 'tools': array too long. Expected an array with maximum length
+    // 128, but got an array with length 143" once skills pushed the registry
+    // past 128, which is what introduced maxTools + callLLM's truncation. The
+    // OpenRouter block header omits maxTools because OpenRouter's APIs expose
+    // no limit for ARBITRARY upstreams; that rationale does not apply when the
+    // upstream is known to be Azure. (The GPT-5.6 trio above omit it and have
+    // run since 2026-08-19 — the same gap, not evidence of a higher cap.)
+    // `tier` is the no-price fallback only; the picker derives ultra_premium
+    // live from MODEL_PRICING.
+    'openrouter/openai/gpt-6-astra': { name: 'GPT-6 Astra', provider: 'openai', tier: 'ultra_premium', description: 'OpenAI\'s frontier model for coding and agentic work', client: null, supportsTemperature: false, supportsVision: true, maxTools: 128, qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-6 Astra, max' },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     // 2026-08-19: all four below are `legacy` (picker-grouping only, see
     // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still
@@ -2516,21 +2636,21 @@ export class AgentModeService {
     // have active schedules touching them the same day this was written), so
     // NOT deleted and NOT adminOnly — customers can still select them via
     // "Show more", they're just no longer the default row per tier.
-    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 37, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true, legacy: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 23, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Sonnet 4.5, Non-reasoning' },
+    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 38, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Sonnet 4.6, Adaptive Reasoning, Max Effort' },
+    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true, legacy: true , qualityScore: 31, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Opus 4.6, Non-reasoning, High Effort' },
     // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
     // temperature is deprecated for this model
-    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true, legacy: true , qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true, legacy: true , qualityScore: 46, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Opus 4.8, Adaptive Reasoning, Max Effort (AA estimate)' },
     // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
     // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
     // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
     // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
     // deprecated for this model") — verified against live Bedrock, not assumed.
-    'anthropic.claude-opus-5': { name: 'Claude Opus 5', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 63, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-opus-5': { name: 'Claude Opus 5', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 54, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Opus 5, Adaptive Reasoning, Max Effort' },
+    'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Sonnet 5, Adaptive Reasoning, Max Effort' },
     // Haiku 4.5 still accepts temperature (also live-verified).
-    'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 30, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 17, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Haiku 4.5, Non-reasoning' },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -2607,6 +2727,12 @@ export class AgentModeService {
    * agree with the cost meter it's grouping by. Only when a model has no
    * MODEL_PRICING entry (so costScore can't be computed) does tier fall back
    * to the config's static field, and costScore/costScoreSource are omitted.
+   *
+   * qualityTier (ENG-1789) is a SEPARATE axis derived from qualityScore via
+   * tierFromQualityScore/QUALITY_SCORE_BANDS — it groups by benchmark quality,
+   * not cost, and is omitted whenever qualityScore itself is omitted. `tier`
+   * remains the cost-driven field the picker's existing section headers use;
+   * qualityTier is additive, for any quality-driven grouping/filter.
    */
   async getSupportedModelsWithMetadata(isAdmin: boolean = false): Promise<SupportedModelInfo[]> {
     const ids = await this.getSupportedModels(isAdmin);
@@ -2620,6 +2746,7 @@ export class AgentModeService {
         id,
         name: config?.name ?? id,
         tier: typeof costScore === 'number' ? tierFromCostScore(costScore) : (config?.tier ?? 'medium'),
+        qualityTier: typeof config?.qualityScore === 'number' ? tierFromQualityScore(config.qualityScore) : undefined,
         description: config?.description ?? 'General-purpose model',
         provider: config?.provider ?? 'other',
         family: config?.family,
@@ -2638,6 +2765,7 @@ export class AgentModeService {
       id: e.id,
       name: e.name,
       tier: e.tier,
+      ...(e.qualityTier ? { qualityTier: e.qualityTier } : {}),
       description: e.description,
       provider: e.provider,
       ...(e.staticLegacy || dominatedIds.has(e.id) ? { legacy: true as const } : {}),
@@ -3346,7 +3474,7 @@ export class AgentModeService {
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
 
       // 3. Build Initial Messages
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl);
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
@@ -5395,6 +5523,29 @@ export class AgentModeService {
   }
 
   /**
+   * ENG-1811: is this work plan ACTUALLY finished — every step terminal AND no
+   * outstanding debt from a removed step's required function call that never
+   * genuinely succeeded (workPlan.pendingRequiredFunctionCalls, resolved against real
+   * session.calledFunctions, not just "does anything remain marked pending").
+   *
+   * The debt ledger's only *enforcement* point is setWorkPlanStatusAttempt, which
+   * nothing calls once no steps remain pending — so every OTHER place in the codebase
+   * that infers "plan done" from `steps.every(completed|skipped)` alone can be fooled
+   * by deleting the last pending step(s) via modify_work_plan and never re-adding them.
+   * Use this helper (not a bare `.every(...)`) anywhere that inference feeds a
+   * user-facing "done" claim or gates a retry loop.
+   */
+  public static isWorkPlanFullyResolved(workPlan: any, calledFunctions?: Record<string, number>): boolean {
+    if (!workPlan || !Array.isArray(workPlan.steps)) return true;
+    const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+    if (!allStepsTerminal) return false;
+    const rawCalledFunctionCounts = calledFunctions || {};
+    const unresolvedPendingDebt = (workPlan.pendingRequiredFunctionCalls || [])
+      .filter((fn: string) => (rawCalledFunctionCounts[fn] || 0) === 0);
+    return unresolvedPendingDebt.length === 0;
+  }
+
+  /**
    * Render a session work plan into LLM context message(s).
    *
    * Shared by agent mode (buildMarketingContext) and Emma (chatbotService.generateChatResponse)
@@ -5419,8 +5570,17 @@ export class AgentModeService {
    * stay byte-for-byte identical to current production behavior (header + step list +
    * the ORIGINAL autocomplete wording, nothing else). This keeps Emma's surface
    * unchanged while still fixing the agent-mode loop.
+   *
+   * `calledFunctions` (optional, session.calledFunctions) resolves ENG-1811 debt
+   * (`workPlan.pendingRequiredFunctionCalls`) against real call history. Without it, a
+   * caller that deletes the last pending step(s) via modify_work_plan (never re-adding
+   * them, never calling set_work_plan_status again) makes every step terminal while
+   * debt from the removed step was never satisfied — the ONLY enforcement point for
+   * that ledger is setWorkPlanStatusAttempt, which nothing here ever invokes again, so
+   * the "ALL STEPS ARE DONE" branch below would tell the model to stop and declare
+   * victory despite the outstanding requirement (found live via subagent review, PR #2808).
    */
-  public static buildWorkPlanContextMessages(workPlan?: any, generatedImageFilenames?: string[], includeResumeGuidance: boolean = true): any[] {
+  public static buildWorkPlanContextMessages(workPlan?: any, generatedImageFilenames?: string[], includeResumeGuidance: boolean = true, calledFunctions?: Record<string, number>): any[] {
     if (!workPlan || !Array.isArray(workPlan.steps) || workPlan.steps.length === 0) {
       return [];
     }
@@ -5432,10 +5592,22 @@ export class AgentModeService {
     };
 
     // Check if all steps are terminal (completed or skipped) — no pending work remains
-    const allStepsDone = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+    const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+    const rawCalledFunctionCounts = calledFunctions || {};
+    const unresolvedPendingDebt: string[] = (workPlan.pendingRequiredFunctionCalls || [])
+      .filter((fn: string) => (rawCalledFunctionCounts[fn] || 0) === 0);
+    const allStepsDone = allStepsTerminal && unresolvedPendingDebt.length === 0;
 
     let workPlanContent = `⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️\n\n`;
     workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
+
+    if (allStepsTerminal && unresolvedPendingDebt.length > 0) {
+      // Every step looks terminal, but a step that got removed via modify_work_plan
+      // required a function call that never actually succeeded (ENG-1811 debt ledger).
+      // Do NOT tell the model the plan is done — that would silently launder the debt.
+      workPlanContent += `❌ This plan is NOT actually finished: ${unresolvedPendingDebt.join(', ')} ${unresolvedPendingDebt.length === 1 ? 'was' : 'were'} required by a step that got removed, but never actually succeeded. Call it for real, or use modify_work_plan to add back a step that genuinely does this work, before treating this plan as complete or reporting it to the user as done.`;
+      return [{ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` }];
+    }
 
     if (allStepsDone) {
       // When all steps are done, skip listing step details to avoid the LLM trying to "finish" them.
@@ -5557,9 +5729,21 @@ export class AgentModeService {
         workPlanContent += `   Required assets: ${step.expectedAssetCount} (this step cannot be completed until ${step.expectedAssetCount} images/assets have actually been generated this session)\n`;
       }
 
-      // Include skill IDs if available (for awareness)
+      // Include skill IDs if available (for awareness). ENG-1697: this used to
+      // unconditionally claim "(auto-installed when this step becomes active)",
+      // but that's only true for a predefined-template launch (which installs
+      // the union of all step skills upfront) — an ad-hoc plan's first step, or
+      // any step that becomes active because an earlier step was SKIPPED rather
+      // than completed, never goes through that upfront install. Deliberately
+      // NOT telling the model to proactively call install_skills here: toolDispatch's
+      // gate (search "is not available. You must install the required skill
+      // first") already catches any tool call gated on a missing skill and
+      // instructs recovery at that exact point, reactively and only when truly
+      // needed — restating it here would just invite redundant defensive
+      // install_skills calls on the already-working template-launch path where
+      // skills are already installed. Just drop the false claim.
       if (step.skillIds && step.skillIds.length > 0) {
-        workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
+        workPlanContent += `   Skills for this step: ${step.skillIds.join(', ')}\n`;
       }
 
       workPlanContent += '\n';
@@ -5631,7 +5815,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -5789,7 +5973,7 @@ export class AgentModeService {
     // regenerate-from-scratch loop after a run timeout.
     if (workPlan) {
       const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
-      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames));
+      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames, true, calledFunctions));
     } else {
       // ENG-510: even WITHOUT a work plan (plain multi-image requests — the reported
       // scenario), a run that timed out mid-batch leaves already-generated images in
@@ -17419,7 +17603,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
       // Step 1: Fetch the source ad (now includes creative sub-fields)
-      const sourceAd = await metaService.getAd(accessToken, sourceAdId);
+      const sourceAd = await metaService.getAd(accessToken, sourceAdId, accountId);
       const creativeRef = sourceAd?.creative;
       const oldCreativeId = creativeRef?.id || creativeRef?.creative_id;
       if (!oldCreativeId) {
@@ -18513,7 +18697,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         normalizedParams.daily_budget = Math.round(normalizedParams.budget_amount * 100);
         delete normalizedParams.budget_amount;
       }
-      await metaService.updateCampaign(accessToken, campaignId, normalizedParams);
+      await metaService.updateCampaign(accessToken, campaignId, normalizedParams, accountId);
 
       if (normalizedParams.spend_cap === undefined || normalizedParams.spend_cap === null) {
         return {
@@ -18569,8 +18753,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async deleteMetaAdsCampaign(userId: string, campaignId: string, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
-      await metaService.deleteCampaign(accessToken, campaignId);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.deleteCampaign(accessToken, campaignId, accountId);
       return {
         success: true,
         message: `Campaign deleted successfully`
@@ -18590,7 +18774,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async updateMetaAdsAdSet(userId: string, adSetId: string, params: any, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const toCents = (val?: number) => val !== undefined ? Math.round(val * 100) : undefined;
       const normalizedParams = {
         ...params,
@@ -18598,7 +18782,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(params.lifetime_budget !== undefined && { lifetime_budget: toCents(params.lifetime_budget) }),
         ...(params.bid_amount !== undefined && { bid_amount: toCents(params.bid_amount) }),
       };
-      await metaService.updateAdSet(accessToken, adSetId, normalizedParams);
+      await metaService.updateAdSet(accessToken, adSetId, normalizedParams, accountId);
       return {
         success: true,
         message: `Ad set updated successfully`
@@ -18618,8 +18802,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async deleteMetaAdsAdSet(userId: string, adSetId: string, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
-      await metaService.deleteAdSet(accessToken, adSetId);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.deleteAdSet(accessToken, adSetId, accountId);
       return {
         success: true,
         message: `Ad set deleted successfully`
@@ -18656,7 +18840,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // but the ad keeps its old creative), so handle it explicitly before any other branch.
       if (params.creative_id) {
         const newCreativeId = params.creative_id;
-        await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
+        await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } }, accountId);
 
         // Apply any other ad-level params (status, name, etc.) in a separate update
         const adLevelParams: any = {};
@@ -18664,12 +18848,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           if (key !== 'creative_id') adLevelParams[key] = params[key];
         }
         if (Object.keys(adLevelParams).length > 0) {
-          await metaService.updateAd(accessToken, adId, adLevelParams);
+          await metaService.updateAd(accessToken, adId, adLevelParams, accountId);
         }
 
         // The same silent-success trap applies here: POST /{ad-id} can return 200 while the
         // ad keeps its old creative. Read back the ad to confirm the swap actually took.
-        const verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId);
+        const verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, accountId);
         if (!verification.attached) {
           return {
             success: false,
@@ -18700,7 +18884,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       // Standard ad-level update (status, name, etc.)
-      await metaService.updateAd(accessToken, adId, params);
+      await metaService.updateAd(accessToken, adId, params, accountId);
       return {
         success: true,
         message: `Ad updated successfully`
@@ -18736,7 +18920,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     console.log(`AgentMode: Detected creative content update for ad ${adId}. Keys: ${creativeKeys.join(', ')}. Using creative swap approach.`);
 
     // Step 1: Fetch the ad to get its creative_id
-    const adData = await metaService.getAd(accessToken, adId);
+    const adData = await metaService.getAd(accessToken, adId, accountId);
     const oldCreativeId = adData?.creative?.creative_id || adData?.creative?.id;
     if (!oldCreativeId) {
       return {
@@ -18874,7 +19058,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
     }
     if (Object.keys(adLevelParams).length > 0) {
-      await metaService.updateAd(accessToken, adId, adLevelParams);
+      await metaService.updateAd(accessToken, adId, adLevelParams, accountId);
     }
 
     // Step 5: Attach the new creative, then read back to VERIFY it took effect. Meta's POST /{ad-id}
@@ -18887,8 +19071,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     let verification: Awaited<ReturnType<AgentModeService['verifyCreativeSwap']>> | undefined;
 
     for (let attempt = 1; attempt <= SWAP_VERIFY_ATTEMPTS; attempt++) {
-      await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
-      verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, newLinkUrl);
+      await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } }, accountId);
+      verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, accountId, newLinkUrl);
 
       const destinationOk = !newLinkUrl || !verification.liveLinkUrl
         || this.linkUrlMatches(verification.liveLinkUrl, newLinkUrl);
@@ -18990,10 +19174,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     accessToken: string,
     adId: string,
     newCreativeId: string,
+    accountId: string,
     expectedLinkUrl?: string
   ): Promise<{ attached: boolean; verified: boolean; liveCreativeId?: string; liveLinkUrl?: string; effectiveStatus?: string; reviewFeedback?: string }> {
     try {
-      const ad = await metaService.getAd(accessToken, adId);
+      const ad = await metaService.getAd(accessToken, adId, accountId);
       const liveCreativeId = ad?.creative?.creative_id || ad?.creative?.id;
       const attached = String(liveCreativeId) === String(newCreativeId);
 
@@ -19074,8 +19259,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async deleteMetaAdsAd(userId: string, adId: string, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
-      await metaService.deleteAd(accessToken, adId);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.deleteAd(accessToken, adId, accountId);
       return {
         success: true,
         message: `Ad deleted successfully`
@@ -19110,9 +19295,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    */
   public async retagMetaAdUtm(userId: string, adId: string, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
-      const adData = await metaService.getAd(accessToken, adId);
+      const adData = await metaService.getAd(accessToken, adId, accountId);
       const creativeId = adData?.creative?.creative_id || adData?.creative?.id;
       if (!creativeId) {
         return {
@@ -19330,7 +19515,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
         fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
         fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
+        // ENG-1742 follow-up: unencoded `{...}` in a nested field selector is silently
+        // mangled by Graph — on this `ads` edge it doesn't hard-error, it just drops the
+        // `creative` field from every result with no indication anything is missing.
+        // Confirmed live 2026-09-04: this exact string returned every ad with `creative`
+        // entirely absent; the encoded form returns real thumbnail_url/title/body/image_url.
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/ads?fields=id,name,status,adset_id,campaign_id,${encodeURIComponent('creative{thumbnail_url,title,body,image_url}')}${filteringParam}&access_token=${accessToken}`),
         // Ad-level insights for ads processing
         fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
         // Adset-level insights for ad sets processing
@@ -32351,6 +32541,19 @@ ${strippedHtml}`;
       // Update the session with the work plan
       await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
 
+      // ENG-1698: session.calledFunctions accumulates for the life of the session with
+      // no per-plan scoping. Without this reset, a brand new plan on an existing session
+      // inherits whatever tool-call credit is left over from a completely unrelated
+      // earlier plan (or an earlier attempt at this same plan) — a later step can be
+      // marked completed via stale credit without the model calling the tool again for
+      // it. Reset on every genuinely NEW plan start; modifyWorkPlan (steps added
+      // mid-run) deliberately does NOT reset this, since that's still the same run.
+      try {
+        await chatbotDb.updateCalledFunctions(sessionId, {});
+      } catch (resetError) {
+        console.error('AgentMode: Error resetting calledFunctions for new work plan:', resetError);
+      }
+
       return {
         success: true,
         message: `Work plan "${title}" created with ${steps.length} steps`,
@@ -32410,10 +32613,12 @@ ${strippedHtml}`;
       // behavior — title-based launches from Emma — unchanged.
       const candidates = await getAccessiblePredefinedWorkPlanCandidates(userId);
 
-      const needle = planTitleOrId.toLowerCase();
-      const predefinedPlan = candidates.find(
-        (p) => p.planId === planTitleOrId || (p.title && p.title.toLowerCase() === needle)
-      );
+      // ENG-1794: case/whitespace/underscore-insensitive title match (see
+      // normalizeWorkPlanTitleForMatch above) — planId still wins on an exact
+      // match first, since a title collision must never shadow a stable id.
+      const needle = normalizeWorkPlanTitleForMatch(planTitleOrId);
+      const predefinedPlan = candidates.find((p) => p.planId === planTitleOrId)
+        ?? candidates.find((p) => p.title && normalizeWorkPlanTitleForMatch(p.title) === needle);
 
       if (!predefinedPlan) {
         return { success: false, message: `Work plan template "${planTitleOrId}" not found` };
@@ -32437,6 +32642,13 @@ ${strippedHtml}`;
           skillIds: step.skillIds,
           ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
           ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
+          // ENG-1765: this whitelist previously omitted inputRequest, silently
+          // dropping every predefined template's authored guided-input-card data
+          // on launch -- the only code that reads step.inputRequest (below, in
+          // setWorkPlanStatusAttempt) could therefore never fire for any
+          // predefined-plan launch, live-confirmed dead against 26 of 28 real
+          // production templates.
+          ...(step.inputRequest !== undefined && { inputRequest: step.inputRequest }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
         autocomplete: predefinedPlan.autocomplete || false,
@@ -32449,6 +32661,66 @@ ${strippedHtml}`;
         templatePlanId: predefinedPlan.planId,
       };
       await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      // ENG-1765: the reactive "surface the next pending step's inputRequest"
+      // check in setWorkPlanStatusAttempt only runs after a set_work_plan_status
+      // call — it never runs on a fresh launch. Most predefined templates put
+      // their inputRequest on step 1 itself, which starts pending with nothing
+      // before it to trigger that reactive scan, so without this it would still
+      // never surface even after restoring the field above. Surface it here too,
+      // the same way, so a launch's own first pending input-requesting step is
+      // never silently skipped.
+      //
+      // Reviewer finding: this write must use the same failIfAwaitingExists
+      // guard as the reactive block. Without it, updateSessionWorkPlanInputRequest
+      // attaches no ConditionExpression at all and blindly overwrites
+      // pendingWorkPlanInput — a force=true relaunch could silently clobber a
+      // genuinely still-awaiting card from whatever was active before, leaving
+      // it orphaned (pointing at a step that's no longer in the active plan)
+      // instead of failing closed. On a guard failure this just logs and skips
+      // surfacing the new step's card rather than blocking the launch — the
+      // plan itself is still valid without it, and the model can still recover
+      // by asking conversationally like it already does today.
+      // User-facing signal (not just a server log) when this doesn't surface:
+      // the model is told via the returned message so it can ask for the same
+      // information conversationally instead of the user silently never seeing
+      // a card and the model never knowing to ask.
+      let inputRequestNotSurfaced: { title: string; prompt?: string } | null = null;
+      const launchInputStep = workPlan.steps
+        .slice()
+        .sort((a, b) => a.stepCount - b.stepCount)
+        .find((s) => s.status === 'pending' && (s as any).inputRequest);
+      if (launchInputStep) {
+        const req = (launchInputStep as any).inputRequest;
+        try {
+          const written = await chatbotDb.updateSessionWorkPlanInputRequest(
+            sessionId,
+            buildWorkPlanInputRequest({
+              ...req,
+              requestId: uuidv4(),
+              stepCount: launchInputStep.stepCount,
+            }),
+            { failIfAwaitingExists: true },
+          );
+          if (!written) {
+            // Guarded off: a genuinely still-awaiting request from before this
+            // launch won the race, per design (see comment above) — not an error.
+            inputRequestNotSurfaced = { title: req.title, prompt: req.prompt };
+          }
+        } catch (inputRequestError) {
+          console.error('AgentMode: Error surfacing input request for launched work plan:', inputRequestError);
+          inputRequestNotSurfaced = { title: req.title, prompt: req.prompt };
+        }
+      }
+
+      // ENG-1698: same reset as createWorkPlan — see that call site's comment. A
+      // predefined-plan launch on an existing session (including a force=true
+      // relaunch of the same plan) must not inherit tool-call credit from before.
+      try {
+        await chatbotDb.updateCalledFunctions(sessionId, {});
+      } catch (resetError) {
+        console.error('AgentMode: Error resetting calledFunctions for new predefined work plan:', resetError);
+      }
 
       // Auto-install ALL skills from ALL steps upfront so their tools are available
       // from the next message (tool filtering is computed at the start of each message).
@@ -32480,9 +32752,16 @@ ${strippedHtml}`;
         }
       }
 
+      // ENG-1765: tell the model when step 1's input card didn't surface, so it
+      // asks for the same information conversationally instead of the session
+      // silently sitting on a step whose required input nobody was ever asked for.
+      const inputRequestNote = inputRequestNotSurfaced
+        ? ` Note: this plan's first step normally asks "${inputRequestNotSurfaced.title}" via a structured card, but that card could not be shown right now — ask the user for this information directly instead: ${inputRequestNotSurfaced.prompt || inputRequestNotSurfaced.title}`
+        : '';
+
       return {
         success: true,
-        message: `Started work plan "${predefinedPlan.title}" with ${workPlan.steps.length} steps`,
+        message: `Started work plan "${predefinedPlan.title}" with ${workPlan.steps.length} steps${inputRequestNote}`,
         workPlan,
         welcomeMessage: workPlan.welcomeMessage,
         formattedContent: `Started work plan "${predefinedPlan.title}":\n${workPlan.steps.map((s: any) => `${s.stepCount}. ${s.title}`).join('\n')}`,
@@ -32631,7 +32910,19 @@ ${strippedHtml}`;
 
   public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
-      const session = await chatbotDb.getChatSession(sessionId);
+      // ENG-1793: consistentRead=true so this read of session.workPlan /
+      // calledFunctions / failedFunctions / calledFunctionsVersion -- the fields
+      // the requiredFunctionCalls protection below (see the update-loop comment)
+      // depends on -- is strongly consistent, not the default eventually-consistent
+      // read. Those fields live on the AW-ChatSessions record itself, so this needs
+      // getChatSession -> getChatSessionRecord's own dynamodb.get to pass
+      // ConsistentRead: true (see chatbotService.ts); it is NOT satisfied by
+      // getMessagesFromMessagesTable's consistent read, which covers a different
+      // table (AW-ChatMessages) that this call site does not depend on. Without a
+      // strongly consistent read of the session record, a required call's failure
+      // recorded earlier in this very turn, immediately before this modify_work_plan
+      // call, could be missed.
+      const session = await chatbotDb.getChatSession(sessionId, true);
       if (!session || !session.workPlan) {
         return {
           success: false,
@@ -32640,6 +32931,51 @@ ${strippedHtml}`;
       }
 
       const workPlan = { ...session.workPlan };
+
+      // Snapshot of every step as it existed before this call's removeStepCounts
+      // filtering runs below, keyed by stepCount. Still used further down for
+      // expectedAssetCount/expectedAssetCountTools: when a step reusing a
+      // just-removed stepCount reaches the "add new step" branch in THIS SAME
+      // call, reattach the pre-removal asset-count requirement instead of
+      // treating it as having no history. (requiredFunctionCalls no longer
+      // uses this snapshot -- see pendingRequiredFunctionCalls below, which
+      // closes the same gap completely instead of only within one call.)
+      const originalStepsBeforeRemoval = new Map<number, (typeof workPlan.steps)[number]>(
+        workPlan.steps.map((s: any) => [s.stepCount, s]),
+      );
+
+      // ENG-1811: before removing anything, carry forward any genuinely
+      // unresolved requiredFunctionCalls from the steps about to be removed
+      // into a session-lifetime, stepCount-agnostic debt ledger
+      // (workPlan.pendingRequiredFunctionCalls). This is deliberately NOT
+      // scoped to "does a later step reuse this same stepCount" -- that
+      // per-call/per-stepCount approach (the first attempt at this fix) was
+      // itself defeated live, unprompted, on test-env1: the model removed
+      // steps 2 and 3 via removeStepCounts in one modify_work_plan call, then
+      // re-added them with omitted requiredFunctionCalls in a SEPARATE, LATER
+      // call that didn't mention removeStepCounts at all -- that later call's
+      // own invocation has no memory of the earlier removal, so a per-call
+      // snapshot can never see across it. A plain session-level ledger does,
+      // because workPlan (and this field on it) is the one thing every
+      // invocation reads fresh and writes back. See setWorkPlanStatusAttempt
+      // for where this is enforced: it blocks a batch from resolving the LAST
+      // remaining pending step(s) (finishing the plan) while any entry here
+      // still hasn't succeeded, regardless of which step (if any) still lists
+      // it as required.
+      const priorPendingRequiredFunctionCalls = workPlan.pendingRequiredFunctionCalls || [];
+      if (removeStepCounts && removeStepCounts.length > 0) {
+        const succeededFunctionCountsAtRemoval = session.calledFunctions || {};
+        const newlyUnresolved = new Set(priorPendingRequiredFunctionCalls);
+        for (const step of workPlan.steps) {
+          if (!removeStepCounts.includes(step.stepCount)) continue;
+          for (const fn of step.requiredFunctionCalls || []) {
+            if ((succeededFunctionCountsAtRemoval[fn] || 0) === 0) {
+              newlyUnresolved.add(fn);
+            }
+          }
+        }
+        workPlan.pendingRequiredFunctionCalls = Array.from(newlyUnresolved);
+      }
 
       // Update autocomplete if explicitly provided
       if (autocomplete !== undefined) {
@@ -32651,6 +32987,164 @@ ${strippedHtml}`;
         workPlan.steps = workPlan.steps.filter(s => !removeStepCounts.includes(s.stepCount));
       }
 
+      // ENG-1793: a production predefined-plan session (a90b38fc-...) called
+      // modify_work_plan mid-run for its "Create HTML report" step right after
+      // that step's required create_html_from_template call had just FAILED.
+      // The template authored requiredFunctionCalls: ["create_html_from_template"]
+      // for that step, but the modify_work_plan update happened to pass
+      // requiredFunctionCalls: [] for it -- a defined, non-undefined value, so
+      // the old merge below ("use newStep's value if provided, else keep the
+      // old one") silently replaced the real requirement with an empty one.
+      // set_work_plan_status's completion gate (setWorkPlanStatusAttempt) then
+      // had nothing left to check for that step and let it complete despite the
+      // failed required call never succeeding.
+      //
+      // ENG-1799 (follow-up): the original fix here only protected a function
+      // that had already FAILED at least once (failed>0 && succeeded===0). A
+      // production predefined-plan session (3fce3c5a-...) showed the same class
+      // of gap for functions that were simply never called at all -- never
+      // attempted, so never in failedFunctions either, but still genuinely
+      // required and unsatisfied. That shape passed the old check trivially
+      // (failed===0 fails the `failed > 0` test), so modify_work_plan could
+      // silently drop a still-unmet requirement the model had not gotten
+      // around to calling yet, the same gate-bypass shape, just without a
+      // prior failed attempt on record.
+      //
+      // Fix: requiredFunctionCalls can still be freely modified -- added to,
+      // reordered, or have functions removed -- EXCEPT it may never silently
+      // drop a function that has not yet SUCCEEDED for this session, whether
+      // it previously failed or was never attempted at all. A function that
+      // was never required to begin with, or that has already succeeded at
+      // least once, is unaffected and can still be dropped normally (e.g. a
+      // genuine, deliberate scope reduction).
+      //
+      // NOT exempt once a step has resolved (completed/skipped): a resolved
+      // step can be reset back to 'pending' later (e.g. "assets need
+      // regenerating" -- see the ENG-1188/CodeRabbit PR #2430 cutoff-timestamp
+      // handling above, which explicitly treats that reset as a supported
+      // transition) without restoring requiredFunctionCalls to anything. An
+      // earlier version of this fix exempted resolved steps on the theory
+      // that "the gate that mattered already ran" -- but that only holds
+      // until the very next reset-to-pending, at which point a
+      // never-actually-called requirement cleared while 'completed' stays
+      // silently cleared through the reset and the step re-completes with no
+      // gate at all. Note this protection is NOT a pure no-op for every
+      // resolved step: `session.calledFunctions[fn]` decrements back toward 0
+      // once the step consuming its credit completes (ENG-1698's
+      // decrementCalledFunctionsClamped), so a function called exactly once
+      // for its own step looks like `succeeded === 0` again immediately after
+      // that step's own legitimate completion -- indistinguishable from
+      // "never called." That's intentional, not a bug: it forces a genuine
+      // scope-reduction edit on an already-resolved step to re-prove the
+      // requirement rather than trust stale state, matching the
+      // "fail closed" posture the rest of this fix takes, and is itself
+      // covered by a dedicated test below rather than assumed harmless.
+      const succeededFunctionCounts = session.calledFunctions || {};
+      const mergeRequiredFunctionCalls = (
+        existingRequired: string[] | undefined,
+        requested: string[] | undefined,
+      ): string[] | undefined => {
+        if (requested === undefined) return existingRequired;
+        const unresolvedRequirements = (existingRequired || []).filter((fn) => {
+          if (requested.includes(fn)) return false;
+          const succeeded = succeededFunctionCounts[fn] || 0;
+          return succeeded === 0;
+        });
+        return unresolvedRequirements.length > 0 ? [...requested, ...unresolvedRequirements] : requested;
+      };
+
+      // ENG-1800: sibling protection for the asset-count completion gate
+      // (expectedAssetCount/expectedAssetCountTools) -- see the merge call
+      // below for the full incident writeup and the applied fix.
+      const findAssetCountCutoff = (
+        allSteps: Array<{ stepCount: number; status?: string; resolvedAt?: string; completedAt?: string }>,
+        stepCount: number,
+      ): string | undefined => {
+        const earlier = allSteps
+          .filter((s) => s.stepCount < stepCount)
+          .sort((a, b) => b.stepCount - a.stepCount);
+        for (const s of earlier) {
+          if (s.status === 'completed' || s.status === 'skipped') {
+            const resolvedAt = s.resolvedAt || s.completedAt;
+            if (resolvedAt) return resolvedAt;
+          }
+        }
+        return undefined;
+      };
+      const computeStepProducedAssetCount = (
+        tools: string[] | undefined,
+        sinceIso: string | undefined,
+      ): number => tools?.length
+        ? extractProducedAssetCount(session.messages, sinceIso, tools)
+        : Math.max(
+            AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
+            extractProducedAssetCount(session.messages, sinceIso),
+          );
+
+      // ENG-1800: a production predefined-plan session (ca06a9e0-...) hit the
+      // asset-count gate's workplan_insufficient_assets block for "Render the
+      // Full Size Matrix" (expectedAssetCount 12, expectedAssetCountTools
+      // ["playwright_browser_take_screenshot"], only 1 real screenshot
+      // produced). Instead of producing the remaining assets, the model called
+      // modify_work_plan TWICE in the same run to shrink expectedAssetCount
+      // first to 1, then to 0 for that step (and later 0 for two more steps) --
+      // silently clearing the exact gate it was failing. Nothing distinguished
+      // that self-serving edit from a genuine user-approved scope reduction
+      // (the blocked response's own guidance tells the model to do exactly
+      // this once the USER approves a smaller set), so the steps completed
+      // with 1 of the promised 12 assets and the closing synthesis then
+      // falsely claimed "✅ Deliverables Generated & Verified" across "all 12
+      // units".
+      //
+      // Fix: expectedAssetCount can still be freely changed (raised, lowered,
+      // or cleared) EXCEPT it may never be silently LOWERED while the step's
+      // own actual produced-asset count has not yet met the EXISTING (pre-edit)
+      // requirement -- the exact "shrink the goalpost to dodge a failing gate"
+      // bypass this incident hit. The moment the step has genuinely produced
+      // enough assets to meet its current target, the requirement is
+      // unaffected and can be freely lowered or cleared afterward (the same
+      // "failed and later succeeded" carve-out ENG-1793/ENG-1799 established
+      // for requiredFunctionCalls above).
+      //
+      // NOT exempt once a step has resolved (completed/skipped) -- same
+      // reasoning as mergeRequiredFunctionCalls above: a resolved step can be
+      // reset back to 'pending' without restoring expectedAssetCount, and for
+      // a step that resolved normally `produced` was already >= `existing`
+      // when it completed, so this protection is a no-op in the normal case
+      // and only bites the reset-then-shrink-then-recomplete abuse path.
+      //
+      // Fresh-eyes review of this PR also found `expectedAssetCountTools`
+      // itself had ZERO protection: leaving expectedAssetCount unchanged
+      // (e.g. still 12) while silently retargeting expectedAssetCountTools to
+      // an unrelated tool the model already called 12+ times for other
+      // reasons achieves the identical "dodge a failing gate" outcome through
+      // a field this check never looked at. mergeExpectedAssetCountTools
+      // below applies the same guard: don't allow the counted-tools list to
+      // change while the CURRENT requirement (measured against the EXISTING
+      // tools) hasn't genuinely been met.
+      const mergeExpectedAssetCount = (
+        existingStep: { stepCount: number; status?: string; expectedAssetCount?: number; expectedAssetCountTools?: string[] },
+        requested: number | undefined,
+      ): number | undefined => {
+        if (requested === undefined) return existingStep.expectedAssetCount;
+        const existing = existingStep.expectedAssetCount;
+        if (typeof existing !== 'number' || existing <= 0 || requested >= existing) return requested;
+        const sinceIso = findAssetCountCutoff(workPlan.steps, existingStep.stepCount);
+        const produced = computeStepProducedAssetCount(existingStep.expectedAssetCountTools, sinceIso);
+        return produced < existing ? existing : requested;
+      };
+      const mergeExpectedAssetCountTools = (
+        existingStep: { stepCount: number; status?: string; expectedAssetCount?: number; expectedAssetCountTools?: string[] },
+        requested: string[] | undefined,
+      ): string[] | undefined => {
+        if (requested === undefined) return existingStep.expectedAssetCountTools;
+        const existing = existingStep.expectedAssetCount;
+        if (typeof existing !== 'number' || existing <= 0) return requested;
+        const sinceIso = findAssetCountCutoff(workPlan.steps, existingStep.stepCount);
+        const produced = computeStepProducedAssetCount(existingStep.expectedAssetCountTools, sinceIso);
+        return produced < existing ? existingStep.expectedAssetCountTools : requested;
+      };
+
       // Update or add steps
       for (const newStep of steps) {
         const existingIndex = workPlan.steps.findIndex(s => s.stepCount === newStep.stepCount);
@@ -32661,17 +33155,43 @@ ${strippedHtml}`;
             title: newStep.title,
             description: newStep.description,
             ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
-            requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls,
+            requiredFunctionCalls: mergeRequiredFunctionCalls(
+              workPlan.steps[existingIndex].requiredFunctionCalls,
+              newStep.requiredFunctionCalls,
+            ),
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
-            // Allow scope changes: an explicit expectedAssetCount overrides (including 0
-            // to clear the asset gate when the user approves a smaller set); omitting it
-            // preserves the existing value. Same override-or-preserve semantics for
-            // expectedAssetCountTools (ENG-1331).
-            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount,
-            expectedAssetCountTools: newStep.expectedAssetCountTools !== undefined ? newStep.expectedAssetCountTools : workPlan.steps[existingIndex].expectedAssetCountTools
+            // Allow scope changes: an explicit expectedAssetCount/expectedAssetCountTools
+            // overrides (including 0/[] to clear the asset gate when the user approves a
+            // smaller set) UNLESS the step hasn't actually produced enough assets to meet
+            // its current requirement yet -- see mergeExpectedAssetCount/
+            // mergeExpectedAssetCountTools (ENG-1800) above. Omitting either preserves the
+            // existing value.
+            expectedAssetCount: mergeExpectedAssetCount(workPlan.steps[existingIndex], newStep.expectedAssetCount),
+            expectedAssetCountTools: mergeExpectedAssetCountTools(workPlan.steps[existingIndex], newStep.expectedAssetCountTools)
           };
         } else {
-          // Add new step (stepCount will be fixed by updateSessionWorkPlan)
+          // Add new step (stepCount will be fixed by updateSessionWorkPlan).
+          //
+          // requiredFunctionCalls is taken as given here, unprotected -- ENG-1811's
+          // pendingRequiredFunctionCalls ledger (populated above whenever a step is
+          // removed) is what actually guarantees a genuinely unresolved requirement
+          // can't be walked away from, enforced at completion time in
+          // setWorkPlanStatusAttempt regardless of which step (if any) still lists
+          // it. That covers this stepCount being reused in this same call, a later
+          // separate call, or never being reused at all -- strictly more than a
+          // per-call reattachment here could.
+          //
+          // expectedAssetCount/expectedAssetCountTools have no equivalent
+          // session-level ledger yet (the "produced count" calculation is inherently
+          // step-relative, not easily genericized the way a function name is) -- if
+          // this stepCount was just removed via removeStepCounts in THIS SAME call,
+          // still reattach its pre-removal asset-count requirement as a best-effort
+          // guard using the pre-removal step as the baseline. A genuinely new
+          // stepCount, or one whose removal happened in an earlier, separate call,
+          // has no such reattachment (a known, narrower residual gap -- see ENG-1808).
+          const removedOriginal = removeStepCounts?.includes(newStep.stepCount)
+            ? originalStepsBeforeRemoval.get(newStep.stepCount)
+            : undefined;
           workPlan.steps.push({
             stepCount: newStep.stepCount,
             title: newStep.title,
@@ -32682,8 +33202,12 @@ ${strippedHtml}`;
             notes: undefined,
             requiredFunctionCalls: newStep.requiredFunctionCalls,
             skillIds: newStep.skillIds,
-            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount }),
-            ...(newStep.expectedAssetCountTools !== undefined && { expectedAssetCountTools: newStep.expectedAssetCountTools })
+            ...(removedOriginal
+              ? { expectedAssetCount: mergeExpectedAssetCount(removedOriginal, newStep.expectedAssetCount) }
+              : (newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount })),
+            ...(removedOriginal
+              ? { expectedAssetCountTools: mergeExpectedAssetCountTools(removedOriginal, newStep.expectedAssetCountTools) }
+              : (newStep.expectedAssetCountTools !== undefined && { expectedAssetCountTools: newStep.expectedAssetCountTools }))
           });
         }
       }
@@ -32828,9 +33352,15 @@ ${strippedHtml}`;
     const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
     const outOfOrderSteps: Array<{ stepCount: number; title: string; pendingSteps: string[] }> = [];
 
-    // Get function call counts from session (make a copy to modify)
+    // Get function call counts from session (make a copy to modify). This local
+    // copy drives this call's own gating decisions (does THIS step have enough
+    // available calls) and is inherently a single-request snapshot. The actual
+    // persisted decrement (see countsModified below) is applied as a delta
+    // against a fresh read at write time, not this snapshot, to avoid clobbering
+    // a concurrent writer (ENG-1698).
     const calledFunctionCounts = { ...(session.calledFunctions || {}) };
     let countsModified = false;
+    const pendingCalledFunctionDecrements: Record<string, number> = {};
 
     const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
 
@@ -32910,7 +33440,28 @@ ${strippedHtml}`;
         // If validation passed and marking as completed, decrement the function counts
         for (const fn of step.requiredFunctionCalls) {
           calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
+          pendingCalledFunctionDecrements[fn] = (pendingCalledFunctionDecrements[fn] || 0) + 1;
           countsModified = true;
+        }
+      }
+
+      // ENG-1698: a skipped step never reaches the 'completed' branch above, so any
+      // calls it DID make toward its own requiredFunctionCalls (before being skipped)
+      // were never decremented — that credit stays in the shared pool, available to
+      // silently satisfy ANY later step requiring the same tool name without the model
+      // calling it again for that step's own purpose. Mirror the completed-branch
+      // decrement here, clamped at 0 (not gated on availability like completed's is,
+      // since a step can be skipped without ever having made its required calls at
+      // all — clamping avoids driving the count negative and over-penalizing a later
+      // step that makes a genuinely fresh call).
+      if (update.status === 'skipped' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+        for (const fn of step.requiredFunctionCalls) {
+          const current = calledFunctionCounts[fn] || 0;
+          if (current > 0) {
+            calledFunctionCounts[fn] = current - 1;
+            pendingCalledFunctionDecrements[fn] = (pendingCalledFunctionDecrements[fn] || 0) + 1;
+            countsModified = true;
+          }
         }
       }
 
@@ -33091,6 +33642,58 @@ ${strippedHtml}`;
       };
     }
 
+    // ENG-1811: a step removed via modify_work_plan's removeStepCounts can carry
+    // requiredFunctionCalls that never succeeded -- genuinely necessary work that
+    // was never done. Refuse to let this batch finish the WHOLE plan (resolve the
+    // last remaining pending step(s)) while any such debt is still outstanding,
+    // regardless of whether any current step still lists it as required. Scoped to
+    // "finishing the plan" rather than every individual step transition so
+    // unrelated, still-in-progress steps keep completing normally in the
+    // meantime -- only the moment the run would otherwise look fully done is
+    // gated, which is the only place a silently-dropped requirement actually
+    // matters.
+    //
+    // Reads session.calledFunctions directly (the raw, never-mutated snapshot
+    // from the top of this function), NOT the local calledFunctionCounts copy --
+    // that copy gets decremented in-place, once per required call, as THIS SAME
+    // batch's own steps pass their gates above (the pre-existing ENG-1698
+    // credit-consumption mechanic). A debt name that's ALSO genuinely required
+    // and satisfied by an ordinary step completing earlier in this very loop
+    // would decrement calledFunctionCounts back toward 0, making a real success
+    // moments earlier look like it never happened -- a real bug found by review,
+    // reproduced standalone before this comment was written: a session with a
+    // pending debt for `list_html_templates`, a single step requiring exactly
+    // that function, called exactly once and genuinely succeeding, still got
+    // permanently blocked from ever finishing. The real persisted decrement
+    // (decrementCalledFunctionsClamped) only runs after this whole gate passes
+    // anyway, so there's no correctness reason to consult the hypothetical
+    // post-decrement value at decision time -- only whether the function
+    // actually succeeded at all this session.
+    const rawCalledFunctionCounts = session.calledFunctions || {};
+    const unresolvedPendingRequiredFunctionCalls = (workPlan.pendingRequiredFunctionCalls || [])
+      .filter(fn => (rawCalledFunctionCounts[fn] || 0) === 0);
+    if (unresolvedPendingRequiredFunctionCalls.length > 0) {
+      const noStepsRemainPending = !workPlan.steps.some(s => s.status === 'pending');
+      if (noStepsRemainPending) {
+        return {
+          success: false,
+          // ENG-1626: deliberate gate, see the out-of-order gate above for why
+          // blocked/reason is set here.
+          blocked: true,
+          reason: 'workplan_unresolved_removed_requirements',
+          message: 'Cannot finish this work plan. A required function call from a removed step was never made.',
+          pendingRequiredFunctionCalls: unresolvedPendingRequiredFunctionCalls,
+          formattedContent: `❌ Cannot mark this plan finished yet: ${unresolvedPendingRequiredFunctionCalls.join(', ')} ${unresolvedPendingRequiredFunctionCalls.length === 1 ? 'was' : 'were'} required by a step that got removed, but never actually succeeded.\n\nCall it for real, or use modify_work_plan to add back a step that genuinely does this work, before finishing the plan.`
+        };
+      }
+    }
+    // Auto-clear any debts that have since genuinely succeeded (by any means --
+    // not necessarily via the stepCount that originally required them), so the
+    // ledger doesn't grow stale forever once real work actually happens.
+    if (workPlan.pendingRequiredFunctionCalls && workPlan.pendingRequiredFunctionCalls.length > 0) {
+      workPlan.pendingRequiredFunctionCalls = unresolvedPendingRequiredFunctionCalls;
+    }
+
     // Check if any steps were not found
     if (notFoundSteps.length > 0 && updatedSteps.length === 0) {
       return {
@@ -33165,9 +33768,12 @@ ${strippedHtml}`;
         );
       }
 
-      // Update function counts if they were modified
+      // Update function counts if they were modified. Applied as a clamped delta
+      // against a fresh read (ENG-1698) rather than this call's local snapshot,
+      // so it can't clobber a concurrent writer (e.g. a new plan's reset, or
+      // another in-flight tool-dispatch increment).
       if (countsModified) {
-        await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
+        await chatbotDb.decrementCalledFunctionsClamped(sessionId, pendingCalledFunctionDecrements);
       }
 
       // Auto-install skills for the next pending step
@@ -35174,8 +35780,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // the account still needs to be the caller's own/shared account) but is
     // deliberately NOT in PACED_WRITE_ACTIONS — it doesn't touch LinkedIn at
     // all, so none of the burst/hourly/daily send-pacing below applies to it.
+    // ENG-1719: withdraw-stale-invitations shares the ownership check for the same
+    // reason set-daily-invite-cap does — it writes to the account, so it must be the
+    // caller's own or org-shared one. It is deliberately NOT in PACED_WRITE_ACTIONS:
+    // the umbrella call itself performs no LinkedIn write, and pacing it here would
+    // consume a slot on top of the one each individual withdrawal already reserves
+    // inside the drain.
     let resolvedLinkedInAccount: ResolvedLinkedInAccount | null = null;
-    if (PACED_WRITE_ACTIONS.has(action) || action === 'set-daily-invite-cap') {
+    if (
+      PACED_WRITE_ACTIONS.has(action)
+      || action === 'set-daily-invite-cap'
+      || action === 'withdraw-stale-invitations'
+    ) {
       resolvedLinkedInAccount = await resolveLinkedInAccountForWrite(userId, account_id);
       if (!resolvedLinkedInAccount) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
@@ -35566,19 +36182,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
 
         case 'list-sent-invitations': {
-          const invitationsResult = await linkedInOutreachService.listSentInvitations(account_id, args.cursor);
-          // Trim to id fields only — full invitation objects grow ~10 entries/day and can
-          // reach 200+ entries, causing severe context window bloat in scheduled sessions.
-          if (Array.isArray(invitationsResult?.items)) {
-            const trimmedItems = invitationsResult.items.map((item: any) => ({
-              id: item.id,
-              invited_user_id: item.invited_user_id,
-              invited_user_public_id: item.invited_user_public_id,
-              invited_user: item.invited_user,
-            }));
-            return { success: true, data: { ...invitationsResult, items: trimmedItems } };
-          }
-          return { success: true, data: invitationsResult };
+          // ENG-1718: this used to ask one question — is `items` an array? — and on
+          // `false` return `{ success: true, data: <whatever came back> }`. The SDK
+          // is constructed at its default `validateRequestPayloadLevel: 'warn'`, so a
+          // 2xx body failing its own response schema is logged and passed through
+          // unchanged; any such body therefore became a SUCCESSFUL EMPTY RESULT.
+          // That is the `{}` iTrials saw while a cooldown was actively firing, with
+          // 126 pending invitations sitting in our own ledger unread — this action
+          // never consulted it. See linkedInSentInvitationsView.ts for the full
+          // chain; every outcome is now named, and none of them is a bare empty.
+          const { getSentInvitationsView } = await import('./agentMode/linkedInSentInvitationsView');
+          const { getAllSentInvitationsByAccount } = await import('./unipileSentInvitationsDb');
+          const view = await getSentInvitationsView(account_id, args.cursor, {
+            fetchLive: (id, cur) => linkedInOutreachService.listSentInvitations(id, cur),
+            fetchCached: (id) => getAllSentInvitationsByAccount(id),
+          });
+          return { success: true, data: view };
         }
 
         case 'list-received-invitations': {
@@ -36168,6 +36787,64 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             console.error(`[AgentMode] Failed to drop withdrawn invitation ${invitationId}:`, err),
           );
           return { success: true, data: cancelResult };
+        }
+
+        // ENG-1719 / ENG-1609 AC #8: bulk-withdraw the oldest pending invitations.
+        //
+        // Routed through paceLinkedInWrite per withdrawal, exactly like the
+        // single-shot cancel-invitation above, so the drain inherits the spacing
+        // gap and the hourly ceiling instead of working around them — and,
+        // because dailyVolumeClassFor returns null for cancel, does not consume
+        // the account's daily invite budget.
+        case 'withdraw-stale-invitations': {
+          const {
+            withdrawStaleInvitations,
+            DEFAULT_MAX_WITHDRAWALS_PER_RUN,
+          } = await import('./agentMode/linkedInStaleInvitationDrain');
+          const {
+            getAllSentInvitationsByAccount,
+            deleteSentInvitationByInvitationId,
+          } = await import('./unipileSentInvitationsDb');
+
+          const rawDays = Number(args.older_than_days);
+          if (!Number.isFinite(rawDays) || rawDays < 1) {
+            throw new Error('older_than_days is required for withdraw-stale-invitations and must be at least 1');
+          }
+          const rawMax = Number(args.max_withdrawals);
+
+          const result = await withdrawStaleInvitations({
+            accountId: account_id,
+            olderThanDays: rawDays,
+            maxWithdrawals: Number.isFinite(rawMax) && rawMax > 0 ? rawMax : DEFAULT_MAX_WITHDRAWALS_PER_RUN,
+            deps: {
+              fetchPending: (acc) => getAllSentInvitationsByAccount(acc),
+              // The pacer's own refusal text, or null to proceed. Reusing
+              // paceLinkedInWrite rather than reserveWriteSlot directly keeps the
+              // drain on the identical path every other LinkedIn write takes.
+              pace: async (acc) => {
+                const paced = await paceLinkedInWrite('cancel-invitation', resolvedLinkedInAccount!, acc);
+                // resolvedLinkedInAccount is non-null here: this action is in the
+                // ownership gate above, which returns early when it cannot resolve.
+                return paced.refusal ? paced.refusal.error : null;
+              },
+              cancel: async (invitationId, acc) => {
+                await linkedInOutreachService.cancelInvitation(invitationId, acc);
+              },
+              forget: (acc, invitationId) => deleteSentInvitationByInvitationId(acc, invitationId),
+              recordWithdrawal: async (candidate) => {
+                const { recordInviteWithdrawnInCrm } = await import('./linkedInInviteCrmMirror');
+                return recordInviteWithdrawnInCrm({
+                  userId,
+                  accountId: account_id,
+                  linkedinUrl: candidate.publicProfileUrl,
+                  invitationId: candidate.invitationId,
+                  sentAt: candidate.sentAt,
+                  ...(args.list_id ? { listId: args.list_id } : {}),
+                });
+              },
+            },
+          });
+          return { success: true, data: result };
         }
 
         case 'search-parameters': {

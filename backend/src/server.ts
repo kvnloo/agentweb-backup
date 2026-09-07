@@ -6,6 +6,7 @@ import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import dotenv from 'dotenv';
 import { getJwtSecret, assertJwtSecretAtBoot } from './config/jwt';
+import { logServiceSecretResolutionAtBoot } from './middleware/serviceAuth';
 import bcrypt from 'bcryptjs';
 import http from 'http';
 import { Server, Socket } from 'socket.io';
@@ -45,6 +46,11 @@ registerFathomLinearPort(createFathomLinearPort());
 // letting tokens be signed/verified with a fallback secret or erroring on first request.
 assertJwtSecretAtBoot();
 
+// Best-effort visibility only (ENG-1754 AC3) — never blocks/delays binding the port.
+logServiceSecretResolutionAtBoot().catch((err) =>
+  console.error('[serviceAuth] boot-time secret resolution check failed:', err)
+);
+
 const port = process.env.PORT || 3001;
 const server = http.createServer(app);
 
@@ -59,9 +65,23 @@ const io = new Server(server, {
         'http://localhost:5174',
         process.env.FRONTEND_URL || 'http://localhost:5173',
         process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174',
-        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
-        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/, // Allow any ngrok.io subdomain
       ];
+
+      // Same fail-closed production gate as the HTTP CORS config in app.ts
+      // (ENG-1751): ngrok tunnels are a local-dev convenience and must not be
+      // a credentialed origin in production. `NODE_ENV !== 'production'` was
+      // fail-open (no tracked EB config sets NODE_ENV=production explicitly);
+      // require an explicit NODE_ENV=development or the CORS_ALLOW_NGROK=1
+      // opt-in instead.
+      if (
+        process.env.NODE_ENV === 'development' ||
+        process.env.CORS_ALLOW_NGROK === '1'
+      ) {
+        allowedOrigins.push(
+          /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
+          /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/ // Allow any ngrok.io subdomain
+        );
+      }
 
       if (!origin) return callback(null, true);
 

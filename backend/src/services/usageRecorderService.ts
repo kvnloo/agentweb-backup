@@ -13,6 +13,12 @@
 
 import { getModelPrice, cacheWriteCost, CacheWriteByTtl, isPerGenerationPriced } from "../utils/llmPricing";
 import { usageRecordDb, CostSource } from "./usageRecordDb";
+import { buildShadowEvent, mirrorVendorUsage } from "./spendLedgerDualWrite";
+import {
+  flushDroppedWriteAlerts,
+  recordDroppedWrite,
+  retryTransientWrite,
+} from "./usageWriteFailureMonitor";
 // tokenUsageService is lazy-required inside meterUserUsage (not statically imported):
 // it pulls in db.ts -> config/aws.ts, and usageRecorderService is imported very widely
 // (via llmClients). A static import would drag that whole graph into every consumer's
@@ -86,6 +92,32 @@ export interface RecordVendorUsageContext {
   costSource: CostSource;
   /** Dollar cost of this call. Omitted means 0 — ENG-700 makes an unpriced unit loud. */
   costUsd?: number;
+  /**
+   * ENG-702 AC1: a stable token for THIS vendor call, supplied at the call
+   * site. When present, the daily aggregate row and the immutable spend event
+   * are written in ONE transaction guarded on it, so a retried call increases
+   * recorded spend exactly once on BOTH rails.
+   *
+   * Omit only when the call site genuinely has no natural per-call id. A retry
+   * is then counted twice — which is what every vendor path did before this
+   * field existed, and is deliberately preserved so adoption can be
+   * incremental rather than a single flag day across seven adapters.
+   */
+  idempotencyKey?: string;
+}
+
+/** Log at most one shadow-ledger failure per minute, on its own throttle so a
+ * spend-ledger outage cannot crowd out the recorder's own error channel. */
+let lastShadowErrorLogAt = 0;
+function logShadowLedgerFailure(reason: string): void {
+  const now = Date.now();
+  if (now - lastShadowErrorLogAt >= ERROR_LOG_INTERVAL_MS) {
+    lastShadowErrorLogAt = now;
+    console.error(
+      "[spendLedgerShadow] Failed to mirror vendor usage (further failures suppressed for 60s):",
+      reason,
+    );
+  }
 }
 
 /** Log at most one recorder failure per minute to avoid log spam on outages. */
@@ -228,11 +260,114 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
  * different vendors can never aggregate into one row and overwrite each other's
  * `provider`. For token-priced LLM rows that ambiguity is ENG-700's job.
  */
+/**
+ * The idempotent vendor write (ENG-702 AC1).
+ *
+ * Never throws, for the same reason the shadow mirror never does: every caller
+ * invokes recordVendorUsage fire-and-forget, so a rejection here becomes an
+ * unhandled promise rejection and takes the process down. AC3's "surfaced
+ * rather than silently discarded" is served by the failure counter and alert,
+ * not by throwing into a caller that cannot catch it.
+ */
+async function recordVendorUsageIdempotent(ctx: RecordVendorUsageContext, now: Date): Promise<void> {
+  const userId = ctx.userId || "system";
+  const billingUserId = ctx.billingUserId || userId;
+
+  try {
+    const built = buildShadowEvent(ctx, now.toISOString());
+    if ("skip" in built) {
+      // Unpriced: no spend event may exist for it, so there is nothing to make
+      // the aggregate write idempotent against. Fall back to the plain write
+      // rather than inventing a $0 event the billing boundary forbids.
+      await usageRecordDb.incrementUsage(buildVendorIncrement(ctx, userId, billingUserId, now));
+      // Recovery on ANY successful path closes an open window, not just the
+      // priced+keyed one (CodeRabbit, PR #2807) — otherwise an account whose
+      // vendor traffic is all unpriced never reports its final alert.
+      flushDroppedWriteAlerts();
+      return;
+    }
+
+    // ENG-702 AC3. Retrying is safe here and ONLY here: the conditional
+    // transaction makes a replay a no-op, so a lost response cannot become a
+    // second charge. A "conflict" outcome is a write that did not happen at
+    // all, so it is retried as a transient failure rather than reported as a
+    // loss.
+    const outcome = await retryTransientWrite(async () => {
+      const result = await usageRecordDb.incrementUsageWithSpendEvent(
+        buildVendorIncrement(ctx, userId, billingUserId, now),
+        built.event,
+      );
+      if (result === "conflict") {
+        throw Object.assign(new Error("transaction conflict on vendor usage"), {
+          code: "TransactionConflictException",
+        });
+      }
+      return result;
+    });
+
+    void outcome;
+
+    // A window only closes when the NEXT drop arrives, so when an outage ENDS
+    // -- exactly when someone starts investigating -- its final and often
+    // largest batch would never be reported. The first successful write after
+    // recovery flushes it. Cheaper and more reliable than a timer, since it
+    // fires precisely when there is evidence the rail is healthy again.
+    flushDroppedWriteAlerts();
+  } catch (error) {
+    // Exhausted, or permanent. Surfaced as a counted, aggregated alert rather
+    // than thrown: every caller is fire-and-forget, so throwing would be an
+    // unhandled rejection and take the process down (ENG-1804).
+    recordDroppedWrite({
+      provider: ctx.provider,
+      operation: ctx.operation,
+      costMicroUsd: Math.max(0, Math.round((ctx.costUsd || 0) * 1e6)),
+      billingUserId,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/** The daily-aggregate shape for a vendor call, shared by both write paths. */
+function buildVendorIncrement(
+  ctx: RecordVendorUsageContext,
+  userId: string,
+  billingUserId: string,
+  now: Date,
+) {
+  return {
+    userId,
+    date: now.toISOString().slice(0, 10),
+    model: `${ctx.provider}:${ctx.operation}`,
+    feature: ctx.feature || "unknown",
+    inputTokens: 0,
+    outputTokens: 0,
+    costMicroUsd: Math.max(0, Math.round((ctx.costUsd || 0) * 1e6)),
+    billingUserId,
+    provider: ctx.provider,
+    unit: ctx.unit,
+    quantity: ctx.quantity,
+    costSource: ctx.costSource,
+    ...(ctx.onBehalfOf ? { onBehalfOf: ctx.onBehalfOf } : {}),
+    ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+  };
+}
+
 export async function recordVendorUsage(ctx: RecordVendorUsageContext): Promise<void> {
+  const now = new Date();
+
+  // ENG-702 AC1. With a token, both rails move together under one condition:
+  // a replay skips the spend event and the aggregate's contribution as a unit.
+  // Without one, the legacy path below keeps today's behaviour — unconditional
+  // aggregate write, then a fail-open shadow mirror.
+  if (ctx.idempotencyKey) {
+    await recordVendorUsageIdempotent(ctx, now);
+    return;
+  }
+
   try {
     const userId = ctx.userId || "system";
     const billingUserId = ctx.billingUserId || userId;
-    const date = new Date().toISOString().slice(0, 10);
+    const date = now.toISOString().slice(0, 10);
 
     await usageRecordDb.incrementUsage({
       userId,
@@ -252,9 +387,51 @@ export async function recordVendorUsage(ctx: RecordVendorUsageContext): Promise<
       ...(ctx.onBehalfOf ? { onBehalfOf: ctx.onBehalfOf } : {}),
       ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
     });
+    // Recovery on the legacy path closes an open window too.
+    flushDroppedWriteAlerts();
   } catch (error) {
     logRecorderFailure(error);
+    // ENG-702 AC3: counted even here, so an outage's cost is visible whether or
+    // not the call site has adopted a token. NOT retried, though: this path's
+    // aggregate write is an unconditional ADD, so a retry after a lost response
+    // double-counts -- the exact failure AC1 exists to prevent. Failing toward
+    // under-counting is recoverable through reconciliation; over-charging a
+    // customer is not.
+    recordDroppedWrite({
+      provider: ctx.provider,
+      operation: ctx.operation,
+      costMicroUsd: Math.max(0, Math.round((ctx.costUsd || 0) * 1e6)),
+      billingUserId: ctx.billingUserId || ctx.userId || "system",
+      reason: error instanceof Error ? error.message : String(error),
+    });
+    // Do NOT mirror a row the live rail failed to write (CodeRabbit, PR #2793).
+    // The shadow exists to measure ONE difference -- all-vendor spend against
+    // LLM-only -- and a ledger row with no matching usage record is not that
+    // difference, it is an outage artifact. §8 cannot tell the two apart, so
+    // letting them mix would pollute the very measurement this phase produces.
+    // The shadow mirrors the live rail; it never leads it.
+    return;
   }
+
+  // ENG-1250 §9 step 2 -- observe-only shadow of the row just written.
+  // Fire-and-forget and fail-open: nothing reads these rows, and a failure here
+  // must never break the metering it mirrors. Stamped from the same `now` as
+  // the live row above, so the two cannot straddle UTC midnight.
+  void mirrorVendorUsage(
+    {
+      ...ctx,
+      ...(ctx.feature ? { feature: ctx.feature } : {}),
+    },
+    now.toISOString(),
+  )
+    .then((result) => {
+      if (result.status === "failed") logShadowLedgerFailure(result.reason);
+    })
+    // mirrorVendorUsage is written never to reject, but this is a
+    // fire-and-forget call on a hot path: if that contract is ever broken, an
+    // unhandled rejection takes the process down. Cheap insurance against the
+    // shadow ledger killing the rail it observes.
+    .catch((error) => logShadowLedgerFailure(error instanceof Error ? error.message : String(error)));
 }
 
 /**

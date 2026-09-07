@@ -258,7 +258,7 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
 
       expect(result.success).toBe(true);
       expect(result.message).toBe('Campaign updated successfully');
-      expect(metaService.updateCampaign).toHaveBeenCalledWith('mock-access-token', campaignId, params);
+      expect(metaService.updateCampaign).toHaveBeenCalledWith('mock-access-token', campaignId, params, '123456789');
     });
 
     it('should use specified account_id when provided', async () => {
@@ -299,7 +299,7 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(metaService.updateCampaign).toHaveBeenCalledWith('token2', 'camp_123', { name: 'Updated' });
+      expect(metaService.updateCampaign).toHaveBeenCalledWith('token2', 'camp_123', { name: 'Updated' }, '987654321');
     });
 
     it('should handle errors', async () => {
@@ -324,7 +324,7 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
 
       expect(result.success).toBe(true);
       expect(result.message).toBe('Campaign deleted successfully');
-      expect(metaService.deleteCampaign).toHaveBeenCalledWith('mock-access-token', campaignId);
+      expect(metaService.deleteCampaign).toHaveBeenCalledWith('mock-access-token', campaignId, '123456789');
     });
 
     it('should use specified account_id when provided', async () => {
@@ -360,7 +360,7 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
       const result = await agentModeService.deleteMetaAdsCampaign('user123', 'camp_123', '987654321');
 
       expect(result.success).toBe(true);
-      expect(metaService.deleteCampaign).toHaveBeenCalledWith('token2', 'camp_123');
+      expect(metaService.deleteCampaign).toHaveBeenCalledWith('token2', 'camp_123', '987654321');
     });
 
     it('should handle errors', async () => {

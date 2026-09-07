@@ -219,6 +219,30 @@ describe('Meta Legacy Routes', () => {
       expect(response.body).toHaveProperty('campaignSummary');
     });
 
+    it('requests the ads creative sub-selector URL-encoded, not raw braces (ENG-1742 follow-up)', async () => {
+      // Confirmed live 2026-09-04 against a real ad account: an unencoded `creative{...}`
+      // selector doesn't error on this `ads` edge — Graph silently drops the whole `creative`
+      // field from every result instead, with no error anywhere to reveal it. Every ad's
+      // thumbnail/title/body/image would come back missing with the route reporting success.
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (getMetaAccessToken as jest.Mock).mockResolvedValue('mock-token');
+
+      (global.fetch as jest.Mock).mockResolvedValueOnce({
+        json: async () => ({ id: '123', name: 'Test User' }),
+        ok: true,
+      });
+
+      const mockFetch = fetchWithRetryAndPaging as jest.Mock;
+      mockFetch.mockResolvedValue({ data: [] });
+
+      await request(app).get('/api/meta/ad-performance?timeframe=7d');
+
+      const adsCallUrl = mockFetch.mock.calls.find((call: any[]) => call[0].includes('/ads?'))?.[0];
+      expect(adsCallUrl).toBeDefined();
+      expect(adsCallUrl).toContain('creative%7Bthumbnail_url');
+      expect(adsCallUrl).not.toContain('creative{thumbnail_url');
+    });
+
     it('should handle token validation failure', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
       (getMetaAccessToken as jest.Mock).mockResolvedValue('mock-token');

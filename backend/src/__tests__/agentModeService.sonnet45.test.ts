@@ -281,9 +281,10 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       // "cost-band tier derivation" below), not read off this static field —
       // these three still carry the pre-derivation literal so a model with
       // no MODEL_PRICING entry has a sane fallback, but it is no longer what
-      // the picker actually shows. The real, cost-derived tiers are
-      // ultra_premium, pro, and ultra_cheap respectively (see the
-      // derivation test).
+      // the picker actually shows. With ENG-1784's bands (Frontier ≥64,
+      // Pro 58–63, Medium 53–57, Cheap 31–52) the real, cost-derived tiers
+      // are ultra_premium (Sol, 71), pro (Terra, 62) and cheap (Luna, 50)
+      // respectively — see the ENG-1784 block for the pinned outcomes.
       it('carries a static tier as a no-price fallback, distinct from its real cost-derived tier', () => {
         const llmModels = (agentModeService as any).llmModels;
         expect(llmModels['openrouter/openai/gpt-5.6-sol'].tier).toBe('pro');
@@ -320,6 +321,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         'openrouter/openai/gpt-5.6-sol',
         'openrouter/openai/gpt-5.6-terra',
         'openrouter/openai/gpt-5.6-luna',
+        'openrouter/openai/gpt-6-astra', // ENG-1769
       ];
 
       it.each(OPENROUTER_IDS)('%s carries no adminOnly flag', (id) => {
@@ -350,19 +352,92 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * live there at all).
      */
     describe('2026-08-19 — quality/cost meter scores', () => {
-      const SCORED_IDS = [
-        'anthropic.claude-opus-5', 'anthropic.claude-opus-4-8', 'anthropic.claude-opus-4-6-v1',
-        'anthropic.claude-sonnet-5', 'anthropic.claude-sonnet-4-6', 'anthropic.claude-sonnet-4-5-20250929-v1:0',
-        'anthropic.claude-haiku-4-5-20251001-v1:0',
-        'gpt-5.5', 'gpt-5.4', 'gpt-5.4-nano',
-        'gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.5-flash', 'gemini-3.7-flash', 'gemini-3.1-flash-lite',
-        'openrouter/openai/gpt-4o-mini', 'openrouter/x-ai/grok-4.6',
-        'openrouter/deepseek/deepseek-v4-pro', 'openrouter/deepseek/deepseek-v4-flash',
-        'openrouter/qwen/qwen3.8-max', 'openrouter/mistralai/mistral-small-2603',
-        'openrouter/moonshotai/kimi-k3', 'openrouter/moonshotai/kimi-k2.7-code',
-        'openrouter/z-ai/glm-5.2', 'openrouter/z-ai/glm-4.7-flash',
-        'openrouter/openai/gpt-5.6-sol', 'openrouter/openai/gpt-5.6-terra', 'openrouter/openai/gpt-5.6-luna',
+      // ENG-1786: human-supplied AA v4.2 research, canonical/default variants,
+      // snapshot 2026-09-05. These are benchmark variants, not runtime effort settings.
+      const AA_V42: [string, number, string][] = [
+        ['openrouter/anthropic/claude-fable-5.1', 57, 'Claude Fable 5.1, Adaptive Reasoning, Max Effort'],
+        ['openrouter/openai/gpt-6-astra', 55, 'GPT-6 Astra, max'],
+        ['anthropic.claude-opus-5', 54, 'Claude Opus 5, Adaptive Reasoning, Max Effort'],
+        ['openrouter/openai/gpt-5.6-sol', 51, 'GPT-5.6 Sol, max'],
+        ['openrouter/x-ai/grok-4.6', 51, 'Grok 4.6, high'],
+        ['openrouter/moonshotai/kimi-k3', 50, 'Kimi K3, max'],
+        ['openrouter/openai/gpt-5.6-terra', 47, 'GPT-5.6 Terra, max'],
+        ['openrouter/qwen/qwen3.8-max', 47, 'Qwen3.8 Max, reasoning'],
+        ['gemini-3.8-flash', 47, 'Gemini 3.8 Flash, high'],
+        ['gpt-5.5', 46, 'GPT-5.5, xhigh'],
+        ['anthropic.claude-opus-4-8', 46, 'Claude Opus 4.8, Adaptive Reasoning, Max Effort (AA estimate)'],
+        ['anthropic.claude-sonnet-5', 45, 'Claude Sonnet 5, Adaptive Reasoning, Max Effort'],
+        ['gemini-3.7-flash', 45, 'Gemini 3.7 Flash, high'],
+        ['gpt-5.4', 43, 'GPT-5.4, xhigh'],
+        ['openrouter/openai/gpt-5.6-luna', 43, 'GPT-5.6 Luna, max'],
+        ['openrouter/z-ai/glm-5.2', 43, 'GLM 5.2, max'],
+        ['openrouter/deepseek/deepseek-v4-pro', 42, 'DeepSeek V4 Pro 0813, Reasoning, Max Effort'],
+        ['openrouter/qwen/qwen3.8-27b', 41, 'Qwen3.8 27B, xhigh'],
+        ['openrouter/deepseek/deepseek-v4-flash', 41, 'DeepSeek V4 Flash 0731, Reasoning, Max Effort'],
+        ['gemini-3.5-flash', 40, 'Gemini 3.5 Flash, high'],
+        ['anthropic.claude-sonnet-4-6', 38, 'Claude Sonnet 4.6, Adaptive Reasoning, Max Effort'],
+        ['gemini-3.1-pro-preview', 37, 'Gemini 3.1 Pro Preview, reasoning'],
+        ['openrouter/moonshotai/kimi-k2.7-code', 34, 'Kimi K2.7 Code, reasoning'],
+        ['gpt-5.4-nano', 31, 'GPT-5.4 Nano, xhigh (AA estimate)'],
+        ['anthropic.claude-opus-4-6-v1', 31, 'Claude Opus 4.6, Non-reasoning, High Effort'],
+        ['anthropic.claude-sonnet-4-5-20250929-v1:0', 23, 'Claude Sonnet 4.5, Non-reasoning'],
+        ['gemini-3-flash-preview', 21, 'Gemini 3 Flash Preview, Non-reasoning (AA estimate)'],
+        ['gemini-3.1-flash-lite', 19, 'Gemini 3.1 Flash Lite, reasoning'],
+        ['anthropic.claude-haiku-4-5-20251001-v1:0', 17, 'Claude Haiku 4.5, Non-reasoning'],
+        ['openrouter/z-ai/glm-4.7-flash', 17, 'GLM 4.7 Flash, reasoning'],
+        ['openrouter/mistralai/mistral-small-2603', 13, 'Mistral Small 4, reasoning'],
+        ['openrouter/openai/gpt-4o-mini', 1, 'GPT-4o Mini, non-reasoning (AA estimate)'],
       ];
+      const SCORED_IDS = AA_V42.map(([id]) => id);
+
+      it.each(AA_V42)('ENG-1786: %s reports its v4.2 score and canonical variant', async (id, score, variant) => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const info = models.find((model) => model.id === id)!;
+        expect(info.qualityScore).toBe(score);
+        expect(info.qualityScoreSource).toBe(`Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, ${variant}`);
+      });
+
+      it('ENG-1786: every scored registry row names an index version and uses the v4.2 snapshot', () => {
+        const registry = (agentModeService as any).llmModels;
+        const scoredIds = Object.keys(registry).filter((id) => typeof registry[id].qualityScore === 'number');
+        expect(scoredIds.sort()).toEqual([...SCORED_IDS].sort());
+        for (const id of scoredIds) {
+          expect(registry[id].qualityScoreSource).toMatch(/Intelligence Index v\d+\.\d+(?:\.\d+)?\b/);
+          expect(registry[id].qualityScoreSource).toMatch(/^Artificial Analysis Intelligence Index v4\.2, snapshot 2026-09-05, .+/);
+        }
+      });
+
+      it('ENG-1786: Fable (57) > Astra (55) > Sol (51), with Astra directly below Fable', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const quality = (id: string) => models.find((model) => model.id === id)!.qualityScore!;
+        const fable = quality('openrouter/anthropic/claude-fable-5.1');
+        const astra = quality('openrouter/openai/gpt-6-astra');
+        const sol = quality('openrouter/openai/gpt-5.6-sol');
+        expect([fable, astra, sol]).toEqual([57, 55, 51]);
+        expect(fable).toBeGreaterThan(astra);
+        expect(astra).toBeGreaterThan(sol);
+        expect(models.filter((model) => model.qualityScore! > astra).map((model) => model.id))
+          .toEqual(['openrouter/anthropic/claude-fable-5.1']);
+      });
+
+      it.each<[string | undefined, string[]]>([
+        ['gpt5-chat', ['gpt-5.5']],
+        ['gpt5-nano', ['gpt-5.4-nano', 'openrouter/openai/gpt-4o-mini']],
+        ['gemini-flash', ['gemini-3.5-flash', 'gemini-3.7-flash']],
+        ['claude-opus', []],
+        ['claude-sonnet', []],
+        ['claude-fable', []],
+        [undefined, []],
+      ])('ENG-1786: %s keeps its baseline dominance-only legacy rows', async (family, expected) => {
+        // Baseline includes ENG-1784 bands and ENG-1781 Luna pricing.
+        // Static legacy rows remain covered by the existing legacy tests.
+        const registry = (agentModeService as any).llmModels;
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const dominated = models.filter((model) =>
+          registry[model.id].family === family && !registry[model.id].legacy && model.legacy,
+        ).map((model) => model.id);
+        expect(dominated.sort()).toEqual([...expected].sort());
+      });
 
       it.each(SCORED_IDS)('%s has an in-range (0-100) qualityScore and costScore, each with a source note', async (id) => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
@@ -380,20 +455,22 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       // Regression pins on a few real, hand-verified values — catches an
       // accidental reshuffle without re-deriving the whole table in the
-      // assertion. qualityScore is AA Intelligence Index v4.1.1
-      // (live-fetched 2026-08-19); costScore is computed from MODEL_PRICING.
+      // assertion. qualityScore is AA Intelligence Index v4.2
+      // (snapshot 2026-09-05); costScore is computed from MODEL_PRICING.
       it('pins Claude Opus 5 at the real AA-sourced quality / MODEL_PRICING-derived cost values', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
         const info = models.find((m) => m.id === 'anthropic.claude-opus-5')!;
-        expect(info.qualityScore).toBe(63);
+        expect(info.qualityScore).toBe(54);
         expect(info.costScore).toBe(70); // $5/$25 blended 75:25 -> $10.00/1M, log-normalized
-        expect(info.tier).toBe('pro'); // 70 falls in the 51-70 "pro" cost band
+        // 70 was the top of the old 64–70 "pro" band; ENG-1784 (2026-09-05)
+        // re-cut Flagship to ≥64 precisely so Opus 5 sits with GPT-5.6 Sol.
+        expect(info.tier).toBe('ultra_premium');
       });
 
       it('pins GPT-4o Mini (the cheapest, weakest scored model) at the real values', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
         const info = models.find((m) => m.id === 'openrouter/openai/gpt-4o-mini')!;
-        expect(info.qualityScore).toBe(7);
+        expect(info.qualityScore).toBe(1);
         expect(info.costScore).toBe(22);
         expect(info.tier).toBe('ultra_cheap'); // 22 falls in the <=30 "ultra_cheap" cost band
       });
@@ -406,10 +483,167 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         const opus5 = (agentModeService as any).llmModels['anthropic.claude-opus-5'];
         const opus48 = (agentModeService as any).llmModels['anthropic.claude-opus-4-8'];
         const opus46 = (agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'];
-        expect(opus48.qualityScore).toBe(57);
-        expect(opus46.qualityScore).toBe(45);
+        expect(opus48.qualityScore).toBe(46);
+        expect(opus46.qualityScore).toBe(31);
         expect(opus5.qualityScore).toBeGreaterThan(opus48.qualityScore);
         expect(opus48.qualityScore).toBeGreaterThan(opus46.qualityScore);
+      });
+    });
+
+    /*
+     * ENG-1784 (2026-09-05) — Harsha re-cut the picker's cost bands: "low
+     * should have everything 52 and below (very low is fine as it is now),
+     * then medium should be 57-53, then pro should be 63-58, frontier is
+     * everything above" — and, from the same conversation, "so Sol and Opus 5
+     * can be on the same tier". Live cost scores that day: Fable 5.1 / Astra
+     * 79, Sol 71, GPT-5.5 71 (legacy), Opus 5 / Opus 4.8 70, Sonnet 5 63,
+     * Terra 62, Kimi K3 61, Grok 4.6 / Qwen3.8 Max 54, Luna 50, Haiku 4.5 49,
+     * GPT-5.4 Nano 29. Only models whose prices are not known to be stale are
+     * pinned below (Terra/Luna are being re-priced under ENG-1781).
+     */
+    describe('ENG-1784 — cost bands re-cut: Frontier ≥64, Pro 58–63, Medium 53–57, Cheap 31–52', () => {
+      const tierOf = async (id: string) => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        return models.find((m) => m.id === id)!.tier;
+      };
+
+      it('puts GPT-5.6 Sol and Claude Opus 5 in the same tier — the Flagship/frontier band (AC2)', async () => {
+        const sol = await tierOf('openrouter/openai/gpt-5.6-sol');
+        expect(sol).toBe('ultra_premium');
+        expect(await tierOf('anthropic.claude-opus-5')).toBe(sol);
+      });
+
+      it('keeps GPT-6 Astra and Claude Fable 5.1 in the Flagship band (AC3)', async () => {
+        expect(await tierOf('openrouter/openai/gpt-6-astra')).toBe('ultra_premium');
+        expect(await tierOf('openrouter/anthropic/claude-fable-5.1')).toBe('ultra_premium');
+      });
+
+      it('places the band edges where Harsha drew them: Sonnet 5 (63) pro, Haiku 4.5 (49) cheap, GPT-5.4 Nano (29) very cheap', async () => {
+        expect(await tierOf('anthropic.claude-sonnet-5')).toBe('pro');
+        expect(await tierOf('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe('cheap');
+        expect(await tierOf('gpt-5.4-nano')).toBe('ultra_cheap');
+      });
+
+      // Dominance is band-rank based; re-cutting the bands must not rescue
+      // GPT-5.5 (Terra is still a cheaper band and at least as good) and must
+      // not touch Sol (no family).
+      it('leaves dominance outcomes unchanged: GPT-5.5 still legacy, Sol still not (AC4)', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        expect(models.find((m) => m.id === 'gpt-5.5')!.legacy).toBe(true);
+        expect(models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!.legacy).toBeUndefined();
+      });
+    });
+
+    /*
+     * ENG-1789 (2026-09-06) — Harsha, after ENG-1786 re-snapshotted quality
+     * scores to AA v4.2: "fable + astra are flagship, opus + 5.6 sol are pro,
+     * sonnet + 5.6 terra are mid, haiku + 5.6 luna are low." A quality-driven
+     * grouping, independent of the cost-driven `tier` field above — see
+     * `qualityTier` / `tierFromQualityScore` / `QUALITY_SCORE_BANDS`. Live
+     * v4.2 scores that day: Fable 5.1 57, Astra 55, Opus 5 54, Sol 51,
+     * Terra 47, Sonnet 5 45, Luna 43, Haiku 4.5 17. Ties resolve to the
+     * higher band (Harsha, 2026-09-06): e.g. Grok 4.6 also scores 51 and
+     * also lands in 'pro', same as Sol.
+     */
+    describe('ENG-1789 — quality bands: Flagship >=55, Pro >=51, Medium >=45, Cheap >=17', () => {
+      const qualityTierOf = async (id: string) => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        return models.find((m) => m.id === id)!.qualityTier;
+      };
+
+      it('puts Claude Fable 5.1 and GPT-6 Astra in the Flagship quality tier', async () => {
+        expect(await qualityTierOf('openrouter/anthropic/claude-fable-5.1')).toBe('ultra_premium');
+        expect(await qualityTierOf('openrouter/openai/gpt-6-astra')).toBe('ultra_premium');
+      });
+
+      it('puts Claude Opus 5 and GPT-5.6 Sol in the Pro quality tier', async () => {
+        expect(await qualityTierOf('anthropic.claude-opus-5')).toBe('pro');
+        expect(await qualityTierOf('openrouter/openai/gpt-5.6-sol')).toBe('pro');
+      });
+
+      it('puts Claude Sonnet 5 and GPT-5.6 Terra in the Medium quality tier', async () => {
+        expect(await qualityTierOf('anthropic.claude-sonnet-5')).toBe('medium');
+        expect(await qualityTierOf('openrouter/openai/gpt-5.6-terra')).toBe('medium');
+      });
+
+      it('puts Claude Haiku 4.5 and GPT-5.6 Luna in the Cheap quality tier', async () => {
+        expect(await qualityTierOf('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe('cheap');
+        expect(await qualityTierOf('openrouter/openai/gpt-5.6-luna')).toBe('cheap');
+      });
+
+      // The quality axis is independent of the cost axis: Opus 5/Sol are
+      // Flagship on cost (ENG-1784, tier: ultra_premium) but only Pro on
+      // quality (qualityTier: pro) — both fields are real and neither
+      // overrides the other.
+      it('keeps qualityTier independent of the cost-derived tier for Opus 5 and Sol', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const opus5 = models.find((m) => m.id === 'anthropic.claude-opus-5')!;
+        const sol = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!;
+        expect(opus5.tier).toBe('ultra_premium');
+        expect(opus5.qualityTier).toBe('pro');
+        expect(sol.tier).toBe('ultra_premium');
+        expect(sol.qualityTier).toBe('pro');
+      });
+    });
+
+    /*
+     * ENG-1769 (2026-09-05) — GPT-6 Astra, OpenAI's frontier release of
+     * 2026-09-03, routed through OpenRouter and BYOK-served by our own Azure
+     * resource (agentweb-openrouter-byok, deployment `gpt-6-astra`; live-
+     * confirmed provider=Azure / is_byok=true before these tests were written).
+     * Harsha: "is it possible to launch astra on agentweb now? ... go ahead".
+     * These assert the acceptance contract on the Linear issue, not the
+     * implementation: selectable by everyone, priced at Azure's rate (see
+     * llmPricing.test.ts), and NOT entangled with GPT-5.6 Sol's legacy state.
+     */
+    describe('ENG-1769 — GPT-6 Astra via Azure BYOK', () => {
+      const ASTRA = 'openrouter/openai/gpt-6-astra';
+
+      it('is registered with a clean name, the openai provider, and no access gate', () => {
+        const config = (agentModeService as any).llmModels[ASTRA];
+        expect(config).toBeDefined();
+        expect(config.name).toBe('GPT-6 Astra');
+        expect(config.provider).toBe('openai');
+        expect(config.adminOnly).toBeUndefined();
+        expect(config.internalOnly).toBeUndefined();
+        expect(config.legacy).toBeUndefined();
+      });
+
+      it('is a reasoning model: temperature unsupported, image input supported (live image call via the describe_image base64 data-URL shape, 2026-09-05)', () => {
+        const config = (agentModeService as any).llmModels[ASTRA];
+        expect(config.supportsTemperature).toBe(false);
+        expect(config.supportsVision).toBe(true);
+      });
+
+      it('carries a sourced Artificial Analysis quality score', () => {
+        const config = (agentModeService as any).llmModels[ASTRA];
+        expect(config.qualityScore).toBe(55);
+        expect(config.qualityScoreSource).toMatch(/Artificial Analysis/);
+      });
+
+      it('is offered to a non-admin caller (AC1)', async () => {
+        const models = await agentModeService.getSupportedModels(false);
+        expect(models).toContain(ASTRA);
+      });
+
+      it('lands in the ultra_premium cost band, above GPT-5.6 Sol, from the $10/$50 Azure rate (AC2)', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const astra = models.find((m) => m.id === ASTRA)!;
+        const sol = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!;
+        expect(astra.tier).toBe('ultra_premium');
+        expect(astra.costScore!).toBeGreaterThan(sol.costScore!);
+      });
+
+      // Astra is stronger than Sol on v4.2 (55 vs 51), but these distinct
+      // product lines must not auto-retire each other.
+      // Enforced structurally — Astra carries no `family` (same treatment as
+      // Sol itself and Kimi K3), so the dominance rule never compares them.
+      it('does not flip GPT-5.6 Sol to legacy, and is not legacy itself (AC3)', async () => {
+        const config = (agentModeService as any).llmModels[ASTRA];
+        expect(config.family).toBeUndefined();
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        expect(models.find((m) => m.id === ASTRA)!.legacy).toBeUndefined();
+        expect(models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!.legacy).toBeUndefined();
       });
     });
 
@@ -431,21 +665,21 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * guard.
      */
     describe('2026-08-19 — same-family dominance auto-legacy', () => {
-      // Originally this asserted Luna dominates Nano (same cost band, higher
-      // quality) — that used OpenRouter's own marketplace price for Luna.
-      // Luna is BYOK-routed to our Azure resource (agentweb-openrouter-byok,
-      // confirmed live), so we're actually billed Azure's list rate
-      // ($1.00/$6.00), not OpenRouter's. At that real price Luna's cost band
-      // moves up from 'ultra_cheap' to 'cheap' — no longer the same band as
-      // Nano, so dominance correctly no longer fires. Higher quality alone
-      // doesn't dominate; it has to be same-or-cheaper too.
-      it('does NOT flag GPT-5.4 Nano as legacy — GPT-5.6 Luna is pricier at Azure BYOK rates, not the same cost band', async () => {
+      // 2026-09-05 (ENG-1781): re-flipped back. The Azure BYOK price used
+      // above ($1.00/$6.00) was itself stale — Azure cut Luna 80% on
+      // 2026-07-30 and the pricing table was never updated. At the
+      // corrected Azure rate ($0.20/$1.20) Luna's cost score drops to 29,
+      // landing back in the same 'ultra_cheap' band as Nano (29) — this is
+      // Harsha's original 2026-08-19 intent restored on real numbers: Luna
+      // is genuinely real GPT-5.6 reasoning at Nano's price, so Nano is
+      // correctly dominated again.
+      it('flags GPT-5.4 Nano as legacy — GPT-5.6 Luna is same cost band at the corrected Azure BYOK rate and strictly higher quality', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         const nano = models.find((m) => m.id === 'gpt-5.4-nano')!;
         const luna = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-luna')!;
-        expect(nano.tier).not.toBe(luna.tier);
+        expect(nano.tier).toBe(luna.tier);
         expect(luna.qualityScore).toBeGreaterThan(nano.qualityScore!);
-        expect(nano.legacy).toBeUndefined();
+        expect(nano.legacy).toBe(true);
       });
 
       it('flags the far-weaker, same-band GPT-4o Mini as legacy too (dominated by GPT-5.4 Nano)', async () => {

@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
-import { agentModeService, AgentModeService } from '../services/agentModeService';
+import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch } from '../services/agentModeService';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
 import { computeSessionModelAttribution } from '../utils/sessionModelAttribution';
@@ -31,6 +31,7 @@ import { cronJobRegistry } from '../utils/cronJobRegistry';
 import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
 import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, hasUnmetPublishRequirement, classifyPublishStall } from '../utils/publishPressCircuitBreaker';
 import { MAX_READ_ONLY_PRESS_ATTEMPTS, isReadOnlyOnlyUnmet, shouldStopPressingForReadOnly } from '../utils/readOnlyPressCircuitBreaker';
+import { MAX_SEND_PRESS_ATTEMPTS, isSendOnlyUnmet, shouldStopPressingForSend } from '../utils/sendPressCircuitBreaker';
 import { isReadOnlyToolName, isWriteToolCall } from '../utils/toolWriteClassification';
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
@@ -40,6 +41,7 @@ import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { ACCOUNT_DISCONNECTED_STATUS, MAX_CONSECUTIVE_ACCOUNT_SKIPS, AccountGateResult, buildAccountSkipReason, countTrailingAccountSkips, evaluateAccountGate } from '../utils/scheduledRunAccountGate';
+import { CapacityGateResult, SEND_CAPACITY_EXHAUSTED_STATUS, buildCapacitySkipReason, evaluateCapacityGate } from '../utils/scheduledRunCapacityGate';
 import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
@@ -613,13 +615,15 @@ export interface ScheduleRunHealth {
   // Widened to the statuses runScheduledChat can actually store: computeScheduleRunHealth
   // forwards `last.status` verbatim, so any status the run path writes can appear here.
   // 'skipped_no_content' (ENG-1259) already exceeded the old union; 'skipped_account_disconnected'
-  // (ENG-1197) would have been the second.
+  // (ENG-1197) would have been the second, and 'skipped_send_capacity_exhausted' (ENG-1717)
+  // the third.
   lastRunStatus:
     | 'success'
     | 'failure'
     | 'pending_user_input'
     | 'skipped_no_content'
     | 'skipped_account_disconnected'
+    | 'skipped_send_capacity_exhausted'
     | null;
   lastRunAt: string | null;
   // Failures counted back from the MOST RECENT run, stopping at the first non-failure.
@@ -3524,7 +3528,33 @@ type RunVerifiedChatResult = {
   // a read-only tool carries no external write, so a schedule's own deliverable
   // can be complete and correct even though this one minimum stayed unmet.
   readOnlyRequirementWaived?: boolean;
+  // ENG-1715: set when the run spent its send-press budget with a send requirement
+  // (per isSendName — linkedin_outreach, send_email, …) still unmet, and stopped
+  // instead of re-pressing to maxAttempts. Like the publish markers and UNLIKE
+  // readOnlyRequirementWaived, the run still FAILED: a send that did not happen is
+  // real work left undone, so nothing is waived here. This only records WHY it
+  // ended early.
+  sendPressExhausted?: boolean;
 };
+
+// ENG-1811: is this work plan ACTUALLY finished -- every step terminal AND no
+// outstanding debt from a removed step's required function call that never
+// genuinely succeeded (workPlan.pendingRequiredFunctionCalls, resolved against
+// real calledFunctions, not just "does anything remain marked pending").
+// Inlined here (rather than calling AgentModeService.isWorkPlanFullyResolved)
+// because ~150 test files in this suite mock '../services/agentModeService' as
+// a bare { agentModeService: {...} } object with no AgentModeService class
+// export -- depending on that class from this heavily-mocked controller file
+// breaks any of them that happen to exercise this retry loop.
+function workPlanCompletedWithoutDebt(workPlan: any, calledFunctions?: Record<string, number>): boolean {
+  if (!workPlan || !Array.isArray(workPlan.steps)) return true;
+  const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+  if (!allStepsTerminal) return false;
+  const called = calledFunctions || {};
+  const unresolvedPendingDebt = (workPlan.pendingRequiredFunctionCalls || [])
+    .filter((fn: string) => (called[fn] || 0) === 0);
+  return unresolvedPendingDebt.length === 0;
+}
 
 // Common function to run verified chat with work plan, keywords, and function call verification
 // Used by both scheduled chat and verified-generate
@@ -3710,6 +3740,11 @@ async function runVerifiedChatInner(
   // TYPE because a run can pass through the publish-only-unmet state and the
   // read-only-only-unmet state at different points as requirements clear.
   let readOnlyPressAttempts = 0;
+  // ENG-1715: third press counter, same reasoning as the two above. Mutually
+  // exclusive with both by construction — the send-only gate below is suppressed
+  // when the publish gate claims the turn, and no name is both a send and
+  // read-only — so at most one of the three increments per attempt.
+  let sendPressAttempts = 0;
   let allContent = '';
   const allToolCalls: any[] = [];
   const sessionForModel = await chatbotDb.getChatSession(sessionId);
@@ -4167,7 +4202,7 @@ async function runVerifiedChatInner(
         // Check work plan status
         const session = await chatbotDb.getChatSession(sessionId);
         const workPlan = session?.workPlan;
-        const workPlanCompleted = workPlan && workPlan.steps.every((step: any) => step.status === 'completed' || step.status === 'skipped');
+        const workPlanCompleted = workPlan && workPlanCompletedWithoutDebt(workPlan, session?.calledFunctions);
 
         if (workPlan && !workPlanCompleted) {
           // Remind to complete pending steps
@@ -4247,7 +4282,7 @@ async function runVerifiedChatInner(
 
       // Check work plan status
       const workPlan = response.workPlan;
-      const workPlanCompleted = workPlan && workPlan.steps.every((step: any) => step.status === 'completed' || step.status === 'skipped');
+      const workPlanCompleted = workPlan && workPlanCompletedWithoutDebt(workPlan, response.calledFunctions);
 
       // Only evaluate keywords and function calls if work plan is completed or doesn't exist
       let keywordMatches: string[] = [];
@@ -4433,6 +4468,27 @@ async function runVerifiedChatInner(
       if (readOnlyIsTheOnlyThingLeft) {
         readOnlyPressAttempts++;
       }
+      // ENG-1715: sibling gate for a stalled SEND requirement (linkedin_outreach,
+      // send_email, …) — the class that is neither publish nor read-only and so had
+      // no breaker at all, taking the full 20-attempt press.
+      //
+      // Suppressed when the publish gate has already claimed this turn. The two
+      // classifiers do not overlap by name, but `publishIsTheOnlyThingLeft` also
+      // fires via the ENG-930 branch (a genuinely withheld publish whose requirement
+      // was excluded from scope), and THAT can be true while `functionCallMisses`
+      // holds only a send — a schedule requiring both a publish and a send. Publish
+      // wins there: it carries the richer verdict and the larger budget, and letting
+      // both counters advance on one turn would spend two budgets for one press.
+      const sendIsTheOnlyThingLeft =
+        !publishIsTheOnlyThingLeft &&
+        completionGate &&
+        !allFunctionCallsMet &&
+        allKeywordsMet &&
+        (!workPlan || workPlanCompleted) &&
+        isSendOnlyUnmet(functionCallMisses);
+      if (sendIsTheOnlyThingLeft) {
+        sendPressAttempts++;
+      }
       // A stalled publish requirement has three causes and they need different
       // things from the owner, so the marker must not conflate them. Only
       // SUCCEEDED external writes count as evidence the run published — a failed
@@ -4526,6 +4582,54 @@ async function runVerifiedChatInner(
             : toolFailing
             ? { publishToolFailing: true }
             : { publishRequirementMismatch: true }),
+          content: allContent,
+          toolCalls: allToolCalls,
+          keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+          keywordMisses: remainingKeywords,
+          functionCallMatches,
+          functionCallMisses,
+          functionStatus: requiredFunctions.map((reqFunc) => {
+            const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
+            return {
+              functionName: reqFunc.functionName,
+              requiredCount: reqFunc.minCount,
+              actualCount,
+              met: actualCount >= reqFunc.minCount,
+            };
+          }),
+          attempts: attempt,
+          workPlanCompleted: workPlanCompleted || !workPlan,
+        };
+      }
+
+      // ENG-1715: the send press circuit breaker. Checked BEFORE the read-only
+      // breaker below, deliberately: read-only WAIVES its requirement and returns
+      // `success: true`, and a send that did not happen must never be waived that
+      // way. The two cannot both fire today (no name is both a send and read-only,
+      // pinned by a drift-guard test), so the ordering is a guarantee against a
+      // future classifier change, not a live tie-break.
+      //
+      // Like the read-only case there is no "why" to classify — a send has no
+      // "held for approval" or "wrote through an equivalent route" nuance — so a
+      // send-only-unmet stall has exactly one outcome (stop) once the budget is
+      // spent. Unlike it, the run is still a FAILURE with the requirement named:
+      // this changes only how much is spent reaching that verdict.
+      if (
+        sendIsTheOnlyThingLeft &&
+        shouldStopPressingForSend({ pressAttempt: sendPressAttempts, unmetRequiredFunctions: functionCallMisses })
+      ) {
+        console.warn(
+          `AgentMode runVerifiedChat: session ${sessionId} spent its send-press budget ` +
+          `(${sendPressAttempts}/${MAX_SEND_PRESS_ATTEMPTS} press attempts, ${attempt} attempts overall) ` +
+          `with [${functionCallMisses.join(', ')}] still unmet. Ending the run instead of re-pressing to ` +
+          `${maxAttempts} attempts — a send refused by an account-level cooldown or a daily pacing cap ` +
+          `will be refused identically on every later attempt in this run, and pressing an irreversible ` +
+          `external send that the run has already correctly stopped attempting risks a duplicate contact ` +
+          `to a real person on an account the provider is already throttling (ENG-1715).`
+        );
+        return {
+          success: false,
+          sendPressExhausted: true,
           content: allContent,
           toolCalls: allToolCalls,
           keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
@@ -4883,6 +4987,55 @@ async function evaluateLinkedInAccountGate(
 }
 
 /**
+ * Wiring only — the decision lives in `scheduledRunCapacityGate.evaluateCapacityGate`
+ * (ENG-1717), same split as the ENG-1197 account gate above.
+ *
+ * Reads own AND org-shared accounts, because `resolveLinkedInAccountForWrite` lets a
+ * write route through either; judging on own-only would withhold a run that a shared
+ * account could still have completed.
+ *
+ * The pending-invitation count is best-effort: it is REPORTED in the skip reason but
+ * never decides the verdict (LinkedIn publishes no pending cap to compare it
+ * against), so a failed count must not cost us the gate. It is fetched only for
+ * accounts that are already out of daily budget, so the common path pays nothing.
+ */
+async function evaluateLinkedInCapacityGate(
+  schedule: any,
+  userId: string,
+): Promise<CapacityGateResult> {
+  const gate = await evaluateCapacityGate(schedule, userId, {
+    listUsableAccounts: async (uid) => {
+      const { getAccountsWithOwnerIncludingOrgShared } = await import('../services/connectedAccountsDb');
+      const { remainingDailyInvites } = await import('../services/linkedInWritePacer');
+      return (await getAccountsWithOwnerIncludingOrgShared(uid))
+        .filter((acc: any) => acc.platform === 'unipile')
+        .map((acc: any) => ({
+          account_id: acc.account_id,
+          account_name: acc.account_name,
+          config: acc.config,
+          // Pure arithmetic over already-loaded config — no I/O per account.
+          headroom: remainingDailyInvites(acc?.config?.daily_invite_cap, acc?.config?.daily_volume),
+        }));
+    },
+  });
+
+  // Pending counts are for the REPORT only — they never decide the verdict, since
+  // LinkedIn publishes no pending cap to compare them against. Fetched here, after
+  // the decision, so a passing run pays nothing and a failed count cannot cost us
+  // the gate.
+  if (!gate.blocked) return gate;
+  const { countSentInvitationsByAccount } = await import('../services/unipileSentInvitationsDb');
+  const accounts = await Promise.all(gate.accounts.map(async (acc) => ({
+    ...acc,
+    pendingCount: await countSentInvitationsByAccount(acc.account_id).catch((err) => {
+      console.error(`[capacityGate] pending count unavailable for ${acc.account_id}:`, err);
+      return null;
+    }),
+  })));
+  return { ...gate, accounts };
+}
+
+/**
  * Stop a schedule that has now been skipped for a disconnected account this many
  * times in a row. Best-effort and loudly logged: failing to pause leaves the
  * schedule skipping cheaply, which is a tolerable end state, so this must never
@@ -5055,7 +5208,17 @@ export async function runScheduledChat(
   // LinkedIn account the schedule pins has no live session, so the run cannot do
   // the thing it exists to do. Kept separate from 'skipped_no_content' because the
   // remedy is a customer reconnect, not a prompt or cadence change.
-  status: 'success' | 'failure' | 'pending_user_input' | 'skipped_no_content' | 'skipped_account_disconnected';
+  // ENG-1717: 'skipped_send_capacity_exhausted' also exits before the model, but for a
+  // condition that resolves ITSELF — the account's daily invite budget is spent and
+  // renews within 24h. Separate from 'skipped_account_disconnected' precisely because
+  // it needs no customer action, so it must never drive a reconnect prompt or a pause.
+  status:
+    | 'success'
+    | 'failure'
+    | 'pending_user_input'
+    | 'skipped_no_content'
+    | 'skipped_account_disconnected'
+    | 'skipped_send_capacity_exhausted';
   passed: boolean;
   actualResponse: string;
   actualFunctionCalls: string[];
@@ -5084,6 +5247,11 @@ export async function runScheduledChat(
   // budget with a read-only tool still uncalled. Unlike the publish markers
   // above, this is a SUCCESSFUL run — no external write was left undone.
   readOnlyRequirementWaived?: boolean;
+  // ENG-1715: present only when the run stopped early on the send-press budget
+  // with a send tool (linkedin_outreach, send_email, …) still under-called. A
+  // `failure`, like the publish markers and unlike readOnlyRequirementWaived —
+  // the contact never went out.
+  sendPressExhausted?: boolean;
 }> {
   const now = new Date();
   let sessionId: string = '';
@@ -5564,6 +5732,53 @@ export async function runScheduledChat(
         await pauseScheduleForDisconnectedAccount(schedule, userId, trailingSkips + 1, accountGate);
       }
       return skipResult;
+    }
+
+    // ENG-1717 (ENG-1609 AC #9): the account is connected, but may have no daily
+    // invite budget left — in which case every send this run attempts is already
+    // proven to be refused. Withhold the run instead of spending it discovering
+    // that one recipient at a time.
+    //
+    // Runs for a TEST too, unlike the disconnect gate above: AC #9 says
+    // "scheduled/test run", and the run that opened ENG-1132 (iTrials, 2026-08-26)
+    // was itself a test run that burned 5 of 7 sends on the same condition.
+    //
+    // A resuming parked run is still excluded — it is mid-flight work whose
+    // remaining steps may not be sends at all.
+    const capacityGate = isResumingParkedRun
+      ? { blocked: false, accounts: [] }
+      : await evaluateLinkedInCapacityGate(schedule, userId);
+    if (capacityGate.blocked) {
+      console.log(
+        `runScheduledChat: schedule ${schedule.scheduleId} skipped before invoking the model — `
+        + `no daily LinkedIn invite budget on ${capacityGate.accounts.map((a) => a.account_id).join(', ')}`,
+      );
+      const capacitySkipResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: SEND_CAPACITY_EXHAUSTED_STATUS,
+        passed: false,
+        actualResponse: buildCapacitySkipReason(capacityGate.accounts),
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: Date.now() - now.getTime(),
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, capacitySkipResult);
+      } catch (saveError) {
+        console.error(`Error saving capacity-gate skip result for schedule ${schedule.scheduleId}:`, saveError);
+      }
+      // Deliberately NO pause and NO email, unlike the disconnect gate. A daily cap
+      // renews within 24 hours by construction, so this schedule is already
+      // self-healing; pausing it would be a defect, and mailing the owner every time
+      // a safety limit worked as intended is noise, not a signal.
+      return capacitySkipResult;
     }
 
     // ENG-657: resume path. When the reconciler marked this schedule to resume an
@@ -6358,6 +6573,13 @@ export async function runScheduledChat(
       // either: reporting it as held-for-approval sends them to an approval queue
       // that is empty, when what they need is to reconnect the account.
       ...(result.publishToolFailing ? { publishToolFailing: true } : {}),
+      // ENG-1715: the run ended early because its send-press budget ran out with a
+      // send requirement still under-called — an account-level cooldown or pacing
+      // cap stopped it, and re-pressing an irreversible external send would only
+      // risk a duplicate contact. Still a `failure` (the sends did not happen, so
+      // the streak/oncall escalation must keep firing), marked so it is
+      // distinguishable from a run that exhausted all 20 attempts some other way.
+      ...(result.sendPressExhausted ? { sendPressExhausted: true } : {}),
     };
     const scheduledChatFailureDescription =
       `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\n` +
@@ -7460,6 +7682,10 @@ export async function generateSessionResponse(
   sources: string[];
   responseMessages: any[];
   workPlan?: any;
+  // ENG-1811: raw session.calledFunctions snapshot alongside workPlan, so a caller
+  // checking "is the plan done" can resolve pendingRequiredFunctionCalls debt against
+  // real call history instead of inferring completion from step status alone.
+  calledFunctions?: Record<string, number>;
   skills?: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[];
   // ENG-244: true when the underlying run exhausted its step budget (maxIterations)
   // and was truncated before emitting the final deliverable. The scheduled-run
@@ -7824,6 +8050,7 @@ export async function generateSessionResponse(
   return {
     ...response,
     workPlan: finalSession?.workPlan,
+    calledFunctions: finalSession?.calledFunctions,
     skills
   };
 }
@@ -12998,8 +13225,12 @@ export const agentModeController = {
       // private plan takes priority over a system/public plan with the same title
       const allPlans = [...userPrivatePlans.map(mapPlan), ...publicPlans.map(mapPlan)];
       const seen = new Set<string>();
+      // ENG-1802: normalize separators/case (not just case) so two templates whose
+      // titles differ only by underscore/hyphen-vs-space or case still dedupe to one
+      // entry, matching the same normalization applyPredefinedWorkPlan already uses
+      // to resolve a title (ENG-1794).
       const deduped = allPlans.filter(p => {
-        const key = p.title.toLowerCase();
+        const key = normalizeWorkPlanTitleForMatch(p.title);
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
@@ -13046,7 +13277,10 @@ export const agentModeController = {
 
       // Find work plan with matching title (case-insensitive) — private plans checked first
       const workPlan = allPlans.find((wp) =>
-        wp.title && wp.title.toLowerCase() === planTitle.toLowerCase()
+        // ENG-1802: separator/case-insensitive match (not just case), mirroring
+        // applyPredefinedWorkPlan's normalization (ENG-1794) -- a title typed with
+        // spaces must resolve against a stored underscore-joined title.
+        wp.title && normalizeWorkPlanTitleForMatch(wp.title) === normalizeWorkPlanTitleForMatch(planTitle)
       );
 
       if (!workPlan) {
@@ -13119,7 +13353,10 @@ export const agentModeController = {
 
       // Find work plan with matching title (case-insensitive) — private plans checked first
       const predefinedPlan = allPlans.find((wp) =>
-        wp.title && wp.title.toLowerCase() === planTitle.toLowerCase()
+        // ENG-1802: separator/case-insensitive match (not just case), mirroring
+        // applyPredefinedWorkPlan's normalization (ENG-1794) -- a title typed with
+        // spaces must resolve against a stored underscore-joined title.
+        wp.title && normalizeWorkPlanTitleForMatch(wp.title) === normalizeWorkPlanTitleForMatch(planTitle)
       );
 
       if (!predefinedPlan) {

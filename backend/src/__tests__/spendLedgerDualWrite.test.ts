@@ -1,0 +1,218 @@
+/**
+ * Tests for the ENG-1250 §9 observe-only dual-write.
+ *
+ * What matters here: the shadow row agrees with the row it mirrors (or the
+ * whole reconciliation is noise), unpriced calls never become $0 spend, and a
+ * failure can never escape into the metering path.
+ */
+jest.mock('../services/spendEventDb', () => ({
+  recordSpendEvent: jest.fn(),
+}));
+
+import {
+  VendorUsageMirrorInput,
+  buildShadowEvent,
+  isDualWriteEnabled,
+  mirrorVendorUsage,
+  resolveRateProvenance,
+} from '../services/spendLedgerDualWrite';
+import { recordSpendEvent } from '../services/spendEventDb';
+import { VENDOR_RATE_CARD_VERSION } from '../utils/vendorRateCard';
+
+const mockRecord = recordSpendEvent as jest.Mock;
+const AT = '2026-09-07T10:00:00.000Z';
+
+const anInput = (over: Partial<VendorUsageMirrorInput> = {}): VendorUsageMirrorInput => ({
+  userId: 'user-1',
+  provider: 'you.com',
+  operation: 'query',
+  feature: 'agent-search',
+  unit: 'query',
+  quantity: 1,
+  costSource: 'allocated',
+  costUsd: 0.0125,
+  ...over,
+});
+
+describe('spendLedgerDualWrite', () => {
+  const originalEnv = process.env.SPEND_LEDGER_DUAL_WRITE;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    delete process.env.SPEND_LEDGER_DUAL_WRITE;
+    mockRecord.mockImplementation(async (event) => ({ stored: true, event }));
+  });
+  afterAll(() => {
+    if (originalEnv === undefined) delete process.env.SPEND_LEDGER_DUAL_WRITE;
+    else process.env.SPEND_LEDGER_DUAL_WRITE = originalEnv;
+  });
+
+  describe('kill switch', () => {
+    it('defaults ON so shadow evidence actually accumulates', () => {
+      expect(isDualWriteEnabled()).toBe(true);
+    });
+
+    it('is disabled only by the exact string "false"', () => {
+      process.env.SPEND_LEDGER_DUAL_WRITE = 'false';
+      expect(isDualWriteEnabled()).toBe(false);
+      process.env.SPEND_LEDGER_DUAL_WRITE = 'true';
+      expect(isDualWriteEnabled()).toBe(true);
+      process.env.SPEND_LEDGER_DUAL_WRITE = '0';
+      expect(isDualWriteEnabled()).toBe(true);
+    });
+
+    it('writes nothing when disabled', async () => {
+      process.env.SPEND_LEDGER_DUAL_WRITE = 'false';
+
+      await expect(mirrorVendorUsage(anInput(), AT)).resolves.toEqual({ status: 'skipped', reason: 'disabled' });
+      expect(mockRecord).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('the shadow row agrees with the row it mirrors', () => {
+    // If these two roundings ever diverge, every §8 comparison reports drift
+    // that is really one number rounded two ways. The cases below are chosen to
+    // DISCRIMINATE: 0.0495 rounds and floors identically, so it would pass
+    // against the wrong implementation and prove nothing.
+    it.each([
+      [0.0495, 49500],
+      [0.0000125, 13], // rounds up; a floor would give 12
+      [0.0000004, 0],
+      [-0.5, 0], // clamped, not carried through as negative money
+    ])('uses the SAME micro-dollar arithmetic as recordVendorUsage: $%s -> %s micro', (costUsd, expected) => {
+      const built = buildShadowEvent(anInput({ costUsd }), AT) as { event: any };
+
+      expect(built.event.costMicroUsd).toBe(Math.max(0, Math.round((costUsd || 0) * 1e6)));
+      expect(built.event.costMicroUsd).toBe(expected);
+    });
+
+    it('resolves the billing subject the same way (billingUserId || userId || system)', () => {
+      const explicit = buildShadowEvent(anInput({ userId: 'u', billingUserId: 'owner' }), AT) as { event: any };
+      expect(explicit.event).toMatchObject({ billingUserId: 'owner', actingUserId: 'u' });
+      // Passed through, NOT derived from payer != actor the way the charging
+      // service derives it. Shadow parity is the goal here: recordVendorUsage
+      // only writes onBehalfOf when its caller supplied one, so deriving it
+      // would make the two rails disagree on rows that are otherwise identical.
+      expect(explicit.event.onBehalfOf).toBeUndefined();
+
+      const fallback = buildShadowEvent(anInput({ userId: 'u', billingUserId: undefined }), AT) as { event: any };
+      expect(fallback.event.billingUserId).toBe('u');
+
+      const system = buildShadowEvent(anInput({ userId: undefined, billingUserId: undefined }), AT) as { event: any };
+      expect(system.event.billingUserId).toBe('system');
+    });
+
+    it('carries onBehalfOf and sessionId through', () => {
+      const built = buildShadowEvent(anInput({ onBehalfOf: 'member-2', sessionId: 's-9' }), AT) as { event: any };
+
+      expect(built.event.onBehalfOf).toBe('member-2');
+      expect(built.event.references).toEqual({ sessionId: 's-9' });
+    });
+
+    it('records settled, not reserved — the vendor call already happened', () => {
+      const built = buildShadowEvent(anInput(), AT) as { event: any };
+      expect(built.event.lifecycle).toBe('settled');
+    });
+
+    it('derives billingMonth from the same instant', () => {
+      const built = buildShadowEvent(anInput(), '2026-01-31T23:59:59.999Z') as { event: any };
+      expect(built.event.billingMonth).toBe('2026-01');
+    });
+  });
+
+  describe('unpriced calls', () => {
+    it('are skipped, never written as $0 spend', async () => {
+      const built = buildShadowEvent(anInput({ costSource: 'unpriced', costUsd: undefined }), AT);
+
+      expect(built).toEqual({ skip: 'unpriced' });
+      await expect(mirrorVendorUsage(anInput({ costSource: 'unpriced' }), AT)).resolves.toEqual({
+        status: 'skipped',
+        reason: 'unpriced',
+      });
+      expect(mockRecord).not.toHaveBeenCalled();
+    });
+
+    it('a priced $0 call IS still recorded — zero from a known rate is real', async () => {
+      await mirrorVendorUsage(anInput({ costSource: 'allocated', costUsd: 0 }), AT);
+
+      expect(mockRecord).toHaveBeenCalledTimes(1);
+      expect(mockRecord.mock.calls[0][0].costMicroUsd).toBe(0);
+    });
+  });
+
+  describe('rate provenance (§5)', () => {
+    it('stamps the card version when the card can price it', () => {
+      expect(resolveRateProvenance('you.com', 'query')).toBe(VENDOR_RATE_CARD_VERSION);
+      expect(resolveRateProvenance('apollo', 'email_reveal')).toBe(VENDOR_RATE_CARD_VERSION);
+    });
+
+    it('does NOT claim the card priced X/Twitter, which it deliberately excludes', () => {
+      // ENG-703 scope note: X rates live in twitterPricing.ts, not the card.
+      expect(resolveRateProvenance('twitter', 'post_read')).toBe('caller:twitter');
+    });
+
+    it('omits the version entirely for a vendor-measured cost', () => {
+      const built = buildShadowEvent(anInput({ costSource: 'measured' }), AT) as { event: any };
+      expect(built.event.rateCardVersion).toBeUndefined();
+    });
+
+    it('always sets a version for an allocated cost, so the event is never unattributable', () => {
+      const carded = buildShadowEvent(anInput({ provider: 'you.com', operation: 'query' }), AT) as { event: any };
+      const uncarded = buildShadowEvent(anInput({ provider: 'twitter', operation: 'post_read' }), AT) as { event: any };
+
+      expect(carded.event.rateCardVersion).toBeTruthy();
+      expect(uncarded.event.rateCardVersion).toBeTruthy();
+    });
+  });
+
+  describe('idempotency', () => {
+    it('uses a call-site token when one is supplied', () => {
+      const built = buildShadowEvent(anInput({ idempotencyKey: 'vendor-req-42' }), AT) as { event: any };
+      expect(built.event.eventId).toBe('vendor-req-42');
+    });
+
+    it('generates a marked id when none is — retries duplicate, matching the live rail', () => {
+      const a = buildShadowEvent(anInput(), AT) as { event: any };
+      const b = buildShadowEvent(anInput(), AT) as { event: any };
+
+      expect(a.event.eventId).toMatch(/^gen:/);
+      expect(a.event.eventId).not.toBe(b.event.eventId);
+    });
+
+    it('reports a replayed token as duplicate rather than a second charge', async () => {
+      mockRecord.mockResolvedValue({ stored: false, event: { eventId: 'vendor-req-42' } });
+
+      const result = await mirrorVendorUsage(anInput({ idempotencyKey: 'vendor-req-42' }), AT);
+
+      expect(result.status).toBe('duplicate');
+    });
+  });
+
+  describe('fail-open', () => {
+    it('never throws when the ledger write fails', async () => {
+      mockRecord.mockRejectedValue(new Error('DynamoDB is down'));
+
+      await expect(mirrorVendorUsage(anInput(), AT)).resolves.toEqual({
+        status: 'failed',
+        reason: 'DynamoDB is down',
+      });
+    });
+
+    it('never throws even when building the event itself blows up', async () => {
+      // The whole function is inside its try, not just the store call. It runs
+      // fire-and-forget from a hot metering path, so a rejection escaping it
+      // becomes an unhandled promise rejection and takes the process down --
+      // the shadow ledger killing the rail it observes.
+      await expect(mirrorVendorUsage(anInput(), null as unknown as string)).resolves.toMatchObject({
+        status: 'failed',
+      });
+      expect(mockRecord).not.toHaveBeenCalled();
+    });
+
+    it('never throws when the event is rejected as invalid', async () => {
+      mockRecord.mockRejectedValue(new Error('billingMonth disagrees with occurredAt'));
+
+      await expect(mirrorVendorUsage(anInput(), AT)).resolves.toMatchObject({ status: 'failed' });
+    });
+  });
+});

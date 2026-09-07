@@ -2948,6 +2948,136 @@ Use this to quickly diagnose a client's marketing funnel completeness.`,
   }
 });
 
+mcpToolRegistry.register({
+  name: 'check_account_tracking_health',
+  definition: {
+    name: 'check_account_tracking_health',
+    description: `Check Meta pixel/CAPI health and destination-URL coverage for a specific client's ad account. Admin-only tool, read-only — never sends a real alert, always runs in dry-run mode against this one account.
+
+Resolves the client (email or name) to their Meta ad account via the same lookup assess_client_health uses, then runs the tracking-integrity check scoped to that one account only.
+
+Returns:
+- 'summary': aggregate counts (blackouts, tokenErrors, fetchErrors, healthy, destinationAlerts, destinationOk, etc.) — since this call is scoped to exactly one account, a nonzero count on any of these describes THIS account, not a fleet-wide total.
+- 'summary.capturedAlerts': the specific findings that would have alerted, each with a subject, message, and structured context — this is the actual evidence (which pixel, which destination check, why) behind the aggregate counts above.
+
+Use this to check "is the pixel broken" / "is CAPI deployed" / "does this ad's destination actually carry a pixel this account owns" BEFORE concluding a lead-volume or CTR/CPM anomaly is caused by tracking failure rather than a genuine performance issue — the same reasoning monitor_lead_volume's 'requiresTrackingValidation' field already points here for.
+
+If the client has no connected Meta ad account, this returns an error rather than a health result — check assess_client_health first if account connectivity itself is in question.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const healthData: any = await mcpFetch({
+      method: 'GET',
+      path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    if (!healthData?.success || !healthData?.health?.client?.userId) {
+      return jsonResult({ success: false, error: healthData?.message || `Could not resolve client "${args.client_name_or_email}"` });
+    }
+    const userId = healthData.health.client.userId;
+    const adAccountId = healthData.health.ads_layer?.ad_account_id;
+    if (!adAccountId) {
+      return jsonResult({ success: false, error: `Client "${args.client_name_or_email}" has no connected Meta ad account — nothing to check.` });
+    }
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/admin/tracking-monitor/run',
+      context: ctx(context),
+      body: { dryRun: true, userId, adAccountId },
+    });
+    return jsonResult({ success: true, client: healthData.health.client, ...data });
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'diagnose_leads_at_zero',
+  definition: {
+    name: 'diagnose_leads_at_zero',
+    description: `Discriminate between look-alike causes for a client's "leads at zero" symptom, per connected Meta ad account. Admin-only, read-only.
+
+Evaluates five causes — pixel_capi_broken, landing_page_unreachable, budget_exhausted, genuine_demand_drop, normal_variance — using monitor_lead_volume and the tracking-health sweep as evidence, and applies a strict discrimination gate: 'determined' is only returned when exactly one cause has DIRECT supporting evidence and every other checkable cause has been ruled out. 'budget_exhausted' has no evidence source anywhere in this system today and is always reported as 'unchecked'. 'genuine_demand_drop' can be ruled out but never confirmed here either — a real drought requires a Conversion Tracking Validator pass this tool cannot run, so it stops at 'unchecked' rather than a confident but unvalidated 'supported'. Neither blocks a determined diagnosis on a different, well-evidenced cause — both are always disclosed.
+
+⚠ When the result is 'could_not_determine', do NOT pick a cause anyway and do NOT recommend an action — report it as an honest diagnosis gap, listing which causes remain live/unchecked. A confidently wrong diagnosis is worse than an honest "could not determine" — this is the one thing this tool must never be used to work around.
+
+Returns one diagnosis per connected Meta ad account, each with: outcome ('determined'|'could_not_determine'), concludedCause (null unless determined), causes (every cause evaluated, with its verdict and evidence — always read this, not just the top-line outcome), and reason (populated only when could_not_determine).`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/l2-diagnose/leads-at-zero/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'monitor_lead_volume',
+  definition: {
+    name: 'monitor_lead_volume',
+    description: `Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool.
+
+Trigger is distribution-aware, not a fixed day count: a campaign is flagged only when its trailing 7-day lead average falls below its OWN 5th-percentile historical floor. A campaign needs at least 14 days of baseline history (excluding the trailing window) before it can be flagged at all — with less, status is 'insufficient_history', not 'normal' or 'drought'.
+
+⚠ A flagged campaign ('status': 'drought') is NOT a confirmed drought — 'requiresTrackingValidation' is always true on that verdict, and you MUST run Conversion Tracking Validator on the same client before reporting it as a real issue. Pixel/CAPI breakage produces the same signal as a genuine lead collapse, and this tool cannot distinguish them.
+
+⚠ The response also includes 'unattributedContext' and 'totalUnattributedLeads' at the ACCOUNT level, separate from every campaign's own totals. A nonzero unattributed count is normal (not every ad carries a matchable UTM) — NEVER read it as evidence any specific campaign's volume collapsed, and never subtract it from a campaign's lead total.
+
+Returns one report per connected Meta ad account for the client.
+
+⚠ If the response has 'truncated': true, the underlying data read was cut short and every verdict in this response (including 'normal' ones) may be based on incomplete history — narrow the since/until window and retry rather than reporting any of it as final.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        },
+        since: {
+          type: 'string',
+          description: 'Optional window start, YYYY-MM-DD. Defaults to 60 days before `until`.'
+        },
+        until: {
+          type: 'string',
+          description: 'Optional window end, YYYY-MM-DD. Defaults to today.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const query = new URLSearchParams();
+    if (args.since) query.set('since', args.since);
+    if (args.until) query.set('until', args.until);
+    const qs = query.toString();
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/lead-volume-monitor/${encodeURIComponent(args.client_name_or_email)}${qs ? `?${qs}` : ''}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
 // ─── Admin landing-page discovery/reassociation (ENG-721, admin-only) ───────
 
 mcpToolRegistry.register({
