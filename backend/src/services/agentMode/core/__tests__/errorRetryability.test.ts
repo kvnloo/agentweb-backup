@@ -86,6 +86,67 @@ describe('retryabilityLine', () => {
   });
 });
 
+describe('a refusal that forbids substitution is never handed a "use a different tool" verdict', () => {
+  /*
+   * The bug this pins: install_skills' plan refusal says "Do NOT substitute a different tool's
+   * output". Unclassified, it took DEFAULT_NEXT_STEP — "...use a different tool..." — and the
+   * dispatcher appended that directly underneath. The last line the model reads was an
+   * instruction to do the thing the line above forbids, which is the ENG-1625 fabricated
+   * "UTM Tagging Audit Summary — PASS, 6/6 tagged".
+   */
+  it('subscription_blocked tells the model to report, never to substitute', () => {
+    const line = retryabilityLine('subscription_blocked');
+    expect(line).toContain('Retryable: no');
+    expect(line.toLowerCase()).toContain('do not substitute');
+    expect(line.toLowerCase()).not.toContain('use a different tool');
+  });
+
+  it('tool_unavailable no longer suggests substituting either', () => {
+    // Same hazard one wiring change away: this class is what an uninstalled gated tool throws.
+    const line = retryabilityLine('tool_unavailable');
+    expect(line).toContain('install_skills');
+    expect(line.toLowerCase()).not.toContain('use a different tool');
+  });
+
+  it('end to end: the appended verdict does not contradict the refusal above it', () => {
+    const refusal =
+      "⚠️ Tool Error: install_skills\nReason: The requested skills are not available with your current"
+      + " subscription. Do NOT substitute a different tool's output for the tool that needed this skill.";
+    const out = appendRetryabilityGuidance(refusal, 'subscription_blocked');
+    expect(out).toContain(refusal);
+    expect(out.toLowerCase()).not.toContain('use a different tool');
+  });
+});
+
+describe('a scope refusal never suggests widening the read it just refused', () => {
+  it('scope_refused forbids retry and forbids falling back to an unscoped/account-wide read', () => {
+    const line = retryabilityLine('scope_refused');
+    expect(line).toContain('Retryable: no');
+    expect(line.toLowerCase()).toContain('do not fall back');
+    expect(line.toLowerCase()).not.toContain('use a different tool');
+  });
+
+  it('is fast-tripped — an identical retry on a refused node is known-pointless', () => {
+    expect(isFastTripErrorClass('scope_refused')).toBe(true);
+  });
+});
+
+describe('an incomplete read is never told the target was not found', () => {
+  it('read_incomplete is retryable and forbids reporting absence', () => {
+    const line = retryabilityLine('read_incomplete');
+    expect(line).toContain('Retryable: yes');
+    expect(line.toLowerCase()).toContain('not evidence that anything is absent');
+    expect(line.toLowerCase()).not.toContain('was not found');
+  });
+
+  it('read_bounded is NOT retryable, and still forbids reporting absence', () => {
+    const line = retryabilityLine('read_bounded');
+    expect(line).toContain('Retryable: no');
+    expect(line.toLowerCase()).toContain('narrow the scope');
+    expect(line.toLowerCase()).toContain('never report an item as missing');
+  });
+});
+
 describe('appendRetryabilityGuidance', () => {
   it('appends the verdict line on its own line after the formatted error', () => {
     const out = appendRetryabilityGuidance('⚠️ Tool Error: send_email\nReason: Unauthorized', 'auth');

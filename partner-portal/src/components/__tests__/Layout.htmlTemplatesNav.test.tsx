@@ -1,7 +1,7 @@
 /// <reference path="../../types/assets.d.ts" />
 
 import "@testing-library/jest-dom";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import Layout from "../Layout";
 
@@ -15,7 +15,7 @@ jest.mock("../../assets/logo.svg", () => "logo.svg");
 jest.mock("../ChatSupport", () => () => <div>ChatSupport</div>);
 
 describe("Layout html templates navigation", () => {
-  it("shows HTML Templates nav button for admin users with correct href", () => {
+  it("keeps Admin direct and exposes HTML Templates through the Build menu", () => {
     mockUseAuth.mockReturnValue({
       user: { isAdmin: true },
       logout: jest.fn(),
@@ -32,8 +32,10 @@ describe("Layout html templates navigation", () => {
       </MemoryRouter>
     );
 
-    const htmlTemplatesLink = screen.getByRole("link", { name: "HTML Templates" });
-    expect(htmlTemplatesLink).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Admin" })).toHaveAttribute("href", "/admin");
+    expect(screen.queryByRole("link", { name: "HTML Templates" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Build" }));
+    const htmlTemplatesLink = screen.getByRole("menuitem", { name: "HTML Templates" });
     expect(htmlTemplatesLink).toHaveAttribute("href", "/html-templates");
   });
 

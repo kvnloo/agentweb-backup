@@ -6,6 +6,19 @@
  * chatbotDb session so the manifest-grant seam (claimMetaWriteManifestGrant)
  * is proven end to end, matching the metaLaunchGateWiring.test.ts pattern.
  */
+
+/*
+ * Jest's 5s default is not enough for these two under load, and the cause is contention rather
+ * than slow code: every call here is mocked, and the only real work is an HMAC digest — work
+ * measured in milliseconds. It passes alone and passed a full 1,631-suite run; it timed out in a
+ * 372-suite pre-push batch where the workers were competing for CPU. A default that fails only
+ * when the machine is busy is a flake that blocks every push touching a hub file, so the timeout
+ * is raised to a value the assertions can survive on a loaded box.
+ *
+ * Deliberately NOT masking a hang: with the timeout raised the suite completes in well under a
+ * second, so if these ever approach 30s something has genuinely broken and it should fail.
+ */
+jest.setTimeout(30_000);
 jest.mock('../services/metaLaunchGate', () => ({
   isMetaSpendStartingWrite: jest.fn().mockReturnValue(false),
   runMetaTrackingGate: jest.fn(),

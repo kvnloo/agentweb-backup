@@ -2185,7 +2185,7 @@ export async function runCodingAgent(
       abortController.abort();
       resolve({
         success: false,
-        message: 'Coding agent timed out after 10 minutes. The run was cancelled; check the recorded draft branch for any recoverable partial work.',
+        message: `Coding agent timed out after ${Math.round(AGENT_TIMEOUT_MS / 60_000)} minutes. The run was cancelled; check the recorded draft branch for any recoverable partial work.`,
         iterations: -1,
         runId: run.runId,
         state: 'timed_out',

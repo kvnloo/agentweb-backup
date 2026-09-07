@@ -156,6 +156,28 @@ describe('AgentModeService - Work Plan', () => {
       expect(result.success).toBe(true);
       expect(result.message).toContain('Work plan "New Plan" created');
     });
+
+    it('ENG-1698: resets calledFunctions so a new plan does not inherit stale tool-call credit', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        messages: [],
+        // Leftover credit from a completely unrelated earlier plan in this session.
+        calledFunctions: { generate_image: 5 },
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).createWorkPlan(
+        'Fresh Plan',
+        [{ stepCount: 1, title: 'Step 1' }],
+        mockSessionId
+      );
+
+      expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(mockSessionId, {});
+    });
   });
 
   describe('modifyWorkPlan', () => {
@@ -752,6 +774,7 @@ describe('AgentModeService - Work Plan', () => {
         ]);
         // The step was not completed, so its credits must be untouched.
         expect(chatbotDb.updateCalledFunctions).not.toHaveBeenCalled();
+        expect(chatbotDb.decrementCalledFunctionsClamped).not.toHaveBeenCalled();
         expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
       });
 
@@ -1930,7 +1953,7 @@ describe('AgentModeService - Work Plan', () => {
 
         (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
         (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
-        (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.decrementCalledFunctionsClamped as jest.Mock).mockResolvedValue(mockSession);
 
         const result = await (agentModeService as any).setWorkPlanStatus(
           [{ stepCount: 1, status: 'completed' }],
@@ -1939,9 +1962,11 @@ describe('AgentModeService - Work Plan', () => {
 
         expect(result.success).toBe(true);
         expect(result.message).toContain('Step 1 status updated to completed');
-        expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(
+        // ENG-1698: applied as a delta against a fresh read, not an absolute
+        // value computed from this call's local snapshot.
+        expect(chatbotDb.decrementCalledFunctionsClamped).toHaveBeenCalledWith(
           mockSessionId,
-          { you_search_web: 0 }
+          { you_search_web: 1 }
         );
       });
 
@@ -2005,7 +2030,7 @@ describe('AgentModeService - Work Plan', () => {
 
         (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
         (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
-        (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.decrementCalledFunctionsClamped as jest.Mock).mockResolvedValue(mockSession);
 
         const result = await (agentModeService as any).setWorkPlanStatus(
           [{ stepCount: 1, status: 'completed' }],
@@ -2013,9 +2038,9 @@ describe('AgentModeService - Work Plan', () => {
         );
 
         expect(result.success).toBe(true);
-        expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(
+        expect(chatbotDb.decrementCalledFunctionsClamped).toHaveBeenCalledWith(
           mockSessionId,
-          { create_blog_article: 2 } // Should decrement by 3
+          { create_blog_article: 3 } // Delta: decrement by 3
         );
       });
 
@@ -2094,6 +2119,366 @@ describe('AgentModeService - Work Plan', () => {
         expect(result.message).toContain('Step 1 status updated to skipped');
         // Should not try to update calledFunctions when skipping
         expect(chatbotDb.updateCalledFunctions).not.toHaveBeenCalled();
+        expect(chatbotDb.decrementCalledFunctionsClamped).not.toHaveBeenCalled();
+      });
+
+      it('ENG-1698: decrements calledFunctions when skipping a step that already made its calls', async () => {
+        // Step 1 called generate_image once (required) before being skipped. Without
+        // decrementing, that credit stays in the pool and could silently satisfy step
+        // 2's own generate_image requirement without step 2 ever calling it.
+        const workPlan = {
+          title: 'Project Plan',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Draft hero image',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['generate_image'],
+            },
+            {
+              stepCount: 2,
+              title: 'Draft banner image',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['generate_image'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: { generate_image: 1 },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.decrementCalledFunctionsClamped as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'skipped', notes: 'Not needed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.decrementCalledFunctionsClamped).toHaveBeenCalledWith(
+          mockSessionId,
+          { generate_image: 1 }
+        );
+      });
+
+      it('ENG-1698: skipping a step that never made its calls does not drive the count negative', async () => {
+        const workPlan = {
+          title: 'Project Plan',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Draft hero image',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['generate_image'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {}, // never called
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'skipped' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        // Clamped at 0 -- must not persist a negative count for a later step to inherit.
+        expect(chatbotDb.updateCalledFunctions).not.toHaveBeenCalled();
+        expect(chatbotDb.decrementCalledFunctionsClamped).not.toHaveBeenCalled();
+      });
+
+      // ENG-1793: pins the "or failing" half of the ticket title -- a required
+      // function that was invoked and FAILED (present in failedFunctions) but
+      // never subsequently succeeded (absent/zero in calledFunctions) must not
+      // satisfy the gate. calledFunctionCounts is keyed off calledFunctions only,
+      // so this was already correctly enforced; this test guards against a future
+      // change that starts crediting failed attempts toward the required count.
+      it('ENG-1793: fails to complete a step whose required function was called but failed, never succeeded', async () => {
+        const workPlan = {
+          title: 'Meta Ads Performance Report',
+          steps: [
+            {
+              stepCount: 3,
+              title: 'Create HTML report',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['create_html_from_template'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {}, // never succeeded
+          failedFunctions: { create_html_from_template: 1 }, // invoked, and failed
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 3, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Required function calls have not been made');
+        expect(result.missingFunctionCalls[0].missing).toContain('create_html_from_template (need 1, have 0)');
+      });
+    });
+
+    // ENG-1793: production session a90b38fc-a641-4e11-b5af-219d1fa39145 launched
+    // the "Meta Ads Performance Report" predefined plan. Its "Create HTML report"
+    // step required create_html_from_template; that call FAILED
+    // (failedFunctions.create_html_from_template = 1, calledFunctions has no
+    // successful entry for it), yet a mid-run modify_work_plan call updated that
+    // step and happened to pass requiredFunctionCalls: [] -- silently clearing the
+    // real requirement -- after which set_work_plan_status marked the step
+    // completed anyway, because the gate had nothing left to check.
+    describe('ENG-1793: modify_work_plan cannot silently drop a failed required function call', () => {
+      it('re-adds a required function that already failed and never succeeded, even when the update omits it', async () => {
+        const workPlan = {
+          title: 'Meta Ads Performance Report',
+          steps: [
+            {
+              stepCount: 3,
+              title: 'Create HTML report',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['create_html_from_template'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {}, // create_html_from_template never succeeded
+          failedFunctions: { create_html_from_template: 1 }, // ...but it DID fail
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [
+            {
+              stepCount: 3,
+              title: 'Create HTML report',
+              requiredFunctionCalls: [], // the exact production payload
+            },
+          ],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({
+                stepCount: 3,
+                requiredFunctionCalls: ['create_html_from_template'],
+              }),
+            ]),
+          })
+        );
+      });
+
+      it('reads the session with consistentRead so a same-turn failure is never missed', async () => {
+        const workPlan = {
+          title: 'Project Plan',
+          steps: [{ stepCount: 1, title: 'Step 1', status: 'pending' as const, requiredFunctionCalls: [] }],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 1, title: 'Step 1' }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.getChatSession).toHaveBeenCalledWith(mockSessionId, true);
+      });
+
+      it('still allows a genuine scope reduction: dropping a required function that never failed', async () => {
+        const workPlan = {
+          title: 'Project Plan',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Load Campaign Metrics',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['list_meta_ads_campaigns', 'get_meta_ads_metrics'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {},
+          failedFunctions: {}, // neither function has ever failed
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [
+            {
+              stepCount: 1,
+              title: 'Load Campaign Metrics',
+              requiredFunctionCalls: ['list_meta_ads_campaigns'], // user approved dropping the metrics call
+            },
+          ],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({
+                stepCount: 1,
+                requiredFunctionCalls: ['list_meta_ads_campaigns'],
+              }),
+            ]),
+          })
+        );
+      });
+
+      it('does not re-add a required function that failed but has since succeeded', async () => {
+        const workPlan = {
+          title: 'Project Plan',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Create HTML report',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['create_html_from_template'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: { create_html_from_template: 1 }, // a later retry succeeded
+          failedFunctions: { create_html_from_template: 1 }, // the first attempt failed
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 1, title: 'Create HTML report', requiredFunctionCalls: [] }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepCount: 1, requiredFunctionCalls: [] }),
+            ]),
+          })
+        );
+      });
+
+      it('end-to-end: modify_work_plan cannot be used to bypass set_work_plan_status\'s completion gate', async () => {
+        const workPlan = {
+          title: 'Meta Ads Performance Report',
+          steps: [
+            {
+              stepCount: 3,
+              title: 'Create HTML report',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['create_html_from_template'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {},
+          failedFunctions: { create_html_from_template: 1 },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        // Step 1: the model tries to clear the failed step's required calls via modify_work_plan.
+        const modifyResult = await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Create HTML report', requiredFunctionCalls: [] }],
+          [],
+          mockSessionId
+        );
+        expect(modifyResult.success).toBe(true);
+
+        // Step 2: the model then tries to mark the step completed anyway.
+        const statusResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 3, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(statusResult.success).toBe(false);
+        expect(statusResult.message).toContain('Required function calls have not been made');
+        expect(statusResult.missingFunctionCalls[0].missing).toContain('create_html_from_template (need 1, have 0)');
       });
     });
   });

@@ -42,6 +42,140 @@ describe('Meta launch gate (ENG-941)', () => {
     mockPreflight.mockResolvedValue({ ok: true, results: [], blockedUrls: [], message: '' });
   });
 
+  /*
+   * ENG-1476 follow-up. metaService's list reads report `truncated` when a page/wall-clock
+   * bound stops them short. This gate decides from that ad list what a launch would send
+   * traffic to, so a partial list means some ads in scope were never checked. It used to
+   * discard the flag entirely and judge the launch on whatever it happened to receive.
+   */
+  describe('a truncated ad read is not a clean read', () => {
+    it('blocks a campaign-level activation when the ad list stopped at its bound', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t');
+
+      // An empty destination list from a truncated read is "we did not fetch them", not
+      // "there are none" — the old code returned proceed:true here.
+      expect(out.proceed).toBe(false);
+      expect(out.blockResult.error).toMatch(/could not be read completely/i);
+      expect(mockRecord).toHaveBeenCalledWith('sess-t', expect.objectContaining({ outcome: 'blocked' }));
+    });
+
+    it('blocks even when some destinations were found, because the rest were never read', async () => {
+      mockListAds.mockResolvedValue({
+        items: [{ adId: 'a1', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/lp'] }],
+        truncated: true,
+        pagesFetched: 25,
+      });
+      mockPreflight.mockResolvedValue({ ok: true, results: [], blockedUrls: [], message: '' });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t');
+
+      expect(out.proceed).toBe(false);
+      expect(out.blockResult.error).toMatch(/never checked/i);
+    });
+
+    it('still honours an explicit override, recorded as overridden rather than passed', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', true, 'sess-t');
+
+      expect(out.proceed).toBe(true);
+      expect(mockRecord).toHaveBeenCalledWith('sess-t', expect.objectContaining({ outcome: 'overridden' }));
+    });
+
+    it('does not block a complete read that legitimately has nothing to measure', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t');
+
+      // Guards the opposite error: a campaign with no ads yet must still pass.
+      expect(out.proceed).toBe(true);
+    });
+
+    it('does not block an AD-level activation, which is judged on that ad alone', async () => {
+      mockListAds.mockResolvedValue({
+        items: [{ adId: 'a1', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/lp'] }],
+        truncated: true,
+        pagesFetched: 25,
+      });
+      mockPreflight.mockResolvedValue({ ok: true, results: [], blockedUrls: [], message: '' });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t', {}, 'a1');
+
+      expect(out.proceed).toBe(true);
+    });
+
+    it('says the search was incomplete — not that the ad is elsewhere — when a named ad is missed', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t', {}, 'a-missing');
+
+      expect(out.proceed).toBe(false);
+      // ENG-1636's lesson: a pre-flight that names the wrong remedy sends the reader to fix
+      // a cause that is not theirs.
+      expect(out.blockResult.error).toMatch(/not necessarily absent|not have been reached/i);
+      /*
+       * Same guard the accountWideTruncated branch below already carries, applied to the branch
+       * beside it: this module has NO ad-set concept — zero references, and
+       * `metaService.listAdsForUtmAudit` takes a campaign id and nothing else — so narrowing to
+       * an ad set cannot make the gate's read smaller or change the outcome. The reasoning was
+       * written for one branch and not applied to its sibling.
+       */
+      expect(out.blockResult.error).not.toMatch(/narrow the request to the ad set/i);
+      // Supplying the destination IS honoured for an AD entity, so it stays.
+      expect(out.blockResult.error).toMatch(/supply the destination on the request/i);
+      expect(out.blockResult.error).not.toMatch(/may belong to a different campaign/i);
+    });
+
+    /*
+     * The two truncation flags answer different questions, and collapsing them
+     * (`adsTruncated || accountWideTruncated`) made the message describe a read that had not
+     * stopped at all.
+     *
+     * The account-wide fallback only runs when the CAMPAIGN-scoped read already came back
+     * without the ad. So when that campaign read was complete and only the fallback truncated,
+     * "the ad list for campaign X was too large to read completely" was false — and it told the
+     * user to narrow to the ad set containing an ad that is not in the campaign, while
+     * suppressing the one accurate sentence: that the ad may belong to a different campaign.
+     */
+    it('names the account-wide read, not the campaign read, when only the fallback truncated', async () => {
+      mockListAds.mockImplementation((_accountId: string, _token: string, campaignId?: string) =>
+        Promise.resolve(
+          campaignId
+            // Campaign-scoped read: COMPLETE, and the ad is genuinely not in it.
+            ? { items: [], truncated: false, pagesFetched: 1 }
+            // Account-wide fallback: stopped at its bound, so where the ad lives is unknown.
+            : { items: [], truncated: true, pagesFetched: 25 },
+        ),
+      );
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t', {}, 'a-missing');
+
+      expect(out.proceed).toBe(false);
+      // The campaign read finished — saying it did not is describing the wrong read.
+      expect(out.blockResult.error).not.toMatch(/ad list for campaign [^.]*was too large/i);
+      // ...and pointing at an ad set inside that campaign is a remedy that cannot work.
+      expect(out.blockResult.error).not.toMatch(/narrow the request to the ad set/i);
+      // The accurate diagnosis must survive rather than be suppressed by the wrong one.
+      expect(out.blockResult.error).toMatch(/may belong to a different campaign/i);
+      // And the read that actually stopped short is named.
+      expect(out.blockResult.error).toMatch(/account-wide search/i);
+    });
+
+    it('keeps the plain not-found message when neither read stopped short', async () => {
+      // Guards the opposite error: both reads complete and the ad is simply elsewhere.
+      mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
+
+      const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-t', {}, 'a-missing');
+
+      expect(out.proceed).toBe(false);
+      expect(out.blockResult.error).toMatch(/may belong to a different campaign/i);
+      expect(out.blockResult.error).not.toMatch(/could not be read completely/i);
+      expect(out.blockResult.error).not.toMatch(/account-wide search/i);
+    });
+  });
+
   it('proceeds and records a pass when every destination is measured', async () => {
     const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-1');
     expect(out.proceed).toBe(true);
@@ -74,7 +208,13 @@ describe('Meta launch gate (ENG-941)', () => {
   it('passes the ad account\'s own pixel ids into the check', async () => {
     mockListPixels.mockResolvedValue({ pixels: [{ id: PIXEL }, { id: '999' }], truncated: false, pagesFetched: 1 });
     await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-1');
-    expect(mockPreflight).toHaveBeenCalledWith(['https://site.example/lp'], [PIXEL, '999']);
+    /*
+     * Four args now: the pre-flight shares the gate's wall-clock budget, so a launch pointing at
+     * many distinct destinations cannot spend unbounded time on top of the ad reads. Asserting
+     * the deadline is a real number rather than ignoring it — passing `undefined` would silently
+     * restore the unbounded behaviour and this test would not notice.
+     */
+    expect(mockPreflight).toHaveBeenCalledWith(['https://site.example/lp'], [PIXEL, '999'], {}, expect.any(Number));
   });
 
   it('gathers destinations across every ad in the campaign', async () => {
@@ -288,7 +428,7 @@ describe('scoping and bypass fixes (ENG-941)', () => {
       { adId: 'ad-bad', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/bad'] },
     ], truncated: false, pagesFetched: 1 });
     await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_UPDATE', false, 'sess-1', {}, 'ad-good');
-    expect(mockPreflight).toHaveBeenCalledWith(['https://site.example/good'], [PIXEL]);
+    expect(mockPreflight).toHaveBeenCalledWith(['https://site.example/good'], [PIXEL], {}, expect.any(Number));
   });
 
   it('checks the whole campaign when no single ad is named', async () => {
@@ -388,6 +528,152 @@ describe('referenced creative destinations (ENG-941)', () => {
     expect(mockPreflight.mock.calls[0][0]).toEqual(['https://site.example/new']);
   });
 
+  /*
+   * `adId` is supplied only for an AD-entity write, so it is undefined for every CREATE. Gating
+   * the truncation block on `!adId` alone therefore blocked creates whose destination was fully
+   * checkable, telling them to "activate a single ad instead" — impossible for an entity that
+   * does not exist yet. The ad list's completeness only matters when the ad list is what the
+   * decision rests on.
+   */
+  describe('a truncated ad list and a CREATE that carries its own destination', () => {
+    it('does not block a CREATE whose destination came from the request', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+      mockPreflight.mockResolvedValue({ ok: true, results: [], blockedUrls: [], message: '' });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'AD_CREATE', false, 'sess-c',
+        {}, undefined, ['https://site.example/new-lp'], [],
+      );
+
+      expect(out.proceed).toBe(true);
+      // The supplied destination is what gets checked — the unread siblings are irrelevant to it.
+      expect(mockPreflight.mock.calls[0][0]).toContain('https://site.example/new-lp');
+    });
+
+    it('still blocks when the truncated ad list IS what the decision rests on', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'UPDATE', false, 'sess-c', {}, undefined, [], [],
+      );
+
+      expect(out.proceed).toBe(false);
+      expect(out.blockResult.error).toMatch(/could not be read completely/i);
+    });
+
+    it('offers a remedy a CREATE can actually follow', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'UPDATE', false, 'sess-c', {}, undefined, [], [],
+      );
+
+      /*
+       * This branch fires only for CAMPAIGN_UPDATE / AD_SET_UPDATE / AD_CREATE, and
+       * `collectPendingDestinations` returns [] unconditionally for the two UPDATEs (campaigns
+       * carry no destination; an ad set carries one only on CREATE). So "supply the destination
+       * on the request" — which this test used to REQUIRE — is a remedy the caller can follow
+       * exactly and get the identical block back. Same defect class the sibling branch is already
+       * guarded against at the ad-set assertion above.
+       */
+      /*
+       * The destination remedy may be MENTIONED, but only qualified. It works for an AD CREATE
+       * and not for the campaign/ad-set UPDATEs that also reach this branch, where
+       * `collectPendingDestinations` returns [] unconditionally. The defect was stating it
+       * flatly, as if the caller could add link_url and retry.
+       */
+      expect(out.blockResult.error).toMatch(/for an AD CREATE/i);
+      expect(out.blockResult.error).not.toMatch(/narrow the launch to a single ad/i);
+      /*
+       * And the extended launch budget must be named, so "just wait longer" is visibly already
+       * tried. This branch is now the genuinely-enormous case, not the 45-second case: reading
+       * the campaign gets four minutes because refusing a launch is far more expensive to the
+       * user than a slow one.
+       */
+      expect(out.blockResult.error).toMatch(/extended launch read budget/i);
+      expect(out.blockResult.error).toMatch(/tracking-check override/i);
+    });
+  });
+
+  /*
+   * The `!destinationCameFromRequest` escape above does not reach the launches that create an
+   * EMPTY container, because they carry no destination to supply: `executeAudienceCampaignLaunch`
+   * calls this gate with no `pendingDestinations` argument at all, and a plain AD_SET CREATE with
+   * no link_url has none either.
+   *
+   * Those launches put ZERO pre-existing ads live — the new ad set contains no ads and can send
+   * traffic nowhere — so the campaign's unread ads cannot be "some ads in this launch that were
+   * never checked". And "Narrow the launch to a single ad" is not a remedy anyone can follow for
+   * an entity that does not exist.
+   */
+  describe('a truncated ad list and a launch that activates no existing ad', () => {
+    it('does not block the audience-launch path, which creates an ad set and no ads', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'TARGETED_AUDIENCE_LAUNCH', false, 'sess-c',
+      );
+
+      expect(out.proceed).toBe(true);
+    });
+
+    it('does not block the retargeting-launch path either', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'RETARGETING_LAUNCH', false, 'sess-c',
+      );
+
+      expect(out.proceed).toBe(true);
+    });
+
+    it('does not block a plain AD_SET CREATE that carries no link_url', async () => {
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'AD_SET_CREATE', false, 'sess-c', {}, undefined, [], [],
+      );
+
+      expect(out.proceed).toBe(true);
+    });
+
+    it('still blocks an AD_CREATE with no destination — that one really does start serving', async () => {
+      // The boundary: an AD CREATE makes something that serves, and with no destination on the
+      // request the campaign's (unread) ad list is what the check would have to fall back on.
+      mockListAds.mockResolvedValue({ items: [], truncated: true, pagesFetched: 25 });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'AD_CREATE', false, 'sess-c', {}, undefined, [], [],
+      );
+
+      expect(out.proceed).toBe(false);
+      expect(out.blockResult.error).toMatch(/could not be read completely/i);
+    });
+
+    it('still checks the campaign destinations it CAN read for an empty-container launch', async () => {
+      // Lifting the truncation block is not lifting the gate: a readable, untracked destination
+      // still blocks these launches exactly as before.
+      mockListAds.mockResolvedValue({
+        items: [{ adId: 'a1', campaignId: CAMPAIGN, destinationUrls: ['https://dark.example/lp'] }],
+        truncated: true,
+        pagesFetched: 25,
+      });
+      // ...Once, not a new default: the describes below this one have no beforeEach of their
+      // own and inherit whatever mock state the previous test left behind.
+      mockPreflight.mockResolvedValueOnce({
+        ok: false, results: [{ url: 'https://dark.example/lp', status: 'missing', mechanisms: [] }],
+        blockedUrls: ['https://dark.example/lp'], message: 'no tracking found',
+      });
+
+      const out = await _runMetaTrackingGateForTest(
+        creds, CAMPAIGN, 'TARGETED_AUDIENCE_LAUNCH', false, 'sess-c',
+      );
+
+      expect(out.proceed).toBe(false);
+      expect(out.blockResult.error).toMatch(/no tracking found/i);
+    });
+  });
+
   it('resolves a referenced creative to its destination and checks it', async () => {
     mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     const resolveCreativeDestinations = jest.fn().mockResolvedValue(['https://site.example/referenced']);
@@ -407,9 +693,18 @@ describe('referenced creative destinations (ENG-941)', () => {
       { resolveCreativeDestinations }, undefined, [], ['120299'],
     );
     expect(out.proceed).toBe(false);
-    expect(out.blockResult.error).toContain('120299');
+    /*
+     * Same rule as the ad-level blocks in this function: the id comes out of the text the user
+     * reads and goes onto the ledger row instead. This assertion used to REQUIRE the id in the
+     * message — the last place in this module still doing it.
+     */
+    expect(out.blockResult.error).toContain('could not verify where the requested ad creative sends people');
+    expect(out.blockResult.error).not.toContain('120299');
     expect(mockPreflight).not.toHaveBeenCalled();
-    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'blocked' }));
+    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      outcome: 'blocked',
+      creativeId: '120299',
+    }));
   });
 
   it('blocks when a referenced creative resolves to no destination at all — the shape was not understood', async () => {
@@ -419,7 +714,10 @@ describe('referenced creative destinations (ENG-941)', () => {
       { resolveCreativeDestinations: jest.fn().mockResolvedValue([]) }, undefined, [], ['120299'],
     );
     expect(out.proceed).toBe(false);
-    expect(out.blockResult.error).toContain('120299');
+    // Id on the ledger, not in the user-facing text — see the sibling test above.
+    expect(out.blockResult.error).not.toContain('120299');
+    expect(out.blockResult.error).toContain('reported no destination URL');
+    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ creativeId: '120299' }));
   });
 
   it('still honours an explicit override when a creative cannot be resolved', async () => {
@@ -571,9 +869,30 @@ describe('named-ad scoping must not silently pass (ENG-941)', () => {
     ], truncated: false, pagesFetched: 1 });
     const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42');
     expect(out.proceed).toBe(false);
-    expect(out.blockResult.error).toContain('ad-42');
+    /*
+     * The block must say WHICH failure this is, without printing a raw Meta id.
+     *
+     * These assertions used to pin `ad-42` in the model/user-visible text. Product rule: ids are
+     * not shown to the user, and this string is relayed to them. The ad is the one the caller
+     * just named in this request, so the sentence is unambiguous without it — and the id is
+     * still recorded on the ledger entry for debugging.
+     */
+    expect(out.blockResult.error).toContain('the requested ad was not found in this campaign');
+    expect(out.blockResult.error).not.toContain('ad-42');
     expect(mockPreflight).not.toHaveBeenCalled();
-    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'blocked' }));
+    /*
+     * The id has to survive SOMEWHERE, and the ledger is the only place left.
+     *
+     * Taking it out of the block text is right — that text reaches the user. But it was the only
+     * record of which ad was refused: `blockResult` carries no ids, the gate logs none, and the
+     * ledger row was `{accountId, campaignId, action, outcome}`, identical for every ad in the
+     * campaign AND for the campaign-wide truncation block. "Emma refused to activate my ad" had
+     * no answer. Removing the id from prose and adding it here are one change, not two.
+     */
+    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      outcome: 'blocked',
+      adId: 'ad-42',
+    }));
   });
 
   it('proceeds when the copy carries its own destination, which is what will serve', async () => {
@@ -621,7 +940,8 @@ describe('named-ad lookup falls back to the account before blocking (ENG-941)', 
     mockListAds.mockResolvedValue({ items: [], truncated: false, pagesFetched: 1 });
     const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42');
     expect(out.proceed).toBe(false);
-    expect(out.blockResult.error).toContain('ad-42');
+    expect(out.blockResult.error).toContain('the requested ad was not found in this campaign');
+    expect(out.blockResult.error).not.toContain('ad-42');
   });
 
   it('does not pay for the account-wide lookup when the campaign scope already found the ad', async () => {

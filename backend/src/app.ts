@@ -30,7 +30,6 @@ import agentModeRoutes from "./routes/agentMode";
 import settingsRoutes from "./routes/settings";
 import imageModelsRoutes from "./routes/image-models";
 import webhookRoutes from "./routes/webhooks";
-import devEnvRoutes from "./routes/devEnv";
 import benchmarkRoutes from "./routes/benchmark";
 import seoRoutes from "./routes/seo";
 import funnelRoutes from "./routes/funnel";
@@ -68,6 +67,7 @@ import fathomOnboardingAdminRoutes from "./routes/fathomOnboardingAdmin";
 import hubspotAuthRoutes from "./routes/hubspotAuth";
 import attioAuthRoutes from "./routes/attioAuth";
 import crmSyncRoutes from "./routes/crmSync";
+import adsThresholdsRoutes from "./routes/adsThresholds";
 import crmWebhookRoutes from "./routes/crmWebhook";
 import mcpServersRoutes, { mcpOAuthPublicRouter } from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
@@ -98,6 +98,7 @@ import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
 import batchReviewRoutes, { batchReviewPublicRouter } from "./routes/batchReview";
 import imageReportsRoutes from "./routes/imageReports";
 import clientHealthRoutes from "./routes/clientHealth";
+import leadVolumeMonitorRoutes from "./routes/leadVolumeMonitor";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
 import orgMemoryRoutes from "./routes/orgMemory";
@@ -185,10 +186,26 @@ const corsOptions = {
       "https://agentweb-user-files.s3.us-west-2.amazonaws.com", // S3 bucket for user files
       process.env.FRONTEND_URL || "http://localhost:5173", // Partner Portal (Deployed or Local)
       process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174", // Customer Portal (Deployed or Local)
-      process.env.GROWTH_GENIUS_CHAT_URL || "http://localhost:8080", // Growth Genius Chat (Deployed or Local)
-      /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
-      /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/, // Allow any ngrok.io subdomain
     ];
+
+    // ngrok tunnels are a local-dev convenience (exposing a laptop's backend to a
+    // webhook sender, a mobile device, etc.) and must never be a credentialed
+    // origin in production — any ngrok tenant on the internet would otherwise be
+    // allowed (ENG-1751). Fail closed on NODE_ENV: neither tracked EB config nor
+    // package.json sets NODE_ENV=production explicitly, so `!== "production"`
+    // was fail-open (unset/mistyped/staging all fell through as "allow"), the
+    // exact class of bug already fixed in webhooks.ts's Attio isDev check. Only
+    // an explicit NODE_ENV=development, or the CORS_ALLOW_NGROK=1 opt-in, allows
+    // ngrok origins.
+    if (
+      process.env.NODE_ENV === "development" ||
+      process.env.CORS_ALLOW_NGROK === "1"
+    ) {
+      allowedOrigins.push(
+        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
+        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/ // Allow any ngrok.io subdomain
+      );
+    }
 
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
@@ -330,7 +347,6 @@ app.use("/api/webhooks/fathom", fathomWebhookRoutes);
 app.use("/api/webhooks/calendly", calendlyWebhookRoutes);
 app.use("/api/webhooks/unipile", unipileWebhookRoutes);
 registerConversionRelayProcessor();
-app.use("/api", devEnvRoutes);
 app.use("/api/benchmark", benchmarkRoutes);
 app.use("/api/seo", seoRoutes);
 app.use("/api/funnels", funnelRoutes);
@@ -345,6 +361,9 @@ app.use("/api/crm/webhooks/apollo", apolloWebhookRoutes);
 app.use("/api/crm/sequences", sequenceRoutes);
 app.use("/api/crm/companies", crmCompaniesRoutes);
 app.use("/api/crm", crmRoutes);
+// ENG-918 — per-account ads-detection thresholds. Every route authenticates and re-derives
+// ad-account ownership from the caller's own connected accounts; see the route file's header.
+app.use("/api/ads-thresholds", adsThresholdsRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
 app.use("/api/oauth/linkedin", linkedinAuthRoutes);
@@ -376,6 +395,9 @@ app.use("/api/admin/onboarding-loop", authenticateToken, isAdmin, onboardingLoop
 app.use("/api/admin/loops", authenticateToken, isAdmin, loopHealthRoutes);
 app.use("/api/admin/agent-runs", authenticateToken, isAdmin, agentRunsRoutes);
 app.use("/api/client-health", authenticateToken, isAdmin, clientHealthRoutes);
+// ENG-1551 — lead volume drought monitor. Same double-gate as client-health: middleware +
+// service-layer admin check.
+app.use("/api/lead-volume-monitor", authenticateToken, isAdmin, leadVolumeMonitorRoutes);
 app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/user-skills", authenticateToken, userSkillRoutes);
 app.use("/api/user-work-plans", authenticateToken, userWorkPlanRoutes);

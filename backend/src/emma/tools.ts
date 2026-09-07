@@ -1022,7 +1022,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
                         Optional but WRITABLE on create: bid_strategy (LOWEST_COST_WITHOUT_CAP | LOWEST_COST_WITH_BID_CAP | COST_CAP) and bid_amount.
                         Omitting bid_strategy silently defaults to LOWEST_COST_WITHOUT_CAP — set it deliberately when the user expressed any cost target (ENG-838).
                         bid_amount is REQUIRED for LOWEST_COST_WITH_BID_CAP and COST_CAP, and must be OMITTED for LOWEST_COST_WITHOUT_CAP.
-                        NOT SUPPORTED: dayparting / ad scheduling (adset_schedule, pacing_type). A request for scheduled delivery is REJECTED, not silently ignored — tell the user it must be set in Ads Manager after creation. start_time/end_time are the flight window, not dayparting.
+                        Dayparting/ad scheduling (adset_schedule, pacing_type) IS supported but requires lifetime_budget (never daily_budget) plus end_time — Meta silently ignores the schedule and delivers 24/7 on a daily-budget ad set, so that combination is REJECTED, naming the requirement. pacing_type defaults to ['day_parting'] automatically whenever adset_schedule is present and pacing_type is omitted. start_time/end_time are the flight window, not dayparting, and remain independent (ENG-842).
                         After a successful create the ad set is READ BACK from Meta: the result carries readBack (the settings Meta actually stored), readBackVerified, and readBackMismatches. If a mismatch is reported the call returns success:false even though the ad set exists — tell the user which parameter Meta overrode and that the ad set is live with settings nobody chose (ENG-838).
   AD_CREATIVE CREATE:   name, page_id, body, title, link_url + exactly one creative type (see below)
   AD CREATE:            name, creative_id (plus ad_set_id top-level param)
@@ -7227,6 +7227,80 @@ mcpToolRegistry.register({
   },
 });
 
+const LINEAR_PRIORITY_BY_NAME: Record<string, number> = { Urgent: 1, High: 2, Medium: 3, Low: 4 };
+const LINEAR_STATE_TYPES_BY_BUCKET: Record<string, string[]> = {
+  open: ['triage', 'backlog', 'unstarted', 'started'],
+  completed: ['completed'],
+  canceled: ['canceled'],
+};
+
+mcpToolRegistry.register({
+  name: 'read_linear_issues',
+  definition: {
+    name: 'read_linear_issues',
+    description:
+      'Admin-only, read-only: list/search AgentWeb Linear issues by team, state, priority, label, and ' +
+      'assignee, or read one issue in full detail (description, comments, sub-issues, blocking ' +
+      'relationships). Never mutates Linear and never exposes Linear credentials.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'detail'],
+          description: '"list" to search/filter issues, "detail" to read one issue fully (description, comments, sub-issues, blocking relations).',
+        },
+        team_key: { type: 'string', description: 'Team key, e.g. ENG. Defaults to ENG.' },
+        state: {
+          type: 'string',
+          enum: ['open', 'completed', 'canceled'],
+          description: 'For action=list: "open" (triage/backlog/unstarted/started), "completed", or "canceled". Defaults to open.',
+        },
+        priorities: {
+          type: 'array',
+          items: { type: 'string', enum: ['Urgent', 'High', 'Medium', 'Low'] },
+          description: 'For action=list: filter to these priority levels.',
+        },
+        label_name: { type: 'string', description: 'For action=list: filter to issues carrying this exact label name.' },
+        assignee_email: { type: 'string', description: 'For action=list: filter to issues assigned to this email.' },
+        limit: { type: 'number', description: 'For action=list: max issues to return (default 50, max 100).' },
+        issue_ref: { type: 'string', description: 'For action=detail: issue identifier (e.g. ENG-42) or internal id.' },
+      },
+      required: ['action'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+    const user = await userDb.getUserById(userId);
+    const delegated = context?.isDelegatedAccess === true || context?.isDelegatedAdmin === true;
+    if (user?.isAdmin !== true && !delegated) {
+      throw new Error('Admin access required to read Linear issues');
+    }
+    const { searchIssues, getIssueFullDetail } = await import('../services/linearService');
+    if (args.action === 'detail') {
+      if (!args.issue_ref) throw new Error('issue_ref is required for action=detail');
+      return getIssueFullDetail(args.issue_ref);
+    }
+    if (args.action === 'list') {
+      const priorities = Array.isArray(args.priorities)
+        ? args.priorities.map((p: string) => LINEAR_PRIORITY_BY_NAME[p]).filter((p: number | undefined): p is number => typeof p === 'number')
+        : undefined;
+      const limit = Math.min(Math.max(Number(args.limit) || 50, 1), 100);
+      const issues = await searchIssues({
+        teamKey: args.team_key,
+        stateTypes: LINEAR_STATE_TYPES_BY_BUCKET[args.state || 'open'] || LINEAR_STATE_TYPES_BY_BUCKET.open,
+        priorities,
+        labelName: args.label_name,
+        assigneeEmail: args.assignee_email,
+        limit,
+      });
+      return { issues };
+    }
+    throw new Error(`Unknown action "${args.action}" — expected "list" or "detail"`);
+  },
+});
+
 const bridgedToolNames = [
   // Scheduled Chat tools
   'list_scheduled_chats',
@@ -7265,6 +7339,7 @@ const bridgedToolNames = [
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
 const adminToolNames = [
   'manage_linear_governance_label',
+  'read_linear_issues',
   'list_predefined_work_plans',
   'manage_predefined_work_plan',
   'list_skills',
@@ -7272,6 +7347,7 @@ const adminToolNames = [
   'get_chat_history',
   'list_all_clients',
   'assess_client_health',
+  'monitor_lead_volume',
   'get_pr_digest',
   'freeze_user_account',
   'manage_scoring_judges',
@@ -9551,24 +9627,43 @@ emmaToolRegistry.register({
       throw new Error('account_id is required — get it from list_connected_accounts.');
     }
 
+    // Reads behind this audit can stop at a page or wall-clock bound. Collect that here so a
+    // partial read is never presented as a clean bill of health.
+    const completeness: { incomplete?: boolean; campaignListIncomplete?: boolean } = {};
     const campaigns = await auditCampaigns(
       platform as AdPlatform,
       context.userId,
       accountId,
       port,
+      completeness,
     );
 
     const needingAction = campaigns.filter((c) => !c.tagged);
     const unreadableCount = campaigns.reduce((n, c) => n + c.unreadableAdIds.length, 0);
 
+    /*
+     * "All N campaign(s) carry UTM tracking" is a claim about everything, so it may only be
+     * made from a read that saw everything. Under truncation the audit found nothing wrong in
+     * the part it read, which is a different statement — and reporting the stronger one is
+     * exactly how a bounded read told a customer something did not exist (ENG-1584).
+     */
+    const incompleteNote = completeness.incomplete
+      ? (completeness.campaignListIncomplete
+          ? ` ⚠ The campaign list stopped at a read bound, so campaigns beyond it were never audited.`
+          : ` ⚠ At least one campaign's ad list stopped at a read bound, so some ads were never audited.`) +
+        ` Treat this as "nothing wrong in what was read", not a clean bill of health.`
+      : '';
+
     // Say the unreadable count out loud. Silently folding it into "untagged" would send
     // someone to swap a creative we never actually managed to read.
-    const message = needingAction.length === 0
-      ? `✅ All ${campaigns.length} campaign(s) on ${platform} carry UTM tracking. Nothing to opt in.`
+    const message = (needingAction.length === 0
+      ? (completeness.incomplete
+          ? `No UTM problems found in the ${campaigns.length} campaign(s) read on ${platform}.`
+          : `✅ All ${campaigns.length} campaign(s) on ${platform} carry UTM tracking. Nothing to opt in.`)
       : `${needingAction.length} of ${campaigns.length} campaign(s) on ${platform} need attention.` +
         (unreadableCount > 0
           ? ` ${unreadableCount} ad(s) were unreadable — their destination URL could not be parsed, so they need review by a human rather than an automatic fix.`
-          : '');
+          : '')) + incompleteNote;
 
     return {
       success: true,
@@ -9578,6 +9673,8 @@ emmaToolRegistry.register({
       totalCampaigns: campaigns.length,
       campaignsNeedingAction: needingAction.length,
       unreadableAdCount: unreadableCount,
+      ...(completeness.incomplete ? { readIncomplete: true } : {}),
+      ...(completeness.campaignListIncomplete ? { campaignListIncomplete: true } : {}),
       campaigns,
     };
   },

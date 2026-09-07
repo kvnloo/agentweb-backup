@@ -23,6 +23,7 @@
  * than executing the page. That is why the explicit override path exists.
  */
 import axios from 'axios';
+import { TRANSIENT_NETWORK_RE } from './metaLaunchGate';
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { fetchHtmlFollowingRedirects } from './googleAdsTrackingPreflight';
 
@@ -51,7 +52,7 @@ export interface MetaPreflightGateResult {
 
 export interface MetaPreflightDeps {
   /** Injectable fetch boundary. Must resolve to the served HTML or throw on failure. */
-  fetchHtml?: (url: string) => Promise<string>;
+  fetchHtml?: (url: string, deadlineAt?: number) => Promise<string>;
 }
 
 /** The measurement mechanisms this gate recognises (surfaced to users verbatim). */
@@ -440,19 +441,72 @@ function pixelIds(mechanisms: string[]): string[] {
  * redirect follower and `assertPublicHostname` SSRF guard must stay in the path. A cache that
  * called `axios` directly would be a quiet way to lose both.
  */
+/**
+ * Per-fetch ceiling for a destination page.
+ *
+ * 10s was tight for a real marketing landing page — heavy JS, cold CDN, a slow origin — and a
+ * fetch that misses the ceiling is recorded as `unverifiable`, which BLOCKS the launch. So a
+ * page that is perfectly well tracked could stop a launch purely for being slow, which is
+ * latency masquerading as a tracking failure.
+ *
+ * Fetches run at FETCH_CONCURRENCY, so this costs ceil(N/5) x timeout, not N x timeout — for the
+ * handful of unique destinations a typical campaign has, one batch.
+ */
+const FETCH_TIMEOUT_MS = 25_000;
+
+/**
+ * True for a failure worth one more attempt.
+ *
+ * Deliberately NOT retrying 4xx. A 403 here is usually bot protection answering a datacenter IP
+ * deterministically — a second identical request gets the identical refusal, and retrying only
+ * spends the launch's time. A timeout or a 5xx is the case where trying again genuinely helps.
+ */
+function isTransientFetchFailure(err: any): boolean {
+  const status = err?.response?.status;
+  if (typeof status === 'number') return status >= 500;
+  // Shared with the launch gate: same `[code, message]` reason as there, and one pattern so the
+  // two cannot drift (this copy was already missing `enotfound`).
+  return TRANSIENT_NETWORK_RE.test([err?.code, err?.message].join(' '));
+}
+
 /* istanbul ignore next — network boundary; unit tests inject `fetchHtml` instead. */
-export async function defaultFetchHtml(url: string): Promise<string> {
+export async function defaultFetchHtml(url: string, deadlineAt?: number): Promise<string> {
   const MAX_HTML_BYTES = 5 * 1024 * 1024;
   return fetchHtmlFollowingRedirects(url, {
-    get: (u: string) =>
-      (axios as any).get(u, {
-        timeout: 10_000,
+    // The chain gets the same bound as the batch — six hops at 25s (50s with the retry) is 300s
+    // for ONE destination, which a between-batches check cannot see.
+    deadlineAt,
+    // The retry sits INSIDE `get`, so `assertPublic` and the redirect follower stay in the path
+    // on every attempt — a retry that bypassed them would quietly drop the SSRF guard.
+    get: async (u: string) => {
+      /*
+       * Same shape as the gate's per-pixel probe (defaultPixelHasRecentActivity): a flat
+       * FETCH_TIMEOUT_MS plus an unconditional retry meant one hop, entered near the deadline,
+       * could still run for the FULL 25s + a FULL 25s retry — up to 50s past a budget that had
+       * almost nothing left. Clamping the timeout to what remains, and skipping the retry unless
+       * a full second attempt still fits, bounds a single hop by the caller's actual budget
+       * rather than by this function's own constant.
+       */
+      const timeout = deadlineAt !== undefined
+        ? Math.max(1_000, Math.min(FETCH_TIMEOUT_MS, deadlineAt - Date.now()))
+        : FETCH_TIMEOUT_MS;
+      const attempt = () => (axios as any).get(u, {
+        timeout,
         maxRedirects: 0,
         maxContentLength: MAX_HTML_BYTES,
         validateStatus: (s: number) => s >= 200 && s < 400,
         headers: PREFLIGHT_FETCH_HEADERS,
         responseType: 'text',
-      }),
+      });
+      try {
+        return await attempt();
+      } catch (err: any) {
+        if (!isTransientFetchFailure(err)) throw err;
+        if (deadlineAt !== undefined && Date.now() + FETCH_TIMEOUT_MS >= deadlineAt) throw err;
+        console.log('[META PREFLIGHT] retrying a transient destination fetch once:', u, err?.message);
+        return await attempt();
+      }
+    },
     assertPublic: assertPublicHostname,
   });
 }
@@ -468,6 +522,20 @@ export async function preflightMetaTrackingGate(
   urls: string[],
   accountPixelIds: string[],
   deps: MetaPreflightDeps = {},
+  /**
+   * A wall-clock deadline shared with the caller, when the caller has already spent part of a
+   * budget before getting here.
+   *
+   * Destinations are fetched in batches of FETCH_CONCURRENCY at up to FETCH_TIMEOUT_MS each (now
+   * twice that, since a transient failure is retried), so a launch pointing at many distinct
+   * pages composes into real time on top of whatever the ad reads already cost. Without a shared
+   * deadline the gate's total is unbounded in aggregate even though every individual step is
+   * bounded — the same shape that let two ad reads spend 480s between them.
+   *
+   * A destination not reached before the deadline is reported `unverifiable`, which is exactly
+   * what it is: we did not look. It blocks like any other unverifiable, and the override remains.
+   */
+  deadlineAt?: number,
 ): Promise<MetaPreflightGateResult> {
   const fetchHtml = deps.fetchHtml ?? defaultFetchHtml;
   const ownedPixels = new Set((accountPixelIds ?? []).filter(Boolean).map(String));
@@ -484,10 +552,32 @@ export async function preflightMetaTrackingGate(
   const results: MetaUrlTrackingResult[] = [];
   for (let i = 0; i < unique.length; i += FETCH_CONCURRENCY) {
     const batch = unique.slice(i, i + FETCH_CONCURRENCY);
+    // Out of budget: report the rest honestly rather than spending time the caller does not have.
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+      results.push(...unique.slice(i).map((url): MetaUrlTrackingResult => ({
+        url,
+        status: 'unverifiable',
+        mechanisms: [],
+        checkedFor: META_TRACKING_MECHANISMS,
+        error: 'not checked — the launch pre-flight ran out of its time budget before reaching this destination',
+      })));
+      break;
+    }
     const settled = await Promise.all(
       batch.map(async (url): Promise<MetaUrlTrackingResult> => {
+        // Checked INSIDE the batch as well as between batches: a batch of five starting with 1ms
+        // left still ran all five to completion, up to 50s each.
+        if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+          return {
+            url,
+            status: 'unverifiable',
+            mechanisms: [],
+            checkedFor: META_TRACKING_MECHANISMS,
+            error: 'not checked — the launch pre-flight ran out of its time budget before reaching this destination',
+          };
+        }
         try {
-          const html = await fetchHtml(url);
+          const html = await fetchHtml(url, deadlineAt);
           const mechanisms = detectMetaPixels(html);
           const onPage = pixelIds(mechanisms);
           // Measured requires BOTH: a pixel is installed, and at least one installed pixel
@@ -524,12 +614,44 @@ export async function preflightMetaTrackingGate(
  * what we found instead, and — the case people misread most often — that a pixel *was*
  * present but belongs to a different account.
  */
+/**
+ * Does this failure look like a WAF/bot-protection refusal rather than a broken page?
+ *
+ * 403 and 401 are the direct refusals; 503 is what Cloudflare's challenge and several rate
+ * limiters return. Deliberately conservative — a 404 or a 500 is the site being broken or
+ * absent, which is a genuine reason to distrust the destination and must keep reading as one.
+ */
+function isLikelyBotProtection(error: string | undefined): boolean {
+  if (!error) return false;
+  return /\b(401|403|503)\b|forbidden|access denied|captcha|cloudflare|are you a robot|just a moment/i.test(error);
+}
+
 function buildMessage(blocked: MetaUrlTrackingResult[], ownedPixels: Set<string>): string {
   if (blocked.length === 0) return '';
 
   const owned = [...ownedPixels];
   const lines = blocked.map(r => {
     if (r.status === 'unverifiable') {
+      /*
+       * Name bot protection when that is what happened.
+       *
+       * "could not verify (Request failed with status code 403)" is accurate and nearly
+       * useless: a WAF refusing a datacenter IP is the single most common reason a perfectly
+       * well-tracked page cannot be read here, and nobody reads "403" and concludes "my
+       * firewall blocked their crawler, my pixel is fine". Without saying so, the honest
+       * verdict still reads like a tracking problem, and the user either chases a bug that
+       * does not exist or overrides blindly.
+       *
+       * The verdict does not change — we still could not verify, and that still blocks. What
+       * changes is that the override becomes an informed decision instead of a guess.
+       */
+      if (isLikelyBotProtection(r.error)) {
+        return `  • ${r.url} — could not verify: the site refused our automated request `
+          + `(${r.error}), which usually means a firewall or bot protection blocking non-browser `
+          + `clients. This is NOT evidence that the pixel is missing — it means we could not look. `
+          + `Open the page yourself to confirm the pixel is present; if it is, this launch is safe `
+          + `to proceed with an explicit tracking-check override.`;
+      }
       return `  • ${r.url} — could not verify (${r.error}). Treated as unmeasured rather than assumed working.`;
     }
     const onPage = pixelIds(r.mechanisms);

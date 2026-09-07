@@ -13,6 +13,7 @@
 
 import { getModelPrice, cacheWriteCost, CacheWriteByTtl, isPerGenerationPriced } from "../utils/llmPricing";
 import { usageRecordDb, CostSource } from "./usageRecordDb";
+import { mirrorVendorUsage } from "./spendLedgerDualWrite";
 // tokenUsageService is lazy-required inside meterUserUsage (not statically imported):
 // it pulls in db.ts -> config/aws.ts, and usageRecorderService is imported very widely
 // (via llmClients). A static import would drag that whole graph into every consumer's
@@ -86,6 +87,20 @@ export interface RecordVendorUsageContext {
   costSource: CostSource;
   /** Dollar cost of this call. Omitted means 0 — ENG-700 makes an unpriced unit loud. */
   costUsd?: number;
+}
+
+/** Log at most one shadow-ledger failure per minute, on its own throttle so a
+ * spend-ledger outage cannot crowd out the recorder's own error channel. */
+let lastShadowErrorLogAt = 0;
+function logShadowLedgerFailure(reason: string): void {
+  const now = Date.now();
+  if (now - lastShadowErrorLogAt >= ERROR_LOG_INTERVAL_MS) {
+    lastShadowErrorLogAt = now;
+    console.error(
+      "[spendLedgerShadow] Failed to mirror vendor usage (further failures suppressed for 60s):",
+      reason,
+    );
+  }
 }
 
 /** Log at most one recorder failure per minute to avoid log spam on outages. */
@@ -229,10 +244,12 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
  * `provider`. For token-priced LLM rows that ambiguity is ENG-700's job.
  */
 export async function recordVendorUsage(ctx: RecordVendorUsageContext): Promise<void> {
+  const now = new Date();
+
   try {
     const userId = ctx.userId || "system";
     const billingUserId = ctx.billingUserId || userId;
-    const date = new Date().toISOString().slice(0, 10);
+    const date = now.toISOString().slice(0, 10);
 
     await usageRecordDb.incrementUsage({
       userId,
@@ -254,7 +271,34 @@ export async function recordVendorUsage(ctx: RecordVendorUsageContext): Promise<
     });
   } catch (error) {
     logRecorderFailure(error);
+    // Do NOT mirror a row the live rail failed to write (CodeRabbit, PR #2793).
+    // The shadow exists to measure ONE difference -- all-vendor spend against
+    // LLM-only -- and a ledger row with no matching usage record is not that
+    // difference, it is an outage artifact. §8 cannot tell the two apart, so
+    // letting them mix would pollute the very measurement this phase produces.
+    // The shadow mirrors the live rail; it never leads it.
+    return;
   }
+
+  // ENG-1250 §9 step 2 -- observe-only shadow of the row just written.
+  // Fire-and-forget and fail-open: nothing reads these rows, and a failure here
+  // must never break the metering it mirrors. Stamped from the same `now` as
+  // the live row above, so the two cannot straddle UTC midnight.
+  void mirrorVendorUsage(
+    {
+      ...ctx,
+      ...(ctx.feature ? { feature: ctx.feature } : {}),
+    },
+    now.toISOString(),
+  )
+    .then((result) => {
+      if (result.status === "failed") logShadowLedgerFailure(result.reason);
+    })
+    // mirrorVendorUsage is written never to reject, but this is a
+    // fire-and-forget call on a hot path: if that contract is ever broken, an
+    // unhandled rejection takes the process down. Cheap insurance against the
+    // shadow ledger killing the rail it observes.
+    .catch((error) => logShadowLedgerFailure(error instanceof Error ? error.message : String(error)));
 }
 
 /**

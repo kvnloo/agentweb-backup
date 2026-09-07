@@ -112,6 +112,170 @@ describe('AgentModeService - Skills', () => {
       expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
     });
 
+    /*
+     * Observed live (delegated session a1a6345a, Phoenix): the skill gate refused
+     * `audit_ad_utm_coverage`, this install was refused by subscription, and the model then ran
+     * an unrelated AD LIST and presented a confident "UTM Tagging Audit Summary — PASS, 6/6
+     * tagged" table built from it, as though the audit had run. A downstream truthfulness guard
+     * appended a correction, but BELOW the fabricated table.
+     *
+     * The model cannot be unit-tested into honesty, but the two inputs it reasons from can be
+     * pinned: this refusal must read as a hard failure, and it must carry an explicit
+     * instruction not to substitute another tool's output for the gated one.
+     */
+    it('reports a subscription refusal as a hard failure, not an ambiguous message', async () => {
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+      const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+
+      // `success` was previously left undefined here while the success path sets `success: true`,
+      // so a refusal did not necessarily read as a failure at all.
+      expect(result.success).toBe(false);
+    });
+
+    it('tells the model not to substitute another tool for the one that needed the skill', async () => {
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+      const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+
+      expect(result.message).toMatch(/do not substitute/i);
+      expect(result.message).toMatch(/not on their plan/i);
+    });
+
+    /*
+     * The outcome has to survive MINIMIZATION, not just be returned.
+     *
+     * The dispatcher does not store the result — it stores
+     * `extractMinimalToolResult(result, 'install_skills')`, and that function's default branch
+     * returns `{}`. So a refusal that reads perfectly here can still reach the ledger as an
+     * empty object with no `success: false` at all, and anything downstream reading the ledger
+     * to find out whether the install worked sees a shape indistinguishable from a clean one.
+     *
+     * That is not hypothetical: `extractMinimalToolResult`'s own ENG-1207 comment records
+     * `reconcileUnconsumedCursors` being inert in production for exactly this reason while all
+     * of its unit tests passed, because those tests built ledger entries by hand and so never
+     * crossed this function. This test crosses it deliberately.
+     */
+    it('a refused install still reads as a failure AFTER ledger minimization', async () => {
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+      const refusal = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+      const ledgerResult = (agentModeService as any).extractMinimalToolResult(refusal, 'install_skills');
+
+      expect(ledgerResult.success).toBe(false);
+      // The refusal must still be readable in the ledger, not just in the returned object.
+      expect(String(ledgerResult.message)).toMatch(/not available with your current subscription/i);
+    });
+
+    it('a PARTIAL install survives minimization as partial, not as a clean success', async () => {
+      // success:true (something installed) + the refused ids. Without the ids the ledger says
+      // only "the install succeeded", which is true and useless: the one skill the gated tool
+      // needed may be exactly the one that was refused.
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+      ]);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      const partial = await agentModeService.installSkills(
+        ['skill-1', 'utm-audit'],
+        'user-123',
+        'session-123',
+      );
+      expect(partial.success).toBe(true);
+      expect(partial.rejectedSkillIds).toEqual(['utm-audit']);
+
+      const ledgerResult = (agentModeService as any).extractMinimalToolResult(partial, 'install_skills');
+      expect(ledgerResult.success).toBe(true);
+      expect(ledgerResult.rejectedSkillIds).toEqual(['utm-audit']);
+    });
+
+    /*
+     * The real incident shape, and the one the earlier version of this fix quietly did not
+     * cover: `installSkills` resolves rejected ids against `getSkillsForDisplay` ->
+     * `getSkillsAvailableToUser`, which is ALREADY filtered to this user's subscription tier. A
+     * skill rejected FOR being outside that tier was excluded from that map before
+     * `rejectedSkillIds` was even computed, so resolving `rejectedToolNames` against it always
+     * found nothing — the exact skill the notice most needs to name resolved to an empty array,
+     * silently falling back to the unscoped (turn-global) path every time. `utm-audit` here is a
+     * real, published skill (present in the FULL catalog, `getPublishedSkills`) that this user's
+     * tier does not include (absent from `getSkillsAvailableToUser`) — the live incident's shape,
+     * not a skill that simply does not exist.
+     */
+    it('resolves rejectedToolNames for a skill excluded by subscription tier, not just an unknown id', async () => {
+      const fullCatalog = [
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+        {
+          skillId: 'utm-audit',
+          name: 'UTM Audit',
+          description: 'Desc',
+          toolNames: ['audit_ad_utm_coverage'],
+          isPublished: true,
+        },
+      ];
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(fullCatalog);
+      // Tier-filtered: only skill-1 is on this user's plan, matching how a subscription refusal
+      // actually reaches installSkills in production.
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([fullCatalog[0]]);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      const partial = await agentModeService.installSkills(
+        ['skill-1', 'utm-audit'],
+        'user-123',
+        'session-123',
+      );
+      expect(partial.rejectedSkillIds).toEqual(['utm-audit']);
+      expect(partial.rejectedToolNames).toEqual(['audit_ad_utm_coverage']);
+
+      const ledgerResult = (agentModeService as any).extractMinimalToolResult(partial, 'install_skills');
+      expect(ledgerResult.rejectedToolNames).toEqual(['audit_ad_utm_coverage']);
+    });
+
+    /*
+     * Regression: a rejection mixing a real skill id with a virtual one (`__admin_tools__`,
+     * `__other_skills__`) used to resolve rejectedToolNames from the real id ONLY — a non-empty
+     * array that reads as a fully scoped rejection while silently dropping every admin/other
+     * tool from it. A gated admin tool refused the same turn would then wrongly read as
+     * available, since its name is absent from a rejectedToolNames that looks complete. The
+     * field must be omitted entirely rather than partially populated, so the notice's per-tool
+     * scoping falls back to its safe (unscoped) path instead of a falsely precise one.
+     */
+    it('omits rejectedToolNames entirely when one of the rejected ids cannot be resolved (mixed real + virtual id)', async () => {
+      const fullCatalog = [
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+        {
+          skillId: 'utm-audit',
+          name: 'UTM Audit',
+          description: 'Desc',
+          toolNames: ['audit_ad_utm_coverage'],
+          isPublished: true,
+        },
+      ];
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(fullCatalog);
+      // Tier-filtered: only skill-1 is on this user's plan — utm-audit resolves via the full
+      // catalog fallback, same as the subscription-tier test above.
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([fullCatalog[0]]);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      // Both utm-audit AND __admin_tools__ are rejected together in the SAME call. utm-audit
+      // resolves fine (via the full-catalog fallback); __admin_tools__ never enters availableById
+      // (non-admin, non-delegated caller) and never appears in getPublishedSkills (it is
+      // synthesized, not a real published skill), so it cannot resolve in either catalog. The old
+      // code read this as a fully-scoped rejection naming only utm-audit's tool — silently
+      // dropping every admin tool from it.
+      const partial = await agentModeService.installSkills(
+        ['skill-1', 'utm-audit', '__admin_tools__'],
+        'user-123',
+        'session-123',
+        false,
+      );
+
+      expect(partial.rejectedSkillIds).toEqual(['utm-audit', '__admin_tools__']);
+      expect(partial.rejectedToolNames).toBeUndefined();
+
+      const ledgerResult = (agentModeService as any).extractMinimalToolResult(partial, 'install_skills');
+      expect(ledgerResult.rejectedToolNames).toBeUndefined();
+    });
+
     it('should filter out unpublished skills', async () => {
       const skills = [
         { skillId: 'skill-1', name: 'Published', description: 'Desc', toolNames: ['tool1'], isPublished: true },
