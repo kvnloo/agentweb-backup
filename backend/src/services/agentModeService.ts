@@ -32866,10 +32866,18 @@ ${strippedHtml}`;
 
   public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
-      // ENG-1793: consistentRead=true, mirroring setWorkPlanStatusAttempt's ENG-1188
-      // read -- the requiredFunctionCalls protection below (see the update-loop
-      // comment) needs to see a required call's failure even when it was recorded
-      // earlier in this very turn, immediately before this modify_work_plan call.
+      // ENG-1793: consistentRead=true so this read of session.workPlan /
+      // calledFunctions / failedFunctions / calledFunctionsVersion -- the fields
+      // the requiredFunctionCalls protection below (see the update-loop comment)
+      // depends on -- is strongly consistent, not the default eventually-consistent
+      // read. Those fields live on the AW-ChatSessions record itself, so this needs
+      // getChatSession -> getChatSessionRecord's own dynamodb.get to pass
+      // ConsistentRead: true (see chatbotService.ts); it is NOT satisfied by
+      // getMessagesFromMessagesTable's consistent read, which covers a different
+      // table (AW-ChatMessages) that this call site does not depend on. Without a
+      // strongly consistent read of the session record, a required call's failure
+      // recorded earlier in this very turn, immediately before this modify_work_plan
+      // call, could be missed.
       const session = await chatbotDb.getChatSession(sessionId, true);
       if (!session || !session.workPlan) {
         return {
