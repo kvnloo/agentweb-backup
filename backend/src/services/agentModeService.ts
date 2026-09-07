@@ -1414,6 +1414,42 @@ function validateDriveDateFilter(value: string, label: string): string {
   return value;
 }
 
+/**
+ * ENG-1794: normalize a predefined-work-plan title for matching in
+ * `applyPredefinedWorkPlan` (the `launch_predefined_work_plan` tool handler).
+ *
+ * Templates are stored with underscore-joined titles (e.g.
+ * "Founder_Linkedin_Sales_Readiness_Eval"), but a user/model referring to one
+ * in chat naturally types it with spaces and mixed case (e.g. "Founder
+ * LinkedIn Sales Readiness Eval"). The previous match was `.toLowerCase()`
+ * only, so that natural phrasing never matched the stored title at all — the
+ * call failed with "not found" and the model fell back to grepping the full
+ * (370KB+) plan listing via search_tool_response/read_tool_response to find
+ * a title to retry with. When two templates are near-duplicates (identical
+ * welcomeMessage/description, titles differing only by an "_Eval"/"_Audit"
+ * suffix), that fallback search is exactly where the model can pick up the
+ * WRONG template's title from a truncated snippet and silently launch it
+ * with no error, since the retry is then a legitimate exact match against
+ * the wrong record (confirmed live: ENG-1794, session
+ * 3fce3c5a-6b25-4167-987b-b5bd8c7f4c5b launched
+ * "Founder_Linkedin_Sales_Readiness_Audit" instead of "..._Eval").
+ *
+ * Folding underscores/hyphens to spaces and collapsing whitespace before the
+ * case-insensitive comparison lets the natural-language phrasing resolve
+ * directly on the FIRST call, so the risky multi-step fallback search never
+ * has to run for this common case. This only smooths over separator/case
+ * differences — it does not do fuzzy/substring/similarity matching, so two
+ * templates whose titles genuinely differ (e.g. the "_Eval"/"_Audit" suffix
+ * itself) never collide.
+ */
+function normalizeWorkPlanTitleForMatch(value: unknown): string {
+  return String(value ?? '')
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
   // ENG-1295 hardening: self-consistency cache for perform_data_analysis. Keyed by
@@ -32533,10 +32569,12 @@ ${strippedHtml}`;
       // behavior — title-based launches from Emma — unchanged.
       const candidates = await getAccessiblePredefinedWorkPlanCandidates(userId);
 
-      const needle = planTitleOrId.toLowerCase();
-      const predefinedPlan = candidates.find(
-        (p) => p.planId === planTitleOrId || (p.title && p.title.toLowerCase() === needle)
-      );
+      // ENG-1794: case/whitespace/underscore-insensitive title match (see
+      // normalizeWorkPlanTitleForMatch above) — planId still wins on an exact
+      // match first, since a title collision must never shadow a stable id.
+      const needle = normalizeWorkPlanTitleForMatch(planTitleOrId);
+      const predefinedPlan = candidates.find((p) => p.planId === planTitleOrId)
+        ?? candidates.find((p) => p.title && normalizeWorkPlanTitleForMatch(p.title) === needle);
 
       if (!predefinedPlan) {
         return { success: false, message: `Work plan template "${planTitleOrId}" not found` };
@@ -32828,7 +32866,19 @@ ${strippedHtml}`;
 
   public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
-      const session = await chatbotDb.getChatSession(sessionId);
+      // ENG-1793: consistentRead=true so this read of session.workPlan /
+      // calledFunctions / failedFunctions / calledFunctionsVersion -- the fields
+      // the requiredFunctionCalls protection below (see the update-loop comment)
+      // depends on -- is strongly consistent, not the default eventually-consistent
+      // read. Those fields live on the AW-ChatSessions record itself, so this needs
+      // getChatSession -> getChatSessionRecord's own dynamodb.get to pass
+      // ConsistentRead: true (see chatbotService.ts); it is NOT satisfied by
+      // getMessagesFromMessagesTable's consistent read, which covers a different
+      // table (AW-ChatMessages) that this call site does not depend on. Without a
+      // strongly consistent read of the session record, a required call's failure
+      // recorded earlier in this very turn, immediately before this modify_work_plan
+      // call, could be missed.
+      const session = await chatbotDb.getChatSession(sessionId, true);
       if (!session || !session.workPlan) {
         return {
           success: false,
@@ -32848,6 +32898,42 @@ ${strippedHtml}`;
         workPlan.steps = workPlan.steps.filter(s => !removeStepCounts.includes(s.stepCount));
       }
 
+      // ENG-1793: a production predefined-plan session (a90b38fc-...) called
+      // modify_work_plan mid-run for its "Create HTML report" step right after
+      // that step's required create_html_from_template call had just FAILED.
+      // The template authored requiredFunctionCalls: ["create_html_from_template"]
+      // for that step, but the modify_work_plan update happened to pass
+      // requiredFunctionCalls: [] for it -- a defined, non-undefined value, so
+      // the old merge below ("use newStep's value if provided, else keep the
+      // old one") silently replaced the real requirement with an empty one.
+      // set_work_plan_status's completion gate (setWorkPlanStatusAttempt) then
+      // had nothing left to check for that step and let it complete despite the
+      // failed required call never succeeding.
+      //
+      // Fix: requiredFunctionCalls can still be freely modified -- added to,
+      // reordered, or have functions removed -- EXCEPT it may never silently
+      // drop a function that has already failed for this session and has not
+      // since succeeded. That specific removal is the exact gate-bypass this
+      // incident hit. A function that was never required to begin with, or
+      // that failed and later succeeded, or that never failed at all, is
+      // unaffected and can still be dropped normally (e.g. a genuine,
+      // deliberate scope reduction).
+      const failedFunctionCounts = session.failedFunctions || {};
+      const succeededFunctionCounts = session.calledFunctions || {};
+      const mergeRequiredFunctionCalls = (
+        existingRequired: string[] | undefined,
+        requested: string[] | undefined,
+      ): string[] | undefined => {
+        if (requested === undefined) return existingRequired;
+        const unresolvedFailures = (existingRequired || []).filter((fn) => {
+          if (requested.includes(fn)) return false;
+          const failed = failedFunctionCounts[fn] || 0;
+          const succeeded = succeededFunctionCounts[fn] || 0;
+          return failed > 0 && succeeded === 0;
+        });
+        return unresolvedFailures.length > 0 ? [...requested, ...unresolvedFailures] : requested;
+      };
+
       // Update or add steps
       for (const newStep of steps) {
         const existingIndex = workPlan.steps.findIndex(s => s.stepCount === newStep.stepCount);
@@ -32858,7 +32944,7 @@ ${strippedHtml}`;
             title: newStep.title,
             description: newStep.description,
             ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
-            requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls,
+            requiredFunctionCalls: mergeRequiredFunctionCalls(workPlan.steps[existingIndex].requiredFunctionCalls, newStep.requiredFunctionCalls),
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
             // Allow scope changes: an explicit expectedAssetCount overrides (including 0
             // to clear the asset gate when the user approves a smaller set); omitting it
