@@ -33608,8 +33608,26 @@ ${strippedHtml}`;
     // meantime -- only the moment the run would otherwise look fully done is
     // gated, which is the only place a silently-dropped requirement actually
     // matters.
+    //
+    // Reads session.calledFunctions directly (the raw, never-mutated snapshot
+    // from the top of this function), NOT the local calledFunctionCounts copy --
+    // that copy gets decremented in-place, once per required call, as THIS SAME
+    // batch's own steps pass their gates above (the pre-existing ENG-1698
+    // credit-consumption mechanic). A debt name that's ALSO genuinely required
+    // and satisfied by an ordinary step completing earlier in this very loop
+    // would decrement calledFunctionCounts back toward 0, making a real success
+    // moments earlier look like it never happened -- a real bug found by review,
+    // reproduced standalone before this comment was written: a session with a
+    // pending debt for `list_html_templates`, a single step requiring exactly
+    // that function, called exactly once and genuinely succeeding, still got
+    // permanently blocked from ever finishing. The real persisted decrement
+    // (decrementCalledFunctionsClamped) only runs after this whole gate passes
+    // anyway, so there's no correctness reason to consult the hypothetical
+    // post-decrement value at decision time -- only whether the function
+    // actually succeeded at all this session.
+    const rawCalledFunctionCounts = session.calledFunctions || {};
     const unresolvedPendingRequiredFunctionCalls = (workPlan.pendingRequiredFunctionCalls || [])
-      .filter(fn => (calledFunctionCounts[fn] || 0) === 0);
+      .filter(fn => (rawCalledFunctionCounts[fn] || 0) === 0);
     if (unresolvedPendingRequiredFunctionCalls.length > 0) {
       const noStepsRemainPending = !workPlan.steps.some(s => s.status === 'pending');
       if (noStepsRemainPending) {
