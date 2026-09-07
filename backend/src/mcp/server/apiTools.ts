@@ -2949,6 +2949,56 @@ Use this to quickly diagnose a client's marketing funnel completeness.`,
 });
 
 mcpToolRegistry.register({
+  name: 'check_account_tracking_health',
+  definition: {
+    name: 'check_account_tracking_health',
+    description: `Check Meta pixel/CAPI health and destination-URL coverage for a specific client's ad account. Admin-only tool, read-only — never sends a real alert, always runs in dry-run mode against this one account.
+
+Resolves the client (email or name) to their Meta ad account via the same lookup assess_client_health uses, then runs the tracking-integrity check scoped to that one account only.
+
+Returns:
+- 'summary': aggregate counts (blackouts, tokenErrors, fetchErrors, healthy, destinationAlerts, destinationOk, etc.) — since this call is scoped to exactly one account, a nonzero count on any of these describes THIS account, not a fleet-wide total.
+- 'summary.capturedAlerts': the specific findings that would have alerted, each with a subject, message, and structured context — this is the actual evidence (which pixel, which destination check, why) behind the aggregate counts above.
+
+Use this to check "is the pixel broken" / "is CAPI deployed" / "does this ad's destination actually carry a pixel this account owns" BEFORE concluding a lead-volume or CTR/CPM anomaly is caused by tracking failure rather than a genuine performance issue — the same reasoning monitor_lead_volume's 'requiresTrackingValidation' field already points here for.
+
+If the client has no connected Meta ad account, this returns an error rather than a health result — check assess_client_health first if account connectivity itself is in question.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const healthData: any = await mcpFetch({
+      method: 'GET',
+      path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    if (!healthData?.success || !healthData?.health?.client?.userId) {
+      return jsonResult({ success: false, error: healthData?.message || `Could not resolve client "${args.client_name_or_email}"` });
+    }
+    const userId = healthData.health.client.userId;
+    const adAccountId = healthData.health.ads_layer?.ad_account_id;
+    if (!adAccountId) {
+      return jsonResult({ success: false, error: `Client "${args.client_name_or_email}" has no connected Meta ad account — nothing to check.` });
+    }
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/admin/tracking-monitor/run',
+      context: ctx(context),
+      body: { dryRun: true, userId, adAccountId },
+    });
+    return jsonResult({ success: true, client: healthData.health.client, ...data });
+  }
+});
+
+mcpToolRegistry.register({
   name: 'monitor_lead_volume',
   definition: {
     name: 'monitor_lead_volume',
