@@ -32888,6 +32888,23 @@ ${strippedHtml}`;
 
       const workPlan = { ...session.workPlan };
 
+      // Snapshot of every step as it existed before this call's removeStepCounts
+      // filtering runs below, keyed by stepCount. Used further down to detect
+      // and protect against "remove step N via removeStepCounts, then add a
+      // fresh step N back in the same steps[] array" -- a step reaching the
+      // "add new step" branch is otherwise treated as having no prior history
+      // at all, even when this exact call just removed the real history one
+      // line below. Live-verified on test-env1, 2026-09-07 (unprompted,
+      // organic model behavior, not a scripted repro): the model removed steps
+      // 2 and 3 via removeStepCounts and added a single new step 2 with
+      // requiredFunctionCalls: [], silently dropping list_html_templates and
+      // create_html_from_template -- both genuinely never called -- with zero
+      // protection, even though the ENG-1799/1800 merge guards were already
+      // active for ordinary same-step edits.
+      const originalStepsBeforeRemoval = new Map<number, (typeof workPlan.steps)[number]>(
+        workPlan.steps.map((s: any) => [s.stepCount, s]),
+      );
+
       // Update autocomplete if explicitly provided
       if (autocomplete !== undefined) {
         workPlan.autocomplete = autocomplete;
@@ -33075,7 +33092,19 @@ ${strippedHtml}`;
             expectedAssetCountTools: mergeExpectedAssetCountTools(workPlan.steps[existingIndex], newStep.expectedAssetCountTools)
           };
         } else {
-          // Add new step (stepCount will be fixed by updateSessionWorkPlan)
+          // Add new step (stepCount will be fixed by updateSessionWorkPlan).
+          //
+          // If this stepCount was just removed via removeStepCounts in this
+          // same call, this is really an edit wearing a "new step" costume --
+          // apply the same merge protection as the existingIndex>=0 branch
+          // above, using the pre-removal step as the baseline, so removing and
+          // re-adding a step can't be used to launder away an unresolved
+          // requirement (see the comment on originalStepsBeforeRemoval above).
+          // A genuinely new stepCount (never existed before this call) has no
+          // history to protect, so it's unaffected.
+          const removedOriginal = removeStepCounts?.includes(newStep.stepCount)
+            ? originalStepsBeforeRemoval.get(newStep.stepCount)
+            : undefined;
           workPlan.steps.push({
             stepCount: newStep.stepCount,
             title: newStep.title,
@@ -33084,10 +33113,20 @@ ${strippedHtml}`;
             status: 'pending',
             completedAt: undefined,
             notes: undefined,
-            requiredFunctionCalls: newStep.requiredFunctionCalls,
+            requiredFunctionCalls: removedOriginal
+              ? mergeRequiredFunctionCalls(removedOriginal.requiredFunctionCalls, newStep.requiredFunctionCalls)
+              : newStep.requiredFunctionCalls,
             skillIds: newStep.skillIds,
-            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount }),
-            ...(newStep.expectedAssetCountTools !== undefined && { expectedAssetCountTools: newStep.expectedAssetCountTools })
+            ...(newStep.expectedAssetCount !== undefined && {
+              expectedAssetCount: removedOriginal
+                ? mergeExpectedAssetCount(removedOriginal, newStep.expectedAssetCount)
+                : newStep.expectedAssetCount,
+            }),
+            ...(newStep.expectedAssetCountTools !== undefined && {
+              expectedAssetCountTools: removedOriginal
+                ? mergeExpectedAssetCountTools(removedOriginal, newStep.expectedAssetCountTools)
+                : newStep.expectedAssetCountTools,
+            })
           });
         }
       }
