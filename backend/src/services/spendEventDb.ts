@@ -164,6 +164,25 @@ function utcMonthOf(value: string): string | null {
 }
 
 /**
+ * The canonical `toISOString()` form of an accepted instant, or null.
+ *
+ * The GSI sorts `occurredAt` as a raw string, and variable fractional precision
+ * makes that ordering disagree with time (CodeRabbit, PR #2787) -- lexically,
+ * `...10:00:00.123Z` < `...10:00:00.12Z` < `...10:00:00.1Z` < `...10:00:00Z`,
+ * the exact reverse of the true order, because `.` sorts below `Z` and a
+ * shorter fraction is not a numeric prefix. A BETWEEN range query on that key
+ * then excludes or misorders events.
+ *
+ * So the store accepts any valid instant but persists exactly one shape:
+ * always three fractional digits, which is what `Date.toISOString()` emits and
+ * therefore what every caller building a timestamp already produces.
+ */
+function canonicalUtcInstant(value: string): string | null {
+  if (utcMonthOf(value) === null) return null;
+  return new Date(value).toISOString();
+}
+
+/**
  * Reject anything that would make the §3 invariant unprovable later. These are
  * cheap to check now and effectively unfixable once written: an event whose
  * billingMonth disagrees with its occurredAt lands in one month's projection
@@ -222,15 +241,19 @@ export function validateSpendEvent(event: SpendEvent): void {
 export async function recordSpendEvent(event: SpendEvent): Promise<RecordSpendEventResult> {
   validateSpendEvent(event);
 
+  // Persist one fixed serialization so the GSI's lexical order IS chronological
+  // order. validateSpendEvent has already proven this cannot be null.
+  const canonical: SpendEvent = { ...event, occurredAt: canonicalUtcInstant(event.occurredAt)! };
+
   try {
     await db()
       .put({
         TableName: SPEND_EVENTS_TABLE,
-        Item: event,
+        Item: canonical,
         ConditionExpression: "attribute_not_exists(billingUserId) AND attribute_not_exists(eventId)",
       })
       .promise();
-    return { stored: true, event };
+    return { stored: true, event: canonical };
   } catch (error: any) {
     if (error?.code !== "ConditionalCheckFailedException") throw error;
 

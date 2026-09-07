@@ -212,6 +212,45 @@ describe('spendEventDb', () => {
     });
   });
 
+  // CodeRabbit, PR #2787: the GSI sorts occurredAt as a raw string, so every
+  // stored row has to use ONE serialization or lexical order stops matching
+  // chronological order.
+  describe('occurredAt is canonicalised on write', () => {
+    it.each([
+      ['2026-09-07T10:00:00Z', '2026-09-07T10:00:00.000Z'],
+      ['2026-09-07T10:00:00.1Z', '2026-09-07T10:00:00.100Z'],
+      ['2026-09-07T10:00:00.12Z', '2026-09-07T10:00:00.120Z'],
+      ['2026-09-07T10:00:00.123Z', '2026-09-07T10:00:00.123Z'],
+    ])('stores %s as %s', async (given, expected) => {
+      await recordSpendEvent(anEvent({ occurredAt: given }));
+
+      expect(mockDynamoDB.put.mock.calls[0][0].Item.occurredAt).toBe(expected);
+    });
+
+    it('returns the canonicalised event, not the caller\'s raw one', async () => {
+      const result = await recordSpendEvent(anEvent({ occurredAt: '2026-09-07T10:00:00Z' }));
+
+      expect(result.event.occurredAt).toBe('2026-09-07T10:00:00.000Z');
+    });
+
+    it('the four accepted forms sort chronologically once stored', async () => {
+      const given = ['2026-09-07T10:00:00Z', '2026-09-07T10:00:00.1Z', '2026-09-07T10:00:00.12Z', '2026-09-07T10:00:00.123Z'];
+
+      const stored: string[] = [];
+      for (const occurredAt of given) {
+        jest.clearAllMocks();
+        mockDynamoDB.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+        await recordSpendEvent(anEvent({ occurredAt }));
+        stored.push(mockDynamoDB.put.mock.calls[0][0].Item.occurredAt);
+      }
+
+      // Raw, these sort in exactly reverse-chronological order.
+      expect([...given].sort()).toEqual([...given].sort((a, b) => Date.parse(b) - Date.parse(a)));
+      // Canonicalised, lexical order and instant order are the same thing.
+      expect([...stored].sort()).toEqual([...stored].sort((a, b) => Date.parse(a) - Date.parse(b)));
+    });
+  });
+
   describe('lifecycle', () => {
     it('only allows a reservation to advance, and both terminal states are final', () => {
       expect(isLegalLifecycleTransition('reserved', 'settled')).toBe(true);
