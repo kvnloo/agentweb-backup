@@ -24,6 +24,11 @@ jest.mock('../services/spendLedgerDualWrite', () => {
 });
 
 import { recordVendorUsage, RecordVendorUsageContext } from '../services/usageRecorderService';
+import {
+  getDroppedWriteTotals,
+  resetDroppedWriteState,
+  setDroppedWriteAlertSink,
+} from '../services/usageWriteFailureMonitor';
 import { usageRecordDb } from '../services/usageRecordDb';
 import { mirrorVendorUsage } from '../services/spendLedgerDualWrite';
 
@@ -47,6 +52,8 @@ const ctx = (over: Partial<RecordVendorUsageContext> = {}): RecordVendorUsageCon
 describe('recordVendorUsage — idempotent vendor writes (ENG-702 AC1)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    resetDroppedWriteState();
+    setDroppedWriteAlertSink(() => {});
     mockTxn.mockResolvedValue('applied');
     mockPlain.mockResolvedValue(undefined);
     mockMirror.mockResolvedValue({ status: 'written' });
@@ -111,6 +118,77 @@ describe('recordVendorUsage — idempotent vendor writes (ENG-702 AC1)', () => {
 
       expect(mockTxn).not.toHaveBeenCalled();
       expect(mockPlain).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('retry and surface (AC3 / AC6)', () => {
+    it('retries a transient failure and succeeds without recording a loss', async () => {
+      mockTxn
+        .mockRejectedValueOnce(Object.assign(new Error('throttled'), { code: 'ThrottlingException' }))
+        .mockResolvedValue('applied');
+
+      await recordVendorUsage(ctx({ idempotencyKey: 'k' }));
+
+      expect(mockTxn).toHaveBeenCalledTimes(2);
+      expect(getDroppedWriteTotals()).toEqual({ count: 0, lostMicroUsd: 0 });
+    });
+
+    it('retries a transaction conflict — the write did not happen at all', async () => {
+      mockTxn.mockResolvedValueOnce('conflict').mockResolvedValue('applied');
+
+      await recordVendorUsage(ctx({ idempotencyKey: 'k' }));
+
+      expect(mockTxn).toHaveBeenCalledTimes(2);
+      expect(getDroppedWriteTotals().count).toBe(0);
+    });
+
+    it('surfaces an exhausted write as a counted loss, with the money', async () => {
+      mockTxn.mockRejectedValue(Object.assign(new Error('throttled'), { code: 'ThrottlingException' }));
+
+      await expect(recordVendorUsage(ctx({ idempotencyKey: 'k' }))).resolves.toBeUndefined();
+
+      expect(mockTxn).toHaveBeenCalledTimes(3);
+      expect(getDroppedWriteTotals()).toEqual({ count: 1, lostMicroUsd: 12500 });
+    });
+
+    it('does not retry a permanent failure, but still counts it', async () => {
+      mockTxn.mockRejectedValue(Object.assign(new Error('bad'), { code: 'ValidationException' }));
+
+      await recordVendorUsage(ctx({ idempotencyKey: 'k' }));
+
+      expect(mockTxn).toHaveBeenCalledTimes(1);
+      expect(getDroppedWriteTotals().count).toBe(1);
+    });
+
+    it('a successful write after an outage flushes the final alert window', async () => {
+      // Otherwise the last batch of a finished outage is never reported, since
+      // windows only close when a LATER drop arrives.
+      const alerts: unknown[] = [];
+      setDroppedWriteAlertSink((summary) => alerts.push(summary));
+
+      mockTxn.mockRejectedValue(Object.assign(new Error('down'), { code: 'ValidationException' }));
+      await recordVendorUsage(ctx({ idempotencyKey: 'a' }));
+      expect(alerts).toHaveLength(0);
+
+      jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 120_000);
+      mockTxn.mockResolvedValue('applied');
+      await recordVendorUsage(ctx({ idempotencyKey: 'b' }));
+
+      expect(alerts).toHaveLength(1);
+      jest.spyOn(Date, 'now').mockRestore();
+    });
+
+    it('counts a loss on the tokenless path too, but never retries it', async () => {
+      // That path's aggregate write is an unconditional ADD: a retry after a
+      // lost response double-counts, which is the failure AC1 exists to
+      // prevent. Under-counting is recoverable through reconciliation;
+      // over-charging a customer is not.
+      mockPlain.mockRejectedValue(Object.assign(new Error('throttled'), { code: 'ThrottlingException' }));
+
+      await recordVendorUsage(ctx());
+
+      expect(mockPlain).toHaveBeenCalledTimes(1);
+      expect(getDroppedWriteTotals()).toEqual({ count: 1, lostMicroUsd: 12500 });
     });
   });
 

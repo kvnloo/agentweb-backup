@@ -14,6 +14,11 @@
 import { getModelPrice, cacheWriteCost, CacheWriteByTtl, isPerGenerationPriced } from "../utils/llmPricing";
 import { usageRecordDb, CostSource } from "./usageRecordDb";
 import { buildShadowEvent, mirrorVendorUsage } from "./spendLedgerDualWrite";
+import {
+  flushDroppedWriteAlerts,
+  recordDroppedWrite,
+  retryTransientWrite,
+} from "./usageWriteFailureMonitor";
 // tokenUsageService is lazy-required inside meterUserUsage (not statically imported):
 // it pulls in db.ts -> config/aws.ts, and usageRecorderService is imported very widely
 // (via llmClients). A static import would drag that whole graph into every consumer's
@@ -278,19 +283,43 @@ async function recordVendorUsageIdempotent(ctx: RecordVendorUsageContext, now: D
       return;
     }
 
-    const outcome = await usageRecordDb.incrementUsageWithSpendEvent(
-      buildVendorIncrement(ctx, userId, billingUserId, now),
-      built.event,
-    );
+    // ENG-702 AC3. Retrying is safe here and ONLY here: the conditional
+    // transaction makes a replay a no-op, so a lost response cannot become a
+    // second charge. A "conflict" outcome is a write that did not happen at
+    // all, so it is retried as a transient failure rather than reported as a
+    // loss.
+    const outcome = await retryTransientWrite(async () => {
+      const result = await usageRecordDb.incrementUsageWithSpendEvent(
+        buildVendorIncrement(ctx, userId, billingUserId, now),
+        built.event,
+      );
+      if (result === "conflict") {
+        throw Object.assign(new Error("transaction conflict on vendor usage"), {
+          code: "TransactionConflictException",
+        });
+      }
+      return result;
+    });
 
-    if (outcome === "conflict") {
-      // Two concurrent writers touched the same aggregate row. Neither rail
-      // moved, so this is a retryable nothing rather than a lost charge -- and
-      // the token makes the retry safe.
-      logRecorderFailure(new Error(`transaction conflict on vendor usage for ${billingUserId}; not applied`));
-    }
+    void outcome;
+
+    // A window only closes when the NEXT drop arrives, so when an outage ENDS
+    // -- exactly when someone starts investigating -- its final and often
+    // largest batch would never be reported. The first successful write after
+    // recovery flushes it. Cheaper and more reliable than a timer, since it
+    // fires precisely when there is evidence the rail is healthy again.
+    flushDroppedWriteAlerts();
   } catch (error) {
-    logRecorderFailure(error);
+    // Exhausted, or permanent. Surfaced as a counted, aggregated alert rather
+    // than thrown: every caller is fire-and-forget, so throwing would be an
+    // unhandled rejection and take the process down (ENG-1804).
+    recordDroppedWrite({
+      provider: ctx.provider,
+      operation: ctx.operation,
+      costMicroUsd: Math.max(0, Math.round((ctx.costUsd || 0) * 1e6)),
+      billingUserId,
+      reason: error instanceof Error ? error.message : String(error),
+    });
   }
 }
 
@@ -356,6 +385,19 @@ export async function recordVendorUsage(ctx: RecordVendorUsageContext): Promise<
     });
   } catch (error) {
     logRecorderFailure(error);
+    // ENG-702 AC3: counted even here, so an outage's cost is visible whether or
+    // not the call site has adopted a token. NOT retried, though: this path's
+    // aggregate write is an unconditional ADD, so a retry after a lost response
+    // double-counts -- the exact failure AC1 exists to prevent. Failing toward
+    // under-counting is recoverable through reconciliation; over-charging a
+    // customer is not.
+    recordDroppedWrite({
+      provider: ctx.provider,
+      operation: ctx.operation,
+      costMicroUsd: Math.max(0, Math.round((ctx.costUsd || 0) * 1e6)),
+      billingUserId: ctx.billingUserId || ctx.userId || "system",
+      reason: error instanceof Error ? error.message : String(error),
+    });
     // Do NOT mirror a row the live rail failed to write (CodeRabbit, PR #2793).
     // The shadow exists to measure ONE difference -- all-vendor spend against
     // LLM-only -- and a ledger row with no matching usage record is not that
