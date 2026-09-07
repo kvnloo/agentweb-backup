@@ -17,7 +17,7 @@
  */
 import { SpendEvent, SPEND_EVENTS_TABLE } from "../services/spendEventDb";
 import { UsageRecordRow, usageRecordDb } from "../services/usageRecordDb";
-import { reconcileMonth } from "../services/spendReconciliation";
+import { reconcileMonth, selectReconcilableSubjects } from "../services/spendReconciliation";
 import AWS from "aws-sdk";
 
 const usd = (micro: number) => `$${(micro / 1e6).toFixed(6)}`;
@@ -54,7 +54,16 @@ async function main(): Promise<void> {
   const mirrorStartedAt = process.env.SPEND_LEDGER_MIRROR_STARTED_AT;
 
   const events = await scanAllSpendEvents(month);
-  const subjects = only ? [only] : [...new Set(events.map((e) => e.billingUserId))].sort();
+  const liveRowsForMonth = await usageRecordDb.scanByDateRange(`${month}-01`, `${month}-31`);
+
+  // Subjects come from BOTH rails, not just the ledger (CodeRabbit, PR #2805).
+  // Deriving them from spend events alone hides the single worst case this
+  // report exists to catch: a subject whose mirror writes ALL failed has no
+  // events, so it would be absent from the list, never loaded, and its
+  // unmirrored spend would be invisible -- the report would print clean
+  // precisely when the mirror had failed hardest.
+  const { reconcilable, llmOnly } = selectReconcilableSubjects(events, liveRowsForMonth);
+  const subjects = only ? [only] : reconcilable;
 
   console.log(`\nENG-1250 §8 internal reconciliation — ${month}`);
   console.log(`table: ${SPEND_EVENTS_TABLE}   spend events in month: ${events.length}`);
@@ -64,16 +73,26 @@ async function main(): Promise<void> {
       : "fidelity UNSCOPED — set SPEND_LEDGER_MIRROR_STARTED_AT or every pre-mirror row reads as a failure",
   );
 
+  if (!only && llmOnly.length > 0) {
+    console.log(`${llmOnly.length} subject(s) with LLM spend only — nothing to reconcile, not listed`);
+  }
+
   if (subjects.length === 0) {
-    console.log("\nNo spend events yet for this month. Nothing to reconcile.\n");
+    console.log("\nNo spend events and no vendor usage this month. Nothing to reconcile.\n");
     return;
   }
 
-  const start = `${month}-01`;
-  const end = `${month}-31`;
+  // Grouped once from the single scan above rather than re-queried per subject:
+  // the same rows, one pass instead of N.
+  const liveRowsBySubject = new Map<string, UsageRecordRow[]>();
+  for (const row of liveRowsForMonth) {
+    const list = liveRowsBySubject.get(row.billingUserId);
+    if (list) list.push(row);
+    else liveRowsBySubject.set(row.billingUserId, [row]);
+  }
 
   for (const billingUserId of subjects) {
-    const liveRows: UsageRecordRow[] = await usageRecordDb.queryByBillingUserDateRange(billingUserId, start, end);
+    const liveRows: UsageRecordRow[] = liveRowsBySubject.get(billingUserId) ?? [];
     const report = reconcileMonth(billingUserId, month, events, liveRows, { mirrorStartedAt });
     const f = report.fidelity;
     const d = report.divergence;

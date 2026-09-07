@@ -227,6 +227,36 @@ export function reconcileVendorFidelity(
   };
 }
 
+/**
+ * Which billing subjects a monthly reconciliation should actually cover.
+ *
+ * Vendor activity on EITHER rail makes a subject reconcilable. Deriving the set
+ * from spend events alone hides the single worst case this check exists to
+ * catch (CodeRabbit, PR #2805): a subject whose mirror writes ALL failed has no
+ * events, so it would never be looked at, and the run would print clean
+ * precisely when the mirror had failed hardest.
+ *
+ * Subjects with only LLM spend are returned separately rather than dropped
+ * silently — they have nothing to reconcile here, but "19 subjects not listed"
+ * is a materially different report from one that simply omits them.
+ */
+export function selectReconcilableSubjects(
+  events: readonly SpendEvent[],
+  liveRows: readonly UsageRecordRow[],
+): { reconcilable: string[]; llmOnly: string[] } {
+  const reconcilable = new Set<string>(events.map((e) => e.billingUserId).filter(Boolean));
+  const llmOnly = new Set<string>();
+
+  for (const row of liveRows) {
+    if (!row.billingUserId) continue;
+    if (isVendorEntry(row)) reconcilable.add(row.billingUserId);
+    else llmOnly.add(row.billingUserId);
+  }
+  for (const id of reconcilable) llmOnly.delete(id);
+
+  return { reconcilable: [...reconcilable].sort(), llmOnly: [...llmOnly].sort() };
+}
+
 export interface BasisDivergenceReport {
   /** What the live gate enforces on today: token-priced LLM spend. */
   llmOnlyMicroUsd: number;

@@ -12,6 +12,7 @@ import {
   measureBasisDivergence,
   reconcileMonth,
   reconcileVendorFidelity,
+  selectReconcilableSubjects,
   splitVendorModel,
 } from '../services/spendReconciliation';
 import { SpendEvent } from '../services/spendEventDb';
@@ -312,6 +313,52 @@ describe('measureBasisDivergence', () => {
 
   it('marks it trustworthy when the mirror is faithful', () => {
     expect(measureBasisDivergence([anLlmRow(), aVendorRow()], clean).trustworthy).toBe(true);
+  });
+});
+
+describe('selectReconcilableSubjects', () => {
+  it('includes a subject whose mirror failed COMPLETELY — the worst case', () => {
+    // No events at all, only live vendor rows. Deriving subjects from events
+    // would skip it entirely and the run would print clean precisely when the
+    // mirror had failed hardest.
+    const { reconcilable } = selectReconcilableSubjects([], [aVendorRow({ billingUserId: 'all-failed' })]);
+
+    expect(reconcilable).toEqual(['all-failed']);
+  });
+
+  it('includes a subject known only from the ledger', () => {
+    const { reconcilable } = selectReconcilableSubjects([anEvent({ billingUserId: 'ledger-only' })], []);
+
+    expect(reconcilable).toEqual(['ledger-only']);
+  });
+
+  it('separates LLM-only subjects instead of dropping them silently', () => {
+    const { reconcilable, llmOnly } = selectReconcilableSubjects(
+      [],
+      [anLlmRow({ billingUserId: 'llm-guy' }), aVendorRow({ billingUserId: 'vendor-guy' })],
+    );
+
+    expect(reconcilable).toEqual(['vendor-guy']);
+    expect(llmOnly).toEqual(['llm-guy']);
+  });
+
+  it('does not list a subject as LLM-only when it also has vendor spend', () => {
+    const { reconcilable, llmOnly } = selectReconcilableSubjects(
+      [],
+      [anLlmRow({ billingUserId: 'both' }), aVendorRow({ billingUserId: 'both' })],
+    );
+
+    expect(reconcilable).toEqual(['both']);
+    expect(llmOnly).toEqual([]);
+  });
+
+  it('deduplicates and sorts', () => {
+    const { reconcilable } = selectReconcilableSubjects(
+      [anEvent({ billingUserId: 'b' }), anEvent({ billingUserId: 'a' })],
+      [aVendorRow({ billingUserId: 'b' })],
+    );
+
+    expect(reconcilable).toEqual(['a', 'b']);
   });
 });
 
