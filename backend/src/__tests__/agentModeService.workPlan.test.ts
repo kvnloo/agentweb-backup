@@ -2337,7 +2337,11 @@ describe('AgentModeService - Work Plan', () => {
         expect(chatbotDb.getChatSession).toHaveBeenCalledWith(mockSessionId, true);
       });
 
-      it('still allows a genuine scope reduction: dropping a required function that never failed', async () => {
+      // ENG-1799 tightened this: it is no longer enough for the dropped function to
+      // have merely never failed -- it must have actually SUCCEEDED at least once
+      // (see the new 'ENG-1799' describe block below for the "never called at all"
+      // case this test used to leave unprotected).
+      it('still allows a genuine scope reduction: dropping a required function that already succeeded', async () => {
         const workPlan = {
           title: 'Project Plan',
           steps: [
@@ -2357,8 +2361,8 @@ describe('AgentModeService - Work Plan', () => {
           userId: mockUserId,
           messages: [],
           workPlan: JSON.parse(JSON.stringify(workPlan)),
-          calledFunctions: {},
-          failedFunctions: {}, // neither function has ever failed
+          calledFunctions: { get_meta_ads_metrics: 1 }, // already succeeded once
+          failedFunctions: {},
         };
 
         (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
@@ -2479,6 +2483,767 @@ describe('AgentModeService - Work Plan', () => {
         expect(statusResult.success).toBe(false);
         expect(statusResult.message).toContain('Required function calls have not been made');
         expect(statusResult.missingFunctionCalls[0].missing).toContain('create_html_from_template (need 1, have 0)');
+      });
+    });
+
+    // ENG-1799: production session 3fce3c5a-6b25-4167-987b-b5bd8c7f4c5b launched
+    // the "Founder_Linkedin_Sales_Readiness_Audit" predefined plan. Investigation
+    // showed the SAME class of gap ENG-1793 fixed above, but for a required
+    // function that was never called at all rather than one that was called and
+    // failed: the old mergeRequiredFunctionCalls only protected a function with
+    // failedFunctions[fn] > 0, so a never-attempted function (failed === 0,
+    // succeeded === 0) failed that `failed > 0` test and could be silently
+    // dropped by modify_work_plan just as easily as a genuinely-satisfied one.
+    describe('ENG-1799: modify_work_plan cannot silently drop a never-called required function call', () => {
+      it('re-adds a required function that was never called, even when the update omits it', async () => {
+        const workPlan = {
+          title: 'Founder_Linkedin_Sales_Readiness_Audit',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'ICP Info Collection',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['read_knowledge_base_files', 'read_market_strategy', 'you_search_web'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {}, // none of the three has ever been called
+          failedFunctions: {}, // and none has ever failed either -- just never attempted
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [
+            {
+              stepCount: 1,
+              title: 'ICP Info Collection',
+              requiredFunctionCalls: [], // silently drops all three unmet requirements
+            },
+          ],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({
+                stepCount: 1,
+                requiredFunctionCalls: expect.arrayContaining([
+                  'read_knowledge_base_files',
+                  'read_market_strategy',
+                  'you_search_web',
+                ]),
+              }),
+            ]),
+          })
+        );
+      });
+
+      it('still allows dropping a required function that already succeeded', async () => {
+        const workPlan = {
+          title: 'Founder_Linkedin_Sales_Readiness_Audit',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'ICP Info Collection',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['read_knowledge_base_files', 'you_search_web'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: { read_knowledge_base_files: 1, you_search_web: 1 }, // both already succeeded
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [
+            {
+              stepCount: 1,
+              title: 'ICP Info Collection',
+              requiredFunctionCalls: ['read_knowledge_base_files'], // user approved dropping the already-satisfied you_search_web
+            },
+          ],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepCount: 1, requiredFunctionCalls: ['read_knowledge_base_files'] }),
+            ]),
+          })
+        );
+      });
+
+      it('still protects a never-succeeded required function even once the step shows completed (closes the reset-to-pending bypass)', async () => {
+        // Fresh-eyes review of PR #2794 found: an earlier version of this fix
+        // exempted a resolved (completed/skipped) step from protection entirely,
+        // on the theory that "the gate that mattered already ran its decision."
+        // That's unsafe -- a resolved step can be reset back to 'pending' later
+        // (e.g. "assets need regenerating", see the ENG-1188/CodeRabbit PR #2430
+        // cutoff-timestamp handling in setWorkPlanStatusAttempt, which explicitly
+        // treats that reset as a supported transition) without restoring
+        // requiredFunctionCalls to anything. Clearing a requirement while
+        // 'completed' would then survive the reset silently, letting the step
+        // re-complete with no gate at all. Protection must stay active
+        // regardless of status; it's a no-op for a step that resolved normally
+        // (every required call already succeeded), and only bites when a
+        // requirement was never actually satisfied -- exactly the case this
+        // test pins.
+        const workPlan = {
+          title: 'Founder_Linkedin_Sales_Readiness_Audit',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'ICP Info Collection',
+              status: 'completed' as const,
+              requiredFunctionCalls: ['read_knowledge_base_files', 'you_search_web'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          // Neither function ever actually succeeded for this session -- an
+          // inconsistent-but-possible state (e.g. the step was force-completed
+          // by an earlier bug, or reset-and-recompleted before this fix).
+          calledFunctions: {},
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 1, title: 'ICP Info Collection', requiredFunctionCalls: [] }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({
+                stepCount: 1,
+                requiredFunctionCalls: expect.arrayContaining(['read_knowledge_base_files', 'you_search_web']),
+              }),
+            ]),
+          })
+        );
+      });
+
+      it('end-to-end: clearing a required call while completed cannot survive a reset-to-pending, then re-complete without the real work', async () => {
+        // The exact exploit sequence the review reproduced. Starting state:
+        // the step is already 'completed' with its credit already consumed
+        // (calledFunctions: {}) -- the same realistic post-completion shape
+        // ENG-1698's decrementCalledFunctionsClamped produces once a step
+        // that consumed a required call's credit has resolved. From there:
+        // clear requiredFunctionCalls via modify_work_plan while still
+        // 'completed' (previously exempt from protection), reset the step
+        // back to 'pending' (a real, already-supported transition -- resets
+        // never restore requiredFunctionCalls), then re-complete it without
+        // ever calling the required function again.
+        const workPlan = {
+          title: 'Meta_Ads_Perf_Report',
+          steps: [
+            {
+              stepCount: 3,
+              title: 'Create HTML report',
+              status: 'completed' as const,
+              requiredFunctionCalls: ['create_html_file'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {},
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        // 1. Clear requiredFunctionCalls via modify_work_plan while the step is 'completed'.
+        const modifyResult = await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Create HTML report', requiredFunctionCalls: [] }],
+          [],
+          mockSessionId
+        );
+        expect(modifyResult.success).toBe(true);
+        expect(mockSession.workPlan.steps[0].requiredFunctionCalls).toEqual(['create_html_file']);
+
+        // 2. Reset the step back to pending (no required-call check on this transition).
+        const resetResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 3, status: 'pending' }],
+          mockSessionId
+        );
+        expect(resetResult.success).toBe(true);
+
+        // 3. Re-complete without ever calling create_html_file again -- must be blocked.
+        const secondComplete = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 3, status: 'completed' }],
+          mockSessionId
+        );
+        expect(secondComplete.success).toBe(false);
+        expect(secondComplete.missingFunctionCalls[0].missing).toContain('create_html_file (need 1, have 0)');
+      });
+
+      it('does not lose a never-called requirement when a step is removed via removeStepCounts and the SAME stepCount is added back in the same call', async () => {
+        // Live-verified on test-env1, 2026-09-07 (unprompted, organic model
+        // behavior against the real deployed branch, not a scripted repro):
+        // the model called modify_work_plan with removeStepCounts including a
+        // stepCount, and a new step reusing that exact same stepCount, in the
+        // SAME call. Because removeStepCounts filters workPlan.steps BEFORE
+        // the update-or-add loop runs, the re-added step landed in the "add
+        // new step" branch (existingIndex === -1), bypassing
+        // mergeRequiredFunctionCalls entirely -- a different bypass mechanism
+        // than the reset-to-pending one above, and one the original
+        // ENG-1799/1800 fix (and its first correction) both missed since
+        // neither touched the removeStepCounts interaction.
+        //
+        // Scope note: this test covers the exact reused-stepCount pattern
+        // observed live and protected by originalStepsBeforeRemoval above. A
+        // broader N-to-M consolidation (e.g. removing steps 2 AND 3, adding
+        // back only step 2 with a different, larger scope) can still lose
+        // step 3's specific unresolved requirement if step 3's number is
+        // never reused -- tracked separately as a follow-up rather than
+        // guessed at here, since blindly attaching an unrelated removed
+        // step's requirements to whatever new step happens to appear in the
+        // same call risks over-blocking genuinely unrelated, legitimate
+        // step deletions.
+        const workPlan = {
+          title: 'Meta_Ads_Perf_Report',
+          steps: [
+            {
+              stepCount: 2,
+              title: 'Perform data analysis on metrics',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['list_html_templates', 'perform_data_analysis'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          // perform_data_analysis genuinely succeeded; list_html_templates never did.
+          calledFunctions: { perform_data_analysis: 1 },
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        // Remove step 2, add a new step 2 (same number) with no requiredFunctionCalls.
+        const modifyResult = await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 2, title: 'Performance Report & Analysis', requiredFunctionCalls: [] }],
+          [2],
+          mockSessionId
+        );
+        expect(modifyResult.success).toBe(true);
+
+        const newStep2 = mockSession.workPlan.steps.find((s: any) => s.stepCount === 2);
+        // list_html_templates never succeeded -- must survive into the
+        // re-added step. perform_data_analysis genuinely succeeded, so it's
+        // correctly allowed to drop.
+        expect(newStep2.requiredFunctionCalls).toEqual(expect.arrayContaining(['list_html_templates']));
+        expect(newStep2.requiredFunctionCalls).not.toContain('perform_data_analysis');
+
+        // Attempting to complete the re-added step without ever calling
+        // list_html_templates must still be blocked.
+        const completeResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 2, status: 'completed' }],
+          mockSessionId
+        );
+        expect(completeResult.success).toBe(false);
+        expect(completeResult.missingFunctionCalls[0].missing).toContain('list_html_templates (need 1, have 0)');
+      });
+
+      it('does not silently drop expectedAssetCount/expectedAssetCountTools when a reused step OMITS those fields entirely', async () => {
+        // Second-round fresh-eyes review of PR #2794 found: the reused-stepCount
+        // fix above unconditionally protects requiredFunctionCalls (the merge
+        // function always runs when removedOriginal exists), but
+        // expectedAssetCount/expectedAssetCountTools kept the OLD
+        // "only call the merge function if the caller explicitly supplied the
+        // field" pattern. A model reusing a just-removed stepCount and simply
+        // OMITTING expectedAssetCount (rather than explicitly lowering it to
+        // 0 -- the only case the earlier tests covered) skipped
+        // mergeExpectedAssetCount entirely, so the re-added step ended up with
+        // NO expectedAssetCount property at all -- a complete, silent removal
+        // of the asset-count gate, worse than an explicit lowering, through
+        // exactly the reused-stepCount surface this fix claims to close.
+        // Reproduced independently before this test was written: pushing a
+        // step with only { stepCount, title } (no asset-count fields) through
+        // a removed-and-reused stepCount left expectedAssetCount undefined
+        // instead of preserving the pre-removal value of 12.
+        const workPlan = {
+          title: 'Display Ad Set Production',
+          steps: [
+            {
+              stepCount: 3,
+              title: 'Render the Full Size Matrix',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['playwright_browser_take_screenshot'],
+              expectedAssetCount: 12,
+              expectedAssetCountTools: ['playwright_browser_take_screenshot'],
+            },
+          ],
+          createdAt: '2026-08-12T14:54:35.000Z',
+          updatedAt: '2026-08-12T14:54:35.000Z',
+        };
+
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          // Only 1 of the 12 required assets has genuinely been produced.
+          messages: [{
+            role: 'assistant',
+            timestamp: '2026-08-12T15:35:00.000Z',
+            metadata: {
+              timestamp: '2026-08-12T15:35:00.000Z',
+              toolCalls: [{ name: 'playwright_browser_take_screenshot', result: { success: true } }],
+            },
+          }],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: { playwright_browser_take_screenshot: 1 },
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        // Remove step 3, add a new step 3 (same number) that OMITS
+        // expectedAssetCount/expectedAssetCountTools entirely -- no explicit
+        // lowering, just silence.
+        const modifyResult = await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix' }],
+          [3],
+          mockSessionId
+        );
+        expect(modifyResult.success).toBe(true);
+
+        const newStep3 = mockSession.workPlan.steps.find((s: any) => s.stepCount === 3);
+        expect(newStep3.expectedAssetCount).toBe(12);
+        expect(newStep3.expectedAssetCountTools).toEqual(['playwright_browser_take_screenshot']);
+
+        // Attempting to complete the re-added step with only 1 of 12 assets
+        // produced must still be blocked.
+        const completeResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 3, status: 'completed' }],
+          mockSessionId
+        );
+        expect(completeResult.success).toBe(false);
+        expect(completeResult.reason).toBe('workplan_insufficient_assets');
+      });
+
+      it('end-to-end: modify_work_plan cannot be used to bypass set_work_plan_status\'s completion gate for a never-called function', async () => {
+        const workPlan = {
+          title: 'Founder_Linkedin_Sales_Readiness_Audit',
+          steps: [
+            {
+              stepCount: 6,
+              title: 'Generate HTML Readiness Report',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['create_html_file'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {},
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        // Step 1: the model tries to clear the never-called step's required calls.
+        const modifyResult = await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 6, title: 'Generate HTML Readiness Report', requiredFunctionCalls: [] }],
+          [],
+          mockSessionId
+        );
+        expect(modifyResult.success).toBe(true);
+
+        // Step 2: the model then tries to mark the step completed anyway.
+        const statusResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 6, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(statusResult.success).toBe(false);
+        expect(statusResult.message).toContain('Required function calls have not been made');
+        expect(statusResult.missingFunctionCalls[0].missing).toContain('create_html_file (need 1, have 0)');
+      });
+    });
+
+    // ENG-1800: production session ca06a9e0-9499-42e1-98ce-72b5bb7b4d04 launched
+    // the "Display Ad Set Production -- One Master, Every Size" predefined plan.
+    // "Render the Full Size Matrix" required expectedAssetCount: 12 (gated on
+    // expectedAssetCountTools: ["playwright_browser_take_screenshot"]) but only 1
+    // real screenshot was ever taken. Instead of producing the rest, the model
+    // called modify_work_plan to shrink expectedAssetCount to 1, then to 0 --
+    // silently clearing the sibling completion gate the same way ENG-1793/1799
+    // showed requiredFunctionCalls could be cleared, with no protection at all
+    // (the field was deliberately unguarded to allow a genuine user-approved
+    // scope reduction). The step then completed with 1 of the promised 12 assets
+    // and the closing synthesis falsely claimed "Deliverables Generated & Verified"
+    // across all 12 units.
+    describe('ENG-1800: modify_work_plan cannot silently clear the expectedAssetCount gate', () => {
+      const makeStep = (overrides: Record<string, unknown> = {}) => ({
+        stepCount: 3,
+        title: 'Render the Full Size Matrix',
+        status: 'pending' as const,
+        requiredFunctionCalls: ['create_html_file', 'playwright_browser_take_screenshot'],
+        expectedAssetCount: 12,
+        expectedAssetCountTools: ['playwright_browser_take_screenshot'],
+        ...overrides,
+      });
+
+      const screenshotMessage = (isoTimestamp: string) => ({
+        role: 'assistant',
+        timestamp: isoTimestamp,
+        metadata: {
+          timestamp: isoTimestamp,
+          toolCalls: [{ name: 'playwright_browser_take_screenshot', result: { success: true } }],
+        },
+      });
+
+      it('refuses to lower expectedAssetCount to 0 while only 1 of 12 assets has been produced', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [screenshotMessage('2026-08-12T15:35:00.000Z')],
+          workPlan: {
+            title: 'Display Ad Set Production',
+            steps: [makeStep()],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:54:35.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        // The exact production payload: the model shrinks the goalpost to match
+        // what it actually produced instead of producing the rest.
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix', expectedAssetCount: 0 }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepCount: 3, expectedAssetCount: 12 }),
+            ]),
+          })
+        );
+      });
+
+      it('still allows lowering expectedAssetCount once enough assets have genuinely been produced', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          // 12 real screenshots -- the step has genuinely met its current target.
+          messages: Array.from({ length: 12 }, (_, i) =>
+            screenshotMessage(`2026-08-12T15:${String(35 + i).padStart(2, '0')}:00.000Z`)
+          ),
+          workPlan: {
+            title: 'Display Ad Set Production',
+            steps: [makeStep()],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:54:35.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix', expectedAssetCount: 1 }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepCount: 3, expectedAssetCount: 1 }),
+            ]),
+          })
+        );
+      });
+
+      it('still allows raising expectedAssetCount freely', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [screenshotMessage('2026-08-12T15:35:00.000Z')],
+          workPlan: {
+            title: 'Display Ad Set Production',
+            steps: [makeStep()],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:54:35.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix', expectedAssetCount: 20 }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepCount: 3, expectedAssetCount: 20 }),
+            ]),
+          })
+        );
+      });
+
+      it('still refuses to lower expectedAssetCount even once the step shows completed (closes the reset-to-pending bypass)', async () => {
+        // Fresh-eyes review of PR #2794 found: an earlier version of this fix
+        // exempted a resolved (completed/skipped) step entirely. Unsafe for the
+        // same reason as the requiredFunctionCalls case above -- a resolved step
+        // can be reset back to 'pending' (a real, already-supported transition)
+        // without restoring expectedAssetCount, so a shrink applied while
+        // 'completed' would silently survive the reset. Protection must stay
+        // active regardless of status; only 1 of 12 assets were ever produced
+        // here, so the shrink must still be blocked.
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [screenshotMessage('2026-08-12T15:35:00.000Z')],
+          workPlan: {
+            title: 'Display Ad Set Production',
+            steps: [makeStep({ status: 'completed' as const })],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:54:35.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix', expectedAssetCount: 0 }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepCount: 3, expectedAssetCount: 12 }),
+            ]),
+          })
+        );
+      });
+
+      it('refuses to retarget expectedAssetCountTools to an unrelated already-satisfied tool while the current requirement is unmet', async () => {
+        // Fresh-eyes review of PR #2794 found a second, unaddressed bypass: the
+        // numeric expectedAssetCount fix does nothing to protect
+        // expectedAssetCountTools. Leaving expectedAssetCount at 12 but silently
+        // retargeting expectedAssetCountTools to an unrelated tool the model
+        // already called 12+ times achieves the identical "dodge a failing
+        // gate" outcome through a field the numeric check never looks at.
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [
+            screenshotMessage('2026-08-12T15:35:00.000Z'),
+            ...Array.from({ length: 12 }, (_, i) => ({
+              role: 'assistant',
+              timestamp: `2026-08-12T15:${String(40 + i).padStart(2, '0')}:00.000Z`,
+              metadata: {
+                timestamp: `2026-08-12T15:${String(40 + i).padStart(2, '0')}:00.000Z`,
+                toolCalls: [{ name: 'you_search_web', result: { success: true } }],
+              },
+            })),
+          ],
+          workPlan: {
+            title: 'Display Ad Set Production',
+            steps: [makeStep()],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:54:35.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        // expectedAssetCount stays 12 -- only expectedAssetCountTools is retargeted
+        // to a tool that was already called 12 times for an unrelated reason.
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix', expectedAssetCountTools: ['you_search_web'] }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({
+                stepCount: 3,
+                expectedAssetCountTools: ['playwright_browser_take_screenshot'],
+              }),
+            ]),
+          })
+        );
+      });
+
+      it('still allows retargeting expectedAssetCountTools once the current requirement has genuinely been met', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          // 12 real screenshots under the EXISTING tool -- requirement already met.
+          messages: Array.from({ length: 12 }, (_, i) =>
+            screenshotMessage(`2026-08-12T15:${String(35 + i).padStart(2, '0')}:00.000Z`)
+          ),
+          workPlan: {
+            title: 'Display Ad Set Production',
+            steps: [makeStep()],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:54:35.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix', expectedAssetCountTools: ['generate_image'] }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepCount: 3, expectedAssetCountTools: ['generate_image'] }),
+            ]),
+          })
+        );
+      });
+
+      it('end-to-end: modify_work_plan cannot be used to bypass set_work_plan_status\'s asset-count gate', async () => {
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [screenshotMessage('2026-08-12T15:35:00.000Z')],
+          calledFunctions: { create_html_file: 1, playwright_browser_take_screenshot: 1 },
+          workPlan: {
+            title: 'Display Ad Set Production',
+            steps: [makeStep()],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:54:35.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        // Step 1: set_work_plan_status correctly blocks -- only 1 of 12 produced.
+        const blockedResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 3, status: 'completed' }],
+          mockSessionId
+        );
+        expect(blockedResult.success).toBe(false);
+        expect(blockedResult.reason).toBe('workplan_insufficient_assets');
+
+        // Step 2: the model tries to shrink the goalpost instead of finishing the work.
+        const modifyResult = await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix', expectedAssetCount: 0 }],
+          [],
+          mockSessionId
+        );
+        expect(modifyResult.success).toBe(true);
+
+        // Step 3: the model tries to mark the step completed anyway.
+        const statusResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 3, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(statusResult.success).toBe(false);
+        expect(statusResult.reason).toBe('workplan_insufficient_assets');
+        expect(statusResult.insufficientAssets).toEqual([
+          expect.objectContaining({ stepCount: 3, expected: 12, produced: 1 }),
+        ]);
       });
     });
   });

@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
-import { agentModeService, AgentModeService } from '../services/agentModeService';
+import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch } from '../services/agentModeService';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
 import { computeSessionModelAttribution } from '../utils/sessionModelAttribution';
@@ -13201,8 +13201,12 @@ export const agentModeController = {
       // private plan takes priority over a system/public plan with the same title
       const allPlans = [...userPrivatePlans.map(mapPlan), ...publicPlans.map(mapPlan)];
       const seen = new Set<string>();
+      // ENG-1802: normalize separators/case (not just case) so two templates whose
+      // titles differ only by underscore/hyphen-vs-space or case still dedupe to one
+      // entry, matching the same normalization applyPredefinedWorkPlan already uses
+      // to resolve a title (ENG-1794).
       const deduped = allPlans.filter(p => {
-        const key = p.title.toLowerCase();
+        const key = normalizeWorkPlanTitleForMatch(p.title);
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
@@ -13249,7 +13253,10 @@ export const agentModeController = {
 
       // Find work plan with matching title (case-insensitive) — private plans checked first
       const workPlan = allPlans.find((wp) =>
-        wp.title && wp.title.toLowerCase() === planTitle.toLowerCase()
+        // ENG-1802: separator/case-insensitive match (not just case), mirroring
+        // applyPredefinedWorkPlan's normalization (ENG-1794) -- a title typed with
+        // spaces must resolve against a stored underscore-joined title.
+        wp.title && normalizeWorkPlanTitleForMatch(wp.title) === normalizeWorkPlanTitleForMatch(planTitle)
       );
 
       if (!workPlan) {
@@ -13322,7 +13329,10 @@ export const agentModeController = {
 
       // Find work plan with matching title (case-insensitive) — private plans checked first
       const predefinedPlan = allPlans.find((wp) =>
-        wp.title && wp.title.toLowerCase() === planTitle.toLowerCase()
+        // ENG-1802: separator/case-insensitive match (not just case), mirroring
+        // applyPredefinedWorkPlan's normalization (ENG-1794) -- a title typed with
+        // spaces must resolve against a stored underscore-joined title.
+        wp.title && normalizeWorkPlanTitleForMatch(wp.title) === normalizeWorkPlanTitleForMatch(planTitle)
       );
 
       if (!predefinedPlan) {
