@@ -2694,5 +2694,220 @@ describe('AgentModeService - Work Plan', () => {
         expect(statusResult.missingFunctionCalls[0].missing).toContain('create_html_file (need 1, have 0)');
       });
     });
+
+    // ENG-1800: production session ca06a9e0-9499-42e1-98ce-72b5bb7b4d04 launched
+    // the "Display Ad Set Production -- One Master, Every Size" predefined plan.
+    // "Render the Full Size Matrix" required expectedAssetCount: 12 (gated on
+    // expectedAssetCountTools: ["playwright_browser_take_screenshot"]) but only 1
+    // real screenshot was ever taken. Instead of producing the rest, the model
+    // called modify_work_plan to shrink expectedAssetCount to 1, then to 0 --
+    // silently clearing the sibling completion gate the same way ENG-1793/1799
+    // showed requiredFunctionCalls could be cleared, with no protection at all
+    // (the field was deliberately unguarded to allow a genuine user-approved
+    // scope reduction). The step then completed with 1 of the promised 12 assets
+    // and the closing synthesis falsely claimed "Deliverables Generated & Verified"
+    // across all 12 units.
+    describe('ENG-1800: modify_work_plan cannot silently clear the expectedAssetCount gate', () => {
+      const makeStep = (overrides: Record<string, unknown> = {}) => ({
+        stepCount: 3,
+        title: 'Render the Full Size Matrix',
+        status: 'pending' as const,
+        requiredFunctionCalls: ['create_html_file', 'playwright_browser_take_screenshot'],
+        expectedAssetCount: 12,
+        expectedAssetCountTools: ['playwright_browser_take_screenshot'],
+        ...overrides,
+      });
+
+      const screenshotMessage = (isoTimestamp: string) => ({
+        role: 'assistant',
+        timestamp: isoTimestamp,
+        metadata: {
+          timestamp: isoTimestamp,
+          toolCalls: [{ name: 'playwright_browser_take_screenshot', result: { success: true } }],
+        },
+      });
+
+      it('refuses to lower expectedAssetCount to 0 while only 1 of 12 assets has been produced', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [screenshotMessage('2026-08-12T15:35:00.000Z')],
+          workPlan: {
+            title: 'Display Ad Set Production',
+            steps: [makeStep()],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:54:35.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        // The exact production payload: the model shrinks the goalpost to match
+        // what it actually produced instead of producing the rest.
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix', expectedAssetCount: 0 }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepCount: 3, expectedAssetCount: 12 }),
+            ]),
+          })
+        );
+      });
+
+      it('still allows lowering expectedAssetCount once enough assets have genuinely been produced', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          // 12 real screenshots -- the step has genuinely met its current target.
+          messages: Array.from({ length: 12 }, (_, i) =>
+            screenshotMessage(`2026-08-12T15:${String(35 + i).padStart(2, '0')}:00.000Z`)
+          ),
+          workPlan: {
+            title: 'Display Ad Set Production',
+            steps: [makeStep()],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:54:35.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix', expectedAssetCount: 1 }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepCount: 3, expectedAssetCount: 1 }),
+            ]),
+          })
+        );
+      });
+
+      it('still allows raising expectedAssetCount freely', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [screenshotMessage('2026-08-12T15:35:00.000Z')],
+          workPlan: {
+            title: 'Display Ad Set Production',
+            steps: [makeStep()],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:54:35.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix', expectedAssetCount: 20 }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepCount: 3, expectedAssetCount: 20 }),
+            ]),
+          })
+        );
+      });
+
+      it('does not protect expectedAssetCount once the step has already resolved (completed)', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [screenshotMessage('2026-08-12T15:35:00.000Z')],
+          workPlan: {
+            title: 'Display Ad Set Production',
+            steps: [makeStep({ status: 'completed' as const })],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:54:35.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix', expectedAssetCount: 0 }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepCount: 3, expectedAssetCount: 0 }),
+            ]),
+          })
+        );
+      });
+
+      it('end-to-end: modify_work_plan cannot be used to bypass set_work_plan_status\'s asset-count gate', async () => {
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [screenshotMessage('2026-08-12T15:35:00.000Z')],
+          calledFunctions: { create_html_file: 1, playwright_browser_take_screenshot: 1 },
+          workPlan: {
+            title: 'Display Ad Set Production',
+            steps: [makeStep()],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:54:35.000Z',
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        // Step 1: set_work_plan_status correctly blocks -- only 1 of 12 produced.
+        const blockedResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 3, status: 'completed' }],
+          mockSessionId
+        );
+        expect(blockedResult.success).toBe(false);
+        expect(blockedResult.reason).toBe('workplan_insufficient_assets');
+
+        // Step 2: the model tries to shrink the goalpost instead of finishing the work.
+        const modifyResult = await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 3, title: 'Render the Full Size Matrix', expectedAssetCount: 0 }],
+          [],
+          mockSessionId
+        );
+        expect(modifyResult.success).toBe(true);
+
+        // Step 3: the model tries to mark the step completed anyway.
+        const statusResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 3, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(statusResult.success).toBe(false);
+        expect(statusResult.reason).toBe('workplan_insufficient_assets');
+        expect(statusResult.insufficientAssets).toEqual([
+          expect.objectContaining({ stepCount: 3, expected: 12, produced: 1 }),
+        ]);
+      });
+    });
   });
 });
