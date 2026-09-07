@@ -26,12 +26,13 @@ router.get('/me/onboarding', authenticateToken, async (req, res) => {
 // ENG-1124: self-service display-name persistence.
 // ENG-1316: extended to also persist emailNotificationsEnabled — the portal
 // preferences save previously silently dropped this field (ENG-1085 gap).
+// ENG-188: extended again for emmaTipsEnabled (the Emma tips carousel opt-out).
 router.patch('/me/profile', authenticateToken, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ message: 'User not authenticated' });
 
-    const { displayName, emailNotificationsEnabled } = req.body ?? {};
+    const { displayName, emailNotificationsEnabled, emmaTipsEnabled } = req.body ?? {};
 
     const trimmedDisplayName = typeof displayName === 'string' ? displayName.trim() : displayName;
     if (displayName !== undefined && (typeof trimmedDisplayName !== 'string' || !trimmedDisplayName || trimmedDisplayName.length > 100)) {
@@ -40,10 +41,14 @@ router.patch('/me/profile', authenticateToken, async (req, res) => {
     if (emailNotificationsEnabled !== undefined && typeof emailNotificationsEnabled !== 'boolean') {
       return res.status(400).json({ message: 'emailNotificationsEnabled must be a boolean' });
     }
+    if (emmaTipsEnabled !== undefined && typeof emmaTipsEnabled !== 'boolean') {
+      return res.status(400).json({ message: 'emmaTipsEnabled must be a boolean' });
+    }
 
     const updates: Record<string, unknown> = {};
     if (displayName !== undefined) updates.displayName = trimmedDisplayName;
     if (emailNotificationsEnabled !== undefined) updates.emailNotificationsEnabled = emailNotificationsEnabled;
+    if (emmaTipsEnabled !== undefined) updates.emmaTipsEnabled = emmaTipsEnabled;
 
     if (Object.keys(updates).length === 0) {
       return res.status(400).json({ message: 'No valid fields to update' });

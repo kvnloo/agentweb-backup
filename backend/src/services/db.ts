@@ -152,6 +152,7 @@ export interface User {
   roles?: ("partner" | "customer" | "free" | "contractor")[];
   displayName?: string;
   emailNotificationsEnabled?: boolean; // Portal Settings > Preferences toggle (ENG-1316). Absent = enabled (default).
+  emmaTipsEnabled?: boolean; // Portal Settings > Preferences toggle + tip-card "don't show again" (ENG-188). Absent = enabled (default).
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // @deprecated legacy single sending domain — kept for the task/subscriber-notification fallback sender (emailService.ts, dripSequenceWorker.ts legacyDefaultSender); CRM sending domains live in emailDomains[] (ENG-265)
