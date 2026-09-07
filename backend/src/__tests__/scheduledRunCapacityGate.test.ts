@@ -142,6 +142,37 @@ describe('evaluateCapacityGate — must NOT block', () => {
     expect(result.blocked).toBe(false);
   });
 
+  // CodeRabbit on PR #2795: a user-configured cap of 0 is a deliberate "send
+  // nothing", not an exhausted budget. remainingDailyInvites reports resetsInMs: 0
+  // for an account that has sent nothing, which read as "renewing right now" and
+  // let the run proceed — so every send was refused one at a time, the futile run
+  // this gate exists to prevent. It also made buildCapacitySkipReason's dedicated
+  // zero-cap sentence unreachable.
+  it('BLOCKS a deliberate cap of 0 instead of reading its zero countdown as an imminent renewal', async () => {
+    const result = await evaluateCapacityGate(OUTREACH_SCHEDULE, 'u1', deps([
+      account(ITRIALS, { remaining: 0, cap: 0, used: 0, resetsInMs: 0 }),
+    ]));
+    expect(result.blocked).toBe(true);
+    // And the dedicated sentence is now reachable.
+    expect(buildCapacitySkipReason((result as any).accounts)).toContain('daily invite cap of 0');
+  });
+
+  it('BLOCKS a cap lowered to 0 after sends, even mid-renewal-window', async () => {
+    // The case a bare `resetsInMs > 0` guard would still miss: a live window with a
+    // real countdown, but nothing waiting on the other side of it.
+    const result = await evaluateCapacityGate(OUTREACH_SCHEDULE, 'u1', deps([
+      account(ITRIALS, { remaining: 0, cap: 0, used: 4, resetsInMs: WINDOW_RENEWAL_MARGIN_MS - 1 }),
+    ]));
+    expect(result.blocked).toBe(true);
+  });
+
+  it('still lets a genuinely exhausted POSITIVE cap through when its window is about to renew', async () => {
+    const result = await evaluateCapacityGate(OUTREACH_SCHEDULE, 'u1', deps([
+      account(ITRIALS, { remaining: 0, cap: 10, used: 10, resetsInMs: WINDOW_RENEWAL_MARGIN_MS - 1 }),
+    ]));
+    expect(result.blocked).toBe(false);
+  });
+
   it('lets the run through when the user has no connected outreach account', async () => {
     const result = await evaluateCapacityGate(OUTREACH_SCHEDULE, 'u1', deps([]));
     expect(result.blocked).toBe(false);

@@ -219,7 +219,22 @@ export async function evaluateCapacityGate(
     // Every account is at zero — but a window about to renew would make that
     // untrue minutes from now. Run instead of withholding on a fact with a
     // visible expiry.
-    if (relevant.some((acc) => acc.headroom.resetsInMs <= WINDOW_RENEWAL_MARGIN_MS)) {
+    //
+    // A renewal is only a reprieve for an account that will HAVE budget after it.
+    // A user-configured cap of 0 renews into another zero, and `remainingDailyInvites`
+    // reports `resetsInMs: 0` for one that has sent nothing — which read as "renewing
+    // right now" and returned NOT_BLOCKED, so a deliberate "send nothing" ran anyway
+    // and had every send refused one at a time. That also made the dedicated
+    // zero-cap sentence in `buildCapacitySkipReason` unreachable (CodeRabbit).
+    //
+    // `cap > 0` is the substantive half and covers the case a bare `resetsInMs > 0`
+    // guard would still miss: a cap lowered to 0 AFTER some sends has a live window
+    // and a positive countdown, but nothing waits on the other side of it.
+    if (relevant.some((acc) =>
+      acc.headroom.cap > 0
+      && acc.headroom.resetsInMs > 0
+      && acc.headroom.resetsInMs <= WINDOW_RENEWAL_MARGIN_MS
+    )) {
       return NOT_BLOCKED;
     }
 
