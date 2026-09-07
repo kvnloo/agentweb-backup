@@ -474,6 +474,74 @@ export type DailyVolumeSlot =
   | { allowed: false; reason: string; retryAfterMs: number };
 
 /**
+ * Read the current daily window for one class WITHOUT reserving anything.
+ *
+ * Extracted (ENG-1717) so the reservation path and the pre-send capacity gate can
+ * never disagree about what "used today" means. A fixed window renews from the
+ * first send after it expires, so an expired window reads as a fresh zero — that
+ * detail is exactly what a second, hand-written implementation would get wrong.
+ */
+function readDailyWindow(
+  state: DailyVolumeState,
+  cls: DailyVolumeClass,
+  now: number,
+): { currentCount: number; windowStartedAt: number } {
+  const existingWindow = state[cls];
+  const windowExpired = !existingWindow || now - existingWindow.windowStartedAt >= DAY_MS;
+  return {
+    currentCount: windowExpired ? 0 : existingWindow!.count,
+    windowStartedAt: windowExpired ? now : existingWindow!.windowStartedAt,
+  };
+}
+
+/** How much of an account's daily invite budget is left, and when it renews. */
+export interface DailyInviteHeadroom {
+  /** Sends still permitted in the current window. `Infinity` when the cap mechanism is disabled. */
+  remaining: number;
+  /** The cap in force. `Infinity` when the operator escape hatch is on. */
+  cap: number;
+  /** Invites already sent inside the current window. */
+  used: number;
+  /** Ms until the current window renews. `0` when nothing is used or the cap is disabled. */
+  resetsInMs: number;
+}
+
+/**
+ * Answer "can this account send an invite right now?" WITHOUT consuming a slot.
+ *
+ * `reserveDailyVolumeSlot` already refuses an over-cap send, but only once a send
+ * is attempted — which is per-recipient, after a run has done all of its sourcing
+ * work. This is the same arithmetic, exposed as a read, so a caller can decide
+ * before spending the run (ENG-1717 / ENG-1132's "pre-send capacity check").
+ *
+ * Deliberately pure and I/O-free, exactly like `reserveDailyVolumeSlot`, and
+ * sharing `readDailyWindow` with it so the two can never drift. A `remaining` of 0
+ * is therefore not a heuristic: it is a proof that the next `send-invite` on this
+ * account will be refused, for as long as `resetsInMs` says.
+ */
+export function remainingDailyInvites(
+  configuredInviteCap: number | null | undefined,
+  persistedState: DailyVolumeState | null | undefined,
+  deps: Partial<Pick<PacerDeps, 'now'>> = {},
+): DailyInviteHeadroom {
+  const now = (deps.now ?? defaultDeps.now)();
+  const cap = resolveDailyInviteCap(configuredInviteCap);
+  // Operator escape hatch (`dailyInviteAbsoluteMax() <= 0`) surfaces as Infinity —
+  // unlimited, no window to report. A USER-configured 0 is finite and stays a real
+  // block, the same distinction resolveDailyInviteCap draws.
+  if (!Number.isFinite(cap)) {
+    return { remaining: Infinity, cap: Infinity, used: 0, resetsInMs: 0 };
+  }
+  const { currentCount, windowStartedAt } = readDailyWindow(persistedState || {}, 'invite', now);
+  return {
+    remaining: Math.max(0, cap - currentCount),
+    cap,
+    used: currentCount,
+    resetsInMs: currentCount > 0 ? Math.max(0, windowStartedAt + DAY_MS - now) : 0,
+  };
+}
+
+/**
  * Check this account's daily invite/message budget against its persisted
  * state, and — if allowed — return the incremented state for the caller to
  * persist.
@@ -514,10 +582,7 @@ export function reserveDailyVolumeSlot(
     return { allowed: true, nextState: carriedState };
   }
 
-  const existingWindow = carriedState[cls];
-  const windowExpired = !existingWindow || now - existingWindow.windowStartedAt >= DAY_MS;
-  const currentCount = windowExpired ? 0 : existingWindow!.count;
-  const windowStartedAt = windowExpired ? now : existingWindow!.windowStartedAt;
+  const { currentCount, windowStartedAt } = readDailyWindow(carriedState, cls, now);
 
   if (currentCount >= cap) {
     const label = cls === 'invite' ? 'LinkedIn connection request' : 'LinkedIn message';
