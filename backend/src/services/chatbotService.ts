@@ -1762,12 +1762,13 @@ export class ChatbotDB {
    * absent for non-legacy sessions). Callers that need the real conversation
    * must use `getChatSession`.
    */
-  async getChatSessionRecord(sessionId: string): Promise<ChatSession | null> {
+  async getChatSessionRecord(sessionId: string, consistentRead = false): Promise<ChatSession | null> {
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
+      ...(consistentRead ? { ConsistentRead: true } : {}),
     };
 
     try {
@@ -1780,7 +1781,7 @@ export class ChatbotDB {
   }
 
   async getChatSession(sessionId: string, consistentRead = false): Promise<ChatSession | null> {
-    const session = await this.getChatSessionRecord(sessionId);
+    const session = await this.getChatSessionRecord(sessionId, consistentRead);
 
     if (!session) {
       return null;

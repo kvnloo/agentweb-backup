@@ -7347,6 +7347,7 @@ const adminToolNames = [
   'get_chat_history',
   'list_all_clients',
   'assess_client_health',
+  'monitor_lead_volume',
   'get_pr_digest',
   'freeze_user_account',
   'manage_scoring_judges',
