@@ -36052,19 +36052,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
 
         case 'list-sent-invitations': {
-          const invitationsResult = await linkedInOutreachService.listSentInvitations(account_id, args.cursor);
-          // Trim to id fields only — full invitation objects grow ~10 entries/day and can
-          // reach 200+ entries, causing severe context window bloat in scheduled sessions.
-          if (Array.isArray(invitationsResult?.items)) {
-            const trimmedItems = invitationsResult.items.map((item: any) => ({
-              id: item.id,
-              invited_user_id: item.invited_user_id,
-              invited_user_public_id: item.invited_user_public_id,
-              invited_user: item.invited_user,
-            }));
-            return { success: true, data: { ...invitationsResult, items: trimmedItems } };
-          }
-          return { success: true, data: invitationsResult };
+          // ENG-1718: this used to ask one question — is `items` an array? — and on
+          // `false` return `{ success: true, data: <whatever came back> }`. The SDK
+          // is constructed at its default `validateRequestPayloadLevel: 'warn'`, so a
+          // 2xx body failing its own response schema is logged and passed through
+          // unchanged; any such body therefore became a SUCCESSFUL EMPTY RESULT.
+          // That is the `{}` iTrials saw while a cooldown was actively firing, with
+          // 126 pending invitations sitting in our own ledger unread — this action
+          // never consulted it. See linkedInSentInvitationsView.ts for the full
+          // chain; every outcome is now named, and none of them is a bare empty.
+          const { getSentInvitationsView } = await import('./agentMode/linkedInSentInvitationsView');
+          const { getAllSentInvitationsByAccount } = await import('./unipileSentInvitationsDb');
+          const view = await getSentInvitationsView(account_id, args.cursor, {
+            fetchLive: (id, cur) => linkedInOutreachService.listSentInvitations(id, cur),
+            fetchCached: (id) => getAllSentInvitationsByAccount(id),
+          });
+          return { success: true, data: view };
         }
 
         case 'list-received-invitations': {
